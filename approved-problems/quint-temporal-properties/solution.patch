@@ -1,0 +1,914 @@
+diff --git a/quint/src/quintError.ts b/quint/src/quintError.ts
+index 7aa16c21..a4d39af2 100644
+--- a/quint/src/quintError.ts
++++ b/quint/src/quintError.ts
+@@ -129,6 +129,8 @@ export type ErrorCode =
+   | 'QNT516'
+   /* QNT517: Rust evaluator killed by signal */
+   | 'QNT517'
++  /* QNT518: A temporal operator was evaluated outside of an execution */
++  | 'QNT518'
+   /* QNT600: Integer literal is outside the supported range for the Rust evaluator */
+   | 'QNT600'
+   /* QNT601: Integer overflow in the rust evaluator */
+diff --git a/quint/src/runtime/impl/VarStorage.ts b/quint/src/runtime/impl/VarStorage.ts
+index 5a90feb7..6c28aee8 100644
+--- a/quint/src/runtime/impl/VarStorage.ts
++++ b/quint/src/runtime/impl/VarStorage.ts
+@@ -156,6 +156,30 @@ export class VarStorage {
+     this.clearCaches()
+   }
+ 
++  /**
++   * Loads a position of a run into the storage: `current` becomes the state under evaluation and
++   * `successor`, when there is one, becomes the next state, so that expressions referring to both
++   * states can be evaluated at that position.
++   *
++   * @param current - the state at the position
++   * @param successor - the state that follows it, if the position has one
++   */
++  loadTransition(current: RuntimeValue, successor: RuntimeValue | undefined) {
++    this.fromRecord(current)
++
++    if (successor === undefined) {
++      return
++    }
++
++    const registersByName = new Map(this.nextVars.valueSeq().map((reg): [string, NamedRegister] => [reg.name, reg]))
++    successor.toOrderedMap().forEach((value, key) => {
++      const register = registersByName.get(key)
++      if (register !== undefined) {
++        register.value = right(value)
++      }
++    })
++  }
++
+   /**
+    * Resets the current and next state variable registers to their initial values.
+    * This method sets the value of each register in both the current and next state
+diff --git a/quint/src/runtime/impl/builder.ts b/quint/src/runtime/impl/builder.ts
+index 6cdc6d85..32607d29 100644
+--- a/quint/src/runtime/impl/builder.ts
++++ b/quint/src/runtime/impl/builder.ts
+@@ -52,6 +52,18 @@ export class Builder {
+   namespaces: List<string> = List()
+   varStorage: VarStorage
+ 
++  /**
++   * Whether variable references are currently being built against the next state.
++   */
++  nextState: boolean = false
++
++  /**
++   * Memos for the next state, one per memo used for the current state, so that a definition built
++   * for both states does not reuse the function built for the other one.
++   */
++  nextStateMemos: Map<Map<bigint, EvalFunction>, Map<bigint, EvalFunction>> = new Map()
++  nextStateMemosByInstance: Map<bigint, Map<bigint, EvalFunction>> = new Map()
++
+   /**
+    * Constructs a new Builder instance.
+    *
+@@ -83,6 +95,49 @@ export class Builder {
+     this.varStorage.nextVars = this.varStorage.nextVars.set(key, nextRegister)
+   }
+ 
++  /**
++   * Builds something with variable references pointing at the next state instead of the current one.
++   * The memos are swapped so that a definition that is used in both states is built twice.
++   *
++   * @param build - the function that builds the EvalFunction
++   *
++   * @returns the result of build, built against the next state
++   */
++  underNextState(build: () => EvalFunction): EvalFunction {
++    if (this.nextState) {
++      return build()
++    }
++
++    const memoBefore = this.memo
++    let memo = this.nextStateMemos.get(memoBefore)
++    if (memo === undefined) {
++      memo = new Map()
++      this.nextStateMemos.set(memoBefore, memo)
++    }
++
++    this.memo = memo
++    this.nextState = true
++    try {
++      return build()
++    } finally {
++      this.nextState = false
++      this.memo = memoBefore
++    }
++  }
++
++  /**
++   * Gets the register that a variable reference should read, which is the next state register while
++   * building under `underNextState`, and the current state one otherwise.
++   *
++   * @param def - The variable to get the register for.
++   *
++   * @returns the register to read the variable from
++   */
++  registerToRead(def: QuintVar): NamedRegister {
++    const current = this.getVar(def)
++    return this.nextState ? this.getNextVar(def.id) : current
++  }
++
+   /**
+    * Gets the register for a variable by its id and the namespaces in scope (tracked by this builder).
+    *
+@@ -225,11 +280,12 @@ function buildUnderDefContext(
+   // For example, if N is a constant, the expression N + 1 can have different values for different instances.
+   // We re-use the same memo for the same instance. So, let's check if there is an existing memo,
+   // or create and save a new one
+-  if (builder.memoByInstance.has(instance.id)) {
+-    builder.memo = builder.memoByInstance.get(instance.id)!
++  const memosByInstance = builder.nextState ? builder.nextStateMemosByInstance : builder.memoByInstance
++  if (memosByInstance.has(instance.id)) {
++    builder.memo = memosByInstance.get(instance.id)!
+   } else {
+     builder.memo = new Map()
+-    builder.memoByInstance.set(instance.id, builder.memo)
++    memosByInstance.set(instance.id, builder.memo)
+   }
+ 
+   // We also need to update the namespaces to include the instance's namespaces.
+@@ -333,7 +389,7 @@ function buildDefCore(builder: Builder, def: LookupDefinition): EvalFunction {
+     case 'var': {
+       // Every variable has a single register, and we just change this register's value at each state
+       // So, a reference to a variable simply evaluates to the value of the register.
+-      const register = builder.getVar(def)
++      const register = builder.registerToRead(def)
+       return _ => {
+         return register.value
+       }
+@@ -367,10 +423,13 @@ function buildDefWithMemo(builder: Builder, def: LookupDefinition): EvalFunction
+   const defEval = buildDefCore(builder, def)
+ 
+   // For top-level value definitions, we can cache the resulting value, as long as we are careful with state changes.
++  // A definition read in the next state cannot be cached against the current one: the next state
++  // changes with every action tried from the same state, while the cache only clears on a shift.
+   const statefulCachingCondition =
+     def.kind === 'def' &&
+     (def.qualifier === 'pureval' || def.qualifier === 'val') &&
+-    (def.depth === undefined || def.depth === 0)
++    (def.depth === undefined || def.depth === 0) &&
++    !builder.nextState
+ 
+   if (!statefulCachingCondition) {
+     // Only use memo, no runtime caching
+@@ -448,6 +507,18 @@ function buildExprCore(builder: Builder, expr: QuintEx): EvalFunction {
+         })
+       }
+ 
++      if (expr.opcode === 'next') {
++        // The value of an expression in the next state, that is, built with every variable
++        // reference reading the next state register instead of the current state one.
++        return builder.underNextState(() => buildExpr(builder, expr.args[0]))
++      }
++
++      if (expr.opcode === 'orKeep' || expr.opcode === 'mustChange') {
++        // These compare the second argument across the transition, or keep the variables occurring
++        // in it, so they need the expression itself and not only its value.
++        return buildTransitionOp(builder, expr)
++      }
++
+       const args = expr.args.map(arg => buildExpr(builder, arg))
+ 
+       // If the operator is a lazy operator, we can't evaluate the arguments before evaluating application
+@@ -590,3 +661,134 @@ export function nameWithNamespaces(name: string, namespaces: List<string>): stri
+   const revertedNamespaces = namespaces.reverse()
+   return revertedNamespaces.push(name).join('::')
+ }
++
++/**
++ * Collects the variable definitions referred to by an expression, in the order they occur.
++ *
++ * @param builder - The Builder instance
++ * @param expr - The expression to scan
++ *
++ * @returns the variable definitions occurring in the expression, without repetitions
++ */
++function variablesOccurringIn(builder: Builder, expr: QuintEx): QuintVar[] {
++  const found: Map<bigint, QuintVar> = new Map()
++
++  const scan = (ex: QuintEx): void => {
++    switch (ex.kind) {
++      case 'name': {
++        const def = builder.table.get(ex.id)
++        if (def?.kind === 'var') {
++          found.set(def.id, def)
++        } else if (def?.kind === 'def' && def.expr !== undefined) {
++          scan(def.expr)
++        }
++        return
++      }
++      case 'app':
++        ex.args.forEach(scan)
++        return
++      case 'lambda':
++        scan(ex.expr)
++        return
++      case 'let':
++        scan(ex.opdef.expr)
++        scan(ex.expr)
++        return
++      default:
++        return
++    }
++  }
++
++  scan(expr)
++  return [...found.values()]
++}
++
++/**
++ * Builds a function that keeps a variable, that is, that gives it the same value in the next state
++ * as it has in the current one.
++ *
++ * @param builder - The Builder instance
++ * @param varDef - The variable to keep
++ *
++ * @returns an evaluation function that keeps the variable and evaluates to true
++ */
++function buildKeep(builder: Builder, varDef: QuintVar): EvalFunction {
++  return buildUnderDefContext(builder, varDef, () => {
++    builder.discoverVar(varDef.id, varDef.name)
++    const current = builder.getVar(varDef)
++    const next = builder.getNextVar(varDef.id)
++
++    return _ => {
++      next.value = current.value
++      return right(rv.mkBool(true))
++    }
++  })
++}
++
++/**
++ * Builds `orKeep` and `mustChange`, which relate an action to how a given expression changes over
++ * the transition it produces.
++ *
++ * `a.orKeep(v)` takes `a` when it is enabled, and otherwise takes a stuttering step in which the
++ * variables occurring in `v` keep their values. `a.mustChange(v)` takes `a` only when it changes
++ * the value of `v`. Both leave the next state untouched when they evaluate to false.
++ *
++ * @param builder - The Builder instance
++ * @param expr - The application to build
++ *
++ * @returns the evaluation function for the application
++ */
++function buildTransitionOp(builder: Builder, expr: QuintApp): EvalFunction {
++  const actionEval = buildExpr(builder, expr.args[0])
++
++  if (expr.opcode === 'mustChange') {
++    const beforeEval = buildExpr(builder, expr.args[1])
++    const afterEval = builder.underNextState(() => buildExpr(builder, expr.args[1]))
++
++    return ctx => {
++      const snapshot = ctx.varStorage.snapshot()
++      const rejected = (result: Either<QuintError, RuntimeValue>): Either<QuintError, RuntimeValue> => {
++        ctx.varStorage.recoverSnapshot(snapshot)
++        return result
++      }
++
++      const taken = actionEval(ctx)
++      if (taken.isLeft()) {
++        return rejected(taken)
++      }
++      if (!taken.value.toBool()) {
++        return rejected(right(rv.mkBool(false)))
++      }
++
++      const observed = beforeEval(ctx).chain(before => afterEval(ctx).map(after => rv.mkBool(before.equals(after))))
++      if (observed.isLeft()) {
++        return rejected(observed)
++      }
++
++      return observed.value.toBool() ? rejected(right(rv.mkBool(false))) : right(rv.mkBool(true))
++    }
++  }
++
++  const keeps = variablesOccurringIn(builder, expr.args[1]).map(varDef => buildKeep(builder, varDef))
++
++  return ctx => {
++    const snapshot = ctx.varStorage.snapshot()
++    const taken = actionEval(ctx)
++    if (taken.isRight() && taken.value.toBool()) {
++      return taken
++    }
++
++    ctx.varStorage.recoverSnapshot(snapshot)
++    if (taken.isLeft()) {
++      return taken
++    }
++
++    for (const keep of keeps) {
++      const kept = keep(ctx)
++      if (kept.isLeft()) {
++        return kept
++      }
++    }
++    return right(rv.mkBool(true))
++  }
++}
+diff --git a/quint/src/runtime/impl/builtins.ts b/quint/src/runtime/impl/builtins.ts
+index 04117265..58ca44ac 100644
+--- a/quint/src/runtime/impl/builtins.ts
++++ b/quint/src/runtime/impl/builtins.ts
+@@ -75,6 +75,7 @@ export const lazyOps = [
+   'assign',
+   'actionAny',
+   'actionAll',
++  'enabled',
+   'ite',
+   'matchVariant',
+   'oneOf',
+@@ -189,6 +190,15 @@ export function lazyBuiltinLambda(
+         return right(rv.mkBool(false))
+       }
+     }
++    case 'enabled':
++      // Tries the action and reports whether it could be taken, leaving the state as it was.
++      return (ctx, args) => {
++        const snapshot = ctx.varStorage.snapshot()
++        const result = args[0](ctx)
++        ctx.varStorage.recoverSnapshot(snapshot)
++        return result
++      }
++
+     case 'actionAll':
+       // Executes all of the given actions, or none of them if any of them results in false.
+       return (ctx, args) => {
+@@ -747,20 +757,24 @@ export function builtinLambda(op: string): (ctx: Context, args: RuntimeValue[])
+         return right(args[1])
+       }
+ 
++    // temporal operators, which are decided over a whole execution and have no value on their own
++    case 'always':
++    case 'eventually':
++    case 'leadsTo':
++      return _ =>
++        left({
++          code: 'QNT518',
++          message: `'${op}' talks about a whole execution, so it can only be checked as a property of a run`,
++        })
++
+     // standard unary operators that are not handled by REPL
+     case 'allLists':
+     case 'chooseSome':
+-    case 'always':
+-    case 'eventually':
+-    case 'enabled':
+       return _ => left({ code: 'QNT501', message: `Runtime does not support the built -in operator '${op}'` })
+ 
+     // builtin operators that are not handled by REPL
+-    case 'orKeep':
+-    case 'mustChange':
+     case 'weakFair':
+     case 'strongFair':
+-    case 'leadsTo':
+       return _ => left({ code: 'QNT501', message: `Runtime does not support the built -in operator '${op}'` })
+ 
+     default:
+diff --git a/quint/src/runtime/impl/evaluator.ts b/quint/src/runtime/impl/evaluator.ts
+index 1e7d64a8..e38852da 100644
+--- a/quint/src/runtime/impl/evaluator.ts
++++ b/quint/src/runtime/impl/evaluator.ts
+@@ -27,6 +27,7 @@ import { Rng } from '../../rng'
+ import { zerog } from '../../idGenerator'
+ import { List } from 'immutable'
+ import { Builder, buildDef, buildExpr, nameWithNamespaces } from './builder'
++import { TemporalChecker, Verdict, isTemporalFormula } from './temporal'
+ import { Presets, SingleBar } from 'cli-progress'
+ import { Outcome, SimulationTrace, getTraceStatistics } from '../../simulation'
+ import assert from 'assert'
+@@ -188,7 +189,12 @@ export class Evaluator {
+ 
+     const initEval = buildExpr(this.builder, init)
+     const stepEval = buildExpr(this.builder, step)
+-    const invEval = buildExpr(this.builder, inv)
++    // A property that talks about a whole execution is decided once the run is over, so it is not
++    // built as something to check at each state.
++    const temporalProperty = isTemporalFormula(inv, this.builder.table) ? inv : undefined
++    const invEval = temporalProperty ? undefined : buildExpr(this.builder, inv)
++    const checkInvariant = (): Either<QuintError, RuntimeValue> =>
++      invEval ? invEval(this.ctx) : right(rv.mkBool(true))
+     const witnessesEvals = witnesses.map(w => buildExpr(this.builder, w))
+     const witnessingTraces = new Array(witnesses.length).fill(0)
+     const traceLengths: number[] = []
+@@ -213,7 +219,7 @@ export class Evaluator {
+       } else {
+         this.shift()
+ 
+-        const invResult = invEval(this.ctx).mapLeft(error => (failure = error))
++        const invResult = checkInvariant().mapLeft(error => (failure = error))
+         this.recorder.onUserOperatorReturn(initApp, [], invResult)
+         if (!isTrue(invResult)) {
+           errorsFound++
+@@ -254,7 +260,7 @@ export class Evaluator {
+               }
+             })
+ 
+-            const invResult = invEval(this.ctx).mapLeft(error => (failure = error))
++            const invResult = checkInvariant().mapLeft(error => (failure = error))
+             if (!isTrue(invResult)) {
+               errorsFound++
+             }
+@@ -267,6 +273,13 @@ export class Evaluator {
+             }
+           })
+ 
++          if (temporalProperty) {
++            const verdict = this.decideTemporalProperty(temporalProperty).mapLeft(error => (failure = error))
++            if (verdict.isRight() && verdict.value === 'false') {
++              errorsFound++
++            }
++          }
++
+           traceLengths.push(this.trace.get().length)
+         }
+       }
+@@ -311,6 +324,32 @@ export class Evaluator {
+     }
+   }
+ 
++  /**
++   * Decides a temporal property over the run that was just produced.
++   *
++   * The states of the run are loaded back into the storage one at a time, together with the state
++   * that follows each of them, so that the predicates the property is built from can be evaluated
++   * at every position. The state the run ended in is put back afterwards.
++   *
++   * @param property - the temporal property to decide
++   *
++   * @returns the verdict for the run, or the error that stopped the property from being decided
++   */
++  private decideTemporalProperty(property: QuintEx): Either<QuintError, Verdict> {
++    const states = this.trace.get()
++    const finalState = this.ctx.varStorage.asRecord()
++
++    const checker = new TemporalChecker(states, this.builder.table, (ex, position, successor) => {
++      this.ctx.varStorage.loadTransition(states[position], successor === undefined ? undefined : states[successor])
++      return buildExpr(this.builder, ex)(this.ctx).map(value => value.toBool())
++    })
++
++    const verdict = checker.check(property)
++    this.ctx.varStorage.fromRecord(finalState)
++
++    return verdict
++  }
++
+   /**
+    * Run a specified test definition a given number of times, and report the result.
+    *
+diff --git a/quint/src/runtime/impl/temporal.ts b/quint/src/runtime/impl/temporal.ts
+new file mode 100644
+index 00000000..e50859af
+--- /dev/null
++++ b/quint/src/runtime/impl/temporal.ts
+@@ -0,0 +1,443 @@
++/* ----------------------------------------------------------------------------------
++ * Copyright 2026 Informal Systems
++ * Licensed under the Apache License, Version 2.0.
++ * See LICENSE in the project root for license information.
++ * --------------------------------------------------------------------------------- */
++
++/**
++ * Deciding temporal properties over the executions produced by the simulator.
++ *
++ * A run is a finite sequence of states. When one of its states repeats, the run stands for the
++ * infinite behavior that reaches the first repeated state and then cycles forever, and every
++ * formula has a definite value on it. When no state repeats, the run is a prefix that could be
++ * continued in ways we did not explore, so a formula is only reported as violated when no
++ * continuation could satisfy it. Both cases are covered by evaluating with three values.
++ *
++ * @module
++ */
++
++import { Either, right } from '@sweet-monads/either'
++import { OrderedMap } from 'immutable'
++import { QuintEx } from '../../ir/quintIr'
++import { LookupDefinition, LookupTable } from '../../names/base'
++import { QuintError } from '../../quintError'
++import { RuntimeValue } from './runtimeValue'
++import { ACTION_TAKEN, NONDET_PICKS } from '../../itf'
++
++/**
++ * The value of a formula over a run: definitely true, definitely false, or not decided by this run.
++ */
++export type Verdict = 'true' | 'false' | 'unknown'
++
++/**
++ * The operators that talk about a whole execution rather than about a single state.
++ */
++const temporalOperators = ['always', 'eventually', 'leadsTo']
++
++/**
++ * The boolean connectives that a temporal formula may be built from.
++ */
++const connectives = ['and', 'or', 'not', 'implies', 'iff']
++
++/**
++ * The fields that the storage adds to a state record to carry trace metadata. They describe how a
++ * state was reached rather than what the state is, so states are compared without them.
++ */
++const metadataFields = [ACTION_TAKEN, NONDET_PICKS]
++
++/**
++ * Unfolds a reference to a definition that takes no arguments, so that the formula it stands for
++ * can be inspected. Anything else is returned unchanged.
++ *
++ * @param ex - the expression to unfold
++ * @param table - the lookup table
++ *
++ * @returns the body the name stands for, or the expression itself
++ */
++export function unfoldDefinition(ex: QuintEx, table: LookupTable): QuintEx {
++  let current = ex
++  const seen: Set<bigint> = new Set()
++
++  while (current.kind === 'name') {
++    const def: LookupDefinition | undefined = table.get(current.id)
++    if (def === undefined || def.kind !== 'def' || def.expr === undefined || def.expr.kind === 'lambda') {
++      return current
++    }
++    if (seen.has(def.id)) {
++      return current
++    }
++    seen.add(def.id)
++    current = def.expr
++  }
++
++  return current
++}
++
++/**
++ * Whether an expression talks about a whole execution, that is, whether a temporal operator occurs
++ * in it, including through the definitions it refers to.
++ *
++ * @param ex - the expression to inspect
++ * @param table - the lookup table
++ *
++ * @returns true iff the expression is a temporal formula
++ */
++export function isTemporalFormula(ex: QuintEx, table: LookupTable): boolean {
++  return occurs(ex, table, opcode => temporalOperators.includes(opcode))
++}
++
++/**
++ * Whether an expression reads the next state, that is, whether `next` occurs in it, including
++ * through the definitions it refers to.
++ *
++ * @param ex - the expression to inspect
++ * @param table - the lookup table
++ *
++ * @returns true iff the expression reads the next state
++ */
++export function readsNextState(ex: QuintEx, table: LookupTable): boolean {
++  return occurs(ex, table, opcode => opcode === 'next')
++}
++
++function occurs(ex: QuintEx, table: LookupTable, predicate: (opcode: string) => boolean): boolean {
++  const visited: Set<bigint> = new Set()
++
++  const scan = (current: QuintEx): boolean => {
++    if (visited.has(current.id)) {
++      return false
++    }
++    visited.add(current.id)
++
++    switch (current.kind) {
++      case 'app':
++        return predicate(current.opcode) || current.args.some(scan)
++      case 'lambda':
++        return scan(current.expr)
++      case 'let':
++        return scan(current.opdef.expr) || scan(current.expr)
++      case 'name': {
++        const unfolded = unfoldDefinition(current, table)
++        return unfolded.kind === 'name' ? false : scan(unfolded)
++      }
++      default:
++        return false
++    }
++  }
++
++  return scan(ex)
++}
++
++/**
++ * The shape a run has when it is read as a behavior: the states it visits, and, when a state
++ * repeats, where the cycle starts.
++ */
++export class RunShape {
++  /**
++   * The states of the run, up to but not including the repeated one.
++   */
++  readonly states: RuntimeValue[]
++
++  /**
++   * The position the behavior returns to after the last one, when the run cycles.
++   */
++  readonly loopStart: number | undefined
++
++  private constructor(states: RuntimeValue[], loopStart: number | undefined) {
++    this.states = states
++    this.loopStart = loopStart
++  }
++
++  /**
++   * Reads a run as a behavior, looking for the earliest state that repeats an earlier one. The
++   * repeated state is dropped, since the behavior returns to the earlier occurrence instead.
++   *
++   * @param states - the states of the run, in order
++   *
++   * @returns the shape of the run
++   */
++  static of(states: RuntimeValue[]): RunShape {
++    const visited = states.map(withoutMetadata)
++
++    for (let position = 0; position < visited.length; position++) {
++      for (let earlier = 0; earlier < position; earlier++) {
++        if (visited[earlier].equals(visited[position])) {
++          return new RunShape(states.slice(0, position), earlier)
++        }
++      }
++    }
++
++    return new RunShape(states, undefined)
++  }
++
++  /**
++   * Whether the run cycles, and therefore stands for a complete behavior.
++   */
++  get cycles(): boolean {
++    return this.loopStart !== undefined
++  }
++
++  /**
++   * The last position of the run.
++   */
++  get lastPosition(): number {
++    return this.states.length - 1
++  }
++
++  /**
++   * The positions the behavior visits from a position onwards. A cycling run comes back to the
++   * start of its cycle, so every position from there on is visited again.
++   *
++   * @param position - the position to start from
++   *
++   * @returns the positions visited from that position onwards
++   */
++  positionsFrom(position: number): number[] {
++    const first = this.loopStart === undefined ? position : Math.min(position, this.loopStart)
++    const positions = []
++    for (let p = first; p <= this.lastPosition; p++) {
++      positions.push(p)
++    }
++    return positions
++  }
++
++  /**
++   * The position that follows a position in the behavior, which for the last position of a cycling
++   * run is the start of the cycle, and which does not exist for the last position of a run that
++   * does not cycle.
++   *
++   * @param position - the position to take the successor of
++   *
++   * @returns the following position, if there is one
++   */
++  successorOf(position: number): number | undefined {
++    if (position < this.lastPosition) {
++      return position + 1
++    }
++    return this.loopStart
++  }
++}
++
++/**
++ * The variables of a state, without the metadata that records how the state was reached. Two states
++ * are the same state when their variables are the same, however they were arrived at.
++ *
++ * @param state - the state record
++ *
++ * @returns the variables of the state
++ */
++function withoutMetadata(state: RuntimeValue): OrderedMap<string, RuntimeValue> {
++  return state.toOrderedMap().filter((_value, key) => !metadataFields.includes(key))
++}
++
++function negate(verdict: Verdict): Verdict {
++  switch (verdict) {
++    case 'true':
++      return 'false'
++    case 'false':
++      return 'true'
++    default:
++      return 'unknown'
++  }
++}
++
++function conjoin(left_: Verdict, right_: Verdict): Verdict {
++  if (left_ === 'false' || right_ === 'false') {
++    return 'false'
++  }
++  return left_ === 'true' && right_ === 'true' ? 'true' : 'unknown'
++}
++
++function disjoin(left_: Verdict, right_: Verdict): Verdict {
++  if (left_ === 'true' || right_ === 'true') {
++    return 'true'
++  }
++  return left_ === 'false' && right_ === 'false' ? 'false' : 'unknown'
++}
++
++/**
++ * Decides a temporal property over a run.
++ *
++ * State predicates are handed back to the caller, which knows how to evaluate an expression at a
++ * position of the run. A predicate that reads the next state has no value at the last position of
++ * a run that does not cycle, since that position has no successor there.
++ */
++export class TemporalChecker {
++  private shape: RunShape
++  private table: LookupTable
++  private evaluateAt: (ex: QuintEx, position: number, successor: number | undefined) => Either<QuintError, boolean>
++
++  /**
++   * @param states - the states of the run, in order
++   * @param table - the lookup table
++   * @param evaluateAt - evaluates a state predicate at a position, given the position that follows it
++   */
++  constructor(
++    states: RuntimeValue[],
++    table: LookupTable,
++    evaluateAt: (ex: QuintEx, position: number, successor: number | undefined) => Either<QuintError, boolean>
++  ) {
++    this.shape = RunShape.of(states)
++    this.table = table
++    this.evaluateAt = evaluateAt
++  }
++
++  /**
++   * Decides the property over the run, from its first state.
++   *
++   * @param property - the property to decide
++   *
++   * @returns the verdict, or an error raised while evaluating a state predicate
++   */
++  check(property: QuintEx): Either<QuintError, Verdict> {
++    if (this.shape.states.length === 0) {
++      return right('unknown')
++    }
++    return this.verdictAt(property, 0)
++  }
++
++  private verdictAt(formula: QuintEx, position: number): Either<QuintError, Verdict> {
++    const ex = unfoldDefinition(formula, this.table)
++
++    if (ex.kind !== 'app' || !this.isTemporal(ex)) {
++      return this.statePredicateAt(ex, position)
++    }
++
++    switch (ex.opcode) {
++      case 'always':
++        return this.overPositions(position, p => this.verdictAt(ex.args[0], p), 'all')
++
++      case 'eventually':
++        return this.overPositions(position, p => this.verdictAt(ex.args[0], p), 'some')
++
++      case 'leadsTo':
++        // Whenever the cause holds, the effect has to hold then or later. A position where the cause
++        // does not hold says nothing, so the effect is not looked for there.
++        return this.overPositions(
++          position,
++          p =>
++            this.verdictAt(ex.args[0], p).chain(cause =>
++              cause === 'false'
++                ? right('true')
++                : this.overPositions(p, q => this.verdictAt(ex.args[1], q), 'some').map(effect =>
++                    disjoin(negate(cause), effect)
++                  )
++            ),
++          'all'
++        )
++
++      case 'not':
++        return this.verdictAt(ex.args[0], position).map(negate)
++
++      case 'and':
++        return this.foldOperands(ex.args, position, conjoin, 'true', 'false')
++
++      case 'or':
++        return this.foldOperands(ex.args, position, disjoin, 'false', 'true')
++
++      case 'implies': {
++        // As with the boolean operator, an antecedent that does not hold settles the implication and
++        // the consequent is not looked at
++        const antecedent = this.verdictAt(ex.args[0], position)
++        if (antecedent.isLeft()) {
++          return antecedent
++        }
++        if (antecedent.value === 'false') {
++          return right('true')
++        }
++        const settled = antecedent.value
++        return this.verdictAt(ex.args[1], position).map(consequent => disjoin(negate(settled), consequent))
++      }
++
++      case 'iff':
++        return this.verdictAt(ex.args[0], position).chain(l =>
++          this.verdictAt(ex.args[1], position).map(r =>
++            disjoin(conjoin(l, r), conjoin(negate(l), negate(r)))
++          )
++        )
++
++      default:
++        return this.statePredicateAt(ex, position)
++    }
++  }
++
++  /**
++   * A temporal formula is one that has a temporal operator in it. A connective only counts as part
++   * of the formula when one of its operands is temporal; otherwise it is an ordinary predicate and
++   * is evaluated in one go.
++   */
++  private isTemporal(ex: QuintEx): boolean {
++    if (ex.kind !== 'app') {
++      return false
++    }
++    if (temporalOperators.includes(ex.opcode)) {
++      return true
++    }
++    return connectives.includes(ex.opcode) && ex.args.some(arg => isTemporalFormula(arg, this.table))
++  }
++
++  /**
++   * Folds a connective over its operands, short-circuiting the way the boolean operators do: once an
++   * operand settles the connective, the ones after it are not looked at.
++   */
++  private foldOperands(
++    operands: QuintEx[],
++    position: number,
++    combine: (a: Verdict, b: Verdict) => Verdict,
++    unit: Verdict,
++    settles: Verdict
++  ): Either<QuintError, Verdict> {
++    let sofar: Verdict = unit
++    for (const operand of operands) {
++      if (sofar === settles) {
++        return right(sofar)
++      }
++      const next = this.verdictAt(operand, position)
++      if (next.isLeft()) {
++        return next
++      }
++      sofar = combine(sofar, next.value)
++    }
++    return right(sofar)
++  }
++
++  /**
++   * Folds a verdict over every position the behavior visits from a position onwards. A run that
++   * does not cycle can only refute: it never concludes that a property holds forever, or that one
++   * never comes to hold.
++   */
++  private overPositions(
++    position: number,
++    verdictOf: (p: number) => Either<QuintError, Verdict>,
++    quantifier: 'all' | 'some'
++  ): Either<QuintError, Verdict> {
++    const decisive: Verdict = quantifier === 'all' ? 'false' : 'true'
++    let sawOnlyOpposite = true
++
++    for (const p of this.shape.positionsFrom(position)) {
++      const verdict = verdictOf(p)
++      if (verdict.isLeft()) {
++        return verdict
++      }
++      if (verdict.value === decisive) {
++        return right(decisive)
++      }
++      sawOnlyOpposite = sawOnlyOpposite && verdict.value !== 'unknown'
++    }
++
++    if (this.shape.cycles && sawOnlyOpposite) {
++      return right(negate(decisive))
++    }
++    return right('unknown')
++  }
++
++  private statePredicateAt(ex: QuintEx, position: number): Either<QuintError, Verdict> {
++    const successor = this.shape.successorOf(position)
++    if (successor === undefined && readsNextState(ex, this.table)) {
++      // The last position of a run that does not cycle has no successor, so a predicate that reads
++      // the next state says nothing there.
++      return right('unknown')
++    }
++
++    return this.evaluateAt(ex, position, successor).map((value): Verdict => (value ? 'true' : 'false'))
++  }
++}

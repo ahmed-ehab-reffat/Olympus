@@ -1,0 +1,653 @@
+diff --git a/src/ezdxf/entities/dictionary.py b/src/ezdxf/entities/dictionary.py
+index fc901ea16..823415cc3 100644
+--- a/src/ezdxf/entities/dictionary.py
++++ b/src/ezdxf/entities/dictionary.py
+@@ -23,7 +23,7 @@ from ezdxf.lldxf.types import is_valid_handle
+ from ezdxf.audit import AuditError
+ from ezdxf.entities import factory, DXFGraphic
+ from .dxfentity import base_class, SubclassProcessor, DXFEntity
+-from .dxfobj import DXFObject
++from .dxfobj import DXFObject, is_dxf_object
+ from .copy import default_copy, CopyNotSupported
+ 
+ if TYPE_CHECKING:
+@@ -135,6 +135,22 @@ class Dictionary(DXFObject):
+         else:
+             entity._data = dict(self._data)
+ 
++    def register_resources(self, registry: xref.Registry) -> None:
++        """Register resources referenced by dictionary entries.
++
++        Hard-owned entries are copied as linked content of this dictionary, so only
++        their own external resources have to be registered.  Soft-owned entries are
++        independent objects and have to enter the copy machine themselves.
++        """
++        super().register_resources(registry)
++        for _, entry in self.items():
++            if not isinstance(entry, DXFEntity) or not is_dxf_object(entry):
++                continue
++            if self.is_hard_owner:
++                entry.register_resources(registry)
++            else:
++                registry.add_entity(entry)
++
+     def get_handle_mapping(self, clone: Dictionary) -> dict[str, str]:
+         """Returns handle mapping for in-object copies."""
+         handle_mapping: dict[str, str] = dict()
+@@ -145,7 +161,7 @@ class Dictionary(DXFObject):
+             if not isinstance(entity, DXFEntity):
+                 continue
+             copied_entry = clone.get(key)
+-            if copied_entry:
++            if isinstance(copied_entry, DXFEntity):
+                 handle_mapping[entity.dxf.handle] = copied_entry.dxf.handle
+         return handle_mapping
+ 
+@@ -154,14 +170,20 @@ class Dictionary(DXFObject):
+         assert isinstance(clone, Dictionary)
+         super().map_resources(clone, mapping)
+         if self.is_hard_owner:
++            for key, entity in self.items():
++                if not isinstance(entity, DXFEntity):
++                    continue
++                entity_copy = clone.get(key)
++                if isinstance(entity_copy, DXFEntity):
++                    entity.map_resources(entity_copy, mapping)
+             return
+         data = dict()
+         for key, entity in self.items():
+             if not isinstance(entity, DXFEntity):
+                 continue
+             entity_copy = mapping.get_reference_of_copy(entity.dxf.handle)
+-            if entity_copy:
+-                data[key] = entity
++            if entity_copy is not None:
++                data[key] = entity_copy
+         clone._data = data  # type: ignore
+ 
+     def del_source_of_copy(self) -> None:
+@@ -567,6 +589,23 @@ class DictionaryWithDefault(Dictionary):
+         assert isinstance(entity, DictionaryWithDefault)
+         entity._default = self._default
+ 
++    def register_resources(self, registry: xref.Registry) -> None:
++        """Register the dictionary-wide default object as a hard reference."""
++        super().register_resources(registry)
++        registry.add_handle(self.dxf.default)
++
++    def map_resources(self, clone: Self, mapping: xref.ResourceMapper) -> None:
++        """Map the dictionary-wide default to the target-side copy."""
++        assert isinstance(clone, DictionaryWithDefault)
++        super().map_resources(clone, mapping)
++        default = mapping.get_reference_of_copy(self.dxf.default)
++        if isinstance(default, DXFObject):
++            clone.set_default(default)
++            default.dxf.owner = clone.dxf.handle
++        else:
++            clone._default = None
++            clone.dxf.default = "0"
++
+     def post_load_hook(self, doc: Drawing) -> None:
+         # Set _default to None if default object not exist - audit() replaces
+         # a not existing default object by a placeholder object.
+diff --git a/src/ezdxf/entities/dxfentity.py b/src/ezdxf/entities/dxfentity.py
+index d48457344..6c7aeae14 100644
+--- a/src/ezdxf/entities/dxfentity.py
++++ b/src/ezdxf/entities/dxfentity.py
+@@ -30,7 +30,7 @@ from typing_extensions import Self
+ import logging
+ import uuid
+ from ezdxf import options
+-from ezdxf.lldxf import const
++from ezdxf.lldxf import const, types
+ from ezdxf.lldxf.tags import Tags
+ from ezdxf.lldxf.types import DXFTag
+ from ezdxf.lldxf.extendedtags import ExtendedTags
+@@ -979,9 +979,38 @@ class DXFTagStorage(DXFEntity):
+         self.embedded_objects: Optional[list[Tags]] = None
+ 
+     def copy(self, copy_strategy=default_copy) -> Self:
+-        raise CopyNotSupported(
+-            f"Copying of tag storage {self.dxftype()} not supported."
+-        )
++        """Create an independent copy of an unknown entity or object."""
++        if self.is_graphic_entity:
++            raise CopyNotSupported(
++                f"Copying of tag storage {self.dxftype()} not supported."
++            )
++        return copy_strategy.copy(self)
++
++    def copy_data(self, entity: Self, copy_strategy=default_copy) -> None:
++        assert isinstance(entity, DXFTagStorage)
++        entity.xtags = self.xtags.clone()
++        entity.embedded_objects = entity.xtags.embedded_objects
++        entity.DXFTYPE = self.DXFTYPE
++
++    def _resource_tag_groups(self) -> Iterator[Tags]:
++        yield from self.xtags.subclasses[1:]
++        if self.embedded_objects:
++            yield from self.embedded_objects
++
++    def register_resources(self, registry: xref.Registry) -> None:
++        """Register hard referenced objects stored in unknown tag structures."""
++        super().register_resources(registry)
++        for tags in self._resource_tag_groups():
++            for tag in tags:
++                if types.is_hard_pointer(tag) or types.is_hard_owner(tag):
++                    registry.add_handle(tag.value)
++
++    def map_resources(self, clone: Self, mapping: xref.ResourceMapper) -> None:
++        """Translate pointer handles in unknown tag structures."""
++        assert isinstance(clone, DXFTagStorage)
++        super().map_resources(clone, mapping)
++        for tags in clone._resource_tag_groups():
++            mapping.map_pointers(tags, new_owner_handle=clone.dxf.handle)
+ 
+     def transform(self, m: Matrix44) -> Self:
+         raise NotImplementedError("cannot transform DXF tag storage")
+diff --git a/src/ezdxf/entities/dxfobj.py b/src/ezdxf/entities/dxfobj.py
+index e3a7b70cd..3eb25933b 100644
+--- a/src/ezdxf/entities/dxfobj.py
++++ b/src/ezdxf/entities/dxfobj.py
+@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Iterable, Union, Any, Optional
+ from typing_extensions import Self, TypeGuard
+ import logging
+ import array
+-from ezdxf.lldxf import validator
++from ezdxf.lldxf import validator, types
+ from ezdxf.lldxf.const import DXF2000, DXFStructureError, SUBCLASS_MARKER
+ from ezdxf.lldxf.tags import Tags
+ from ezdxf.lldxf.types import dxftag, DXFTag, DXFBinaryTag
+@@ -22,6 +22,7 @@ from .factory import register_entity
+ from .copy import default_copy
+ 
+ if TYPE_CHECKING:
++    from ezdxf import xref
+     from ezdxf.audit import Auditor
+     from ezdxf.entities import DXFNamespace
+     from ezdxf.lldxf.tagwriter import AbstractTagWriter
+@@ -91,6 +92,19 @@ class XRecord(DXFObject):
+         assert isinstance(entity, XRecord)
+         entity.tags = Tags(self.tags)
+ 
++    def register_resources(self, registry: xref.Registry) -> None:
++        """Register hard referenced objects stored in the XRECORD tags."""
++        super().register_resources(registry)
++        for tag in self.tags:
++            if types.is_hard_pointer(tag) or types.is_hard_owner(tag):
++                registry.add_handle(tag.value)
++
++    def map_resources(self, clone: Self, mapping: xref.ResourceMapper) -> None:
++        """Translate pointer handles stored in the XRECORD tags."""
++        assert isinstance(clone, XRecord)
++        super().map_resources(clone, mapping)
++        mapping.map_pointers(clone.tags, new_owner_handle=clone.dxf.handle)
++
+     def load_dxf_attribs(
+         self, processor: Optional[SubclassProcessor] = None
+     ) -> DXFNamespace:
+diff --git a/src/ezdxf/xref.py b/src/ezdxf/xref.py
+index 8b21896bc..a6397d008 100644
+--- a/src/ezdxf/xref.py
++++ b/src/ezdxf/xref.py
+@@ -36,6 +36,8 @@ from ezdxf.entities import (
+     Insert,
+     DXFLayout,
+     VisualStyle,
++    Dictionary,
++    DictionaryWithDefault,
+ )
+ from ezdxf.entities.copy import CopyStrategy, CopySettings
+ from ezdxf.math import UVec, Vec3
+@@ -961,6 +963,61 @@ class Loader:
+         entities = _get_table_entries(names, self.sdoc.materials)
+         self.add_command(LoadResources(entities))
+ 
++    def load_objects(self, objects: Sequence[DXFEntity]) -> None:
++        """Loads DXF objects and their named-dictionary ownership paths into the
++        target document.
++
++        Objects have to be stored in the OBJECTS section of the source document.
++        Graphical entities, objects from another document and the root dictionary
++        itself are not accepted.  Hard-owned dictionary content is loaded as part of
++        the dictionary; soft-owned content is loaded as an independently mapped
++        resource.
++
++        Args:
++            objects: sequence of DXF objects from the source document
++
++        Raises:
++            EntityError: invalid object or source document
++
++        """
++        entities: list[DXFEntity] = []
++        for entity in objects:
++            if not isinstance(entity, DXFEntity) or not is_dxf_object(entity):
++                raise EntityError(f"expected DXF object, got: {str(entity)}")
++            if entity.doc is not self.sdoc:
++                raise EntityError(
++                    f"DXF object does not belong to the source document: {str(entity)}"
++                )
++            if entity is self.sdoc.rootdict:
++                raise EntityError("loading the source root dictionary is not supported")
++            self._validate_named_object(entity)
++            entities.append(entity)
++        self.add_command(LoadResources(entities))
++
++    def _validate_named_object(self, entity: DXFEntity) -> None:
++        """Validate a dictionary-only ownership path to the source root."""
++        child = entity
++        visited: set[str] = set()
++        while True:
++            owner = self.sdoc.entitydb.get(child.dxf.get("owner"))
++            if not isinstance(owner, Dictionary):
++                raise EntityError(
++                    f"DXF object has no named-dictionary path: {str(entity)}"
++                )
++            if not owner.find_key(child):
++                raise EntityError(
++                    f"DXF object is not linked by its owner: {str(entity)}"
++                )
++            if owner is self.sdoc.rootdict:
++                return
++            handle = owner.dxf.handle
++            if handle in visited:
++                raise EntityError(
++                    f"cyclic dictionary owner path for DXF object: {str(entity)}"
++                )
++            visited.add(handle)
++            child = owner
++
+     def execute(self, xref_prefix: str = "") -> None:
+         """Execute all loading commands. The `xref_prefix` string is used as XREF name
+         when the conflict policy :attr:`ConflictPolicy.XREF_PREFIX` is applied.
+@@ -1028,18 +1085,42 @@ class _Registry:
+         self.source_blocks: dict[str, dict[str, DXFEntity]] = {NO_BLOCK: {}}
+         self.appids: set[str] = set()
+         self.debug_messages: list[str] = []
++        self.hard_dependencies: dict[str, set[str]] = {}
++        self._registering_entity: Optional[str] = None
++        self._inline_hard_owned_handles: set[str] = set()
+ 
+     def debug(self, msg: str) -> None:
+         self.debug_messages.append(msg)
+ 
+     def add_entity(self, entity: DXFEntity, block_key: str = NO_BLOCK) -> None:
+         assert entity is not None, "internal error: entity is None"
+-        block = self.source_blocks.setdefault(block_key, {})
+         entity_handle = entity.dxf.handle
++        if isinstance(entity, Dictionary) and entity.is_hard_owner:
++            self._mark_inline_hard_owned_entries(entity)
++        if entity_handle in self._inline_hard_owned_handles:
++            return
++        block = self.source_blocks.setdefault(block_key, {})
+         if entity_handle in block:
+             return
+         block[entity_handle] = entity
+-        entity.register_resources(self)
++        previous = self._registering_entity
++        self._registering_entity = entity_handle
++        try:
++            entity.register_resources(self)
++        finally:
++            self._registering_entity = previous
++
++    def _mark_inline_hard_owned_entries(self, dictionary: Dictionary) -> None:
++        """Exclude entries already copied as content of a hard-owned dictionary."""
++        for _, entry in dictionary.items():
++            if not isinstance(entry, DXFEntity):
++                continue
++            handle = entry.dxf.handle
++            self._inline_hard_owned_handles.add(handle)
++            for block in self.source_blocks.values():
++                block.pop(handle, None)
++            if isinstance(entry, Dictionary) and entry.is_hard_owner:
++                self._mark_inline_hard_owned_entries(entry)
+ 
+     def add_block(self, block_record: BlockRecord) -> None:
+         # add resource entity BLOCK_RECORD to NO_BLOCK
+@@ -1060,6 +1141,10 @@ class _Registry:
+         """
+         if handle is None or handle == "0":
+             return
++        if self._registering_entity is not None:
++            self.hard_dependencies.setdefault(
++                self._registering_entity, set()
++            ).add(handle)
+         entity = self.source_doc.entitydb.get(handle)
+         if entity is None:
+             self.debug(f"source entity #{handle} does not exist")
+@@ -1138,6 +1223,7 @@ class _Transfer:
+         self.block_name_mapping: dict[str, str] = {}
+         self.handle_mapping: dict[str, str] = handle_mapping
+         self._replace_handles: dict[str, str] = {}
++        self._discarded_object_sources: set[str] = set()
+         self.debug_messages: list[str] = []
+ 
+     def debug(self, msg: str) -> None:
+@@ -1277,7 +1363,8 @@ class _Transfer:
+         # Ezdxf does rename conflicting entries according to self.conflict_policy,
+         # exceptions are only the system entries.
+         tdoc = self.registry.target_doc
+-        for _, entity in self.copied_objects.items():
++        source_db = self.registry.source_doc.entitydb
++        for source_handle, entity in self.copied_objects.items():
+             if isinstance(entity, Material):
+                 self.add_collection_entry(
+                     tdoc.materials,
+@@ -1304,10 +1391,290 @@ class _Transfer:
+                 self.add_visualstyle_entry(entity)
+             elif isinstance(entity, DXFLayout):
+                 self.create_empty_paperspace_layout(entity)
+-            # TODO:
+-            #  add GROUP to ACAD_GROUP dictionary
+-            #  add SCALE to ACAD_SCALELIST dictionary
+-            #  add TABLESTYLE to ACAD_TABLESTYLE dictionary
++            else:
++                source = source_db.get(source_handle)
++                if source is None:
++                    raise InternalError("database error, source object not found")
++                self.register_named_object(source, entity)
++        self.discard_unretained_owned_object_copies()
++
++    def register_named_object(self, source: DXFEntity, clone: DXFEntity) -> None:
++        """Register an ordinary copied object in its named-dictionary path.
++
++        Objects owned by graphical entities or by non-dictionary management
++        structures are handled by their owning entity and are intentionally ignored
++        here.  The source root dictionary is mapped to the target root dictionary;
++        other dictionaries are reused, copied, or reconstructed as required.
++        """
++        source_doc = self.registry.source_doc
++        owner = source_doc.entitydb.get(source.dxf.get("owner"))
++        if not isinstance(owner, Dictionary):
++            return
++        key = owner.find_key(source)
++        if not key:
++            if (
++                isinstance(owner, DictionaryWithDefault)
++                and owner.dxf.default == source.dxf.handle
++            ):
++                return
++            self.debug(f"source owner {str(owner)} has no key for {str(source)}")
++            self.discard_object_copy(source, clone)
++            return
++        target_owner = self.get_target_dictionary(owner)
++        if target_owner is None:
++            self.debug(f"cannot reconstruct owner path of {str(source)}")
++            self.discard_object_copy(source, clone)
++            return
++        self.add_named_object_entry(target_owner, key, source, clone)
++
++    def get_target_dictionary(
++        self, source: Dictionary, visited: Optional[set[str]] = None
++    ) -> Optional[Dictionary]:
++        """Return the target counterpart of a source dictionary.
++
++        Existing management dictionaries are always reused.  Missing custom
++        dictionaries are reconstructed with their hard-owner and duplicate-record
++        settings.  A non-dictionary collision follows the configured conflict policy.
++        """
++        source_doc = self.registry.source_doc
++        target_doc = self.registry.target_doc
++        if source is source_doc.rootdict:
++            return target_doc.rootdict
++
++        source_handle = source.dxf.handle
++        mapped_handle = self.handle_mapping.get(source_handle)
++        if mapped_handle:
++            mapped = target_doc.entitydb.get(mapped_handle)
++            if isinstance(mapped, Dictionary) and mapped.is_alive:
++                return mapped
++
++        if visited is None:
++            visited = set()
++        if source_handle in visited:
++            self.debug(f"cyclic dictionary owner path at {str(source)}")
++            return None
++        visited.add(source_handle)
++
++        source_owner = source_doc.entitydb.get(source.dxf.get("owner"))
++        if not isinstance(source_owner, Dictionary):
++            return None
++        source_key = source_owner.find_key(source)
++        if not source_key:
++            return None
++        target_owner = self.get_target_dictionary(source_owner, visited)
++        if target_owner is None:
++            return None
++
++        target_key = source_key
++        existing = (
++            target_owner.get(target_key) if target_key in target_owner else None
++        )
++        if isinstance(existing, Dictionary):
++            self.handle_mapping[source_handle] = existing.dxf.handle
++            return existing
++        if existing is not None:
++            if self.conflict_policy == ConflictPolicy.KEEP:
++                self.debug(
++                    f"cannot replace non-dictionary entry '{target_key}' in "
++                    f"{str(target_owner)}"
++                )
++                return None
++            prefix = (
++                self.xref_prefix
++                if self.conflict_policy == ConflictPolicy.XREF_PREFIX
++                else ""
++            )
++            target_key = get_unique_dict_key(target_key, prefix, target_owner)
++
++        target = target_owner.add_new_dict(
++            target_key, hard_owned=source.is_hard_owner
++        )
++        target.dxf.cloning = source.dxf.cloning
++        self.handle_mapping[source_handle] = target.dxf.handle
++        return target
++
++    def add_named_object_entry(
++        self,
++        target_owner: Dictionary,
++        source_key: str,
++        source: DXFEntity,
++        clone: DXFEntity,
++    ) -> None:
++        """Attach a copied object to `target_owner` and apply conflict mapping."""
++        target_key = source_key
++        existing = (
++            target_owner.get(target_key) if target_key in target_owner else None
++        )
++        if (
++            isinstance(source, Dictionary)
++            and isinstance(clone, Dictionary)
++            and isinstance(existing, Dictionary)
++        ):
++            self.reuse_dictionary_copy(source, clone, existing)
++            return
++        if self.conflict_policy == ConflictPolicy.KEEP:
++            if isinstance(existing, DXFEntity):
++                self.discard_object_copy(source, clone, existing.dxf.handle)
++                return
++        elif (
++            self.conflict_policy == ConflictPolicy.XREF_PREFIX
++            and existing is not None
++        ):
++            target_key = get_unique_dict_key(
++                target_key, self.xref_prefix, target_owner
++            )
++        elif (
++            self.conflict_policy == ConflictPolicy.NUM_PREFIX
++            and existing is not None
++        ):
++            target_key = get_unique_dict_key(target_key, "", target_owner)
++
++        target_owner.add(target_key, clone)  # type: ignore[arg-type]
++        clone.dxf.owner = target_owner.dxf.handle
++
++    def reuse_dictionary_copy(
++        self, source: Dictionary, clone: Dictionary, target: Dictionary
++    ) -> None:
++        """Merge copied dictionary content into a matching target dictionary."""
++        clone_handle = clone.dxf.handle
++        if clone_handle:
++            self.replace_handle_mapping(clone_handle, target.dxf.handle)
++
++        for source_key in list(source.keys()):
++            source_entry = source.get(source_key)
++            copied_entry = clone.get(source_key)
++            if not isinstance(source_entry, DXFEntity) or not isinstance(
++                copied_entry, DXFEntity
++            ):
++                continue
++            clone.discard(source_key)
++            existing = target.get(source_key) if source_key in target else None
++            if (
++                isinstance(source_entry, Dictionary)
++                and isinstance(copied_entry, Dictionary)
++                and isinstance(existing, Dictionary)
++            ):
++                self.reuse_dictionary_copy(source_entry, copied_entry, existing)
++                continue
++
++            target_key = source_key
++            if existing is not None:
++                if self.conflict_policy == ConflictPolicy.KEEP:
++                    replacement = (
++                        existing.dxf.handle
++                        if isinstance(existing, DXFEntity)
++                        else "0"
++                    )
++                    self.discard_object_copy(
++                        source_entry, copied_entry, replacement
++                    )
++                    continue
++                prefix = (
++                    self.xref_prefix
++                    if self.conflict_policy == ConflictPolicy.XREF_PREFIX
++                    else ""
++                )
++                target_key = get_unique_dict_key(target_key, prefix, target)
++
++            target.add(target_key, copied_entry)  # type: ignore[arg-type]
++            copied_entry.dxf.owner = target.dxf.handle
++
++        clone.destroy()
++        self._discarded_object_sources.add(source.dxf.handle)
++
++    def discard_object_copy(
++        self, source: DXFEntity, clone: DXFEntity, replacement: str = "0"
++    ) -> None:
++        """Discard a copied object and dependent hard-owned object copies."""
++        clone_handle = clone.dxf.handle
++        if clone_handle:
++            self.replace_handle_mapping(clone_handle, replacement)
++        clone.destroy()
++        self._discarded_object_sources.add(source.dxf.handle)
++
++    def discard_unretained_owned_object_copies(self) -> None:
++        """Discard owned copies that have no surviving hard-reference path."""
++        discarded = self._discarded_object_sources
++        if not discarded:
++            return
++        source_db = self.registry.source_doc.entitydb
++        owned_children: dict[str, set[str]] = {}
++        for child_handle, child_clone in self.copied_objects.items():
++            if child_clone is None or not child_clone.is_alive:
++                continue
++            child_source = source_db.get(child_handle)
++            if child_source is None:
++                continue
++            owner_handle = child_source.dxf.get("owner")
++            if owner_handle:
++                owned_children.setdefault(owner_handle, set()).add(child_handle)
++
++        def direct_owned_children(owner_handle: str) -> set[str]:
++            owner = source_db.get(owner_handle)
++            children = owned_children.get(owner_handle, set())
++            if isinstance(owner, Dictionary) and not owner.is_hard_owner:
++                if isinstance(owner, DictionaryWithDefault):
++                    default_handle = owner.dxf.get("default")
++                    return {default_handle} if default_handle in children else set()
++                return set()
++            return set(children)
++
++        candidates: set[str] = set()
++        pending = list(discarded)
++        while pending:
++            owner_handle = pending.pop()
++            for child_handle in direct_owned_children(owner_handle):
++                if child_handle not in candidates:
++                    candidates.add(child_handle)
++                    pending.append(child_handle)
++
++        if not candidates:
++            return
++
++        retained: set[str] = set()
++        queue = [
++            source_handle
++            for source_handle, clone in self.copied_objects.items()
++            if clone is not None
++            and clone.is_alive
++            and source_handle not in discarded
++            and source_handle not in candidates
++        ]
++        visited: set[str] = set()
++        while queue:
++            source_handle = queue.pop()
++            if source_handle in visited:
++                continue
++            visited.add(source_handle)
++            for target_handle in self.registry.hard_dependencies.get(
++                source_handle, set()
++            ):
++                if target_handle in candidates and target_handle not in retained:
++                    retained.add(target_handle)
++                    queue.append(target_handle)
++            if source_handle in retained:
++                for child_handle in direct_owned_children(source_handle):
++                    if child_handle in candidates and child_handle not in retained:
++                        retained.add(child_handle)
++                        queue.append(child_handle)
++
++        target_root_handle = self.registry.target_doc.rootdict.dxf.handle
++        for source_handle in candidates:
++            clone = self.copied_objects.get(source_handle)
++            if clone is None or not clone.is_alive:
++                continue
++            source = source_db.get(source_handle)
++            if source_handle in retained:
++                if (
++                    source is not None
++                    and source.dxf.get("owner") not in retained
++                ):
++                    clone.dxf.owner = target_root_handle
++                continue
++            clone_handle = clone.dxf.handle
++            if clone_handle:
++                self.replace_handle_mapping(clone_handle, "0")
++            clone.destroy()
+ 
+     def replace_handle_mapping(self, old_target, new_target) -> None:
+         self._replace_handles[old_target] = new_target
+@@ -1548,7 +1915,7 @@ class _Transfer:
+         """Add copied DXF objects to the OBJECTS section of the target document."""
+         objects = self.registry.target_doc.objects
+         for _, obj in copies.items():
+-            if obj and obj.is_alive:
++            if obj is not None and obj.is_alive:
+                 objects.add_object(obj)  # type: ignore
+ 
+     def copy_settings(self):
+@@ -1641,6 +2008,11 @@ class CopyMachine:
+             clone = self.copy_entity(entity)
+             if clone is None:
+                 continue
++            if isinstance(entity, Dictionary) and not entity.is_hard_owner:
++                # Soft-owned entries are independent resources.  Keeping source
++                # objects in the clone creates cross-document references and false
++                # target-side conflicts before resource mapping.
++                clone._data = {}  # type: ignore
+             factory.bind(clone, tdoc)
+             handle_mapping[handle] = clone.dxf.handle
+             # Get handle mapping for in-object copies: DICTIONARY

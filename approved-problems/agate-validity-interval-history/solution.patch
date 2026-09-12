@@ -1,0 +1,1299 @@
+diff --git a/agate/aggregations/__init__.py b/agate/aggregations/__init__.py
+index 6d2cc2f..0f66365 100644
+--- a/agate/aggregations/__init__.py
++++ b/agate/aggregations/__init__.py
+@@ -17,6 +17,7 @@ from agate.aggregations.all import All
+ from agate.aggregations.any import Any
+ from agate.aggregations.base import Aggregation
+ from agate.aggregations.count import Count
++from agate.aggregations.coverage import Coverage
+ from agate.aggregations.deciles import Deciles
+ from agate.aggregations.first import First
+ from agate.aggregations.has_nulls import HasNulls
+diff --git a/agate/aggregations/coverage.py b/agate/aggregations/coverage.py
+new file mode 100644
+index 0000000..983efdf
+--- /dev/null
++++ b/agate/aggregations/coverage.py
+@@ -0,0 +1,59 @@
++import datetime
++
++from agate.aggregations.base import Aggregation
++from agate.data_types import TimeDelta
++from agate.history import interval_data_type, validate_intervals
++
++
++class Coverage(Aggregation):
++    """
++    Calculate how much time the intervals of a history table cover in total.
++
++    Intervals that overlap or meet end to end are treated as the single stretch
++    of time they span, so no instant is ever counted twice. The result is null
++    when any interval is open ended.
++
++    :param start_column_name:
++        The name of the column holding interval starts.
++    :param end_column_name:
++        The name of the column holding interval ends.
++    """
++    def __init__(self, start_column_name='valid_from', end_column_name='valid_to'):
++        self._start_column_name = start_column_name
++        self._end_column_name = end_column_name
++
++    def get_aggregate_data_type(self, table):
++        return TimeDelta()
++
++    def validate(self, table):
++        interval_data_type(table, self._start_column_name, self._end_column_name)
++        validate_intervals(table, self._start_column_name, self._end_column_name)
++
++    def run(self, table):
++        intervals = []
++
++        for row in table.rows:
++            start = row[self._start_column_name]
++            end = row[self._end_column_name]
++
++            if end is None:
++                return None
++
++            intervals.append((start, end))
++
++        covered = datetime.timedelta()
++        span = None
++
++        for start, end in sorted(intervals):
++            if span is None:
++                span = [start, end]
++            elif start > span[1]:
++                covered += span[1] - span[0]
++                span = [start, end]
++            elif end > span[1]:
++                span[1] = end
++
++        if span is not None:
++            covered += span[1] - span[0]
++
++        return covered
+diff --git a/agate/history.py b/agate/history.py
+new file mode 100644
+index 0000000..cccd050
+--- /dev/null
++++ b/agate/history.py
+@@ -0,0 +1,250 @@
++"""
++This module contains the machinery shared by the history methods of
++:class:`.Table`. A history table records the values that belong to a key over a
++sequence of half-open intervals: an interval covers every instant from its
++start up to, but not including, its end. An interval with a null end has not
++finished yet and covers every instant from its start onwards.
++"""
++
++from collections import OrderedDict
++
++from agate import utils
++from agate.data_types import Date, DateTime
++from agate.exceptions import DataTypeError
++from agate.rows import Row
++
++
++def key_column_names(table, key):
++    """
++    Resolve a key argument into a list of column names.
++
++    :param table:
++        The :class:`.Table` the key refers to.
++    :param key:
++        Either the name or index of a column, or a sequence of such column
++        identifiers.
++    :returns:
++        A :class:`list` of column names.
++    """
++    if utils.issequence(key):
++        identifiers = list(key)
++    else:
++        identifiers = [key]
++
++    return [table._columns[identifier].name for identifier in identifiers]
++
++
++def matching_key_column_names(table, key, key_names):
++    """
++    Resolve a key against a second table the way it was resolved against the
++    first, and raise when the two do not arrive at the same column names.
++
++    :param table:
++        The other :class:`.Table` the key must also select.
++    :param key:
++        The key argument as it was given.
++    :param key_names:
++        The column names the key selected in the first table.
++    """
++    try:
++        names = key_column_names(table, key)
++    except KeyError:
++        names = None
++
++    if names != list(key_names):
++        raise ValueError('Both tables must name their key columns the same way.')
++
++
++def interval_data_type(table, start_column_name, end_column_name):
++    """
++    Return the data type shared by a pair of interval columns.
++
++    :param table:
++        The :class:`.Table` the interval columns belong to.
++    :param start_column_name:
++        The name of the column holding interval starts.
++    :param end_column_name:
++        The name of the column holding interval ends.
++    :returns:
++        An instance of :class:`.Date` or :class:`.DateTime`.
++    """
++    start_type = table._columns[start_column_name].data_type
++    end_type = table._columns[end_column_name].data_type
++
++    if not isinstance(start_type, (Date, DateTime)):
++        raise DataTypeError('History intervals must be bounded by Date or DateTime columns.')
++
++    if type(start_type) is not type(end_type):
++        raise DataTypeError('The "%s" and "%s" columns must share a data type.' % (start_column_name, end_column_name))
++
++    return start_type
++
++
++def payload_column_names(table, key_names, start_column_name, end_column_name):
++    """
++    Return the names of the columns that carry the values of a history table.
++
++    :param table:
++        The :class:`.Table` to read column names from.
++    :param key_names:
++        A sequence of key column names.
++    :param start_column_name:
++        The name of the column holding interval starts.
++    :param end_column_name:
++        The name of the column holding interval ends.
++    :returns:
++        A :class:`list` of column names.
++    """
++    excluded = list(key_names) + [start_column_name, end_column_name]
++
++    return [name for name in table._column_names if name not in excluded]
++
++
++def payload_values(row, names):
++    """
++    Return the values a row carries in the given columns.
++    """
++    return tuple(row[name] for name in names)
++
++
++def validate_new_column_names(existing_names, new_names):
++    """
++    Raise if a column that is about to be created already exists.
++    """
++    seen = list(existing_names)
++
++    for name in new_names:
++        if name in seen:
++            raise ValueError('The "%s" column already exists in this table.' % name)
++
++        seen.append(name)
++
++
++def validate_intervals(table, start_column_name, end_column_name):
++    """
++    Raise if any interval in a history table is unbounded at its start or ends
++    at or before it begins.
++    """
++    for row in table._rows:
++        start = row[start_column_name]
++        end = row[end_column_name]
++
++        if start is None:
++            raise ValueError('The "%s" column of a history table may not contain nulls.' % start_column_name)
++
++        if end is not None and end <= start:
++            raise ValueError('A history interval must end after it begins.')
++
++
++def validate_no_overlaps(rows, start_column_name, end_column_name):
++    """
++    Raise if any two of the given intervals cover a common instant.
++
++    :param rows:
++        A sequence of rows sharing a key, ordered by interval start.
++    """
++    for previous, row in zip(rows, rows[1:]):
++        if ends_after(previous[end_column_name], row[start_column_name]):
++            raise ValueError('The history intervals of a key may not overlap.')
++
++
++def group_rows(table, key_names):
++    """
++    Collect the rows of a table into groups sharing a key, in the order the
++    keys first appear.
++
++    :returns:
++        An :class:`.OrderedDict` mapping key tuples to lists of rows.
++    """
++    groups = OrderedDict()
++
++    for row in table._rows:
++        group = payload_values(row, key_names)
++
++        if group not in groups:
++            groups[group] = []
++
++        groups[group].append(row)
++
++    return groups
++
++
++def sorted_by_start(rows, start_column_name):
++    """
++    Order a sequence of rows by interval start.
++    """
++    return sorted(rows, key=lambda row: row[start_column_name])
++
++
++def ends_after(end, instant):
++    """
++    Return :code:`True` when an interval that stops at :code:`end` still covers
++    :code:`instant`. A null end never stops.
++    """
++    return end is None or end > instant
++
++
++def earlier_end(first, second):
++    """
++    Return whichever of two interval ends comes first, treating a null end as
++    coming after every other one.
++    """
++    if first is None:
++        return second
++
++    if second is None:
++        return first
++
++    return min(first, second)
++
++
++def overlap(first_start, first_end, second_start, second_end):
++    """
++    Return :code:`True` when two intervals cover a common instant.
++    """
++    return ends_after(first_end, second_start) and ends_after(second_end, first_start)
++
++
++def subtract(segment, start, end):
++    """
++    Remove the span an interval covers from a segment and return what is left
++    of it. A segment the interval covers entirely disappears, and one the
++    interval divides comes back in two pieces.
++
++    :param segment:
++        A :class:`list` of a row, an interval start and an interval end.
++    :returns:
++        A :class:`list` of segments.
++    """
++    row, segment_start, segment_end = segment
++
++    if not overlap(segment_start, segment_end, start, end):
++        return [segment]
++
++    pieces = []
++
++    if segment_start < start:
++        pieces.append([row, segment_start, start])
++
++    if end is not None and ends_after(segment_end, end):
++        pieces.append([row, end, segment_end])
++
++    return pieces
++
++
++def replace_interval(table, row, start_column_name, end_column_name, start, end):
++    """
++    Copy a row, giving it a new interval and leaving every other column where
++    it was.
++    """
++    values = []
++
++    for name in table._column_names:
++        if name == start_column_name:
++            values.append(start)
++        elif name == end_column_name:
++            values.append(end)
++        else:
++            values.append(row[name])
++
++    return Row(values, table._column_names)
+diff --git a/agate/table/__init__.py b/agate/table/__init__.py
+index 542e861..b298644 100644
+--- a/agate/table/__init__.py
++++ b/agate/table/__init__.py
+@@ -302,19 +302,28 @@ class Table:
+ from agate.table.aggregate import aggregate
+ from agate.table.bar_chart import bar_chart
+ from agate.table.bins import bins
++from agate.table.clip_history import clip_history
++from agate.table.coalesce_history import coalesce_history
+ from agate.table.column_chart import column_chart
+ from agate.table.compute import compute
+ from agate.table.denormalize import denormalize
+ from agate.table.distinct import distinct
+ from agate.table.exclude import exclude
+ from agate.table.find import find
++from agate.table.flatten_history import flatten_history
+ from agate.table.from_csv import from_csv
+ from agate.table.from_fixed import from_fixed
+ from agate.table.from_json import from_json
+ from agate.table.from_object import from_object
+ from agate.table.group_by import group_by
++from agate.table.history_at import history_at
++from agate.table.history_events import history_events
++from agate.table.history_gaps import history_gaps
++from agate.table.history_overlaps import history_overlaps
++from agate.table.history_spans import history_spans
+ from agate.table.homogenize import homogenize
+ from agate.table.join import join
++from agate.table.join_history import join_history
+ from agate.table.limit import limit
+ from agate.table.line_chart import line_chart
+ from agate.table.merge import merge
+@@ -328,26 +337,37 @@ from agate.table.print_table import print_table
+ from agate.table.rename import rename
+ from agate.table.scatterplot import scatterplot
+ from agate.table.select import select
++from agate.table.split_history import split_history
+ from agate.table.to_csv import to_csv
++from agate.table.to_history import to_history
+ from agate.table.to_json import to_json
+ from agate.table.where import where
+ 
+ Table.aggregate = aggregate
+ Table.bar_chart = bar_chart
+ Table.bins = bins
++Table.clip_history = clip_history
++Table.coalesce_history = coalesce_history
+ Table.column_chart = column_chart
+ Table.compute = compute
+ Table.denormalize = denormalize
+ Table.distinct = distinct
+ Table.exclude = exclude
+ Table.find = find
++Table.flatten_history = flatten_history
+ Table.from_csv = from_csv
+ Table.from_fixed = from_fixed
+ Table.from_json = from_json
+ Table.from_object = from_object
+ Table.group_by = group_by
++Table.history_at = history_at
++Table.history_events = history_events
++Table.history_gaps = history_gaps
++Table.history_overlaps = history_overlaps
++Table.history_spans = history_spans
+ Table.homogenize = homogenize
+ Table.join = join
++Table.join_history = join_history
+ Table.limit = limit
+ Table.line_chart = line_chart
+ Table.merge = merge
+@@ -361,6 +381,8 @@ Table.print_table = print_table
+ Table.rename = rename
+ Table.scatterplot = scatterplot
+ Table.select = select
++Table.split_history = split_history
+ Table.to_csv = to_csv
++Table.to_history = to_history
+ Table.to_json = to_json
+ Table.where = where
+diff --git a/agate/table/clip_history.py b/agate/table/clip_history.py
+new file mode 100644
+index 0000000..9319c21
+--- /dev/null
++++ b/agate/table/clip_history.py
+@@ -0,0 +1,56 @@
++from agate import history
++
++
++def clip_history(self, key, start, end=None, start_column_name='valid_from', end_column_name='valid_to'):
++    """
++    Create a new table holding only the part of each interval that falls inside
++    a window of time.
++
++    An interval that reaches past either edge of the window is cut back to it,
++    and one that shares no instant with the window is dropped. The window is
++    half open, like the intervals themselves.
++
++    :param key:
++        Either the name or index of a column that identifies what an interval
++        describes, or a sequence of such column identifiers.
++    :param start:
++        The instant the window begins at. It is cast with the data type of the
++        interval columns, so a string may be used.
++    :param end:
++        The instant the window ends at, or :code:`None` for a window that never
++        ends.
++    :param start_column_name:
++        The name of the column holding interval starts.
++    :param end_column_name:
++        The name of the column holding interval ends.
++    :returns:
++        A new :class:`.Table`.
++    """
++    key_names = history.key_column_names(self, key)
++    data_type = history.interval_data_type(self, start_column_name, end_column_name)
++
++    history.validate_intervals(self, start_column_name, end_column_name)
++
++    window_start = data_type.cast(start)
++    window_end = data_type.cast(end)
++
++    if window_start is None:
++        raise ValueError('A window must have a start.')
++
++    if window_end is not None and window_end <= window_start:
++        raise ValueError('A window must end after it begins.')
++
++    rows = []
++
++    for group, group_rows in history.group_rows(self, key_names).items():
++        for row in history.sorted_by_start(group_rows, start_column_name):
++            if not history.overlap(row[start_column_name], row[end_column_name], window_start, window_end):
++                continue
++
++            clipped_start = max(row[start_column_name], window_start)
++            clipped_end = history.earlier_end(row[end_column_name], window_end)
++
++            rows.append(history.replace_interval(self, row, start_column_name, end_column_name,
++                                                 clipped_start, clipped_end))
++
++    return self._fork(rows, row_names=[])
+diff --git a/agate/table/coalesce_history.py b/agate/table/coalesce_history.py
+new file mode 100644
+index 0000000..50c3177
+--- /dev/null
++++ b/agate/table/coalesce_history.py
+@@ -0,0 +1,52 @@
++from agate import history
++
++
++def coalesce_history(self, key, start_column_name='valid_from', end_column_name='valid_to'):
++    """
++    Create a new table in which the intervals of a key that meet end to end and
++    carry the same values are replaced by the single interval they span.
++
++    Two intervals meet when the end of one is the start of the next. Intervals
++    separated by a gap are never merged, however alike their values are.
++
++    :param key:
++        Either the name or index of a column that identifies what an interval
++        describes, or a sequence of such column identifiers.
++    :param start_column_name:
++        The name of the column holding interval starts.
++    :param end_column_name:
++        The name of the column holding interval ends.
++    :returns:
++        A new :class:`.Table`.
++    """
++    key_names = history.key_column_names(self, key)
++
++    history.interval_data_type(self, start_column_name, end_column_name)
++    history.validate_intervals(self, start_column_name, end_column_name)
++
++    payload_names = history.payload_column_names(self, key_names, start_column_name, end_column_name)
++
++    rows = []
++
++    for group, group_rows in history.group_rows(self, key_names).items():
++        ordered = history.sorted_by_start(group_rows, start_column_name)
++
++        history.validate_no_overlaps(ordered, start_column_name, end_column_name)
++
++        segments = []
++
++        for row in ordered:
++            values = history.payload_values(row, payload_names)
++            start = row[start_column_name]
++            end = row[end_column_name]
++
++            if segments and segments[-1][2] is not None and segments[-1][2] == start and segments[-1][3] == values:
++                segments[-1][2] = end
++                continue
++
++            segments.append([row, start, end, values])
++
++        for row, start, end, values in segments:
++            rows.append(history.replace_interval(self, row, start_column_name, end_column_name, start, end))
++
++    return self._fork(rows, row_names=[])
+diff --git a/agate/table/flatten_history.py b/agate/table/flatten_history.py
+new file mode 100644
+index 0000000..dfb32c8
+--- /dev/null
++++ b/agate/table/flatten_history.py
+@@ -0,0 +1,47 @@
++from agate import history
++
++
++def flatten_history(self, key, start_column_name='valid_from', end_column_name='valid_to'):
++    """
++    Create a new table in which the intervals of a key no longer overlap.
++
++    The rows of a key are applied in the order they appear in this table, and
++    each one takes the instants it covers away from the rows applied before it.
++    An interval that loses a span out of its middle survives as the two pieces
++    left on either side.
++
++    :param key:
++        Either the name or index of a column that identifies what an interval
++        describes, or a sequence of such column identifiers.
++    :param start_column_name:
++        The name of the column holding interval starts.
++    :param end_column_name:
++        The name of the column holding interval ends.
++    :returns:
++        A new :class:`.Table`.
++    """
++    key_names = history.key_column_names(self, key)
++
++    history.interval_data_type(self, start_column_name, end_column_name)
++    history.validate_intervals(self, start_column_name, end_column_name)
++
++    rows = []
++
++    for group, group_rows in history.group_rows(self, key_names).items():
++        segments = []
++
++        for row in group_rows:
++            start = row[start_column_name]
++            end = row[end_column_name]
++            remaining = []
++
++            for segment in segments:
++                remaining.extend(history.subtract(segment, start, end))
++
++            remaining.append([row, start, end])
++            segments = remaining
++
++        for row, start, end in sorted(segments, key=lambda segment: segment[1]):
++            rows.append(history.replace_interval(self, row, start_column_name, end_column_name, start, end))
++
++    return self._fork(rows, row_names=[])
+diff --git a/agate/table/history_at.py b/agate/table/history_at.py
+new file mode 100644
+index 0000000..efe8848
+--- /dev/null
++++ b/agate/table/history_at.py
+@@ -0,0 +1,38 @@
++from agate import history
++from agate.rows import Row
++
++
++def history_at(self, instant, start_column_name='valid_from', end_column_name='valid_to'):
++    """
++    Create a new table holding the rows of a history table whose interval
++    covers a given instant, without the two interval columns.
++
++    :param instant:
++        The instant to look at. It is cast with the data type of the interval
++        columns, so a string may be used.
++    :param start_column_name:
++        The name of the column holding interval starts.
++    :param end_column_name:
++        The name of the column holding interval ends.
++    :returns:
++        A new :class:`.Table`.
++    """
++    data_type = history.interval_data_type(self, start_column_name, end_column_name)
++
++    history.validate_intervals(self, start_column_name, end_column_name)
++
++    instant = data_type.cast(instant)
++
++    if instant is None:
++        raise ValueError('An instant may not be null.')
++
++    column_names = [name for name in self._column_names if name not in (start_column_name, end_column_name)]
++    column_types = [self._columns[name].data_type for name in column_names]
++
++    rows = []
++
++    for row in self._rows:
++        if row[start_column_name] <= instant and history.ends_after(row[end_column_name], instant):
++            rows.append(Row([row[name] for name in column_names], column_names))
++
++    return self._fork(rows, column_names, column_types, row_names=[])
+diff --git a/agate/table/history_events.py b/agate/table/history_events.py
+new file mode 100644
+index 0000000..3b4465a
+--- /dev/null
++++ b/agate/table/history_events.py
+@@ -0,0 +1,59 @@
++from agate import history
++from agate.rows import Row
++
++
++def history_events(self, key, effective_column_name='effective', start_column_name='valid_from',
++                   end_column_name='valid_to'):
++    """
++    Create a new table that describes a history table as the moments at which
++    something about a key changed.
++
++    Every interval contributes the moment it began, carrying its values. An
++    interval that ends without another one taking over at that instant also
++    contributes the moment it ended, carrying nulls, because from then on the
++    key has no values at all. The two interval columns are replaced by a single
++    column holding the moment.
++
++    :param key:
++        Either the name or index of a column that identifies what an interval
++        describes, or a sequence of such column identifiers.
++    :param effective_column_name:
++        The name to give the column holding the moment of a change.
++    :param start_column_name:
++        The name of the column holding interval starts.
++    :param end_column_name:
++        The name of the column holding interval ends.
++    :returns:
++        A new :class:`.Table`.
++    """
++    key_names = history.key_column_names(self, key)
++    data_type = history.interval_data_type(self, start_column_name, end_column_name)
++
++    history.validate_intervals(self, start_column_name, end_column_name)
++
++    payload_names = history.payload_column_names(self, key_names, start_column_name, end_column_name)
++
++    history.validate_new_column_names(self._column_names, [effective_column_name])
++
++    column_names = key_names + [effective_column_name] + payload_names
++    column_types = [self._columns[name].data_type for name in key_names] + [data_type]
++    column_types += [self._columns[name].data_type for name in payload_names]
++
++    rows = []
++
++    for group, group_rows in history.group_rows(self, key_names).items():
++        ordered = history.sorted_by_start(group_rows, start_column_name)
++
++        history.validate_no_overlaps(ordered, start_column_name, end_column_name)
++
++        starts = [row[start_column_name] for row in ordered]
++
++        for row in ordered:
++            values = [row[name] for name in payload_names]
++
++            rows.append(Row(list(group) + [row[start_column_name]] + values, column_names))
++
++            if row[end_column_name] is not None and row[end_column_name] not in starts:
++                rows.append(Row(list(group) + [row[end_column_name]] + [None] * len(payload_names), column_names))
++
++    return self._fork(rows, column_names, column_types, row_names=[])
+diff --git a/agate/table/history_gaps.py b/agate/table/history_gaps.py
+new file mode 100644
+index 0000000..5db38e8
+--- /dev/null
++++ b/agate/table/history_gaps.py
+@@ -0,0 +1,45 @@
++from agate import history
++from agate.rows import Row
++
++
++def history_gaps(self, key, start_column_name='valid_from', end_column_name='valid_to'):
++    """
++    Create a new table holding the stretches of time a history table leaves
++    uncovered between the intervals of a key.
++
++    The new table has the key columns and the two interval columns, and nothing
++    else.
++
++    :param key:
++        Either the name or index of a column that identifies what an interval
++        describes, or a sequence of such column identifiers.
++    :param start_column_name:
++        The name of the column holding interval starts.
++    :param end_column_name:
++        The name of the column holding interval ends.
++    :returns:
++        A new :class:`.Table`.
++    """
++    key_names = history.key_column_names(self, key)
++    data_type = history.interval_data_type(self, start_column_name, end_column_name)
++
++    history.validate_intervals(self, start_column_name, end_column_name)
++
++    column_names = key_names + [start_column_name, end_column_name]
++    column_types = [self._columns[name].data_type for name in key_names] + [data_type, data_type]
++
++    rows = []
++
++    for group, group_rows in history.group_rows(self, key_names).items():
++        ordered = history.sorted_by_start(group_rows, start_column_name)
++
++        history.validate_no_overlaps(ordered, start_column_name, end_column_name)
++
++        for previous, row in zip(ordered, ordered[1:]):
++            end = previous[end_column_name]
++            start = row[start_column_name]
++
++            if end < start:
++                rows.append(Row(list(group) + [end, start], column_names))
++
++    return self._fork(rows, column_names, column_types, row_names=[])
+diff --git a/agate/table/history_overlaps.py b/agate/table/history_overlaps.py
+new file mode 100644
+index 0000000..2ea87ad
+--- /dev/null
++++ b/agate/table/history_overlaps.py
+@@ -0,0 +1,50 @@
++from agate import history
++from agate.rows import Row
++
++
++def history_overlaps(self, key, start_column_name='valid_from', end_column_name='valid_to'):
++    """
++    Create a new table holding the stretches of time that more than one
++    interval of a key claims.
++
++    Each pair of intervals of a key that cover a common instant contributes one
++    row, holding the span the two of them share. The new table has the key
++    columns and the two interval columns, and nothing else.
++
++    :param key:
++        Either the name or index of a column that identifies what an interval
++        describes, or a sequence of such column identifiers.
++    :param start_column_name:
++        The name of the column holding interval starts.
++    :param end_column_name:
++        The name of the column holding interval ends.
++    :returns:
++        A new :class:`.Table`.
++    """
++    key_names = history.key_column_names(self, key)
++    data_type = history.interval_data_type(self, start_column_name, end_column_name)
++
++    history.validate_intervals(self, start_column_name, end_column_name)
++
++    column_names = key_names + [start_column_name, end_column_name]
++    column_types = [self._columns[name].data_type for name in key_names] + [data_type, data_type]
++
++    rows = []
++
++    for group, group_rows in history.group_rows(self, key_names).items():
++        ordered = history.sorted_by_start(group_rows, start_column_name)
++
++        shared = []
++
++        for i, first in enumerate(ordered):
++            for second in ordered[i + 1:]:
++                start = max(first[start_column_name], second[start_column_name])
++                end = history.earlier_end(first[end_column_name], second[end_column_name])
++
++                if history.ends_after(end, start):
++                    shared.append((start, end))
++
++        for start, end in sorted(shared, key=lambda span: span[0]):
++            rows.append(Row(list(group) + [start, end], column_names))
++
++    return self._fork(rows, column_names, column_types, row_names=[])
+diff --git a/agate/table/history_spans.py b/agate/table/history_spans.py
+new file mode 100644
+index 0000000..9b8c282
+--- /dev/null
++++ b/agate/table/history_spans.py
+@@ -0,0 +1,60 @@
++import datetime
++
++from agate import history
++from agate.data_types import TimeDelta
++from agate.rows import Row
++
++
++def history_spans(self, key, start_column_name='valid_from', end_column_name='valid_to',
++                  duration_column_name='duration'):
++    """
++    Create a new table with one row per key, holding the reach of that key's
++    intervals and how much of it they actually cover.
++
++    The new table has the key columns, the two interval columns and a
++    :class:`.TimeDelta` column. The start is the earliest start of the key and
++    the end is its latest end. A key with an open ended interval has a null end
++    and a null duration, because neither of them is known yet.
++
++    :param key:
++        Either the name or index of a column that identifies what an interval
++        describes, or a sequence of such column identifiers.
++    :param start_column_name:
++        The name of the column holding interval starts.
++    :param end_column_name:
++        The name of the column holding interval ends.
++    :param duration_column_name:
++        The name to give the column holding covered time.
++    :returns:
++        A new :class:`.Table`.
++    """
++    key_names = history.key_column_names(self, key)
++    data_type = history.interval_data_type(self, start_column_name, end_column_name)
++
++    history.validate_intervals(self, start_column_name, end_column_name)
++    history.validate_new_column_names(self._column_names, [duration_column_name])
++
++    column_names = key_names + [start_column_name, end_column_name, duration_column_name]
++    column_types = [self._columns[name].data_type for name in key_names]
++    column_types += [data_type, data_type, TimeDelta()]
++
++    rows = []
++
++    for group, group_rows in history.group_rows(self, key_names).items():
++        ordered = history.sorted_by_start(group_rows, start_column_name)
++
++        history.validate_no_overlaps(ordered, start_column_name, end_column_name)
++
++        start = ordered[0][start_column_name]
++        ends = [row[end_column_name] for row in ordered]
++
++        if None in ends:
++            end = None
++            duration = None
++        else:
++            end = max(ends)
++            duration = sum((row[end_column_name] - row[start_column_name] for row in ordered), datetime.timedelta())
++
++        rows.append(Row(list(group) + [start, end, duration], column_names))
++
++    return self._fork(rows, column_names, column_types, row_names=[])
+diff --git a/agate/table/join_history.py b/agate/table/join_history.py
+new file mode 100644
+index 0000000..d2fe38c
+--- /dev/null
++++ b/agate/table/join_history.py
+@@ -0,0 +1,109 @@
++from agate import history
++from agate.exceptions import DataTypeError
++from agate.rows import Row
++
++
++def join_history(self, right_table, key, inner=True, start_column_name='valid_from', end_column_name='valid_to'):
++    """
++    Create a new table by pairing the rows of two history tables that share a
++    key over the instants their intervals have in common.
++
++    Every pair of rows that share a key and cover a common instant contributes
++    one row, whose interval is the span the two of them cover together. Rows
++    that merely touch, so that one begins where the other ends, share no
++    instant and contribute nothing.
++
++    If :code:`inner` is :code:`False`, whatever is left of a row of this table
++    once every span it shares with the right table is taken away also comes
++    through, with the right-hand columns set to :code:`None`. A row can be left
++    with more than one such piece.
++
++    Both tables must name their interval columns and their key columns the
++    same way. Column names taken from :code:`right_table` which also exist in
++    this table are suffixed "2" in the new table.
++
++    :param right_table:
++        The "right" table to join to.
++    :param key:
++        Either the name or index of a column that identifies what an interval
++        describes, or a sequence of such column identifiers.
++    :param inner:
++        Leave out the parts of this table's intervals that the right table does
++        not cover.
++    :param start_column_name:
++        The name of the column holding interval starts.
++    :param end_column_name:
++        The name of the column holding interval ends.
++    :returns:
++        A new :class:`.Table`.
++    """
++    key_names = history.key_column_names(self, key)
++
++    left_type = history.interval_data_type(self, start_column_name, end_column_name)
++
++    history.matching_key_column_names(right_table, key, key_names)
++
++    for name in [start_column_name, end_column_name]:
++        if name not in right_table._column_names:
++            raise ValueError('The "%s" column is missing from the right table.' % name)
++
++    right_type = history.interval_data_type(right_table, start_column_name, end_column_name)
++
++    if type(left_type) is not type(right_type):
++        raise DataTypeError('Both tables must bound their intervals with the same data type.')
++
++    history.validate_intervals(self, start_column_name, end_column_name)
++    history.validate_intervals(right_table, start_column_name, end_column_name)
++
++    left_payload = history.payload_column_names(self, key_names, start_column_name, end_column_name)
++    right_payload = history.payload_column_names(right_table, key_names, start_column_name, end_column_name)
++
++    column_names = key_names + [start_column_name, end_column_name] + left_payload
++    column_types = [self._columns[name].data_type for name in key_names]
++    column_types += [left_type, left_type]
++    column_types += [self._columns[name].data_type for name in left_payload]
++
++    for name in right_payload:
++        if name in column_names:
++            column_names.append('%s2' % name)
++        else:
++            column_names.append(name)
++
++        column_types.append(right_table._columns[name].data_type)
++
++    right_groups = history.group_rows(right_table, key_names)
++
++    rows = []
++
++    for left_row in self._rows:
++        group = history.payload_values(left_row, key_names)
++        remainder = [] if inner else [[left_row, left_row[start_column_name], left_row[end_column_name]]]
++
++        for right_row in right_groups.get(group, []):
++            start = max(left_row[start_column_name], right_row[start_column_name])
++            end = history.earlier_end(left_row[end_column_name], right_row[end_column_name])
++
++            if not history.ends_after(end, start):
++                continue
++
++            values = list(group) + [start, end]
++            values += [left_row[name] for name in left_payload]
++            values += [right_row[name] for name in right_payload]
++
++            rows.append(Row(values, column_names))
++
++            pieces = []
++
++            for segment in remainder:
++                pieces.extend(history.subtract(segment, start, end))
++
++            remainder = pieces
++
++        for segment in remainder:
++            values = list(group) + [segment[1], segment[2]]
++            values += [left_row[name] for name in left_payload]
++            values += [None] * len(right_payload)
++
++            rows.append(Row(values, column_names))
++
++    return self._fork(rows, column_names, column_types, row_names=[])
+diff --git a/agate/table/split_history.py b/agate/table/split_history.py
+new file mode 100644
+index 0000000..4b40af0
+--- /dev/null
++++ b/agate/table/split_history.py
+@@ -0,0 +1,49 @@
++from agate import history
++
++
++def split_history(self, key, boundaries, start_column_name='valid_from', end_column_name='valid_to'):
++    """
++    Create a new table in which every interval is cut at the given instants.
++
++    An instant that falls strictly inside an interval ends the piece before it
++    and begins the piece after it, and every piece keeps the values of the
++    interval it came from. An instant that falls on an interval boundary, or
++    outside it, changes nothing.
++
++    :param key:
++        Either the name or index of a column that identifies what an interval
++        describes, or a sequence of such column identifiers.
++    :param boundaries:
++        A sequence of instants to cut at. Each one is cast with the data type
++        of the interval columns, so strings may be used.
++    :param start_column_name:
++        The name of the column holding interval starts.
++    :param end_column_name:
++        The name of the column holding interval ends.
++    :returns:
++        A new :class:`.Table`.
++    """
++    key_names = history.key_column_names(self, key)
++    data_type = history.interval_data_type(self, start_column_name, end_column_name)
++
++    history.validate_intervals(self, start_column_name, end_column_name)
++
++    instants = sorted({data_type.cast(boundary) for boundary in boundaries} - {None})
++
++    rows = []
++
++    for group, group_rows in history.group_rows(self, key_names).items():
++        for row in history.sorted_by_start(group_rows, start_column_name):
++            start = row[start_column_name]
++            end = row[end_column_name]
++
++            for instant in instants:
++                if instant <= start or not history.ends_after(end, instant):
++                    continue
++
++                rows.append(history.replace_interval(self, row, start_column_name, end_column_name, start, instant))
++                start = instant
++
++            rows.append(history.replace_interval(self, row, start_column_name, end_column_name, start, end))
++
++    return self._fork(rows, row_names=[])
+diff --git a/agate/table/to_history.py b/agate/table/to_history.py
+new file mode 100644
+index 0000000..0a67f0f
+--- /dev/null
++++ b/agate/table/to_history.py
+@@ -0,0 +1,87 @@
++from agate import history
++from agate.data_types import Date, DateTime
++from agate.exceptions import DataTypeError
++from agate.rows import Row
++
++
++def to_history(self, key, effective, start_column_name='valid_from', end_column_name='valid_to'):
++    """
++    Create a new table that describes each key as a sequence of half-open
++    intervals, from a table of observations that each carry the instant they
++    took effect.
++
++    The observations of a key are read in order of their effective instant.
++    Each one holds until the next one replaces it, so the last observation of a
++    key is left open ended. Observations that repeat the values of the one
++    before them do not begin a new interval.
++
++    :param key:
++        Either the name or index of a column that identifies what an
++        observation describes, or a sequence of such column identifiers.
++    :param effective:
++        The name or index of the column holding the instant an observation took
++        effect. It must be a :class:`.Date` or :class:`.DateTime` column.
++    :param start_column_name:
++        The name to give the column holding interval starts.
++    :param end_column_name:
++        The name to give the column holding interval ends.
++    :returns:
++        A new :class:`.Table`.
++    """
++    key_names = history.key_column_names(self, key)
++    effective_name = self._columns[effective].name
++    effective_type = self._columns[effective_name].data_type
++
++    if not isinstance(effective_type, (Date, DateTime)):
++        raise DataTypeError('The "%s" column must be a Date or DateTime column.' % effective_name)
++
++    excluded = key_names + [effective_name]
++    payload_names = [name for name in self._column_names if name not in excluded]
++
++    history.validate_new_column_names(self._column_names, [start_column_name, end_column_name])
++
++    column_names = key_names + [start_column_name, end_column_name] + payload_names
++    column_types = [self._columns[name].data_type for name in key_names]
++    column_types += [effective_type, effective_type]
++    column_types += [self._columns[name].data_type for name in payload_names]
++
++    for row in self._rows:
++        if row[effective_name] is None:
++            raise ValueError('The "%s" column may not contain nulls.' % effective_name)
++
++    rows = []
++
++    for group, group_rows in history.group_rows(self, key_names).items():
++        observations = []
++
++        for row in sorted(group_rows, key=lambda row: row[effective_name]):
++            if observations and observations[-1][effective_name] == row[effective_name]:
++                observations[-1] = row
++            else:
++                observations.append(row)
++
++        segments = []
++
++        for row in observations:
++            values = history.payload_values(row, payload_names)
++            instant = row[effective_name]
++            open_segment = segments[-1] if segments and segments[-1][1] is None else None
++
++            if all(value is None for value in values):
++                if open_segment is not None:
++                    open_segment[1] = instant
++
++                continue
++
++            if open_segment is not None:
++                if open_segment[2] == values:
++                    continue
++
++                open_segment[1] = instant
++
++            segments.append([instant, None, values])
++
++        for start, end, values in segments:
++            rows.append(Row(list(group) + [start, end] + list(values), column_names))
++
++    return self._fork(rows, column_names, column_types, row_names=[])
+diff --git a/agate/tableset/__init__.py b/agate/tableset/__init__.py
+index 4876d00..2f11ee0 100644
+--- a/agate/tableset/__init__.py
++++ b/agate/tableset/__init__.py
+@@ -165,8 +165,11 @@ from agate.tableset.having import having
+ from agate.tableset.line_chart import line_chart
+ from agate.tableset.merge import merge
+ from agate.tableset.print_structure import print_structure
+-from agate.tableset.proxy_methods import (bins, compute, denormalize, distinct, exclude, find, group_by, homogenize,
+-                                          join, limit, normalize, order_by, pivot, select, where)
++from agate.tableset.proxy_methods import (bins, clip_history, coalesce_history, compute, denormalize, distinct,
++                                          exclude, find, flatten_history, group_by, history_at, history_events,
++                                          history_gaps, history_overlaps, history_spans, homogenize, join,
++                                          join_history, limit, normalize, order_by, pivot, select, split_history,
++                                          to_history, where)
+ from agate.tableset.scatterplot import scatterplot
+ from agate.tableset.to_csv import to_csv
+ from agate.tableset.to_json import to_json
+@@ -174,18 +177,27 @@ from agate.tableset.to_json import to_json
+ TableSet.aggregate = aggregate
+ TableSet.bar_chart = bar_chart
+ TableSet.bins = bins
++TableSet.clip_history = clip_history
++TableSet.coalesce_history = coalesce_history
+ TableSet.column_chart = column_chart
+ TableSet.compute = compute
+ TableSet.denormalize = denormalize
+ TableSet.distinct = distinct
+ TableSet.exclude = exclude
+ TableSet.find = find
++TableSet.flatten_history = flatten_history
+ TableSet.from_csv = from_csv
+ TableSet.from_json = from_json
+ TableSet.group_by = group_by
+ TableSet.having = having
++TableSet.history_at = history_at
++TableSet.history_events = history_events
++TableSet.history_gaps = history_gaps
++TableSet.history_overlaps = history_overlaps
++TableSet.history_spans = history_spans
+ TableSet.homogenize = homogenize
+ TableSet.join = join
++TableSet.join_history = join_history
+ TableSet.limit = limit
+ TableSet.line_chart = line_chart
+ TableSet.merge = merge
+@@ -195,6 +207,8 @@ TableSet.pivot = pivot
+ TableSet.print_structure = print_structure
+ TableSet.scatterplot = scatterplot
+ TableSet.select = select
++TableSet.split_history = split_history
+ TableSet.to_csv = to_csv
++TableSet.to_history = to_history
+ TableSet.to_json = to_json
+ TableSet.where = where
+diff --git a/agate/tableset/proxy_methods.py b/agate/tableset/proxy_methods.py
+index e7ac2b7..d9eab27 100644
+--- a/agate/tableset/proxy_methods.py
++++ b/agate/tableset/proxy_methods.py
+@@ -5,6 +5,20 @@ def bins(self, *args, **kwargs):
+     return self._proxy('bins', *args, **kwargs)
+ 
+ 
++def clip_history(self, *args, **kwargs):
++    """
++    Calls :meth:`.Table.clip_history` on each table in the TableSet.
++    """
++    return self._proxy('clip_history', *args, **kwargs)
++
++
++def coalesce_history(self, *args, **kwargs):
++    """
++    Calls :meth:`.Table.coalesce_history` on each table in the TableSet.
++    """
++    return self._proxy('coalesce_history', *args, **kwargs)
++
++
+ def compute(self, *args, **kwargs):
+     """
+     Calls :meth:`.Table.compute` on each table in the TableSet.
+@@ -33,6 +47,13 @@ def exclude(self, *args, **kwargs):
+     return self._proxy('exclude', *args, **kwargs)
+ 
+ 
++def flatten_history(self, *args, **kwargs):
++    """
++    Calls :meth:`.Table.flatten_history` on each table in the TableSet.
++    """
++    return self._proxy('flatten_history', *args, **kwargs)
++
++
+ def find(self, *args, **kwargs):
+     """
+     Calls :meth:`.Table.find` on each table in the TableSet.
+@@ -47,6 +68,41 @@ def group_by(self, *args, **kwargs):
+     return self._proxy('group_by', *args, **kwargs)
+ 
+ 
++def history_events(self, *args, **kwargs):
++    """
++    Calls :meth:`.Table.history_events` on each table in the TableSet.
++    """
++    return self._proxy('history_events', *args, **kwargs)
++
++
++def history_at(self, *args, **kwargs):
++    """
++    Calls :meth:`.Table.history_at` on each table in the TableSet.
++    """
++    return self._proxy('history_at', *args, **kwargs)
++
++
++def history_gaps(self, *args, **kwargs):
++    """
++    Calls :meth:`.Table.history_gaps` on each table in the TableSet.
++    """
++    return self._proxy('history_gaps', *args, **kwargs)
++
++
++def history_spans(self, *args, **kwargs):
++    """
++    Calls :meth:`.Table.history_spans` on each table in the TableSet.
++    """
++    return self._proxy('history_spans', *args, **kwargs)
++
++
++def history_overlaps(self, *args, **kwargs):
++    """
++    Calls :meth:`.Table.history_overlaps` on each table in the TableSet.
++    """
++    return self._proxy('history_overlaps', *args, **kwargs)
++
++
+ def homogenize(self, *args, **kwargs):
+     """
+     Calls :meth:`.Table.homogenize` on each table in the TableSet.
+@@ -61,6 +117,13 @@ def join(self, *args, **kwargs):
+     return self._proxy('join', *args, **kwargs)
+ 
+ 
++def join_history(self, *args, **kwargs):
++    """
++    Calls :meth:`.Table.join_history` on each table in the TableSet.
++    """
++    return self._proxy('join_history', *args, **kwargs)
++
++
+ def limit(self, *args, **kwargs):
+     """
+     Calls :meth:`.Table.limit` on each table in the TableSet.
+@@ -101,3 +164,17 @@ def where(self, *args, **kwargs):
+     Calls :meth:`.Table.where` on each table in the TableSet.
+     """
+     return self._proxy('where', *args, **kwargs)
++
++
++def split_history(self, *args, **kwargs):
++    """
++    Calls :meth:`.Table.split_history` on each table in the TableSet.
++    """
++    return self._proxy('split_history', *args, **kwargs)
++
++
++def to_history(self, *args, **kwargs):
++    """
++    Calls :meth:`.Table.to_history` on each table in the TableSet.
++    """
++    return self._proxy('to_history', *args, **kwargs)

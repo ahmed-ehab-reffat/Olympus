@@ -1,0 +1,1044 @@
+diff --git a/src/cpu/cpu.ts b/src/cpu/cpu.ts
+index 4065b0a..4485855 100644
+--- a/src/cpu/cpu.ts
++++ b/src/cpu/cpu.ts
+@@ -37,12 +37,40 @@ export interface AVRInterruptConfig {
+ 
+ export type AVRClockEventCallback = () => void;
+ 
++/**
++ * The clock signal that drives a scheduled event. Each one can be stopped independently, either
++ * by a sleep mode or by the power reduction register.
++ */
++export enum AVRPeripheralClock {
++  IO,
++  Timer0,
++  Timer1,
++  Timer2,
++  ADC,
++  SPI,
++  USART0,
++  TWI,
++  EEPROM,
++  Watchdog,
++}
++
++const peripheralClockCount = AVRPeripheralClock.Watchdog + 1;
++
++export type AVRSleepListener = (mode: number | null) => void;
++
+ interface AVRClockEventEntry {
+   cycles: number;
++  clock: AVRPeripheralClock;
+   callback: AVRClockEventCallback;
+   next: AVRClockEventEntry | null;
+ }
+ 
++interface AVRSuspendedEvent {
++  remaining: number;
++  clock: AVRPeripheralClock;
++  callback: AVRClockEventCallback;
++}
++
+ export class CPU {
+   readonly data: Uint8Array = new Uint8Array(this.sramBytes + registerSpace);
+   readonly data16 = new Uint16Array(this.data.buffer);
+@@ -53,6 +81,10 @@ export class CPU {
+   private readonly pendingInterrupts: (AVRInterruptConfig | null)[] = new Array(MAX_INTERRUPTS);
+   private nextClockEvent: AVRClockEventEntry | null = null;
+   private readonly clockEventPool: AVRClockEventEntry[] = []; // helps avoid garbage collection
++  private readonly clockStopped: boolean[] = new Array(peripheralClockCount).fill(false);
++  private readonly clockStoppedAt: number[] = new Array(peripheralClockCount).fill(0);
++  private readonly clockStall: number[] = new Array(peripheralClockCount).fill(0);
++  private suspendedEvents: AVRSuspendedEvent[] = [];
+ 
+   /**
+    * Whether the program counter (PC) can address 22 bits (the default is 16)
+@@ -70,6 +102,23 @@ export class CPU {
+     /* empty by default */
+   };
+ 
++  /**
++   * This function is called by the SLEEP instruction. The power management peripheral attaches to
++   * it and decides, from the sleep mode registers, whether the CPU actually goes to sleep.
++   */
++  onSleep = () => {
++    /* empty by default */
++  };
++
++  /** Called whenever the CPU enters a sleep mode (with the mode) or wakes up (with null). */
++  readonly sleepListeners = new Set<AVRSleepListener>();
++
++  /** Whether the CPU is currently sleeping. No instruction executes while this is set. */
++  sleeping = false;
++
++  /** The sleep mode the CPU is currently in, or null when it is awake. */
++  sleepMode: number | null = null;
++
+   /**
+    * Program counter
+    */
+@@ -96,6 +145,19 @@ export class CPU {
+     this.pendingInterrupts.fill(null);
+     this.nextInterrupt = -1;
+     this.nextClockEvent = null;
++    const wasSleeping = this.sleeping;
++    this.sleeping = false;
++    this.sleepMode = null;
++    this.suspendedEvents = [];
++    this.clockStopped.fill(false);
++    this.clockStoppedAt.fill(0);
++    this.clockStall.fill(0);
++    if (wasSleeping) {
++      // A reset is not a wake-up: the clocks come back with no start-up delay.
++      for (const listener of this.sleepListeners) {
++        listener(null);
++      }
++    }
+   }
+ 
+   readData(addr: number) {
+@@ -194,12 +256,22 @@ export class CPU {
+     }
+   }
+ 
+-  addClockEvent(callback: AVRClockEventCallback, cycles: number) {
++  addClockEvent(
++    callback: AVRClockEventCallback,
++    cycles: number,
++    clock: AVRPeripheralClock = AVRPeripheralClock.IO,
++  ) {
++    const remaining = Math.max(1, cycles);
++    if (this.clockStopped[clock]) {
++      this.suspendedEvents.push({ remaining, clock, callback });
++      return callback;
++    }
+     const { clockEventPool } = this;
+-    cycles = this.cycles + Math.max(1, cycles);
++    cycles = this.cycles + remaining;
+     const maybeEntry = clockEventPool.pop();
+-    const entry: AVRClockEventEntry = maybeEntry ?? { cycles, callback, next: null };
++    const entry: AVRClockEventEntry = maybeEntry ?? { cycles, clock, callback, next: null };
+     entry.cycles = cycles;
++    entry.clock = clock;
+     entry.callback = callback;
+     let { nextClockEvent: clockEvent } = this;
+     let lastItem = null;
+@@ -218,14 +290,20 @@ export class CPU {
+   }
+ 
+   updateClockEvent(callback: AVRClockEventCallback, cycles: number) {
+-    if (this.clearClockEvent(callback)) {
+-      this.addClockEvent(callback, cycles);
++    const clock = this.clockOf(callback);
++    if (clock !== null && this.clearClockEvent(callback)) {
++      this.addClockEvent(callback, cycles, clock);
+       return true;
+     }
+     return false;
+   }
+ 
+   clearClockEvent(callback: AVRClockEventCallback) {
++    const suspendedIndex = this.suspendedEvents.findIndex((item) => item.callback === callback);
++    if (suspendedIndex >= 0) {
++      this.suspendedEvents.splice(suspendedIndex, 1);
++      return true;
++    }
+     let { nextClockEvent: clockEvent } = this;
+     if (!clockEvent) {
+       return false;
+@@ -250,6 +328,101 @@ export class CPU {
+     return false;
+   }
+ 
++  private clockOf(callback: AVRClockEventCallback): AVRPeripheralClock | null {
++    for (const item of this.suspendedEvents) {
++      if (item.callback === callback) {
++        return item.clock;
++      }
++    }
++    let clockEvent = this.nextClockEvent;
++    while (clockEvent) {
++      if (clockEvent.callback === callback) {
++        return clockEvent.clock;
++      }
++      clockEvent = clockEvent.next;
++    }
++    return null;
++  }
++
++  /**
++   * The number of cycles the given clock has run for. It stops advancing while the clock is
++   * stopped, so peripherals that measure elapsed time against it do not count the stall.
++   */
++  clockCycles(clock: AVRPeripheralClock) {
++    const reference = this.clockStopped[clock] ? this.clockStoppedAt[clock] : this.cycles;
++    return reference - this.clockStall[clock];
++  }
++
++  isClockStopped(clock: AVRPeripheralClock) {
++    return this.clockStopped[clock];
++  }
++
++  /**
++   * Stops or restarts a peripheral clock. Events waiting on a stopped clock keep the number of
++   * cycles they still owe, and are rescheduled with that same remainder when it restarts.
++   */
++  setClockStopped(clock: AVRPeripheralClock, stopped: boolean) {
++    if (this.clockStopped[clock] === stopped) {
++      return;
++    }
++    this.clockStopped[clock] = stopped;
++    if (stopped) {
++      this.clockStoppedAt[clock] = this.cycles;
++      let clockEvent = this.nextClockEvent;
++      const detached: AVRClockEventEntry[] = [];
++      while (clockEvent) {
++        if (clockEvent.clock === clock) {
++          detached.push(clockEvent);
++        }
++        clockEvent = clockEvent.next;
++      }
++      for (const entry of detached) {
++        const remaining = Math.max(1, entry.cycles - this.cycles);
++        this.clearClockEvent(entry.callback);
++        this.suspendedEvents.push({ remaining, clock, callback: entry.callback });
++      }
++    } else {
++      this.clockStall[clock] += this.cycles - this.clockStoppedAt[clock];
++      const resumed = this.suspendedEvents.filter((item) => item.clock === clock);
++      this.suspendedEvents = this.suspendedEvents.filter((item) => item.clock !== clock);
++      for (const item of resumed) {
++        this.addClockEvent(item.callback, item.remaining, clock);
++      }
++    }
++  }
++
++  /** Puts the CPU into the given sleep mode and notifies the sleep listeners. */
++  enterSleep(mode: number) {
++    this.sleeping = true;
++    this.sleepMode = mode;
++    for (const listener of this.sleepListeners) {
++      listener(mode);
++    }
++  }
++
++  /** Wakes the CPU up and notifies the sleep listeners. */
++  wakeUp() {
++    if (!this.sleeping) {
++      return;
++    }
++    this.sleepMode = null;
++    for (const listener of this.sleepListeners) {
++      listener(null);
++    }
++    this.sleeping = false;
++  }
++
++  /**
++   * Advances the cycle counter without executing an instruction, up to the next event of a clock
++   * that is still running. Called instead of decoding an opcode while the CPU sleeps.
++   */
++  idle() {
++    const { nextClockEvent } = this;
++    this.cycles = nextClockEvent
++      ? Math.max(this.cycles + 1, nextClockEvent.cycles)
++      : this.cycles + 1;
++  }
++
+   tick() {
+     const { nextClockEvent } = this;
+     if (nextClockEvent && nextClockEvent.cycles <= this.cycles) {
+@@ -261,6 +434,9 @@ export class CPU {
+     }
+ 
+     const { nextInterrupt } = this;
++    if (this.sleeping && nextInterrupt >= 0) {
++      this.wakeUp();
++    }
+     if (this.interruptsEnabled && nextInterrupt >= 0) {
+       const interrupt = this.pendingInterrupts[nextInterrupt]!;
+       avrInterrupt(this, interrupt.address);
+diff --git a/src/cpu/instruction.ts b/src/cpu/instruction.ts
+index 77f27ba..3ef3e70 100644
+--- a/src/cpu/instruction.ts
++++ b/src/cpu/instruction.ts
+@@ -30,6 +30,11 @@ function isTwoWordInstruction(opcode: u16) {
+ }
+ 
+ export function avrInstruction(cpu: CPU) {
++  if (cpu.sleeping) {
++    cpu.idle();
++    return;
++  }
++
+   const opcode = cpu.progMem[cpu.pc];
+ 
+   if ((opcode & 0xfc00) === 0x1c00) {
+@@ -662,7 +667,7 @@ export function avrInstruction(cpu: CPU) {
+     }
+   } else if (opcode === 0x9588) {
+     /* SLEEP, 1001 0101 1000 1000 */
+-    /* not implemented */
++    cpu.onSleep();
+   } else if (opcode === 0x95e8) {
+     /* SPM, 1001 0101 1110 1000 */
+     /* not implemented */
+diff --git a/src/index.ts b/src/index.ts
+index f951897..2e8ce89 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,8 +1,8 @@
+ // SPDX-License-Identifier: MIT
+ // Copyright (c) Uri Shaked and contributors
+ 
+-export { CPU } from './cpu/cpu';
+-export type { CPUMemoryHook, CPUMemoryHooks } from './cpu/cpu';
++export { AVRPeripheralClock, CPU } from './cpu/cpu';
++export type { AVRSleepListener, CPUMemoryHook, CPUMemoryHooks } from './cpu/cpu';
+ export { avrInstruction } from './cpu/instruction';
+ export { avrInterrupt } from './cpu/interrupt';
+ export {
+@@ -43,6 +43,8 @@ export type {
+   AVRPortConfig,
+   GPIOListener,
+ } from './peripherals/gpio';
++export { AVRPower, AVRSleepMode, attinyPowerConfig, powerConfig } from './peripherals/power';
++export type { AVRPowerConfig } from './peripherals/power';
+ export { AVRSPI, spiConfig } from './peripherals/spi';
+ export type { SPIConfig, SPITransferCallback } from './peripherals/spi';
+ export { AVRTimer, timer0Config, timer1Config, timer2Config } from './peripherals/timer';
+diff --git a/src/peripherals/adc.ts b/src/peripherals/adc.ts
+index a601b09..b7ce1ee 100644
+--- a/src/peripherals/adc.ts
++++ b/src/peripherals/adc.ts
+@@ -9,8 +9,9 @@
+  * Copyright (C) 2019, 2020, 2021 Uri Shaked
+  */
+ 
+-import { AVRInterruptConfig, CPU } from '../cpu/cpu';
++import { AVRInterruptConfig, AVRPeripheralClock, CPU } from '../cpu/cpu';
+ import { u8 } from '../types';
++import { AVRSleepMode } from './power';
+ 
+ export enum ADCReference {
+   AVCC,
+@@ -151,7 +152,11 @@ export class AVRADC {
+     }
+     const rawValue = (voltage / this.referenceVoltage) * 1024;
+     const result = Math.min(Math.max(Math.floor(rawValue), 0), 1023);
+-    this.cpu.addClockEvent(() => this.completeADCRead(result), this.sampleCycles);
++    this.cpu.addClockEvent(
++      () => this.completeADCRead(result),
++      this.sampleCycles,
++      AVRPeripheralClock.ADC,
++    );
+   };
+ 
+   private converting = false;
+@@ -179,7 +184,11 @@ export class AVRADC {
+       if (!this.converting && value & ADSC) {
+         if (!(value & ADEN)) {
+           // Special case: reading while the ADC is not enabled should return 0
+-          this.cpu.addClockEvent(() => this.completeADCRead(0), this.sampleCycles);
++          this.cpu.addClockEvent(
++            () => this.completeADCRead(0),
++            this.sampleCycles,
++            AVRPeripheralClock.ADC,
++          );
+           return true;
+         }
+         let channel = this.cpu.data[this.config.ADMUX] & MUX_MASK;
+@@ -193,8 +202,33 @@ export class AVRADC {
+         return true; // don't update
+       }
+     };
++
++    cpu.sleepListeners.add(this.handleSleepChange);
+   }
+ 
++  /**
++   * ADC noise reduction mode starts a conversion on entry, so that the sample is taken while the
++   * rest of the chip is quiet.
++   */
++  private handleSleepChange = (mode: number | null) => {
++    const { ADCSRA, ADMUX, ADCSRB } = this.config;
++    const adcsra = this.cpu.data[ADCSRA];
++    if (mode !== AVRSleepMode.ADCNoiseReduction || this.converting || !(adcsra & ADEN)) {
++      return;
++    }
++    if (this.cpu.isClockStopped(AVRPeripheralClock.ADC)) {
++      return;
++    }
++    this.cpu.data[ADCSRA] = adcsra | ADSC;
++    let channel = this.cpu.data[ADMUX] & MUX_MASK;
++    if (this.cpu.data[ADCSRB] & MUX5) {
++      channel |= 0x20;
++    }
++    channel &= this.config.muxInputMask;
++    this.converting = true;
++    this.onADCRead(this.config.muxChannels[channel] ?? fallbackMuxInput);
++  };
++
+   completeADCRead(value: number) {
+     const { ADCL, ADCH, ADMUX, ADCSRA } = this.config;
+     this.converting = false;
+diff --git a/src/peripherals/eeprom.ts b/src/peripherals/eeprom.ts
+index 186bdcc..c58a5c3 100644
+--- a/src/peripherals/eeprom.ts
++++ b/src/peripherals/eeprom.ts
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: MIT
+ // Copyright (c) Uri Shaked and contributors
+ 
+-import { AVRInterruptConfig, CPU } from '../cpu/cpu';
++import { AVRInterruptConfig, AVRPeripheralClock, CPU } from '../cpu/cpu';
+ import { u16, u32, u8 } from '../types';
+ 
+ export interface EEPROMBackend {
+@@ -105,9 +105,13 @@ export class AVREEPROM {
+       if (eecr & EEMPE) {
+         const eempeCycles = 4;
+         this.writeEnabledCycles = this.cpu.cycles + eempeCycles;
+-        this.cpu.addClockEvent(() => {
+-          this.cpu.data[EECR] &= ~EEMPE;
+-        }, eempeCycles);
++        this.cpu.addClockEvent(
++          () => {
++            this.cpu.data[EECR] &= ~EEMPE;
++          },
++          eempeCycles,
++          AVRPeripheralClock.EEPROM,
++        );
+       }
+ 
+       // Read
+@@ -148,9 +152,13 @@ export class AVREEPROM {
+ 
+         this.cpu.data[EECR] |= EEPE;
+ 
+-        this.cpu.addClockEvent(() => {
+-          this.cpu.setInterruptFlag(this.EER);
+-        }, this.writeCompleteCycles - this.cpu.cycles);
++        this.cpu.addClockEvent(
++          () => {
++            this.cpu.setInterruptFlag(this.EER);
++          },
++          this.writeCompleteCycles - this.cpu.cycles,
++          AVRPeripheralClock.EEPROM,
++        );
+ 
+         // When EEPE has been set, the CPU is halted for two cycles before the
+         // next instruction is executed.
+diff --git a/src/peripherals/gpio.ts b/src/peripherals/gpio.ts
+index 69db9b1..9818bc3 100644
+--- a/src/peripherals/gpio.ts
++++ b/src/peripherals/gpio.ts
+@@ -9,7 +9,7 @@
+  * Copyright (C) 2019-2023 Uri Shaked
+  */
+ 
+-import { AVRInterruptConfig, CPU } from '../cpu/cpu';
++import { AVRInterruptConfig, AVRPeripheralClock, CPU } from '../cpu/cpu';
+ import { u8 } from '../types';
+ 
+ export interface AVRExternalInterrupt {
+@@ -411,6 +411,9 @@ export class AVRIOPort {
+       const { EIMSK, index, EICR, iscOffset } = externalConfig;
+       if (cpu.data[EIMSK] & (1 << index)) {
+         const configuration = (cpu.data[EICR] >> iscOffset) & 0x3;
++        // Edge and change detection is clocked by the I/O clock, so it is blind while that clock
++        // is stopped. Low level detection is asynchronous and keeps working.
++        const edgeDetection = !cpu.isClockStopped(AVRPeripheralClock.IO);
+         let generateInterrupt = false;
+         external.constant = false;
+         switch (configuration) {
+@@ -419,13 +422,13 @@ export class AVRIOPort {
+             external.constant = true;
+             break;
+           case InterruptMode.Change:
+-            generateInterrupt = true;
++            generateInterrupt = edgeDetection;
+             break;
+           case InterruptMode.FallingEdge:
+-            generateInterrupt = !risingEdge;
++            generateInterrupt = !risingEdge && edgeDetection;
+             break;
+           case InterruptMode.RisingEdge:
+-            generateInterrupt = risingEdge;
++            generateInterrupt = risingEdge && edgeDetection;
+             break;
+         }
+         if (generateInterrupt) {
+diff --git a/src/peripherals/power.ts b/src/peripherals/power.ts
+new file mode 100644
+index 0000000..5c4d092
+--- /dev/null
++++ b/src/peripherals/power.ts
+@@ -0,0 +1,195 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) Uri Shaked and contributors
++
++/**
++ * AVR-8 Sleep Modes and Power Management
++ * Part of AVR8js
++ * Reference: http://ww1.microchip.com/downloads/en/DeviceDoc/ATmega48A-PA-88A-PA-168A-PA-328-P-DS-DS40002061A.pdf
++ *
++ * Copyright (C) 2019-2026 Uri Shaked
++ */
++
++import { AVRPeripheralClock, CPU } from '../cpu/cpu';
++import { u8 } from '../types';
++
++/** The values are the mode selection each one is written as. */
++export enum AVRSleepMode {
++  Idle = 0,
++  ADCNoiseReduction = 1,
++  PowerDown = 2,
++  PowerSave = 3,
++  Standby = 6,
++  ExtendedStandby = 7,
++}
++
++export interface AVRPowerConfig {
++  /** Register holding the sleep enable bit and the mode selection */
++  SMCR: u8;
++
++  /** Bits of that register the device implements */
++  SMCRMask: u8;
++
++  /** Sleep enable bit */
++  SE: u8;
++
++  /** Position and width of the mode selection inside the register */
++  modeShift: u8;
++  modeMask: u8;
++
++  /** The mode each selection value picks. A null entry is a reserved selection. */
++  modes: (AVRSleepMode | null)[];
++
++  /** Power reduction register, and the bits the device implements */
++  PRR: u8;
++  PRRMask: u8;
++
++  /** The peripheral clock each power reduction bit stops */
++  powerReduction: [AVRPeripheralClock, u8][];
++
++  /** Asynchronous status register, or 0 when the device has no asynchronous timer */
++  ASSR: u8;
++}
++
++export const powerConfig: AVRPowerConfig = {
++  SMCR: 0x53,
++  SMCRMask: 0x0f,
++  SE: 1,
++  modeShift: 1,
++  modeMask: 7,
++  modes: [
++    AVRSleepMode.Idle,
++    AVRSleepMode.ADCNoiseReduction,
++    AVRSleepMode.PowerDown,
++    AVRSleepMode.PowerSave,
++    null,
++    null,
++    AVRSleepMode.Standby,
++    AVRSleepMode.ExtendedStandby,
++  ],
++  PRR: 0x64,
++  PRRMask: 0xef,
++  powerReduction: [
++    [AVRPeripheralClock.ADC, 0x01],
++    [AVRPeripheralClock.USART0, 0x02],
++    [AVRPeripheralClock.SPI, 0x04],
++    [AVRPeripheralClock.Timer1, 0x08],
++    [AVRPeripheralClock.Timer0, 0x20],
++    [AVRPeripheralClock.Timer2, 0x40],
++    [AVRPeripheralClock.TWI, 0x80],
++  ],
++  ASSR: 0xb6,
++};
++
++/** ATtiny25/45/85: the sleep controls live in MCUCR and there is no asynchronous timer. */
++export const attinyPowerConfig: AVRPowerConfig = {
++  SMCR: 0x35,
++  SMCRMask: 0xff,
++  SE: 0x20,
++  modeShift: 3,
++  modeMask: 3,
++  modes: [AVRSleepMode.Idle, AVRSleepMode.ADCNoiseReduction, AVRSleepMode.PowerDown, null],
++  PRR: 0x20,
++  PRRMask: 0x0f,
++  powerReduction: [
++    [AVRPeripheralClock.ADC, 0x01],
++    [AVRPeripheralClock.Timer0, 0x04],
++    [AVRPeripheralClock.Timer1, 0x08],
++  ],
++  ASSR: 0,
++};
++
++const AS2 = 0x20;
++
++const ioClocks = [
++  AVRPeripheralClock.IO,
++  AVRPeripheralClock.Timer0,
++  AVRPeripheralClock.Timer1,
++  AVRPeripheralClock.Timer2,
++  AVRPeripheralClock.SPI,
++  AVRPeripheralClock.USART0,
++  AVRPeripheralClock.TWI,
++  AVRPeripheralClock.EEPROM,
++];
++
++const gatedClocks = [...ioClocks, AVRPeripheralClock.ADC];
++
++/** The modes that leave an asynchronously clocked timer 2 running. */
++const asyncModes = [AVRSleepMode.PowerSave, AVRSleepMode.ExtendedStandby];
++
++function stoppedByMode(mode: AVRSleepMode, asynchronous: boolean) {
++  if (mode === AVRSleepMode.Idle) {
++    return [];
++  }
++  const stopped = [...ioClocks];
++  if (mode !== AVRSleepMode.ADCNoiseReduction) {
++    stopped.push(AVRPeripheralClock.ADC);
++  }
++  if (asynchronous && asyncModes.includes(mode)) {
++    return stopped.filter((clock) => clock !== AVRPeripheralClock.Timer2);
++  }
++  return stopped;
++}
++
++export class AVRPower {
++  private activeMode: AVRSleepMode | null = null;
++
++  constructor(
++    private cpu: CPU,
++    private config: AVRPowerConfig = powerConfig,
++  ) {
++    cpu.writeHooks[config.SMCR] = (value: u8) => {
++      cpu.data[config.SMCR] = value & config.SMCRMask;
++      return true;
++    };
++
++    cpu.writeHooks[config.PRR] = (value: u8) => {
++      cpu.data[config.PRR] = value & config.PRRMask;
++      this.updateClocks();
++      return true;
++    };
++
++    cpu.onSleep = this.handleSleepInstruction;
++    cpu.sleepListeners.add(this.handleSleepChange);
++  }
++
++  /** The sleep mode the CPU is in, or null when it is awake. */
++  get mode() {
++    return this.activeMode;
++  }
++
++  /** Whether timer 2 is clocked from the asynchronous crystal. */
++  get asynchronous() {
++    const { ASSR } = this.config;
++    return ASSR !== 0 && (this.cpu.data[ASSR] & AS2) !== 0;
++  }
++
++  private handleSleepInstruction = () => {
++    const { SMCR, SE, modeShift, modeMask, modes } = this.config;
++    const register = this.cpu.data[SMCR];
++    if (!(register & SE)) {
++      return;
++    }
++    const mode = modes[(register >> modeShift) & modeMask];
++    if (mode == null) {
++      return;
++    }
++    this.cpu.enterSleep(mode);
++  };
++
++  private handleSleepChange = (mode: number | null) => {
++    this.activeMode = mode;
++    this.updateClocks();
++  };
++
++  private updateClocks() {
++    const { cpu } = this;
++    const prr = cpu.data[this.config.PRR];
++    const asleep =
++      this.activeMode !== null ? stoppedByMode(this.activeMode, this.asynchronous) : [];
++    for (const clock of gatedClocks) {
++      const reduction = this.config.powerReduction.find(([candidate]) => candidate === clock);
++      const reduced = reduction ? (prr & reduction[1]) !== 0 : false;
++      cpu.setClockStopped(clock, reduced || asleep.includes(clock));
++    }
++  }
++}
+diff --git a/src/peripherals/spi.ts b/src/peripherals/spi.ts
+index b6d414e..4c10aee 100644
+--- a/src/peripherals/spi.ts
++++ b/src/peripherals/spi.ts
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: MIT
+ // Copyright (c) Uri Shaked and contributors
+ 
+-import { AVRInterruptConfig, CPU } from '../cpu/cpu';
++import { AVRInterruptConfig, AVRPeripheralClock, CPU } from '../cpu/cpu';
+ import { u8 } from '../types';
+ 
+ export interface SPIConfig {
+@@ -52,7 +52,11 @@ export class AVRSPI {
+    */
+   public onByte: SPIByteTransferCallback = (value) => {
+     const valueIn = this.onTransfer(value);
+-    this.cpu.addClockEvent(() => this.completeTransfer(valueIn), this.transferCycles);
++    this.cpu.addClockEvent(
++      () => this.completeTransfer(valueIn),
++      this.transferCycles,
++      AVRPeripheralClock.SPI,
++    );
+   };
+ 
+   private transmissionActive = false;
+diff --git a/src/peripherals/timer-attiny.ts b/src/peripherals/timer-attiny.ts
+index 98bf473..7be9d04 100644
+--- a/src/peripherals/timer-attiny.ts
++++ b/src/peripherals/timer-attiny.ts
+@@ -7,13 +7,16 @@
+  * Reference: http://ww1.microchip.com/downloads/en/DeviceDoc/Atmel-2586-AVR-8-bit-Microcontroller-ATtiny25-ATtiny45-ATtiny85_Datasheet.pdf
+  */
+ 
+-import { AVRInterruptConfig, CPU, CPUMemoryHook } from '../cpu/cpu';
++import { AVRInterruptConfig, AVRPeripheralClock, CPU, CPUMemoryHook } from '../cpu/cpu';
+ import { PinOverrideMode } from './gpio';
+ 
+ type u8 = number;
+ type u16 = number;
+ 
+ export interface ATtinyTimer1Config {
++  /** The peripheral clock that drives this timer. Defaults to the I/O clock. */
++  clock?: AVRPeripheralClock;
++
+   TCCR1: u8;
+   GTCCR: u8;
+   TCNT1: u8;
+@@ -54,6 +57,7 @@ const FOC1A = 1 << 2;
+ const PSR1 = 1 << 1;
+ 
+ export const attinyTimer1Config: ATtinyTimer1Config = {
++  clock: AVRPeripheralClock.Timer1,
+   TCCR1: 0x50,
+   GTCCR: 0x4c,
+   TCNT1: 0x4f,
+@@ -185,7 +189,7 @@ export class ATtinyTimer1 {
+         this.forceCompare('B');
+       }
+       if (value & PSR1) {
+-        this.lastCycle = this.cpu.cycles;
++        this.lastCycle = this.timerCycles;
+       }
+       value &= ~(FOC1A | FOC1B | PSR1);
+ 
+@@ -264,9 +268,17 @@ export class ATtinyTimer1 {
+     return 0xff;
+   }
+ 
++  private get timerClock() {
++    return this.config.clock ?? AVRPeripheralClock.IO;
++  }
++
++  private get timerCycles() {
++    return this.cpu.clockCycles(this.timerClock);
++  }
++
+   count = (reschedule = true) => {
+     const { divider, lastCycle, cpu } = this;
+-    const { cycles } = cpu;
++    const cycles = this.timerCycles;
+     const delta = cycles - lastCycle;
+ 
+     if (divider && delta >= divider) {
+@@ -301,17 +313,21 @@ export class ATtinyTimer1 {
+     if (this.updateDivider) {
+       const cs = this.CS;
+       const newDivider = this.config.dividers[cs] ?? 0;
+-      this.lastCycle = newDivider ? this.cpu.cycles : 0;
++      this.lastCycle = newDivider ? this.timerCycles : 0;
+       this.updateDivider = false;
+       this.divider = newDivider;
+       if (newDivider) {
+-        cpu.addClockEvent(this.count, this.lastCycle + newDivider - cpu.cycles);
++        cpu.addClockEvent(
++          this.count,
++          this.lastCycle + newDivider - this.timerCycles,
++          this.timerClock,
++        );
+       }
+       return;
+     }
+ 
+     if (reschedule && divider) {
+-      cpu.addClockEvent(this.count, this.lastCycle + divider - cpu.cycles);
++      cpu.addClockEvent(this.count, this.lastCycle + divider - this.timerCycles, this.timerClock);
+     }
+   };
+ 
+diff --git a/src/peripherals/timer.ts b/src/peripherals/timer.ts
+index 0c18071..32c5b8c 100644
+--- a/src/peripherals/timer.ts
++++ b/src/peripherals/timer.ts
+@@ -9,7 +9,7 @@
+  * Copyright (C) 2019, 2020, 2021 Uri Shaked
+  */
+ 
+-import { AVRInterruptConfig, CPU } from '../cpu/cpu';
++import { AVRInterruptConfig, AVRPeripheralClock, CPU } from '../cpu/cpu';
+ import { AVRIOPort, PinOverrideMode, portBConfig, portDConfig } from './gpio';
+ 
+ const timer01Dividers = {
+@@ -46,6 +46,9 @@ export interface AVRTimerConfig {
+   bits: 8 | 16;
+   dividers: TimerDividers;
+ 
++  /** The peripheral clock that drives this timer. Defaults to the I/O clock. */
++  clock?: AVRPeripheralClock;
++
+   // Interrupt vectors
+   captureInterrupt: u8;
+   compAInterrupt: u8;
+@@ -107,6 +110,7 @@ const defaultTimerBits = {
+ 
+ export const timer0Config: AVRTimerConfig = {
+   bits: 8,
++  clock: AVRPeripheralClock.Timer0,
+   captureInterrupt: 0, // not available
+   compAInterrupt: 0x1c,
+   compBInterrupt: 0x1e,
+@@ -136,6 +140,7 @@ export const timer0Config: AVRTimerConfig = {
+ 
+ export const timer1Config: AVRTimerConfig = {
+   bits: 16,
++  clock: AVRPeripheralClock.Timer1,
+   captureInterrupt: 0x14,
+   compAInterrupt: 0x16,
+   compBInterrupt: 0x18,
+@@ -165,6 +170,7 @@ export const timer1Config: AVRTimerConfig = {
+ 
+ export const timer2Config: AVRTimerConfig = {
+   bits: 8,
++  clock: AVRPeripheralClock.Timer2,
+   captureInterrupt: 0, // not available
+   compAInterrupt: 0x0e,
+   compBInterrupt: 0x10,
+@@ -420,7 +426,7 @@ export class AVRTimer {
+       this.cpu.data[config.TCCRB] = value;
+       this.updateDivider = true;
+       this.cpu.clearClockEvent(this.count);
+-      this.cpu.addClockEvent(this.count, 0);
++      this.cpu.addClockEvent(this.count, 0, this.timerClock);
+       this.updateWGMConfig();
+       return true;
+     };
+@@ -552,11 +558,20 @@ export class AVRTimer {
+     }
+   }
+ 
++  private get timerClock() {
++    return this.config.clock ?? AVRPeripheralClock.IO;
++  }
++
++  private get timerCycles() {
++    return this.cpu.clockCycles(this.timerClock);
++  }
++
+   count = (reschedule = true, external = false) => {
+     const { divider, lastCycle, cpu } = this;
+-    const { cycles } = cpu;
++    const cycles = this.timerCycles;
+     const delta = cycles - lastCycle;
+-    if ((divider && delta >= divider) || external) {
++    const stopped = cpu.isClockStopped(this.timerClock);
++    if ((divider && delta >= divider && !stopped) || (external && !stopped)) {
+       const counterDelta = external ? 1 : Math.floor(delta / divider);
+       this.lastCycle += counterDelta * divider;
+       const val = this.tcnt;
+@@ -615,7 +630,7 @@ export class AVRTimer {
+       const { CS } = this;
+       const { externalClockPin } = this.config;
+       const newDivider = this.config.dividers[CS];
+-      this.lastCycle = newDivider ? this.cpu.cycles : 0;
++      this.lastCycle = newDivider ? this.timerCycles : 0;
+       this.updateDivider = false;
+       this.divider = newDivider;
+       if (this.config.externalClockPort && !this.externalClockPort) {
+@@ -625,7 +640,11 @@ export class AVRTimer {
+         this.externalClockPort.externalClockListeners[externalClockPin] = null;
+       }
+       if (newDivider) {
+-        cpu.addClockEvent(this.count, this.lastCycle + newDivider - cpu.cycles);
++        cpu.addClockEvent(
++          this.count,
++          this.lastCycle + newDivider - this.timerCycles,
++          this.timerClock,
++        );
+       } else if (
+         this.externalClockPort &&
+         (CS === ExternalClockMode.FallingEdge || CS === ExternalClockMode.RisingEdge)
+@@ -637,7 +656,7 @@ export class AVRTimer {
+       return;
+     }
+     if (reschedule && divider) {
+-      cpu.addClockEvent(this.count, this.lastCycle + divider - cpu.cycles);
++      cpu.addClockEvent(this.count, this.lastCycle + divider - this.timerCycles, this.timerClock);
+     }
+   };
+ 
+diff --git a/src/peripherals/twi.ts b/src/peripherals/twi.ts
+index 654da33..5d2f24a 100644
+--- a/src/peripherals/twi.ts
++++ b/src/peripherals/twi.ts
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: MIT
+ // Copyright (c) Uri Shaked and contributors
+ 
+-import { AVRInterruptConfig, CPU } from '../cpu/cpu';
++import { AVRInterruptConfig, AVRPeripheralClock, CPU } from '../cpu/cpu';
+ import { u8 } from '../types';
+ 
+ export interface TWIEventHandler {
+@@ -122,25 +122,29 @@ export class AVRTWI {
+       const { status } = this;
+       if (clearInt && value & TWCR_TWEN && !this.busy) {
+         const twdrValue = this.cpu.data[this.config.TWDR];
+-        this.cpu.addClockEvent(() => {
+-          if (value & TWCR_TWSTA) {
+-            this.busy = true;
+-            this.eventHandler.start(status !== STATUS_TWI_IDLE);
+-          } else if (value & TWCR_TWSTO) {
+-            this.busy = true;
+-            this.eventHandler.stop();
+-          } else if (status === STATUS_START || status === STATUS_REPEATED_START) {
+-            this.busy = true;
+-            this.eventHandler.connectToSlave(twdrValue >> 1, twdrValue & 0x1 ? false : true);
+-          } else if (status === STATUS_SLAW_ACK || status === STATUS_DATA_SENT_ACK) {
+-            this.busy = true;
+-            this.eventHandler.writeByte(twdrValue);
+-          } else if (status === STATUS_SLAR_ACK || status === STATUS_DATA_RECEIVED_ACK) {
+-            this.busy = true;
+-            const ack = !!(value & TWCR_TWEA);
+-            this.eventHandler.readByte(ack);
+-          }
+-        }, 0);
++        this.cpu.addClockEvent(
++          () => {
++            if (value & TWCR_TWSTA) {
++              this.busy = true;
++              this.eventHandler.start(status !== STATUS_TWI_IDLE);
++            } else if (value & TWCR_TWSTO) {
++              this.busy = true;
++              this.eventHandler.stop();
++            } else if (status === STATUS_START || status === STATUS_REPEATED_START) {
++              this.busy = true;
++              this.eventHandler.connectToSlave(twdrValue >> 1, twdrValue & 0x1 ? false : true);
++            } else if (status === STATUS_SLAW_ACK || status === STATUS_DATA_SENT_ACK) {
++              this.busy = true;
++              this.eventHandler.writeByte(twdrValue);
++            } else if (status === STATUS_SLAR_ACK || status === STATUS_DATA_RECEIVED_ACK) {
++              this.busy = true;
++              const ack = !!(value & TWCR_TWEA);
++              this.eventHandler.readByte(ack);
++            }
++          },
++          0,
++          AVRPeripheralClock.TWI,
++        );
+         return true;
+       }
+     };
+diff --git a/src/peripherals/usart.ts b/src/peripherals/usart.ts
+index c64ec6f..e8c58d4 100644
+--- a/src/peripherals/usart.ts
++++ b/src/peripherals/usart.ts
+@@ -9,7 +9,7 @@
+  * Copyright (C) 2019, 2020, 2021 Uri Shaked
+  */
+ 
+-import { AVRInterruptConfig, CPU } from '../cpu/cpu';
++import { AVRInterruptConfig, AVRPeripheralClock, CPU } from '../cpu/cpu';
+ import { u8 } from '../types';
+ 
+ export interface USARTConfig {
+@@ -168,10 +168,14 @@ export class AVRUSART {
+           this.lineBuffer += ch;
+         }
+       }
+-      this.cpu.addClockEvent(() => {
+-        cpu.setInterruptFlag(this.UDRE);
+-        cpu.setInterruptFlag(this.TXC);
+-      }, this.cyclesPerChar);
++      this.cpu.addClockEvent(
++        () => {
++          cpu.setInterruptFlag(this.UDRE);
++          cpu.setInterruptFlag(this.TXC);
++        },
++        this.cyclesPerChar,
++        AVRPeripheralClock.USART0,
++      );
+       this.cpu.clearInterrupt(this.TXC);
+       this.cpu.clearInterrupt(this.UDRE);
+     };
+@@ -211,10 +215,14 @@ export class AVRUSART {
+       this.onRxComplete?.();
+     } else {
+       this.rxBusyValue = true;
+-      cpu.addClockEvent(() => {
+-        this.rxBusyValue = false;
+-        this.writeByte(value, true);
+-      }, this.cyclesPerChar);
++      cpu.addClockEvent(
++        () => {
++          this.rxBusyValue = false;
++          this.writeByte(value, true);
++        },
++        this.cyclesPerChar,
++        AVRPeripheralClock.USART0,
++      );
+       return true;
+     }
+   }
+diff --git a/src/peripherals/watchdog.ts b/src/peripherals/watchdog.ts
+index c4803ed..34b1d63 100644
+--- a/src/peripherals/watchdog.ts
++++ b/src/peripherals/watchdog.ts
+@@ -10,7 +10,7 @@
+  */
+ 
+ import { AVRClock } from '..';
+-import { AVRInterruptConfig, CPU } from '../cpu/cpu';
++import { AVRInterruptConfig, AVRPeripheralClock, CPU } from '../cpu/cpu';
+ import { u8 } from '../types';
+ 
+ export interface WatchdogConfig {
+@@ -86,7 +86,11 @@ export class AVRWatchdog {
+       }
+ 
+       if (this.enabled && !this.scheduled) {
+-        this.cpu.addClockEvent(this.checkWatchdog, this.watchdogTimeout - this.cpu.cycles);
++        this.cpu.addClockEvent(
++          this.checkWatchdog,
++          this.watchdogTimeout - this.cpu.cycles,
++          AVRPeripheralClock.Watchdog,
++        );
+       }
+ 
+       this.cpu.clearInterruptByFlag(this.Watchdog, value);
+@@ -120,7 +124,11 @@ export class AVRWatchdog {
+     }
+     if (this.enabled) {
+       this.scheduled = true;
+-      this.cpu.addClockEvent(this.checkWatchdog, this.watchdogTimeout - this.cpu.cycles);
++      this.cpu.addClockEvent(
++        this.checkWatchdog,
++        this.watchdogTimeout - this.cpu.cycles,
++        AVRPeripheralClock.Watchdog,
++      );
+     } else {
+       this.scheduled = false;
+     }

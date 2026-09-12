@@ -1,0 +1,917 @@
+diff --git a/crates/deadpool/tests/keyed_pool_behavior_matrix.rs b/crates/deadpool/tests/keyed_pool_behavior_matrix.rs
+new file mode 100644
+index 0000000..7e82d64
+--- /dev/null
++++ b/crates/deadpool/tests/keyed_pool_behavior_matrix.rs
+@@ -0,0 +1,799 @@
++//! Behavioral conformance suite for the keyed managed pool, exercised entirely
++//! through the public API.
++
++#![cfg(feature = "managed")]
++
++use std::{
++    future::{poll_fn, Future},
++    pin::Pin,
++    sync::atomic::{AtomicUsize, Ordering},
++    sync::{Arc, Mutex},
++    task::Poll,
++    time::Duration,
++};
++
++use deadpool::managed::{
++    KeyedKeyStatus, KeyedManager, KeyedPool, KeyedPoolConfig, KeyedRetainResult, KeyedStatus,
++    Metrics, ObjectId, PoolError, RecycleResult, Timeouts,
++};
++use deadpool::Runtime;
++
++#[derive(Default)]
++struct Backend {
++    next: AtomicUsize,
++}
++
++impl KeyedManager for Backend {
++    type Key = &'static str;
++    type Type = usize;
++    type Error = ();
++
++    async fn create(&self, _key: &&'static str) -> Result<usize, ()> {
++        Ok(self.next.fetch_add(1, Ordering::SeqCst))
++    }
++
++    async fn recycle(
++        &self,
++        _key: &&'static str,
++        _obj: &mut usize,
++        _metrics: &Metrics,
++    ) -> RecycleResult<()> {
++        Ok(())
++    }
++
++}
++
++fn pool(max_size: usize, max_per_key: usize) -> KeyedPool<Backend> {
++    KeyedPool::new(Backend::default(), KeyedPoolConfig::new(max_size, max_per_key))
++}
++
++fn slow_pool(max_size: usize, max_per_key: usize, slow_recycle: bool) -> KeyedPool<SlowBackend> {
++    KeyedPool::new(
++        SlowBackend {
++            next: AtomicUsize::new(0),
++            slow_recycle,
++        },
++        KeyedPoolConfig::new(max_size, max_per_key),
++    )
++}
++
++/// Polls the future once and reports whether it is still pending.
++async fn is_pending<F: Future>(fut: &mut Pin<&mut F>) -> bool {
++    poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx).is_pending())).await
++}
++
++#[tokio::test]
++async fn per_key_limit_serializes_same_key() {
++    let pool = pool(8, 1);
++    let a = pool.get("k").await.unwrap();
++    assert_eq!(pool.key_size(&"k"), 1);
++
++    let fut = pool.get("k");
++    tokio::pin!(fut);
++    assert!(is_pending(&mut fut).await, "second get on a saturated key must wait");
++
++    drop(a);
++    let b = fut.await.unwrap();
++    assert_eq!(pool.key_size(&"k"), 1);
++    drop(b);
++}
++
++#[tokio::test]
++async fn global_capacity_is_never_exceeded() {
++    let pool = pool(2, 0);
++    let a = pool.get("a").await.unwrap();
++    let b = pool.get("b").await.unwrap();
++    assert_eq!(pool.status().size, 2);
++
++    let fut = pool.get("c");
++    tokio::pin!(fut);
++    assert!(is_pending(&mut fut).await, "third object over global cap must wait");
++
++    drop(a);
++    let c = fut.await.unwrap();
++    assert!(pool.status().size <= 2, "size must never exceed max_size");
++    drop((b, c));
++}
++
++#[tokio::test]
++async fn full_pool_evicts_idle_object_of_another_key() {
++    let pool = pool(2, 0);
++    let a = pool.get("a").await.unwrap();
++    let b = pool.get("b").await.unwrap();
++    // "a" is returned first, so it is the least-recently-returned idle object.
++    drop(a);
++    drop(b);
++    assert_eq!(pool.status().size, 2);
++    assert_eq!(pool.status().available, 2);
++
++    // A brand-new key when globally full must evict the least-recently-returned
++    // idle object of a different key, i.e. "a" rather than "b".
++    let c = pool.get("c").await.unwrap();
++    assert!(pool.status().size <= 2);
++    assert_eq!(pool.key_size(&"c"), 1);
++    assert_eq!(pool.key_size(&"a"), 0, "the least-recently-returned idle object is the victim");
++    assert_eq!(pool.key_size(&"b"), 1, "the more recently returned idle object survives");
++    drop(c);
++}
++
++#[tokio::test]
++async fn eviction_victim_follows_return_order() {
++    // Same as above but with the return order reversed: "b" is returned first
++    // and must therefore be the victim.
++    let pool = pool(2, 0);
++    let a = pool.get("a").await.unwrap();
++    let b = pool.get("b").await.unwrap();
++    drop(b);
++    drop(a);
++
++    let c = pool.get("c").await.unwrap();
++    assert_eq!(pool.key_size(&"b"), 0, "the least-recently-returned idle object is the victim");
++    assert_eq!(pool.key_size(&"a"), 1);
++    assert_eq!(pool.key_size(&"c"), 1);
++    drop(c);
++}
++
++/// Reads an object's id through the associated-function API.
++fn object_id(o: &deadpool::managed::KeyedObject<Backend>) -> ObjectId {
++    deadpool::managed::KeyedObject::id(o)
++}
++
++#[tokio::test]
++async fn idle_object_is_reused_for_same_key() {
++    let pool = pool(4, 0);
++    let a = pool.get("k").await.unwrap();
++    let id = object_id(&a);
++    drop(a);
++    let b = pool.get("k").await.unwrap();
++    assert_eq!(object_id(&b), id, "idle object should be reused, not recreated");
++    drop(b);
++}
++
++#[tokio::test]
++async fn stale_idle_object_is_discarded_on_get() {
++    // A zero idle lifetime makes every idle object stale, so `get` must discard
++    // it and create a fresh one instead of reusing it.
++    let pool = KeyedPool::builder(Backend::default())
++        .max_size(4)
++        .max_idle_lifetime(Some(Duration::ZERO))
++        .build()
++        .unwrap();
++    let a = pool.get("k").await.unwrap();
++    let first = object_id(&a);
++    drop(a);
++
++    let b = pool.get("k").await.unwrap();
++    assert_ne!(object_id(&b), first, "a stale idle object must not be reused");
++    assert_eq!(pool.key_size(&"k"), 1);
++    drop(b);
++}
++
++#[tokio::test]
++async fn zero_max_per_key_means_unlimited() {
++    let pool = pool(4, 0);
++    let a = pool.get("k").await.unwrap();
++    let b = pool.get("k").await.unwrap();
++    let c = pool.get("k").await.unwrap();
++    assert_eq!(pool.key_size(&"k"), 3, "max_per_key of 0 must not limit a key");
++    drop((a, b, c));
++}
++
++#[tokio::test]
++async fn timeout_get_overrides_configured_timeouts() {
++    // The pool is configured to wait indefinitely; a per-call zero wait timeout
++    // must override that and fail immediately instead of blocking.
++    let pool = pool(1, 0);
++    let _a = pool.get("a").await.unwrap();
++
++    let non_blocking = Timeouts { wait: Some(Duration::ZERO), ..Timeouts::default() };
++    let err = pool.timeout_get("b", &non_blocking).await.err().unwrap();
++    assert!(matches!(err, PoolError::Timeout(_)));
++
++    // ...while the configured (unbounded) wait still blocks rather than erroring.
++    let fut = pool.get("b");
++    tokio::pin!(fut);
++    assert!(is_pending(&mut fut).await);
++}
++
++#[tokio::test]
++async fn non_blocking_wait_returns_timeout_when_saturated() {
++    let pool = pool(1, 0);
++    let _a = pool.get("a").await.unwrap();
++    let timeouts = Timeouts { wait: Some(Duration::ZERO), ..Timeouts::default() };
++    let err = pool.timeout_get("b", &timeouts).await.err().unwrap();
++    assert!(matches!(err, PoolError::Timeout(_)));
++}
++
++#[tokio::test]
++async fn blocking_wait_timeout_expires() {
++    let pool = KeyedPool::builder(Backend::default())
++        .max_size(1)
++        .wait_timeout(Some(Duration::from_millis(20)))
++        .runtime(Runtime::Tokio1)
++        .build()
++        .unwrap();
++    let _a = pool.get("a").await.unwrap();
++    let err = pool.get("b").await.err().unwrap();
++    assert!(matches!(err, PoolError::Timeout(_)));
++}
++
++#[tokio::test]
++async fn resize_shrink_drops_idle_and_respects_new_cap() {
++    let pool = pool(4, 0);
++    for k in ["a", "b", "c"] {
++        drop(pool.get(k).await.unwrap());
++    }
++    assert_eq!(pool.status().size, 3);
++    pool.resize(1);
++    assert!(pool.status().size <= 1, "shrink must drop idle objects down to the new cap");
++    // the freed slots are reusable
++    let x = pool.get("d").await.unwrap();
++    assert!(pool.status().size <= 1);
++    drop(x);
++}
++
++#[tokio::test]
++async fn resize_grow_adds_capacity() {
++    let pool = pool(1, 0);
++    let a = pool.get("a").await.unwrap();
++    let fut = pool.get("b");
++    tokio::pin!(fut);
++    assert!(is_pending(&mut fut).await);
++    pool.resize(2);
++    let b = fut.await.unwrap();
++    assert_eq!(pool.status().size, 2);
++    drop((a, b));
++}
++
++#[tokio::test]
++async fn clear_key_frees_only_that_key() {
++    let pool = pool(4, 0);
++    drop(pool.get("a").await.unwrap());
++    drop(pool.get("b").await.unwrap());
++    assert_eq!(pool.status().size, 2);
++    pool.clear_key(&"a");
++    assert_eq!(pool.key_size(&"a"), 0);
++    assert_eq!(pool.key_size(&"b"), 1);
++    assert_eq!(pool.status().size, 1);
++    // freed slot reusable by any key
++    let c = pool.get("c").await.unwrap();
++    assert!(pool.status().size <= 4);
++    drop(c);
++}
++
++#[tokio::test]
++async fn capacity_is_still_enforced_after_clear_key() {
++    // Removing an idle object frees a slot, but it must not increase the pool's
++    // effective capacity: once the freed slot is refilled the pool is full again.
++    let pool = pool(2, 0);
++    let a = pool.get("a").await.unwrap();
++    let b = pool.get("b").await.unwrap();
++    drop(a);
++    pool.clear_key(&"a");
++    assert_eq!(pool.status().size, 1);
++
++    let c = pool.get("c").await.unwrap();
++    assert_eq!(pool.status().size, 2);
++
++    // "b" and "c" are in flight and nothing is idle, so a further get must wait.
++    let fut = pool.get("d");
++    tokio::pin!(fut);
++    assert!(is_pending(&mut fut).await, "max_size must still be enforced after clear_key");
++    assert!(pool.status().size <= 2);
++    drop((b, c));
++}
++
++#[tokio::test]
++async fn capacity_is_still_enforced_after_reap_idle() {
++    let pool = KeyedPool::builder(Backend::default())
++        .max_size(2)
++        .max_idle_lifetime(Some(Duration::ZERO))
++        .build()
++        .unwrap();
++    let a = pool.get("a").await.unwrap();
++    let b = pool.get("b").await.unwrap();
++    drop(a);
++    assert_eq!(pool.reap_idle(), 1);
++    assert_eq!(pool.status().size, 1);
++
++    let c = pool.get("c").await.unwrap();
++    assert_eq!(pool.status().size, 2);
++
++    let fut = pool.get("d");
++    tokio::pin!(fut);
++    assert!(is_pending(&mut fut).await, "max_size must still be enforced after reap_idle");
++    assert!(pool.status().size <= 2);
++    drop((b, c));
++}
++
++#[tokio::test]
++async fn retain_removes_rejected_idle_objects() {
++    let pool = pool(4, 0);
++    drop(pool.get("a").await.unwrap());
++    drop(pool.get("b").await.unwrap());
++    let result: KeyedRetainResult = pool.retain(|key, _obj, _metrics| *key == "a");
++    assert_eq!(result.retained, 1);
++    assert_eq!(result.removed, 1);
++    assert_eq!(pool.key_size(&"b"), 0);
++    assert_eq!(pool.key_size(&"a"), 1);
++}
++
++#[tokio::test]
++async fn reap_idle_removes_stale_and_keeps_fresh() {
++    let stale = KeyedPool::builder(Backend::default())
++        .max_size(4)
++        .max_idle_lifetime(Some(Duration::ZERO))
++        .build()
++        .unwrap();
++    drop(stale.get("a").await.unwrap());
++    drop(stale.get("b").await.unwrap());
++    assert_eq!(stale.reap_idle(), 2, "zero lifetime makes every idle object stale");
++    assert_eq!(stale.status().size, 0);
++
++    let fresh = KeyedPool::builder(Backend::default())
++        .max_size(4)
++        .max_idle_lifetime(Some(Duration::from_secs(3600)))
++        .build()
++        .unwrap();
++    drop(fresh.get("a").await.unwrap());
++    assert_eq!(fresh.reap_idle(), 0);
++    assert_eq!(fresh.status().size, 1);
++}
++
++#[tokio::test]
++async fn close_rejects_new_gets_but_returns_in_flight() {
++    let pool = pool(2, 0);
++    let a = pool.get("a").await.unwrap();
++    pool.close();
++    assert!(pool.is_closed());
++    assert!(matches!(pool.get("b").await, Err(PoolError::Closed)));
++    // the in-flight object still drops cleanly
++    drop(a);
++}
++
++#[tokio::test]
++async fn take_removes_object_permanently() {
++    let pool = pool(2, 0);
++    let a = pool.get("k").await.unwrap();
++    assert_eq!(pool.key_size(&"k"), 1);
++    let value = deadpool::managed::KeyedObject::take(a);
++    let _ = value;
++    assert_eq!(pool.key_size(&"k"), 0, "take must free the slot");
++    // slot is reusable
++    let b = pool.get("k").await.unwrap();
++    assert_eq!(pool.key_size(&"k"), 1);
++    drop(b);
++}
++
++#[tokio::test]
++async fn object_ids_are_unique_and_increasing() {
++    let pool = pool(4, 0);
++    let a = pool.get("a").await.unwrap();
++    let b = pool.get("b").await.unwrap();
++    let c = pool.get("a").await.unwrap();
++    let (ia, ib, ic) = (object_id(&a), object_id(&b), object_id(&c));
++    assert!(ia < ib && ib < ic, "ids must be unique and increasing: {ia:?}, {ib:?}, {ic:?}");
++    drop((a, b, c));
++}
++
++#[tokio::test]
++async fn close_detaches_idle_objects() {
++    let pool = pool(4, 0);
++    drop(pool.get("a").await.unwrap());
++    drop(pool.get("b").await.unwrap());
++    assert_eq!(pool.status().size, 2);
++
++    pool.close();
++    assert!(pool.is_closed());
++    assert_eq!(pool.status().size, 0, "close must detach the idle objects");
++}
++
++#[tokio::test]
++async fn resize_shrink_keeps_checked_out_objects() {
++    let pool = pool(3, 0);
++    let a = pool.get("a").await.unwrap();
++    let b = pool.get("b").await.unwrap();
++    drop(pool.get("c").await.unwrap()); // one idle object
++    assert_eq!(pool.status().size, 3);
++
++    // Shrinking below the number of checked-out objects drops only the idle one;
++    // the two in-flight objects are never removed.
++    pool.resize(1);
++    assert_eq!(pool.status().size, 2, "checked-out objects must survive a shrink");
++    assert_eq!(pool.key_size(&"c"), 0, "the idle object is dropped");
++    assert_eq!(pool.key_size(&"a"), 1);
++    assert_eq!(pool.key_size(&"b"), 1);
++    drop((a, b));
++}
++
++#[tokio::test]
++async fn close_returns_closed_even_for_a_saturated_key() {
++    // The per-key limit is reached, so a further get for that key would queue on
++    // the per-key gate. Closing the pool must still make it fail rather than
++    // leave the caller blocked forever.
++    let pool = pool(4, 1);
++    let a = pool.get("k").await.unwrap();
++    pool.close();
++
++    let result = tokio::time::timeout(Duration::from_secs(5), pool.get("k"))
++        .await
++        .expect("close() must not leave a get() for a saturated key blocked");
++    assert!(matches!(result, Err(PoolError::Closed)));
++    drop(a);
++}
++
++#[tokio::test]
++async fn nothing_is_handed_out_while_over_capacity_after_a_shrink() {
++    let pool = pool(3, 0);
++    let a = pool.get("a").await.unwrap();
++    let b = pool.get("b").await.unwrap();
++    let c = pool.get("c").await.unwrap();
++    assert_eq!(pool.status().size, 3);
++
++    // Nothing is idle, so the shrink cannot remove anything and the pool is left
++    // above the new cap.
++    pool.resize(1);
++    assert_eq!(pool.status().size, 3, "checked-out objects survive a shrink");
++
++    let fut = pool.get("d");
++    tokio::pin!(fut);
++    assert!(is_pending(&mut fut).await, "no object may be handed out while over the cap");
++
++    // While over the cap a returned object is discarded rather than kept idle,
++    // and the waiter still gets nothing.
++    drop(a);
++    assert_eq!(pool.status().size, 2);
++    assert!(is_pending(&mut fut).await, "still over the cap");
++
++    drop(b);
++    assert_eq!(pool.status().size, 1);
++    assert!(is_pending(&mut fut).await, "the last object is still checked out");
++
++    // Once the pool is back within the cap the waiter is finally served.
++    drop(c);
++    let d = fut.await.unwrap();
++    assert!(pool.status().size <= 1, "size must be back within the new cap");
++    drop(d);
++}
++
++#[tokio::test]
++async fn resize_shrink_then_grow_does_not_over_issue_capacity() {
++    // A shrink cannot remove checked-out objects, so it can leave the pool over
++    // capacity. Growing again must only hand out the slots that are genuinely
++    // free, not `new_max - old_max` of them.
++    let pool = pool(3, 0);
++    let a = pool.get("a").await.unwrap();
++    let b = pool.get("b").await.unwrap();
++    drop(pool.get("c").await.unwrap()); // one idle object
++    assert_eq!(pool.status().size, 3);
++
++    pool.resize(1); // drops the idle object; the two checked-out ones remain
++    assert_eq!(pool.status().size, 2);
++    pool.resize(3);
++
++    let d = pool.get("d").await.unwrap(); // fills the single genuinely free slot
++    assert_eq!(pool.status().size, 3);
++
++    let fut = pool.get("e");
++    tokio::pin!(fut);
++    assert!(is_pending(&mut fut).await, "growing must not over-issue capacity");
++    assert!(pool.status().size <= 3, "size must never exceed max_size");
++    drop((a, b, d));
++}
++
++#[tokio::test]
++async fn cleanup_never_disturbs_checked_out_objects() {
++    let pool = pool(4, 0);
++    let a = pool.get("k").await.unwrap(); // checked out
++    drop(pool.get("k").await.unwrap()); // idle, same key
++    assert_eq!(pool.key_size(&"k"), 2);
++
++    pool.clear_key(&"k");
++    assert_eq!(pool.key_size(&"k"), 1, "clear_key removes only the idle object");
++
++    // the checked-out object is untouched and still returns cleanly
++    drop(a);
++    assert_eq!(pool.key_size(&"k"), 1);
++    assert_eq!(pool.status().available, 1);
++}
++
++#[tokio::test]
++async fn status_and_key_introspection() {
++    let pool = pool(4, 3);
++    let a = pool.get("a").await.unwrap();
++    let b = pool.get("a").await.unwrap();
++    drop(pool.get("b").await.unwrap());
++    let ks: KeyedKeyStatus = pool.key_status(&"a");
++    assert_eq!(ks.size, 2);
++    assert_eq!(ks.available, 0);
++    assert_eq!(ks.max_per_key, 3);
++
++    let status: KeyedStatus = pool.status();
++    assert_eq!(status.max_size, 4);
++    assert_eq!(status.size, 3);
++    assert_eq!(status.available, 1, "only the returned \"b\" object is idle");
++    assert_eq!(status.keys, 2, "two keys hold objects");
++
++    let mut keys = pool.keys();
++    keys.sort_unstable();
++    assert_eq!(keys, vec!["a", "b"]);
++    drop((a, b));
++}
++
++/// Records the key handed to every manager callback into a shared log.
++struct Recorder {
++    calls: Arc<Mutex<Vec<String>>>,
++}
++
++impl KeyedManager for Recorder {
++    type Key = &'static str;
++    type Type = usize;
++    type Error = ();
++
++    async fn create(&self, key: &&'static str) -> Result<usize, ()> {
++        self.calls.lock().unwrap().push(format!("create:{key}"));
++        Ok(0)
++    }
++
++    async fn recycle(
++        &self,
++        key: &&'static str,
++        _obj: &mut usize,
++        _metrics: &Metrics,
++    ) -> RecycleResult<()> {
++        self.calls.lock().unwrap().push(format!("recycle:{key}"));
++        Ok(())
++    }
++
++    fn detach(&self, key: &&'static str, _obj: &mut usize) {
++        self.calls.lock().unwrap().push(format!("detach:{key}"));
++    }
++}
++
++#[tokio::test]
++async fn manager_callbacks_receive_the_right_key() {
++    let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
++    let pool = KeyedPool::new(
++        Recorder {
++            calls: Arc::clone(&calls),
++        },
++        KeyedPoolConfig::new(2, 0),
++    );
++
++    drop(pool.get("a").await.unwrap()); // create:a, then idle
++    drop(pool.get("a").await.unwrap()); // recycle:a (reused)
++    let b = pool.get("b").await.unwrap(); // create:b
++    drop(b);
++
++    // Pool is full with "a" and "b" idle; "a" was returned first, so a get for a
++    // new key evicts "a" -> detach:a, then create:c.
++    let c = pool.get("c").await.unwrap();
++    drop(c);
++
++    let calls = calls.lock().unwrap().clone();
++    assert_eq!(
++        calls,
++        vec!["create:a", "recycle:a", "create:b", "detach:a", "create:c"],
++        "each callback must receive the key it belongs to"
++    );
++}
++
++/// A manager whose `create` and `recycle` are slow enough to trip timeouts.
++#[derive(Default)]
++struct SlowBackend {
++    next: AtomicUsize,
++    slow_recycle: bool,
++}
++
++impl KeyedManager for SlowBackend {
++    type Key = &'static str;
++    type Type = usize;
++    type Error = ();
++
++    async fn create(&self, _key: &&'static str) -> Result<usize, ()> {
++        if !self.slow_recycle {
++            tokio::time::sleep(Duration::from_millis(500)).await;
++        }
++        Ok(self.next.fetch_add(1, Ordering::SeqCst))
++    }
++
++    async fn recycle(
++        &self,
++        _key: &&'static str,
++        _obj: &mut usize,
++        _metrics: &Metrics,
++    ) -> RecycleResult<()> {
++        if self.slow_recycle {
++            tokio::time::sleep(Duration::from_millis(500)).await;
++        }
++        Ok(())
++    }
++
++    fn detach(&self, _key: &&'static str, _obj: &mut usize) {}
++}
++
++#[tokio::test]
++async fn timeout_get_overrides_the_create_timeout() {
++    // The pool's configured create timeout is generous; a per-call short one
++    // must override it, so the override applies to more than just `wait`.
++    let pool = KeyedPool::builder(SlowBackend::default())
++        .max_size(1)
++        .create_timeout(Some(Duration::from_secs(30)))
++        .runtime(Runtime::Tokio1)
++        .build()
++        .unwrap();
++
++    let short = Timeouts {
++        create: Some(Duration::from_millis(20)),
++        ..Timeouts::default()
++    };
++    let err = pool.timeout_get("a", &short).await.err().unwrap();
++    assert!(matches!(err, PoolError::Timeout(_)));
++}
++
++#[tokio::test]
++async fn timeout_get_overrides_the_recycle_timeout() {
++    // The pool's configured recycle timeout is generous; a per-call short one
++    // must override it, so the idle object cannot be recycled and is replaced.
++    let pool = KeyedPool::builder(SlowBackend {
++        next: AtomicUsize::new(0),
++        slow_recycle: true,
++    })
++    .max_size(2)
++    .recycle_timeout(Some(Duration::from_secs(30)))
++    .runtime(Runtime::Tokio1)
++    .build()
++    .unwrap();
++
++    drop(pool.get("k").await.unwrap()); // object 0, now idle
++
++    let short = Timeouts {
++        recycle: Some(Duration::from_millis(20)),
++        ..Timeouts::default()
++    };
++    let b = pool.timeout_get("k", &short).await.unwrap();
++    assert_eq!(*b, 1, "the un-recyclable idle object is replaced by a fresh one");
++    drop(b);
++}
++
++#[tokio::test]
++async fn create_timeout_expires() {
++    let pool = KeyedPool::builder(SlowBackend::default())
++        .max_size(1)
++        .create_timeout(Some(Duration::from_millis(20)))
++        .runtime(Runtime::Tokio1)
++        .build()
++        .unwrap();
++    let err = pool.get("a").await.err().unwrap();
++    assert!(matches!(err, PoolError::Timeout(_)));
++}
++
++#[tokio::test]
++async fn recycle_timeout_discards_the_idle_object() {
++    let pool = KeyedPool::builder(SlowBackend {
++        next: AtomicUsize::new(0),
++        slow_recycle: true,
++    })
++    .max_size(2)
++    .recycle_timeout(Some(Duration::from_millis(20)))
++    .runtime(Runtime::Tokio1)
++    .build()
++    .unwrap();
++
++    let a = pool.get("k").await.unwrap();
++    drop(a); // now idle; recycling it will time out
++
++    // The idle object cannot be recycled, so it is discarded and a fresh one is
++    // created instead of surfacing an error.
++    let b = pool.get("k").await.unwrap();
++    assert_eq!(*b, 1, "a fresh object replaces the un-recyclable idle one");
++    assert_eq!(pool.key_size(&"k"), 1);
++    drop(b);
++}
++
++#[test]
++fn builder_requires_runtime_for_timeouts() {
++    let result = KeyedPool::builder(Backend::default())
++        .wait_timeout(Some(Duration::from_millis(10)))
++        .build();
++    assert!(result.is_err(), "timeouts without a runtime must fail to build");
++}
++
++#[tokio::test]
++async fn cancelling_a_get_while_it_creates_gives_the_slot_back() {
++    let pool = slow_pool(2, 0, false);
++    {
++        let fut = pool.get("a");
++        tokio::pin!(fut);
++        assert!(is_pending(&mut fut).await);
++    }
++    assert_eq!(pool.status().size, 0);
++    assert_eq!(pool.key_size(&"a"), 0);
++    assert_eq!(pool.status().available, 0);
++}
++
++#[tokio::test]
++async fn cancelling_a_get_while_it_recycles_gives_the_slot_back() {
++    let pool = slow_pool(2, 0, true);
++    drop(pool.get("a").await.unwrap());
++    assert_eq!(pool.status().size, 1);
++    {
++        let fut = pool.get("a");
++        tokio::pin!(fut);
++        assert!(is_pending(&mut fut).await);
++    }
++    assert_eq!(pool.status().size, 0);
++    assert_eq!(pool.key_size(&"a"), 0);
++}
++
++#[tokio::test]
++async fn cancelling_a_get_that_waits_for_capacity_leaves_the_pool_intact() {
++    let pool = pool(1, 0);
++    let held = pool.get("a").await.unwrap();
++    {
++        let fut = pool.get("b");
++        tokio::pin!(fut);
++        assert!(is_pending(&mut fut).await);
++    }
++    assert_eq!(pool.status().size, 1);
++    drop(held);
++    let next = pool.get("b").await.unwrap();
++    assert_eq!(pool.key_size(&"b"), 1);
++    drop(next);
++}
++
++#[tokio::test]
++async fn a_cancelled_waiter_does_not_swallow_the_object_it_was_waiting_for() {
++    let pool = pool(1, 0);
++    let held = pool.get("a").await.unwrap();
++    let mut abandoned = Box::pin(pool.get("a"));
++    assert!(is_pending(&mut abandoned.as_mut()).await);
++    drop(held);
++    drop(abandoned);
++
++    let obj = tokio::time::timeout(Duration::from_secs(5), pool.get("a"))
++        .await
++        .expect("the cancelled waiter must not keep the only slot")
++        .unwrap();
++    assert_eq!(pool.status().size, 1);
++    drop(obj);
++}
++
++#[tokio::test]
++async fn cancelling_a_get_frees_the_per_key_slot_too() {
++    let pool = slow_pool(4, 1, false);
++    {
++        let fut = pool.get("a");
++        tokio::pin!(fut);
++        assert!(is_pending(&mut fut).await);
++    }
++    assert_eq!(pool.key_size(&"a"), 0);
++
++    let fut = pool.get("a");
++    tokio::pin!(fut);
++    assert!(is_pending(&mut fut).await);
++    let obj = fut.await.unwrap();
++    assert_eq!(pool.key_size(&"a"), 1);
++    drop(obj);
++}
++
++#[tokio::test]
++async fn repeated_cancellation_never_erodes_the_capacity() {
++    let pool = slow_pool(2, 0, false);
++    for key in ["a", "b", "c", "a", "b"] {
++        let fut = pool.get(key);
++        tokio::pin!(fut);
++        assert!(is_pending(&mut fut).await);
++    }
++    assert_eq!(pool.status().size, 0);
++    assert_eq!(pool.keys().len(), 0);
++
++    let a = pool.get("a").await.unwrap();
++    let b = pool.get("b").await.unwrap();
++    assert_eq!(pool.status().size, 2);
++
++    let fut = pool.get("c");
++    tokio::pin!(fut);
++    assert!(is_pending(&mut fut).await);
++    drop((a, b));
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..1f79522
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,106 @@
++#!/usr/bin/env bash
++set -u
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path)
++      OUTPUT_PATH="$2"
++      shift 2
++      ;;
++    base|new)
++      MODE="$1"
++      shift
++      ;;
++    *)
++      shift
++      ;;
++  esac
++done
++
++if [ -z "$MODE" ] || [ -z "$OUTPUT_PATH" ]; then
++  echo "usage: test.sh --output_path <path> base|new" >&2
++  exit 2
++fi
++
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++cd "$(dirname "$0")"
++
++export CARGO_HOME="${CARGO_HOME:-/opt/cargo}"
++export PATH="${CARGO_HOME}/bin:${PATH}"
++export CARGO_NET_OFFLINE=true
++export CARGO_TERM_COLOR=never
++
++TEST_FILE="crates/deadpool/tests/keyed_pool_behavior_matrix.rs"
++TEST_TARGET="keyed_pool_behavior_matrix"
++
++sanitize() {
++  printf '%s' "$1" | tail -c 4000 | sed 's/]]>/]] >/g'
++}
++
++if [ "$MODE" = "new" ]; then
++  # The hidden suite exercises the keyed pool through the public API. On the
++  # base repo it does not compile (the keyed pool does not exist yet), so cargo
++  # emits a compiler error and no per-test results; in that case synthesize one
++  # failing node per expected test so the report keeps per-test granularity.
++  TESTS=$(awk '/#\[(tokio::)?test\]/{getline; if ($0 ~ /fn /) {sub(/.*fn /,""); sub(/\(.*/,""); print}}' "$TEST_FILE")
++
++  OUT=$(cd crates/deadpool && cargo test --features rt_tokio_1,managed --test "$TEST_TARGET" 2>&1)
++
++  total=0
++  failures=0
++  body=""
++  for tn in $TESTS; do
++    total=$((total + 1))
++    if printf '%s\n' "$OUT" | grep -qE "^test ${tn} \.\.\. ok"; then
++      body="$body    <testcase name=\"${tn}\" classname=\"keyed_pool\"></testcase>
++"
++    else
++      failures=$((failures + 1))
++      body="$body    <testcase name=\"${tn}\" classname=\"keyed_pool\"><failure message=\"failed\"><![CDATA[$(sanitize "$OUT")]]></failure></testcase>
++"
++    fi
++  done
++
++  cat > "$OUTPUT_PATH" <<XML
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites>
++  <testsuite name="keyed_pool" tests="${total}" failures="${failures}">
++${body}  </testsuite>
++</testsuites>
++XML
++  [ "$failures" -eq 0 ] && exit 0 || exit 1
++fi
++
++# base mode: the crate's own unit tests and doctests. Integration test targets
++# are not compiled here, so the hidden suite (added by test.patch) is excluded
++# and this passes on the base repo as well as with the solution applied.
++LIB_OUT=$(cd crates/deadpool && cargo test --lib 2>&1)
++RC=$?
++DOC_OUT=$(cd crates/deadpool && cargo test --doc 2>&1)
++DOC_RC=$?
++[ "$RC" -eq 0 ] && RC=$DOC_RC
++OUT="${LIB_OUT}
++${DOC_OUT}"
++
++if [ "$RC" -eq 0 ]; then
++  cat > "$OUTPUT_PATH" <<XML
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites>
++  <testsuite name="regression" tests="1" failures="0">
++    <testcase name="deadpool_lib_and_doctests" classname="regression"></testcase>
++  </testsuite>
++</testsuites>
++XML
++else
++  cat > "$OUTPUT_PATH" <<XML
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites>
++  <testsuite name="regression" tests="1" failures="1">
++    <testcase name="deadpool_lib_and_doctests" classname="regression"><failure message="failed"><![CDATA[$(sanitize "$OUT")]]></failure></testcase>
++  </testsuite>
++</testsuites>
++XML
++fi
++exit "$RC"

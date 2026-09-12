@@ -1,0 +1,168 @@
+diff --git a/internal/compiler/checker_statements.go b/internal/compiler/checker_statements.go
+index 30a8f12f..de3c0f09 100644
+--- a/internal/compiler/checker_statements.go
++++ b/internal/compiler/checker_statements.go
+@@ -320,6 +320,18 @@ nodesLoop:
+ 				}
+ 				typ1 = typ.Elem()
+ 				maxLhs = 1
++			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
++				reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
++				if ti.Untyped() {
++					if _, err := ti.Constant.representedBy(intType); err != nil {
++						panic(tc.errorf(node.Assignment.Rhs[0], "cannot range over %s (type %s)", expr, ti.StringWithNumber(true)))
++					}
++					ti.setValue(intType)
++					typ1 = intType
++				} else {
++					typ1 = typ
++				}
++				maxLhs = 1
+ 			default:
+ 				panic(tc.errorf(node.Assignment.Rhs[0], "cannot range over %s (type %s)", expr, ti.StringWithNumber(true)))
+ 			}
+diff --git a/internal/compiler/checker_template_test.go b/internal/compiler/checker_template_test.go
+index 9242becf..335ddff1 100644
+--- a/internal/compiler/checker_template_test.go
++++ b/internal/compiler/checker_template_test.go
+@@ -580,7 +580,7 @@ var checkerTemplateStmts = []struct {
+ 	{src: `{%% for k in map[float64]string{} { var _ float64 = k } %%}`, expected: ok},
+ 	{src: `{%% for _ in (&[...]int{}) { } %%}`, expected: ok},
+ 	{src: `{%% for a in make(<-chan string) { var _ string = a } %%}`, expected: ok},
+-	{src: `{%% for _ in 0 { } %%}`, expected: `cannot range over 0 (type untyped number)`},
++	{src: `{%% for _ in 0 { } %%}`, expected: `too many variables in range`},
+ 	{src: `{%% for _ in (&[]int{}) { } %%}`, expected: `cannot range over &[]int{} (type *[]int)`},
+ 	{src: `{%% for a, b in "" { } %%}`, expected: `unexpected in, expecting := or = or comma`}, // should be better 'too many variables in range'.
+ 	{src: `{%% for a in nil { } %%}`, expected: `cannot range over nil`},
+diff --git a/internal/compiler/checker_test.go b/internal/compiler/checker_test.go
+index f75d0e33..65624369 100644
+--- a/internal/compiler/checker_test.go
++++ b/internal/compiler/checker_test.go
+@@ -1242,7 +1242,7 @@ var checkerStmts = map[string]string{
+ 	`for k, v := range ([...]int{}) { var _, _ int = k, v }`:                         ok,
+ 	`for k, v := range map[float64]string{} { var _ float64 = k; var _ string = v }`: ok,
+ 	`for _, _ = range (&[...]int{}) { }`:                                             ok,
+-	`for _, _ = range 0 { }`:                                                         `cannot range over 0 (type untyped number)`,
++	`for _, _ = range 0 { }`:                                                         `too many variables in range`,
+ 	`for _, _ = range (&[]int{}) { }`:                                                `cannot range over &[]int{} (type *[]int)`,
+ 	`for a, b, c := range "" { }`:                                                    `too many variables in range`,
+ 	`for a, b := range nil { }`:                                                      `cannot range over nil`,
+diff --git a/internal/compiler/emitter_statements.go b/internal/compiler/emitter_statements.go
+index 648f3538..f5d33898 100644
+--- a/internal/compiler/emitter_statements.go
++++ b/internal/compiler/emitter_statements.go
+@@ -1041,6 +1041,11 @@ func (em *emitter) emitTypeSwitch(node *ast.TypeSwitch) {
+ // emitForRange emits a for range statement.
+ func (em *emitter) emitForRange(node *ast.ForRange) {
+ 
++	if k := em.typ(node.Assignment.Rhs[0]).Kind(); reflect.Int <= k && k <= reflect.Uintptr {
++		em.emitForRangeInt(node)
++		return
++	}
++
+ 	inForRange := em.inForRange
+ 	em.inForRange = true
+ 
+@@ -1132,3 +1137,102 @@ func (em *emitter) emitForRange(node *ast.ForRange) {
+ 	}
+ 
+ }
++
++// emitForRangeInt emits the code for a for-range statement whose range
++// expression is an integer.
++func (em *emitter) emitForRangeInt(node *ast.ForRange) {
++
++	vars := node.Assignment.Lhs
++	expr := node.Assignment.Rhs[0]
++	exprType := em.typ(expr)
++	kind := exprType.Kind()
++	pos := node.Pos()
++
++	currentBreakable := em.breakable
++	currentBreakLabel := em.breakLabel
++	em.breakable = true
++	em.breakLabel = nil
++
++	em.fb.enterScope()
++
++	// The range expression is evaluated once, so snapshot it into a
++	// dedicated register that the loop condition reads.
++	nReg := em.fb.newRegister(kind)
++	em.fb.emitMove(false, em.emitExpr(expr, exprType), nReg, kind)
++
++	// The counter drives the iteration and is kept separate from the range
++	// variable, so the range variable retains its last value (n-1) after
++	// the loop rather than n.
++	counter := em.fb.newRegister(kind)
++
++	var index, indirectIndex int8
++	hasVar := len(vars) >= 1 && !isBlankIdentifier(vars[0])
++	if hasVar {
++		name := vars[0].(*ast.Identifier).Name
++		if node.Assignment.Type == ast.AssignmentDeclaration {
++			index = em.fb.newRegister(kind)
++			if em.varStore.mustBeDeclaredAsIndirect(vars[0].(*ast.Identifier)) {
++				indirectIndex = em.fb.newIndirectRegister()
++				em.fb.emitNew(exprType, -indirectIndex)
++				em.fb.bindVarReg(name, indirectIndex)
++			} else {
++				em.fb.bindVarReg(name, index)
++			}
++		} else {
++			index = em.fb.scopeLookup(name)
++		}
++	}
++
++	cond := runtime.ConditionLess
++	switch kind {
++	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
++		cond = runtime.ConditionLessU
++	}
++
++	em.fb.emitMove(true, 0, counter, kind)
++
++	endForLabel := em.fb.newLabel()
++	var elseLabel label
++	if node.Else != nil {
++		elseLabel = em.fb.newLabel()
++		em.fb.emitIf(false, counter, cond, nReg, kind, pos)
++		em.fb.emitGoto(elseLabel)
++	}
++
++	forHead := em.fb.newLabel()
++	forPost := em.fb.newLabel()
++	em.fb.setLabelAddr(forHead)
++	em.fb.emitIf(false, counter, cond, nReg, kind, pos)
++	em.fb.emitGoto(endForLabel)
++
++	em.fb.enterScope()
++	if hasVar {
++		em.fb.emitMove(false, counter, index, kind)
++		if indirectIndex != 0 {
++			em.changeRegister(false, index, indirectIndex, exprType, exprType)
++		}
++	}
++	em.rangeLabels = append(em.rangeLabels, forPost)
++	em.emitNodes(node.Body)
++	em.rangeLabels = em.rangeLabels[:len(em.rangeLabels)-1]
++	em.fb.setLabelAddr(forPost)
++	em.fb.emitAdd(true, counter, 1, counter, kind)
++	em.fb.emitGoto(forHead)
++	em.fb.exitScope()
++
++	if node.Else != nil {
++		em.fb.setLabelAddr(elseLabel)
++		em.fb.enterScope()
++		em.emitNodes(node.Else.Nodes)
++		em.fb.exitScope()
++	}
++
++	em.fb.setLabelAddr(endForLabel)
++	em.fb.exitScope()
++
++	if em.breakLabel != nil {
++		em.fb.setLabelAddr(*em.breakLabel)
++	}
++	em.breakable = currentBreakable
++	em.breakLabel = currentBreakLabel
++}

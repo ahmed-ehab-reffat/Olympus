@@ -1,0 +1,1169 @@
+diff --git a/copyOnWriteFs.go b/copyOnWriteFs.go
+index aba2879..a51e764 100644
+--- a/copyOnWriteFs.go
++++ b/copyOnWriteFs.go
+@@ -18,14 +18,22 @@ var _ Lstater = (*CopyOnWriteFs)(nil)
+ //
+ // Reading directories is currently only supported via Open(), not OpenFile().
+ type CopyOnWriteFs struct {
+-	base  Fs
+-	layer Fs
++	base      Fs
++	layer     Fs
++	deletions bool
+ }
+ 
+ func NewCopyOnWriteFs(base Fs, layer Fs) Fs {
+ 	return &CopyOnWriteFs{base: base, layer: layer}
+ }
+ 
++// NewCopyOnWriteFsWithDeletions returns an overlay that records removals in the
++// layer, so paths that live only in the base can be removed and renamed and stay
++// that way for any overlay built over the same layer.
++func NewCopyOnWriteFsWithDeletions(base Fs, layer Fs) *CopyOnWriteFs {
++	return &CopyOnWriteFs{base: base, layer: layer, deletions: true}
++}
++
+ // Returns true if the file is not in the overlay
+ func (u *CopyOnWriteFs) isBaseFile(name string) (bool, error) {
+ 	if _, err := u.layer.Stat(name); err == nil {
+@@ -50,7 +58,21 @@ func (u *CopyOnWriteFs) copyToLayer(name string) error {
+ 	return copyToLayer(u.base, u.layer, name)
+ }
+ 
++func (u *CopyOnWriteFs) gone(op, name string) (bool, error) {
++	hidden, err := u.hidden(name)
++	if err != nil {
++		return false, err
++	}
++	if !hidden {
++		return false, nil
++	}
++	return true, &os.PathError{Op: op, Path: name, Err: os.ErrNotExist}
++}
++
+ func (u *CopyOnWriteFs) Chtimes(name string, atime, mtime time.Time) error {
++	if hidden, gerr := u.gone("chtimes", name); hidden || gerr != nil {
++		return gerr
++	}
+ 	b, err := u.isBaseFile(name)
+ 	if err != nil {
+ 		return err
+@@ -64,6 +86,9 @@ func (u *CopyOnWriteFs) Chtimes(name string, atime, mtime time.Time) error {
+ }
+ 
+ func (u *CopyOnWriteFs) Chmod(name string, mode os.FileMode) error {
++	if hidden, gerr := u.gone("chmod", name); hidden || gerr != nil {
++		return gerr
++	}
+ 	b, err := u.isBaseFile(name)
+ 	if err != nil {
+ 		return err
+@@ -77,6 +102,9 @@ func (u *CopyOnWriteFs) Chmod(name string, mode os.FileMode) error {
+ }
+ 
+ func (u *CopyOnWriteFs) Chown(name string, uid, gid int) error {
++	if hidden, gerr := u.gone("chown", name); hidden || gerr != nil {
++		return gerr
++	}
+ 	b, err := u.isBaseFile(name)
+ 	if err != nil {
+ 		return err
+@@ -90,6 +118,9 @@ func (u *CopyOnWriteFs) Chown(name string, uid, gid int) error {
+ }
+ 
+ func (u *CopyOnWriteFs) Stat(name string) (os.FileInfo, error) {
++	if hidden, gerr := u.gone("stat", name); hidden || gerr != nil {
++		return nil, gerr
++	}
+ 	fi, err := u.layer.Stat(name)
+ 	if err != nil {
+ 		isNotExist := u.isNotExist(err)
+@@ -102,6 +133,10 @@ func (u *CopyOnWriteFs) Stat(name string) (os.FileInfo, error) {
+ }
+ 
+ func (u *CopyOnWriteFs) LstatIfPossible(name string) (os.FileInfo, bool, error) {
++	if hidden, gerr := u.gone("lstat", name); hidden || gerr != nil {
++		return nil, false, gerr
++	}
++
+ 	llayer, ok1 := u.layer.(Lstater)
+ 	lbase, ok2 := u.base.(Lstater)
+ 
+@@ -140,6 +175,10 @@ func (u *CopyOnWriteFs) SymlinkIfPossible(oldname, newname string) error {
+ }
+ 
+ func (u *CopyOnWriteFs) ReadlinkIfPossible(name string) (string, error) {
++	if hidden, gerr := u.gone("readlink", name); hidden || gerr != nil {
++		return "", gerr
++	}
++
+ 	if rlayer, ok := u.layer.(LinkReader); ok {
+ 		return rlayer.ReadlinkIfPossible(name)
+ 	}
+@@ -161,56 +200,141 @@ func (u *CopyOnWriteFs) isNotExist(err error) bool {
+ 	return false
+ }
+ 
+-// Renaming files present only in the base layer is not permitted
++// Renaming files present only in the base layer is not permitted unless the
++// overlay records removals, in which case the source is copied into the layer
++// under the new name and the old name is recorded as removed.
+ func (u *CopyOnWriteFs) Rename(oldname, newname string) error {
+-	b, err := u.isBaseFile(oldname)
+-	if err != nil {
++	if !u.deletions {
++		b, err := u.isBaseFile(oldname)
++		if err != nil {
++			return err
++		}
++		if b {
++			return syscall.EPERM
++		}
++		return u.layer.Rename(oldname, newname)
++	}
++
++	if hidden, gerr := u.gone("rename", oldname); hidden || gerr != nil {
++		return gerr
++	}
++	if overlayPath(oldname) == overlayPath(newname) {
++		_, err := u.Stat(oldname)
+ 		return err
+ 	}
+-	if b {
+-		return syscall.EPERM
++	if err := u.materializeSubtree(oldname); err != nil {
++		return err
++	}
++	if err := u.ensureLayerDir(filepath.Dir(newname)); err != nil {
++		return err
++	}
++	if err := u.clearRemoval(newname); err != nil {
++		return err
++	}
++	if err := u.layer.Rename(oldname, newname); err != nil {
++		return err
++	}
++	if _, err := u.base.Stat(oldname); err == nil {
++		return u.recordRemoval(oldname)
++	} else if !u.isNotExist(err) && !os.IsNotExist(err) {
++		return err
+ 	}
+-	return u.layer.Rename(oldname, newname)
++	return nil
+ }
+ 
+-// Removing files present only in the base layer is not permitted. If
+-// a file is present in the base layer and the overlay, only the overlay
+-// will be removed.
++// Removing files present only in the base layer is not permitted unless the
++// overlay records removals. If a file is present in the base layer and the
++// overlay, only the overlay will be removed unless removals are recorded.
+ func (u *CopyOnWriteFs) Remove(name string) error {
+-	err := u.layer.Remove(name)
+-	switch err {
+-	case syscall.ENOENT:
+-		_, err = u.base.Stat(name)
+-		if err == nil {
+-			return syscall.EPERM
++	if !u.deletions {
++		err := u.layer.Remove(name)
++		switch err {
++		case syscall.ENOENT:
++			_, err = u.base.Stat(name)
++			if err == nil {
++				return syscall.EPERM
++			}
++			return syscall.ENOENT
++		default:
++			return err
+ 		}
+-		return syscall.ENOENT
+-	default:
+-		return err
+ 	}
++
++	if hidden, gerr := u.gone("remove", name); hidden || gerr != nil {
++		return gerr
++	}
++	fi, err := u.Stat(name)
++	if err != nil {
++		return &os.PathError{Op: "remove", Path: name, Err: os.ErrNotExist}
++	}
++	if fi.IsDir() {
++		infos, err := u.mergedInfos(name)
++		if err != nil {
++			return err
++		}
++		if len(infos) > 0 {
++			return &os.PathError{Op: "remove", Path: name, Err: syscall.ENOTEMPTY}
++		}
++	}
++	return u.hidePath(name)
+ }
+ 
+ func (u *CopyOnWriteFs) RemoveAll(name string) error {
+-	err := u.layer.RemoveAll(name)
+-	switch err {
+-	case syscall.ENOENT:
+-		_, err = u.base.Stat(name)
+-		if err == nil {
+-			return syscall.EPERM
++	if !u.deletions {
++		err := u.layer.RemoveAll(name)
++		switch err {
++		case syscall.ENOENT:
++			_, err = u.base.Stat(name)
++			if err == nil {
++				return syscall.EPERM
++			}
++			return syscall.ENOENT
++		default:
++			return err
+ 		}
+-		return syscall.ENOENT
+-	default:
++	}
++
++	hidden, err := u.hidden(name)
++	if err != nil {
+ 		return err
+ 	}
++	if hidden {
++		return nil
++	}
++	if _, err := u.Stat(name); err != nil {
++		return nil
++	}
++	return u.hidePath(name)
+ }
+ 
+ func (u *CopyOnWriteFs) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
++	writing := flag&(os.O_WRONLY|os.O_RDWR|os.O_APPEND|os.O_CREATE|os.O_TRUNC) != 0
++
++	if u.deletions {
++		hidden, err := u.hidden(name)
++		if err != nil {
++			return nil, err
++		}
++		if hidden {
++			if !writing || flag&os.O_CREATE == 0 {
++				return nil, &os.PathError{Op: "open", Path: name, Err: os.ErrNotExist}
++			}
++			if err := u.ensureLayerDir(filepath.Dir(name)); err != nil {
++				return nil, err
++			}
++			if err := u.clearRemoval(name); err != nil {
++				return nil, err
++			}
++			return u.layer.OpenFile(name, flag, perm)
++		}
++	}
++
+ 	b, err := u.isBaseFile(name)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	if flag&(os.O_WRONLY|os.O_RDWR|os.O_APPEND|os.O_CREATE|os.O_TRUNC) != 0 {
++	if writing {
+ 		if b {
+ 			if err = u.copyToLayer(name); err != nil {
+ 				return nil, err
+@@ -224,7 +348,7 @@ func (u *CopyOnWriteFs) OpenFile(name string, flag int, perm os.FileMode) (File,
+ 			return nil, err
+ 		}
+ 		if isaDir {
+-			if err = u.layer.MkdirAll(dir, 0o777); err != nil {
++			if err = u.ensureLayerDir(dir); err != nil {
+ 				return nil, err
+ 			}
+ 			return u.layer.OpenFile(name, flag, perm)
+@@ -256,6 +380,10 @@ func (u *CopyOnWriteFs) OpenFile(name string, flag int, perm os.FileMode) (File,
+ //	layer: doesn't exist, exists as a file, and exists as a directory
+ //	base:  doesn't exist, exists as a file, and exists as a directory
+ func (u *CopyOnWriteFs) Open(name string) (File, error) {
++	if hidden, gerr := u.gone("open", name); hidden || gerr != nil {
++		return nil, gerr
++	}
++
+ 	// Since the overlay overrides the base we check that first
+ 	b, err := u.isBaseFile(name)
+ 	if err != nil {
+@@ -264,7 +392,11 @@ func (u *CopyOnWriteFs) Open(name string) (File, error) {
+ 
+ 	// If overlay doesn't exist, return the base (base state irrelevant)
+ 	if b {
+-		return u.base.Open(name)
++		bfile, err := u.base.Open(name)
++		if err != nil {
++			return nil, err
++		}
++		return u.asDirectory(name, nil, bfile)
+ 	}
+ 
+ 	// If overlay is a file, return it (base state irrelevant)
+@@ -279,36 +411,44 @@ func (u *CopyOnWriteFs) Open(name string) (File, error) {
+ 	// Overlay is a directory, base state now matters.
+ 	// Base state has 3 states to check but 2 outcomes:
+ 	// A. It's a file or non-readable in the base (return just the overlay)
+-	// B. It's an accessible directory in the base (return a UnionFile)
++	// B. It's an accessible directory in the base (return a merged view)
++	lfile, lErr := u.layer.Open(name)
++	if lErr != nil {
++		return nil, lErr
++	}
+ 
+-	// If base is file or nonreadable, return overlay
+ 	dir, err = IsDir(u.base, name)
+ 	if !dir || err != nil {
+-		return u.layer.Open(name)
++		return u.asDirectory(name, lfile, nil)
+ 	}
+ 
+-	// Both base & layer are directories
+-	// Return union file (if opens are without error)
+ 	bfile, bErr := u.base.Open(name)
+-	lfile, lErr := u.layer.Open(name)
+-
+-	// If either have errors at this point something is very wrong. Return nil and the errors
+-	if bErr != nil || lErr != nil {
++	if bErr != nil {
++		lfile.Close()
+ 		return nil, fmt.Errorf("BaseErr: %v\nOverlayErr: %v", bErr, lErr)
+ 	}
+ 
+-	return &UnionFile{Base: bfile, Layer: lfile}, nil
++	return u.asDirectory(name, lfile, bfile)
+ }
+ 
+ func (u *CopyOnWriteFs) Mkdir(name string, perm os.FileMode) error {
++	if u.deletions {
++		hidden, err := u.hidden(name)
++		if err != nil {
++			return err
++		}
++		if hidden {
++			return u.mkdirAllInLayer(name, perm)
++		}
++	}
+ 	dir, err := IsDir(u.base, name)
+ 	if err != nil {
+-		return u.layer.MkdirAll(name, perm)
++		return u.mkdirAllInLayer(name, perm)
+ 	}
+ 	if dir {
+ 		return ErrFileExists
+ 	}
+-	return u.layer.MkdirAll(name, perm)
++	return u.mkdirAllInLayer(name, perm)
+ }
+ 
+ func (u *CopyOnWriteFs) Name() string {
+@@ -316,15 +456,24 @@ func (u *CopyOnWriteFs) Name() string {
+ }
+ 
+ func (u *CopyOnWriteFs) MkdirAll(name string, perm os.FileMode) error {
++	if u.deletions {
++		hidden, err := u.hidden(name)
++		if err != nil {
++			return err
++		}
++		if hidden {
++			return u.mkdirAllInLayer(name, perm)
++		}
++	}
+ 	dir, err := IsDir(u.base, name)
+ 	if err != nil {
+-		return u.layer.MkdirAll(name, perm)
++		return u.mkdirAllInLayer(name, perm)
+ 	}
+ 	if dir {
+ 		// This is in line with how os.MkdirAll behaves.
+ 		return nil
+ 	}
+-	return u.layer.MkdirAll(name, perm)
++	return u.mkdirAllInLayer(name, perm)
+ }
+ 
+ func (u *CopyOnWriteFs) Create(name string) (File, error) {
+diff --git a/unionFile.go b/unionFile.go
+index e2dd5b4..743d1f1 100644
+--- a/unionFile.go
++++ b/unionFile.go
+@@ -4,6 +4,7 @@ import (
+ 	"io"
+ 	"os"
+ 	"path/filepath"
++	"sort"
+ 	"syscall"
+ )
+ 
+@@ -149,13 +150,12 @@ var defaultUnionMergeDirsFn = func(lofi, bofi []os.FileInfo) ([]os.FileInfo, err
+ 		}
+ 	}
+ 
+-	rfi := make([]os.FileInfo, len(files))
++	rfi := make([]os.FileInfo, 0, len(files))
+ 
+-	i := 0
+ 	for _, fi := range files {
+-		rfi[i] = fi
+-		i++
++		rfi = append(rfi, fi)
+ 	}
++	sort.Slice(rfi, func(i, j int) bool { return rfi[i].Name() < rfi[j].Name() })
+ 
+ 	return rfi, nil
+ }
+diff --git a/overlayDeletions.go b/overlayDeletions.go
+new file mode 100644
+index 0000000..155fdbd
+--- /dev/null
++++ b/overlayDeletions.go
+@@ -0,0 +1,573 @@
++package afero
++
++import (
++	"io"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++)
++
++const (
++	deletionMarkerPrefix = ".afero_wh."
++	directorySealName    = ".afero_opq"
++)
++
++// overlayPath roots a name at the overlay so a relative and an absolute
++// spelling of the same path key the same bookkeeping, without leaning on the
++// backing filesystem to normalise for us.
++func overlayPath(name string) string {
++	clean := filepath.Clean(name)
++	if !filepath.IsAbs(clean) {
++		clean = filepath.Join(FilePathSeparator, clean)
++	}
++	return clean
++}
++
++func deletionMarkerPath(name string) string {
++	return filepath.Join(filepath.Dir(name), deletionMarkerPrefix+filepath.Base(name))
++}
++
++func directorySealPath(dir string) string {
++	return filepath.Join(dir, directorySealName)
++}
++
++func isOverlayBookkeeping(base string) bool {
++	return base == directorySealName || strings.HasPrefix(base, deletionMarkerPrefix)
++}
++
++func isPathRoot(name string) bool {
++	return name == "." || name == string(filepath.Separator) || name == ""
++}
++
++func pathAncestors(name string) []string {
++	clean := overlayPath(name)
++	var reversed []string
++	for {
++		parent := filepath.Dir(clean)
++		if parent == clean {
++			break
++		}
++		reversed = append(reversed, parent)
++		clean = parent
++	}
++	out := make([]string, 0, len(reversed))
++	for i := len(reversed) - 1; i >= 0; i-- {
++		out = append(out, reversed[i])
++	}
++	return out
++}
++
++func (u *CopyOnWriteFs) markerExists(path string) (bool, error) {
++	if _, err := u.layer.Stat(path); err == nil {
++		return true, nil
++	} else if u.isNotExist(err) || os.IsNotExist(err) {
++		return false, nil
++	} else {
++		return false, err
++	}
++}
++
++func (u *CopyOnWriteFs) touchMarker(path string) error {
++	fh, err := u.layer.Create(path)
++	if err != nil {
++		return err
++	}
++	return fh.Close()
++}
++
++func (u *CopyOnWriteFs) sealDirectory(dir string) error {
++	return u.touchMarker(directorySealPath(dir))
++}
++
++func (u *CopyOnWriteFs) recordRemoval(name string) error {
++	clean := overlayPath(name)
++	if err := u.ensureLayerDir(filepath.Dir(clean)); err != nil {
++		return err
++	}
++	return u.touchMarker(deletionMarkerPath(clean))
++}
++
++// mirrorBaseDir gives the copy the overlay had to make in the layer the same
++// permissions and modification time the base directory has. A directory that was
++// removed and made again is the caller's, not a copy, and keeps its own.
++func (u *CopyOnWriteFs) mirrorBaseDir(dir string) error {
++	fi, err := u.base.Stat(dir)
++	if err != nil || !fi.IsDir() {
++		return nil
++	}
++	sealed, err := u.markerExists(directorySealPath(dir))
++	if err != nil || sealed {
++		return err
++	}
++	return u.adoptBaseDirMetadata(dir)
++}
++
++// adoptBaseDirMetadata gives a directory the overlay stood up itself the
++// permissions and modification time the base keeps for it.
++func (u *CopyOnWriteFs) adoptBaseDirMetadata(dir string) error {
++	fi, err := u.base.Stat(dir)
++	if err != nil || !fi.IsDir() {
++		return nil
++	}
++	if err := u.layer.Chmod(dir, fi.Mode().Perm()); err != nil {
++		return err
++	}
++	return u.layer.Chtimes(dir, fi.ModTime(), fi.ModTime())
++}
++
++func (u *CopyOnWriteFs) reviveDir(step string, perm os.FileMode) error {
++	if err := u.layer.MkdirAll(step, perm); err != nil {
++		return err
++	}
++	if err := u.layer.Remove(deletionMarkerPath(step)); err != nil {
++		return err
++	}
++	if wasDir, _ := IsDir(u.base, step); wasDir {
++		return u.sealDirectory(step)
++	}
++	return nil
++}
++
++// ensureLayerDir makes the layer able to hold something at name. Directories the
++// overlay creates for its own sake shadow the base ones, so they take the base
++// permissions and modification time; a directory that had been removed is made
++// again instead, and keeps the base contents under it hidden.
++func (u *CopyOnWriteFs) ensureLayerDir(name string) error {
++	clean := overlayPath(name)
++	if !u.deletions {
++		return u.layer.MkdirAll(clean, 0o777)
++	}
++	for _, step := range append(pathAncestors(clean), clean) {
++		if isPathRoot(step) {
++			continue
++		}
++		removed, err := u.markerExists(deletionMarkerPath(step))
++		if err != nil {
++			return err
++		}
++		if removed {
++			if err := u.reviveDir(step, 0o777); err != nil {
++				return err
++			}
++			if err := u.adoptBaseDirMetadata(step); err != nil {
++				return err
++			}
++			continue
++		}
++		if _, err := u.layer.Stat(step); err == nil {
++			continue
++		} else if !u.isNotExist(err) && !os.IsNotExist(err) {
++			return err
++		}
++		if err := u.layer.Mkdir(step, 0o777); err != nil {
++			return err
++		}
++		if err := u.mirrorBaseDir(step); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (u *CopyOnWriteFs) clearRemoval(name string) error {
++	marker := deletionMarkerPath(overlayPath(name))
++	present, err := u.markerExists(marker)
++	if err != nil || !present {
++		return err
++	}
++	return u.layer.Remove(marker)
++}
++
++// hidden reports whether the overlay keeps name out of sight: the path itself or
++// one of the directories above it has been removed, or the base entry sits under
++// a directory that was removed and made again.
++func (u *CopyOnWriteFs) hidden(name string) (bool, error) {
++	if !u.deletions {
++		return false, nil
++	}
++	clean := overlayPath(name)
++	if isOverlayBookkeeping(filepath.Base(clean)) {
++		return u.markerExists(clean)
++	}
++	for _, step := range append(pathAncestors(clean), clean) {
++		if isPathRoot(step) {
++			continue
++		}
++		removed, err := u.markerExists(deletionMarkerPath(step))
++		if err != nil {
++			return false, err
++		}
++		if removed {
++			return true, nil
++		}
++	}
++	if _, err := u.layer.Stat(clean); err == nil {
++		return false, nil
++	} else if !u.isNotExist(err) && !os.IsNotExist(err) {
++		return false, err
++	}
++	for _, dir := range pathAncestors(clean) {
++		sealed, err := u.markerExists(directorySealPath(dir))
++		if err != nil {
++			return false, err
++		}
++		if sealed {
++			return true, nil
++		}
++		shadowed, err := u.layerHoldsNonDirectory(dir)
++		if err != nil {
++			return false, err
++		}
++		if shadowed {
++			return true, nil
++		}
++	}
++	return false, nil
++}
++
++// layerHoldsNonDirectory reports whether the layer stands something other than a
++// directory at dir, which leaves nothing underneath it for the base to fill in.
++func (u *CopyOnWriteFs) layerHoldsNonDirectory(dir string) (bool, error) {
++	fi, err := u.layer.Stat(dir)
++	if err != nil {
++		if u.isNotExist(err) || os.IsNotExist(err) {
++			return false, nil
++		}
++		return false, err
++	}
++	return !fi.IsDir(), nil
++}
++
++func (u *CopyOnWriteFs) readDirInfos(fs Fs, dir string) ([]os.FileInfo, error) {
++	fh, err := fs.Open(dir)
++	if err != nil {
++		if u.isNotExist(err) || os.IsNotExist(err) {
++			return nil, nil
++		}
++		return nil, err
++	}
++	defer fh.Close()
++	fi, err := fh.Stat()
++	if err != nil {
++		if u.isNotExist(err) || os.IsNotExist(err) {
++			return nil, nil
++		}
++		return nil, err
++	}
++	if !fi.IsDir() {
++		return nil, nil
++	}
++	return fh.Readdir(-1)
++}
++
++// mergedInfos builds the view of a directory the overlay shows: the layer's own
++// entries, the base entries the layer neither replaces nor removes, sorted by
++// name and stripped of the bookkeeping the layer keeps for removals.
++func (u *CopyOnWriteFs) mergedInfos(dir string) ([]os.FileInfo, error) {
++	clean := overlayPath(dir)
++
++	layerInfos, err := u.readDirInfos(u.layer, clean)
++	if err != nil {
++		return nil, err
++	}
++
++	visible := make([]os.FileInfo, 0, len(layerInfos))
++	for _, fi := range layerInfos {
++		if u.deletions {
++			if isOverlayBookkeeping(fi.Name()) {
++				continue
++			}
++			gone, err := u.hidden(filepath.Join(clean, fi.Name()))
++			if err != nil {
++				return nil, err
++			}
++			if gone {
++				continue
++			}
++		}
++		visible = append(visible, fi)
++	}
++
++	baseInfos, err := u.readDirInfos(u.base, clean)
++	if err != nil {
++		return nil, err
++	}
++	present := make(map[string]bool, len(visible))
++	for _, fi := range visible {
++		present[fi.Name()] = true
++	}
++	for _, fi := range baseInfos {
++		if present[fi.Name()] {
++			continue
++		}
++		gone, err := u.hidden(filepath.Join(clean, fi.Name()))
++		if err != nil {
++			return nil, err
++		}
++		if gone {
++			continue
++		}
++		visible = append(visible, fi)
++	}
++
++	sort.Slice(visible, func(i, j int) bool { return visible[i].Name() < visible[j].Name() })
++	return visible, nil
++}
++
++// mkdirAllInLayer creates a directory the caller asked for, with the permissions
++// the caller asked for, over whatever the base and the removal records hold.
++func (u *CopyOnWriteFs) mkdirAllInLayer(name string, perm os.FileMode) error {
++	clean := overlayPath(name)
++	if !u.deletions {
++		return u.layer.MkdirAll(clean, perm)
++	}
++	parent := filepath.Dir(clean)
++	if parent != clean && !isPathRoot(parent) {
++		if err := u.ensureLayerDir(parent); err != nil {
++			return err
++		}
++	}
++	removed, err := u.markerExists(deletionMarkerPath(clean))
++	if err != nil {
++		return err
++	}
++	if removed {
++		return u.reviveDir(clean, perm)
++	}
++	return u.layer.MkdirAll(clean, perm)
++}
++
++func (u *CopyOnWriteFs) stripBookkeeping(dir string) error {
++	infos, err := u.readDirInfos(u.layer, dir)
++	if err != nil {
++		return err
++	}
++	for _, fi := range infos {
++		if !isOverlayBookkeeping(fi.Name()) {
++			continue
++		}
++		if err := u.layer.Remove(filepath.Join(dir, fi.Name())); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// pruneLayer drops what the layer holds at name, keeping the removals recorded
++// under it so that bringing name back does not bring them back with it.
++func (u *CopyOnWriteFs) pruneLayer(name string) error {
++	fi, err := u.layer.Stat(name)
++	if err != nil {
++		if u.isNotExist(err) || os.IsNotExist(err) {
++			return nil
++		}
++		return err
++	}
++	if !fi.IsDir() {
++		return u.layer.Remove(name)
++	}
++
++	infos, err := u.readDirInfos(u.layer, name)
++	if err != nil {
++		return err
++	}
++	occupied := false
++	for _, entry := range infos {
++		if isOverlayBookkeeping(entry.Name()) {
++			occupied = true
++			continue
++		}
++		child := filepath.Join(name, entry.Name())
++		if err := u.pruneLayer(child); err != nil {
++			return err
++		}
++		if _, err := u.layer.Stat(child); err == nil {
++			occupied = true
++		}
++	}
++	if occupied {
++		return nil
++	}
++	return u.layer.Remove(name)
++}
++
++// hidePath drops whatever the layer holds for name and, when the base still has
++// something there, writes the removal into the layer.
++func (u *CopyOnWriteFs) hidePath(name string) error {
++	clean := overlayPath(name)
++	if isPathRoot(clean) {
++		infos, err := u.mergedInfos(clean)
++		if err != nil {
++			return err
++		}
++		for _, entry := range infos {
++			if err := u.hidePath(filepath.Join(clean, entry.Name())); err != nil {
++				return err
++			}
++		}
++		return nil
++	}
++	inBase := false
++	if _, err := u.base.Stat(clean); err == nil {
++		inBase = true
++	} else if !u.isNotExist(err) && !os.IsNotExist(err) {
++		return err
++	}
++
++	if inBase {
++		if err := u.recordRemoval(clean); err != nil {
++			return err
++		}
++	} else if err := u.clearRemoval(clean); err != nil {
++		return err
++	}
++	return u.pruneLayer(clean)
++}
++
++// Restore drops the removal recorded at name so the base entry, and everything
++// under it that is not recorded separately, shows through again. A path with no
++// removal recorded reports os.ErrNotExist.
++func (u *CopyOnWriteFs) Restore(name string) error {
++	clean := overlayPath(name)
++	if u.deletions {
++		marker := deletionMarkerPath(clean)
++		present, err := u.markerExists(marker)
++		if err != nil {
++			return err
++		}
++		if present {
++			return u.layer.Remove(marker)
++		}
++	}
++	return &os.PathError{Op: "restore", Path: name, Err: os.ErrNotExist}
++}
++
++// Flatten writes the view the overlay shows into dst: directories are created,
++// files are copied with their contents and modification times, and nothing the
++// overlay hides is written.
++func (u *CopyOnWriteFs) Flatten(dst Fs) error {
++	return u.flattenPath(dst, FilePathSeparator)
++}
++
++func (u *CopyOnWriteFs) flattenPath(dst Fs, name string) error {
++	fi, err := u.Stat(name)
++	if err != nil {
++		return err
++	}
++	if err := u.clearConflicting(dst, name, fi.IsDir()); err != nil {
++		return err
++	}
++	if !fi.IsDir() {
++		return copyVisibleFile(u, dst, name, fi)
++	}
++	if err := dst.MkdirAll(name, fi.Mode()); err != nil {
++		return err
++	}
++	infos, err := u.mergedInfos(name)
++	if err != nil {
++		return err
++	}
++	for _, entry := range infos {
++		if err := u.flattenPath(dst, filepath.Join(name, entry.Name())); err != nil {
++			return err
++		}
++	}
++	if isPathRoot(overlayPath(name)) {
++		return nil
++	}
++	if err := dst.Chmod(name, fi.Mode().Perm()); err != nil {
++		return err
++	}
++	return dst.Chtimes(name, fi.ModTime(), fi.ModTime())
++}
++
++// clearConflicting drops a destination entry that is there as the other kind, so
++// the view lands whole rather than on top of something it cannot overwrite.
++func (u *CopyOnWriteFs) clearConflicting(dst Fs, name string, wantDir bool) error {
++	dfi, err := dst.Stat(name)
++	if err != nil {
++		if u.isNotExist(err) || os.IsNotExist(err) {
++			return nil
++		}
++		return err
++	}
++	if dfi.IsDir() == wantDir {
++		return nil
++	}
++	return dst.RemoveAll(name)
++}
++
++func copyVisibleFile(src Fs, dst Fs, name string, fi os.FileInfo) error {
++	in, err := src.Open(name)
++	if err != nil {
++		return err
++	}
++	defer in.Close()
++
++	if err := dst.MkdirAll(filepath.Dir(name), 0o777); err != nil {
++		return err
++	}
++	out, err := dst.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fi.Mode())
++	if err != nil {
++		return err
++	}
++	if _, err := io.Copy(out, in); err != nil {
++		out.Close()
++		return err
++	}
++	if err := out.Close(); err != nil {
++		return err
++	}
++	if err := dst.Chmod(name, fi.Mode().Perm()); err != nil {
++		return err
++	}
++	return dst.Chtimes(name, fi.ModTime(), fi.ModTime())
++}
++
++// Deleted reports the paths the overlay currently hides, slash separated and
++// rooted at the overlay, sorted, leaving out anything that is only out of sight
++// because a directory above it is. An overlay without deletion support reports
++// nothing.
++func (u *CopyOnWriteFs) Deleted() ([]string, error) {
++	if !u.deletions {
++		return []string{}, nil
++	}
++	var found []string
++	err := Walk(u.layer, FilePathSeparator, func(path string, info os.FileInfo, err error) error {
++		if err != nil {
++			if u.isNotExist(err) || os.IsNotExist(err) {
++				return nil
++			}
++			return err
++		}
++		if info == nil || info.IsDir() {
++			return nil
++		}
++		if !strings.HasPrefix(info.Name(), deletionMarkerPrefix) {
++			return nil
++		}
++		target := filepath.Join(filepath.Dir(path), strings.TrimPrefix(info.Name(), deletionMarkerPrefix))
++		found = append(found, filepath.ToSlash(target))
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	sort.Strings(found)
++
++	pruned := make([]string, 0, len(found))
++	for _, candidate := range found {
++		covered := false
++		for _, kept := range pruned {
++			if candidate == kept || strings.HasPrefix(candidate, strings.TrimSuffix(kept, "/")+"/") {
++				covered = true
++				break
++			}
++		}
++		if !covered {
++			pruned = append(pruned, candidate)
++		}
++	}
++	return pruned, nil
++}
+diff --git a/overlayDir.go b/overlayDir.go
+new file mode 100644
+index 0000000..a1c7dea
+--- /dev/null
++++ b/overlayDir.go
+@@ -0,0 +1,166 @@
++package afero
++
++import (
++	"io"
++	"os"
++	"path/filepath"
++	"sort"
++)
++
++// overlayDir is the directory handle CopyOnWriteFs hands out. It answers
++// Readdir and Readdirnames from the merged view of the two layers so the order
++// is stable and the layer's removal bookkeeping never shows up.
++type overlayDir struct {
++	*UnionFile
++	fs     *CopyOnWriteFs
++	path   string
++	off    int
++	infos  []os.FileInfo
++	loaded bool
++}
++
++func (u *CopyOnWriteFs) asDirectory(name string, lfile, bfile File) (File, error) {
++	probe := lfile
++	if probe == nil {
++		probe = bfile
++	}
++	fi, err := probe.Stat()
++	if err != nil {
++		probe.Close()
++		return nil, err
++	}
++	if !fi.IsDir() {
++		return probe, nil
++	}
++	return &overlayDir{
++		UnionFile: &UnionFile{Base: bfile, Layer: lfile},
++		fs:        u,
++		path:      name,
++	}, nil
++}
++
++func (d *overlayDir) Close() error {
++	var err error
++	if d.UnionFile.Base != nil {
++		err = d.UnionFile.Base.Close()
++	}
++	if d.UnionFile.Layer != nil {
++		if lerr := d.UnionFile.Layer.Close(); err == nil {
++			err = lerr
++		}
++	}
++	return err
++}
++
++func (d *overlayDir) Readdir(c int) ([]os.FileInfo, error) {
++	if !d.loaded {
++		infos, err := d.fs.mergedInfos(d.path)
++		if err != nil {
++			return nil, err
++		}
++		d.infos = infos
++		d.loaded = true
++	}
++
++	files := d.infos[d.off:]
++	if c <= 0 {
++		return files, nil
++	}
++	if len(files) == 0 {
++		return nil, io.EOF
++	}
++	if c > len(files) {
++		c = len(files)
++	}
++	d.off += c
++	return files[:c], nil
++}
++
++func (d *overlayDir) Readdirnames(c int) ([]string, error) {
++	infos, err := d.Readdir(c)
++	if err != nil {
++		return nil, err
++	}
++	var names []string
++	for _, fi := range infos {
++		names = append(names, fi.Name())
++	}
++	return names, nil
++}
++
++func (u *CopyOnWriteFs) copyBaseFileAs(src, dst string) error {
++	base, layer := u.base, u.layer
++
++	bfh, err := base.Open(src)
++	if err != nil {
++		return err
++	}
++	defer bfh.Close()
++
++	if err := u.ensureLayerDir(filepath.Dir(dst)); err != nil {
++		return err
++	}
++
++	bfi, err := bfh.Stat()
++	if err != nil {
++		return err
++	}
++
++	lfh, err := layer.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, bfi.Mode().Perm())
++	if err != nil {
++		return err
++	}
++	if _, err := io.Copy(lfh, bfh); err != nil {
++		lfh.Close()
++		layer.Remove(dst)
++		return err
++	}
++	if err := lfh.Close(); err != nil {
++		layer.Remove(dst)
++		return err
++	}
++
++	if err := layer.Chmod(dst, bfi.Mode().Perm()); err != nil {
++		return err
++	}
++	return layer.Chtimes(dst, bfi.ModTime(), bfi.ModTime())
++}
++
++// materializeSubtree pulls everything the overlay shows at name into the layer
++// so the layer alone can carry it, and drops the removal bookkeeping that has
++// been satisfied by the copy.
++func (u *CopyOnWriteFs) materializeSubtree(name string) error {
++	clean := filepath.Clean(name)
++	fi, err := u.Stat(clean)
++	if err != nil {
++		return err
++	}
++
++	if !fi.IsDir() {
++		if _, err := u.layer.Stat(clean); err == nil {
++			return nil
++		} else if !u.isNotExist(err) && !os.IsNotExist(err) {
++			return err
++		}
++		return u.copyBaseFileAs(clean, clean)
++	}
++
++	infos, err := u.mergedInfos(clean)
++	if err != nil {
++		return err
++	}
++	if err := u.ensureLayerDir(clean); err != nil {
++		return err
++	}
++	names := make([]string, 0, len(infos))
++	for _, entry := range infos {
++		names = append(names, entry.Name())
++	}
++	sort.Strings(names)
++	for _, entry := range names {
++		if err := u.materializeSubtree(filepath.Join(clean, entry)); err != nil {
++			return err
++		}
++	}
++	return u.stripBookkeeping(clean)
++}

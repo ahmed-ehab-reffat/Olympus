@@ -1,0 +1,770 @@
+diff --git a/analyzer.go b/analyzer.go
+new file mode 100644
+index 0000000..fdcf3f6
+--- /dev/null
++++ b/analyzer.go
+@@ -0,0 +1,419 @@
++package astits
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"time"
++)
++
++const (
++	analyzerDefaultMaxPCRInterval = 40 * time.Millisecond
++	analyzerDefaultMaxPATInterval = 500 * time.Millisecond
++	analyzerDefaultMaxPMTInterval = 500 * time.Millisecond
++	analyzerReservedPIDMax        = 0x1f
++	analyzerNoEvent               = AnalyzerEventKind(-1)
++)
++
++// AnalyzerOptions represents the thresholds used by an Analyzer
++// A zero duration falls back to the default for that field
++type AnalyzerOptions struct {
++	MaxPATInterval time.Duration
++	MaxPCRInterval time.Duration
++	MaxPMTInterval time.Duration
++}
++
++type analyzerRecord struct {
++	index         int
++	pid           uint16
++	counter       uint8
++	scrambling    uint8
++	payloadLength int
++	pcr           int64
++	discontinuity bool
++	errored       bool
++	hasPayload    bool
++	unitStart     bool
++	unreferenced  bool
++	tablePID      bool
++	pmtPID        bool
++}
++
++// Analyzer inspects a transport stream and collects anomalies and statistics
++type Analyzer struct {
++	maxPATTicks int64
++	maxPCRTicks int64
++	maxPMTTicks int64
++
++	packets  int
++	events   []AnalyzerEvent
++	pending  []analyzerRecord
++	states   map[uint16]*analyzerPIDState
++	programs map[uint16]AnalyzerProgram
++
++	declared map[uint16]bool
++	pmtPIDs  map[uint16]bool
++	reported map[uint16]bool
++
++	deferred  []analyzerDeferred
++	lastIndex int
++	lastTime  int64
++
++	hasReference   bool
++	referenceIndex int
++	referencePID   uint16
++	referenceTime  int64
++}
++
++type analyzerDeferred struct {
++	event int
++	index int
++}
++
++// NewAnalyzer creates a new analyzer
++func NewAnalyzer(o AnalyzerOptions) *Analyzer {
++	if o.MaxPATInterval <= 0 {
++		o.MaxPATInterval = analyzerDefaultMaxPATInterval
++	}
++	if o.MaxPCRInterval <= 0 {
++		o.MaxPCRInterval = analyzerDefaultMaxPCRInterval
++	}
++	if o.MaxPMTInterval <= 0 {
++		o.MaxPMTInterval = analyzerDefaultMaxPMTInterval
++	}
++	return &Analyzer{
++		lastIndex:   -1,
++		lastTime:    analyzerNoTime,
++		maxPATTicks: analyzerDurationToTicks(o.MaxPATInterval),
++		maxPCRTicks: analyzerDurationToTicks(o.MaxPCRInterval),
++		maxPMTTicks: analyzerDurationToTicks(o.MaxPMTInterval),
++		declared:    make(map[uint16]bool),
++		pmtPIDs:     make(map[uint16]bool),
++		programs:    make(map[uint16]AnalyzerProgram),
++		reported:    make(map[uint16]bool),
++		states:      make(map[uint16]*analyzerPIDState),
++	}
++}
++
++// Packet feeds the analyzer with the next packet of the stream
++func (a *Analyzer) Packet(p *Packet) {
++	if p == nil {
++		return
++	}
++	r := analyzerRecord{
++		counter:       p.Header.ContinuityCounter,
++		errored:       p.Header.TransportErrorIndicator,
++		hasPayload:    p.Header.HasPayload,
++		index:         a.packets,
++		payloadLength: len(p.Payload),
++		pcr:           analyzerNoTime,
++		pid:           p.Header.PID,
++		scrambling:    p.Header.TransportScramblingControl,
++		unitStart:     p.Header.PayloadUnitStartIndicator,
++	}
++	if p.AdaptationField != nil {
++		r.discontinuity = p.AdaptationField.DiscontinuityIndicator
++		if p.AdaptationField.HasPCR && p.AdaptationField.PCR != nil {
++			r.pcr = analyzerClockTicks(p.AdaptationField.PCR)
++		}
++	}
++	a.packets++
++	if !r.errored {
++		r.pmtPID = a.pmtPIDs[r.pid]
++		r.tablePID = r.pid == PIDPAT || r.pid == PIDNull || r.pmtPID
++		if !a.isReferenced(r.pid) && !a.reported[r.pid] {
++			a.reported[r.pid] = true
++			r.unreferenced = true
++		}
++	}
++	a.ingest(r)
++}
++
++func (a *Analyzer) isReferenced(pid uint16) bool {
++	return pid <= analyzerReservedPIDMax || pid == PIDNull || a.pmtPIDs[pid] || a.declared[pid]
++}
++
++func (a *Analyzer) ingest(r analyzerRecord) {
++	if !a.hasReference {
++		if r.pcr >= 0 && !r.errored {
++			a.hasReference = true
++			a.referenceIndex = r.index
++			a.referencePID = r.pid
++			a.referenceTime = r.pcr
++			a.process(r, r.pcr, analyzerNoEvent)
++			return
++		}
++		a.process(r, analyzerNoTime, analyzerNoEvent)
++		return
++	}
++	if r.pid == a.referencePID && r.pcr >= 0 && !r.errored {
++		a.closeWindow(r)
++		return
++	}
++	a.pending = append(a.pending, r)
++}
++
++func (a *Analyzer) closeWindow(r analyzerRecord) {
++	delta := analyzerClockElapsed(a.referenceTime, r.pcr)
++	kind := analyzerNoEvent
++	regular := !r.discontinuity
++	if regular {
++		switch {
++		case delta <= 0:
++			kind = AnalyzerEventKindPCRDiscontinuityError
++			regular = false
++		case delta > a.maxPCRTicks:
++			kind = AnalyzerEventKindPCRRepetitionError
++			regular = false
++		}
++	}
++	span := r.index - a.referenceIndex
++	for _, p := range a.pending {
++		t := analyzerNoTime
++		if regular {
++			t = analyzerInterpolate(a.referenceTime, delta, p.index-a.referenceIndex, span)
++		}
++		a.process(p, t, analyzerNoEvent)
++	}
++	a.pending = a.pending[:0]
++	a.process(r, r.pcr, kind)
++	a.referenceIndex = r.index
++	a.referenceTime = r.pcr
++}
++
++func (a *Analyzer) resolve(index int, t int64) {
++	kept := a.deferred[:0]
++	for _, d := range a.deferred {
++		if d.index == index {
++			a.events[d.event].Time = t
++			continue
++		}
++		kept = append(kept, d)
++	}
++	a.deferred = kept
++	a.lastIndex = index
++	a.lastTime = t
++}
++
++func (a *Analyzer) process(r analyzerRecord, t int64, pcrEvent AnalyzerEventKind) {
++	a.resolve(r.index, t)
++	s := a.state(r.pid)
++	s.packets++
++	if r.errored {
++		a.emit(AnalyzerEventKindTransportError, r, t)
++		return
++	}
++	if r.unreferenced {
++		a.emit(AnalyzerEventKindUnreferencedPID, r, t)
++	}
++	if r.scrambling != 0 {
++		s.scrambledPackets++
++		if r.tablePID {
++			a.emit(AnalyzerEventKindScramblingError, r, t)
++		}
++	}
++	s.payloadBytes += r.payloadLength
++	if r.pcr >= 0 {
++		s.pcrs++
++		if s.hasPCRTick {
++			s.interval(analyzerClockElapsed(s.lastPCRTick, r.pcr))
++		}
++		s.hasPCRTick = true
++		s.lastPCRTick = r.pcr
++	}
++	if r.discontinuity {
++		s.discontinuities++
++	}
++	duplicated := a.continuity(s, r, t)
++	s.stamp(t)
++	if pcrEvent != analyzerNoEvent {
++		a.emit(pcrEvent, r, t)
++	}
++	a.repetition(s, r, t, duplicated)
++}
++
++func (a *Analyzer) continuity(s *analyzerPIDState, r analyzerRecord, t int64) (duplicated bool) {
++	if r.pid == PIDNull {
++		return
++	}
++	if r.discontinuity || !s.hasCounter {
++		s.counter = r.counter
++		s.duplicated = false
++		s.hasCounter = true
++		return
++	}
++	expected := s.counter
++	if r.hasPayload {
++		expected = (s.counter + 1) & 0xf
++	}
++	switch {
++	case r.counter == expected:
++		s.duplicated = false
++	case r.hasPayload && r.counter == s.counter && !s.duplicated:
++		duplicated = true
++		s.duplicated = true
++	default:
++		s.continuityErrors++
++		a.events = append(a.events, AnalyzerEvent{
++			Actual:      r.counter,
++			Expected:    expected,
++			Kind:        AnalyzerEventKindContinuityError,
++			PacketIndex: r.index,
++			PID:         r.pid,
++			Time:        t,
++		})
++		s.duplicated = false
++	}
++	s.counter = r.counter
++	return
++}
++
++func (a *Analyzer) repetition(s *analyzerPIDState, r analyzerRecord, t int64, duplicated bool) {
++	if !r.unitStart || duplicated {
++		return
++	}
++	var kind AnalyzerEventKind
++	var limit int64
++	switch {
++	case r.pid == PIDPAT:
++		kind = AnalyzerEventKindPATRepetitionError
++		limit = a.maxPATTicks
++	case r.pmtPID:
++		kind = AnalyzerEventKindPMTRepetitionError
++		limit = a.maxPMTTicks
++	default:
++		return
++	}
++	if t >= 0 && s.lastTableTime >= 0 && analyzerClockElapsed(s.lastTableTime, t) > limit {
++		a.emit(kind, r, t)
++	}
++	s.lastTableTime = t
++}
++
++// Data feeds the analyzer with the next data unit of the stream
++func (a *Analyzer) Data(d *DemuxerData) {
++	if d == nil {
++		return
++	}
++	if d.PAT != nil {
++		for _, pgm := range d.PAT.Programs {
++			if pgm.ProgramNumber == 0 {
++				continue
++			}
++			a.pmtPIDs[pgm.ProgramMapID] = true
++			p := a.programs[pgm.ProgramNumber]
++			p.Number = pgm.ProgramNumber
++			p.PMTPID = pgm.ProgramMapID
++			a.programs[pgm.ProgramNumber] = p
++		}
++	}
++	if d.PMT != nil {
++		pids := make(map[uint16]bool)
++		for _, es := range d.PMT.ElementaryStreams {
++			a.declared[es.ElementaryPID] = true
++			pids[es.ElementaryPID] = true
++		}
++		a.declared[d.PMT.PCRPID] = true
++		p := a.programs[d.PMT.ProgramNumber]
++		p.ElementaryPIDs = analyzerSortedPIDs(pids)
++		p.Number = d.PMT.ProgramNumber
++		p.PCRPID = d.PMT.PCRPID
++		p.PMTPID = d.PID
++		a.programs[d.PMT.ProgramNumber] = p
++	}
++	if d.PES != nil {
++		a.timestamps(d)
++	}
++}
++
++func (a *Analyzer) timestamps(d *DemuxerData) {
++	if d.PES.Header == nil || d.PES.Header.OptionalHeader == nil || d.PES.Header.OptionalHeader.PTS == nil {
++		return
++	}
++	if a.packets == 0 {
++		return
++	}
++	o := d.PES.Header.OptionalHeader
++	r := analyzerRecord{index: a.packets - 1, pid: d.PID}
++	s := a.state(d.PID)
++	if s.hasPTS && analyzerPTSElapsed(s.lastPTS, o.PTS.Base) <= 0 {
++		a.timestampEvent(AnalyzerEventKindPTSOrderError, r)
++	}
++	s.hasPTS = true
++	s.lastPTS = o.PTS.Base
++	if o.DTS != nil && analyzerPTSElapsed(o.PTS.Base, o.DTS.Base) > 0 {
++		a.timestampEvent(AnalyzerEventKindDTSOrderError, r)
++	}
++}
++
++func (a *Analyzer) timestampEvent(k AnalyzerEventKind, r analyzerRecord) {
++	if r.index == a.lastIndex {
++		a.emit(k, r, a.lastTime)
++		return
++	}
++	a.emit(k, r, analyzerNoTime)
++	a.deferred = append(a.deferred, analyzerDeferred{event: len(a.events) - 1, index: r.index})
++}
++
++// Report finalizes the analysis and returns its outcome
++func (a *Analyzer) Report() *AnalyzerReport {
++	for _, p := range a.pending {
++		a.process(p, analyzerNoTime, analyzerNoEvent)
++	}
++	a.pending = a.pending[:0]
++	r := &AnalyzerReport{Packets: a.packets}
++	r.Events = append(r.Events, a.events...)
++	analyzerSortEvents(r.Events)
++	for _, s := range a.states {
++		r.PIDs = append(r.PIDs, s.toStat())
++	}
++	analyzerSortPIDs(r.PIDs)
++	for _, p := range a.programs {
++		p.MissingPIDs = a.missing(p.ElementaryPIDs)
++		r.Programs = append(r.Programs, p)
++	}
++	analyzerSortPrograms(r.Programs)
++	return r
++}
++
++func (a *Analyzer) missing(pids []uint16) (out []uint16) {
++	for _, pid := range pids {
++		if s, ok := a.states[pid]; !ok || s.packets == 0 {
++			out = append(out, pid)
++		}
++	}
++	return
++}
++
++// AnalyzeStream demuxes a whole stream and returns its analysis
++func AnalyzeStream(ctx context.Context, r io.Reader, o AnalyzerOptions) (*AnalyzerReport, error) {
++	a := NewAnalyzer(o)
++	dmx := NewDemuxer(ctx, r, DemuxerOptAnalyzer(a))
++	for {
++		if _, err := dmx.NextData(); err != nil {
++			if errors.Is(err, ErrNoMorePackets) || errors.Is(err, io.EOF) {
++				return a.Report(), nil
++			}
++			return nil, fmt.Errorf("astits: analyzing stream failed: %w", err)
++		}
++	}
++}
++
++func (a *Analyzer) state(pid uint16) *analyzerPIDState {
++	s, ok := a.states[pid]
++	if !ok {
++		s = newAnalyzerPIDState(pid)
++		a.states[pid] = s
++	}
++	return s
++}
++
++func (a *Analyzer) emit(k AnalyzerEventKind, r analyzerRecord, t int64) {
++	a.events = append(a.events, AnalyzerEvent{
++		Kind:        k,
++		PacketIndex: r.index,
++		PID:         r.pid,
++		Time:        t,
++	})
++}
+diff --git a/analyzer_clock.go b/analyzer_clock.go
+new file mode 100644
+index 0000000..ce44bb5
+--- /dev/null
++++ b/analyzer_clock.go
+@@ -0,0 +1,55 @@
++package astits
++
++import "time"
++
++const (
++	analyzerClockRate = 27000000
++	analyzerClockWrap = (int64(1) << 33) * 300
++	analyzerClockHalf = analyzerClockWrap / 2
++	analyzerPTSWrap   = int64(1) << 33
++	analyzerPTSHalf   = analyzerPTSWrap / 2
++	analyzerNoTime    = int64(-1)
++)
++
++func analyzerClockTicks(cr *ClockReference) int64 {
++	return cr.Base*300 + cr.Extension
++}
++
++func analyzerModulo(v, wrap int64) int64 {
++	v %= wrap
++	if v < 0 {
++		v += wrap
++	}
++	return v
++}
++
++func analyzerSigned(from, to, wrap, half int64) int64 {
++	d := analyzerModulo(to-from, wrap)
++	if d >= half {
++		d -= wrap
++	}
++	return d
++}
++
++func analyzerClockElapsed(from, to int64) int64 {
++	return analyzerSigned(from, to, analyzerClockWrap, analyzerClockHalf)
++}
++
++func analyzerPTSElapsed(from, to int64) int64 {
++	return analyzerSigned(from, to, analyzerPTSWrap, analyzerPTSHalf)
++}
++
++func analyzerClockAdd(t, d int64) int64 {
++	return analyzerModulo(t+d, analyzerClockWrap)
++}
++
++func analyzerDurationToTicks(d time.Duration) int64 {
++	return int64(d) * 27 / 1000
++}
++
++func analyzerInterpolate(base, delta int64, offset, span int) int64 {
++	if span <= 0 {
++		return base
++	}
++	return analyzerClockAdd(base, delta*int64(offset)/int64(span))
++}
+diff --git a/analyzer_report.go b/analyzer_report.go
+new file mode 100644
+index 0000000..b999dc1
+--- /dev/null
++++ b/analyzer_report.go
+@@ -0,0 +1,178 @@
++package astits
++
++import "sort"
++
++// AnalyzerEventKind represents the kind of an analyzer event
++type AnalyzerEventKind int
++
++// Analyzer event kinds
++const (
++	AnalyzerEventKindTransportError AnalyzerEventKind = iota
++	AnalyzerEventKindUnreferencedPID
++	AnalyzerEventKindScramblingError
++	AnalyzerEventKindContinuityError
++	AnalyzerEventKindPCRDiscontinuityError
++	AnalyzerEventKindPCRRepetitionError
++	AnalyzerEventKindPATRepetitionError
++	AnalyzerEventKindPMTRepetitionError
++	AnalyzerEventKindPTSOrderError
++	AnalyzerEventKindDTSOrderError
++)
++
++// AnalyzerEvent represents a single anomaly reported by the Analyzer
++type AnalyzerEvent struct {
++	Kind        AnalyzerEventKind
++	PID         uint16
++	PacketIndex int
++	Time        int64
++	Expected    uint8
++	Actual      uint8
++}
++
++// AnalyzerPIDStat represents the statistics gathered for a single PID
++type AnalyzerPIDStat struct {
++	PID              uint16
++	Packets          int
++	ScrambledPackets int
++	PayloadBytes     int
++	ContinuityErrors int
++	Discontinuities  int
++	PCRs             int
++	FirstTime        int64
++	LastTime         int64
++	MinPCRInterval   int64
++	MaxPCRInterval   int64
++	Bitrate          int64
++}
++
++// AnalyzerProgram represents a program as declared by the tables seen so far
++type AnalyzerProgram struct {
++	Number         uint16
++	PMTPID         uint16
++	PCRPID         uint16
++	ElementaryPIDs []uint16
++	MissingPIDs    []uint16
++}
++
++// AnalyzerReport represents the outcome of an analysis
++type AnalyzerReport struct {
++	Packets  int
++	Events   []AnalyzerEvent
++	PIDs     []AnalyzerPIDStat
++	Programs []AnalyzerProgram
++}
++
++type analyzerPIDState struct {
++	pid              uint16
++	packets          int
++	scrambledPackets int
++	payloadBytes     int
++	continuityErrors int
++	discontinuities  int
++	pcrs             int
++	timedPackets     int
++	firstTime        int64
++	lastTime         int64
++	hasCounter       bool
++	counter          uint8
++	duplicated       bool
++	lastPTS          int64
++	hasPTS           bool
++	lastTableTime    int64
++	lastPCRTick      int64
++	hasPCRTick       bool
++	hasInterval      bool
++	minInterval      int64
++	maxInterval      int64
++}
++
++func newAnalyzerPIDState(pid uint16) *analyzerPIDState {
++	return &analyzerPIDState{
++		pid:           pid,
++		firstTime:     analyzerNoTime,
++		lastTime:      analyzerNoTime,
++		lastTableTime: analyzerNoTime,
++		minInterval:   analyzerNoTime,
++		maxInterval:   analyzerNoTime,
++	}
++}
++
++func (s *analyzerPIDState) interval(d int64) {
++	if !s.hasInterval {
++		s.hasInterval = true
++		s.minInterval = d
++		s.maxInterval = d
++		return
++	}
++	if d < s.minInterval {
++		s.minInterval = d
++	}
++	if d > s.maxInterval {
++		s.maxInterval = d
++	}
++}
++
++func (s *analyzerPIDState) stamp(t int64) {
++	if t < 0 {
++		return
++	}
++	if s.timedPackets == 0 {
++		s.firstTime = t
++	}
++	s.lastTime = t
++	s.timedPackets++
++}
++
++func (s *analyzerPIDState) bitrate() int64 {
++	if s.timedPackets < 2 {
++		return 0
++	}
++	elapsed := analyzerClockElapsed(s.firstTime, s.lastTime)
++	if elapsed <= 0 {
++		return 0
++	}
++	return int64(s.timedPackets-1) * MpegTsPacketSize * 8 * analyzerClockRate / elapsed
++}
++
++func (s *analyzerPIDState) toStat() AnalyzerPIDStat {
++	return AnalyzerPIDStat{
++		PID:              s.pid,
++		Packets:          s.packets,
++		ScrambledPackets: s.scrambledPackets,
++		PayloadBytes:     s.payloadBytes,
++		ContinuityErrors: s.continuityErrors,
++		Discontinuities:  s.discontinuities,
++		PCRs:             s.pcrs,
++		FirstTime:        s.firstTime,
++		LastTime:         s.lastTime,
++		MinPCRInterval:   s.minInterval,
++		MaxPCRInterval:   s.maxInterval,
++		Bitrate:          s.bitrate(),
++	}
++}
++
++func analyzerSortEvents(es []AnalyzerEvent) {
++	sort.SliceStable(es, func(i, j int) bool {
++		if es[i].PacketIndex != es[j].PacketIndex {
++			return es[i].PacketIndex < es[j].PacketIndex
++		}
++		return es[i].Kind < es[j].Kind
++	})
++}
++
++func analyzerSortPIDs(ss []AnalyzerPIDStat) {
++	sort.Slice(ss, func(i, j int) bool { return ss[i].PID < ss[j].PID })
++}
++
++func analyzerSortPrograms(ps []AnalyzerProgram) {
++	sort.Slice(ps, func(i, j int) bool { return ps[i].Number < ps[j].Number })
++}
++
++func analyzerSortedPIDs(m map[uint16]bool) []uint16 {
++	var out []uint16
++	for pid := range m {
++		out = append(out, pid)
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
++	return out
++}
+diff --git a/demuxer.go b/demuxer.go
+index 044856a..27dab71 100644
+--- a/demuxer.go
++++ b/demuxer.go
+@@ -27,6 +27,7 @@ type Demuxer struct {
+ 	dataBuffer []*DemuxerData
+ 	l          astikit.CompleteLogger
+ 
++	optAnalyzer      *Analyzer
+ 	optPacketSize    int
+ 	optPacketsParser PacketsParser
+ 	optPacketSkipper PacketSkipper
+@@ -64,6 +65,13 @@ func NewDemuxer(ctx context.Context, r io.Reader, opts ...func(*Demuxer)) (d *De
+ 	return
+ }
+ 
++// DemuxerOptAnalyzer returns the option to feed an analyzer with every packet and data unit
++func DemuxerOptAnalyzer(a *Analyzer) func(*Demuxer) {
++	return func(d *Demuxer) {
++		d.optAnalyzer = a
++	}
++}
++
+ // DemuxerOptLogger returns the option to set the logger
+ func DemuxerOptLogger(l astikit.StdLogger) func(*Demuxer) {
+ 	return func(d *Demuxer) {
+@@ -116,6 +124,9 @@ func (dmx *Demuxer) NextPacket() (p *Packet, err error) {
+ 		}
+ 		return
+ 	}
++	if dmx.optAnalyzer != nil {
++		dmx.optAnalyzer.Packet(p)
++	}
+ 	return
+ }
+ 
+@@ -191,6 +202,9 @@ func (dmx *Demuxer) updateData(ds []*DemuxerData) (d *DemuxerData) {
+ 
+ 		// Update program map
+ 		for _, v := range ds {
++			if dmx.optAnalyzer != nil {
++				dmx.optAnalyzer.Data(v)
++			}
+ 			if v.PAT != nil {
+ 				for _, pgm := range v.PAT.Programs {
+ 					// Program number 0 is reserved to NIT
+diff --git a/muxer.go b/muxer.go
+index 4163017..5f6d602 100644
+--- a/muxer.go
++++ b/muxer.go
+@@ -51,6 +51,8 @@ type Muxer struct {
+ 	// We use map[uint32] instead map[uint16] as go runtime provide optimized hash functions for (u)int32/64 keys
+ 	esContexts              map[uint32]*esContext
+ 	tablesRetransmitCounter int
++
++	optAnalyzer *Analyzer
+ }
+ 
+ type esContext struct {
+@@ -87,6 +89,13 @@ func WithPMTPID(pid uint16) func(*Muxer) {
+ 	}
+ }
+ 
++// MuxerOptAnalyzer returns the option to feed an analyzer with the packets the muxer builds
++func MuxerOptAnalyzer(a *Analyzer) func(*Muxer) {
++	return func(m *Muxer) {
++		m.optAnalyzer = a
++	}
++}
++
+ // TODO MuxerOptAutodetectPCRPID selecting first video PID for each PMT, falling back to first audio, falling back to any other
+ 
+ func NewMuxer(ctx context.Context, w io.Writer, opts ...func(*Muxer)) *Muxer {
+@@ -281,6 +290,10 @@ func (m *Muxer) WriteData(d *MuxerData) (int, error) {
+ 				return bytesWritten, err
+ 			}
+ 
++			if m.optAnalyzer != nil {
++				m.optAnalyzer.Packet(&pkt)
++			}
++
+ 			bytesWritten += n
+ 
+ 			payloadStart = false
+@@ -297,7 +310,14 @@ func (m *Muxer) WriteData(d *MuxerData) (int, error) {
+ // Writes given packet to MPEG-TS stream
+ // Stuffs with 0xffs if packet turns out to be shorter than target packet length
+ func (m *Muxer) WritePacket(p *Packet) (int, error) {
+-	return writePacket(m.bitsWriter, p, m.packetSize)
++	n, err := writePacket(m.bitsWriter, p, m.packetSize)
++	if err != nil {
++		return n, err
++	}
++	if m.optAnalyzer != nil {
++		m.optAnalyzer.Packet(p)
++	}
++	return n, nil
+ }
+ 
+ func (m *Muxer) retransmitTables(force bool) (int, error) {

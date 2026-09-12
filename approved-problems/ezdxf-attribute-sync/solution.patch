@@ -1,0 +1,649 @@
+diff --git a/src/ezdxf/attsync.py b/src/ezdxf/attsync.py
+new file mode 100644
+index 0000000..0927daa
+--- /dev/null
++++ b/src/ezdxf/attsync.py
+@@ -0,0 +1,475 @@
++# Copyright (c) 2026, Manfred Moitzi
++# License: MIT License
++"""Keep the ATTRIB entities of block references in step with the ATTDEF entities of
++their block definition.
++
++"""
++
++from __future__ import annotations
++from typing import Iterator, NamedTuple, Optional, Sequence, TYPE_CHECKING, cast
++import dataclasses
++
++from ezdxf.entities import AttDef, Attrib, Insert, factory
++from ezdxf.lldxf.const import DXF2018, DXFKeyError, DXFValueError
++from ezdxf.math import Matrix44, NULLVEC, Vec3
++from ezdxf.tools.text import fast_plain_mtext
++
++if TYPE_CHECKING:
++    from ezdxf.document import Drawing
++    from ezdxf.entities import BlockRecord
++    from ezdxf.layouts import BaseLayout, BlockLayout
++
++__all__ = [
++    "AttribPlacement",
++    "AttribSyncReport",
++    "attrib_placements",
++    "delete_attdef",
++    "out_of_sync_references",
++    "rename_attdef",
++    "reorder_attdefs",
++    "sync_block_reference",
++    "sync_block_references",
++]
++
++TEMPLATE_DISCARD = {"prompt", "handle", "owner", "paperspace"}
++KEEP = {"handle", "owner", "paperspace"}
++
++
++@dataclasses.dataclass
++class AttribSyncReport:
++    """Counts the changes made by an attribute synchronization.
++
++    Attributes:
++        references: count of processed block references
++        added: count of added ATTRIB entities
++        removed: count of removed ATTRIB entities
++        updated: count of changed or moved ATTRIB entities
++
++    """
++
++    references: int = 0
++    added: int = 0
++    removed: int = 0
++    updated: int = 0
++
++    @property
++    def changed(self) -> bool:
++        """Returns ``True`` if any ATTRIB entity was added, removed or updated."""
++        return bool(self.added or self.removed or self.updated)
++
++
++class AttribPlacement(NamedTuple):
++    """Where an ATTRIB entity of a block reference ends up in the drawing.
++
++    Attributes:
++        tag: tag of the ATTRIB entity
++        text: content text of the ATTRIB entity
++        location: insert location in the :ref:`WCS`
++        rotation: text rotation in the :ref:`WCS`
++        height: text height in the :ref:`WCS`
++        insert: the block reference the ATTRIB entity is attached to
++
++    """
++
++    tag: str
++    text: str
++    location: Vec3
++    rotation: float
++    height: float
++    insert: Insert
++
++
++def attrib_placements(block: BlockLayout) -> list[AttribPlacement]:
++    """Returns the placement of every ATTRIB entity of every block reference of
++    `block` which is reachable from a layout of the document.
++    """
++    doc = block.doc
++    if doc is None:
++        return []
++    placements: list[AttribPlacement] = []
++    for layout in _layouts(doc):
++        _walk(layout, block.block_record, Matrix44(), [], placements)
++    return placements
++
++
++def _layouts(doc: Drawing) -> Iterator[BaseLayout]:
++    yield doc.modelspace()
++    for name in doc.layout_names_in_taborder():
++        layout = doc.layout(name)
++        if layout is not doc.modelspace():
++            yield layout
++
++
++def _walk(
++    layout: BaseLayout,
++    block_record: BlockRecord,
++    matrix: Matrix44,
++    chain: list[str],
++    placements: list[AttribPlacement],
++) -> None:
++    for entity in layout:
++        if not isinstance(entity, Insert) or not entity.is_alive:
++            continue
++        referenced = entity.block()
++        if referenced is None:
++            continue
++        handle = referenced.block_record.dxf.handle
++        if handle in chain:
++            continue
++        for element in _grid(entity):
++            if referenced.block_record is block_record:
++                for attrib in element.attribs:
++                    placed = cast(Attrib, attrib.copy())
++                    placed.transform(matrix)
++                    placements.append(
++                        AttribPlacement(
++                            placed.dxf.get("tag", ""),
++                            placed.dxf.get("text", ""),
++                            Vec3(placed.dxf.get("insert", NULLVEC)),
++                            placed.dxf.get("rotation", 0.0),
++                            placed.dxf.get("height", 0.0),
++                            entity,
++                        )
++                    )
++            _walk(
++                referenced,
++                block_record,
++                element.matrix44() * matrix,
++                chain + [handle],
++                placements,
++            )
++
++
++def _grid(insert: Insert) -> Iterator[Insert]:
++    if insert.mcount > 1:
++        yield from insert.multi_insert()
++    else:
++        yield insert
++
++
++def sync_block_reference(insert: Insert) -> AttribSyncReport:
++    """Synchronizes the ATTRIB entities of a single block reference with the ATTDEF
++    entities of its block definition.
++    """
++    report = AttribSyncReport()
++    block = insert.block()
++    if block is None:
++        return report
++    _sync_reference(insert, block, report)
++    block.update_block_flags()
++    return report
++
++
++def sync_block_references(block: BlockLayout) -> AttribSyncReport:
++    """Synchronizes the ATTRIB entities of all block references of `block` in the
++    document with the ATTDEF entities of the block definition.
++    """
++    return _sync_references(block, AttribSyncReport(), set())
++
++
++def _sync_references(
++    block: BlockLayout, report: AttribSyncReport, forced: set[int]
++) -> AttribSyncReport:
++    for insert in _block_references(block):
++        _sync_reference(insert, block, report, forced=forced)
++    block.update_block_flags()
++    return report
++
++
++def out_of_sync_references(block: BlockLayout) -> list[Insert]:
++    """Returns all block references of `block` in the document which are not in sync
++    with the ATTDEF entities of the block definition, without changing anything.
++    """
++    references: list[Insert] = []
++    for insert in _block_references(block):
++        report = AttribSyncReport()
++        _sync_reference(insert, block, report, apply=False)
++        if report.changed:
++            references.append(insert)
++    return references
++
++
++def sync_document(doc: Drawing) -> AttribSyncReport:
++    """Synchronizes the ATTRIB entities of all block references in the document with
++    the ATTDEF entities of their block definitions.
++    """
++    report = AttribSyncReport()
++    references: dict[str, tuple[BlockLayout, list[Insert]]] = {}
++    for entity in list(doc.chain_layouts_and_blocks()):
++        if not isinstance(entity, Insert) or not entity.is_alive:
++            continue
++        block = entity.block()
++        if block is None:
++            continue
++        handle = block.block_record.dxf.handle
++        if handle not in references:
++            references[handle] = (block, [])
++        references[handle][1].append(entity)
++    for block, inserts in references.values():
++        for insert in inserts:
++            _sync_reference(insert, block, report)
++        block.update_block_flags()
++    return report
++
++
++def rename_attdef(block: BlockLayout, old_tag: str, new_tag: str) -> AttribSyncReport:
++    """Renames the ATTDEF entity `old_tag` of `block` to `new_tag` and transfers the
++    content text of the matching ATTRIB entity of every block reference in the
++    document to the new tag.
++    """
++    attdef = _get_attdef(block, old_tag)
++    if attdef is None:
++        raise DXFKeyError(old_tag)
++    if not new_tag:
++        raise DXFValueError("new tag is empty")
++    existing = _get_attdef(block, new_tag)
++    if existing is not None and existing is not attdef:
++        raise DXFValueError(f"attribute tag '{new_tag}' already exist")
++    if attdef.dxf.get("tag", "") == new_tag:
++        return AttribSyncReport()
++
++    report = AttribSyncReport()
++    forced: set[int] = set()
++    key = _key(old_tag)
++    for insert in _block_references(block):
++        renamed: Optional[Attrib] = None
++        for attrib in list(insert.attribs):
++            if _key(attrib.dxf.get("tag", "")) == key and renamed is None:
++                attrib.dxf.tag = new_tag
++                renamed = attrib
++                forced.add(id(attrib))
++        if renamed is not None:
++            _remove_attribs(
++                insert, [a for a in insert.attribs if a is not renamed], new_tag, report
++            )
++    attdef.dxf.tag = new_tag
++    return _sync_references(block, report, forced)
++
++
++def delete_attdef(block: BlockLayout, tag: str) -> AttribSyncReport:
++    """Deletes the ATTDEF entity `tag` from `block` and the matching ATTRIB entity
++    from every block reference in the document.
++    """
++    attdef = _get_attdef(block, tag)
++    if attdef is None:
++        raise DXFKeyError(tag)
++    block.delete_entity(attdef)
++    return sync_block_references(block)
++
++
++def reorder_attdefs(block: BlockLayout, tags: Sequence[str]) -> AttribSyncReport:
++    """Rearranges the ATTDEF entities of `block` in the order of `tags` and applies
++    the new order to the ATTRIB entities of every block reference in the document.
++
++    The `tags` sequence has to contain the tag of every ATTDEF entity of the block
++    definition exactly once.
++    """
++    attdefs: dict[str, AttDef] = {}
++    for attdef in block.attdefs():
++        key = _key(attdef.dxf.get("tag", ""))
++        if key not in attdefs:
++            attdefs[key] = attdef
++    order = [_key(tag) for tag in tags]
++    if sorted(order) != sorted(attdefs.keys()):
++        raise DXFValueError("tags do not match the attribute definitions")
++
++    queue = [attdefs[key] for key in order]
++    selected = set(id(attdef) for attdef in queue)
++    entities = block.entity_space.entities
++    index = 0
++    for position, entity in enumerate(entities):
++        if id(entity) in selected:
++            entities[position] = queue[index]
++            index += 1
++    return sync_block_references(block)
++
++
++def _block_references(block: BlockLayout) -> Iterator[Insert]:
++    doc = block.doc
++    if doc is None:
++        return
++    block_record = block.block_record
++    for entity in list(doc.chain_layouts_and_blocks()):
++        if not isinstance(entity, Insert) or not entity.is_alive:
++            continue
++        referenced = entity.block()
++        if referenced is not None and referenced.block_record is block_record:
++            yield entity
++
++
++def _key(tag: str) -> str:
++    return tag.upper()
++
++
++def _get_attdef(block: BlockLayout, tag: str) -> Optional[AttDef]:
++    key = _key(tag)
++    for attdef in block.attdefs():
++        if _key(attdef.dxf.get("tag", "")) == key:
++            return attdef
++    return None
++
++
++def _attdefs(block: BlockLayout) -> Iterator[AttDef]:
++    seen: set[str] = set()
++    for attdef in block.attdefs():
++        if attdef.is_const or not attdef.dxf.hasattr("tag"):
++            continue
++        key = _key(attdef.dxf.tag)
++        if key in seen:
++            continue
++        seen.add(key)
++        yield attdef
++
++
++def _default_content(attdef: AttDef) -> str:
++    if _multiline(attdef):
++        return attdef.virtual_mtext_entity().text
++    if attdef.has_embedded_mtext_entity:
++        lines = fast_plain_mtext(attdef.virtual_mtext_entity().text, split=True)
++        return lines[0] if lines else ""
++    return attdef.dxf.get("text", "")
++
++
++def _content(attrib: Attrib, attdef: AttDef) -> str:
++    if not attrib.has_embedded_mtext_entity:
++        return attrib.dxf.get("text", "")
++    text = attrib.virtual_mtext_entity().text
++    if _multiline(attdef):
++        return text
++    lines = fast_plain_mtext(text, split=True)
++    return lines[0] if lines else ""
++
++
++def _remove_attribs(
++    insert: Insert, candidates: list[Attrib], tag: str, report: AttribSyncReport
++) -> None:
++    attribs = insert.attribs
++    key = _key(tag)
++    for attrib in candidates:
++        if _key(attrib.dxf.get("tag", "")) != key:
++            continue
++        attribs.remove(attrib)
++        attrib.destroy()
++        report.removed += 1
++
++
++def _sync_reference(
++    insert: Insert,
++    block: BlockLayout,
++    report: AttribSyncReport,
++    apply: bool = True,
++    forced: Optional[set[int]] = None,
++) -> None:
++    m = insert.matrix44()
++    attribs = insert.attribs
++    present: dict[str, Attrib] = {}
++    obsolete: list[Attrib] = []
++    for attrib in attribs:
++        key = _key(attrib.dxf.get("tag", ""))
++        if key in present:
++            obsolete.append(attrib)
++        else:
++            present[key] = attrib
++
++    ordered: list[Attrib] = []
++    position = 0
++    for attdef in _attdefs(block):
++        tag = attdef.dxf.tag
++        attrib = present.pop(_key(tag), None)
++        if attrib is None:
++            report.added += 1
++            if apply:
++                new_attrib = insert.add_attrib(tag, "")
++                _apply(new_attrib, _template(attdef, _default_content(attdef), m))
++                ordered.append(new_attrib)
++        else:
++            template = _template(attdef, _content(attrib, attdef), m)
++            if attrib.dxf.get("lock_position", 0):
++                _keep_location(template, attrib)
++            _keep_lock(template, attrib)
++            moved = attribs.index(attrib) != position
++            if apply:
++                changed = _apply(attrib, template)
++            else:
++                changed = _state(attrib) != _state(template)
++                template.destroy()
++            if changed or moved or (forced is not None and id(attrib) in forced):
++                report.updated += 1
++            ordered.append(attrib)
++        position += 1
++
++    obsolete.extend(present.values())
++    report.removed += len(obsolete)
++    if apply:
++        for attrib in obsolete:
++            attrib.destroy()
++        attribs[:] = ordered
++    report.references += 1
++
++
++def _multiline(attdef: AttDef) -> bool:
++    if not attdef.has_embedded_mtext_entity:
++        return False
++    doc = attdef.doc
++    return doc is None or doc.dxfversion >= DXF2018
++
++
++def _template(attdef: AttDef, text: str, m: Matrix44) -> Attrib:
++    dxfattribs = attdef.dxfattribs(drop=TEMPLATE_DISCARD)
++    dxfattribs["text"] = text
++    attrib = cast(Attrib, factory.new("ATTRIB", dxfattribs=dxfattribs))
++    if _multiline(attdef):
++        mtext = attdef.virtual_mtext_entity()
++        mtext.text = text
++        attrib.embed_mtext(mtext)
++    attrib.transform(m)
++    return attrib
++
++
++def _keep_location(template: Attrib, attrib: Attrib) -> None:
++    if template.has_embedded_mtext_entity and attrib.has_embedded_mtext_entity:
++        mtext = template.virtual_mtext_entity()
++        mtext.dxf.insert = attrib.virtual_mtext_entity().dxf.insert
++        template.set_mtext(mtext)
++    for key in ("insert", "align_point"):
++        if attrib.dxf.hasattr(key):
++            template.dxf.set(key, attrib.dxf.get(key))
++        else:
++            template.dxf.discard(key)
++
++
++def _keep_lock(template: Attrib, attrib: Attrib) -> None:
++    if attrib.dxf.hasattr("lock_position"):
++        template.dxf.lock_position = attrib.dxf.lock_position
++    else:
++        template.dxf.discard("lock_position")
++
++
++def _apply(attrib: Attrib, template: Attrib) -> bool:
++    before = _state(attrib)
++    if template.has_embedded_mtext_entity:
++        attrib.set_mtext(template.virtual_mtext_entity())
++    elif attrib.has_embedded_mtext_entity:
++        attrib.discard_mtext()
++    source = template.dxf.all_existing_dxf_attribs()
++    for key, value in source.items():
++        if key not in KEEP:
++            attrib.dxf.set(key, value)
++    for key in list(attrib.dxf.all_existing_dxf_attribs().keys()):
++        if key not in source and key not in KEEP:
++            attrib.dxf.discard(key)
++    template.destroy()
++    return before != _state(attrib)
++
++
++def _state(attrib: Attrib) -> tuple:
++    dxfattribs = attrib.dxfattribs(drop=KEEP)
++    state = tuple(sorted((key, str(value)) for key, value in dxfattribs.items()))
++    if not attrib.has_embedded_mtext_entity:
++        return state, None
++    mtext = attrib.virtual_mtext_entity()
++    content = mtext.dxfattribs(drop=KEEP)
++    return state, (
++        mtext.text,
++        tuple(sorted((key, str(value)) for key, value in content.items())),
++    )
+diff --git a/src/ezdxf/entities/insert.py b/src/ezdxf/entities/insert.py
+index a5c3d62..4c459c1 100644
+--- a/src/ezdxf/entities/insert.py
++++ b/src/ezdxf/entities/insert.py
+@@ -63,6 +63,7 @@ from .subentity import LinkedEntities
+ from .attrib import Attrib
+ 
+ if TYPE_CHECKING:
++    from ezdxf.attsync import AttribSyncReport
+     from ezdxf.audit import Auditor
+     from ezdxf.entities import DXFNamespace, AttDef, DXFEntity
+     from ezdxf.layouts import BaseLayout, BlockLayout
+@@ -762,6 +763,22 @@ class Insert(LinkedEntities):
+             autofill()
+         return self
+ 
++    def sync_attribs(self) -> AttribSyncReport:
++        """Synchronizes the attached :class:`Attrib` entities with the
++        :class:`~ezdxf.entities.AttDef` entities of the block definition and returns
++        an :class:`~ezdxf.attsync.AttribSyncReport`.
++
++        The block reference gets one ATTRIB entity for each non-constant ATTDEF
++        entity of the block definition in the order of the ATTDEF entities.  The
++        content text of an already attached ATTRIB entity is preserved, all other DXF
++        attributes are taken from the ATTDEF entity and transformed into the
++        coordinate system of the block reference.
++
++        """
++        from ezdxf.attsync import sync_block_reference
++
++        return sync_block_reference(self)
++
+     def audit(self, auditor: Auditor) -> None:
+         """Validity check."""
+         super().audit(auditor)
+diff --git a/src/ezdxf/layouts/blocklayout.py b/src/ezdxf/layouts/blocklayout.py
+index d8e443f..9e84161 100644
+--- a/src/ezdxf/layouts/blocklayout.py
++++ b/src/ezdxf/layouts/blocklayout.py
+@@ -1,10 +1,14 @@
+ # Copyright (c) 2019-2021, Manfred Moitzi
+ # License: MIT License
+-from typing import Iterable, Optional
++from __future__ import annotations
++from typing import Iterable, Optional, Sequence, TYPE_CHECKING
+ from ezdxf.math import Vec3, UVec
+ from ezdxf.lldxf import const
+ from .base import BaseLayout
+-from ezdxf.entities import DXFGraphic, AttDef, Block, EndBlk
++from ezdxf.entities import DXFGraphic, AttDef, Block, EndBlk, Insert
++
++if TYPE_CHECKING:
++    from ezdxf.attsync import AttribPlacement, AttribSyncReport
+ 
+ 
+ class BlockLayout(BaseLayout):
+@@ -130,3 +134,77 @@ class BlockLayout(BaseLayout):
+     def update_block_flags(self):
+         state = self.has_non_const_attdef()
+         self.block.set_flag_state(const.BLK_NON_CONSTANT_ATTRIBUTES, state)
++
++    def sync_attribs(self) -> AttribSyncReport:
++        """Synchronizes the :class:`~ezdxf.entities.Attrib` entities of all block
++        references of this block in the document with the
++        :class:`~ezdxf.entities.AttDef` entities of this block definition and returns
++        an :class:`~ezdxf.attsync.AttribSyncReport`.
++
++        Block references are located in all layouts and in all block definitions.
++        See also :meth:`ezdxf.entities.Insert.sync_attribs`.
++
++        """
++        from ezdxf.attsync import sync_block_references
++
++        return sync_block_references(self)
++
++    def attrib_placements(self) -> list[AttribPlacement]:
++        """Returns an :class:`~ezdxf.attsync.AttribPlacement` for every
++        :class:`~ezdxf.entities.Attrib` entity of every block reference of this block
++        which a layout of the document reaches, directly, through other block
++        definitions or as an element of a MINSERT grid.
++        """
++        from ezdxf.attsync import attrib_placements
++
++        return attrib_placements(self)
++
++    def out_of_sync_references(self) -> list[Insert]:
++        """Returns all block references of this block in the document which are not
++        in sync with the :class:`~ezdxf.entities.AttDef` entities of this block
++        definition, without changing anything.
++        """
++        from ezdxf.attsync import out_of_sync_references
++
++        return out_of_sync_references(self)
++
++    def rename_attdef(self, old_tag: str, new_tag: str) -> AttribSyncReport:
++        """Renames the :class:`~ezdxf.entities.AttDef` entity `old_tag` to `new_tag`
++        and transfers the content text of the matching :class:`~ezdxf.entities.Attrib`
++        entity of every block reference in the document to the new tag.
++
++        Raises:
++            DXFKeyError: no ATTDEF entity for `old_tag` exist
++            DXFValueError: `new_tag` is not a valid tag or does already exist
++
++        """
++        from ezdxf.attsync import rename_attdef
++
++        return rename_attdef(self, old_tag, new_tag)
++
++    def delete_attdef(self, tag: str) -> AttribSyncReport:
++        """Deletes the :class:`~ezdxf.entities.AttDef` entity `tag` and the matching
++        :class:`~ezdxf.entities.Attrib` entity of every block reference in the
++        document.
++
++        Raises:
++            DXFKeyError: no ATTDEF entity for `tag` exist
++
++        """
++        from ezdxf.attsync import delete_attdef
++
++        return delete_attdef(self, tag)
++
++    def reorder_attdefs(self, tags: Sequence[str]) -> AttribSyncReport:
++        """Rearranges the :class:`~ezdxf.entities.AttDef` entities in the order of
++        `tags` and applies the new order to the :class:`~ezdxf.entities.Attrib`
++        entities of every block reference in the document.
++
++        Raises:
++            DXFValueError: `tags` does not contain the tag of every ATTDEF entity
++                exactly once
++
++        """
++        from ezdxf.attsync import reorder_attdefs
++
++        return reorder_attdefs(self, tags)
+diff --git a/src/ezdxf/sections/blocks.py b/src/ezdxf/sections/blocks.py
+index 23f6ff8..17299e1 100644
+--- a/src/ezdxf/sections/blocks.py
++++ b/src/ezdxf/sections/blocks.py
+@@ -34,6 +34,7 @@ from ezdxf.math import UVec, NULLVEC, Vec3
+ from ezdxf.render.arrows import ARROWS
+ 
+ if TYPE_CHECKING:
++    from ezdxf.attsync import AttribSyncReport
+     from ezdxf.document import Drawing
+     from ezdxf.entities import DXFEntity, DXFTagStorage
+     from ezdxf.entitydb import EntityDB
+@@ -367,6 +368,21 @@ class BlocksSection:
+             if not self.block_records.has_entry(block_name):
+                 return block_name
+ 
++    def sync_attribs(self) -> AttribSyncReport:
++        """Synchronizes the :class:`~ezdxf.entities.Attrib` entities of all block
++        references in the document with the :class:`~ezdxf.entities.AttDef` entities
++        of their block definition and returns an
++        :class:`~ezdxf.attsync.AttribSyncReport`.
++
++        See also :meth:`ezdxf.layouts.BlockLayout.sync_attribs`.
++
++        """
++        from ezdxf.attsync import AttribSyncReport, sync_document
++
++        if self.doc is None:
++            return AttribSyncReport()
++        return sync_document(self.doc)
++
+     def rename_block(self, old_name: str, new_name: str) -> None:
+         """Rename :class:`~ezdxf.layouts.BlockLayout` `old_name` to `new_name`
+ 

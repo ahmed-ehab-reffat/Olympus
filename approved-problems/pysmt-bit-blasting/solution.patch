@@ -1,0 +1,652 @@
+diff --git a/pysmt/bitblast.py b/pysmt/bitblast.py
+new file mode 100644
+index 0000000..f10b410
+--- /dev/null
++++ b/pysmt/bitblast.py
+@@ -0,0 +1,621 @@
++#
++# This file is part of pySMT.
++#
++#   Copyright 2014 Andrea Micheli and Marco Gario
++#
++#   Licensed under the Apache License, Version 2.0 (the "License");
++#   you may not use this file except in compliance with the License.
++#   You may obtain a copy of the License at
++#
++#       http://www.apache.org/licenses/LICENSE-2.0
++#
++#   Unless required by applicable law or agreed to in writing, software
++#   distributed under the License is distributed on an "AS IS" BASIS,
++#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#   See the License for the specific language governing permissions and
++#   limitations under the License.
++#
++"""
++Bit-blasting of quantifier-free bit-vector formulae into Boolean formulae.
++"""
++from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
++
++import pysmt
++import pysmt.operators as op
++import pysmt.typing as types
++from pysmt.exceptions import ConvertExpressionError
++from pysmt.fnode import FNode
++from pysmt.solvers.eager import EagerModel
++from pysmt.walkers import DagWalker, IdentityDagWalker, handles
++
++Bits = Tuple[FNode, ...]
++Cells = Tuple[Bits, ...]
++
++
++class QuantifierExpander(IdentityDagWalker):
++    """Replaces every quantifier by the instances of its body."""
++
++    def __init__(self, environment: Optional["pysmt.environment.Environment"]=None):
++        IdentityDagWalker.__init__(self, env=environment)
++
++    def expand(self, formula: FNode) -> FNode:
++        if self.env.qfo.is_qf(formula):
++            return formula
++        return self.walk(formula)
++
++    def walk_forall(self, formula: FNode, args: List[FNode], **kwargs) -> FNode:
++        return self.mgr.And(self._instances(formula, args[0]))
++
++    def walk_exists(self, formula: FNode, args: List[FNode], **kwargs) -> FNode:
++        return self.mgr.Or(self._instances(formula, args[0]))
++
++    def _instances(self, formula: FNode, body: FNode) -> List[FNode]:
++        bodies = [body]
++        for variable in formula.quantifier_vars():
++            values = self._domain(variable)
++            bodies = [b.substitute({variable: value})
++                      for b in bodies for value in values]
++        return bodies
++
++    def _domain(self, variable: FNode) -> List[FNode]:
++        variable_type = variable.symbol_type()
++        if variable_type.is_bool_type():
++            return [self.mgr.TRUE(), self.mgr.FALSE()]
++        if variable_type.is_bv_type():
++            width = variable_type.width
++            return [self.mgr.BV(value, width) for value in range(1 << width)]
++        raise ConvertExpressionError("Cannot expand a quantifier over %s"
++                                     % variable)
++
++# EOC QuantifierExpander
++
++
++class BitBlaster(DagWalker):
++    """Converts a bit-vector formula into a Boolean one.
++
++    Every bit-vector symbol is represented by one fresh Boolean symbol per
++    bit, least significant first, and every array symbol by one such group
++    of bits per index. The conversion is equivalence preserving: no other
++    symbol is introduced.
++    """
++
++    def __init__(self, environment: Optional["pysmt.environment.Environment"]=None):
++        DagWalker.__init__(self, env=environment)
++        self.mgr = self.env.formula_manager
++        self.get_type = self.env.stc.get_type
++        self.true = self.mgr.TRUE()
++        self.false = self.mgr.FALSE()
++        self._expander = QuantifierExpander(environment)
++        self._symbol_bits: Dict[FNode, Bits] = {}
++        self._array_bits: Dict[FNode, Cells] = {}
++        self._all_bits: set = set()
++
++    def convert(self, formula: FNode) -> FNode:
++        """Returns a Boolean formula equivalent to the given one."""
++        if not self.get_type(formula).is_bool_type():
++            raise ConvertExpressionError("Cannot bit-blast the non-Boolean "
++                                         "expression %s" % formula)
++        return self.walk(self._expander.expand(formula))
++
++    def bit_symbols(self, symbol: FNode) -> Any:
++        """Returns the Boolean symbols standing for the bits of a symbol."""
++        if symbol.is_symbol():
++            symbol_type = symbol.symbol_type()
++            if symbol_type.is_bv_type():
++                return self._bits_of_symbol(symbol)
++            if symbol_type.is_array_type():
++                return self._cells_of_symbol(symbol)
++        raise ConvertExpressionError("%s has no bits" % symbol)
++
++    def cnf(self, formula: FNode) -> List[List[FNode]]:
++        """Returns clauses satisfiable exactly when the formula is."""
++        blasted = self.convert(formula)
++        if blasted.is_true():
++            return []
++        if blasted.is_false():
++            return [[]]
++        clauses: List[List[FNode]] = []
++        cache: Dict[FNode, FNode] = {}
++        clauses.append([self._literal(blasted, clauses, cache)])
++        return clauses
++
++    def _fresh_auxiliary(self) -> FNode:
++        symbol = self.mgr.FreshSymbol(types.BOOL)
++        self._all_bits.add(symbol)
++        return symbol
++
++    def _literal(self, node: FNode, clauses: List[List[FNode]],
++                 cache: Dict[FNode, FNode]) -> FNode:
++        if node.is_not():
++            return self._negate_literal(
++                self._literal(node.arg(0), clauses, cache))
++        if node.is_symbol():
++            return node
++        try:
++            return cache[node]
++        except KeyError:
++            pass
++        if node.is_true() or node.is_false():
++            symbol = self._fresh_auxiliary()
++            clauses.append([symbol if node.is_true()
++                            else self._negate_literal(symbol)])
++            cache[node] = symbol
++            return symbol
++        args = [self._literal(arg, clauses, cache) for arg in node.args()]
++        symbol = self._fresh_auxiliary()
++        negated = self._negate_literal(symbol)
++        if node.is_and():
++            for arg in args:
++                clauses.append([negated, arg])
++            clauses.append([symbol] + [self._negate_literal(a) for a in args])
++        elif node.is_or():
++            clauses.append([negated] + args)
++            for arg in args:
++                clauses.append([symbol, self._negate_literal(arg)])
++        elif node.is_implies():
++            left, right = args
++            clauses.append([negated, self._negate_literal(left), right])
++            clauses.append([symbol, left])
++            clauses.append([symbol, self._negate_literal(right)])
++        elif node.is_iff() or node.is_xor():
++            left, right = args
++            same = node.is_iff()
++            first, second = (right, self._negate_literal(right)) \
++                if same else (self._negate_literal(right), right)
++            clauses.append([negated, self._negate_literal(left), first])
++            clauses.append([negated, left, second])
++            clauses.append([symbol, self._negate_literal(left), second])
++            clauses.append([symbol, left, first])
++        elif node.is_ite():
++            cond, then_, else_ = args
++            clauses.append([negated, self._negate_literal(cond), then_])
++            clauses.append([negated, cond, else_])
++            clauses.append([symbol, self._negate_literal(cond),
++                            self._negate_literal(then_)])
++            clauses.append([symbol, cond, self._negate_literal(else_)])
++        else:
++            raise ConvertExpressionError("Cannot put %s into clauses" % node)
++        cache[node] = symbol
++        return symbol
++
++    def _negate_literal(self, literal: FNode) -> FNode:
++        if literal.is_not():
++            return literal.arg(0)
++        return self.mgr.Not(literal)
++
++    def reconstruct(self, assignment: Dict[FNode, Any]) -> Dict[FNode, FNode]:
++        """Returns the value of every symbol seen so far."""
++        res = {}
++        for symbol, bits in self._symbol_bits.items():
++            res[symbol] = self._constant(bits, symbol.symbol_type(),
++                                         assignment)
++        for symbol, cells in self._array_bits.items():
++            res[symbol] = self._constant(cells, symbol.symbol_type(),
++                                         assignment)
++        return res
++
++    def _constant(self, value: Any, value_type: Any,
++                  assignment: Dict[FNode, Any]) -> FNode:
++        if value_type.is_bv_type():
++            bits = 0
++            for idx, bit in enumerate(value):
++                if self._truth(assignment.get(bit, False)):
++                    bits += 1 << idx
++            return self.mgr.BV(bits, value_type.width)
++        elem_type = value_type.elem_type
++        default = self._zero(elem_type)
++        values = {}
++        for index, cell in enumerate(value):
++            constant = self._constant(cell, elem_type, assignment)
++            if constant != default:
++                values[self.mgr.BV(index, value_type.index_type.width)] = \
++                    constant
++        return self.mgr.Array(value_type.index_type, default, values)
++
++    def _zero(self, value_type: Any) -> FNode:
++        if value_type.is_bv_type():
++            return self.mgr.BV(0, value_type.width)
++        return self.mgr.Array(value_type.index_type,
++                              self._zero(value_type.elem_type))
++
++    def model(self, assignment: Dict[FNode, Any]) -> EagerModel:
++        """Returns a model of the original formulae from a Boolean one."""
++        values: Dict[FNode, FNode] = dict(self.reconstruct(assignment))
++        for symbol, value in assignment.items():
++            if symbol not in self._all_bits:
++                values[symbol] = self.mgr.Bool(self._truth(value))
++        return EagerModel(values, environment=self.env)
++
++    def _truth(self, value: Any) -> bool:
++        if isinstance(value, FNode):
++            return value.is_true()
++        return bool(value)
++
++    def _bits_of_symbol(self, symbol: FNode) -> Bits:
++        try:
++            return self._symbol_bits[symbol]
++        except KeyError:
++            pass
++        width = symbol.bv_width()
++        bits = tuple(self.mgr.FreshSymbol(types.BOOL)
++                     for _ in range(width))
++        self._symbol_bits[symbol] = bits
++        self._all_bits.update(bits)
++        return bits
++
++    def _cells_of_symbol(self, symbol: FNode) -> Cells:
++        try:
++            return self._array_bits[symbol]
++        except KeyError:
++            pass
++        cells = self._fresh_value(symbol.symbol_type(), symbol)
++        self._array_bits[symbol] = cells
++        return cells
++
++    def _fresh_value(self, value_type: Any, symbol: FNode) -> Any:
++        if value_type.is_bv_type():
++            bits = tuple(self.mgr.FreshSymbol(types.BOOL)
++                         for _ in range(value_type.width))
++            self._all_bits.update(bits)
++            return bits
++        if not value_type.is_array_type() or \
++                not value_type.index_type.is_bv_type():
++            raise ConvertExpressionError("Cannot bit-blast the array %s"
++                                         % symbol)
++        return tuple(self._fresh_value(value_type.elem_type, symbol)
++                     for _ in range(1 << value_type.index_type.width))
++
++    def _not(self, a: FNode) -> FNode:
++        if a.is_true():
++            return self.false
++        if a.is_false():
++            return self.true
++        return self.mgr.Not(a)
++
++    def _and(self, a: FNode, b: FNode) -> FNode:
++        if a.is_false() or b.is_false():
++            return self.false
++        if a.is_true():
++            return b
++        if b.is_true():
++            return a
++        return self.mgr.And(a, b)
++
++    def _or(self, a: FNode, b: FNode) -> FNode:
++        if a.is_true() or b.is_true():
++            return self.true
++        if a.is_false():
++            return b
++        if b.is_false():
++            return a
++        return self.mgr.Or(a, b)
++
++    def _xor(self, a: FNode, b: FNode) -> FNode:
++        if a.is_false():
++            return b
++        if b.is_false():
++            return a
++        if a.is_true():
++            return self._not(b)
++        if b.is_true():
++            return self._not(a)
++        return self.mgr.Xor(a, b)
++
++    def _iff(self, a: FNode, b: FNode) -> FNode:
++        return self._not(self._xor(a, b))
++
++    def _select(self, cond: FNode, a: FNode, b: FNode) -> FNode:
++        if cond.is_true():
++            return a
++        if cond.is_false():
++            return b
++        if a == b:
++            return a
++        return self._or(self._and(cond, a), self._and(self._not(cond), b))
++
++    def _select_bits(self, cond: FNode, a: Bits, b: Bits) -> Bits:
++        return tuple(self._select(cond, x, y) for x, y in zip(a, b))
++
++    def _big_or(self, bits: Sequence[FNode]) -> FNode:
++        res = self.false
++        for bit in bits:
++            res = self._or(res, bit)
++        return res
++
++    def _bits(self, value: int, width: int) -> Bits:
++        return tuple(self.true if (value >> idx) & 1 else self.false
++                     for idx in range(width))
++
++    def _zeroes(self, width: int) -> Bits:
++        return (self.false,) * width
++
++    def _ones(self, width: int) -> Bits:
++        return (self.true,) * width
++
++    def _add(self, a: Bits, b: Bits, carry: Optional[FNode]=None) -> Bits:
++        carry = self.false if carry is None else carry
++        res = []
++        for x, y in zip(a, b):
++            partial = self._xor(x, y)
++            res.append(self._xor(partial, carry))
++            carry = self._or(self._and(x, y), self._and(carry, partial))
++        return tuple(res)
++
++    def _negate(self, a: Bits) -> Bits:
++        flipped = tuple(self._not(x) for x in a)
++        return self._add(flipped, self._zeroes(len(a)), self.true)
++
++    def _subtract(self, a: Bits, b: Bits) -> Bits:
++        return self._add(a, tuple(self._not(x) for x in b), self.true)
++
++    def _multiply(self, a: Bits, b: Bits) -> Bits:
++        width = len(a)
++        res = self._zeroes(width)
++        for idx, bit in enumerate(b):
++            if bit.is_false():
++                continue
++            shifted = self._zeroes(idx) + tuple(self._and(bit, x)
++                                                for x in a[:width - idx])
++            res = self._add(res, shifted)
++        return res
++
++    def _unsigned_lt(self, a: Bits, b: Bits) -> FNode:
++        res = self.false
++        for x, y in zip(a, b):
++            res = self._or(self._and(self._not(x), y),
++                           self._and(self._iff(x, y), res))
++        return res
++
++    def _signed_lt(self, a: Bits, b: Bits) -> FNode:
++        flipped_a = a[:-1] + (self._not(a[-1]),)
++        flipped_b = b[:-1] + (self._not(b[-1]),)
++        return self._unsigned_lt(flipped_a, flipped_b)
++
++    def _equal(self, a: Bits, b: Bits) -> FNode:
++        res = self.true
++        for x, y in zip(a, b):
++            res = self._and(res, self._iff(x, y))
++        return res
++
++    def _divide(self, a: Bits, b: Bits) -> Tuple[Bits, Bits]:
++        """Restoring division, with the SMT-LIB division by zero results."""
++        width = len(a)
++        remainder = self._zeroes(width)
++        quotient: List[FNode] = [self.false] * width
++        for idx in reversed(range(width)):
++            remainder = (a[idx],) + remainder[:width - 1]
++            fits = self._not(self._unsigned_lt(remainder, b))
++            remainder = self._select_bits(fits, self._subtract(remainder, b),
++                                          remainder)
++            quotient[idx] = fits
++        by_zero = self._not(self._big_or(b))
++        return (self._select_bits(by_zero, self._ones(width), tuple(quotient)),
++                self._select_bits(by_zero, a, remainder))
++
++    def _signed_divide(self, a: Bits, b: Bits) -> Tuple[Bits, Bits]:
++        negative_a, negative_b = a[-1], b[-1]
++        magnitude_a = self._select_bits(negative_a, self._negate(a), a)
++        magnitude_b = self._select_bits(negative_b, self._negate(b), b)
++        quotient, remainder = self._divide(magnitude_a, magnitude_b)
++        opposite = self._xor(negative_a, negative_b)
++        return (self._select_bits(opposite, self._negate(quotient), quotient),
++                self._select_bits(negative_a, self._negate(remainder),
++                                  remainder))
++
++    def _shift_by(self, a: Bits, amount: int, left: bool, fill: FNode) -> Bits:
++        width = len(a)
++        if amount >= width:
++            return (fill,) * width
++        if left:
++            return (fill,) * amount + a[:width - amount]
++        return a[amount:] + (fill,) * amount
++
++    def _shift(self, a: Bits, b: Bits, left: bool, fill: FNode) -> Bits:
++        width = len(a)
++        res = a
++        step = 1
++        while step < width:
++            index = step.bit_length() - 1
++            res = self._select_bits(b[index],
++                                    self._shift_by(res, step, left, fill), res)
++            step *= 2
++        too_far = self._not(self._unsigned_lt(b, self._bits(width, width)))
++        return self._select_bits(too_far, (fill,) * width, res)
++
++    def _rotate(self, a: Bits, steps: int, left: bool) -> Bits:
++        width = len(a)
++        steps = steps % width
++        if not left:
++            steps = (width - steps) % width
++        return a[width - steps:] + a[:width - steps]
++
++    def walk_symbol(self, formula: FNode, args: List[Any], **kwargs) -> Any:
++        symbol_type = formula.symbol_type()
++        if symbol_type.is_bool_type():
++            return formula
++        if symbol_type.is_bv_type():
++            return self._bits_of_symbol(formula)
++        if symbol_type.is_array_type():
++            return self._cells_of_symbol(formula)
++        raise ConvertExpressionError("Cannot bit-blast the symbol %s of type "
++                                     "%s" % (formula, symbol_type))
++
++    def walk_bool_constant(self, formula: FNode, args: List[Any], **kwargs) -> FNode:
++        return formula
++
++    def walk_bv_constant(self, formula: FNode, args: List[Any], **kwargs) -> Bits:
++        return self._bits(formula.constant_value(), formula.bv_width())
++
++    def walk_and(self, formula: FNode, args: List[FNode], **kwargs) -> FNode:
++        return self.mgr.And(args)
++
++    def walk_or(self, formula: FNode, args: List[FNode], **kwargs) -> FNode:
++        return self.mgr.Or(args)
++
++    def walk_not(self, formula: FNode, args: List[FNode], **kwargs) -> FNode:
++        return self.mgr.Not(args[0])
++
++    def walk_implies(self, formula: FNode, args: List[FNode], **kwargs) -> FNode:
++        return self.mgr.Implies(args[0], args[1])
++
++    def walk_iff(self, formula: FNode, args: List[FNode], **kwargs) -> FNode:
++        return self.mgr.Iff(args[0], args[1])
++
++    def walk_ite(self, formula: FNode, args: List[Any], **kwargs) -> Any:
++        cond, then_, else_ = args
++        if isinstance(then_, tuple):
++            return self._select_value(cond, then_, else_)
++        return self.mgr.Ite(cond, then_, else_)
++
++    def walk_equals(self, formula: FNode, args: List[Any], **kwargs) -> FNode:
++        left, right = args
++        if not isinstance(left, tuple):
++            raise ConvertExpressionError("Cannot bit-blast the equality %s"
++                                         % formula)
++        return self._equal_value(left, right)
++
++    def _is_cells(self, value: Any) -> bool:
++        return isinstance(value, tuple) and bool(value) and \
++            isinstance(value[0], tuple)
++
++    def _select_value(self, cond: FNode, left: Any, right: Any) -> Any:
++        if self._is_cells(left):
++            return tuple(self._select_value(cond, cell, other)
++                         for cell, other in zip(left, right))
++        return self._select_bits(cond, left, right)
++
++    def _equal_value(self, left: Any, right: Any) -> FNode:
++        if not self._is_cells(left):
++            return self._equal(left, right)
++        res = self.true
++        for cell, other in zip(left, right):
++            res = self._and(res, self._equal_value(cell, other))
++        return res
++
++    def walk_array_select(self, formula: FNode, args: List[Any], **kwargs) -> Any:
++        cells, index = args
++        res = cells[0]
++        for position in range(1, len(cells)):
++            match = self._equal(index, self._bits(position, len(index)))
++            res = self._select_value(match, cells[position], res)
++        return res
++
++    def walk_array_store(self, formula: FNode, args: List[Any], **kwargs) -> Cells:
++        cells, index, value = args
++        res = []
++        for position, cell in enumerate(cells):
++            match = self._equal(index, self._bits(position, len(index)))
++            res.append(self._select_value(match, value, cell))
++        return tuple(res)
++
++    def walk_array_value(self, formula: FNode, args: List[Any], **kwargs) -> Cells:
++        index_type = formula.array_value_index_type()
++        if not index_type.is_bv_type():
++            raise ConvertExpressionError("Cannot bit-blast the array %s"
++                                         % formula)
++        cells = [args[0]] * (1 << index_type.width)
++        for position, index in enumerate(formula.args()[1::2]):
++            cells[index.constant_value()] = args[2 + 2 * position]
++        return tuple(cells)
++
++    def walk_bv_not(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return tuple(self._not(x) for x in args[0])
++
++    def walk_bv_and(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return self._fold(self._and, args)
++
++    def walk_bv_or(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return self._fold(self._or, args)
++
++    def walk_bv_xor(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return self._fold(self._xor, args)
++
++    def _fold(self, operator, args: List[Bits]) -> Bits:
++        res = args[0]
++        for other in args[1:]:
++            res = tuple(operator(x, y) for x, y in zip(res, other))
++        return res
++
++    def walk_bv_neg(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return self._negate(args[0])
++
++    def walk_bv_add(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        res = args[0]
++        for other in args[1:]:
++            res = self._add(res, other)
++        return res
++
++    def walk_bv_sub(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return self._subtract(args[0], args[1])
++
++    def walk_bv_mul(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        res = args[0]
++        for other in args[1:]:
++            res = self._multiply(res, other)
++        return res
++
++    def walk_bv_udiv(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return self._divide(args[0], args[1])[0]
++
++    def walk_bv_urem(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return self._divide(args[0], args[1])[1]
++
++    def walk_bv_sdiv(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return self._signed_divide(args[0], args[1])[0]
++
++    def walk_bv_srem(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return self._signed_divide(args[0], args[1])[1]
++
++    def walk_bv_lshl(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return self._shift(args[0], args[1], True, self.false)
++
++    def walk_bv_lshr(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return self._shift(args[0], args[1], False, self.false)
++
++    def walk_bv_ashr(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return self._shift(args[0], args[1], False, args[0][-1])
++
++    def walk_bv_rol(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return self._rotate(args[0], formula.bv_rotation_step(), True)
++
++    def walk_bv_ror(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return self._rotate(args[0], formula.bv_rotation_step(), False)
++
++    def walk_bv_zext(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return args[0] + (self.false,) * formula.bv_extend_step()
++
++    def walk_bv_sext(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return args[0] + (args[0][-1],) * formula.bv_extend_step()
++
++    def walk_bv_concat(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        res: Bits = ()
++        for chunk in args:
++            res = chunk + res
++        return res
++
++    def walk_bv_extract(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return args[0][formula.bv_extract_start():formula.bv_extract_end() + 1]
++
++    def walk_bv_comp(self, formula: FNode, args: List[Bits], **kwargs) -> Bits:
++        return (self._equal(args[0], args[1]),)
++
++    def walk_bv_ult(self, formula: FNode, args: List[Bits], **kwargs) -> FNode:
++        return self._unsigned_lt(args[0], args[1])
++
++    def walk_bv_ule(self, formula: FNode, args: List[Bits], **kwargs) -> FNode:
++        return self._not(self._unsigned_lt(args[1], args[0]))
++
++    def walk_bv_slt(self, formula: FNode, args: List[Bits], **kwargs) -> FNode:
++        return self._signed_lt(args[0], args[1])
++
++    def walk_bv_sle(self, formula: FNode, args: List[Bits], **kwargs) -> FNode:
++        return self._not(self._signed_lt(args[1], args[0]))
++
++    @handles(op.QUANTIFIERS | op.IRA_OPERATORS | op.IRA_RELATIONS |
++             op.STR_OPERATORS | op.STR_RELATIONS |
++             frozenset([op.FUNCTION, op.INT_CONSTANT, op.REAL_CONSTANT,
++                        op.STR_CONSTANT, op.ALGEBRAIC_CONSTANT]))
++    def walk_unsupported(self, formula: FNode, args: List[Any], **kwargs) -> Any:
++        raise ConvertExpressionError("Cannot bit-blast %s" % formula)
++
++# EOC BitBlaster
+diff --git a/pysmt/rewritings.py b/pysmt/rewritings.py
+index 58b5f95..880a0df 100644
+--- a/pysmt/rewritings.py
++++ b/pysmt/rewritings.py
+@@ -25,6 +25,7 @@ import pysmt
+ from pysmt.walkers import DagWalker, IdentityDagWalker, handles
+ import pysmt.typing as types
+ import pysmt.operators as op
++from pysmt.bitblast import BitBlaster
+ from pysmt.fnode import FNode
+ from pysmt.utils import assert_not_none
+ 
+@@ -1021,6 +1022,12 @@ def aig(formula: FNode, environment: Optional["pysmt.environment.Environment"]=N
+     return aiger.convert(formula)
+ 
+ 
++def bit_blast(formula: FNode, environment: Optional["pysmt.environment.Environment"]=None) -> FNode:
++    """Converts the given bit-vector formula in an equivalent Boolean one"""
++    blaster = BitBlaster(environment)
++    return blaster.convert(formula)
++
++
+ def conjunctive_partition(formula: FNode) -> Iterator[FNode]:
+     """ Returns a generator over the top-level conjuncts of the given formula
+ 

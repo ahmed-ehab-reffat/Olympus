@@ -1,0 +1,717 @@
+diff --git a/base/src/ast.rs b/base/src/ast.rs
+index a48f398..1a49b32 100644
+--- a/base/src/ast.rs
++++ b/base/src/ast.rs
+@@ -320,6 +320,8 @@ pub enum Pattern<'ast, Id> {
+     },
+     /// A literal pattern
+     Literal(Literal),
++    /// An or-pattern, eg. `(Some x | None)` which matches if any alternative matches
++    Or(&'ast mut [SpannedPattern<'ast, Id>]),
+     /// An invalid pattern
+     Error,
+ }
+@@ -362,6 +364,33 @@ pub fn pattern_values_mut<'a, 'ast, Id>(
+     })
+ }
+ 
++pub fn pattern_binds_variables<Id>(pattern: &Pattern<'_, Id>) -> bool {
++    match pattern {
++        Pattern::Ident(_) | Pattern::As(..) => true,
++        Pattern::Constructor(_, args) => {
++            args.iter().any(|arg| pattern_binds_variables(&arg.value))
++        }
++        Pattern::Tuple { elems, .. } => {
++            elems.iter().any(|elem| pattern_binds_variables(&elem.value))
++        }
++        Pattern::Record {
++            fields,
++            implicit_import,
++            ..
++        } => {
++            implicit_import.is_some()
++                || pattern_values(fields).any(|(_, value)| match value {
++                    Some(pat) => pattern_binds_variables(&pat.value),
++                    None => true,
++                })
++        }
++        Pattern::Or(alternatives) => alternatives
++            .iter()
++            .any(|alternative| pattern_binds_variables(&alternative.value)),
++        Pattern::Literal(_) | Pattern::Error => false,
++    }
++}
++
+ #[doc(hidden)]
+ pub trait Captures<'a> {}
+ impl<T> Captures<'_> for T {}
+@@ -384,6 +413,7 @@ impl<Id> Default for Pattern<'_, Id> {
+ #[derive(Eq, PartialEq, Debug, AstClone)]
+ pub struct Alternative<'ast, Id> {
+     pub pattern: SpannedPattern<'ast, Id>,
++    pub guard: Option<&'ast mut SpannedExpr<'ast, Id>>,
+     pub expr: SpannedExpr<'ast, Id>,
+ }
+ 
+@@ -831,6 +861,9 @@ pub fn walk_expr<'a, 'ast, V>(v: &mut V, e: &'a $($mut)* SpannedExpr<'ast, V::Id
+             v.visit_expr(expr);
+             for alt in &$($mut)* **alts {
+                 v.visit_pattern(&$($mut)* alt.pattern);
++                if let Some(ref $($mut)* guard) = alt.guard {
++                    v.visit_expr(&$($mut)* **guard);
++                }
+                 v.visit_expr(&$($mut)* alt.expr);
+             }
+         }
+@@ -964,6 +997,11 @@ pub fn walk_pattern<'a, 'ast,V: ?Sized + $trait_name<'a, 'ast>>(v: &mut V, p: &'
+             }
+         }
+         Pattern::Ident(id) => v.visit_ident(id),
++        Pattern::Or(alternatives) => {
++            for alternative in &$($mut)* **alternatives {
++                v.visit_pattern(alternative);
++            }
++        }
+         Pattern::Literal(_) | Pattern::Error => (),
+     }
+ }
+@@ -1141,6 +1179,9 @@ impl Typed for Pattern<'_, Symbol> {
+             Pattern::Record { ref typ, .. } => Ok(typ.clone()),
+             Pattern::Tuple { ref typ, .. } => Ok(typ.clone()),
+             Pattern::Constructor(ref id, ref args) => get_return_type(env, &id.typ, args.len()),
++            Pattern::Or(ref alternatives) => alternatives
++                .first()
++                .map_or_else(|| Ok(Type::hole()), |pat| pat.try_type_of(env)),
+             Pattern::Error => Ok(Type::hole()),
+             Pattern::Literal(ref l) => l.try_type_of(env),
+         }
+diff --git a/check/src/metadata.rs b/check/src/metadata.rs
+index 1f30234..f753fd6 100644
+--- a/check/src/metadata.rs
++++ b/check/src/metadata.rs
+@@ -153,6 +153,7 @@ pub fn metadata(
+                     self.stack_var(id.name.clone(), metadata);
+                 }
+                 Pattern::Constructor(..)
++                | Pattern::Or(_)
+                 | Pattern::Tuple { .. }
+                 | Pattern::Record { .. }
+                 | Pattern::Literal(_)
+@@ -214,6 +215,7 @@ pub fn metadata(
+                 }
+                 Pattern::Tuple { .. }
+                 | Pattern::Constructor(..)
++                | Pattern::Or(_)
+                 | Pattern::Literal(_)
+                 | Pattern::Error => (),
+             }
+diff --git a/check/src/recursion_check.rs b/check/src/recursion_check.rs
+index 8a6fc7c..c05f0e0 100644
+--- a/check/src/recursion_check.rs
++++ b/check/src/recursion_check.rs
+@@ -277,6 +277,9 @@ impl<'a> Visitor<'a, '_> for Checker {
+                 }
+ 
+                 for alt in &**alts {
++                    if let Some(ref guard) = alt.guard {
++                        self.visit_expr(guard);
++                    }
+                     self.visit_expr(&alt.expr);
+                 }
+             }
+diff --git a/check/src/rename.rs b/check/src/rename.rs
+index 3302064..1050989 100644
+--- a/check/src/rename.rs
++++ b/check/src/rename.rs
+@@ -80,6 +80,11 @@ pub fn rename<'s, 'ast>(
+                         self.new_pattern(arg);
+                     }
+                 }
++                Pattern::Or(ref mut alternatives) => {
++                    for alternative in &mut **alternatives {
++                        self.new_pattern(alternative);
++                    }
++                }
+                 Pattern::Literal(_) | Pattern::Error => (),
+             }
+         }
+@@ -191,6 +196,9 @@ pub fn rename<'s, 'ast>(
+                     for alt in &mut **alts {
+                         self.env.stack.enter_scope();
+                         self.new_pattern(&mut alt.pattern);
++                        if let Some(ref mut guard) = alt.guard {
++                            self.visit_expr(guard);
++                        }
+                         self.visit_expr(&mut alt.expr);
+                         self.env.stack.exit_scope();
+                     }
+diff --git a/check/src/typecheck.rs b/check/src/typecheck.rs
+index b45d37a..f68fa87 100644
+--- a/check/src/typecheck.rs
++++ b/check/src/typecheck.rs
+@@ -397,6 +397,8 @@ impl<'a, 'ast> Typecheck<'a, 'ast> {
+                 | DuplicateField(_)
+                 | UndefinedRecord { .. }
+                 | EmptyCase
++                | NonExhaustivePattern(_)
++                | RedundantPattern
+                 | KindError(_)
+                 | RecursionCheck(_)
+                 | Message(_) => (),
+@@ -839,6 +841,12 @@ impl<'a, 'ast> Typecheck<'a, 'ast> {
+                         scrutinee_type.concrete.clone(),
+                     );
+ 
++                    if let Some(ref mut guard) = alt.guard {
++                        let bool_type = self.bool();
++                        let guard_type = self.typecheck(&mut **guard, ModType::rigid(&bool_type));
++                        self.unify_span(expr_check_span(guard), &bool_type, guard_type.concrete);
++                    }
++
+                     let mut alt_type = self
+                         .typecheck_opt(&mut alt.expr, expected_type.as_ref().map(|t| t.as_ref()));
+                     alt_type.concrete = self.instantiate_generics(&alt_type);
+@@ -890,6 +898,7 @@ impl<'a, 'ast> Typecheck<'a, 'ast> {
+ 
+                     expr_type = Some(alt_type);
+                 }
++                self.check_match_exhaustiveness(expr.span, &original_scrutinee_type.concrete, alts);
+                 expr_type
+                     .ok_or(TypeError::EmptyCase)
+                     .map(|typ| (typ, Vec::new()))
+@@ -1561,6 +1570,101 @@ impl<'a, 'ast> Typecheck<'a, 'ast> {
+         }
+     }
+ 
++    fn check_match_exhaustiveness(
++        &mut self,
++        span: Span<BytePos>,
++        scrutinee_type: &RcType,
++        alts: &[ast::Alternative<'_, Symbol>],
++    ) {
++        fn collect_covered(pattern: &Pattern<Symbol>, covered: &mut FnvSet<String>) -> bool {
++            match pattern {
++                Pattern::Constructor(id, _) => {
++                    covered.insert(id.name.declared_name().to_string());
++                    false
++                }
++                Pattern::As(_, pat) => collect_covered(&pat.value, covered),
++                Pattern::Or(alternatives) => {
++                    let mut catch_all = false;
++                    for alternative in alternatives.iter() {
++                        if collect_covered(&alternative.value, covered) {
++                            catch_all = true;
++                        }
++                    }
++                    catch_all
++                }
++                Pattern::Ident(_)
++                | Pattern::Record { .. }
++                | Pattern::Tuple { .. }
++                | Pattern::Error => true,
++                Pattern::Literal(_) => false,
++            }
++        }
++
++        fn is_irrefutable(pattern: &Pattern<Symbol>) -> bool {
++            match pattern {
++                Pattern::Ident(_) | Pattern::Error => true,
++                Pattern::As(_, pat) => is_irrefutable(&pat.value),
++                Pattern::Tuple { elems, .. } => {
++                    elems.iter().all(|elem| is_irrefutable(&elem.value))
++                }
++                Pattern::Record { fields, .. } => {
++                    ast::pattern_values(fields).all(|(_, value)| match value {
++                        Some(pat) => is_irrefutable(&pat.value),
++                        None => true,
++                    })
++                }
++                Pattern::Constructor(..) | Pattern::Or(_) | Pattern::Literal(_) => false,
++            }
++        }
++
++        let typ = self.remove_aliases(scrutinee_type.clone());
++        let typ = self.instantiate_generics(&typ);
++        let constructors: Vec<Symbol> = match &*typ {
++            Type::Variant(_) => typ.row_iter().map(|field| field.name.clone()).collect(),
++            _ => return,
++        };
++        if constructors.is_empty() {
++            return;
++        }
++
++        let mut covered = FnvSet::default();
++        let mut saturated: FnvSet<String> = FnvSet::default();
++        let mut saw_catch_all = false;
++        for alt in alts {
++            if saw_catch_all {
++                self.error(alt.pattern.span, TypeError::RedundantPattern);
++                continue;
++            }
++            if alt.guard.is_some() {
++                continue;
++            }
++            if let Pattern::Constructor(id, _) = &alt.pattern.value {
++                if saturated.contains(id.name.declared_name()) {
++                    self.error(alt.pattern.span, TypeError::RedundantPattern);
++                    continue;
++                }
++            }
++            if collect_covered(&alt.pattern.value, &mut covered) {
++                saw_catch_all = true;
++            }
++            if let Pattern::Constructor(id, args) = &alt.pattern.value {
++                if args.iter().all(|arg| is_irrefutable(&arg.value)) {
++                    saturated.insert(id.name.declared_name().to_string());
++                }
++            }
++        }
++
++        if !saw_catch_all {
++            let missing: Vec<Symbol> = constructors
++                .into_iter()
++                .filter(|constructor| !covered.contains(constructor.declared_name()))
++                .collect();
++            if !missing.is_empty() {
++                self.error(span, TypeError::NonExhaustivePattern(missing));
++            }
++        }
++    }
++
+     fn typecheck_pattern(
+         &mut self,
+         pattern: &mut SpannedPattern<Symbol>,
+@@ -1747,6 +1851,24 @@ impl<'a, 'ast> Typecheck<'a, 'ast> {
+                 }
+                 tuple_type
+             }
++            Pattern::Or(alternatives) => {
++                for alternative in alternatives.iter_mut() {
++                    if ast::pattern_binds_variables(&alternative.value) {
++                        self.error(
++                            alternative.span,
++                            TypeError::Message(
++                                "An or-pattern alternative may not bind variables".into(),
++                            ),
++                        );
++                    }
++                    self.typecheck_pattern(
++                        alternative,
++                        match_type.clone(),
++                        partial_match_type.clone(),
++                    );
++                }
++                partial_match_type
++            }
+             Pattern::Ident(id) => {
+                 self.stack_var(id.name.clone(), partial_match_type.clone());
+                 id.typ = self.subs.bind_arc(&partial_match_type);
+@@ -2354,6 +2476,11 @@ impl<'a, 'ast> Typecheck<'a, 'ast> {
+                     self.finish_pattern(level, arg, &arg_type);
+                 }
+             }
++            Pattern::Or(ref mut alternatives) => {
++                for alternative in alternatives.iter_mut() {
++                    self.finish_pattern(level, alternative, final_type);
++                }
++            }
+             Pattern::Literal(_) | Pattern::Error => (),
+         }
+     }
+diff --git a/check/src/typecheck/error.rs b/check/src/typecheck/error.rs
+index 78e1972..bb7e012 100644
+--- a/check/src/typecheck/error.rs
++++ b/check/src/typecheck/error.rs
+@@ -53,6 +53,10 @@ pub enum TypeError<I, T> {
+     },
+     /// Found a case expression without any alternatives
+     EmptyCase,
++    /// A pattern match does not cover every constructor of the matched type
++    NonExhaustivePattern(Vec<I>),
++    /// A pattern match alternative can never be reached
++    RedundantPattern,
+     Message(String),
+     UnableToResolveImplicit(implicits::Error<T>),
+     TypeConstructorReturnsWrongType {
+@@ -223,6 +227,14 @@ where
+                 Ok(())
+             }
+             EmptyCase => write!(f, "`case` expression with no alternatives"),
++            NonExhaustivePattern(missing) => {
++                write!(f, "Non-exhaustive pattern match, missing: `{}`", missing[0])?;
++                for name in &missing[1..] {
++                    write!(f, ", `{}`", name)?;
++                }
++                Ok(())
++            }
++            RedundantPattern => write!(f, "This pattern alternative is unreachable"),
+             Message(msg) => write!(f, "{}", msg),
+             UnableToResolveImplicit(err) => write!(f, "{}", err),
+             TypeConstructorReturnsWrongType { expected, actual } => write!(
+diff --git a/completion/src/lib.rs b/completion/src/lib.rs
+index 0c8f30e..fe60df2 100644
+--- a/completion/src/lib.rs
++++ b/completion/src/lib.rs
+@@ -199,6 +199,11 @@ where
+                     self.on_pattern(arg);
+                 }
+             }
++            Pattern::Or(alternatives) => {
++                for alternative in alternatives.iter() {
++                    self.on_pattern(alternative);
++                }
++            }
+             Pattern::Literal(_) | Pattern::Error => (),
+         }
+     }
+@@ -492,7 +497,7 @@ where
+                 let (_, field) = self.select_spanned(&**elems, |elem| elem.span);
+                 self.visit_pattern(field.unwrap());
+             }
+-            Pattern::Ident(_) | Pattern::Literal(_) | Pattern::Error => {
++            Pattern::Ident(_) | Pattern::Or(_) | Pattern::Literal(_) | Pattern::Error => {
+                 self.found = if current.span.containment(self.pos) == Ordering::Equal {
+                     MatchState::Found(Match::Pattern(current))
+                 } else {
+diff --git a/format/src/pretty_print.rs b/format/src/pretty_print.rs
+index 738361d..eca7af5 100644
+--- a/format/src/pretty_print.rs
++++ b/format/src/pretty_print.rs
+@@ -330,6 +330,10 @@ where
+                             arena,
+                             "| ",
+                             self.pretty_pattern(&alt.pattern),
++                            match alt.guard {
++                                Some(ref guard) => chain![arena, " if ", pretty(guard)],
++                                None => arena.nil(),
++                            },
+                             " ->",
+                             self.hang(
+                                 arena.nil(),
+@@ -930,6 +934,16 @@ where
+                 ")"
+             ]
+             .group(),
++            Pattern::Or(ref alternatives) => {
++                let mut doc = arena.nil();
++                for (i, alternative) in alternatives.iter().enumerate() {
++                    if i != 0 {
++                        doc = doc.append(" | ");
++                    }
++                    doc = doc.append(self.pretty_pattern(alternative));
++                }
++                chain![arena, "(", doc, ")"].group()
++            }
+             Pattern::Error => arena.text("<error>"),
+             Pattern::Literal(_) => arena.text(self.source.src_slice(pattern.span)),
+         }
+diff --git a/parser/src/grammar.lalrpop b/parser/src/grammar.lalrpop
+index cf42e80..017b72d 100644
+--- a/parser/src/grammar.lalrpop
++++ b/parser/src/grammar.lalrpop
+@@ -586,6 +586,9 @@ AtomicPattern: Pattern<'ast, Id> = {
+             _ => Pattern::Tuple { typ: type_cache.hole(), elems },
+         },
+ 
++    "(" <first: Sp<Pattern>> <rest: ("|" <Sp<Pattern>>)+> ")" =>
++        Pattern::Or(arena.alloc_extend(Some(first).into_iter().chain(rest))),
++
+     "{" <fields: CommaSlice<PatternField>> <implicit_import: Sp<"?"?>> "}" => {
+         let implicit_import_span = implicit_import.span;
+ 
+@@ -628,10 +631,11 @@ Literal: Literal = {
+ };
+ 
+ Alternative: () = {
+-    "|" <pat: Sp<Pattern>> "->" <expr: SpBlockExpr> => {
++    "|" <pat: Sp<Pattern>> <guard: ("if" <Guard>)?> "->" <expr: SpBlockExpr> => {
+         temp_vecs.select().push(
+             Alternative {
+                 pattern: pat,
++                guard: guard.map(|g| arena.alloc(g)),
+                 expr: super::shrink_hidden_spans(expr),
+             }
+         );
+@@ -641,6 +645,7 @@ Alternative: () = {
+         temp_vecs.select().push(
+             Alternative {
+                 pattern: pat,
++                guard: None,
+                 expr: pos::spanned(span, Expr::Error(None)),
+             }
+         );
+@@ -650,6 +655,7 @@ Alternative: () = {
+         temp_vecs.select().push(
+             Alternative {
+                 pattern: pos::spanned(span, Pattern::Error),
++                guard: None,
+                 expr: pos::spanned(span, Expr::Error(None)),
+             }
+         );
+@@ -840,6 +846,17 @@ InfixExpr = {
+         Expr::Infix { lhs: arena.alloc(lhs), op, rhs: arena.alloc(super::shrink_hidden_spans(rhs)), implicit_args: &mut [], },
+ };
+ 
++GuardExpr = {
++    AppExpr,
++
++    <lhs: Sp<AppExpr>> <op: Sp<Operator>> <rhs: Sp<GuardExpr>> =>
++        Expr::Infix { lhs: arena.alloc(lhs), op, rhs: arena.alloc(super::shrink_hidden_spans(rhs)), implicit_args: &mut [], },
++};
++
++Guard: SpannedExpr<'ast, Id> = {
++    Sp<GuardExpr> => super::shrink_hidden_spans(<>),
++};
++
+ 
+ InExpr: SpannedExpr<'ast, Id> = {
+     "in" <SpExpr>,
+diff --git a/parser/src/layout.rs b/parser/src/layout.rs
+index c73df54..7f8d61e 100644
+--- a/parser/src/layout.rs
++++ b/parser/src/layout.rs
+@@ -303,6 +303,14 @@ where
+ 
+             debug!("--------\n{:?}\n{:?}", token, offside);
+ 
++            // A match alternative guard (`| pat if cond -> body`) reuses the `if` token, which
++            // opens an `If` context that is normally closed by `else`. A guard has no `else`, so
++            // the arrow that starts the alternative body closes the guard's `If` context instead.
++            if token.value == Token::RArrow && offside.context == Context::If {
++                self.indent_levels.pop();
++                continue;
++            }
++
+             match (&token.value, offside.context) {
+                 (&Token::Comma, Context::Brace)
+                 | (&Token::Comma, Context::Paren)
+diff --git a/vm/src/core/mod.rs b/vm/src/core/mod.rs
+index 5335643..58b6f09 100644
+--- a/vm/src/core/mod.rs
++++ b/vm/src/core/mod.rs
+@@ -1042,14 +1042,18 @@ impl<'a, 'e> Translator<'a, 'e> {
+ 
+             ast::Expr::Match(ref expr, ref alts) => {
+                 let expr = self.translate_alloc(&**expr);
+-                let alts: Vec<_> = alts
+-                    .iter()
+-                    .map(|alt| Equation {
+-                        patterns: vec![&alt.pattern],
+-                        result: self.translate_alloc(&alt.expr),
+-                    })
+-                    .collect();
+-                PatternTranslator(self).translate_top(expr, &alts).clone()
++                if alts.iter().any(|alt| alt.guard.is_some()) {
++                    PatternTranslator(self).translate_guarded(expr, alts).clone()
++                } else {
++                    let alts: Vec<_> = alts
++                        .iter()
++                        .map(|alt| Equation {
++                            patterns: vec![&alt.pattern],
++                            result: self.translate_alloc(&alt.expr),
++                        })
++                        .collect();
++                    PatternTranslator(self).translate_top(expr, &alts).clone()
++                }
+             }
+             // expr.projection
+             // =>
+@@ -1763,6 +1767,7 @@ impl<'a, 'e> PatternTranslator<'a, 'e> {
+                 | ast::Pattern::Tuple { .. }
+                 | ast::Pattern::Record { .. }
+                 | ast::Pattern::Ident(_)
++                | ast::Pattern::Or(_)
+                 | ast::Pattern::Literal(_)
+                 | ast::Pattern::Error => unreachable!(),
+             }
+@@ -1901,6 +1906,7 @@ impl<'a, 'e> PatternTranslator<'a, 'e> {
+                 | ast::Pattern::Tuple { .. }
+                 | ast::Pattern::Record { .. }
+                 | ast::Pattern::Ident(_)
++                | ast::Pattern::Or(_)
+                 | ast::Pattern::Error => unreachable!(),
+             }
+         }
+@@ -1963,6 +1969,75 @@ impl<'a, 'e> PatternTranslator<'a, 'e> {
+             .collect::<Vec<_>>()
+     }
+ 
++    fn translate_guarded<'p, 'ast>(
++        &mut self,
++        scrutinee: &'a Expr<'a>,
++        alts: &'p [ast::Alternative<'ast, Symbol>],
++    ) -> Expr<'a> {
++        let arena = &self.0.allocator.arena;
++
++        let (id_expr, binding) = match *scrutinee {
++            Expr::Ident(..) => (scrutinee, None),
++            _ => {
++                let name = TypedIdent {
++                    name: Symbol::from("match_pattern"),
++                    typ: scrutinee.env_type_of(&self.0.env),
++                };
++                let id_expr = &*arena.alloc(Expr::Ident(name.clone(), scrutinee.span()));
++                (id_expr, Some(name))
++            }
++        };
++
++        let mut fallback: &'a Expr<'a> = arena.alloc(self.0.error_expr("Unmatched pattern"));
++
++        for alt in alts.iter().rev() {
++            let body = self.0.translate_alloc(&alt.expr);
++            let result: &'a Expr<'a> = match alt.guard {
++                Some(ref guard) => {
++                    let guard_expr = self.0.translate_alloc(&**guard);
++                    let bool_alts = self.0.allocator.alternative_arena.alloc_fixed(
++                        vec![
++                            Alternative {
++                                pattern: Pattern::Constructor(
++                                    self.0.bool_constructor(true),
++                                    vec![],
++                                ),
++                                expr: body,
++                            },
++                            Alternative {
++                                pattern: Pattern::Constructor(
++                                    self.0.bool_constructor(false),
++                                    vec![],
++                                ),
++                                expr: fallback,
++                            },
++                        ]
++                        .into_iter(),
++                    );
++                    arena.alloc(Expr::Match(guard_expr, bool_alts))
++                }
++                None => body,
++            };
++            let equations = [Equation {
++                patterns: vec![&alt.pattern],
++                result,
++            }];
++            fallback = self.translate(fallback, &[id_expr], &equations);
++        }
++
++        match binding {
++            None => fallback.clone(),
++            Some(name) => Expr::Let(
++                self.0.allocator.let_binding_arena.alloc(LetBinding {
++                    name,
++                    expr: Named::Expr(scrutinee),
++                    span_start: scrutinee.span().start(),
++                }),
++                fallback,
++            ),
++        }
++    }
++
+     fn translate_top<'p>(
+         &mut self,
+         expr: &'a Expr<'a>,
+@@ -2007,10 +2082,30 @@ impl<'a, 'e> PatternTranslator<'a, 'e> {
+                 ast::Pattern::Record { .. } | ast::Pattern::Tuple { .. } => CType::Record,
+                 ast::Pattern::Constructor(_, _) => CType::Constructor,
+                 ast::Pattern::Literal(_) => CType::Literal,
++                ast::Pattern::Or(_) => ice!("ICE: Or-pattern survived pattern expansion"),
+                 ast::Pattern::Error => ice!("ICE: Error pattern survived typechecking"),
+             }
+         }
+ 
++        let expanded_equations: Vec<Equation<'a, 'p, '_>> = equations
++            .iter()
++            .flat_map(|equation| match equation.patterns.first().map(|p| &p.value) {
++                Some(ast::Pattern::Or(alternatives)) => alternatives
++                    .iter()
++                    .map(|alternative| {
++                        let mut patterns = equation.patterns.clone();
++                        patterns[0] = alternative;
++                        Equation {
++                            patterns,
++                            result: equation.result,
++                        }
++                    })
++                    .collect::<Vec<_>>(),
++                _ => vec![equation.clone()],
++            })
++            .collect();
++        let equations = &expanded_equations[..];
++
+         let mut binder = Binder::default();
+ 
+         // The equations must be processed by group
+@@ -2228,6 +2323,7 @@ impl<'a, 'e> PatternTranslator<'a, 'e> {
+                         }
+                     }
+                 }
++                ast::Pattern::Or(_) => ice!("ICE: Or-pattern survived pattern expansion"),
+                 ast::Pattern::Literal(_) | ast::Pattern::Error => (),
+             }
+         }
+diff --git a/vm/src/derive/eq.rs b/vm/src/derive/eq.rs
+index ed6f367..d9e912c 100644
+--- a/vm/src/derive/eq.rs
++++ b/vm/src/derive/eq.rs
+@@ -66,6 +66,7 @@ pub fn generate<'ast>(
+                     span,
+                     Pattern::Ident(TypedIdent::new(symbols.simple_symbol("_"))),
+                 ),
++                guard: None,
+                 expr: ident(span, symbols.simple_symbol("False")),
+             };
+ 
+@@ -112,6 +113,7 @@ pub fn generate<'ast>(
+                                 ]),
+                             },
+                         ),
++                        guard: None,
+                         expr,
+                     }
+                 })
+@@ -165,6 +167,7 @@ pub fn generate<'ast>(
+                             typ: Type::hole(),
+                         },
+                     ),
++                    guard: None,
+                     expr,
+                 }]),
+             )
+diff --git a/vm/src/derive/serialize.rs b/vm/src/derive/serialize.rs
+index faefdf1..b7f2479 100644
+--- a/vm/src/derive/serialize.rs
++++ b/vm/src/derive/serialize.rs
+@@ -80,6 +80,7 @@ pub fn generate<'ast>(
+                     arena.alloc(ident(span, x.clone())),
+                     arena.alloc_extend(Some(Alternative {
+                         pattern: arena.generate_record_pattern(span, row, field_symbols),
++                        guard: None,
+                         expr,
+                     })),
+                 ),
+@@ -137,6 +138,7 @@ pub fn generate<'ast>(
+                     };
+                     Ok(Alternative {
+                         pattern: ctor_pattern(pattern_args),
++                        guard: None,
+                         expr,
+                     })
+                 })
+diff --git a/vm/src/derive/show.rs b/vm/src/derive/show.rs
+index 88bc699..0e057a2 100644
+--- a/vm/src/derive/show.rs
++++ b/vm/src/derive/show.rs
+@@ -91,6 +91,7 @@ pub fn generate<'ast>(
+                     };
+                     Alternative {
+                         pattern: ctor_pattern(pattern_args.into_iter().map(|t| t.1).collect()),
++                        guard: None,
+                         expr,
+                     }
+                 })
+@@ -153,6 +154,7 @@ pub fn generate<'ast>(
+                 arena.alloc(ident(span, x.clone())),
+                 arena.alloc_extend(Some(Alternative {
+                     pattern: arena.generate_record_pattern(span, row, field_symbols),
++                    guard: None,
+                     expr,
+                 })),
+             )

@@ -1,0 +1,408 @@
+diff --git a/crates/tessellation/src/lib.rs b/crates/tessellation/src/lib.rs
+index 556d1d3..8fe1a6b 100644
+--- a/crates/tessellation/src/lib.rs
++++ b/crates/tessellation/src/lib.rs
+@@ -206,6 +206,7 @@ pub mod geometry_builder;
+ mod math_utils;
+ mod monotone;
+ mod stroke;
++mod stroke_to_fill;
+ 
+ #[cfg(test)]
+ #[rustfmt::skip]
+@@ -227,6 +228,7 @@ pub use crate::fill::*;
+ 
+ #[doc(inline)]
+ pub use crate::stroke::*;
++pub use crate::stroke_to_fill::{stroke_to_fill_events, StrokeToFill};
+ 
+ #[doc(inline)]
+ pub use crate::geometry_builder::{
+diff --git a/crates/tessellation/src/stroke_to_fill.rs b/crates/tessellation/src/stroke_to_fill.rs
+new file mode 100644
+index 0000000..a9bee11
+--- /dev/null
++++ b/crates/tessellation/src/stroke_to_fill.rs
+@@ -0,0 +1,382 @@
++//! Convert a stroked path into a fillable outline.
++
++use crate::math::{vector, Point, Vector};
++use crate::math_utils::compute_normal;
++use crate::path::iterator::PathIterator;
++use crate::path::{LineCap, LineJoin, Path, PathEvent, PathSlice};
++use crate::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, StrokeOptions, VertexBuffers};
++use alloc::collections::BTreeMap;
++use alloc::vec::Vec;
++
++#[cfg(not(feature = "std"))]
++use num_traits::Float;
++
++/// Build a fillable outline of the stroke of a path.
++///
++/// The returned path, filled with the non-zero winding rule, covers the region
++/// the stroke paints for the given [`StrokeOptions`].
++pub trait StrokeToFill {
++    fn stroke_to_fill(&self, options: &StrokeOptions) -> Path;
++}
++
++impl StrokeToFill for Path {
++    fn stroke_to_fill(&self, options: &StrokeOptions) -> Path {
++        stroke_to_fill_events(self.iter(), options)
++    }
++}
++
++impl StrokeToFill for PathSlice<'_> {
++    fn stroke_to_fill(&self, options: &StrokeOptions) -> Path {
++        stroke_to_fill_events(self.iter(), options)
++    }
++}
++
++/// Build a fillable outline from a path event iterator.
++///
++/// Equivalent to [`StrokeToFill::stroke_to_fill`], for callers that only have
++/// an `impl IntoIterator<Item = PathEvent>` rather than a [`Path`] or [`PathSlice`].
++pub fn stroke_to_fill_events(
++    events: impl IntoIterator<Item = PathEvent>,
++    options: &StrokeOptions,
++) -> Path {
++    debug_assert!(
++        options.variable_line_width.is_none(),
++        "Variable line width is not supported by stroke_to_fill_events",
++    );
++    let tol = options.tolerance.max(1e-4);
++    outline(events.into_iter().flattened(tol), options)
++}
++
++fn perp(v: Vector) -> Vector {
++    vector(-v.y, v.x)
++}
++
++fn signed_area(pts: &[Point]) -> f32 {
++    let mut acc = 0.0;
++    let n = pts.len();
++    for i in 0..n {
++        let a = pts[i];
++        let b = pts[(i + 1) % n];
++        acc += a.x * b.y - b.x * a.y;
++    }
++    acc * 0.5
++}
++
++fn arc_segments(radius: f32, sweep: f32, tolerance: f32) -> u32 {
++    let r = radius.max(1e-6);
++    let t = tolerance.min(r).max(1e-4);
++    let step = 2.0 * (1.0 - t / r).clamp(-1.0, 1.0).acos();
++    let n = (sweep.abs() / step).ceil() as u32;
++    n.max(1)
++}
++
++fn push_arc(out: &mut Vec<Point>, center: Point, from: Vector, sweep: f32, radius: f32, tol: f32) {
++    let n = arc_segments(radius, sweep, tol);
++    let a0 = from.y.atan2(from.x);
++    for i in 1..n {
++        let a = a0 + sweep * (i as f32) / (n as f32);
++        out.push(center + vector(a.cos(), a.sin()) * radius);
++    }
++}
++
++fn add_contour(contours: &mut Vec<Vec<Point>>, mut poly: Vec<Point>) {
++    if poly.len() < 3 {
++        return;
++    }
++    if signed_area(&poly) < 0.0 {
++        poly.reverse();
++    }
++    contours.push(poly);
++}
++
++fn quad(a: Point, b: Point, n: Vector, contours: &mut Vec<Vec<Point>>) {
++    add_contour(contours, alloc::vec![a + n, b + n, b - n, a - n]);
++}
++
++fn join(
++    v: Point,
++    d0: Vector,
++    d1: Vector,
++    options: &StrokeOptions,
++    half: f32,
++    tol: f32,
++    contours: &mut Vec<Vec<Point>>,
++) {
++    let miter_limit = options.miter_limit.max(1.0);
++    let turn = d0.cross(d1);
++    if turn.abs() < 1e-6 {
++        return;
++    }
++    let outer = if turn > 0.0 { -1.0 } else { 1.0 };
++    let n0 = perp(d0) * (half * outer);
++    let n1 = perp(d1) * (half * outer);
++    let a = v + n0;
++    let b = v + n1;
++
++    match options.line_join {
++        LineJoin::Bevel => add_contour(contours, alloc::vec![v, a, b]),
++        LineJoin::Round => {
++            let va = (a - v).normalize();
++            let vb = (b - v).normalize();
++            let mut sweep = (va.cross(vb)).atan2(va.dot(vb)).abs();
++            let mut poly = alloc::vec![v, a];
++            let from = va;
++            let dir = if va.cross(vb) >= 0.0 { 1.0 } else { -1.0 };
++            sweep *= dir;
++            if sweep.abs() < 1e-4 {
++                sweep = 0.0;
++            }
++            push_arc(&mut poly, v, from, sweep, half, tol);
++            poly.push(b);
++            add_contour(contours, poly);
++        }
++        LineJoin::Miter | LineJoin::MiterClip => {
++            let normal = compute_normal(d0, d1) * outer;
++            let ratio = normal.length();
++            if ratio <= miter_limit && ratio > 0.0 {
++                let m = v + normal * half;
++                add_contour(contours, alloc::vec![v, a, m, b]);
++            } else if options.line_join == LineJoin::MiterClip && ratio > 0.0 {
++                let dir = normal.normalize();
++                let cap_center = v + dir * (miter_limit * half);
++                let cap_n = perp(dir) * half;
++                add_contour(contours, alloc::vec![v, a, cap_center + cap_n, cap_center - cap_n, b]);
++            } else {
++                add_contour(contours, alloc::vec![v, a, b]);
++            }
++        }
++    }
++}
++
++fn cap(p: Point, dir: Vector, kind: LineCap, half: f32, tol: f32, contours: &mut Vec<Vec<Point>>) {
++    let n = perp(dir) * half;
++    let l = p + n;
++    let r = p - n;
++    match kind {
++        LineCap::Butt => {}
++        LineCap::Square => {
++            add_contour(contours, alloc::vec![l, l + dir * half, r + dir * half, r]);
++        }
++        LineCap::Round => {
++            let mut poly = alloc::vec![l];
++            push_arc(&mut poly, p, n, -core::f32::consts::PI, half, tol);
++            poly.push(r);
++            add_contour(contours, poly);
++        }
++    }
++}
++
++fn dot_cap(p: Point, kind: LineCap, half: f32, tol: f32, contours: &mut Vec<Vec<Point>>) {
++    match kind {
++        LineCap::Butt => {}
++        LineCap::Square => {
++            add_contour(
++                contours,
++                alloc::vec![
++                    p + vector(-half, -half),
++                    p + vector(half, -half),
++                    p + vector(half, half),
++                    p + vector(-half, half)
++                ],
++            );
++        }
++        LineCap::Round => {
++            let mut poly = Vec::new();
++            push_arc(&mut poly, p, vector(half, 0.0), core::f32::consts::TAU, half, tol);
++            add_contour(contours, poly);
++        }
++    }
++}
++
++fn build_subpath(
++    pts: &[Point],
++    closed: bool,
++    options: &StrokeOptions,
++    half: f32,
++    tol: f32,
++    contours: &mut Vec<Vec<Point>>,
++) {
++    if !(half > 0.0) || !half.is_finite() {
++        return;
++    }
++    let mut clean: Vec<Point> = Vec::with_capacity(pts.len());
++    for &p in pts {
++        if clean.last().map_or(true, |&q| (p - q).length() > 1e-5) {
++            clean.push(p);
++        }
++    }
++    if closed {
++        if let (Some(&f), Some(&l)) = (clean.first(), clean.last()) {
++            if (f - l).length() <= 1e-5 {
++                clean.pop();
++            }
++        }
++    }
++
++    if clean.len() < 2 {
++        if !closed {
++            let p = pts[0];
++            dot_cap(p, options.start_cap, half, tol, contours);
++        }
++        return;
++    }
++
++    let n = clean.len();
++    let seg_count = if closed { n } else { n - 1 };
++    let dir = |i: usize| -> Vector { (clean[(i + 1) % n] - clean[i]).normalize() };
++
++    for i in 0..seg_count {
++        let a = clean[i];
++        let b = clean[(i + 1) % n];
++        quad(a, b, perp(dir(i)) * half, contours);
++    }
++
++    let joint_range = if closed { 0..n } else { 1..(n - 1) };
++    for i in joint_range {
++        let v = clean[i];
++        let d_in = (clean[i] - clean[(i + n - 1) % n]).normalize();
++        let d_out = dir(i);
++        join(v, d_in, d_out, options, half, tol, contours);
++    }
++
++    if !closed {
++        cap(clean[0], -dir(0), options.start_cap, half, tol, contours);
++        let last = n - 1;
++        let d_end = (clean[last] - clean[last - 1]).normalize();
++        cap(clean[last], d_end, options.end_cap, half, tol, contours);
++    }
++}
++
++fn outline(events: impl Iterator<Item = PathEvent>, options: &StrokeOptions) -> Path {
++    let half = options.line_width * 0.5;
++    let tol = options.tolerance.max(1e-4);
++    let mut contours: Vec<Vec<Point>> = Vec::new();
++    let mut current: Vec<Point> = Vec::new();
++
++    for evt in events {
++        match evt {
++            PathEvent::Begin { at } => {
++                current.clear();
++                current.push(at);
++            }
++            PathEvent::Line { to, .. } => {
++                current.push(to);
++            }
++            PathEvent::Quadratic { to, .. } | PathEvent::Cubic { to, .. } => {
++                current.push(to);
++            }
++            PathEvent::End { close, .. } => {
++                build_subpath(&current, close, options, half, tol, &mut contours);
++                current.clear();
++            }
++        }
++    }
++
++    if contours.is_empty() {
++        return Path::builder().build();
++    }
++
++    let mut overlapping = Path::builder();
++    for c in &contours {
++        overlapping.begin(c[0]);
++        for p in &c[1..] {
++            overlapping.line_to(*p);
++        }
++        overlapping.end(true);
++    }
++    let overlapping = overlapping.build();
++
++    let mut buffers: VertexBuffers<Point, u32> = VertexBuffers::new();
++    let mut tess = FillTessellator::new();
++    {
++        let mut bb = BuffersBuilder::new(&mut buffers, |v: FillVertex| v.position());
++        if tess
++            .tessellate_path(&overlapping, &FillOptions::non_zero().with_tolerance(tol), &mut bb)
++            .is_err()
++        {
++            return overlapping;
++        }
++    }
++
++    boundary_path(&buffers.vertices, &buffers.indices)
++}
++
++fn simplify_loop(pts: &[Point]) -> Option<Vec<Point>> {
++    let mut distinct: Vec<Point> = Vec::with_capacity(pts.len());
++    for &p in pts {
++        if distinct.last().map_or(false, |&q| (p - q).length() <= 1e-4) {
++            continue;
++        }
++        distinct.push(p);
++    }
++    while distinct.len() >= 2 && (distinct[0] - distinct[distinct.len() - 1]).length() <= 1e-4 {
++        distinct.pop();
++    }
++    let n = distinct.len();
++    if n < 3 {
++        return None;
++    }
++    let mut merged: Vec<Point> = Vec::with_capacity(n);
++    for i in 0..n {
++        let prev = distinct[(i + n - 1) % n];
++        let cur = distinct[i];
++        let next = distinct[(i + 1) % n];
++        let e0 = (cur - prev).normalize();
++        let e1 = (next - cur).normalize();
++        if e0.cross(e1).abs() > 1e-4 || e0.dot(e1) < 0.0 {
++            merged.push(cur);
++        }
++    }
++    if merged.len() < 3 || signed_area(&merged).abs() < 1e-6 {
++        return None;
++    }
++    Some(merged)
++}
++
++fn boundary_path(verts: &[Point], indices: &[u32]) -> Path {
++    let key = |a: u32, b: u32| if a < b { (a, b) } else { (b, a) };
++    let mut shared: BTreeMap<(u32, u32), u32> = BTreeMap::new();
++    for tri in indices.chunks_exact(3) {
++        for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
++            *shared.entry(key(a, b)).or_insert(0) += 1;
++        }
++    }
++
++    let mut adjacency: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
++    for tri in indices.chunks_exact(3) {
++        for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
++            if shared[&key(a, b)] == 1 {
++                adjacency.entry(a).or_default().push(b);
++            }
++        }
++    }
++
++    let mut builder = Path::builder();
++    loop {
++        let start = match adjacency.iter().find(|(_, outs)| !outs.is_empty()) {
++            Some((&s, _)) => s,
++            None => break,
++        };
++        let mut loop_pts: Vec<Point> = Vec::new();
++        let mut cur = start;
++        loop {
++            loop_pts.push(verts[cur as usize]);
++            let next = match adjacency.get_mut(&cur).and_then(|outs| outs.pop()) {
++                Some(n) => n,
++                None => break,
++            };
++            cur = next;
++            if cur == start {
++                break;
++            }
++        }
++        if let Some(simple) = simplify_loop(&loop_pts) {
++            builder.begin(simple[0]);
++            for p in &simple[1..] {
++                builder.line_to(*p);
++            }
++            builder.end(true);
++        }
++    }
++    builder.build()
++}

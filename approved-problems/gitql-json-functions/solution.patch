@@ -1,0 +1,1592 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ede9860..cd866a6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -623,6 +623,7 @@ dependencies = [
+  "gitql-core",
+  "rand",
+  "regex",
++ "serde_json",
+  "uuid",
+ ]
+ 
+@@ -1991,6 +1992,7 @@ version = "1.0.145"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "402a6f66d8c709116cf22f558eab210f5a50187f702eb4d7e5ef38d9a7f1c79c"
+ dependencies = [
++ "indexmap",
+  "itoa",
+  "memchr",
+  "ryu",
+diff --git a/crates/gitql-ast/src/expression.rs b/crates/gitql-ast/src/expression.rs
+index d59f4d2..79bc147 100644
+--- a/crates/gitql-ast/src/expression.rs
++++ b/crates/gitql-ast/src/expression.rs
+@@ -7,6 +7,7 @@ use super::types::boolean::BoolType;
+ use super::types::integer::IntType;
+ use super::types::null::NullType;
+ use super::types::text::TextType;
++use super::types::variant::VariantType;
+ use super::types::DataType;
+ 
+ use crate::interval::Interval;
+@@ -38,6 +39,7 @@ pub enum ExprKind {
+     GroupComparison,
+     Contains,
+     ContainedBy,
++    JsonAccess,
+     Like,
+     Regex,
+     Glob,
+@@ -424,6 +426,42 @@ impl Expr for ContainsExpr {
+     }
+ }
+ 
++/// The `->` and `->>` JSON access operators. `as_text` selects `->>`, which
++/// returns the referenced value as a typed value; `->` returns it as JSON text.
++#[derive(Clone)]
++pub struct JsonAccessExpr {
++    pub left: Box<dyn Expr>,
++    pub right: Box<dyn Expr>,
++    pub as_text: bool,
++}
++
++impl Expr for JsonAccessExpr {
++    fn kind(&self) -> ExprKind {
++        ExprKind::JsonAccess
++    }
++
++    fn expr_type(&self) -> Box<dyn DataType> {
++        // `->` always yields JSON text; `->>` yields the referenced value as its
++        // own type. Exposing that as a variant of the concrete scalar types (plus
++        // JSON text for containers) lets it compose in arithmetic and comparisons
++        // on either side rather than as an inert `Any`.
++        if self.as_text {
++            Box::new(VariantType::new(vec![
++                Box::new(IntType),
++                Box::new(FloatType),
++                Box::new(TextType),
++                Box::new(BoolType),
++            ]))
++        } else {
++            Box::new(TextType)
++        }
++    }
++
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++}
++
+ #[derive(Clone)]
+ pub struct ContainedByExpr {
+     pub left: Box<dyn Expr>,
+diff --git a/crates/gitql-ast/src/types/variant.rs b/crates/gitql-ast/src/types/variant.rs
+index aea1af2..8d8928d 100644
+--- a/crates/gitql-ast/src/types/variant.rs
++++ b/crates/gitql-ast/src/types/variant.rs
+@@ -1,6 +1,15 @@
+ use std::any::Any;
+ 
+ use super::base::DataType;
++use super::null::NullType;
++
++/// A function that lists the types a member can perform an operator with
++#[allow(clippy::borrowed_box)]
++pub type CapabilityFunction = fn(&Box<dyn DataType>) -> Vec<Box<dyn DataType>>;
++
++/// A function that resolves the result type of an operator on a member
++#[allow(clippy::borrowed_box)]
++pub type ResultFunction = fn(&Box<dyn DataType>, &Box<dyn DataType>) -> Box<dyn DataType>;
+ 
+ #[derive(Clone)]
+ pub struct VariantType {
+@@ -11,6 +20,39 @@ impl VariantType {
+     pub fn new(variants: Vec<Box<dyn DataType>>) -> Self {
+         VariantType { variants }
+     }
++
++    /// The union of a per-variant capability list, so the variant can act as an
++    /// operand whenever any of its members can.
++    fn union_capability(&self, capability: CapabilityFunction) -> Vec<Box<dyn DataType>> {
++        let mut types: Vec<Box<dyn DataType>> = Vec::new();
++        for variant in self.variants.iter() {
++            types.extend(capability(variant));
++        }
++        types
++    }
++
++    /// The result type of an operator: every member that can perform it with
++    /// `other` contributes its own result, so the possibilities are preserved as
++    /// a variant rather than collapsed to the first match.
++    #[allow(clippy::borrowed_box)]
++    fn delegated_result(
++        &self,
++        other: &Box<dyn DataType>,
++        capability: CapabilityFunction,
++        result: ResultFunction,
++    ) -> Box<dyn DataType> {
++        let mut results: Vec<Box<dyn DataType>> = Vec::new();
++        for variant in self.variants.iter() {
++            if capability(variant).iter().any(|t| t.equals(other)) {
++                results.push(result(variant, other));
++            }
++        }
++        match results.len() {
++            0 => Box::new(NullType),
++            1 => results.pop().unwrap(),
++            _ => Box::new(VariantType::new(results)),
++        }
++    }
+ }
+ 
+ impl DataType for VariantType {
+@@ -45,4 +87,196 @@ impl DataType for VariantType {
+     fn as_any(&self) -> &dyn Any {
+         self
+     }
++
++    fn can_perform_add_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_add_op_with())
++    }
++
++    fn add_op_result_type(&self, other: &Box<dyn DataType>) -> Box<dyn DataType> {
++        self.delegated_result(
++            other,
++            |v| v.can_perform_add_op_with(),
++            |v, o| v.add_op_result_type(o),
++        )
++    }
++
++    fn can_perform_sub_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_sub_op_with())
++    }
++
++    fn sub_op_result_type(&self, other: &Box<dyn DataType>) -> Box<dyn DataType> {
++        self.delegated_result(
++            other,
++            |v| v.can_perform_sub_op_with(),
++            |v, o| v.sub_op_result_type(o),
++        )
++    }
++
++    fn can_perform_mul_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_mul_op_with())
++    }
++
++    fn mul_op_result_type(&self, other: &Box<dyn DataType>) -> Box<dyn DataType> {
++        self.delegated_result(
++            other,
++            |v| v.can_perform_mul_op_with(),
++            |v, o| v.mul_op_result_type(o),
++        )
++    }
++
++    fn can_perform_div_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_div_op_with())
++    }
++
++    fn div_op_result_type(&self, other: &Box<dyn DataType>) -> Box<dyn DataType> {
++        self.delegated_result(
++            other,
++            |v| v.can_perform_div_op_with(),
++            |v, o| v.div_op_result_type(o),
++        )
++    }
++
++    fn can_perform_rem_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_rem_op_with())
++    }
++
++    fn rem_op_result_type(&self, other: &Box<dyn DataType>) -> Box<dyn DataType> {
++        self.delegated_result(
++            other,
++            |v| v.can_perform_rem_op_with(),
++            |v, o| v.rem_op_result_type(o),
++        )
++    }
++
++    fn can_perform_eq_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_eq_op_with())
++    }
++
++    fn can_perform_bang_eq_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_bang_eq_op_with())
++    }
++
++    fn can_perform_gt_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_gt_op_with())
++    }
++
++    fn can_perform_gte_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_gte_op_with())
++    }
++
++    fn can_perform_lt_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_lt_op_with())
++    }
++
++    fn can_perform_lte_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_lte_op_with())
++    }
++
++    fn can_perform_caret_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_caret_op_with())
++    }
++
++    fn caret_op_result_type(&self, other: &Box<dyn DataType>) -> Box<dyn DataType> {
++        self.delegated_result(
++            other,
++            |v| v.can_perform_caret_op_with(),
++            |v, o| v.caret_op_result_type(o),
++        )
++    }
++
++    fn can_perform_or_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_or_op_with())
++    }
++
++    fn or_op_result_type(&self, other: &Box<dyn DataType>) -> Box<dyn DataType> {
++        self.delegated_result(
++            other,
++            |v| v.can_perform_or_op_with(),
++            |v, o| v.or_op_result_type(o),
++        )
++    }
++
++    fn can_perform_and_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_and_op_with())
++    }
++
++    fn and_op_result_type(&self, other: &Box<dyn DataType>) -> Box<dyn DataType> {
++        self.delegated_result(
++            other,
++            |v| v.can_perform_and_op_with(),
++            |v, o| v.and_op_result_type(o),
++        )
++    }
++
++    fn can_perform_xor_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_xor_op_with())
++    }
++
++    fn xor_op_result_type(&self, other: &Box<dyn DataType>) -> Box<dyn DataType> {
++        self.delegated_result(
++            other,
++            |v| v.can_perform_xor_op_with(),
++            |v, o| v.xor_op_result_type(o),
++        )
++    }
++
++    fn can_perform_shl_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_shl_op_with())
++    }
++
++    fn shl_op_result_type(&self, other: &Box<dyn DataType>) -> Box<dyn DataType> {
++        self.delegated_result(
++            other,
++            |v| v.can_perform_shl_op_with(),
++            |v, o| v.shl_op_result_type(o),
++        )
++    }
++
++    fn can_perform_shr_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_shr_op_with())
++    }
++
++    fn shr_op_result_type(&self, other: &Box<dyn DataType>) -> Box<dyn DataType> {
++        self.delegated_result(
++            other,
++            |v| v.can_perform_shr_op_with(),
++            |v, o| v.shr_op_result_type(o),
++        )
++    }
++
++    fn can_perform_logical_or_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_logical_or_op_with())
++    }
++
++    fn logical_or_op_result_type(&self, other: &Box<dyn DataType>) -> Box<dyn DataType> {
++        self.delegated_result(
++            other,
++            |v| v.can_perform_logical_or_op_with(),
++            |v, o| v.logical_or_op_result_type(o),
++        )
++    }
++
++    fn can_perform_logical_and_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_logical_and_op_with())
++    }
++
++    fn logical_and_op_result_type(&self, other: &Box<dyn DataType>) -> Box<dyn DataType> {
++        self.delegated_result(
++            other,
++            |v| v.can_perform_logical_and_op_with(),
++            |v, o| v.logical_and_op_result_type(o),
++        )
++    }
++
++    fn can_perform_logical_xor_op_with(&self) -> Vec<Box<dyn DataType>> {
++        self.union_capability(|v| v.can_perform_logical_xor_op_with())
++    }
++
++    fn logical_xor_op_result_type(&self, other: &Box<dyn DataType>) -> Box<dyn DataType> {
++        self.delegated_result(
++            other,
++            |v| v.can_perform_logical_xor_op_with(),
++            |v, o| v.logical_xor_op_result_type(o),
++        )
++    }
+ }
+diff --git a/crates/gitql-core/src/environment.rs b/crates/gitql-core/src/environment.rs
+index dd9485b..9057f81 100644
+--- a/crates/gitql-core/src/environment.rs
++++ b/crates/gitql-core/src/environment.rs
+@@ -4,6 +4,7 @@ use gitql_ast::types::DataType;
+ 
+ use crate::schema::Schema;
+ use crate::signature::AggregationFunction;
++use crate::signature::JsonAccessFunction;
+ use crate::signature::Signature;
+ use crate::signature::StandardFunction;
+ use crate::signature::WindowFunction;
+@@ -43,6 +44,10 @@ pub struct Environment {
+     /// Local variables types in the current scope, later will be multi layer scopes
+     pub scopes: HashMap<String, Box<dyn DataType>>,
+ 
++    /// Evaluator for the `->` and `->>` JSON access operators, injected by the
++    /// standard library so the engine stays decoupled from it.
++    pub json_access_function: Option<JsonAccessFunction>,
++
+     /// A Table of DataTypes mapped to their original names or aliases
+     pub types_table: TypesTable,
+ }
+@@ -62,9 +67,15 @@ impl Environment {
+             globals_types: HashMap::default(),
+             scopes: HashMap::default(),
+             types_table: TypesTable::new(),
++            json_access_function: None,
+         }
+     }
+ 
++    /// Register the evaluator for the `->` and `->>` JSON access operators
++    pub fn with_json_access_function(&mut self, function: JsonAccessFunction) {
++        self.json_access_function = Some(function);
++    }
++
+     /// Register standard functions signatures and references
+     pub fn with_standard_functions(
+         &mut self,
+diff --git a/crates/gitql-core/src/signature.rs b/crates/gitql-core/src/signature.rs
+index 297483c..1cf13b9 100644
+--- a/crates/gitql-core/src/signature.rs
++++ b/crates/gitql-core/src/signature.rs
+@@ -5,6 +5,10 @@ use gitql_ast::types::DataType;
+ /// Standard function accept array of values and return single [`Value`]
+ pub type StandardFunction = fn(&[Box<dyn Value>]) -> Box<dyn Value>;
+ 
++/// Function type used to evaluate the JSON access operators `->` and `->>`,
++/// injected by the standard library so the engine need not depend on it.
++pub type JsonAccessFunction = fn(&Box<dyn Value>, &Box<dyn Value>, bool) -> Box<dyn Value>;
++
+ /// Aggregation function accept a selected row values for each row in group and return single [`Value`]
+ ///
+ /// [`Vec<Vec<Value>>`] represent the selected values from each row in group
+diff --git a/crates/gitql-engine/src/engine_evaluator.rs b/crates/gitql-engine/src/engine_evaluator.rs
+index 6ed1bd3..d2ad2bd 100644
+--- a/crates/gitql-engine/src/engine_evaluator.rs
++++ b/crates/gitql-engine/src/engine_evaluator.rs
+@@ -22,6 +22,7 @@ use gitql_ast::expression::InExpr;
+ use gitql_ast::expression::IndexExpr;
+ use gitql_ast::expression::IntervalExpr;
+ use gitql_ast::expression::IsNullExpr;
++use gitql_ast::expression::JsonAccessExpr;
+ use gitql_ast::expression::LikeExpr;
+ use gitql_ast::expression::LogicalExpr;
+ use gitql_ast::expression::MemberAccessExpr;
+@@ -143,6 +144,13 @@ pub fn evaluate_expression(
+                 .unwrap();
+             evaluate_contained_by(env, expr, titles, object)
+         }
++        JsonAccess => {
++            let expr = expression
++                .as_any()
++                .downcast_ref::<JsonAccessExpr>()
++                .unwrap();
++            evaluate_json_access(env, expr, titles, object)
++        }
+         Like => {
+             let expr = expression.as_any().downcast_ref::<LikeExpr>().unwrap();
+             evaluate_like(env, expr, titles, object)
+@@ -399,6 +407,20 @@ fn evaluate_contains(
+     lhs.contains_op(&rhs)
+ }
+ 
++fn evaluate_json_access(
++    env: &mut Environment,
++    expr: &JsonAccessExpr,
++    titles: &[String],
++    object: &Vec<Box<dyn Value>>,
++) -> Result<Box<dyn Value>, String> {
++    let lhs = evaluate_expression(env, &expr.left, titles, object)?;
++    let rhs = evaluate_expression(env, &expr.right, titles, object)?;
++    match env.json_access_function {
++        Some(function) => Ok(function(&lhs, &rhs, expr.as_text)),
++        None => Err("JSON access operators require the standard JSON evaluator".to_string()),
++    }
++}
++
+ fn evaluate_contained_by(
+     env: &mut Environment,
+     expr: &ContainedByExpr,
+diff --git a/crates/gitql-parser/src/parser.rs b/crates/gitql-parser/src/parser.rs
+index 6f44d2b..b2d6382 100644
+--- a/crates/gitql-parser/src/parser.rs
++++ b/crates/gitql-parser/src/parser.rs
+@@ -2143,6 +2143,31 @@ fn parse_contained_by_expression(
+     Ok(lhs)
+ }
+ 
++/// Parses the left-associative JSON access operators `->` and `->>`.
++fn parse_json_access_expression(
++    context: &mut ParserContext,
++    env: &mut Environment,
++    tokens: &[Token],
++    position: &mut usize,
++) -> Result<Box<dyn Expr>, Box<Diagnostic>> {
++    let mut lhs = parse_like_expression(context, env, tokens, position)?;
++
++    while is_current_token(tokens, position, TokenKind::Arrow)
++        || is_current_token(tokens, position, TokenKind::LongArrow)
++    {
++        let as_text = tokens[*position].kind == TokenKind::LongArrow;
++        *position += 1;
++        let rhs = parse_like_expression(context, env, tokens, position)?;
++        lhs = Box::new(JsonAccessExpr {
++            left: lhs,
++            right: rhs,
++            as_text,
++        });
++    }
++
++    Ok(lhs)
++}
++
+ fn parse_bitwise_shift_expression(
+     context: &mut ParserContext,
+     env: &mut Environment,
+@@ -2472,7 +2497,7 @@ fn parse_factor_expression(
+     tokens: &[Token],
+     position: &mut usize,
+ ) -> Result<Box<dyn Expr>, Box<Diagnostic>> {
+-    let mut lhs = parse_like_expression(context, env, tokens, position)?;
++    let mut lhs = parse_json_access_expression(context, env, tokens, position)?;
+ 
+     'parse_expr: while is_factor_operator(tokens, position) {
+         let operator = &tokens[*position];
+@@ -2480,7 +2505,7 @@ fn parse_factor_expression(
+         // Consume `*`, '/`, '%' or '^` operator
+         *position += 1;
+ 
+-        let rhs = parse_like_expression(context, env, tokens, position)?;
++        let rhs = parse_json_access_expression(context, env, tokens, position)?;
+ 
+         let lhs_type = lhs.expr_type();
+         let rhs_type = rhs.expr_type();
+diff --git a/crates/gitql-parser/src/token.rs b/crates/gitql-parser/src/token.rs
+index 92af39b..f551cc6 100644
+--- a/crates/gitql-parser/src/token.rs
++++ b/crates/gitql-parser/src/token.rs
+@@ -96,6 +96,8 @@ pub enum TokenKind {
+     NullSafeEqual,
+     AtRightArrow,
+     ArrowRightAt,
++    Arrow,
++    LongArrow,
+     LeftParen,
+     RightParen,
+     LeftBracket,
+@@ -327,6 +329,8 @@ impl Display for TokenKind {
+             TokenKind::NullSafeEqual => "<=>",
+             TokenKind::AtRightArrow => "@>",
+             TokenKind::ArrowRightAt => "<@",
++            TokenKind::Arrow => "->",
++            TokenKind::LongArrow => "->>",
+             TokenKind::LeftParen => "(",
+             TokenKind::RightParen => ")",
+             TokenKind::LeftBracket => "[",
+diff --git a/crates/gitql-parser/src/tokenizer.rs b/crates/gitql-parser/src/tokenizer.rs
+index e86f645..82ad5cb 100644
+--- a/crates/gitql-parser/src/tokenizer.rs
++++ b/crates/gitql-parser/src/tokenizer.rs
+@@ -135,7 +135,7 @@ impl<'a> Tokenizer<'a> {
+                 continue;
+             }
+ 
+-            // Minus
++            // Minus, or the JSON access operators `->` and `->>`
+             if char == '-' {
+                 // Ignore single line comment which from -- until the end of the current line
+                 if self.is_next_char('-') {
+@@ -144,6 +144,19 @@ impl<'a> Tokenizer<'a> {
+                 }
+ 
+                 let location = self.current_source_location();
++                if self.is_next_char('>') {
++                    self.advance();
++                    self.advance();
++                    let kind = if self.is_current_char('>') {
++                        self.advance();
++                        TokenKind::LongArrow
++                    } else {
++                        TokenKind::Arrow
++                    };
++                    tokens.push(Token::new(kind, location));
++                    continue;
++                }
++
+                 tokens.push(Token::new(TokenKind::Minus, location));
+                 self.advance();
+                 continue;
+diff --git a/crates/gitql-std/Cargo.toml b/crates/gitql-std/Cargo.toml
+index a06fbf9..216162e 100644
+--- a/crates/gitql-std/Cargo.toml
++++ b/crates/gitql-std/Cargo.toml
+@@ -14,5 +14,6 @@ gitql-core = { workspace = true }
+ gitql-ast = { workspace = true }
+ chrono = { workspace = true }
+ regex = { workspace = true }
++serde_json = { workspace = true, features = ["preserve_order"] }
+ rand = { workspace = true }
+ uuid = { workspace = true }
+diff --git a/crates/gitql-std/src/json/mod.rs b/crates/gitql-std/src/json/mod.rs
+new file mode 100644
+index 0000000..f4f27a8
+--- /dev/null
++++ b/crates/gitql-std/src/json/mod.rs
+@@ -0,0 +1,867 @@
++use std::collections::HashMap;
++
++use serde_json::json;
++use serde_json::Value as Json;
++
++use gitql_ast::types::any::AnyType;
++use gitql_ast::types::boolean::BoolType;
++use gitql_ast::types::dynamic::DynamicType;
++use gitql_ast::types::float::FloatType;
++use gitql_ast::types::integer::IntType;
++use gitql_ast::types::optional::OptionType;
++use gitql_ast::types::text::TextType;
++use gitql_ast::types::varargs::VarargsType;
++use gitql_ast::types::variant::VariantType;
++use gitql_ast::types::DataType;
++use gitql_core::signature::Signature;
++use gitql_core::signature::StandardFunction;
++use gitql_core::values::boolean::BoolValue;
++use gitql_core::values::float::FloatValue;
++use gitql_core::values::integer::IntValue;
++use gitql_core::values::null::NullValue;
++use gitql_core::values::text::TextValue;
++use gitql_core::values::Value;
++
++/// A single component of a JSON path expression.
++enum PathSegment {
++    Key(String),
++    Index(usize),
++    /// `#-N`, the element N places from the end (`#-0` is the past-the-end index).
++    FromEnd(usize),
++    /// `#`, the literal past-the-last-element position; the only appending target.
++    Append,
++}
++
++/// Resolves a `FromEnd` offset against a known array length. Returns `None`
++/// when the offset points past the front of the array.
++fn end_index(offset: usize, len: usize) -> Option<usize> {
++    len.checked_sub(offset)
++}
++
++fn null() -> Box<dyn Value> {
++    Box::new(NullValue)
++}
++
++fn text(value: String) -> Box<dyn Value> {
++    Box::new(TextValue::new(value))
++}
++
++/// Parses a SQLite-style JSON path (`$`, `$.key`, `$."quoted key"`, `$[0]`,
++/// and chains such as `$.a[1].b`). Returns `None` for malformed paths.
++fn parse_path(path: &str) -> Option<Vec<PathSegment>> {
++    let bytes = path.as_bytes();
++    if bytes.first() != Some(&b'$') {
++        return None;
++    }
++    let mut segments = Vec::new();
++    let mut i = 1;
++    while i < bytes.len() {
++        match bytes[i] {
++            b'.' => {
++                i += 1;
++                if i < bytes.len() && bytes[i] == b'"' {
++                    i += 1;
++                    let start = i;
++                    while i < bytes.len() && bytes[i] != b'"' {
++                        i += 1;
++                    }
++                    if i >= bytes.len() {
++                        return None;
++                    }
++                    segments.push(PathSegment::Key(path[start..i].to_string()));
++                    i += 1;
++                } else {
++                    let start = i;
++                    while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'[' {
++                        i += 1;
++                    }
++                    if start == i {
++                        return None;
++                    }
++                    segments.push(PathSegment::Key(path[start..i].to_string()));
++                }
++            }
++            b'[' => {
++                i += 1;
++                let start = i;
++                while i < bytes.len() && bytes[i] != b']' {
++                    i += 1;
++                }
++                if i >= bytes.len() {
++                    return None;
++                }
++                let inner = &path[start..i];
++                if let Some(rest) = inner.strip_prefix('#') {
++                    if rest.is_empty() {
++                        segments.push(PathSegment::Append);
++                    } else {
++                        let offset = rest.strip_prefix('-')?.parse::<usize>().ok()?;
++                        segments.push(PathSegment::FromEnd(offset));
++                    }
++                } else {
++                    segments.push(PathSegment::Index(inner.parse::<usize>().ok()?));
++                }
++                i += 1;
++            }
++            _ => return None,
++        }
++    }
++    Some(segments)
++}
++
++/// Follows `path` through `root`, returning the referenced value if present.
++fn resolve<'a>(root: &'a Json, path: &[PathSegment]) -> Option<&'a Json> {
++    let mut current = root;
++    for segment in path {
++        current = match (segment, current) {
++            (PathSegment::Key(key), Json::Object(map)) => map.get(key)?,
++            (PathSegment::Index(index), Json::Array(items)) => items.get(*index)?,
++            (PathSegment::FromEnd(offset), Json::Array(items)) => {
++                items.get(end_index(*offset, items.len())?)?
++            }
++            _ => return None,
++        };
++    }
++    Some(current)
++}
++
++/// A single component of an extended path query (`json_query`). Unlike the
++/// single-target segments, a step here can expand one node into many.
++enum QueryStep {
++    Key(String),
++    Index(usize),
++    /// `.*`: every object member value and every array element.
++    Wildcard,
++    /// `[*]`: every array element.
++    ArrayWildcard,
++    /// `..key`: every member named `key` at any depth; `..*` (None) every value.
++    Descend(Option<String>),
++}
++
++/// Parses an extended query pattern for `json_query`. Accepts the object/array
++/// steps a single-target path does (but not the `#` forms), plus `.*`, `[*]`,
++/// `..key` and `..*`. Returns `None` for a malformed pattern.
++fn parse_query(pattern: &str) -> Option<Vec<QueryStep>> {
++    let bytes = pattern.as_bytes();
++    if bytes.first() != Some(&b'$') {
++        return None;
++    }
++    let mut steps = Vec::new();
++    let mut i = 1;
++    while i < bytes.len() {
++        match bytes[i] {
++            b'.' => {
++                i += 1;
++                if i < bytes.len() && bytes[i] == b'.' {
++                    i += 1;
++                    if i < bytes.len() && bytes[i] == b'*' {
++                        steps.push(QueryStep::Descend(None));
++                        i += 1;
++                    } else {
++                        let (key, next) = read_query_key(pattern, i)?;
++                        steps.push(QueryStep::Descend(Some(key)));
++                        i = next;
++                    }
++                } else if i < bytes.len() && bytes[i] == b'*' {
++                    steps.push(QueryStep::Wildcard);
++                    i += 1;
++                } else {
++                    let (key, next) = read_query_key(pattern, i)?;
++                    steps.push(QueryStep::Key(key));
++                    i = next;
++                }
++            }
++            b'[' => {
++                i += 1;
++                let start = i;
++                while i < bytes.len() && bytes[i] != b']' {
++                    i += 1;
++                }
++                if i >= bytes.len() {
++                    return None;
++                }
++                let inner = &pattern[start..i];
++                if inner == "*" {
++                    steps.push(QueryStep::ArrayWildcard);
++                } else {
++                    steps.push(QueryStep::Index(inner.parse::<usize>().ok()?));
++                }
++                i += 1;
++            }
++            _ => return None,
++        }
++    }
++    Some(steps)
++}
++
++/// Reads a bare or `"quoted"` key at `start`, returning it and the next index.
++/// Returns `None` for an empty key or an unterminated quote.
++fn read_query_key(pattern: &str, start: usize) -> Option<(String, usize)> {
++    let bytes = pattern.as_bytes();
++    if bytes.get(start) == Some(&b'"') {
++        let mut i = start + 1;
++        while i < bytes.len() && bytes[i] != b'"' {
++            i += 1;
++        }
++        if i >= bytes.len() {
++            return None;
++        }
++        return Some((pattern[start + 1..i].to_string(), i + 1));
++    }
++    let mut i = start;
++    while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'[' {
++        i += 1;
++    }
++    if i == start {
++        return None;
++    }
++    Some((pattern[start..i].to_string(), i))
++}
++
++/// Collects descendants of `node` in document pre-order. With `key` set only
++/// members of that name are collected; otherwise every nested value is.
++fn descend<'a>(node: &'a Json, key: Option<&str>, out: &mut Vec<&'a Json>) {
++    match node {
++        Json::Object(map) => {
++            for (member, child) in map {
++                if key.is_none_or(|k| k == member) {
++                    out.push(child);
++                }
++                descend(child, key, out);
++            }
++        }
++        Json::Array(items) => {
++            for child in items {
++                if key.is_none() {
++                    out.push(child);
++                }
++                descend(child, key, out);
++            }
++        }
++        _ => {}
++    }
++}
++
++/// Applies one query step to a node, appending each produced match to `out`.
++fn apply_step<'a>(node: &'a Json, step: &QueryStep, out: &mut Vec<&'a Json>) {
++    match (step, node) {
++        (QueryStep::Key(key), Json::Object(map)) => {
++            if let Some(child) = map.get(key) {
++                out.push(child);
++            }
++        }
++        (QueryStep::Index(index), Json::Array(items)) => {
++            if let Some(child) = items.get(*index) {
++                out.push(child);
++            }
++        }
++        (QueryStep::Wildcard, Json::Object(map)) => out.extend(map.values()),
++        (QueryStep::Wildcard, Json::Array(items)) => out.extend(items.iter()),
++        (QueryStep::ArrayWildcard, Json::Array(items)) => out.extend(items.iter()),
++        (QueryStep::Descend(key), _) => descend(node, key.as_deref(), out),
++        _ => {}
++    }
++}
++
++/// Evaluates a parsed query, returning every matched node in document order.
++fn query_collect<'a>(root: &'a Json, steps: &[QueryStep]) -> Vec<&'a Json> {
++    let mut current = vec![root];
++    for step in steps {
++        let mut next = Vec::new();
++        for node in &current {
++            apply_step(node, step, &mut next);
++        }
++        current = next;
++    }
++    current
++}
++
++/// The SQLite `json_type` name of a JSON value.
++fn type_name(value: &Json) -> &'static str {
++    match value {
++        Json::Object(_) => "object",
++        Json::Array(_) => "array",
++        Json::String(_) => "text",
++        Json::Bool(true) => "true",
++        Json::Bool(false) => "false",
++        Json::Null => "null",
++        Json::Number(n) => {
++            if n.is_f64() {
++                "real"
++            } else {
++                "integer"
++            }
++        }
++    }
++}
++
++/// Converts a JSON value to a GitQL value: scalars become typed values while
++/// objects and arrays become their minified textual form.
++fn json_to_value(value: &Json) -> Box<dyn Value> {
++    match value {
++        Json::Null => null(),
++        Json::Bool(b) => Box::new(BoolValue::new(*b)),
++        Json::String(s) => text(s.clone()),
++        Json::Number(n) => {
++            if let Some(i) = n.as_i64() {
++                Box::new(IntValue::new(i))
++            } else {
++                Box::new(FloatValue::new(n.as_f64().unwrap_or(0.0)))
++            }
++        }
++        Json::Array(_) | Json::Object(_) => text(value.to_string()),
++    }
++}
++
++/// Converts a GitQL value to the JSON value used when building documents.
++/// Text is stored as a JSON string, mirroring SQLite's literal treatment.
++#[allow(clippy::borrowed_box)]
++fn value_to_json(value: &Box<dyn Value>) -> Json {
++    if value.is_null() {
++        Json::Null
++    } else if let Some(b) = value.as_bool() {
++        Json::Bool(b)
++    } else if let Some(i) = value.as_int() {
++        json!(i)
++    } else if let Some(f) = value.as_float() {
++        json!(f)
++    } else if let Some(s) = value.as_text() {
++        Json::String(s)
++    } else {
++        Json::Null
++    }
++}
++
++#[allow(clippy::borrowed_box)]
++fn parse_doc(value: &Box<dyn Value>) -> Option<Json> {
++    let raw = value.as_text()?;
++    serde_json::from_str(&raw).ok()
++}
++
++/// Evaluates the `->` and `->>` JSON access operators. The accessor selects an
++/// object member (text), an array element (integer), or a full path (text
++/// beginning with `$`). With `as_text` the referenced value is returned as a
++/// typed GitQL value (the `->>` operator); otherwise it is returned as JSON text
++/// (the `->` operator). A missing target or an invalid document yields null.
++#[allow(clippy::borrowed_box)]
++pub fn evaluate_json_access(
++    document: &Box<dyn Value>,
++    accessor: &Box<dyn Value>,
++    as_text: bool,
++) -> Box<dyn Value> {
++    let Some(doc) = parse_doc(document) else {
++        return null();
++    };
++    let path = if let Some(key) = accessor.as_text() {
++        if key.starts_with('$') {
++            match parse_path(&key) {
++                Some(path) => path,
++                None => return null(),
++            }
++        } else {
++            vec![PathSegment::Key(key)]
++        }
++    } else if let Some(index) = accessor.as_int() {
++        match usize::try_from(index) {
++            Ok(index) => vec![PathSegment::Index(index)],
++            Err(_) => return null(),
++        }
++    } else {
++        return null();
++    };
++    match resolve(&doc, &path) {
++        Some(value) if as_text => json_to_value(value),
++        Some(value) => text(value.to_string()),
++        None => null(),
++    }
++}
++
++pub fn register_std_json_functions(map: &mut HashMap<&'static str, StandardFunction>) {
++    map.insert("json", json_minify);
++    map.insert("json_valid", json_valid);
++    map.insert("json_type", json_type);
++    map.insert("json_extract", json_extract);
++    map.insert("json_query", json_query);
++    map.insert("json_array", json_array);
++    map.insert("json_object", json_object);
++    map.insert("json_array_length", json_array_length);
++    map.insert("json_quote", json_quote);
++    map.insert("json_set", json_set);
++    map.insert("json_insert", json_insert);
++    map.insert("json_replace", json_replace);
++    map.insert("json_remove", json_remove);
++    map.insert("json_patch", json_patch);
++    map.insert("json_keys", json_keys);
++    map.insert("json_contains", json_contains);
++    map.insert("json_depth", json_depth);
++    map.insert("json_pretty", json_pretty);
++}
++
++pub fn register_std_json_function_signatures(map: &mut HashMap<&'static str, Signature>) {
++    let optional_text = || OptionType::new(Some(Box::new(TextType)));
++    let varargs_text = || VarargsType::new(Box::new(TextType));
++    let varargs_any = || VarargsType::new(Box::new(AnyType));
++    map.insert(
++        "json",
++        Signature::new(vec![Box::new(TextType)], Box::new(TextType)),
++    );
++    map.insert(
++        "json_valid",
++        Signature::new(vec![Box::new(TextType)], Box::new(BoolType)),
++    );
++    map.insert(
++        "json_type",
++        Signature::new(
++            vec![Box::new(TextType), Box::new(optional_text())],
++            Box::new(TextType),
++        ),
++    );
++    map.insert(
++        "json_extract",
++        Signature::new(
++            vec![
++                Box::new(TextType),
++                Box::new(TextType),
++                Box::new(varargs_text()),
++            ],
++            Box::new(DynamicType::new(json_extract_return_type)),
++        ),
++    );
++    map.insert(
++        "json_query",
++        Signature::new(
++            vec![Box::new(TextType), Box::new(TextType)],
++            Box::new(TextType),
++        ),
++    );
++    map.insert(
++        "json_array",
++        Signature::new(vec![Box::new(varargs_any())], Box::new(TextType)),
++    );
++    map.insert(
++        "json_object",
++        Signature::new(vec![Box::new(varargs_any())], Box::new(TextType)),
++    );
++    map.insert(
++        "json_array_length",
++        Signature::new(
++            vec![Box::new(TextType), Box::new(optional_text())],
++            Box::new(IntType),
++        ),
++    );
++    map.insert(
++        "json_quote",
++        Signature::new(vec![Box::new(AnyType)], Box::new(TextType)),
++    );
++    for name in ["json_set", "json_insert", "json_replace"] {
++        map.insert(
++            name,
++            Signature::new(
++                vec![
++                    Box::new(TextType),
++                    Box::new(TextType),
++                    Box::new(AnyType),
++                    Box::new(varargs_any()),
++                ],
++                Box::new(TextType),
++            ),
++        );
++    }
++    map.insert(
++        "json_remove",
++        Signature::new(
++            vec![
++                Box::new(TextType),
++                Box::new(TextType),
++                Box::new(varargs_text()),
++            ],
++            Box::new(TextType),
++        ),
++    );
++    map.insert(
++        "json_patch",
++        Signature::new(
++            vec![Box::new(TextType), Box::new(TextType)],
++            Box::new(TextType),
++        ),
++    );
++    map.insert(
++        "json_keys",
++        Signature::new(vec![Box::new(TextType)], Box::new(TextType)),
++    );
++    map.insert(
++        "json_contains",
++        Signature::new(
++            vec![Box::new(TextType), Box::new(TextType)],
++            Box::new(BoolType),
++        ),
++    );
++    map.insert(
++        "json_depth",
++        Signature::new(vec![Box::new(TextType)], Box::new(IntType)),
++    );
++    map.insert(
++        "json_pretty",
++        Signature::new(vec![Box::new(TextType)], Box::new(TextType)),
++    );
++}
++
++fn json_minify(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    match parse_doc(&inputs[0]) {
++        Some(doc) => text(doc.to_string()),
++        None => null(),
++    }
++}
++
++/// `json_pretty(X)`: re-serialises the document with two-space indentation.
++fn json_pretty(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    match parse_doc(&inputs[0]).and_then(|doc| serde_json::to_string_pretty(&doc).ok()) {
++        Some(pretty) => text(pretty),
++        None => null(),
++    }
++}
++
++fn json_valid(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    let valid = inputs[0]
++        .as_text()
++        .is_some_and(|raw| serde_json::from_str::<Json>(&raw).is_ok());
++    Box::new(BoolValue::new(valid))
++}
++
++fn json_type(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    let Some(doc) = parse_doc(&inputs[0]) else {
++        return null();
++    };
++    let resolved = if let Some(path_text) = inputs.get(1).and_then(|v| v.as_text()) {
++        match parse_path(&path_text) {
++            Some(path) => resolve(&doc, &path),
++            None => return null(),
++        }
++    } else {
++        Some(&doc)
++    };
++    match resolved {
++        Some(value) => text(type_name(value).to_string()),
++        None => null(),
++    }
++}
++
++/// Resolves `json_extract`'s return type: several paths always yield a JSON array
++/// (text), while one path yields the referenced value typed (a scalar) or as JSON
++/// text (a container), so it composes in arithmetic and comparisons.
++fn json_extract_return_type(types: &[Box<dyn DataType>]) -> Box<dyn DataType> {
++    let has_varargs = types.iter().any(|t| t.as_any().is::<VarargsType>());
++    if !has_varargs && types.len() > 2 {
++        Box::new(TextType)
++    } else {
++        Box::new(VariantType::new(vec![
++            Box::new(IntType),
++            Box::new(FloatType),
++            Box::new(TextType),
++            Box::new(BoolType),
++        ]))
++    }
++}
++
++fn json_extract(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    let Some(doc) = parse_doc(&inputs[0]) else {
++        return null();
++    };
++    let paths = &inputs[1..];
++    if paths.len() == 1 {
++        let Some(path_text) = paths[0].as_text() else {
++            return null();
++        };
++        let Some(path) = parse_path(&path_text) else {
++            return null();
++        };
++        return match resolve(&doc, &path) {
++            Some(value) => json_to_value(value),
++            None => null(),
++        };
++    }
++    let mut collected = Vec::with_capacity(paths.len());
++    for path_value in paths {
++        let resolved = path_value
++            .as_text()
++            .and_then(|p| parse_path(&p))
++            .and_then(|p| resolve(&doc, &p).cloned());
++        collected.push(resolved.unwrap_or(Json::Null));
++    }
++    text(Json::Array(collected).to_string())
++}
++
++/// `json_query(X, PATTERN)`: an extended path query supporting `.*`, `[*]`,
++/// `..key` and `..*`. Always returns a JSON array of the matches in document
++/// pre-order, keeping duplicates; an invalid document or malformed pattern is
++/// null.
++fn json_query(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    let Some(doc) = parse_doc(&inputs[0]) else {
++        return null();
++    };
++    let Some(pattern) = inputs[1].as_text() else {
++        return null();
++    };
++    let Some(steps) = parse_query(&pattern) else {
++        return null();
++    };
++    let matches: Vec<Json> = query_collect(&doc, &steps).into_iter().cloned().collect();
++    text(Json::Array(matches).to_string())
++}
++
++fn json_array(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    let items: Vec<Json> = inputs.iter().map(value_to_json).collect();
++    text(Json::Array(items).to_string())
++}
++
++fn json_object(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    let mut object = serde_json::Map::new();
++    for pair in inputs.chunks(2) {
++        if pair.len() != 2 {
++            return null();
++        }
++        let Some(key) = pair[0].as_text() else {
++            return null();
++        };
++        object.insert(key, value_to_json(&pair[1]));
++    }
++    text(Json::Object(object).to_string())
++}
++
++fn json_array_length(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    let Some(doc) = parse_doc(&inputs[0]) else {
++        return null();
++    };
++    let resolved = if let Some(path_text) = inputs.get(1).and_then(|v| v.as_text()) {
++        match parse_path(&path_text) {
++            Some(path) => resolve(&doc, &path),
++            None => return null(),
++        }
++    } else {
++        Some(&doc)
++    };
++    let length = match resolved {
++        Some(Json::Array(items)) => items.len() as i64,
++        Some(_) => 0,
++        None => return null(),
++    };
++    Box::new(IntValue::new(length))
++}
++
++fn json_quote(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    text(value_to_json(&inputs[0]).to_string())
++}
++
++/// Applies a `set`/`insert`/`replace` edit at the parent of the final path
++/// segment. `overwrite` and `create` select the three SQLite variants.
++fn edit_at(root: &mut Json, path: &[PathSegment], new_value: Json, overwrite: bool, create: bool) {
++    let Some((last, parents)) = path.split_last() else {
++        // The root path `$` always exists, so only overwriting edits apply.
++        if overwrite {
++            *root = new_value;
++        }
++        return;
++    };
++    let Some(current) = resolve_mut(root, parents) else {
++        return;
++    };
++    match (last, current) {
++        (PathSegment::Key(key), Json::Object(map)) => {
++            let exists = map.contains_key(key);
++            if (exists && overwrite) || (!exists && create) {
++                map.insert(key.clone(), new_value);
++            }
++        }
++        (PathSegment::Index(index), Json::Array(items)) => {
++            // A numeric index only overwrites an existing element; one past the
++            // end or beyond is not the append position and leaves the array as is.
++            if *index < items.len() && overwrite {
++                items[*index] = new_value;
++            }
++        }
++        (PathSegment::Append, Json::Array(items)) => {
++            // `[#]` is the only appending target.
++            if create {
++                items.push(new_value);
++            }
++        }
++        (PathSegment::FromEnd(offset), Json::Array(items)) => {
++            // `[#-n]` addresses an existing element; overwrite only. `[#-0]`
++            // resolves to the length (out of range) and never appends.
++            if let Some(index) = end_index(*offset, items.len()) {
++                if index < items.len() && overwrite {
++                    items[index] = new_value;
++                }
++            }
++        }
++        _ => {}
++    }
++}
++
++fn edit_document(inputs: &[Box<dyn Value>], overwrite: bool, create: bool) -> Box<dyn Value> {
++    let Some(mut doc) = parse_doc(&inputs[0]) else {
++        return null();
++    };
++    let mut rest = &inputs[1..];
++    while !rest.is_empty() {
++        if rest.len() < 2 {
++            return null();
++        }
++        let Some(path_text) = rest[0].as_text() else {
++            return null();
++        };
++        let Some(path) = parse_path(&path_text) else {
++            return null();
++        };
++        edit_at(&mut doc, &path, value_to_json(&rest[1]), overwrite, create);
++        rest = &rest[2..];
++    }
++    text(doc.to_string())
++}
++
++fn json_set(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    edit_document(inputs, true, true)
++}
++
++fn json_insert(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    edit_document(inputs, false, true)
++}
++
++fn json_replace(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    edit_document(inputs, true, false)
++}
++
++fn json_remove(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    let Some(mut doc) = parse_doc(&inputs[0]) else {
++        return null();
++    };
++    for path_value in &inputs[1..] {
++        let Some(path_text) = path_value.as_text() else {
++            return null();
++        };
++        let Some(path) = parse_path(&path_text) else {
++            return null();
++        };
++        let Some((last, parents)) = path.split_last() else {
++            // Removing the root discards the whole document.
++            return null();
++        };
++        if let Some(parent) = resolve_mut(&mut doc, parents) {
++            match (last, parent) {
++                (PathSegment::Key(key), Json::Object(map)) => {
++                    map.remove(key);
++                }
++                (PathSegment::Index(index), Json::Array(items)) => {
++                    if *index < items.len() {
++                        items.remove(*index);
++                    }
++                }
++                (PathSegment::FromEnd(offset), Json::Array(items)) => {
++                    if let Some(index) = end_index(*offset, items.len()) {
++                        if index < items.len() {
++                            items.remove(index);
++                        }
++                    }
++                }
++                _ => {}
++            }
++        }
++    }
++    text(doc.to_string())
++}
++
++/// RFC 7396 recursive merge used by `json_patch`.
++fn merge_patch(target: &mut Json, patch: &Json) {
++    let Json::Object(patch_map) = patch else {
++        *target = patch.clone();
++        return;
++    };
++    if !target.is_object() {
++        *target = Json::Object(serde_json::Map::new());
++    }
++    let target_map = target.as_object_mut().expect("target is an object");
++    for (key, value) in patch_map {
++        if value.is_null() {
++            target_map.remove(key);
++        } else {
++            merge_patch(target_map.entry(key.clone()).or_insert(Json::Null), value);
++        }
++    }
++}
++
++fn json_patch(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    let (Some(mut target), Some(patch)) = (parse_doc(&inputs[0]), parse_doc(&inputs[1])) else {
++        return null();
++    };
++    merge_patch(&mut target, &patch);
++    text(target.to_string())
++}
++
++/// Recursive containment used by `json_contains`: a candidate is contained in a
++/// target when scalars are equal, every candidate array element is contained in
++/// some target array element, and every candidate object member is contained in
++/// the matching target member.
++fn contains(target: &Json, candidate: &Json) -> bool {
++    match (target, candidate) {
++        (Json::Object(t), Json::Object(c)) => c
++            .iter()
++            .all(|(key, value)| t.get(key).is_some_and(|found| contains(found, value))),
++        (Json::Array(t), Json::Array(c)) => c
++            .iter()
++            .all(|candidate| t.iter().any(|target| contains(target, candidate))),
++        (Json::Array(t), candidate) => t.iter().any(|target| contains(target, candidate)),
++        (target, candidate) => target == candidate,
++    }
++}
++
++fn json_contains(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    let (Some(document), Some(candidate)) = (parse_doc(&inputs[0]), parse_doc(&inputs[1])) else {
++        return null();
++    };
++    Box::new(BoolValue::new(contains(&document, &candidate)))
++}
++
++/// The maximum nesting depth of a JSON value: scalars and empty containers have
++/// depth 1, and a non-empty container is one deeper than its deepest child.
++fn depth(value: &Json) -> i64 {
++    match value {
++        Json::Array(items) if !items.is_empty() => 1 + items.iter().map(depth).max().unwrap_or(0),
++        Json::Object(map) if !map.is_empty() => 1 + map.values().map(depth).max().unwrap_or(0),
++        _ => 1,
++    }
++}
++
++fn json_depth(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    match parse_doc(&inputs[0]) {
++        Some(document) => Box::new(IntValue::new(depth(&document))),
++        None => null(),
++    }
++}
++
++/// `json_keys(X)`: the member names of an object as a JSON array, in document
++/// order. Returns NULL when the value is not an object.
++fn json_keys(inputs: &[Box<dyn Value>]) -> Box<dyn Value> {
++    match parse_doc(&inputs[0]) {
++        Some(Json::Object(map)) => {
++            let keys: Vec<Json> = map.keys().map(|k| Json::String(k.clone())).collect();
++            text(Json::Array(keys).to_string())
++        }
++        _ => null(),
++    }
++}
++
++fn resolve_mut<'a>(root: &'a mut Json, path: &[PathSegment]) -> Option<&'a mut Json> {
++    let mut current = root;
++    for segment in path {
++        current = match (segment, current) {
++            (PathSegment::Key(key), Json::Object(map)) => map.get_mut(key)?,
++            (PathSegment::Index(index), Json::Array(items)) => items.get_mut(*index)?,
++            (PathSegment::FromEnd(offset), Json::Array(items)) => {
++                let index = end_index(*offset, items.len())?;
++                items.get_mut(index)?
++            }
++            _ => return None,
++        };
++    }
++    Some(current)
++}
+diff --git a/crates/gitql-std/src/lib.rs b/crates/gitql-std/src/lib.rs
+index e373f80..efbe3a0 100644
+--- a/crates/gitql-std/src/lib.rs
++++ b/crates/gitql-std/src/lib.rs
+@@ -2,6 +2,7 @@ pub mod aggregation;
+ pub mod array;
+ pub mod datetime;
+ pub mod general;
++pub mod json;
+ pub mod meta_types;
+ pub mod number;
+ pub mod range;
+diff --git a/crates/gitql-std/src/standard.rs b/crates/gitql-std/src/standard.rs
+index e45807c..aab2fee 100644
+--- a/crates/gitql-std/src/standard.rs
++++ b/crates/gitql-std/src/standard.rs
+@@ -1,6 +1,7 @@
+ use crate::array::*;
+ use crate::datetime::*;
+ use crate::general::*;
++use crate::json::*;
+ use crate::number::*;
+ use crate::range::*;
+ use crate::regex::*;
+@@ -19,6 +20,7 @@ pub fn standard_functions() -> &'static HashMap<&'static str, StandardFunction>
+         register_std_datetime_functions(&mut map);
+         register_std_number_functions(&mut map);
+         register_std_general_functions(&mut map);
++        register_std_json_functions(&mut map);
+         register_std_regex_functions(&mut map);
+         register_std_array_functions(&mut map);
+         register_std_range_functions(&mut map);
+@@ -32,6 +34,7 @@ pub fn standard_function_signatures() -> HashMap<&'static str, Signature> {
+     register_std_datetime_function_signatures(&mut map);
+     register_std_number_function_signatures(&mut map);
+     register_std_general_function_signatures(&mut map);
++    register_std_json_function_signatures(&mut map);
+     register_std_regex_function_signatures(&mut map);
+     register_std_array_function_signatures(&mut map);
+     register_std_range_function_signatures(&mut map);
+diff --git a/docs/functions/index.md b/docs/functions/index.md
+index 9f8f884..34aa5c0 100644
+--- a/docs/functions/index.md
++++ b/docs/functions/index.md
+@@ -7,6 +7,7 @@ GitQL Standard functions and operators
+ - [Date/Time](datetime.md).
+ - [Regex](regex.md).
+ - [Array](array.md).
++- [JSON](json.md).
+ - [Range](range.md).
+ - [Interval](interval.md).
+ - [Window] (window.md)
+diff --git a/docs/functions/json.md b/docs/functions/json.md
+new file mode 100644
+index 0000000..de1d90c
+--- /dev/null
++++ b/docs/functions/json.md
+@@ -0,0 +1,61 @@
++### JSON access operators
++
++| Operator | Arguments      | Return | Description                                                                 |
++| -------- | -------------- | ------ | --------------------------------------------------------------------------- |
++| ->       | (Text, Any)    | Text   | Select a member/element and return it as JSON text.                         |
++| ->>      | (Text, Any)    | Any    | Select a member/element and return it as a typed value (containers as text).|
++
++The right operand selects an object member when it is text, the array element `[n]`
++when it is an integer, or a JSON path when it begins with `$`. `->` returns JSON text,
++while `->>` returns a typed value (a JSON null becomes SQL null) that composes in
++arithmetic and comparisons, e.g. `(document ->> 'age') + 1`. The operators are
++left-associative and bind tighter than arithmetic, so `document ->> 'n' + 1` groups as
++`(document ->> 'n') + 1`.
++
++### JSON path syntax
++
++| Form           | Description                                     |
++| -------------- | ----------------------------------------------- |
++| `$`            | The document root.                              |
++| `.key`         | An object member; `."quoted key"` when needed.  |
++| `[n]`          | The array element at zero-based index `n`.      |
++| `[#]`          | The position past the last element (append).    |
++| `[#-n]`        | The element `n` places from the end.            |
++
++A malformed path or a lookup with no value yields null. `json_query` additionally
++accepts `.*` (each member value or array element), `[*]` (each array element),
++`..key`/`.."key"` (each such member at any depth) and `..*` (each value); it rejects
++the `[#]` forms.
++
++### JSON functions
++
++| Name              | Parameters               | Return  | Description                                                                        |
++| ----------------- | ------------------------ | ------- | --------------------------------------------------------------------------------- |
++| JSON              | Text                     | Text    | Reparse a document and return minified JSON.                                       |
++| JSON_VALID        | Text                     | Boolean | Report whether the argument is valid JSON.                                         |
++| JSON_TYPE         | Text, Text?              | Text    | The type tag of the value at an optional path.                                     |
++| JSON_EXTRACT      | Text, Text, ...Text      | Any     | The value at one path (typed), or a JSON array for several paths.                  |
++| JSON_QUERY        | Text, Text               | Text    | A JSON array of every match of an extended path, in document pre-order.            |
++| JSON_ARRAY        | ...Any                   | Text    | Build a JSON array from the arguments.                                             |
++| JSON_OBJECT       | ...Any                   | Text    | Build a JSON object from alternating key/value arguments.                          |
++| JSON_ARRAY_LENGTH | Text, Text?              | Integer | The array length at an optional path, zero for a non-array.                        |
++| JSON_QUOTE        | Any                      | Text    | Render a value as JSON.                                                            |
++| JSON_SET          | Text, Text, Any, ...     | Text    | Write each path whether or not it exists.                                          |
++| JSON_INSERT       | Text, Text, Any, ...     | Text    | Write each path only when it is absent.                                            |
++| JSON_REPLACE      | Text, Text, Any, ...     | Text    | Write each path only when it is present.                                           |
++| JSON_REMOVE       | Text, Text, ...Text      | Text    | Delete the values at the paths left to right, reindexing arrays.                   |
++| JSON_PATCH        | Text, Text               | Text    | Apply an RFC 7396 merge patch (null members remove; a non-object patch replaces).  |
++| JSON_KEYS         | Text                     | Text    | An object's member names as a JSON array, or null for a non-object.                |
++| JSON_CONTAINS     | Text, Text               | Boolean | Whether a candidate is recursively contained in the target.                        |
++| JSON_DEPTH        | Text                     | Integer | The nesting depth, one for scalars and empty containers.                           |
++| JSON_PRETTY       | Text                     | Text    | Re-serialise the document with indentation.                                        |
++
++### Mutation semantics
++
++`JSON_SET`, `JSON_INSERT` and `JSON_REPLACE` apply alternating path/value pairs left to
++right, and an updated member keeps its position. For set and replace a `$` path replaces
++the whole document, while insert leaves it unchanged. A mutation whose parent is absent
++leaves the document unchanged, and only `[#]` appends: an out-of-range `[n]` or a `[#-n]`
++before the front is not an append and leaves the array untouched. Functions consuming a
++JSON document return null when it is invalid, and output is minified except for
++`JSON_PRETTY`.
+diff --git a/docs/sdk/assemble.md b/docs/sdk/assemble.md
+index 462a330..0deb186 100644
+--- a/docs/sdk/assemble.md
++++ b/docs/sdk/assemble.md
+@@ -18,6 +18,10 @@ let mut env = Environment::new(schema);
+ env.with_standard_functions(&std_signatures, std_functions);
+ env.with_aggregation_functions(&aggregation_signatures, aggregation_functions);
+ 
++// The `->` and `->>` JSON access operators are evaluated by an injected callback,
++// so register it alongside the standard functions or those operators fail at runtime
++env.with_json_access_function(gitql_std::json::evaluate_json_access);
++
+ // Create instance of the diagnostic reporter, to report errors, warns ...etc
+ let mut reporter = DiagnosticReporter::default();
+ 
+diff --git a/mkdocs.yml b/mkdocs.yml
+index f6caedc..d140a8d 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -119,6 +119,7 @@ nav:
+       - Date/Time: functions/datetime.md
+       - Regex: functions/regex.md
+       - Array: functions/array.md
++      - JSON: functions/json.md
+       - Range: functions/range.md
+       - Interval: functions/interval.md
+       - Aggregate Functions: functions/aggregations.md
+diff --git a/src/gitql/mod.rs b/src/gitql/mod.rs
+index b627e3a..3835d37 100644
+--- a/src/gitql/mod.rs
++++ b/src/gitql/mod.rs
+@@ -33,6 +33,7 @@ pub(crate) fn create_gitql_environment() -> Environment {
+     env.with_standard_functions(&std_signatures, std_functions);
+     env.with_aggregation_functions(&aggregation_signatures, aggregation_functions);
+     env.with_window_functions(&window_signatures, window_function);
++    env.with_json_access_function(gitql_std::json::evaluate_json_access);
+     env
+ }
+ 

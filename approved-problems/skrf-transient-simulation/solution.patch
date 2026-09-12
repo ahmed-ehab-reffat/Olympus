@@ -1,0 +1,739 @@
+diff --git a/skrf/__init__.py b/skrf/__init__.py
+index b1e2850..7a5eafa 100644
+--- a/skrf/__init__.py
++++ b/skrf/__init__.py
+@@ -23,6 +23,7 @@ from . import (
+     qfactor,
+     taper,
+     tlineFunctions,
++    transient,
+     util,
+     vectorFitting,
+     vi,
+@@ -30,6 +31,15 @@ from . import (
+ from .calibration import calibrationSet, deembedding
+ from .frequency import Frequency
+ from .network import Network
++from .transient import (
++    ArraySource,
++    BitSource,
++    Eye,
++    PulseSource,
++    Source,
++    StepSource,
++    TransientResult,
++)
+ from .plotting import stylely
+ 
+ 
+diff --git a/skrf/circuit.py b/skrf/circuit.py
+index f46031c..1639847 100644
+--- a/skrf/circuit.py
++++ b/skrf/circuit.py
+@@ -108,6 +108,8 @@ from .network import Network, connect, innerconnect, s2s
+ from .plotting import subplots
+ 
+ if TYPE_CHECKING:
++    from collections.abc import Callable
++
+     from .constants import MemoryLayoutT, NumberLike
+     from .frequency import Frequency
+ 
+@@ -1831,6 +1833,37 @@ class Circuit:
+             Vs.append((a[port_idx] + b[:,port_idx])*np.sqrt(z0s[:,port_idx]))
+         return np.array(Vs).T
+ 
++    def transient(self, sources: dict, window: str | tuple | Callable | None = None):
++        """Simulate the response of the circuit to real voltage waveforms.
++
++        Every entry of `sources` places an ideal voltage source in series with
++        the reference impedance of that port of the circuit. The other ports
++        are terminated with their own reference impedance, so they do not
++        reflect. Beside the port waveforms the result carries the voltage of
++        every intersection of the circuit.
++
++        Parameters
++        ----------
++        sources : dict
++            Maps a port index to a :class:`~skrf.transient.Source`. The order
++            of the ports is the one of :func:`port_indexes`.
++        window : string, tuple, callable or None
++            Window applied to the spectrum before the transform. No window is
++            applied by default.
++
++        Returns
++        -------
++        result : :class:`~skrf.transient.TransientResult`
++            Port waveforms and internal node voltages.
++
++        See Also
++        --------
++            voltages
++            voltages_external
++        """
++        from .transient import circuit_transient
++        return circuit_transient(self, sources, window=window)
++
+     def plot_graph(self, **kwargs):
+         """
+         Plot the graph of the circuit using networkx drawing capabilities.
+diff --git a/skrf/network.py b/skrf/network.py
+index 25d3a72..80077a9 100644
+--- a/skrf/network.py
++++ b/skrf/network.py
+@@ -4664,6 +4664,51 @@ class Network:
+         t, y = self.impulse_response(window=window, n=n, pad=pad, bandpass=False, squeeze=squeeze)
+         return t, scipy.integrate.cumulative_trapezoid(y, initial=0, axis=0)
+ 
++    def transient(self, sources: dict, z_source: NumberLike | None = None,
++                  z_load: NumberLike | None = None, loads: dict | None = None,
++                  window: str | tuple | Callable | None = None):
++        """Simulate the response of the network to real voltage waveforms.
++
++        Every entry of `sources` places an ideal voltage source in series with
++        `z_source` at that port. Ports without a source are terminated with
++        `z_load`. The network is renormalized to those impedances, so a
++        termination does not reflect.
++
++        The simulation runs on the time grid implied by the frequency vector,
++        which is extrapolated to 0 Hz and to a uniform spacing when needed.
++
++        Parameters
++        ----------
++        sources : dict
++            Maps a port index to a :class:`~skrf.transient.Source`.
++        z_source : number, array or None
++            Source impedance of the driven ports. Defaults to the port
++            reference impedances.
++        z_load : number, array or None
++            Termination impedance of the other ports. Defaults to the port
++            reference impedances.
++        loads : dict or None
++            Maps a port index to a one port :class:`Network` terminating it.
++            Such a termination reflects, and the reflection travels back
++            through the network.
++        window : string, tuple, callable or None
++            Window applied to the spectrum before the transform. No window is
++            applied by default.
++
++        Returns
++        -------
++        result : :class:`~skrf.transient.TransientResult`
++            Port waveforms.
++
++        See Also
++        --------
++            impulse_response
++            step_response
++        """
++        from .transient import network_transient
++        return network_transient(self, sources, z_source=z_source, z_load=z_load,
++                                 loads=loads, window=window)
++
+     # Network Active s/z/y/vswr parameters
+     def s_active(self, a: np.ndarray) -> np.ndarray:
+         r"""
+diff --git a/skrf/transient.py b/skrf/transient.py
+new file mode 100644
+index 0000000..984e5b9
+--- /dev/null
++++ b/skrf/transient.py
+@@ -0,0 +1,598 @@
++"""
++.. module:: skrf.transient
++========================================
++transient (:mod:`skrf.transient`)
++========================================
++
++Time-domain (transient) simulation of linear multiport networks.
++
++A :class:`~skrf.network.Network` or a :class:`~skrf.circuit.Circuit` describes a
++linear system in the frequency domain. This module drives such a system with
++arbitrary real voltage waveforms and returns the resulting port waveforms.
++
++Sources
++-------
++
++.. autosummary::
++   :toctree: generated/
++
++   Source
++   StepSource
++   PulseSource
++   BitSource
++   ArraySource
++
++Results
++-------
++
++.. autosummary::
++   :toctree: generated/
++
++   TransientResult
++
++"""
++from __future__ import annotations
++
++from abc import ABC, abstractmethod
++from collections.abc import Mapping
++
++import numpy as np
++
++__all__ = [
++    "ArraySource",
++    "BitSource",
++    "Eye",
++    "PulseSource",
++    "Source",
++    "StepSource",
++    "TransientResult",
++]
++
++
++def _ramp(t: np.ndarray, delay: float, rise_time: float) -> np.ndarray:
++    """Unit step at `delay` with a linear ramp of duration `rise_time`."""
++    if rise_time < 0:
++        raise ValueError("rise_time must not be negative")
++    if rise_time == 0:
++        return np.where(t >= delay, 1.0, 0.0)
++    return np.clip((t - delay) / rise_time, 0.0, 1.0)
++
++
++class Source(ABC):
++    """Abstract real voltage source waveform.
++
++    A source is sampled on the simulation time grid by :func:`sample`. It
++    represents an ideal voltage source in series with the port impedance.
++    """
++
++    @abstractmethod
++    def sample(self, t: np.ndarray) -> np.ndarray:
++        """Sample the waveform on the time vector `t`, in seconds."""
++
++
++class StepSource(Source):
++    """Step of `amplitude` volts starting at `delay` seconds.
++
++    Parameters
++    ----------
++    amplitude : float
++        Final value in volts.
++    delay : float
++        Time at which the transition starts, in seconds.
++    rise_time : float
++        Duration of the linear 0% to 100% transition, in seconds.
++    """
++
++    def __init__(self, amplitude: float = 1.0, delay: float = 0.0, rise_time: float = 0.0):
++        self.amplitude = float(amplitude)
++        self.delay = float(delay)
++        self.rise_time = float(rise_time)
++
++    def sample(self, t: np.ndarray) -> np.ndarray:
++        return self.amplitude * _ramp(t, self.delay, self.rise_time)
++
++
++class PulseSource(Source):
++    """Rectangular pulse of `width` seconds starting at `delay` seconds.
++
++    Parameters
++    ----------
++    amplitude : float
++        Plateau value in volts.
++    delay : float
++        Time at which the rising transition starts, in seconds.
++    width : float
++        Time between the start of the rising and of the falling transition.
++    rise_time : float
++        Duration of the linear transitions, in seconds.
++    """
++
++    def __init__(self, amplitude: float = 1.0, delay: float = 0.0, width: float = 0.0,
++                 rise_time: float = 0.0):
++        if width < 0:
++            raise ValueError("width must not be negative")
++        self.amplitude = float(amplitude)
++        self.delay = float(delay)
++        self.width = float(width)
++        self.rise_time = float(rise_time)
++
++    def sample(self, t: np.ndarray) -> np.ndarray:
++        up = _ramp(t, self.delay, self.rise_time)
++        down = _ramp(t, self.delay + self.width, self.rise_time)
++        return self.amplitude * (up - down)
++
++
++class BitSource(Source):
++    """Non-return-to-zero bit sequence.
++
++    Bit `k` occupies the interval starting at ``delay + k / bit_rate``. Each
++    change of level is a linear transition of `rise_time` seconds starting at
++    the bit boundary. The level is held after the last bit.
++
++    Parameters
++    ----------
++    bits : sequence of int
++        Sequence of 0 and 1.
++    bit_rate : float
++        Bits per second.
++    amplitude : float
++        Value of a one bit in volts, a zero bit is 0 V.
++    delay : float
++        Time at which the first bit starts, in seconds.
++    rise_time : float
++        Duration of the linear transitions, in seconds.
++    """
++
++    def __init__(self, bits, bit_rate: float, amplitude: float = 1.0, delay: float = 0.0,
++                 rise_time: float = 0.0):
++        bits = [int(b) for b in bits]
++        if len(bits) == 0:
++            raise ValueError("bits must not be empty")
++        if any(b not in (0, 1) for b in bits):
++            raise ValueError("bits must only contain 0 and 1")
++        if not np.isfinite(bit_rate) or bit_rate <= 0:
++            raise ValueError("bit_rate must be a finite positive number")
++        self.bits = bits
++        self.bit_rate = float(bit_rate)
++        self.amplitude = float(amplitude)
++        self.delay = float(delay)
++        self.rise_time = float(rise_time)
++
++    def sample(self, t: np.ndarray) -> np.ndarray:
++        period = 1.0 / self.bit_rate
++        v = self.bits[0] * _ramp(t, self.delay, self.rise_time)
++        previous = self.bits[0]
++        for k, bit in enumerate(self.bits[1:], start=1):
++            if bit != previous:
++                v = v + (bit - previous) * _ramp(t, self.delay + k * period, self.rise_time)
++            previous = bit
++        return self.amplitude * v
++
++
++class ArraySource(Source):
++    """Source waveform given sample by sample on the simulation time grid.
++
++    Parameters
++    ----------
++    v : array
++        Real voltage samples. The length must match the simulation time grid.
++    """
++
++    def __init__(self, v):
++        self.v = np.asarray(v, dtype=float)
++        if self.v.ndim != 1:
++            raise ValueError("v must be one dimensional")
++
++    def sample(self, t: np.ndarray) -> np.ndarray:
++        if self.v.size != t.size:
++            raise ValueError(
++                f"ArraySource has {self.v.size} samples but the simulation grid has {t.size}"
++            )
++        return self.v
++
++
++class Eye:
++    """Statistics of a waveform folded on the unit interval.
++
++    Attributes
++    ----------
++    traces : :class:`np.ndarray`
++        One row per complete unit interval, shape (nui, samples_per_ui).
++    offsets : :class:`np.ndarray`
++        Time of every column inside the unit interval, in seconds.
++    threshold : float
++        Level that separates the upper traces from the lower ones.
++    """
++
++    def __init__(self, traces, offsets, threshold):
++        self.traces = traces
++        self.offsets = offsets
++        self.threshold = float(threshold)
++
++    @property
++    def nui(self) -> int:
++        """Number of complete unit intervals in the eye."""
++        return self.traces.shape[0]
++
++    def _split(self):
++        centre = self.traces.shape[1] // 2
++        upper = self.traces[self.traces[:, centre] > self.threshold]
++        lower = self.traces[self.traces[:, centre] <= self.threshold]
++        if upper.size == 0 or lower.size == 0:
++            raise ValueError("the eye needs both a high and a low unit interval")
++        return upper, lower
++
++    @property
++    def height(self) -> float:
++        """Vertical opening at the centre of the unit interval, in volts."""
++        upper, lower = self._split()
++        centre = self.traces.shape[1] // 2
++        return float(upper[:, centre].min() - lower[:, centre].max())
++
++    @property
++    def open_columns(self) -> np.ndarray:
++        """Columns of the unit interval where the eye is open."""
++        upper, lower = self._split()
++        return np.flatnonzero(upper.min(axis=0) > lower.max(axis=0))
++
++    @property
++    def width(self) -> float:
++        """Time inside the unit interval over which the eye stays open, in seconds."""
++        step = self.offsets[1] - self.offsets[0]
++        return float(self.open_columns.size * step)
++
++
++class TransientResult:
++    """Waveforms produced by a transient simulation.
++
++    Attributes
++    ----------
++    t : :class:`np.ndarray`
++        Time vector in seconds, shape (T,).
++    v : :class:`np.ndarray`
++        Port voltages in volts, shape (T, nports).
++    i : :class:`np.ndarray`
++        Currents flowing into the ports in amperes, shape (T, nports).
++    a : :class:`np.ndarray`
++        Incident waves, shape (T, nports).
++    b : :class:`np.ndarray`
++        Reflected waves, shape (T, nports).
++    node_voltages : dict
++        Voltage waveform of every internal node, keyed by node name. Empty for
++        a network simulation.
++    """
++
++    def __init__(self, t, v, i, a, b, z, node_voltages=None):
++        self.t = t
++        self.v = v
++        self.i = i
++        self.a = a
++        self.b = b
++        self.z = z
++        self.node_voltages = {} if node_voltages is None else node_voltages
++
++    def eye(self, port: int, bit_rate: float, delay: float = 0.0) -> Eye:
++        """Fold the waveform of `port` on the unit interval of `bit_rate`.
++
++        Folding starts at the first sample at or after `delay` and keeps only
++        complete unit intervals.
++        """
++        return _eye(self, port, bit_rate, delay)
++
++    def impedance_profile(self, port: int) -> np.ndarray:
++        """Impedance looking into `port`, in ohms, sample by sample.
++
++        The reflection coefficient is taken against the settled value of the
++        incident wave, so the port must be driven by a source that settles.
++        Samples where the reflection is total are reported as infinite.
++        """
++        self._column(port)
++        return _impedance_profile(self, port)
++
++    @property
++    def nports(self) -> int:
++        """Number of ports."""
++        return self.v.shape[1]
++
++    @property
++    def dt(self) -> float:
++        """Sample spacing of the time vector, in seconds."""
++        return float(self.t[1] - self.t[0])
++
++    def _column(self, port: int) -> np.ndarray:
++        if not 0 <= port < self.nports:
++            raise ValueError(f"port {port} is out of range for {self.nports} ports")
++        return self.v[:, port]
++
++    def settled_value(self, port: int) -> float:
++        """Voltage of the last sample of the record at `port`."""
++        return float(self._column(port)[-1])
++
++    def threshold_time(self, port: int, level: float) -> float:
++        """Time at which the voltage at `port` first reaches `level`.
++
++        The crossing is interpolated linearly between the two samples that
++        straddle it. Returns ``nan`` when the level is never reached.
++        """
++        v = self._column(port)
++        offset = v - level
++        straddles = np.flatnonzero(offset[:-1] * offset[1:] <= 0)
++        if straddles.size == 0:
++            return float("nan")
++        k = int(straddles[0])
++        v0, v1 = v[k], v[k + 1]
++        if v1 == v0:
++            return float(self.t[k])
++        return float(self.t[k] + (level - v0) / (v1 - v0) * (self.t[k + 1] - self.t[k]))
++
++    def propagation_delay(self, port: int, fraction: float = 0.5) -> float:
++        """Time at which `port` first reaches `fraction` of its settled value."""
++        return self.threshold_time(port, fraction * self.settled_value(port))
++
++    def rise_time(self, port: int, low: float = 0.1, high: float = 0.9) -> float:
++        """Time taken at `port` to go from `low` to `high` of the settled value."""
++        if not low < high:
++            raise ValueError("low must be below high")
++        settled = self.settled_value(port)
++        return self.threshold_time(port, high * settled) - self.threshold_time(port, low * settled)
++
++    def overshoot(self, port: int) -> float:
++        """Largest excursion at `port` beyond its settled value, in volts.
++
++        The excursion is measured in the direction the waveform settled in, and
++        is zero when the waveform never goes past its settled value.
++        """
++        v = self._column(port)
++        settled = self.settled_value(port)
++        direction = 1.0 if settled >= 0 else -1.0
++        return float(np.max(v * direction) - settled * direction)
++
++
++def _eye(result, port: int, bit_rate: float, delay: float = 0.0) -> Eye:
++    """Fold the waveform of `port` on the unit interval, see `TransientResult.eye`."""
++    if not np.isfinite(bit_rate) or bit_rate <= 0:
++        raise ValueError("bit_rate must be a finite positive number")
++    v = result._column(port)
++    dt = result.dt
++    per_ui = int(round(1.0 / (bit_rate * dt)))
++    if per_ui < 2:
++        raise ValueError("the time step is too coarse to fold a unit interval")
++    start = int(np.searchsorted(result.t, delay))
++    nui = (v.size - start) // per_ui
++    if nui < 2:
++        raise ValueError("the record is shorter than two unit intervals")
++    traces = v[start: start + nui * per_ui].reshape(nui, per_ui)
++    offsets = np.arange(per_ui) * dt
++    return Eye(traces, offsets, float(np.mean(traces)))
++
++
++def _impedance_profile(result, port: int) -> np.ndarray:
++    """Impedance seen looking into `port`, see `TransientResult.impedance_profile`."""
++    incident = result.a[:, port]
++    reference = incident[-1]
++    if reference == 0:
++        raise ValueError(f"port {port} is not driven by a settled source")
++    rho = result.b[:, port] / reference
++    with np.errstate(divide="ignore", invalid="ignore"):
++        z = result.z[port] * (1.0 + rho) / (1.0 - rho)
++    return np.where(np.isclose(rho, 1.0), np.inf, z)
++
++
++def _as_real_impedances(z, nports: int, name: str) -> np.ndarray:
++    """Broadcast `z` to a real positive impedance vector of length `nports`."""
++    z = np.broadcast_to(np.atleast_1d(np.asarray(z)), (nports,)).astype(complex)
++    if np.any(np.abs(z.imag) > 0):
++        raise ValueError(f"{name} must be real")
++    z = z.real.astype(float)
++    if np.any(~np.isfinite(z)) or np.any(z <= 0):
++        raise ValueError(f"{name} must be a finite positive number")
++    return z
++
++
++def _port_impedances(sources: dict, z_source, z_load, ntwk_z0, nports: int):
++    """Reference impedance seen by every port, driven ports first."""
++    if z_source is None:
++        z_source = ntwk_z0
++    if z_load is None:
++        z_load = ntwk_z0
++    zs = _as_real_impedances(z_source, nports, "z_source")
++    zl = _as_real_impedances(z_load, nports, "z_load")
++    return np.array([zs[p] if p in sources else zl[p] for p in range(nports)])
++
++
++def _check_sources(sources, nports: int) -> dict:
++    """Validate the source mapping against the port count."""
++    if not isinstance(sources, Mapping):
++        raise TypeError("sources must be a mapping from a port index to a Source")
++    if len(sources) == 0:
++        raise ValueError("at least one source is required")
++    checked = {}
++    for port, source in sources.items():
++        port = int(port)
++        if not 0 <= port < nports:
++            raise ValueError(f"port {port} is out of range for {nports} ports")
++        if not isinstance(source, Source):
++            raise TypeError(f"the source at port {port} is not a Source")
++        checked[port] = source
++    return checked
++
++
++def _check_sweep(frequency) -> None:
++    """Reject a frequency vector that is not linearly spaced."""
++    if frequency.sweep_type != "lin":
++        raise NotImplementedError(
++            "a transient simulation needs a linearly spaced frequency vector"
++        )
++
++
++def _uniform_dc_network(ntwk):
++    """Return `ntwk` on a uniform frequency grid anchored at 0 Hz."""
++    _check_sweep(ntwk.frequency)
++    if len(ntwk) < 2:
++        raise ValueError("a transient simulation needs at least two frequency points")
++    if ntwk.frequency.f[0] == 0:
++        return ntwk
++    return ntwk.extrapolate_to_dc()
++
++
++def _impulse_matrix(ntwk, window):
++    """Causal real impulse response matrix of `ntwk` and its time vector."""
++    if window is not None:
++        ntwk = ntwk.windowed(window=window, normalize=False, center_to_dc=True)
++    npoints = len(ntwk)
++    n = 2 * (npoints - 1)
++    h = np.fft.irfft(ntwk.s, n=n, axis=0)
++    dt = 1.0 / (2.0 * ntwk.frequency.f[-1])
++    return np.arange(n) * dt, h
++
++
++def _convolve(h: np.ndarray, a: np.ndarray) -> np.ndarray:
++    """Linear convolution of the impulse matrix with the incident waves."""
++    nsamples, nports = a.shape
++    b = np.zeros_like(a)
++    for p in range(nports):
++        for q in range(nports):
++            if not np.any(a[:, q]):
++                continue
++            b[:, p] += np.convolve(h[:, p, q], a[:, q])[:nsamples]
++    return b
++
++
++def _waves_from_sources(sources: dict, t: np.ndarray, z: np.ndarray) -> np.ndarray:
++    """Incident wave of every port for the given sources."""
++    a = np.zeros((t.size, z.size))
++    for port, source in sources.items():
++        v = np.asarray(source.sample(t), dtype=float)
++        if v.shape != t.shape:
++            raise ValueError(f"the source at port {port} did not return {t.size} samples")
++        a[:, port] = v / (2.0 * np.sqrt(z[port]))
++    return a
++
++
++def _result_from_waves(t, a, b, z, node_voltages=None) -> TransientResult:
++    """Assemble port voltages and currents from the wave records."""
++    root = np.sqrt(z)
++    v = (a + b) * root
++    i = (a - b) / root
++    return TransientResult(t, v, i, a, b, z, node_voltages)
++
++
++def _reflection_of_loads(loads: dict, prepared, z: np.ndarray) -> np.ndarray:
++    """Diagonal reflection matrix of the terminating networks."""
++    from .network import Network
++
++    nports = prepared.nports
++    gamma = np.zeros((len(prepared), nports, nports), dtype=complex)
++    for port, load in loads.items():
++        port = int(port)
++        if not 0 <= port < nports:
++            raise ValueError(f"port {port} is out of range for {nports} ports")
++        if not isinstance(load, Network):
++            raise ValueError(f"the load at port {port} is not a network")
++        if load.nports != 1:
++            raise ValueError(f"the load at port {port} must be a one port network")
++        load = _uniform_dc_network(load)
++        if len(load) != len(prepared) or not np.allclose(load.f, prepared.f):
++            raise ValueError(
++                f"the load at port {port} does not share the frequency vector of the network"
++            )
++        load = load.copy()
++        load.renormalize(z[port])
++        gamma[:, port, port] = load.s[:, 0, 0]
++    return gamma
++
++
++def _close_the_loop(s: np.ndarray, gamma: np.ndarray) -> np.ndarray:
++    """Scattering matrix seen by the sources once the terminations re-reflect."""
++    identity = np.eye(s.shape[-1])
++    return np.linalg.solve(identity - s @ gamma, s)
++
++
++def network_transient(ntwk, sources, z_source=None, z_load=None, loads=None,
++                      window=None) -> TransientResult:
++    """Transient response of a network, see :func:`skrf.network.Network.transient`."""
++    _check_sweep(ntwk.frequency)
++    checked = _check_sources(sources, ntwk.nports)
++    z0 = ntwk.z0[0]
++    _as_real_impedances(z0, ntwk.nports, "the port reference impedance")
++    if np.any(np.abs(ntwk.z0 - z0) > 0):
++        raise ValueError("the port impedances must not depend on frequency")
++    z = _port_impedances(checked, z_source, z_load, z0, ntwk.nports)
++    prepared = _uniform_dc_network(ntwk)
++    if np.any(np.abs(z - prepared.z0[0]) > 0):
++        prepared = prepared.copy()
++        prepared.renormalize(z)
++    if loads is not None and not isinstance(loads, Mapping):
++        raise TypeError("loads must be a mapping from a port index to a Network")
++    if loads:
++        overlap = set(loads) & set(checked)
++        if overlap:
++            raise ValueError(f"port {sorted(overlap)[0]} carries both a source and a load")
++        gamma = _reflection_of_loads(loads, prepared, z)
++        prepared = prepared.copy()
++        prepared.s = _close_the_loop(prepared.s, gamma)
++    t, h = _impulse_matrix(prepared, window)
++    a = _waves_from_sources(checked, t, z)
++    return _result_from_waves(t, a, _convolve(h, a), z)
++
++
++def circuit_transient(cir, sources, window=None) -> TransientResult:
++    """Transient response of a circuit, see :func:`skrf.circuit.Circuit.transient`."""
++    frequency = cir.frequency
++    _check_sweep(frequency)
++    port_indexes = cir.port_indexes
++    checked = _check_sources(sources, len(port_indexes))
++    if frequency.f[0] != 0:
++        raise ValueError("a circuit must start at 0 Hz to be simulated in the time domain")
++    if len(frequency) < 2:
++        raise ValueError("a transient simulation needs at least two frequency points")
++
++    z_internal = cir.z0
++    if np.any(np.abs(z_internal - z_internal[0]) > 0):
++        raise ValueError("the port impedances must not depend on frequency")
++    if np.any(np.abs(z_internal.imag) > 0):
++        raise ValueError("the port impedances must be real")
++    z = np.array([z_internal[0, idx].real for idx in port_indexes])
++
++    from .network import Network
++
++    global_ntwk = Network(frequency=frequency, s=cir.s)
++    t, h = _impulse_matrix(global_ntwk, window)
++    a_port = _waves_from_sources(checked, t, z)
++
++    b_internal = np.zeros((t.size, cir.dim))
++    for column, port in enumerate(port_indexes):
++        wave = a_port[:, column]
++        if not np.any(wave):
++            continue
++        for row in range(cir.dim):
++            b_internal[:, row] += np.convolve(h[:, row, port], wave)[:t.size]
++
++    b_port = b_internal[:, port_indexes]
++    node_voltages = _circuit_node_voltages(cir, b_internal)
++    return _result_from_waves(t, a_port, b_port, z, node_voltages)
++
++
++def _circuit_node_voltages(cir, b_internal: np.ndarray) -> dict:
++    """Voltage waveform of every intersection node of a circuit."""
++    z0s = cir.z0[0].real
++    voltages = {}
++    idx = 0
++    for cnx in cir.connections:
++        cnx_len = len(cnx)
++        z0_segment = z0s[idx: idx + cnx_len]
++        total = (1 / z0_segment).sum()
++        node = np.zeros(b_internal.shape[0])
++        for j in range(cnx_len):
++            in_z0 = z0_segment[j]
++            out_z0 = np.inf if cnx_len == 1 else 1 / (total - 1 / in_z0)
++            tau = 2.0 if cnx_len == 1 else (2 * out_z0) / (out_z0 + in_z0)
++            node += (b_internal[:, idx + j] * np.sqrt(in_z0)) * tau
++        voltages[_node_name(cnx)] = node
++        idx += cnx_len
++    return voltages
++
++
++def _node_name(cnx) -> str:
++    """Name of an intersection node, taken from its connected networks."""
++    return "_".join(f"{ntwk.name}:{port}" for ntwk, port in cnx)

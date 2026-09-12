@@ -1,0 +1,807 @@
+diff --git a/internal/compiler/analyzer/network.go b/internal/compiler/analyzer/network.go
+index a3e34e69..75e038cb 100644
+--- a/internal/compiler/analyzer/network.go
++++ b/internal/compiler/analyzer/network.go
+@@ -32,6 +32,8 @@ func (a Analyzer) analyzeNetwork(
+ ) ([]src.Connection, *compiler.Error) {
+ 	nodesUsage := make(map[string]netNodeUsage, len(nodes))
+ 
++	net = flattenArrayBypassChains(net)
++
+ 	// Read `Union:tag` wiring to bind each `Union<T>` node to a concrete tag.
+ 	// Example: `Union<MyU>`; `MyU::Int -> union:tag`; `42 -> union:data`
+ 	// We bind `tag=Int` so `union:data` must be compatible with int later.
+@@ -68,6 +70,10 @@ func (a Analyzer) analyzeNetwork(
+ 		return nil, err
+ 	}
+ 
++	if err := analyzeArrayBypassAnchoring(net); err != nil {
++		return nil, err
++	}
++
+ 	return analyzedConnections, nil
+ }
+ 
+@@ -123,20 +129,16 @@ func (a Analyzer) analyzeConnection(
+ 	net []src.Connection,
+ 	unionActiveTags map[string]unionActiveTagInfo,
+ ) (src.Connection, *compiler.Error) {
+-	if sender, receiver, ok := arrayBypassPorts(conn); ok {
+-		if err := a.analyzeArrayBypassConnection(
+-			*sender,
+-			*receiver,
++	if link, ok := arrayBypassPorts(conn); ok {
++		return a.analyzeArrayBypassConnection(
++			link,
+ 			conn.Meta,
+ 			scope,
+ 			iface,
+ 			nodes,
+ 			nodesIfaces,
+ 			nodesUsage,
+-		); err != nil {
+-			return src.Connection{}, err
+-		}
+-		return conn, nil
++		)
+ 	}
+ 
+ 	// At this point any remaining [*] means only one side used array-bypass or it appears in a non-1:1 connection.
+@@ -246,27 +248,121 @@ func (a Analyzer) analyzeNormalConnection(
+ 	}, nil
+ }
+ 
++// arrayBypassLink holds every side of an array-bypass connection.
++type arrayBypassLink struct {
++	sender    src.PortAddr
++	receivers []src.PortAddr
++}
++
+ //nolint:gocritic // TODO(strict-lint phase 1): temporary suppression; remove after strict cleanup.
+-func arrayBypassPorts(conn src.Connection) (*src.PortAddr, *src.PortAddr, bool) {
+-	if len(conn.Senders) != 1 || len(conn.Receivers) != 1 {
+-		return nil, nil, false
++func arrayBypassPorts(conn src.Connection) (arrayBypassLink, bool) {
++	if len(conn.Senders) != 1 {
++		return arrayBypassLink{}, false
+ 	}
+ 
+ 	sender := conn.Senders[0]
+-	if sender.PortAddr == nil || sender.Const != nil || len(sender.StructSelector) != 0 {
+-		return nil, nil, false
++	if sender.Const != nil || len(sender.StructSelector) != 0 {
++		return arrayBypassLink{}, false
++	}
++	if !src.IsArrayBypassPortAddr(sender.PortAddr) {
++		return arrayBypassLink{}, false
+ 	}
+ 
+-	receiver := conn.Receivers[0]
+-	if receiver.PortAddr == nil || receiver.ChainedConnection != nil {
+-		return nil, nil, false
++	link := arrayBypassLink{
++		sender:    *sender.PortAddr,
++		receivers: make([]src.PortAddr, 0, len(conn.Receivers)),
++	}
++
++	//nolint:gocritic
++	for _, receiver := range conn.Receivers {
++		if receiver.ChainedConnection != nil {
++			return arrayBypassLink{}, false
++		}
++		if !src.IsArrayBypassPortAddr(receiver.PortAddr) {
++			return arrayBypassLink{}, false
++		}
++		link.receivers = append(link.receivers, *receiver.PortAddr)
+ 	}
+ 
+-	if !src.IsArrayBypassIdx(sender.PortAddr.Idx) || !src.IsArrayBypassIdx(receiver.PortAddr.Idx) {
+-		return nil, nil, false
++	if len(link.receivers) == 0 {
++		return arrayBypassLink{}, false
+ 	}
+ 
+-	return sender.PortAddr, receiver.PortAddr, true
++	return link, true
++}
++
++// flattenArrayBypassChains rewrites `a[*] -> b[*] -> c[*]` into a pair of
++// connections, so chained bypass reaches the rest of the pipeline in the same
++// shape as a bypass written by hand.
++func flattenArrayBypassChains(net []src.Connection) []src.Connection {
++	result := make([]src.Connection, 0, len(net))
++	//nolint:gocritic
++	for _, conn := range net {
++		result = append(result, expandArrayBypassChain(conn)...)
++	}
++	return result
++}
++
++//nolint:gocritic
++func expandArrayBypassChain(conn src.Connection) []src.Connection {
++	if !isArrayBypassSender(conn.Senders) || len(conn.Receivers) != 1 {
++		return []src.Connection{conn}
++	}
++
++	chained := conn.Receivers[0].ChainedConnection
++	if chained == nil || !isArrayBypassSender(chained.Senders) {
++		return []src.Connection{conn}
++	}
++
++	receivers := make([]src.ConnectionReceiver, 0, len(chained.Senders))
++	//nolint:gocritic
++	for _, sender := range chained.Senders {
++		receivers = append(receivers, src.ConnectionReceiver{
++			PortAddr: sender.PortAddr,
++			Meta:     sender.Meta,
++		})
++	}
++
++	head := src.Connection{
++		Senders:   conn.Senders,
++		Receivers: receivers,
++		Meta:      conn.Meta,
++	}
++
++	return append([]src.Connection{head}, expandArrayBypassChain(*chained)...)
++}
++
++func isArrayBypassSender(senders []src.ConnectionSender) bool {
++	return len(senders) == 1 && src.IsArrayBypassPortAddr(senders[0].PortAddr)
++}
++
++// analyzeArrayBypassAnchoring reports bypass connections that never touch a port
++// of the component itself, because that port is the only source of slot count.
++func analyzeArrayBypassAnchoring(net []src.Connection) *compiler.Error {
++	//nolint:gocritic
++	for _, conn := range net {
++		link, ok := arrayBypassPorts(conn)
++		if !ok {
++			continue
++		}
++
++		anchored := link.sender.Node == "in"
++		for _, addr := range link.receivers {
++			if addr.Node == "out" {
++				anchored = true
++			}
++		}
++		if anchored {
++			continue
++		}
++
++		return &compiler.Error{
++			Message: "Array-bypass slot count is unknown: one side must be a port of the component itself",
++			Meta:    &link.sender.Meta,
++		}
++	}
++
++	return nil
+ }
+ 
+ // patchSwitchSenders patches sender types for Switch:case[i] outports.
+@@ -306,11 +402,10 @@ func (a Analyzer) patchSwitchSenders(
+ 	return analyzedSenders, resolvedSenderTypes, nil
+ }
+ 
++//nolint:funlen // every side of the connection is validated in one place.
+ func (a Analyzer) analyzeArrayBypassConnection(
+ 	//nolint:gocritic // TODO(strict-lint phase 1): temporary suppression; remove after strict cleanup.
+-	senderPort src.PortAddr,
+-	//nolint:gocritic // TODO(strict-lint phase 1): temporary suppression; remove after strict cleanup.
+-	receiverPort src.PortAddr,
++	link arrayBypassLink,
+ 	//nolint:gocritic // TODO(strict-lint phase 1): temporary suppression; remove after strict cleanup.
+ 	connMeta core.Meta,
+ 	//nolint:gocritic // TODO(strict-lint phase 1): temporary suppression; remove after strict cleanup.
+@@ -320,8 +415,10 @@ func (a Analyzer) analyzeArrayBypassConnection(
+ 	nodes map[string]src.Node,
+ 	nodesIfaces map[string]foundInterface,
+ 	nodesUsage map[string]netNodeUsage,
+-) *compiler.Error {
+-	_, senderType, isArray, err := a.getPortSenderType(
++) (src.Connection, *compiler.Error) {
++	senderPort := link.sender
++
++	resolvedSender, senderType, isArray, err := a.getPortSenderType(
+ 		senderPort,
+ 		scope,
+ 		iface,
+@@ -329,65 +426,86 @@ func (a Analyzer) analyzeArrayBypassConnection(
+ 		nodesIfaces,
+ 	)
+ 	if err != nil {
+-		return compiler.Error{
++		return src.Connection{}, compiler.Error{
+ 			Meta: &connMeta,
+ 		}.Wrap(err)
+ 	}
+ 	if !isArray {
+-		return &compiler.Error{
++		return src.Connection{}, &compiler.Error{
+ 			Message: "Non-array outport in array-bypass connection",
+ 			Meta:    &senderPort.Meta,
+ 		}
+ 	}
+ 
+-	_, receiverType, isArray, err := a.getReceiverPortType(
+-		receiverPort,
+-		iface,
+-		nodes,
+-		nodesIfaces,
+-		scope,
+-	)
+-	if err != nil {
+-		return compiler.Error{
+-			Meta: &connMeta,
+-		}.Wrap(err)
+-	}
+-	if !isArray {
+-		return &compiler.Error{
+-			Message: "Non-array outport in array-bypass connection",
+-			Meta:    &senderPort.Meta,
++	resolvedSender.Idx = senderPort.Idx
++
++	if err := netNodesUsage(nodesUsage).trackOutportUsage(resolvedSender); err != nil {
++		return src.Connection{}, &compiler.Error{
++			Message: err.Error(),
++			Meta:    &connMeta,
+ 		}
+ 	}
+ 
+-	if err := a.resolver.IsSubtypeOf(
+-		senderType,
+-		receiverType,
+-		scope,
+-	); err != nil {
+-		return &compiler.Error{
+-			Message: fmt.Sprintf(
+-				"Incompatible types: %v -> %v: %v",
+-				senderPort, receiverPort, err.Error(),
+-			),
+-			Meta: &connMeta,
++	analyzedReceivers := make([]src.ConnectionReceiver, 0, len(link.receivers))
++
++	//nolint:gocritic
++	for _, receiverPort := range link.receivers {
++		resolvedPort, receiverType, isArray, err := a.getReceiverPortType(
++			receiverPort,
++			iface,
++			nodes,
++			nodesIfaces,
++			scope,
++		)
++		if err != nil {
++			return src.Connection{}, compiler.Error{
++				Meta: &connMeta,
++			}.Wrap(err)
++		}
++		if !isArray {
++			return src.Connection{}, &compiler.Error{
++				Message: "Non-array outport in array-bypass connection",
++				Meta:    &senderPort.Meta,
++			}
+ 		}
+-	}
+ 
+-	if err := netNodesUsage(nodesUsage).trackOutportUsage(senderPort); err != nil {
+-		return &compiler.Error{
+-			Message: err.Error(),
+-			Meta:    &connMeta,
++		resolvedPort.Idx = receiverPort.Idx
++
++		if err := a.resolver.IsSubtypeOf(
++			senderType,
++			receiverType,
++			scope,
++		); err != nil {
++			return src.Connection{}, &compiler.Error{
++				Message: fmt.Sprintf(
++					"Incompatible types: %v -> %v: %v",
++					senderPort, receiverPort, err.Error(),
++				),
++				Meta: &connMeta,
++			}
+ 		}
+-	}
+ 
+-	if err := netNodesUsage(nodesUsage).trackInportUsage(receiverPort); err != nil {
+-		return &compiler.Error{
+-			Message: err.Error(),
+-			Meta:    &connMeta,
++		analyzedReceivers = append(analyzedReceivers, src.ConnectionReceiver{
++			PortAddr: &resolvedPort,
++			Meta:     receiverPort.Meta,
++		})
++
++		if err := netNodesUsage(nodesUsage).trackInportUsage(resolvedPort); err != nil {
++			return src.Connection{}, &compiler.Error{
++				Message: err.Error(),
++				Meta:    &connMeta,
++			}
+ 		}
+ 	}
+ 
+-	return nil
++	return src.Connection{
++		Senders: []src.ConnectionSender{{
++			PortAddr: &resolvedSender,
++			Meta:     senderPort.Meta,
++		}},
++		Receivers: analyzedReceivers,
++		Meta:      connMeta,
++	}, nil
+ }
+ 
+ //nolint:gocyclo // Network port usage covers multiple connection kinds.
+diff --git a/internal/compiler/desugarer/network.go b/internal/compiler/desugarer/network.go
+index bf429364..95b609cd 100644
+--- a/internal/compiler/desugarer/network.go
++++ b/internal/compiler/desugarer/network.go
+@@ -185,28 +185,36 @@ type desugarConnectionResult struct {
+ 
+ //nolint:gocritic // TODO(strict-lint phase 1): temporary suppression; remove after strict cleanup.
+ func isArrayBypassConn(conn src.Connection) bool {
+-	_, _, ok := arrayBypassPorts(conn)
++	_, ok := arrayBypassPorts(conn)
+ 	return ok
+ }
+ 
++// arrayBypassPorts returns every port address of an array-bypass connection.
++// Such connections keep their fan-in and fan-out shape until IR generation,
++// where slot counts are known.
++//
+ //nolint:gocritic // TODO(strict-lint phase 1): temporary suppression; remove after strict cleanup.
+-func arrayBypassPorts(conn src.Connection) (*src.PortAddr, *src.PortAddr, bool) {
+-	if len(conn.Senders) != 1 || len(conn.Receivers) != 1 {
+-		return nil, nil, false
++func arrayBypassPorts(conn src.Connection) ([]src.PortAddr, bool) {
++	if len(conn.Senders) != 1 || !src.IsArrayBypassPortAddr(conn.Senders[0].PortAddr) {
++		return nil, false
+ 	}
+ 
+-	sender := conn.Senders[0]
+-	receiver := conn.Receivers[0]
+-
+-	if sender.PortAddr == nil || receiver.PortAddr == nil {
+-		return nil, nil, false
++	if len(conn.Receivers) == 0 {
++		return nil, false
+ 	}
+ 
+-	if !src.IsArrayBypassIdx(sender.PortAddr.Idx) || !src.IsArrayBypassIdx(receiver.PortAddr.Idx) {
+-		return nil, nil, false
++	ports := make([]src.PortAddr, 0, len(conn.Receivers)+1)
++	ports = append(ports, *conn.Senders[0].PortAddr)
++
++	//nolint:gocritic
++	for _, receiver := range conn.Receivers {
++		if !src.IsArrayBypassPortAddr(receiver.PortAddr) {
++			return nil, false
++		}
++		ports = append(ports, *receiver.PortAddr)
+ 	}
+ 
+-	return sender.PortAddr, receiver.PortAddr, true
++	return ports, true
+ }
+ 
+ func (d *Desugarer) desugarConnection(
+@@ -220,15 +228,11 @@ func (d *Desugarer) desugarConnection(
+ 	nodesToInsert map[string]src.Node,
+ 	constsToInsert map[string]src.Const,
+ ) (desugarConnectionResult, error) {
+-	if sender, receiver, ok := arrayBypassPorts(conn); ok { // nothing to desugar, just mark ports as used
+-		nodePortsUsed.set(
+-			sender.Node,
+-			sender.Port,
+-		)
+-		nodePortsUsed.set(
+-			receiver.Node,
+-			receiver.Port,
+-		)
++	if ports, ok := arrayBypassPorts(conn); ok { // nothing to desugar, just mark ports as used
++		//nolint:gocritic
++		for _, port := range ports {
++			nodePortsUsed.set(port.Node, port.Port)
++		}
+ 		return desugarConnectionResult{replace: &conn}, nil
+ 	}
+ 
+diff --git a/internal/compiler/irgen/network.go b/internal/compiler/irgen/network.go
+index cd44a2f4..012a7db4 100644
+--- a/internal/compiler/irgen/network.go
++++ b/internal/compiler/irgen/network.go
+@@ -18,17 +18,12 @@ func (g Generator) processNetwork(
+ 	result *ir.Program,
+ ) map[string]portsUsage {
+ 	nodesPortsUsage := map[string]portsUsage{}
++	bypassLinks := make([]arrayBypassLink, 0, len(conns))
+ 
+ 	//nolint:gocritic // TODO(strict-lint phase 1): temporary suppression; remove after strict cleanup.
+ 	for _, conn := range conns {
+-		if sender, receiver, ok := arrayBypassPorts(conn); ok {
+-			g.processArrayBypassConnection(
+-				*sender,
+-				*receiver,
+-				nodesPortsUsage,
+-				nodeCtx,
+-				result,
+-			)
++		if link, ok := arrayBypassPorts(conn); ok {
++			bypassLinks = append(bypassLinks, link)
+ 			continue
+ 		}
+ 
+@@ -45,65 +40,207 @@ func (g Generator) processNetwork(
+ 		)
+ 	}
+ 
++	g.processArrayBypassLinks(bypassLinks, nodesPortsUsage, nodeCtx, result)
++
+ 	return nodesPortsUsage
+ }
+ 
+-func (Generator) processArrayBypassConnection(
+-	//nolint:gocritic // TODO(strict-lint phase 1): temporary suppression; remove after strict cleanup.
+-	senderPort src.PortAddr,
+-	//nolint:gocritic // TODO(strict-lint phase 1): temporary suppression; remove after strict cleanup.
+-	receiverPort src.PortAddr,
++// arrayBypassLink is a single array-bypass connection with all of its sides.
++type arrayBypassLink struct {
++	sender    src.PortAddr
++	receivers []src.PortAddr
++}
++
++// processArrayBypassLinks expands every array-bypass connection into per-slot
++// connections. Used slots of an array port are always dense, so expanding the
++// count from zero reproduces the slots the parent used.
++func (g Generator) processArrayBypassLinks(
++	links []arrayBypassLink,
+ 	nodesPortsUsage map[string]portsUsage,
+ 	//nolint:gocritic // TODO(strict-lint phase 1): temporary suppression; remove after strict cleanup.
+ 	nodeCtx nodeContext,
+ 	result *ir.Program,
+ ) {
+-	// here's how we handle array-bypass connections:
+-	// sender is always component's inport
+-	// based on that, we can set receiver's inport slots
+-	// equal to slots of our own inport
++	slotCounts := resolveArrayBypassSlotCounts(links, nodeCtx)
+ 
+-	arrBypassSender := senderPort
+-	arrBypassReceiver := receiverPort
++	//nolint:gocritic
++	for linkIdx, link := range links {
++		touchNodePortsUsage(nodesPortsUsage, link.sender.Node)
++		for _, addr := range link.receivers {
++			touchNodePortsUsage(nodesPortsUsage, addr.Node)
++		}
+ 
+-	if _, ok := nodesPortsUsage[arrBypassReceiver.Node]; !ok {
+-		nodesPortsUsage[arrBypassReceiver.Node] = portsUsage{
+-			in:  map[relPortAddr]struct{}{},
+-			out: map[relPortAddr]struct{}{},
++		for slot := 0; slot < slotCounts[linkIdx]; slot++ {
++			g.processArrayBypassSlot(
++				link,
++				linkIdx,
++				uint8(slot), //nolint:gosec // slot count is bound by array port size
++				nodesPortsUsage,
++				nodeCtx,
++				result,
++			)
+ 		}
+ 	}
++}
+ 
+-	var slotIdx uint8 = 0
+-	for usageAddr := range nodeCtx.portsUsage.in {
+-		if usageAddr.Port != arrBypassSender.Port {
+-			continue
+-		}
++// processArrayBypassSlot wires one slot of a bypass link. Multiple senders are
++// merged through a fan-in call and multiple receivers are served by a fan-out
++// call, both created per slot.
++func (g Generator) processArrayBypassSlot(
++	//nolint:gocritic
++	link arrayBypassLink,
++	linkIdx int,
++	slot uint8,
++	nodesPortsUsage map[string]portsUsage,
++	//nolint:gocritic
++	nodeCtx nodeContext,
++	result *ir.Program,
++) {
++	senderAddr := g.arrayBypassSenderAddr(link.sender, slot, nodeCtx, nodesPortsUsage)
++
++	if len(link.receivers) == 1 {
++		result.Connections[senderAddr] = g.arrayBypassReceiverAddr(
++			link.receivers[0],
++			slot,
++			nodeCtx,
++			nodesPortsUsage,
++		)
++		return
++	}
+ 
+-		slotIdxCopy := slotIdx
++	path := arrayBypassHelperPath(nodeCtx.path, "fan_out", linkIdx, slot)
+ 
+-		addr := relPortAddr{Port: arrBypassReceiver.Port, Idx: &slotIdxCopy}
+-		nodesPortsUsage[arrBypassReceiver.Node].in[addr] = struct{}{}
++	helperIn := ir.PortAddr{Path: path + "/in", Port: "data"}
++	result.Connections[senderAddr] = helperIn
+ 
+-		irSenderSlot := ir.PortAddr{
+-			Path:    joinNodePath(nodeCtx.path, arrBypassSender.Node),
+-			Port:    arrBypassSender.Port,
+-			Idx:     slotIdxCopy,
++	out := make([]ir.PortAddr, 0, len(link.receivers))
++	//nolint:gocritic
++	for i, receiver := range link.receivers {
++		helperSlot := ir.PortAddr{
++			Path:    path + "/out",
++			Port:    "data",
++			Idx:     uint8(i), //nolint:gosec // receiver count is bound by array port size
+ 			IsArray: true,
+ 		}
++		result.Connections[helperSlot] = g.arrayBypassReceiverAddr(
++			receiver,
++			slot,
++			nodeCtx,
++			nodesPortsUsage,
++		)
++		out = append(out, helperSlot)
++	}
+ 
+-		irReceiverSlot := ir.PortAddr{
+-			Path:    joinNodePath(nodeCtx.path, arrBypassReceiver.Node) + "/in",
+-			Port:    arrBypassReceiver.Port,
+-			Idx:     slotIdxCopy,
+-			IsArray: true,
++	result.Funcs = append(result.Funcs, ir.FuncCall{
++		Ref: "fan_out",
++		IO:  ir.FuncIO{In: []ir.PortAddr{helperIn}, Out: out},
++	})
++}
++
++//nolint:gocritic
++func (Generator) arrayBypassSenderAddr(
++	addr src.PortAddr,
++	slot uint8,
++	//nolint:gocritic
++	nodeCtx nodeContext,
++	nodesPortsUsage map[string]portsUsage,
++) ir.PortAddr {
++	irAddr := ir.PortAddr{
++		Path:    joinNodePath(nodeCtx.path, addr.Node),
++		Port:    addr.Port,
++		Idx:     slot,
++		IsArray: true,
++	}
++
++	if addr.Node == "in" {
++		return irAddr
++	}
++
++	irAddr.Path += "/out"
++	slotCopy := slot
++	nodesPortsUsage[addr.Node].out[relPortAddr{Port: addr.Port, Idx: &slotCopy}] = struct{}{}
++
++	return irAddr
++}
++
++//nolint:gocritic
++func (Generator) arrayBypassReceiverAddr(
++	addr src.PortAddr,
++	slot uint8,
++	//nolint:gocritic
++	nodeCtx nodeContext,
++	nodesPortsUsage map[string]portsUsage,
++) ir.PortAddr {
++	irAddr := ir.PortAddr{
++		Path:    joinNodePath(nodeCtx.path, addr.Node),
++		Port:    addr.Port,
++		Idx:     slot,
++		IsArray: true,
++	}
++
++	if addr.Node == "out" {
++		return irAddr
++	}
++
++	irAddr.Path += "/in"
++	slotCopy := slot
++	nodesPortsUsage[addr.Node].in[relPortAddr{Port: addr.Port, Idx: &slotCopy}] = struct{}{}
++
++	return irAddr
++}
++
++// resolveArrayBypassSlotCounts returns slot count per link. Count comes from the
++// component's own array port, which is the only side whose slots are known from
++// the parent's usage.
++func resolveArrayBypassSlotCounts(
++	links []arrayBypassLink,
++	//nolint:gocritic
++	nodeCtx nodeContext,
++) []int {
++	counts := make([]int, len(links))
++
++	//nolint:gocritic
++	for i, link := range links {
++		if link.sender.Node == "in" {
++			counts[i] = countPortSlots(nodeCtx.portsUsage.in, link.sender.Port)
++		}
++		if counts[i] > 0 {
++			continue
+ 		}
++		for _, receiver := range link.receivers {
++			if receiver.Node == "out" {
++				counts[i] = countPortSlots(nodeCtx.portsUsage.out, receiver.Port)
++			}
++		}
++	}
++
++	return counts
++}
+ 
+-		result.Connections[irSenderSlot] = irReceiverSlot
++func countPortSlots(usage map[relPortAddr]struct{}, port string) int {
++	count := 0
++	for addr := range usage {
++		if addr.Port == port {
++			count++
++		}
++	}
++	return count
++}
+ 
+-		slotIdx++
++func touchNodePortsUsage(nodesPortsUsage map[string]portsUsage, node string) {
++	if _, ok := nodesPortsUsage[node]; ok {
++		return
++	}
++	nodesPortsUsage[node] = portsUsage{
++		in:  map[relPortAddr]struct{}{},
++		out: map[relPortAddr]struct{}{},
+ 	}
+ }
+ 
++func arrayBypassHelperPath(nodePath []string, kind string, linkIdx int, slot uint8) string {
++	return joinNodePath(nodePath, fmt.Sprintf("__bypass_%s__%d_%d", kind, linkIdx, slot))
++}
++
+ func (g Generator) processNormalConnection(
+ 	//nolint:gocritic // TODO(strict-lint phase 1): temporary suppression; remove after strict cleanup.
+ 	nodeCtx nodeContext,
+@@ -129,22 +266,29 @@ func (g Generator) processNormalConnection(
+ }
+ 
+ //nolint:gocritic // TODO(strict-lint phase 1): temporary suppression; remove after strict cleanup.
+-func arrayBypassPorts(conn src.Connection) (*src.PortAddr, *src.PortAddr, bool) {
+-	if len(conn.Senders) != 1 || len(conn.Receivers) != 1 {
+-		return nil, nil, false
++func arrayBypassPorts(conn src.Connection) (arrayBypassLink, bool) {
++	if len(conn.Senders) != 1 || !src.IsArrayBypassPortAddr(conn.Senders[0].PortAddr) {
++		return arrayBypassLink{}, false
++	}
++
++	link := arrayBypassLink{
++		sender:    *conn.Senders[0].PortAddr,
++		receivers: make([]src.PortAddr, 0, len(conn.Receivers)),
+ 	}
+ 
+-	sender := conn.Senders[0]
+-	receiver := conn.Receivers[0]
+-	if sender.PortAddr == nil || receiver.PortAddr == nil {
+-		return nil, nil, false
++	//nolint:gocritic
++	for _, receiver := range conn.Receivers {
++		if !src.IsArrayBypassPortAddr(receiver.PortAddr) {
++			return arrayBypassLink{}, false
++		}
++		link.receivers = append(link.receivers, *receiver.PortAddr)
+ 	}
+ 
+-	if !src.IsArrayBypassIdx(sender.PortAddr.Idx) || !src.IsArrayBypassIdx(receiver.PortAddr.Idx) {
+-		return nil, nil, false
++	if len(link.receivers) == 0 {
++		return arrayBypassLink{}, false
+ 	}
+ 
+-	return sender.PortAddr, receiver.PortAddr, true
++	return link, true
+ }
+ 
+ func (g Generator) processSender(
+diff --git a/internal/runtime/funcs/registry.go b/internal/runtime/funcs/registry.go
+index c6f8507b..593afdd5 100644
+--- a/internal/runtime/funcs/registry.go
++++ b/internal/runtime/funcs/registry.go
+@@ -177,6 +177,7 @@ func NewRegistry() map[string]runtime.FuncCreator {
+ 		"image_new":      imageNew{},
+ 
+ 		"wait_group": waitGroup{},
++		"wait_all":   waitAll{},
+ 
+ 		// "state":       state{},
+ 		"accumulator": accumulator{},
+diff --git a/internal/runtime/funcs/wait_all.go b/internal/runtime/funcs/wait_all.go
+new file mode 100644
+index 00000000..22033f15
+--- /dev/null
++++ b/internal/runtime/funcs/wait_all.go
+@@ -0,0 +1,47 @@
++package funcs
++
++import (
++	"context"
++
++	"github.com/nevalang/neva/internal/runtime"
++	"github.com/nevalang/neva/internal/runtime/messages"
++)
++
++type waitAll struct{}
++
++//nolint:varnamelen
++func (w waitAll) Create(io runtime.IO, _ messages.Msg) (func(ctx context.Context), error) {
++	sigIn, err := io.In.Array("sig")
++	if err != nil {
++		//nolint:wrapcheck
++		return nil, err
++	}
++
++	sigOut, err := io.Out.Single("sig")
++	if err != nil {
++		//nolint:wrapcheck
++		return nil, err
++	}
++
++	return w.Handle(sigIn, sigOut), nil
++}
++
++func (waitAll) Handle(
++	sigIn runtime.ArrayInport,
++	sigOut runtime.SingleOutport,
++) func(ctx context.Context) {
++	return func(ctx context.Context) {
++		for {
++			received := sigIn.ReceiveAll(ctx, func(int, runtime.OrderedMsg) bool {
++				return true
++			})
++			if !received {
++				return
++			}
++
++			if !sigOut.Send(ctx, emptyStruct()) {
++				return
++			}
++		}
++	}
++}
+diff --git a/std/sync/sync.neva b/std/sync/sync.neva
+index 73f2384d..2ad02404 100644
+--- a/std/sync/sync.neva
++++ b/std/sync/sync.neva
+@@ -19,6 +19,20 @@
+ #extern(wait_group)
+ pub def WaitGroup(count int, sig any) (sig any)
+ 
++// WaitAll outputs one signal after every used slot of :sig received a message.
++//
++// Slot count is whatever the parent wires, so it is known at compile time and
++// there is no counter to set.
++//
++// Example:
++//  sync.WaitAll
++// ---
++//  task1 -> wait:sig[0]
++//  task2 -> wait:sig[1]
++//  wait -> :stop  // Signals after both tasks are done.
++#extern(wait_all)
++pub def WaitAll([sig] any) (sig any)
++
+ // Turn is Lock's sibling with a slightly different release rule.
+ //
+ // Like Lock, it releases one data message at a time. Unlike Lock, it releases

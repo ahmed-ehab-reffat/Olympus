@@ -1,0 +1,1002 @@
+diff --git a/changelog/3600.feature.rst b/changelog/3600.feature.rst
+new file mode 100644
+index 0000000..f6bb152
+--- /dev/null
++++ b/changelog/3600.feature.rst
+@@ -0,0 +1,13 @@
++Added |CartesianGrid| methods that treat the grid as the multilinear
++field it interpolates: `~plasmapy.plasma.grids.AbstractGrid.gradient`,
++`~plasmapy.plasma.grids.AbstractGrid.divergence`,
++`~plasmapy.plasma.grids.AbstractGrid.curl`,
++`~plasmapy.plasma.grids.AbstractGrid.line_integral`,
++`~plasmapy.plasma.grids.AbstractGrid.circulation`,
++`~plasmapy.plasma.grids.AbstractGrid.surface_flux`,
++`~plasmapy.plasma.grids.AbstractGrid.net_flux`,
++`~plasmapy.plasma.grids.AbstractGrid.box_integral`,
++`~plasmapy.plasma.grids.AbstractGrid.box_mean`,
++`~plasmapy.plasma.grids.AbstractGrid.volume_integral`,
++`~plasmapy.plasma.grids.AbstractGrid.deposit`, and
++`~plasmapy.plasma.grids.AbstractGrid.remap`.
+diff --git a/src/plasmapy/plasma/_grid_calculus.py b/src/plasmapy/plasma/_grid_calculus.py
+new file mode 100644
+index 0000000..de9a7b1
+--- /dev/null
++++ b/src/plasmapy/plasma/_grid_calculus.py
+@@ -0,0 +1,424 @@
++"""
++Kernels for the exact calculus of the multilinear field defined by a
++uniformly spaced Cartesian grid.
++
++Every routine in this module works in SI units and on bare
++`~numpy.ndarray` objects. The public entry points live on
++`~plasmapy.plasma.grids.AbstractGrid`.
++"""
++
++__all__: list[str] = []
++
++from itertools import pairwise
++
++import numpy as np
++
++# Relative tolerance used when deciding whether a direction cosine is small
++# enough that a segment does not cross cell boundaries along that axis.
++_DIRECTION_TOL = 1e-14
++
++
++def _cell_index(ax, x):
++    """
++    Index of the cell along ``ax`` that contains ``x``.
++
++    Cell ``i`` spans ``ax[i]`` to ``ax[i + 1]``. A position that falls
++    exactly on an interior node belongs to the cell above it; the upper
++    edge of the axis belongs to the final cell.
++    """
++    index = np.searchsorted(ax, x, side="right") - 1
++    return np.clip(index, 0, ax.size - 2)
++
++
++def _corner_values(values, i0, i1, i2):
++    """
++    Gather the eight corner values of the cells identified by the index
++    arrays into an array of shape ``(n, 8, nargs)``.
++
++    The corner ordering is the binary counting order of the offsets
++    ``(a, b, c)`` along the three axes.
++    """
++    corners = np.empty((i0.size, 8, values.shape[-1]))
++    for corner, (a, b, c) in enumerate(_OFFSETS):
++        corners[:, corner, :] = values[i0 + a, i1 + b, i2 + c, :]
++    return corners
++
++
++_OFFSETS = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1)]
++
++
++def _corner_weights(u0, u1, u2):
++    """
++    Multilinear weights of the eight cell corners for local coordinates
++    that each run from zero to one across the cell.
++    """
++    weights = np.empty((np.size(u0), 8))
++    for corner, (a, b, c) in enumerate(_OFFSETS):
++        w0 = u0 if a else 1 - u0
++        w1 = u1 if b else 1 - u1
++        w2 = u2 if c else 1 - u2
++        weights[:, corner] = w0 * w1 * w2
++    return weights
++
++
++def _corner_weight_derivatives(u0, u1, u2):
++    """
++    Derivatives of the multilinear corner weights with respect to each of
++    the three local coordinates, as an array of shape ``(n, 8, 3)``.
++    """
++    derivatives = np.empty((np.size(u0), 8, 3))
++    for corner, (a, b, c) in enumerate(_OFFSETS):
++        w0 = u0 if a else 1 - u0
++        w1 = u1 if b else 1 - u1
++        w2 = u2 if c else 1 - u2
++        d0 = 1.0 if a else -1.0
++        d1 = 1.0 if b else -1.0
++        d2 = 1.0 if c else -1.0
++        derivatives[:, corner, 0] = d0 * w1 * w2
++        derivatives[:, corner, 1] = w0 * d1 * w2
++        derivatives[:, corner, 2] = w0 * w1 * d2
++    return derivatives
++
++
++def _local_coordinates(axes, positions):
++    """
++    Cell indices and local coordinates of positions given in SI metres.
++    """
++    indices = []
++    local = []
++    for axis, column in zip(axes, positions.T, strict=True):
++        index = _cell_index(axis, column)
++        indices.append(index)
++        spacing = axis[index + 1] - axis[index]
++        local.append((column - axis[index]) / spacing)
++    return indices, local
++
++
++def _outside(axes, positions):
++    """Boolean mask of positions that lie outside the grid."""
++    mask = np.zeros(positions.shape[0], dtype=bool)
++    for axis, column in zip(axes, positions.T, strict=True):
++        mask |= (column < axis[0]) | (column > axis[-1])
++    return mask
++
++
++def evaluate(axes, values, positions):
++    """
++    Multilinear field values at ``positions``, shape ``(n, nargs)``.
++
++    Positions outside the grid are returned as not-a-number.
++    """
++    (i0, i1, i2), (u0, u1, u2) = _local_coordinates(axes, positions)
++    corners = _corner_values(values, i0, i1, i2)
++    weights = _corner_weights(u0, u1, u2)
++    result = np.einsum("nc,ncq->nq", weights, corners)
++    result[_outside(axes, positions), :] = np.nan
++    return result
++
++
++def gradient(axes, values, positions):
++    """
++    Gradient of the multilinear field at ``positions``, shape
++    ``(n, nargs, 3)``, in units of the quantity per metre.
++    """
++    (i0, i1, i2), (u0, u1, u2) = _local_coordinates(axes, positions)
++    corners = _corner_values(values, i0, i1, i2)
++    derivatives = _corner_weight_derivatives(u0, u1, u2)
++
++    spacings = np.empty((positions.shape[0], 3))
++    for axis_number, (axis, index) in enumerate(zip(axes, (i0, i1, i2), strict=True)):
++        spacings[:, axis_number] = axis[index + 1] - axis[index]
++
++    result = np.einsum("ncd,ncq->nqd", derivatives, corners)
++    result /= spacings[:, None, :]
++    result[_outside(axes, positions), :, :] = np.nan
++    return result
++
++
++def deposit(axes, shape, positions, amounts):
++    """
++    Spread each amount over the eight grid points that surround its
++    position, using the same weights the multilinear field uses.
++
++    This is the transpose of `evaluate`: the total that lands on the grid
++    is exactly the total carried by the positions that are on it.
++    """
++    (i0, i1, i2), (u0, u1, u2) = _local_coordinates(axes, positions)
++    weights = _corner_weights(u0, u1, u2)
++    weights[_outside(axes, positions), :] = 0.0
++
++    result = np.zeros(shape)
++    for corner, (a, b, c) in enumerate(_OFFSETS):
++        np.add.at(
++            result,
++            (i0 + a, i1 + b, i2 + c),
++            weights[:, corner] * amounts,
++        )
++    return result
++
++
++def _segment_bounds(axes, start, direction):
++    """
++    Parameter interval of the segment ``start + t * direction`` that lies
++    inside the grid, or `None` when no part of it does.
++    """
++    lower, upper = 0.0, 1.0
++    for axis, origin, step in zip(axes, start, direction, strict=True):
++        span = abs(axis[-1] - axis[0])
++        if abs(step) <= _DIRECTION_TOL * max(span, abs(origin)):
++            if origin < axis[0] or origin > axis[-1]:
++                return None
++            continue
++        first = (axis[0] - origin) / step
++        last = (axis[-1] - origin) / step
++        lower = max(lower, min(first, last))
++        upper = min(upper, max(first, last))
++    return None if upper <= lower else (lower, upper)
++
++
++def _segment_breaks(axes, start, direction, lower, upper):
++    """
++    Sorted parameter values at which the segment enters a new cell,
++    including the two ends of the interval.
++    """
++    breaks = [lower, upper]
++    for axis, origin, step in zip(axes, start, direction, strict=True):
++        span = abs(axis[-1] - axis[0])
++        if abs(step) <= _DIRECTION_TOL * max(span, abs(origin)):
++            continue
++        crossings = (axis - origin) / step
++        breaks.extend(crossings[(crossings > lower) & (crossings < upper)].tolist())
++    return np.unique(np.asarray(breaks, dtype=float))
++
++
++def _integrate_segment(axes, values, start, stop, weight):
++    """
++    Integral of ``weight(field)`` along one straight segment with respect
++    to the segment parameter.
++
++    ``weight`` maps an array of field values of shape ``(n, nargs)`` onto
++    an array of shape ``(n, nresults)``. Because the field is a cubic
++    polynomial of the parameter within any one cell, Simpson's rule is
++    exact on each piece.
++    """
++    direction = stop - start
++    bounds = _segment_bounds(axes, start, direction)
++    if bounds is None:
++        return None
++    breaks = _segment_breaks(axes, start, direction, *bounds)
++    if breaks.size < 2:
++        return None
++
++    left = breaks[:-1]
++    right = breaks[1:]
++    middle = 0.5 * (left + right)
++
++    samples = np.concatenate([left, middle, right])
++    positions = start[None, :] + samples[:, None] * direction[None, :]
++
++    # Every sample of a piece is evaluated with the polynomial of the cell
++    # that piece lies in, which is the cell holding its midpoint. The two
++    # ends sit on the boundary of that cell, so this is not an
++    # extrapolation.
++    (i0, i1, i2), _ = _local_coordinates(axes, positions[len(left) : 2 * len(left)])
++    indices = (np.tile(i0, 3), np.tile(i1, 3), np.tile(i2, 3))
++
++    corners = _corner_values(values, *indices)
++    spacings = [axes[k][indices[k] + 1] - axes[k][indices[k]] for k in range(3)]
++    local = [(positions[:, k] - axes[k][indices[k]]) / spacings[k] for k in range(3)]
++    field = np.einsum("nc,ncq->nq", _corner_weights(*local), corners)
++
++    integrand = weight(field)
++    pieces = len(left)
++    simpson = (
++        integrand[:pieces]
++        + 4 * integrand[pieces : 2 * pieces]
++        + integrand[2 * pieces :]
++    ) / 6
++    return np.einsum("p,pr->r", right - left, simpson)
++
++
++def line_integral(axes, values, vertices):
++    """
++    Integral of each quantity with respect to arc length along the
++    polyline given by ``vertices``.
++    """
++    nargs = values.shape[-1]
++    total = np.zeros(nargs)
++    for start, stop in pairwise(vertices):
++        length = float(np.linalg.norm(stop - start))
++        if length == 0.0:
++            continue
++        piece = _integrate_segment(axes, values, start, stop, lambda field: field)
++        if piece is not None:
++            total += length * piece
++    return total
++
++
++def circulation(axes, values, vertices):
++    """
++    Integral of the vector field, whose three components are the three
++    quantities in ``values``, projected onto the polyline.
++    """
++    total = 0.0
++    for start, stop in pairwise(vertices):
++        direction = stop - start
++        if not np.any(direction):
++            continue
++        piece = _integrate_segment(
++            axes,
++            values,
++            start,
++            stop,
++            lambda field, step=direction: (field @ step)[:, None],
++        )
++        if piece is not None:
++            total += float(piece[0])
++    return total
++
++
++def _clip_intervals(axis, lower, upper):
++    """
++    Intersection of each interval with the extent of ``axis``, returned
++    as its two ends and its length. An interval that misses the axis
++    entirely is reported with zero length.
++    """
++    left = np.maximum(np.minimum(lower, upper), axis[0])
++    right = np.minimum(np.maximum(lower, upper), axis[-1])
++    right = np.maximum(right, left)
++    return left, right, right - left
++
++
++def _hat_values(axis, position):
++    """
++    Value of every nodal basis function at each position, as an array of
++    shape ``(m, n)``.
++
++    The multilinear field of the grid is the sum of the nodal values
++    weighted by these functions, so a field integral becomes a
++    contraction against basis integrals.
++    """
++    weights = np.zeros((np.size(position), axis.size))
++    cell = _cell_index(axis, position)
++    width = axis[cell + 1] - axis[cell]
++    local = (position - axis[cell]) / width
++    rows = np.arange(np.size(position))
++    weights[rows, cell] = 1 - local
++    weights[rows, cell + 1] += local
++    return weights
++
++
++def _hat_integrals(axis, lower, upper):
++    """
++    Integral of every nodal basis function over each interval, as an
++    array of shape ``(m, n)``.
++
++    Each cell is visited once and contributes to the two basis functions
++    it supports. Within a cell both are linear, so the integral over the
++    part of the interval inside that cell is the average of the two end
++    values times the length of that part.
++    """
++    left, right, _ = _clip_intervals(axis, lower, upper)
++    weights = np.zeros((left.size, axis.size))
++
++    for cell in range(axis.size - 1):
++        start, stop = axis[cell], axis[cell + 1]
++        width = stop - start
++        a = np.clip(left, start, stop)
++        b = np.clip(right, start, stop)
++        length = b - a
++        weights[:, cell] += 0.5 * ((stop - a) + (stop - b)) * length / width
++        weights[:, cell + 1] += 0.5 * ((a - start) + (b - start)) * length / width
++
++    return weights
++
++
++def _contract(values, w0, w1, w2):
++    """
++    Contract nodal values against per-axis weight matrices, giving one
++    result per weight row and quantity.
++    """
++    return np.einsum("ijkq,mi,mj,mk->mq", values, w0, w1, w2, optimize=True)
++
++
++def box_integral(axes, values, lower, upper):
++    """
++    Integral of each quantity over an axis-aligned box, with the part of
++    the box outside the grid contributing nothing.
++    """
++    weights = [
++        _hat_integrals(axis, np.array([lower[k]]), np.array([upper[k]]))
++        for k, axis in enumerate(axes)
++    ]
++    return _contract(values, *weights)[0]
++
++
++def box_volume(axes, lower, upper):
++    """Volume of the part of an axis-aligned box that lies on the grid."""
++    lengths = [
++        _clip_intervals(axis, np.array([lower[k]]), np.array([upper[k]]))[2]
++        for k, axis in enumerate(axes)
++    ]
++    return float(lengths[0][0] * lengths[1][0] * lengths[2][0])
++
++
++def surface_flux(axes, values, lower, upper, normal_axis):
++    """
++    Flux of the vector field, whose three components are the three
++    quantities in ``values``, through an axis-aligned rectangle, taken
++    towards increasing ``normal_axis``.
++    """
++    position = lower[normal_axis]
++    axis = axes[normal_axis]
++    if position < axis[0] or position > axis[-1]:
++        return 0.0
++
++    weights = []
++    for k, axis_k in enumerate(axes):
++        if k == normal_axis:
++            weights.append(_hat_values(axis_k, np.array([position])))
++        else:
++            weights.append(
++                _hat_integrals(axis_k, np.array([lower[k]]), np.array([upper[k]])),
++            )
++
++    return float(_contract(values, *weights)[0, normal_axis])
++
++
++def remap(source_axes, values, target_axes):
++    """
++    Average of each quantity over the target cell that surrounds every
++    node of the target axes.
++
++    The cell around a node reaches half of the local target spacing in
++    each direction. Averages are taken over the part of that cell inside
++    the source grid; nodes whose cell misses the source grid entirely
++    come back as not-a-number.
++    """
++    lengths = []
++    weights = []
++    for axis, target in zip(source_axes, target_axes, strict=True):
++        edges = np.concatenate(
++            [
++                [target[0] - 0.5 * (target[1] - target[0])],
++                0.5 * (target[:-1] + target[1:]),
++                [target[-1] + 0.5 * (target[-1] - target[-2])],
++            ],
++        )
++        lower, upper = edges[:-1], edges[1:]
++        weights.append(_hat_integrals(axis, lower, upper))
++        lengths.append(_clip_intervals(axis, lower, upper)[2])
++
++    integrals = np.einsum(
++        "ijkq,ai,bj,ck->abcq",
++        values,
++        *weights,
++        optimize=True,
++    )
++    volumes = lengths[0][:, None, None] * lengths[1][None, :, None]
++    volumes = volumes * lengths[2][None, None, :]
++
++    empty = volumes == 0
++    result = integrals / np.where(empty, 1.0, volumes)[..., None]
++    result[empty, :] = np.nan
++    return result
+diff --git a/src/plasmapy/plasma/grids.py b/src/plasmapy/plasma/grids.py
+index d1d73d9..be2a338 100644
+--- a/src/plasmapy/plasma/grids.py
++++ b/src/plasmapy/plasma/grids.py
+@@ -25,6 +25,7 @@
+ from scipy.spatial import distance
+ from scipy.special import erf
+ 
++from plasmapy.plasma import _grid_calculus
+ from plasmapy.utils.decorators.helpers import modify_docstring
+ 
+ 
+@@ -1040,6 +1041,540 @@ def _persistent_interpolator_setup(self, pos, args, persistent):
+ 
+         return pos, args, persistent
+ 
++    # *************************************************************************
++    # Calculus of the multilinear field defined by the grid
++    # *************************************************************************
++
++    def _calculus_setup(self, args):
++        r"""
++        Common validation for the calculus methods.
++
++        Returns the three axes and the quantity arrays in SI units, along
++        with the units that were stripped from the quantities.
++
++        Raises
++        ------
++        `NotImplementedError`
++            If the grid is not uniformly spaced.
++
++        `KeyError`
++            If one of the ``args`` does not correspond to a DataArray in
++            the DataSet.
++        """
++        if not self.is_uniform:
++            raise NotImplementedError(
++                "Calculus on a grid is only defined for uniformly spaced grids.",
++            )
++
++        for arg in args:
++            if arg not in self.quantities:
++                raise KeyError(
++                    "Quantity arguments must correspond to "
++                    "DataArrays in the DataSet. "
++                    f"{arg} was not found. "
++                    f"Existing keys are: {self.quantities}",
++                )
++
++        axes = [self._ax0_si, self._ax1_si, self._ax2_si]
++        values = np.stack(
++            [self.ds[arg].to_numpy() for arg in args],
++            axis=-1,
++        ).astype(np.float64)
++        units = [self.ds[arg].attrs["unit"] for arg in args]
++        return axes, values, units
++
++    def _vector_setup(self, keys):
++        r"""
++        Validation for the calculus methods that take the three
++        components of a vector field.
++
++        Raises
++        ------
++        `ValueError`
++            If ``keys`` does not name exactly three quantities, or if the
++            three quantities do not share a single unit.
++        """
++        keys = tuple(keys)
++        if len(keys) != 3:
++            raise ValueError(
++                "A vector field must be given as three quantity keys, "
++                f"but {len(keys)} were provided.",
++            )
++
++        axes, values, units = self._calculus_setup(keys)
++
++        if not (units[0] == units[1] == units[2]):
++            raise ValueError(
++                f"The components {keys} do not all have the same units: {units}.",
++            )
++
++        return axes, values, units[0]
++
++    def _si_positions(self, pos, *, name: str = "pos"):  # noqa: ANN202
++        r"""
++        Condition an array of positions into SI metres, adding an empty
++        dimension if a single position was provided.
++        """
++        if isinstance(pos, u.Quantity):
++            pos = pos.to(u.m).value
++        else:
++            pos = np.asarray(pos, dtype=np.float64) * np.array(self.si_scale_factors)
++
++        pos = np.atleast_2d(np.asarray(pos, dtype=np.float64))
++
++        if pos.ndim != 2 or pos.shape[1] != 3:
++            raise ValueError(
++                f"{name} must have shape (n, 3) or (3,), "
++                f"but the shape provided was {pos.shape}.",
++            )
++
++        return pos
++
++    def gradient(self, pos, *args: str):  # noqa: ANN201
++        r"""
++        The gradient of one or more quantities at arbitrary positions.
++
++        The grid defines a continuous field by multilinear interpolation
++        between the eight grid points that surround a position, which is
++        the same field returned by
++        `~plasmapy.plasma.grids.CartesianGrid.volume_averaged_interpolator`.
++        The gradient returned here is the exact gradient of that field.
++
++        Parameters
++        ----------
++        pos : `~numpy.ndarray` or `~astropy.units.Quantity`, shape (n,3)
++            Positions at which to evaluate the gradient. If a
++            `~numpy.ndarray` is provided, units are assumed to match
++            those of the grid.
++
++        *args : `str`
++            Strings that correspond to DataArrays in the dataset.
++
++        Returns
++        -------
++        `~astropy.units.Quantity` or `tuple`
++            An array of shape ``(n, 3)`` for each quantity, in units of
++            that quantity per metre. Positions off the grid are returned
++            as not-a-number.
++        """
++        axes, values, units = self._calculus_setup(args)
++        pos = self._si_positions(pos)
++        result = _grid_calculus.gradient(axes, values, pos)
++        output = [
++            result[:, index, :] * (unit / u.m) for index, unit in enumerate(units)
++        ]
++        return output[0] if len(output) == 1 else tuple(output)
++
++    def divergence(self, pos, keys):
++        r"""
++        The divergence of a vector field at arbitrary positions.
++
++        The three components of the field are taken from the three
++        quantities named in ``keys``, and the divergence is that of the
++        multilinear field the grid defines.
++
++        Parameters
++        ----------
++        pos : `~numpy.ndarray` or `~astropy.units.Quantity`, shape (n,3)
++            Positions at which to evaluate the divergence.
++
++        keys : ``iterable`` of `str`
++            The three DataArrays holding the components of the vector
++            field along each axis of the grid.
++
++        Returns
++        -------
++        `~astropy.units.Quantity`
++            An array of shape ``(n,)`` in units of the field per metre.
++        """
++        axes, values, unit = self._vector_setup(keys)
++        pos = self._si_positions(pos)
++        jacobian = _grid_calculus.gradient(axes, values, pos)
++        return np.trace(jacobian, axis1=1, axis2=2) * (unit / u.m)
++
++    def curl(self, pos, keys):
++        r"""
++        The curl of a vector field at arbitrary positions.
++
++        Parameters
++        ----------
++        pos : `~numpy.ndarray` or `~astropy.units.Quantity`, shape (n,3)
++            Positions at which to evaluate the curl.
++
++        keys : ``iterable`` of `str`
++            The three DataArrays holding the components of the vector
++            field along each axis of the grid.
++
++        Returns
++        -------
++        `~astropy.units.Quantity`
++            An array of shape ``(n, 3)`` in units of the field per metre.
++        """
++        axes, values, unit = self._vector_setup(keys)
++        pos = self._si_positions(pos)
++        jacobian = _grid_calculus.gradient(axes, values, pos)
++        result = np.empty((pos.shape[0], 3))
++        for axis in range(3):
++            first, second = (axis + 1) % 3, (axis + 2) % 3
++            result[:, axis] = jacobian[:, second, first] - jacobian[:, first, second]
++        return result * (unit / u.m)
++
++    def line_integral(self, vertices, *args: str):  # noqa: ANN201
++        r"""
++        The integral of one or more quantities with respect to arc length
++        along a polyline.
++
++        The integral is exact for the multilinear field the grid defines.
++        Portions of the polyline that lie outside the grid contribute
++        nothing.
++
++        Parameters
++        ----------
++        vertices : `~numpy.ndarray` or `~astropy.units.Quantity`, shape (m,3)
++            The vertices of the polyline, which is traversed from the
++            first vertex to the last.
++
++        *args : `str`
++            Strings that correspond to DataArrays in the dataset.
++
++        Returns
++        -------
++        `~astropy.units.Quantity` or `tuple`
++            A scalar for each quantity, in units of that quantity times
++            metres.
++
++        Raises
++        ------
++        `ValueError`
++            If fewer than two vertices are provided.
++        """
++        axes, values, units = self._calculus_setup(args)
++        vertices = self._si_positions(vertices, name="vertices")
++        if vertices.shape[0] < 2:
++            raise ValueError(
++                "A polyline requires at least two vertices, "
++                f"but {vertices.shape[0]} were provided.",
++            )
++
++        result = _grid_calculus.line_integral(axes, values, vertices)
++        output = [result[index] * (unit * u.m) for index, unit in enumerate(units)]
++        return output[0] if len(output) == 1 else tuple(output)
++
++    def circulation(self, vertices, keys):
++        r"""
++        The integral of a vector field along a polyline.
++
++        Portions of the polyline that lie outside the grid contribute
++        nothing.
++
++        Parameters
++        ----------
++        vertices : `~numpy.ndarray` or `~astropy.units.Quantity`, shape (m,3)
++            The vertices of the polyline, which is traversed from the
++            first vertex to the last.
++
++        keys : ``iterable`` of `str`
++            The three DataArrays holding the components of the vector
++            field along each axis of the grid.
++
++        Returns
++        -------
++        `~astropy.units.Quantity`
++            A scalar in units of the field times metres.
++
++        Raises
++        ------
++        `ValueError`
++            If fewer than two vertices are provided.
++        """
++        axes, values, unit = self._vector_setup(keys)
++        vertices = self._si_positions(vertices, name="vertices")
++        if vertices.shape[0] < 2:
++            raise ValueError(
++                "A polyline requires at least two vertices, "
++                f"but {vertices.shape[0]} were provided.",
++            )
++
++        return _grid_calculus.circulation(axes, values, vertices) * (unit * u.m)
++
++    def surface_flux(self, corner0, corner1, keys):
++        r"""
++        The flux of a vector field through an axis-aligned rectangle.
++
++        The two corners must share exactly one coordinate, which fixes
++        the plane of the rectangle. The flux is taken towards increasing
++        values along that axis. The part of the rectangle that lies
++        outside the grid contributes nothing.
++
++        Parameters
++        ----------
++        corner0, corner1 : `~numpy.ndarray` or `~astropy.units.Quantity`, shape (3,)
++            Opposite corners of the rectangle.
++
++        keys : ``iterable`` of `str`
++            The three DataArrays holding the components of the vector
++            field along each axis of the grid.
++
++        Returns
++        -------
++        `~astropy.units.Quantity`
++            A scalar in units of the field times square metres.
++
++        Raises
++        ------
++        `ValueError`
++            If the two corners do not share exactly one coordinate.
++        """
++        axes, values, unit = self._vector_setup(keys)
++        lower = self._si_positions(corner0, name="corner0")[0]
++        upper = self._si_positions(corner1, name="corner1")[0]
++
++        shared = np.nonzero(lower == upper)[0]
++        if shared.size != 1:
++            raise ValueError(
++                "The corners of a rectangle must share exactly one "
++                f"coordinate, but they share {shared.size}.",
++            )
++
++        flux = _grid_calculus.surface_flux(
++            axes,
++            values,
++            lower,
++            upper,
++            int(shared[0]),
++        )
++        return flux * (unit * u.m**2)
++
++    def box_integral(self, corner0, corner1, *args: str):  # noqa: ANN201
++        r"""
++        The integral of one or more quantities over an axis-aligned box.
++
++        The integral is exact for the multilinear field the grid defines,
++        and the part of the box that lies outside the grid contributes
++        nothing.
++
++        Parameters
++        ----------
++        corner0, corner1 : `~numpy.ndarray` or `~astropy.units.Quantity`, shape (3,)
++            Opposite corners of the box.
++
++        *args : `str`
++            Strings that correspond to DataArrays in the dataset.
++
++        Returns
++        -------
++        `~astropy.units.Quantity` or `tuple`
++            A scalar for each quantity, in units of that quantity times
++            cubic metres.
++        """
++        axes, values, units = self._calculus_setup(args)
++        lower = self._si_positions(corner0, name="corner0")[0]
++        upper = self._si_positions(corner1, name="corner1")[0]
++
++        result = _grid_calculus.box_integral(axes, values, lower, upper)
++        output = [result[index] * (unit * u.m**3) for index, unit in enumerate(units)]
++        return output[0] if len(output) == 1 else tuple(output)
++
++    def deposit(self, pos, amounts):
++        r"""
++        Spread an amount carried by each of a set of positions onto the
++        grid points.
++
++        Each amount is divided among the eight grid points surrounding
++        its position in the same proportions the multilinear field uses
++        to weight those points, so nothing is created or destroyed:
++        summing the result recovers the total carried by the positions
++        that lie on the grid. Positions off the grid deposit nothing.
++
++        Parameters
++        ----------
++        pos : `~numpy.ndarray` or `~astropy.units.Quantity`, shape (n,3)
++            Positions carrying the amounts.
++
++        amounts : `~numpy.ndarray` or `~astropy.units.Quantity`, shape (n,)
++            The amount carried by each position.
++
++        Returns
++        -------
++        `~astropy.units.Quantity`
++            An array with the shape of the grid, in the units of
++            ``amounts``.
++
++        Raises
++        ------
++        `ValueError`
++            If the number of amounts does not match the number of
++            positions.
++        """
++        if not self.is_uniform:
++            raise NotImplementedError(
++                "Calculus on a grid is only defined for uniformly spaced grids.",
++            )
++
++        pos = self._si_positions(pos)
++
++        unit = (
++            amounts.unit
++            if isinstance(amounts, u.Quantity)
++            else u.dimensionless_unscaled
++        )
++        amounts = np.atleast_1d(
++            np.asarray(u.Quantity(amounts, unit).value, dtype=np.float64)
++        )
++
++        if amounts.shape != (pos.shape[0],):
++            raise ValueError(
++                f"{amounts.shape[0]} amounts were given for {pos.shape[0]} positions.",
++            )
++
++        axes = [self._ax0_si, self._ax1_si, self._ax2_si]
++        return _grid_calculus.deposit(axes, self.shape, pos, amounts) * unit
++
++    def box_mean(self, corner0, corner1, *args: str):  # noqa: ANN201
++        r"""
++        The average of one or more quantities over an axis-aligned box.
++
++        The average is taken over the part of the box that lies inside
++        the grid. A box that misses the grid entirely gives not-a-number.
++
++        Parameters
++        ----------
++        corner0, corner1 : `~numpy.ndarray` or `~astropy.units.Quantity`, shape (3,)
++            Opposite corners of the box.
++
++        *args : `str`
++            Strings that correspond to DataArrays in the dataset.
++
++        Returns
++        -------
++        `~astropy.units.Quantity` or `tuple`
++            A scalar for each quantity, in the units of that quantity.
++        """
++        axes, values, units = self._calculus_setup(args)
++        lower = self._si_positions(corner0, name="corner0")[0]
++        upper = self._si_positions(corner1, name="corner1")[0]
++
++        volume = _grid_calculus.box_volume(axes, lower, upper)
++        integral = _grid_calculus.box_integral(axes, values, lower, upper)
++        means = integral / volume if volume > 0 else np.full(len(units), np.nan)
++
++        output = [means[index] * unit for index, unit in enumerate(units)]
++        return output[0] if len(output) == 1 else tuple(output)
++
++    def net_flux(self, corner0, corner1, keys):
++        r"""
++        The net outward flux of a vector field through the surface of an
++        axis-aligned box.
++
++        Parameters
++        ----------
++        corner0, corner1 : `~numpy.ndarray` or `~astropy.units.Quantity`, shape (3,)
++            Opposite corners of the box.
++
++        keys : ``iterable`` of `str`
++            The three DataArrays holding the components of the vector
++            field along each axis of the grid.
++
++        Returns
++        -------
++        `~astropy.units.Quantity`
++            A scalar in units of the field times square metres.
++        """
++        axes, values, unit = self._vector_setup(keys)
++        lower = self._si_positions(corner0, name="corner0")[0]
++        upper = self._si_positions(corner1, name="corner1")[0]
++        lower, upper = np.minimum(lower, upper), np.maximum(lower, upper)
++
++        total = 0.0
++        for axis_number in range(3):
++            for side, sign in ((upper, 1.0), (lower, -1.0)):
++                face_low = lower.copy()
++                face_high = upper.copy()
++                face_low[axis_number] = face_high[axis_number] = side[axis_number]
++                total += sign * _grid_calculus.surface_flux(
++                    axes,
++                    values,
++                    face_low,
++                    face_high,
++                    axis_number,
++                )
++
++        return total * (unit * u.m**2)
++
++    def remap(self, target, *args: str):  # noqa: ANN201
++        r"""
++        Resample one or more quantities onto the axes of another grid.
++
++        The value placed at a node of ``target`` is the average of the
++        field defined by this grid over the cell surrounding that node,
++        which reaches half of the local spacing of ``target`` in each
++        direction. Only the part of that cell lying inside this grid is
++        averaged, and a node whose cell misses this grid entirely is set
++        to not-a-number.
++
++        Parameters
++        ----------
++        target : `~plasmapy.plasma.grids.AbstractGrid`
++            The grid whose axes the quantities are resampled onto.
++
++        *args : `str`
++            Strings that correspond to DataArrays in the dataset.
++
++        Returns
++        -------
++        `~plasmapy.plasma.grids.CartesianGrid`
++            A new grid with the axes of ``target`` carrying the
++            resampled quantities.
++
++        Raises
++        ------
++        `NotImplementedError`
++            If either grid is not uniformly spaced.
++        """
++        axes, values, units = self._calculus_setup(args)
++
++        if not target.is_uniform:
++            raise NotImplementedError(
++                "Calculus on a grid is only defined for uniformly spaced grids.",
++            )
++
++        target_axes = [target._ax0_si, target._ax1_si, target._ax2_si]  # noqa: SLF001
++        resampled = _grid_calculus.remap(axes, values, target_axes)
++
++        output = CartesianGrid(
++            target.grids[0],
++            target.grids[1],
++            target.grids[2],
++        )
++        output.add_quantities(
++            **{
++                arg: resampled[..., index] * units[index]
++                for index, arg in enumerate(args)
++            },
++        )
++        return output
++
++    def volume_integral(self, *args: str):  # noqa: ANN201
++        r"""
++        The integral of one or more quantities over the whole volume
++        spanned by the grid.
++
++        Parameters
++        ----------
++        *args : `str`
++            Strings that correspond to DataArrays in the dataset.
++
++        Returns
++        -------
++        `~astropy.units.Quantity` or `tuple`
++            A scalar for each quantity, in units of that quantity times
++            cubic metres.
++        """
++        axes, _, _ = self._calculus_setup(args)
++        lower = np.array([axis[0] for axis in axes])
++        upper = np.array([axis[-1] for axis in axes])
++        return self.box_integral(lower * u.m, upper * u.m, *args)
++
+ 
+ def _fast_nearest_neighbor_interpolate(pos, ax):
+     """

@@ -1,0 +1,790 @@
+diff --git a/skfem/__init__.py b/skfem/__init__.py
+index d8af6ba7..0b47e0a7 100644
+--- a/skfem/__init__.py
++++ b/skfem/__init__.py
+@@ -19,9 +19,11 @@ __all__ = all_mesh + all_assembly + all_element + [  # noqa
+     'MappingAffine',
+     'MappingIsoparametric',
+     'adaptive_theta',
++    'coarsen_theta',
+     'build_pc_ilu',
+     'build_pc_diag',
+     'condense',
++    'constrain',
+     'enforce',
+     'penalize',
+     'project',  # TODO remove due to deprecation
+diff --git a/skfem/assembly/basis/abstract_basis.py b/skfem/assembly/basis/abstract_basis.py
+index 59fb7b73..af6d5797 100644
+--- a/skfem/assembly/basis/abstract_basis.py
++++ b/skfem/assembly/basis/abstract_basis.py
+@@ -116,6 +116,108 @@ class AbstractBasis:
+                 self._element_dofs = self.dofs.element_dofs[:, self.tind]
+         return self._element_dofs
+ 
++    def _hanging_rows(self):
++        """Collect the constrained DOFs and the elements constraining them.
++
++        Returns the constrained DOF numbers, the element on the coarse side of
++        the corresponding hanging vertex, an element on the fine side and the
++        local number of the DOF within that element.
++
++        """
++        split = self.mesh._hanging_split
++        if split.shape[1] == 0:
++            return (np.empty((0,), dtype=np.int32),) * 4
++
++        constrained = []
++        coarse = []
++        for parent, vertex, first, second in split.T:
++            dofs = [self.nodal_dofs[:, vertex]]
++            if self.facet_dofs.shape[0] > 0:
++                dofs.append(self.facet_dofs[:, first])
++                dofs.append(self.facet_dofs[:, second])
++            dofs = np.concatenate(dofs)
++            constrained.append(dofs)
++            coarse.append(np.full(len(dofs),
++                                  self.mesh.f2t[0, parent],
++                                  dtype=np.int32))
++
++        constrained, ix = np.unique(np.concatenate(constrained),
++                                    return_index=True)
++        coarse = np.concatenate(coarse)[ix]
++
++        element_dofs = self.dofs.element_dofs
++        owner = np.zeros(self.N, dtype=np.int32)
++        local = np.zeros(self.N, dtype=np.int32)
++        rows, cols = np.indices(element_dofs.shape)
++        owner[element_dofs.flatten()] = cols.flatten()
++        local[element_dofs.flatten()] = rows.flatten()
++
++        return constrained, coarse, owner[constrained], local[constrained]
++
++    def _hanging_values(self, i, X, tind):
++        """Return the components of the ``i`` th basis function at ``X``.
++
++        The components of every field of a composite element are stacked, so
++        that contracting the result of two basis functions picks out the pairs
++        belonging to the same field and the same component.
++
++        """
++        out = []
++        for field in self.elem.gbasis(self.mapping, X, i, tind=tind):
++            value = field.value
++            out.append(value[None, :, 0] if value.ndim == 2 else value[..., 0])
++        return np.concatenate(out, axis=0)
++
++    def hanging_dofs(self) -> ndarray:
++        """Return the DOFs constrained by the hanging vertices."""
++        return self._hanging_rows()[0]
++
++    def hanging_prolongation(self):
++        """Return the matrix expressing the constrained DOFs.
++
++        The returned matrix ``P`` satisfies ``x == P @ x`` for every function
++        of the continuous finite element space.  The row of an unconstrained
++        DOF is a unit row and the row of a constrained DOF holds the values of
++        the basis functions of the element on the coarse side, evaluated at the
++        location of the constrained DOF.
++
++        """
++        from scipy.sparse import coo_matrix, eye
++
++        constrained, coarse, owner, local = self._hanging_rows()
++        N = self.N
++        if len(constrained) == 0:
++            return eye(N, format='csr')
++
++        X = self.mapping.invF(self.doflocs[:, constrained][:, :, None],
++                              tind=coarse)
++        ncomp = self._hanging_values(0, X, coarse).shape[0]
++        directions = np.zeros((ncomp, len(constrained)))
++        for i in np.unique(local):
++            ix = np.nonzero(local == i)[0]
++            own = np.broadcast_to(self.elem.doflocs[i][:, None, None],
++                                  (self.mesh.dim(), len(ix), 1))
++            directions[:, ix] = self._hanging_values(i, own, owner[ix])
++
++        element_dofs = self.dofs.element_dofs[:, coarse]
++        rows, cols, data = [], [], []
++        for i in range(element_dofs.shape[0]):
++            weights = np.einsum('ij,ij->j',
++                                directions,
++                                self._hanging_values(i, X, coarse))
++            ix = np.nonzero(np.abs(weights) > 1e-12)[0]
++            rows.append(constrained[ix])
++            cols.append(element_dofs[i, ix])
++            data.append(weights[ix])
++
++        free = np.setdiff1d(np.arange(N, dtype=np.int32), constrained)
++        return coo_matrix(
++            (np.concatenate(data + [np.ones(len(free))]),
++             (np.concatenate(rows + [free]),
++              np.concatenate(cols + [free]))),
++            shape=(N, N),
++        ).tocsr()
++
+     def complement_dofs(self, *D):
+         if type(D[0]) is dict:
+             # if a dict of Dofs objects are given, flatten all
+diff --git a/skfem/assembly/basis/cell_basis.py b/skfem/assembly/basis/cell_basis.py
+index f1b14a07..beec1628 100644
+--- a/skfem/assembly/basis/cell_basis.py
++++ b/skfem/assembly/basis/cell_basis.py
+@@ -327,7 +327,7 @@ class CellBasis(AbstractBasis):
+             Set to `np.complex64` or similar to use complex numbers.
+ 
+         """
+-        from skfem.utils import solve, condense
++        from skfem.utils import solve, condense, constrain
+ 
+         M, f = self._projection(interp, dtype=dtype)
+ 
+@@ -335,4 +335,6 @@ class CellBasis(AbstractBasis):
+             return solve(*condense(M, f, I=self.get_dofs(elements=elements)))
+         elif self.tind is not None:
+             return solve(*condense(M, f, I=self.get_dofs(elements=self.tind)))
++        elif len(self.hanging_dofs()) > 0:
++            return solve(*constrain(self, M, f))
+         return solve(M, f)
+diff --git a/skfem/assembly/basis/facet_basis.py b/skfem/assembly/basis/facet_basis.py
+index 17788b9b..b5964747 100644
+--- a/skfem/assembly/basis/facet_basis.py
++++ b/skfem/assembly/basis/facet_basis.py
+@@ -73,20 +73,22 @@ class FacetBasis(AbstractBasis):
+             disable_doflocs,
+         )
+ 
+-        # by default use boundary facets
++        # by default use exterior boundary facets
+         if facets is None:
+-            self.find = np.nonzero(self.mesh.f2t[1] == -1)[0].astype(np.int32)
++            self.find = self.mesh.boundary_facets()
+         else:
+             self.find = mesh.normalize_facets(facets)
+ 
++        # the halves of a split facet have the coarse element as the second
++        f2t = self.mesh.hanging_f2t()
++
+         # fix the orientation
+         if isinstance(self.find, OrientedBoundary):
+-            self.tind = self.mesh.f2t[(-1) ** side * self.find.ori - side,
+-                                      self.find]
+-            self.tind_normals = self.mesh.f2t[self.find.ori, self.find]
++            self.tind = f2t[(-1) ** side * self.find.ori - side, self.find]
++            self.tind_normals = f2t[self.find.ori, self.find]
+         else:
+-            self.tind = self.mesh.f2t[side, self.find]
+-            self.tind_normals = self.mesh.f2t[0, self.find]
++            self.tind = f2t[side, self.find]
++            self.tind_normals = f2t[0, self.find]
+ 
+         if len(self.find) == 0:
+             logger.warning("Initializing {} with no facets.".format(typestr))
+diff --git a/skfem/assembly/basis/interior_facet_basis.py b/skfem/assembly/basis/interior_facet_basis.py
+index 17ae04fc..7d29e2b4 100644
+--- a/skfem/assembly/basis/interior_facet_basis.py
++++ b/skfem/assembly/basis/interior_facet_basis.py
+@@ -30,7 +30,9 @@ class InteriorFacetBasis(FacetBasis):
+         """Precomputed global basis on interior facets."""
+ 
+         if facets is None:
+-            facets = np.nonzero(mesh.f2t[1] != -1)[0].astype(np.int32)
++            facets = np.nonzero(
++                mesh.hanging_f2t()[1] != -1
++            )[0].astype(np.int32)
+ 
+         facets = mesh.normalize_facets(facets)
+ 
+diff --git a/skfem/mesh/mesh.py b/skfem/mesh/mesh.py
+index 799f0dd6..426c09fa 100644
+--- a/skfem/mesh/mesh.py
++++ b/skfem/mesh/mesh.py
+@@ -195,8 +195,118 @@ class Mesh:
+         return self.elem.refdom.dim()
+ 
+     def boundary_facets(self) -> ndarray:
+-        """Return an array of boundary facet indices."""
+-        return np.nonzero(self.f2t[1] == -1)[0].astype(np.int32)
++        """Return an array of exterior boundary facet indices."""
++        facets = np.nonzero(self.f2t[1] == -1)[0].astype(np.int32)
++        return np.setdiff1d(
++            facets,
++            np.concatenate((self.split_facets(), self.hanging_facets())),
++        ).astype(np.int32)
++
++    @property
++    def _hanging_split(self):
++        if not hasattr(self, '_split'):
++            self._init_hanging()
++        return self._split
++
++    def _init_hanging(self):
++        """Initialize the description of the hanging vertices.
++
++        The result is a four-row array with one column per hanging vertex,
++        containing the split facet, the hanging vertex and the two facets the
++        split facet is divided into.
++
++        """
++        self._split = np.empty((4, 0), dtype=np.int32)
++        if self.dim() != 2 or self.facets.shape[0] != 2:
++            return
++
++        single = np.nonzero(self.f2t[1] == -1)[0]
++        if len(single) == 0:
++            return
++
++        ends = self.facets[:, single]
++        lookup = {(int(ends[0, i]), int(ends[1, i])): int(f)
++                  for i, f in enumerate(single)}
++        incident: Dict[int, List[int]] = {}
++        for i, f in enumerate(single):
++            for v in (int(ends[0, i]), int(ends[1, i])):
++                incident.setdefault(v, []).append(int(f))
++
++        p = self.p
++        split = []
++        for v, candidates in incident.items():
++            for i in range(len(candidates)):
++                for j in range(i + 1, len(candidates)):
++                    first, second = candidates[i], candidates[j]
++                    a = int(self.facets[:, first].sum()) - v
++                    b = int(self.facets[:, second].sum()) - v
++                    if a == b:
++                        continue
++                    parent = lookup.get((a, b) if a < b else (b, a))
++                    if parent is None:
++                        continue
++                    scale = np.linalg.norm(p[:, b] - p[:, a])
++                    offset = np.linalg.norm(p[:, v]
++                                            - .5 * (p[:, a] + p[:, b]))
++                    if offset > 1e-10 * scale:
++                        continue
++                    split.append((parent, v, first, second))
++
++        if len(split) > 0:
++            self._split = np.array(sorted(split), dtype=np.int32).T
++
++    def hanging_nodes(self) -> ndarray:
++        """Return an array of hanging vertex indices."""
++        return np.unique(self._hanging_split[1]).astype(np.int32)
++
++    def split_facets(self) -> ndarray:
++        """Return an array of facets split by a hanging vertex."""
++        return np.unique(self._hanging_split[0]).astype(np.int32)
++
++    def hanging_facets(self) -> ndarray:
++        """Return an array of the halves of the split facets."""
++        return np.unique(self._hanging_split[2:].flatten()).astype(np.int32)
++
++    def hanging_elements(self) -> ndarray:
++        """Return the elements on the coarse side of a hanging vertex."""
++        split = self._hanging_split
++        if split.shape[1] == 0:
++            return np.empty((0,), dtype=np.int32)
++        return np.unique(self.f2t[0, split[0]]).astype(np.int32)
++
++    def is_one_irregular(self) -> bool:
++        """Return ``True`` if no facet is split more than once.
++
++        A mesh is one-irregular when the two halves of a split facet are
++        themselves unsplit and every hanging vertex is the only one on its
++        facet.
++
++        """
++        split = self._hanging_split
++        parents = split[0]
++        if len(np.unique(parents)) != len(parents):
++            return False
++        return len(np.intersect1d(parents, split[2:].flatten())) == 0
++
++    def hanging_f2t(self) -> ndarray:
++        """Return ``f2t`` with the coarse side of the halves filled in.
++
++        The two halves of a split facet have a neighbouring element on the
++        fine side only.  The returned array names the element on the coarse
++        side as their second neighbour, which makes the halves usable with
++        :class:`~skfem.assembly.InteriorFacetBasis`.
++
++        """
++        if not hasattr(self, '_hanging_f2t'):
++            split = self._hanging_split
++            if split.shape[1] == 0:
++                self._hanging_f2t = self.f2t
++            else:
++                f2t = self.f2t.copy()
++                f2t[1, split[2]] = self.f2t[0, split[0]]
++                f2t[1, split[3]] = self.f2t[0, split[0]]
++                self._hanging_f2t = f2t
++        return self._hanging_f2t
+ 
+     def boundary_edges(self) -> ndarray:
+         """Return an array of boundary edge indices."""
+@@ -911,6 +1021,20 @@ class Mesh:
+                            "Mesh.refined()")
+         return m
+ 
++    def conforming(self):
++        """Return a mesh without hanging vertices.
++
++        The element on the coarse side of each hanging vertex is split, and
++        this is repeated until no hanging vertices are left.
++
++        """
++        m = self
++        while True:
++            elements = m.hanging_elements()
++            if len(elements) == 0:
++                return m
++            m = m.refined(elements)
++
+     def scaled(self, factors):
+         """Return a new mesh with scaled dimensions.
+ 
+diff --git a/skfem/mesh/mesh_quad_1.py b/skfem/mesh/mesh_quad_1.py
+index de1b1d9a..21c5ada0 100644
+--- a/skfem/mesh/mesh_quad_1.py
++++ b/skfem/mesh/mesh_quad_1.py
+@@ -86,6 +86,271 @@ class MeshQuad1(Mesh2D):
+ 
+         return m
+ 
++    def _adaptive_balance(self, marked):
++        """Extend the set of marked elements to keep the mesh one-irregular.
++
++        An element which is on the fine side of an existing hanging vertex can
++        only be split together with the element on the coarse side.  Adding
++        that element can force further elements to be split and, therefore,
++        the set is extended until it stops growing.
++
++        """
++        split = self._hanging_split
++        if split.shape[1] == 0:
++            return marked
++
++        coarse = {}
++        for parent, _, first, second in split.T:
++            elem = int(self.f2t[0, parent])
++            coarse[int(first)] = elem
++            coarse[int(second)] = elem
++
++        result = set(int(elem) for elem in marked)
++        queue = list(result)
++        while len(queue) > 0:
++            elem = queue.pop()
++            for facet in self.t2f[:, elem]:
++                neighbour = coarse.get(int(facet))
++                if neighbour is not None and neighbour not in result:
++                    result.add(neighbour)
++                    queue.append(neighbour)
++
++        return np.array(sorted(result), dtype=np.int32)
++
++    def _adaptive(self, ix: ndarray):
++        marked = np.unique(np.arange(self.t.shape[1], dtype=np.int32)[ix])
++        if len(marked) == 0:
++            return self
++        marked = self._adaptive_balance(marked)
++
++        p = self.doflocs
++        t2f = self.t2f
++        sz = p.shape[1]
++
++        # a facet already carrying a hanging vertex reuses it when split
++        mid = (-1) * np.ones(self.facets.shape[1], dtype=np.int32)
++        split = self._hanging_split
++        if split.shape[1] > 0:
++            mid[split[0]] = split[1]
++        touched = np.unique(t2f[:, marked].flatten())
++        fresh = touched[mid[touched] == -1]
++        mid[fresh] = np.arange(len(fresh), dtype=np.int32) + sz
++
++        centers = np.arange(len(marked), dtype=np.int32) + sz + len(fresh)
++        f = mid[t2f[:, marked]]
++        t = self.t[:, marked]
++        kept = np.setdiff1d(np.arange(self.t.shape[1], dtype=np.int32), marked)
++
++        m = replace(
++            self,
++            doflocs=np.hstack((
++                p,
++                p[:, self.facets[:, fresh]].mean(axis=1),
++                p[:, t].mean(axis=1),
++            )),
++            t=np.hstack((
++                self.t[:, kept],
++                np.vstack((t[0], f[0], centers, f[3])),
++                np.vstack((f[0], t[1], f[1], centers)),
++                np.vstack((centers, f[1], t[2], f[2])),
++                np.vstack((f[3], centers, f[2], t[3])),
++            )),
++            _boundaries=None,
++            _subdomains=None,
++        )
++
++        if self._subdomains is not None:
++            m = replace(
++                m,
++                _subdomains={
++                    name: np.sort(self._adaptive_elements(kept, marked, ixs))
++                    for name, ixs in self._subdomains.items()
++                },
++            )
++
++        if self._boundaries is not None:
++            lookup = {
++                (int(a), int(b)): i
++                for i, (a, b) in enumerate(m.facets.T)
++            }
++            new_facets = [
++                [lookup[(min(a, mid[i]), max(a, mid[i]))],
++                 lookup[(min(mid[i], b), max(mid[i], b))]]
++                if mid[i] >= 0 and i in touched
++                else 2 * [lookup[(int(a), int(b))]]
++                for i, (a, b) in enumerate(self.facets.T)
++            ]
++            new_facets = np.array(new_facets, dtype=np.int32).T
++            m = replace(
++                m,
++                _boundaries={
++                    name: np.unique(new_facets[:, ixs].flatten())
++                    for name, ixs in self._boundaries.items()
++                },
++            )
++
++        return m
++
++    def _adaptive_elements(self, kept, marked, ixs):
++        """Map a set of element indices to the indices after refinement."""
++        position = (-1) * np.ones(self.t.shape[1], dtype=np.int32)
++        position[kept] = np.arange(len(kept), dtype=np.int32)
++        children = (-1) * np.ones(self.t.shape[1], dtype=np.int32)
++        children[marked] = np.arange(len(marked), dtype=np.int32) + len(kept)
++        ixs = np.array(ixs, dtype=np.int32)
++        out = [position[ixs][position[ixs] >= 0]]
++        base = children[ixs][children[ixs] >= 0]
++        for itr in range(4):
++            out.append(base + itr * len(marked))
++        return np.concatenate(out)
++
++    def _coarsen_groups(self):
++        """Find the groups of four elements which form a larger quadrilateral.
++
++        Each group is reported as the shared vertex, the four corners of the
++        larger quadrilateral and the four elements, the latter ordered so that
++        they match the order in which a split produces them.
++
++        """
++        t = self.t
++        p = self.p
++        incident: dict = {}
++        for k in range(4):
++            for elem, vertex in enumerate(t[k]):
++                incident.setdefault(int(vertex), []).append((int(elem), k))
++
++        groups = []
++        for vertex, members in incident.items():
++            if len(members) != 4:
++                continue
++            if sorted(k for _, k in members) != [0, 1, 2, 3]:
++                continue
++            byk = {k: elem for elem, k in members}
++            elems = [byk[2], byk[3], byk[0], byk[1]]
++            corners = [t[itr, elems[itr]] for itr in range(4)]
++            mids = [t[1, elems[0]], t[2, elems[1]],
++                    t[3, elems[2]], t[0, elems[3]]]
++            if [t[0, elems[1]], t[1, elems[2]],
++                    t[2, elems[3]], t[3, elems[0]]] != mids:
++                continue
++            expected = .5 * (p[:, corners] + p[:, np.roll(corners, -1)])
++            if not np.allclose(p[:, mids], expected):
++                continue
++            if not np.allclose(p[:, vertex], p[:, corners].mean(axis=1)):
++                continue
++            groups.append((vertex, corners, elems, mids))
++
++        return sorted(groups, reverse=True)
++
++    def coarsened(self, ix: ndarray):
++        """Return a mesh with the marked elements merged with their siblings.
++
++        Four elements are merged into the quadrilateral they subdivide when
++        all four of them are marked, none of them has already been merged and
++        no facet on the outer boundary of the group carries a hanging vertex.
++        Groups are considered in decreasing order of their shared vertex, so
++        that the most recent refinements are undone first.
++
++        Parameters
++        ----------
++        ix
++            An array of element indices to coarsen.
++
++        """
++        elems = np.arange(self.t.shape[1], dtype=np.int32)[ix]
++        marked = set(int(elem) for elem in elems)
++        split = self.split_facets()
++        t2f = self.t2f
++        consumed: set = set()
++        merged, corners, halved = [], [], []
++
++        for _, group, elems, mids in self._coarsen_groups():
++            if not marked.issuperset(elems) or not consumed.isdisjoint(elems):
++                continue
++            counts = np.bincount(t2f[:, elems].flatten(),
++                                 minlength=self.facets.shape[1])
++            outer = np.nonzero(counts == 1)[0]
++            if len(np.intersect1d(outer, split)) > 0:
++                continue
++            consumed.update(elems)
++            merged.extend(elems)
++            corners.append(group)
++            halved.append(mids)
++
++        if len(corners) == 0:
++            return self
++
++        kept = np.setdiff1d(np.arange(self.t.shape[1], dtype=np.int32),
++                            np.array(merged, dtype=np.int32))
++        groups = np.array(corners, dtype=np.int32).T
++        t = np.hstack((self.t[:, kept], groups))
++        used, inverse = np.unique(t, return_inverse=True)
++        renumber = (-1) * np.ones(self.doflocs.shape[1], dtype=np.int32)
++        renumber[used] = np.arange(len(used), dtype=np.int32)
++
++        m = replace(
++            self,
++            doflocs=self.doflocs[:, used],
++            t=inverse.reshape(t.shape).astype(np.int32),
++            _boundaries=None,
++            _subdomains=None,
++        )
++
++        if self._subdomains is not None:
++            m = replace(
++                m,
++                _subdomains={
++                    name: self._coarsen_elements(kept, merged, ixs)
++                    for name, ixs in self._subdomains.items()
++                },
++            )
++
++        if self._boundaries is not None:
++            after = {(int(a), int(b)): i
++                     for i, (a, b) in enumerate(m.facets.T)}
++            before = {(int(a), int(b)): i
++                      for i, (a, b) in enumerate(self.facets.T)}
++
++            def locate(first, second):
++                ends = renumber[[first, second]]
++                if ends.min() < 0:
++                    return -1
++                return after.get((min(ends), max(ends)), -1)
++
++            new_facets = (-1) * np.ones(self.facets.shape[1], dtype=np.int32)
++            for (a, b), i in before.items():
++                new_facets[i] = locate(a, b)
++            for group, mids in zip(corners, halved):
++                for itr in range(4):
++                    ends = (group[itr], group[(itr + 1) % 4])
++                    facet = locate(*ends)
++                    for end in ends:
++                        half = before.get((min(end, mids[itr]),
++                                           max(end, mids[itr])), -1)
++                        if half >= 0:
++                            new_facets[half] = facet
++
++            m = replace(
++                m,
++                _boundaries={
++                    name: np.unique(new_facets[ixs][new_facets[ixs] >= 0])
++                    for name, ixs in self._boundaries.items()
++                },
++            )
++
++        return m
++
++    def _coarsen_elements(self, kept, merged, ixs):
++        """Map a set of element indices to the indices after coarsening."""
++        position = (-1) * np.ones(self.t.shape[1], dtype=np.int32)
++        position[kept] = np.arange(len(kept), dtype=np.int32)
++        inside = np.isin(np.array(merged, dtype=np.int32),
++                         np.array(ixs, dtype=np.int32)).reshape(-1, 4).all(1)
++        out = [position[np.array(ixs, dtype=np.int32)]]
++        out.append(np.nonzero(inside)[0] + len(kept))
++        out = np.concatenate(out)
++        return np.unique(out[out >= 0])
++
+     @classmethod
+     def init_tensor(cls: Type,
+                     x: ndarray,
+diff --git a/skfem/mesh/mesh_quad_2.py b/skfem/mesh/mesh_quad_2.py
+index 8d147eae..f3d88f2f 100644
+--- a/skfem/mesh/mesh_quad_2.py
++++ b/skfem/mesh/mesh_quad_2.py
+@@ -33,3 +33,7 @@ class MeshQuad2(Mesh2D2, MeshQuad1):
+ 
+     def _uniform(self):
+         return MeshQuad2.from_mesh(MeshQuad1.from_mesh(self).refined())
++
++    def _adaptive(self, ix: ndarray):
++        raise NotImplementedError("Adaptive refinement is supported only for "
++                                  "first-order quadrilateral meshes.")
+diff --git a/skfem/models/__init__.py b/skfem/models/__init__.py
+index 3b3c8d13..67407822 100644
+--- a/skfem/models/__init__.py
++++ b/skfem/models/__init__.py
+@@ -1,2 +1,3 @@
+-from .poisson import laplace, mass, unit_load, vector_laplace  # noqa
++from .poisson import (laplace, mass, residual_estimator, unit_load,  # noqa
++                      vector_laplace)
+ from .elasticity import lame_parameters, linear_stress, linear_elasticity  # noqa
+diff --git a/skfem/models/poisson.py b/skfem/models/poisson.py
+index 13254f68..48d1baab 100644
+--- a/skfem/models/poisson.py
++++ b/skfem/models/poisson.py
+@@ -22,3 +22,50 @@ def mass(u, v, _):
+ @LinearForm
+ def unit_load(v, _):
+     return v
++
++
++def residual_estimator(basis, x, f):
++    """Return elementwise error indicators for the Poisson equation.
++
++    The indicator of an element is the sum of the squared interior residual,
++    scaled by the squared element diameter, and half of the squared jump of
++    the normal derivative over each of its facets, scaled by the facet
++    diameter.  The halves of a split facet contribute to the element on the
++    coarse side as well.
++
++    Parameters
++    ----------
++    basis
++        An object of type :class:`~skfem.assembly.CellBasis`.
++    x
++        The finite element solution.
++    f
++        The load, a function of the global coordinates.
++
++    """
++    import numpy as np
++    from skfem.assembly import Functional, InteriorFacetBasis
++
++    @Functional
++    def interior(w):
++        return w.h ** 2 * f(w.x) ** 2
++
++    @Functional
++    def jump(w):
++        return w.h * dot(grad(w['u1']) - grad(w['u2']), w.n) ** 2
++
++    mesh = basis.mesh
++    f2t = mesh.hanging_f2t()
++    facets = np.nonzero(f2t[1] != -1)[0].astype(np.int32)
++    sides = [InteriorFacetBasis(mesh, basis.elem, facets=facets, side=itr)
++             for itr in [0, 1]]
++
++    eta = interior.elemental(basis)
++    jumps = jump.elemental(sides[0],
++                           u1=sides[0].interpolate(x),
++                           u2=sides[1].interpolate(x))
++
++    for itr in [0, 1]:
++        np.add.at(eta, f2t[itr, facets], .5 * jumps)
++
++    return eta
+diff --git a/skfem/utils.py b/skfem/utils.py
+index b3c3d3a1..455e0a95 100644
+--- a/skfem/utils.py
++++ b/skfem/utils.py
+@@ -673,6 +673,69 @@ def mpc(A: spmatrix,
+     )
+ 
+ 
++def constrain(basis,
++              A: spmatrix,
++              b: Optional[ndarray] = None,
++              x: Optional[ndarray] = None,
++              D: Optional[DofsCollection] = None) -> CondensedSystem:
++    """Eliminate the constrained degrees-of-freedom from a linear system.
++
++    The degrees-of-freedom constrained by the hanging vertices of ``basis``
++    are eliminated together with the ones given through ``D``, and the vector
++    returned by :func:`skfem.utils.solve` has the constrained values filled
++    in.
++
++    Parameters
++    ----------
++    basis
++        The basis used for assembling ``A`` and ``b``.
++    A
++        The system matrix.
++    b
++        The right hand side vector.
++    x
++        The values of the eliminated degrees-of-freedom.  If not given,
++        assumed to be zero.
++    D
++        The set of degree-of-freedom indices to dismiss in addition to the
++        constrained ones.
++
++    """
++    P = basis.hanging_prolongation()
++    S = basis.hanging_dofs()
++    N = A.shape[0]
++
++    given = _flatten_dofs(D)
++    if given is None:
++        given = np.empty((0,), dtype=np.int32)
++    dismiss = np.unique(np.concatenate((given, S)))
++    keep = np.setdiff1d(np.arange(N, dtype=np.int32), dismiss)
++
++    y = np.zeros(N) if x is None else x.copy()
++    y[S] = 0.
++    A = (P.T @ A @ P).tocsr()
++    Pc = P.tocsc()
++
++    if b is None:
++        return (A[keep][:, keep],)
++
++    if isinstance(b, spmatrix):
++        # generalized eigenvalue problem: the mass matrix is constrained too
++        bout = (P.T @ b @ P).tocsr()[keep][:, keep]
++    else:
++        bout = (P.T @ b)[keep] - A[keep][:, dismiss] @ y[dismiss]
++
++    return (
++        A[keep][:, keep],
++        bout,
++        P @ y,
++        (
++            np.arange(N, dtype=np.int32),
++            lambda z: Pc[:, keep] @ z,
++        ),
++    )
++
++
+ # additional utilities
+ 
+ 
+@@ -721,6 +784,19 @@ def adaptive_theta(est, theta=0.5, max=None):
+         return np.nonzero(theta * max < est)[0].astype(np.int32)
+ 
+ 
++def coarsen_theta(est, theta=0.5, max=None):
++    """For choosing which elements to coarsen in an adaptive strategy.
++
++    The counterpart of :func:`skfem.utils.adaptive_theta`: the elements whose
++    indicator stays below the given fraction of the largest indicator are
++    returned.
++
++    """
++    if max is None:
++        max = np.max(est)
++    return np.nonzero(est <= theta * max)[0].astype(np.int32)
++
++
+ @deprecated("Basis.project")
+ def projection(fun,
+                basis_to: Optional[AbstractBasis] = None,

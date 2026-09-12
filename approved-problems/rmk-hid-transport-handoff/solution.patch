@@ -1,0 +1,638 @@
+diff --git a/rmk/src/ble/ble_server.rs b/rmk/src/ble/ble_server.rs
+index f7991a42..0ed6e067 100644
+--- a/rmk/src/ble/ble_server.rs
++++ b/rmk/src/ble/ble_server.rs
+@@ -5,6 +5,8 @@ use super::battery_service::BatteryService;
+ use super::device_info::DeviceConfigurationService;
+ #[cfg(feature = "rynk")]
+ use crate::hid::RynkHidReport;
++#[cfg(feature = "steno")]
++use crate::hid::StenoReport;
+ #[cfg(feature = "vial")]
+ use crate::hid::ViaReport;
+ use crate::hid::{BleCompositeReport, CompositeReportType, HidError, HidWriterTrait, Report};
+@@ -18,6 +20,22 @@ use rmk_types::protocol::rynk::{
+     RYNK_BLE_CHUNK_SIZE, RYNK_HID_REPORT_SIZE, RYNK_INPUT_CHAR_UUID, RYNK_OUTPUT_CHAR_UUID, RYNK_SERVICE_UUID,
+ };
+ 
++#[cfg(feature = "steno")]
++struct BleStenoReport {
++    keys: [u8; 8],
++}
++
++#[cfg(feature = "steno")]
++impl AsInputReport for BleStenoReport {
++    fn serialize(&self, buffer: &mut [u8]) -> Result<usize, usbd_hid::descriptor::BufferOverflow> {
++        if buffer.len() < self.keys.len() {
++            return Err(usbd_hid::descriptor::BufferOverflow);
++        }
++        buffer[..self.keys.len()].copy_from_slice(&self.keys);
++        Ok(self.keys.len())
++    }
++}
++
+ #[cfg(feature = "vial")]
+ #[gatt_server]
+ pub(crate) struct Server {
+@@ -114,12 +132,22 @@ pub(crate) struct VialGattService {
+ /// each characteristic's Report Reference descriptor. Android's HID host only
+ /// attaches to the first HID service instance, so the reports must not be
+ /// spread over multiple service instances.
++fn ble_report_map() -> heapless::Vec<u8, 256> {
++    let mut map = heapless::Vec::new();
++    map.extend_from_slice(BleCompositeReport::desc())
++        .expect("BLE composite report map exceeds capacity");
++    #[cfg(feature = "steno")]
++    map.extend_from_slice(StenoReport::desc())
++        .expect("BLE steno report map exceeds capacity");
++    map
++}
++
+ #[gatt_service(uuid = service::HUMAN_INTERFACE_DEVICE)]
+ pub(crate) struct HidService {
+     #[characteristic(uuid = "2a4a", read, value = [0x01, 0x01, 0x00, 0x03])]
+     pub(crate) hid_info: [u8; 4],
+-    #[characteristic(uuid = "2a4b", read, value = BleCompositeReport::desc().try_into().expect("Failed to convert BleCompositeReport to [u8; 178]"))]
+-    pub(crate) report_map: [u8; 178],
++    #[characteristic(uuid = "2a4b", read, value = ble_report_map())]
++    pub(crate) report_map: heapless::Vec<u8, 256>,
+     #[characteristic(uuid = "2a4c", write_without_response)]
+     pub(crate) hid_control_point: u8,
+     #[characteristic(uuid = "2a4e", read, write_without_response, value = 1)]
+@@ -139,10 +167,16 @@ pub(crate) struct HidService {
+     #[descriptor(uuid = "2908", read, value = [CompositeReportType::System as u8, 1u8])]
+     #[characteristic(uuid = "2a4d", read, notify)]
+     pub(crate) system_report: [u8; 1],
++    #[cfg(feature = "steno")]
++    #[descriptor(uuid = "2908", read, value = [rmk_types::steno::PLOVER_HID_REPORT_ID, 1u8])]
++    #[characteristic(uuid = "2a4d", read, notify)]
++    pub(crate) steno_report: [u8; 8],
+ }
+ 
+ pub(crate) struct BleHidServer<'stack, 'server, 'conn, P: PacketPool> {
+     input_keyboard: Characteristic<[u8; 8]>,
++    #[cfg(feature = "steno")]
++    steno_report: Characteristic<[u8; 8]>,
+     mouse_report: Characteristic<[u8; 5]>,
+     media_report: Characteristic<[u8; 2]>,
+     system_report: Characteristic<[u8; 1]>,
+@@ -153,6 +187,8 @@ impl<'stack, 'server, 'conn, P: PacketPool> BleHidServer<'stack, 'server, 'conn,
+     pub(crate) fn new(server: &Server, conn: &'conn GattConnection<'stack, 'server, P>) -> Self {
+         Self {
+             input_keyboard: server.hid_service.input_keyboard,
++            #[cfg(feature = "steno")]
++            steno_report: server.hid_service.steno_report,
+             mouse_report: server.hid_service.mouse_report,
+             media_report: server.hid_service.media_report,
+             system_report: server.hid_service.system_report,
+@@ -184,12 +220,10 @@ impl<P: PacketPool> HidWriterTrait for BleHidServer<'_, '_, '_, P> {
+             Report::MouseReport(r) => self.notify_report(self.mouse_report, r).await,
+             Report::MediaKeyboardReport(r) => self.notify_report(self.media_report, r).await,
+             Report::SystemControlReport(r) => self.notify_report(self.system_report, r).await,
+-            // Plover HID over BLE is not supported: the stock HID-over-GATT service
+-            // has no stenography characteristic. Drop silently at the writer.
+             #[cfg(feature = "steno")]
+-            Report::StenoReport(_) => {
+-                debug!("Steno chord dropped: Plover HID over BLE is not supported");
+-                Ok(0)
++            Report::StenoReport(r) => {
++                self.notify_report(self.steno_report, &BleStenoReport { keys: r.keys })
++                    .await
+             }
+         }
+     }
+diff --git a/rmk/src/ble/mod.rs b/rmk/src/ble/mod.rs
+index ac4e67cb..66d28310 100644
+--- a/rmk/src/ble/mod.rs
++++ b/rmk/src/ble/mod.rs
+@@ -392,6 +392,8 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
+     let mouse = server.hid_service.mouse_report;
+     let media = server.hid_service.media_report;
+     let system_control = server.hid_service.system_report;
++    #[cfg(feature = "steno")]
++    let steno = server.hid_service.steno_report;
+ 
+     #[cfg(feature = "passkey_entry")]
+     let mut passkey_state = PasskeyInputState::new();
+@@ -489,6 +491,16 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
+                             || event.handle() == mouse.cccd_handle.expect("No CCCD for mouse report")
+                             || event.handle() == media.cccd_handle.expect("No CCCD for media report")
+                             || event.handle() == system_control.cccd_handle.expect("No CCCD for system report")
++                            || {
++                                #[cfg(feature = "steno")]
++                                {
++                                    event.handle() == steno.cccd_handle.expect("No CCCD for steno report")
++                                }
++                                #[cfg(not(feature = "steno"))]
++                                {
++                                    false
++                                }
++                            }
+                             || event.handle() == level.cccd_handle.expect("No CCCD for battery level")
+                         {
+                             cccd_updated = true;
+diff --git a/rmk/src/channel.rs b/rmk/src/channel.rs
+index 30051d85..33b4f576 100644
+--- a/rmk/src/channel.rs
++++ b/rmk/src/channel.rs
+@@ -1,8 +1,11 @@
+ //! Exposed channels which can be used to share data across devices & processors
+ 
++use core::cell::RefCell;
+ use core::future::poll_fn;
++use core::task::{Context, Poll};
+ 
+-use embassy_sync::channel::{Channel, TrySendError};
++use embassy_sync::blocking_mutex::Mutex;
++use embassy_sync::channel::{Channel, TryReceiveError, TrySendError};
+ #[cfg(feature = "_ble")]
+ use embassy_sync::signal::Signal;
+ pub use embassy_sync::{blocking_mutex, channel, pubsub, zerocopy_channel};
+@@ -13,12 +16,268 @@ use {crate::ble::profile::BleProfileAction, rmk_types::led_indicator::LedIndicat
+ #[cfg(all(feature = "vial", feature = "_ble"))]
+ use crate::VIAL_CHANNEL_SIZE;
+ use crate::event::KeyboardEvent;
++#[cfg(feature = "steno")]
++use crate::hid::StenoReport;
+ use crate::hid::{KeyboardReport, Report};
+ #[cfg(feature = "storage")]
+ use crate::{FLASH_CHANNEL_SIZE, storage::FlashOperationMessage};
+ use crate::{REPORT_CHANNEL_SIZE, RawMutex};
++use heapless::Deque;
++use usbd_hid::descriptor::{MediaKeyboardReport, MouseReport, SystemControlReport};
+ 
+-type ReportChannel = Channel<RawMutex, Report, REPORT_CHANNEL_SIZE>;
++const RECONCILIATION_REPORTS: usize = 5;
++
++/// A configured-size live report channel with a bounded reconciliation backlog.
++///
++/// Handoffs can require one snapshot per enabled report family even when the
++/// configured live channel has only one slot. The backlog is lazily moved into
++/// that live channel as the transport writer consumes reports.
++pub struct ReportChannel {
++    live: Channel<RawMutex, Report, REPORT_CHANNEL_SIZE>,
++    pending: Mutex<RawMutex, RefCell<Deque<Report, RECONCILIATION_REPORTS>>>,
++}
++
++impl ReportChannel {
++    const fn new() -> Self {
++        Self {
++            live: Channel::new(),
++            pending: Mutex::new(RefCell::new(Deque::new())),
++        }
++    }
++
++    fn refill(&self) {
++        loop {
++            let Some(report) = self.pending.lock(|pending| pending.borrow_mut().pop_front()) else {
++                return;
++            };
++            if let Err(TrySendError::Full(report)) = self.live.try_send(report) {
++                self.pending.lock(|pending| {
++                    let _ = pending.borrow_mut().push_front(report);
++                });
++                return;
++            }
++        }
++    }
++
++    fn has_pending(&self) -> bool {
++        self.pending.lock(|pending| !pending.borrow().is_empty())
++    }
++
++    fn replace_with(&self, reports: Deque<Report, RECONCILIATION_REPORTS>) {
++        self.live.clear();
++        self.pending.lock(|pending| *pending.borrow_mut() = reports);
++        self.refill();
++    }
++
++    pub fn clear(&self) {
++        self.live.clear();
++        self.pending.lock(|pending| pending.borrow_mut().clear());
++    }
++
++    pub fn len(&self) -> usize {
++        self.live.len() + self.pending.lock(|pending| pending.borrow().len())
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.live.is_empty() && !self.has_pending()
++    }
++
++    pub fn try_send(&self, report: Report) -> Result<(), TrySendError<Report>> {
++        self.refill();
++        if self.has_pending() {
++            Err(TrySendError::Full(report))
++        } else {
++            self.live.try_send(report)
++        }
++    }
++
++    pub fn poll_ready_to_send(&self, cx: &mut Context<'_>) -> Poll<()> {
++        self.refill();
++        self.live.poll_ready_to_send(cx)
++    }
++
++    pub async fn receive(&self) -> Report {
++        self.refill();
++        let report = self.live.receive().await;
++        self.refill();
++        report
++    }
++
++    pub fn try_receive(&self) -> Result<Report, TryReceiveError> {
++        self.refill();
++        let report = self.live.try_receive()?;
++        self.refill();
++        Ok(report)
++    }
++}
++
++impl core::ops::Deref for ReportChannel {
++    type Target = Channel<RawMutex, Report, REPORT_CHANNEL_SIZE>;
++
++    fn deref(&self) -> &Self::Target {
++        &self.live
++    }
++}
++
++impl AsRef<Channel<RawMutex, Report, REPORT_CHANNEL_SIZE>> for ReportChannel {
++    fn as_ref(&self) -> &Channel<RawMutex, Report, REPORT_CHANNEL_SIZE> {
++        &self.live
++    }
++}
++
++const MOUSE_FAMILY: u8 = 1 << 0;
++const MEDIA_FAMILY: u8 = 1 << 1;
++const SYSTEM_FAMILY: u8 = 1 << 2;
++#[cfg(feature = "steno")]
++const STENO_FAMILY: u8 = 1 << 3;
++
++#[derive(Clone, Copy)]
++struct HidReportState {
++    keyboard_modifier: u8,
++    keyboard_reserved: u8,
++    keyboard_leds: u8,
++    keyboard_keycodes: [u8; 6],
++    mouse_buttons: u8,
++    media_usage_id: u16,
++    system_usage_id: u8,
++    #[cfg(feature = "steno")]
++    steno_keys: [u8; 8],
++    usb_dirty: u8,
++    ble_dirty: u8,
++}
++
++impl HidReportState {
++    const fn new() -> Self {
++        Self {
++            keyboard_modifier: 0,
++            keyboard_reserved: 0,
++            keyboard_leds: 0,
++            keyboard_keycodes: [0; 6],
++            mouse_buttons: 0,
++            media_usage_id: 0,
++            system_usage_id: 0,
++            #[cfg(feature = "steno")]
++            steno_keys: [0; 8],
++            usb_dirty: 0,
++            ble_dirty: 0,
++        }
++    }
++
++    fn remember(&mut self, report: &Report) -> Option<u8> {
++        match report {
++            Report::KeyboardReport(report) => {
++                self.keyboard_modifier = report.modifier;
++                self.keyboard_reserved = report.reserved;
++                self.keyboard_leds = report.leds;
++                self.keyboard_keycodes = report.keycodes;
++                None
++            }
++            Report::MouseReport(report) => {
++                self.mouse_buttons = report.buttons;
++                (report.buttons != 0).then_some(MOUSE_FAMILY)
++            }
++            Report::MediaKeyboardReport(report) => {
++                self.media_usage_id = report.usage_id;
++                (report.usage_id != 0).then_some(MEDIA_FAMILY)
++            }
++            Report::SystemControlReport(report) => {
++                self.system_usage_id = report.usage_id;
++                (report.usage_id != 0).then_some(SYSTEM_FAMILY)
++            }
++            #[cfg(feature = "steno")]
++            Report::StenoReport(report) => {
++                self.steno_keys = report.keys;
++                (report.keys != [0; 8]).then_some(STENO_FAMILY)
++            }
++        }
++    }
++
++    fn mark_dirty(&mut self, transport: ConnectionType, family: Option<u8>) {
++        let Some(family) = family else { return };
++        match transport {
++            ConnectionType::Usb => self.usb_dirty |= family,
++            ConnectionType::Ble => self.ble_dirty |= family,
++        }
++    }
++
++    fn take_dirty(&mut self, transport: ConnectionType) -> u8 {
++        let dirty = match transport {
++            ConnectionType::Usb => &mut self.usb_dirty,
++            ConnectionType::Ble => &mut self.ble_dirty,
++        };
++        let result = *dirty;
++        *dirty = 0;
++        result
++    }
++
++    fn releases(self, dirty: u8) -> Deque<Report, RECONCILIATION_REPORTS> {
++        let mut reports = Deque::new();
++        let _ = reports.push_back(Report::KeyboardReport(KeyboardReport::default()));
++        if dirty & MOUSE_FAMILY != 0 {
++            let _ = reports.push_back(Report::MouseReport(MouseReport {
++                buttons: 0,
++                x: 0,
++                y: 0,
++                wheel: 0,
++                pan: 0,
++            }));
++        }
++        if dirty & MEDIA_FAMILY != 0 {
++            let _ = reports.push_back(Report::MediaKeyboardReport(MediaKeyboardReport { usage_id: 0 }));
++        }
++        if dirty & SYSTEM_FAMILY != 0 {
++            let _ = reports.push_back(Report::SystemControlReport(SystemControlReport { usage_id: 0 }));
++        }
++        #[cfg(feature = "steno")]
++        if dirty & STENO_FAMILY != 0 {
++            let _ = reports.push_back(Report::StenoReport(StenoReport { keys: [0; 8] }));
++        }
++        reports
++    }
++
++    fn current(self) -> (Deque<Report, RECONCILIATION_REPORTS>, u8) {
++        let mut reports = Deque::new();
++        if self.keyboard_modifier != 0 || self.keyboard_keycodes != [0; 6] {
++            let _ = reports.push_back(Report::KeyboardReport(KeyboardReport {
++                modifier: self.keyboard_modifier,
++                reserved: self.keyboard_reserved,
++                leds: self.keyboard_leds,
++                keycodes: self.keyboard_keycodes,
++            }));
++        }
++        let mut dirty = 0;
++        if self.mouse_buttons != 0 {
++            dirty |= MOUSE_FAMILY;
++            let _ = reports.push_back(Report::MouseReport(MouseReport {
++                buttons: self.mouse_buttons,
++                x: 0,
++                y: 0,
++                wheel: 0,
++                pan: 0,
++            }));
++        }
++        if self.media_usage_id != 0 {
++            dirty |= MEDIA_FAMILY;
++            let _ = reports.push_back(Report::MediaKeyboardReport(MediaKeyboardReport {
++                usage_id: self.media_usage_id,
++            }));
++        }
++        if self.system_usage_id != 0 {
++            dirty |= SYSTEM_FAMILY;
++            let _ = reports.push_back(Report::SystemControlReport(SystemControlReport {
++                usage_id: self.system_usage_id,
++            }));
++        }
++        #[cfg(feature = "steno")]
++        if self.steno_keys != [0; 8] {
++            dirty |= STENO_FAMILY;
++            let _ = reports.push_back(Report::StenoReport(StenoReport { keys: self.steno_keys }));
++        }
++        (reports, dirty)
++    }
++}
++
++static HID_REPORT_STATE: Mutex<RawMutex, RefCell<HidReportState>> = Mutex::new(RefCell::new(HidReportState::new()));
+ 
+ /// Signal for LED indicator, used in BLE keyboards only since BLE receiving is not async
+ #[cfg(feature = "_ble")]
+@@ -27,11 +286,11 @@ pub(crate) static LED_SIGNAL: Signal<RawMutex, LedIndicator> = Signal::new();
+ /// Drained by the USB HID writer task. Routed through `send_hid_report`
+ /// from the keyboard task and ad-hoc producers (e.g. steno chord output).
+ #[cfg(not(feature = "_no_usb"))]
+-pub static USB_REPORT_CHANNEL: ReportChannel = Channel::new();
++pub static USB_REPORT_CHANNEL: ReportChannel = ReportChannel::new();
+ 
+ /// Drained by the BLE HID writer task. Routed through `send_hid_report`.
+ #[cfg(feature = "_ble")]
+-pub static BLE_REPORT_CHANNEL: ReportChannel = Channel::new();
++pub static BLE_REPORT_CHANNEL: ReportChannel = ReportChannel::new();
+ 
+ fn report_channel(transport: ConnectionType) -> Option<&'static ReportChannel> {
+     match transport {
+@@ -44,46 +303,85 @@ fn report_channel(transport: ConnectionType) -> Option<&'static ReportChannel> {
+     }
+ }
+ 
+-fn active_report_channel() -> Option<(ConnectionType, &'static ReportChannel)> {
+-    let transport = crate::state::active_transport()?;
+-    report_channel(transport).map(|ch| (transport, ch))
++enum SendAttempt {
++    Sent,
++    Disconnected,
++    Full(Report, (ConnectionType, u32), &'static ReportChannel),
+ }
+ 
+-/// Reports generated while no transport is selected are dropped on the floor.
++/// Tracks absolute HID state even while disconnected, then routes the live
++/// report when a transport is selected.
+ pub(crate) async fn send_hid_report(mut report: Report) {
+-    let Some((transport, ch)) = active_report_channel() else {
+-        return;
+-    };
+-
++    let mut expected_route = None;
+     loop {
+-        match ch.try_send(report) {
+-            Ok(()) => return,
+-            Err(TrySendError::Full(r)) => report = r,
+-        }
+-
+-        poll_fn(|cx| ch.poll_ready_to_send(cx)).await;
+-        if crate::state::active_transport() != Some(transport) {
+-            return;
++        match crate::state::with_active_route(|active| {
++            let family = HID_REPORT_STATE.lock(|state| state.borrow_mut().remember(&report));
++            if expected_route.is_some() && active != expected_route {
++                return SendAttempt::Disconnected;
++            }
++            let Some(route @ (transport, _)) = active else {
++                return SendAttempt::Disconnected;
++            };
++            let Some(ch) = report_channel(transport) else {
++                return SendAttempt::Disconnected;
++            };
++            match ch.try_send(report) {
++                Ok(()) => {
++                    HID_REPORT_STATE.lock(|state| state.borrow_mut().mark_dirty(transport, family));
++                    SendAttempt::Sent
++                }
++                Err(TrySendError::Full(report)) => SendAttempt::Full(report, route, ch),
++            }
++        }) {
++            SendAttempt::Sent | SendAttempt::Disconnected => return,
++            SendAttempt::Full(returned, route, ch) => {
++                report = returned;
++                expected_route = Some(route);
++                poll_fn(|cx| ch.poll_ready_to_send(cx)).await;
++                if crate::state::active_route() != Some(route) {
++                    return;
++                }
++            }
+         }
+     }
+ }
+ 
+-/// Drops the report when the active transport's queue is full or no
+-/// transport is selected. Use for producers where back-pressure would block
+-/// the matrix scan (e.g. steno chord output).
++/// Tracks absolute HID state, but drops the live report when the active
++/// transport's queue is full or no transport is selected. Use for producers
++/// where back-pressure would block the matrix scan (e.g. steno chord output).
+ pub(crate) fn try_send_hid_report(report: Report) {
+-    if let Some((_, ch)) = active_report_channel() {
+-        let _ = ch.try_send(report);
+-    }
++    crate::state::with_active_transport(|active| {
++        let family = HID_REPORT_STATE.lock(|state| state.borrow_mut().remember(&report));
++        if let Some(transport) = active
++            && let Some(ch) = report_channel(transport)
++            && ch.try_send(report).is_ok()
++        {
++            HID_REPORT_STATE.lock(|state| state.borrow_mut().mark_dirty(transport, family));
++        }
++    });
+ }
+ 
+-/// Drains queued reports for `transport` and leaves an all-up keyboard report
+-/// for its writer. Called on active-transport flips so the previous host
+-/// releases any pressed keys without replaying stale queued reports later.
+-pub(crate) fn clear_and_release_report_channel(transport: ConnectionType) {
+-    if let Some(ch) = report_channel(transport) {
+-        ch.clear();
+-        let _ = ch.try_send(Report::KeyboardReport(KeyboardReport::default()));
++/// Drains stale traffic, releases state the previous host may have observed,
++/// and replays currently-held absolute state to the new host.
++pub(crate) fn reconcile_report_channels(previous: Option<ConnectionType>, current: Option<ConnectionType>) {
++    let (snapshot, previous_dirty) = HID_REPORT_STATE.lock(|state| {
++        let mut state = state.borrow_mut();
++        let previous_dirty = previous.map(|transport| state.take_dirty(transport)).unwrap_or(0);
++        (*state, previous_dirty)
++    });
++
++    if let Some(previous) = previous
++        && let Some(channel) = report_channel(previous)
++    {
++        channel.replace_with(snapshot.releases(previous_dirty));
++    }
++
++    if let Some(current) = current
++        && let Some(channel) = report_channel(current)
++    {
++        let (reports, dirty) = snapshot.current();
++        channel.replace_with(reports);
++        HID_REPORT_STATE.lock(|state| state.borrow_mut().mark_dirty(current, Some(dirty)));
+     }
+ }
+ 
+diff --git a/rmk/src/state.rs b/rmk/src/state.rs
+index c25340ae..ccf50df6 100644
+--- a/rmk/src/state.rs
++++ b/rmk/src/state.rs
+@@ -1,4 +1,5 @@
+ use core::cell::Cell;
++use core::sync::atomic::{AtomicU32, Ordering};
+ 
+ use embassy_sync::blocking_mutex::Mutex;
+ use rmk_types::ble::BleState;
+@@ -15,10 +16,37 @@ use crate::event::{ConnectionStatusChangeEvent, publish_event};
+ pub(crate) static CONNECTION_STATUS: Mutex<RawMutex, Cell<ConnectionStatus>> =
+     Mutex::new(Cell::new(ConnectionStatus::new()));
+ 
++// Each active-output change creates a new route activation. The transport may
++// be the same before and after an intervening disconnect or preference change,
++// so transport identity alone cannot identify the route a blocked send joined.
++static ACTIVE_ROUTE_GENERATION: AtomicU32 = AtomicU32::new(0);
++
+ pub(crate) fn active_transport() -> Option<ConnectionType> {
+     CONNECTION_STATUS.lock(|c| c.get().decide_active())
+ }
+ 
++pub(crate) fn with_active_transport<R>(f: impl FnOnce(Option<ConnectionType>) -> R) -> R {
++    CONNECTION_STATUS.lock(|c| f(c.get().decide_active()))
++}
++
++pub(crate) fn active_route() -> Option<(ConnectionType, u32)> {
++    CONNECTION_STATUS.lock(|c| {
++        c.get()
++            .decide_active()
++            .map(|transport| (transport, ACTIVE_ROUTE_GENERATION.load(Ordering::Relaxed)))
++    })
++}
++
++pub(crate) fn with_active_route<R>(f: impl FnOnce(Option<(ConnectionType, u32)>) -> R) -> R {
++    CONNECTION_STATUS.lock(|c| {
++        let route = c
++            .get()
++            .decide_active()
++            .map(|transport| (transport, ACTIVE_ROUTE_GENERATION.load(Ordering::Relaxed)));
++        f(route)
++    })
++}
++
+ pub(crate) fn current_connection_status() -> ConnectionStatus {
+     CONNECTION_STATUS.lock(|c| c.get())
+ }
+@@ -47,7 +75,7 @@ pub(crate) fn current_ble_status() -> BleStatus {
+ 
+ /// Read-modify-write the connection status atomically.
+ pub(crate) fn update_status(f: impl FnOnce(&mut ConnectionStatus)) {
+-    let Some((prev, new)) = CONNECTION_STATUS.lock(|c| {
++    let Some(new) = CONNECTION_STATUS.lock(|c| {
+         let prev = c.get();
+         let mut new = prev;
+         f(&mut new);
+@@ -55,23 +83,18 @@ pub(crate) fn update_status(f: impl FnOnce(&mut ConnectionStatus)) {
+             return None;
+         }
+         c.set(new);
+-        Some((prev, new))
++
++        let prev_active = prev.decide_active();
++        let new_active = new.decide_active();
++        if prev_active != new_active {
++            ACTIVE_ROUTE_GENERATION.fetch_add(1, Ordering::Relaxed);
++            crate::channel::reconcile_report_channels(prev_active, new_active);
++        }
++        Some(new)
+     }) else {
+         return;
+     };
+ 
+-    let prev_active = prev.decide_active();
+-    let new_active = new.decide_active();
+-
+-    if prev_active != new_active
+-        && let Some(prev_active) = prev_active
+-    {
+-        // Drain after the commit so any producer racing past the mutex reads
+-        // the new state and routes to the new channel rather than the one
+-        // about to be cleared.
+-        crate::channel::clear_and_release_report_channel(prev_active);
+-    }
+-
+     publish_event(ConnectionStatusChangeEvent(new));
+ }
+ 

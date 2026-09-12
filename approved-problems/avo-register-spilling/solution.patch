@@ -1,0 +1,779 @@
+diff --git a/build/context.go b/build/context.go
+index 8043130..da15873 100644
+--- a/build/context.go
++++ b/build/context.go
+@@ -150,6 +150,22 @@ func (c *Context) AllocLocal(size int) operand.Mem {
+ 	return c.activefunc().AllocLocal(size)
+ }
+ 
++// Reserve withholds the given physical registers from automatic allocation in
++// the active function. Reserved registers may still be used explicitly.
++func (c *Context) Reserve(rs ...reg.Register) {
++	if err := c.activefunc().Reserve(rs...); err != nil {
++		c.adderror(err)
++	}
++}
++
++// Pin binds a virtual register to a physical register for the whole of the
++// active function.
++func (c *Context) Pin(v, p reg.Register) {
++	if err := c.activefunc().Pin(v, p); err != nil {
++		c.adderror(err)
++	}
++}
++
+ // Instruction adds an instruction to the active function.
+ func (c *Context) Instruction(i *ir.Instruction) {
+ 	c.activefunc().AddInstruction(i)
+diff --git a/build/global.go b/build/global.go
+index dae6795..bed4785 100644
+--- a/build/global.go
++++ b/build/global.go
+@@ -147,6 +147,12 @@ func Implement(name string) { ctx.Implement(name) }
+ // Returns a reference to the base pointer for the newly allocated region.
+ func AllocLocal(size int) operand.Mem { return ctx.AllocLocal(size) }
+ 
++// Reserve withholds the given physical registers from automatic allocation in the active function.
++func Reserve(rs ...reg.Register) { ctx.Reserve(rs...) }
++
++// Pin binds a virtual register to a physical register for the whole of the currently active function.
++func Pin(v, p reg.Register) { ctx.Pin(v, p) }
++
+ // Label adds a label to the active function.
+ func Label(name string) { ctx.Label(name) }
+ 
+diff --git a/ir/ir.go b/ir/ir.go
+index 871d488..7eb36ba 100644
+--- a/ir/ir.go
++++ b/ir/ir.go
+@@ -185,6 +185,12 @@ type Function struct {
+ 	// Register allocation.
+ 	Allocation reg.Allocation
+ 
++	// Reserved registers are withheld from automatic allocation.
++	Reserved []reg.Register
++
++	// Pinned records virtual registers bound to a specific physical register.
++	Pinned []PinnedRegister
++
+ 	// ISA is the list of required instruction set extensions.
+ 	ISA []string
+ }
+@@ -212,6 +218,55 @@ func (f *Function) SetSignature(s *gotypes.Signature) {
+ 	f.Signature = s
+ }
+ 
++// PinnedRegister binds a virtual register to a physical one.
++type PinnedRegister struct {
++	Virtual  reg.Register
++	Physical reg.Register
++}
++
++// Pin binds a virtual register to a physical register for the whole function.
++// A pinned register is never spilled, and the physical register is not used
++// for anything else that is live at the same time.
++func (f *Function) Pin(v, p reg.Register) error {
++	if reg.ToVirtual(v) == nil {
++		return errors.New("can only pin a virtual register")
++	}
++	if !allocatable(p) {
++		return errors.New("can only pin to a physical register")
++	}
++	if v.Kind() != p.Kind() {
++		return errors.New("cannot pin a register to a different kind")
++	}
++	for _, pinned := range f.Pinned {
++		if pinned.Virtual.ID() == v.ID() && pinned.Physical.ID() != p.ID() {
++			return errors.New("register pinned twice")
++		}
++	}
++	f.Pinned = append(f.Pinned, PinnedRegister{Virtual: v, Physical: p})
++	return nil
++}
++
++// Reserve withholds the given physical registers from automatic allocation.
++// Reserving a register reserves it at every width. Reserved registers may
++// still be referenced explicitly.
++func (f *Function) Reserve(rs ...reg.Register) error {
++	for _, r := range rs {
++		if !allocatable(r) {
++			return errors.New("cannot reserve a register the allocator cannot assign")
++		}
++		f.Reserved = append(f.Reserved, r)
++	}
++	return nil
++}
++
++// allocatable reports whether the register is one the allocator may assign.
++// Pseudo registers such as the frame and static base pointers have no width,
++// and registers the architecture reserves are never handed out.
++func allocatable(r reg.Register) bool {
++	p := reg.ToPhysical(r)
++	return p != nil && p.Mask() != 0 && (p.Info()&reg.Restricted) == 0
++}
++
+ // AllocLocal allocates size bytes in this function's stack.
+ // Returns a reference to the base pointer for the newly allocated region.
+ func (f *Function) AllocLocal(size int) operand.Mem {
+diff --git a/pass/alloc.go b/pass/alloc.go
+index 39ada55..21bc771 100644
+--- a/pass/alloc.go
++++ b/pass/alloc.go
+@@ -14,6 +14,10 @@ type edge struct {
+ 	X, Y reg.ID
+ }
+ 
++// errPressure reports that a virtual register has no physical register
++// available to it.
++var errPressure = errors.New("failed to allocate registers")
++
+ // Allocator is a graph-coloring register allocator.
+ type Allocator struct {
+ 	registers  []reg.ID
+@@ -21,6 +25,7 @@ type Allocator struct {
+ 	allocation reg.Allocation
+ 	edges      []*edge
+ 	possible   map[reg.ID][]reg.ID
++	widths     map[reg.ID][]reg.Spec
+ }
+ 
+ // NewAllocator builds an allocator for the given physical registers.
+@@ -49,6 +54,7 @@ func NewAllocator(rs []reg.Physical) (*Allocator, error) {
+ 		priority:   map[reg.ID]int{},
+ 		allocation: reg.NewEmptyAllocation(),
+ 		possible:   map[reg.ID][]reg.ID{},
++		widths:     map[reg.ID][]reg.Spec{},
+ 	}
+ 	a.sortregisters()
+ 
+@@ -104,12 +110,55 @@ func (a *Allocator) Add(v reg.ID) {
+ 	if !v.IsVirtual() {
+ 		return
+ 	}
++	if _, assigned := a.allocation[v]; assigned {
++		return
++	}
+ 	if _, found := a.possible[v]; found {
+ 		return
+ 	}
+ 	a.possible[v] = a.possibleregisters(v)
+ }
+ 
++// AddRegister adds a virtual register to be allocated, recording the width it
++// is referenced at. A virtual register may only be allocated to a physical
++// register that has a form at every width it is referenced at.
++func (a *Allocator) AddRegister(r reg.Register) {
++	v := r.ID()
++	if !v.IsVirtual() {
++		return
++	}
++
++	s := reg.Spec(r.Mask())
++	for _, known := range a.widths[v] {
++		if known == s {
++			a.Add(v)
++			return
++		}
++	}
++
++	a.widths[v] = append(a.widths[v], s)
++	delete(a.possible, v)
++	a.Add(v)
++}
++
++// Assign fixes the allocation of a virtual register to a physical register.
++func (a *Allocator) Assign(v, p reg.ID) error {
++	if !v.IsVirtual() || !p.IsPhysical() {
++		return errors.New("can only assign a virtual register to a physical one")
++	}
++	if !a.supports(p, v) {
++		return errors.New("physical register does not have every required width")
++	}
++	if q, found := a.allocation[v]; found && q != p {
++		return errors.New("register assigned twice")
++	}
++
++	a.allocation[v] = p
++	delete(a.possible, v)
++
++	return nil
++}
++
+ // Allocate allocates physical registers.
+ func (a *Allocator) Allocate() (reg.Allocation, error) {
+ 	for {
+@@ -182,7 +231,7 @@ func (a *Allocator) discardconflicting(v, p reg.ID) {
+ func (a *Allocator) alloc(v reg.ID) error {
+ 	ps := a.possible[v]
+ 	if len(ps) == 0 {
+-		return errors.New("failed to allocate registers")
++		return errPressure
+ 	}
+ 	p := ps[0]
+ 	a.allocation[v] = p
+@@ -198,10 +247,21 @@ func (a *Allocator) remaining() int {
+ // possibleregisters returns all allocate-able registers for the given virtual.
+ func (a *Allocator) possibleregisters(v reg.ID) []reg.ID {
+ 	return filterregisters(a.registers, func(r reg.ID) bool {
+-		return v.Kind() == r.Kind()
++		return v.Kind() == r.Kind() && a.supports(r, v)
+ 	})
+ }
+ 
++// supports reports whether the physical register has a form at every width the
++// virtual register is referenced at.
++func (a *Allocator) supports(p, v reg.ID) bool {
++	for _, s := range a.widths[v] {
++		if reg.LookupID(p, s) == nil {
++			return false
++		}
++	}
++	return true
++}
++
+ func filterregisters(in []reg.ID, predicate func(reg.ID) bool) []reg.ID {
+ 	var rs []reg.ID
+ 	for _, r := range in {
+diff --git a/pass/reg.go b/pass/reg.go
+index 6c19eb8..352c519 100644
+--- a/pass/reg.go
++++ b/pass/reg.go
+@@ -2,6 +2,7 @@ package pass
+ 
+ import (
+ 	"errors"
++	"sort"
+ 
+ 	"github.com/mmcloughlin/avo/gotypes"
+ 	"github.com/mmcloughlin/avo/ir"
+@@ -72,15 +73,63 @@ func Liveness(fn *ir.Function) error {
+ 	return nil
+ }
+ 
+-// AllocateRegisters performs register allocation.
++// AllocateRegisters performs register allocation. Virtual registers that
++// cannot be held in physical registers are spilled to the function's stack
++// frame and reloaded around every reference to them.
+ func AllocateRegisters(fn *ir.Function) error {
++	s := newSpiller(fn)
++	for {
++		err := allocateRegisters(fn)
++		if err == nil {
++			return nil
++		}
++
++		var p *pressure
++		if !errors.As(err, &p) {
++			return err
++		}
++
++		spilled, err := s.Spill(p.Kind)
++		if err != nil {
++			return err
++		}
++		if !spilled {
++			return p.Err
++		}
++
++		// Reloads and stores are new instructions, and one of them may take
++		// over as the target of an existing label, so control flow and
++		// liveness must be recomputed before allocation is retried.
++		if err := LabelTarget(fn); err != nil {
++			return err
++		}
++		for _, i := range fn.Instructions() {
++			i.Succ, i.Pred = nil, nil
++		}
++		if err := CFG(fn); err != nil {
++			return err
++		}
++		if err := Liveness(fn); err != nil {
++			return err
++		}
++	}
++}
++
++// allocateRegisters attempts to assign a physical register to every virtual
++// register in the function. Kinds that only appear as explicit physical
++// references need no pool of their own. Failure caused by register pressure is reported as
++// a pressure error, naming the kind of register that ran out.
++func allocateRegisters(fn *ir.Function) error {
+ 	// Initialize one allocator per kind.
+ 	as := map[reg.Kind]*Allocator{}
+ 	for _, i := range fn.Instructions() {
+ 		for _, r := range i.Registers() {
++			if !r.ID().IsVirtual() {
++				continue
++			}
+ 			k := r.Kind()
+ 			if _, found := as[k]; !found {
+-				a, err := NewAllocatorForKind(k)
++				a, err := allocatorForKind(k, fn.Reserved)
+ 				if err != nil {
+ 					return err
+ 				}
+@@ -104,10 +153,24 @@ func AllocateRegisters(fn *ir.Function) error {
+ 		}
+ 	}
+ 
+-	// Populate registers to be allocated.
++	// Populate registers to be allocated, recording the widths each one is
++	// referenced at.
+ 	for _, i := range fn.Instructions() {
+ 		for _, r := range i.Registers() {
+-			as[r.Kind()].Add(r.ID())
++			if a, found := as[r.Kind()]; found {
++				a.AddRegister(r)
++			}
++		}
++	}
++
++	// Apply pinned registers.
++	for _, p := range fn.Pinned {
++		a, found := as[p.Virtual.Kind()]
++		if !found {
++			continue
++		}
++		if err := a.Assign(p.Virtual.ID(), p.Physical.ID()); err != nil {
++			return err
+ 		}
+ 	}
+ 
+@@ -115,16 +178,30 @@ func AllocateRegisters(fn *ir.Function) error {
+ 	for _, i := range fn.Instructions() {
+ 		for _, d := range i.OutputRegisters() {
+ 			k := d.Kind()
++			a, found := as[k]
++			if !found {
++				continue
++			}
+ 			out := i.LiveOut.OfKind(k)
+ 			out.DiscardRegister(d)
+-			as[k].AddInterferenceSet(d, out)
++			a.AddInterferenceSet(d, out)
+ 		}
+ 	}
+ 
+-	// Execute register allocation.
++	// Execute register allocation. Kinds are processed in a fixed order so
++	// that the choice of register to spill does not depend on map iteration.
++	var kinds []reg.Kind
++	for k := range as {
++		kinds = append(kinds, k)
++	}
++	sort.Slice(kinds, func(i, j int) bool { return kinds[i] < kinds[j] })
++
+ 	fn.Allocation = reg.NewEmptyAllocation()
+-	for _, a := range as {
+-		al, err := a.Allocate()
++	for _, k := range kinds {
++		al, err := as[k].Allocate()
++		if errors.Is(err, errPressure) {
++			return &pressure{Kind: k, Err: err}
++		}
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -136,6 +213,39 @@ func AllocateRegisters(fn *ir.Function) error {
+ 	return nil
+ }
+ 
++// allocatorForKind builds an allocator for the given kind of registers,
++// excluding any reserved by the function.
++func allocatorForKind(k reg.Kind, reserved []reg.Register) (*Allocator, error) {
++	f := reg.FamilyOfKind(k)
++	if f == nil {
++		return nil, errors.New("unknown register family")
++	}
++
++	var rs []reg.Physical
++	for _, r := range f.Registers() {
++		if !isReserved(r, reserved) {
++			rs = append(rs, r)
++		}
++	}
++
++	if len(rs) == 0 {
++		return nil, errors.New("no allocatable registers")
++	}
++
++	return NewAllocator(rs)
++}
++
++// isReserved reports whether the physical register overlaps one of the
++// reserved registers. Reserving a register reserves every width of it.
++func isReserved(p reg.Physical, reserved []reg.Register) bool {
++	for _, r := range reserved {
++		if r.ID() == p.ID() {
++			return true
++		}
++	}
++	return false
++}
++
+ // BindRegisters applies the result of register allocation, replacing all virtual registers with their assigned physical registers.
+ func BindRegisters(fn *ir.Function) error {
+ 	for _, i := range fn.Instructions() {
+diff --git a/pass/spill.go b/pass/spill.go
+new file mode 100644
+index 0000000..87ceff4
+--- /dev/null
++++ b/pass/spill.go
+@@ -0,0 +1,357 @@
++package pass
++
++import (
++	"errors"
++	"fmt"
++	"sort"
++
++	"github.com/mmcloughlin/avo/ir"
++	"github.com/mmcloughlin/avo/operand"
++	"github.com/mmcloughlin/avo/reg"
++)
++
++// pressure reports that a kind of register ran out of physical registers
++// during allocation. Such a failure may be resolved by spilling.
++type pressure struct {
++	Kind reg.Kind
++	Err  error
++}
++
++func (p *pressure) Error() string {
++	return fmt.Sprintf("register kind %v: %s", p.Kind, p.Err)
++}
++
++func (p *pressure) Unwrap() error { return p.Err }
++
++// spiller rewrites a function so that selected virtual registers live in stack
++// slots, reloaded into short-lived temporaries around every reference.
++type spiller struct {
++	fn    *ir.Function
++	slots map[reg.ID]operand.Mem
++	pool  []*slot
++	next  map[reg.Kind]reg.Index
++	temps map[reg.ID]bool
++}
++
++// slot is one stack slot and the instructions over which the values held there
++// are live. A slot may serve several values as long as no two of them are live
++// at the same instruction.
++type slot struct {
++	mem  operand.Mem
++	size uint
++	live map[*ir.Instruction]bool
++}
++
++// newSpiller builds a spiller for the function. Virtual register indexes are
++// scanned so that temporaries introduced later cannot collide with them.
++func newSpiller(fn *ir.Function) *spiller {
++	s := &spiller{
++		fn:    fn,
++		slots: map[reg.ID]operand.Mem{},
++		next:  map[reg.Kind]reg.Index{},
++		temps: map[reg.ID]bool{},
++	}
++	for _, i := range fn.Instructions() {
++		for _, r := range i.Registers() {
++			v := reg.ToVirtual(r)
++			if v == nil {
++				continue
++			}
++			if idx := v.VirtualIndex(); idx >= s.next[v.Kind()] {
++				s.next[v.Kind()] = idx + 1
++			}
++		}
++	}
++	return s
++}
++
++// Spill moves one virtual register of the given kind out of registers and into
++// a stack slot. Reports whether a register was spilled.
++func (s *spiller) Spill(k reg.Kind) (bool, error) {
++	id, found := s.candidate(k)
++	if !found {
++		return false, nil
++	}
++
++	slot := s.slot(id)
++
++	var nodes []ir.Node
++	for _, node := range s.fn.Nodes {
++		i, ok := node.(*ir.Instruction)
++		if !ok {
++			nodes = append(nodes, node)
++			continue
++		}
++
++		before, after, err := s.rewrite(i, id, slot)
++		if err != nil {
++			return false, err
++		}
++
++		nodes = append(nodes, before...)
++		nodes = append(nodes, i)
++		nodes = append(nodes, after...)
++	}
++	s.fn.Nodes = nodes
++
++	return true, nil
++}
++
++// candidate selects the virtual register of the given kind with the longest
++// live range, preferring the lowest identifier on a tie for determinism.
++// Pinned registers, and the temporaries introduced by spilling, are never
++// candidates; excluding the latter guarantees that repeated spilling
++// terminates.
++func (s *spiller) candidate(k reg.Kind) (reg.ID, bool) {
++	pinned := map[reg.ID]bool{}
++	for _, p := range s.fn.Pinned {
++		pinned[p.Virtual.ID()] = true
++	}
++
++	live := map[reg.ID]int{}
++	for _, i := range s.fn.Instructions() {
++		for id := range i.LiveIn {
++			if id.IsVirtual() && id.Kind() == k && !s.temps[id] && !pinned[id] {
++				live[id]++
++			}
++		}
++	}
++
++	best, n := reg.ID(0), 0
++	for id, l := range live {
++		if _, spilled := s.slots[id]; spilled {
++			continue
++		}
++		if l > n || (l == n && id < best) {
++			best, n = id, l
++		}
++	}
++
++	return best, n > 0
++}
++
++// slot returns the stack slot assigned to the given virtual register. A slot
++// already holding values that are dead wherever this one is live is reused, so
++// the frame grows with the number of values spilled at once rather than with
++// the number spilled overall. Otherwise a slot is added, sized to the widest
++// reference to the register and placed on a multiple of its own size, which
++// keeps it clear of whatever the function has already allocated and leaves the
++// frame a whole number of slots.
++func (s *spiller) slot(id reg.ID) operand.Mem {
++	if m, found := s.slots[id]; found {
++		return m
++	}
++
++	size := uint(8)
++	for _, i := range s.fn.Instructions() {
++		for _, r := range i.Registers() {
++			if r.ID() == id && r.Size() > size {
++				size = r.Size()
++			}
++		}
++	}
++
++	live := s.liveRange(id)
++
++	for _, p := range s.pool {
++		if p.size != size || p.overlaps(live) {
++			continue
++		}
++		for i := range live {
++			p.live[i] = true
++		}
++		s.slots[id] = p.mem
++		return p.mem
++	}
++
++	if pad := s.fn.LocalSize % int(size); pad != 0 {
++		s.fn.AllocLocal(int(size) - pad)
++	}
++
++	p := &slot{mem: s.fn.AllocLocal(int(size)), size: size, live: live}
++	s.pool = append(s.pool, p)
++	s.slots[id] = p.mem
++
++	return p.mem
++}
++
++// liveRange collects the instructions where the given register is live, which
++// is what decides whether two values can share a slot.
++func (s *spiller) liveRange(id reg.ID) map[*ir.Instruction]bool {
++	live := map[*ir.Instruction]bool{}
++	for _, i := range s.fn.Instructions() {
++		if _, in := i.LiveIn[id]; in {
++			live[i] = true
++			continue
++		}
++		if _, out := i.LiveOut[id]; out {
++			live[i] = true
++			continue
++		}
++		for _, r := range i.Registers() {
++			if r.ID() == id {
++				live[i] = true
++				break
++			}
++		}
++	}
++	return live
++}
++
++// overlaps reports whether any value already in the slot is live where the
++// given value is.
++func (p *slot) overlaps(live map[*ir.Instruction]bool) bool {
++	for i := range live {
++		if p.live[i] {
++			return true
++		}
++	}
++	return false
++}
++
++// rewrite replaces references to the spilled register in the instruction with a
++// fresh temporary, returning the reload and store instructions that must be
++// placed before and after it.
++func (s *spiller) rewrite(i *ir.Instruction, id reg.ID, slot operand.Mem) (before, after []ir.Node, err error) {
++	reads := specs(i.InputRegisters(), id)
++	writes := specs(i.OutputRegisters(), id)
++	if len(reads) == 0 && len(writes) == 0 {
++		return nil, nil, nil
++	}
++
++	idx := s.next[id.Kind()]
++	s.next[id.Kind()]++
++	s.temps[reg.NewVirtual(idx, id.Kind(), reg.S64).ID()] = true
++
++	for _, spec := range reads {
++		t := reg.NewVirtual(idx, id.Kind(), spec)
++		mov, err := move(at(slot, spec), t, spec)
++		if err != nil {
++			return nil, nil, err
++		}
++		before = append(before, mov)
++	}
++
++	for _, spec := range writes {
++		t := reg.NewVirtual(idx, id.Kind(), spec)
++		mov, err := move(t, at(slot, spec), spec)
++		if err != nil {
++			return nil, nil, err
++		}
++		after = append(after, mov)
++	}
++
++	replace(i.Operands, id, idx)
++	replace(i.Inputs, id, idx)
++	replace(i.Outputs, id, idx)
++
++	return before, after, nil
++}
++
++// specs returns the distinct widths at which the given register appears in the
++// register list, in ascending order.
++func specs(rs []reg.Register, id reg.ID) []reg.Spec {
++	seen := map[reg.Spec]bool{}
++	for _, r := range rs {
++		if r.ID() == id {
++			seen[reg.Spec(r.Mask())] = true
++		}
++	}
++
++	var ss []reg.Spec
++	for spec := range seen {
++		ss = append(ss, spec)
++	}
++	sort.Slice(ss, func(a, b int) bool { return ss[a] < ss[b] })
++
++	return ss
++}
++
++// replace substitutes references to the given register in the operand list with
++// the temporary of the given index, preserving the width of each reference.
++func replace(ops []operand.Op, id reg.ID, idx reg.Index) {
++	for n, op := range ops {
++		switch op := op.(type) {
++		case reg.Register:
++			ops[n] = substitute(op, id, idx)
++		case operand.Mem:
++			op.Base = substitute(op.Base, id, idx)
++			op.Index = substitute(op.Index, id, idx)
++			ops[n] = op
++		}
++	}
++}
++
++func substitute(r reg.Register, id reg.ID, idx reg.Index) reg.Register {
++	if r == nil || r.ID() != id {
++		return r
++	}
++	return reg.NewVirtual(idx, id.Kind(), reg.Spec(r.Mask()))
++}
++
++// at returns the part of the stack slot occupied by a register of the given
++// width. High-byte registers live in the second byte of their slot.
++func at(slot operand.Mem, spec reg.Spec) operand.Mem {
++	if spec == reg.S8H {
++		return slot.Offset(1)
++	}
++	return slot
++}
++
++// move builds an instruction copying between a stack slot and a register of the
++// given width. Unaligned forms are used so that spill slots need no alignment.
++func move(src, dst operand.Op, spec reg.Spec) (*ir.Instruction, error) {
++	var opcode string
++	var isa []string
++
++	switch kindOf(src, dst) {
++	case reg.KindGP:
++		switch spec.Size() {
++		case 1:
++			opcode = "MOVB"
++		case 2:
++			opcode = "MOVW"
++		case 4:
++			opcode = "MOVL"
++		case 8:
++			opcode = "MOVQ"
++		}
++	case reg.KindVector:
++		switch spec.Size() {
++		case 16:
++			opcode = "MOVOU"
++			isa = []string{"SSE2"}
++		case 32:
++			opcode = "VMOVDQU"
++			isa = []string{"AVX"}
++		case 64:
++			opcode = "VMOVDQU64"
++			isa = []string{"AVX512F"}
++		}
++	case reg.KindOpmask:
++		opcode = "KMOVQ"
++		isa = []string{"AVX512BW"}
++	}
++
++	if opcode == "" {
++		return nil, errors.New("no spill instruction for register")
++	}
++
++	return &ir.Instruction{
++		Opcode:   opcode,
++		Operands: []operand.Op{src, dst},
++		Inputs:   []operand.Op{src},
++		Outputs:  []operand.Op{dst},
++		ISA:      isa,
++	}, nil
++}
++
++// kindOf returns the register kind involved in a spill move.
++func kindOf(ops ...operand.Op) reg.Kind {
++	for _, op := range ops {
++		if r, ok := op.(reg.Register); ok {
++			return r.Kind()
++		}
++	}
++	return reg.Kind(0)
++}

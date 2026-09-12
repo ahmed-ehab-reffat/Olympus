@@ -1,0 +1,1615 @@
+diff --git a/crates/cli/src/output.rs b/crates/cli/src/output.rs
+index bf568ed..97c3449 100644
+--- a/crates/cli/src/output.rs
++++ b/crates/cli/src/output.rs
+@@ -32,6 +32,7 @@ pub fn format_wasm_type(ty: WasmType) -> &'static str {
+         WasmType::V128 => "v128",
+         WasmType::RefFunc => "funcref",
+         WasmType::RefExtern => "externref",
++        WasmType::RefExn => "exnref",
+     }
+ }
+ 
+@@ -76,6 +77,7 @@ pub fn format_export_type(ty: ExportType<'_>) -> String {
+         ExportType::Memory(ty) => format_memory_type(ty),
+         ExportType::Table(ty) => format_table_type(ty),
+         ExportType::Global(ty) => format_global_type(ty),
++        ExportType::Tag(ty) => format!("tag {}", format_func_type(ty)),
+     }
+ }
+ 
+@@ -85,5 +87,6 @@ pub fn format_import_type(ty: ImportType<'_>) -> String {
+         ImportType::Memory(ty) => format_memory_type(ty),
+         ImportType::Table(ty) => format_table_type(ty),
+         ImportType::Global(ty) => format_global_type(ty),
++        ImportType::Tag(ty) => format!("tag {}", format_func_type(ty)),
+     }
+ }
+diff --git a/crates/cli/src/value_parse.rs b/crates/cli/src/value_parse.rs
+index f9ffbbb..88ba5fc 100644
+--- a/crates/cli/src/value_parse.rs
++++ b/crates/cli/src/value_parse.rs
+@@ -21,7 +21,7 @@ fn parse_arg(index: usize, ty: WasmType, value: &str) -> Result<WasmValue> {
+             .parse::<i128>()
+             .map(|v| WasmValue::V128(v.to_le_bytes()))
+             .map_err(|e| format_error(index, ty, value, e))?,
+-        WasmType::RefFunc | WasmType::RefExtern => {
++        WasmType::RefFunc | WasmType::RefExtern | WasmType::RefExn => {
+             bail!(
+                 "unsupported CLI argument type at position {}: {}; use the embedding API for reference values",
+                 index + 1,
+diff --git a/crates/parser/src/conversion.rs b/crates/parser/src/conversion.rs
+index 586cac5..6e41559 100644
+--- a/crates/parser/src/conversion.rs
++++ b/crates/parser/src/conversion.rs
+@@ -70,9 +70,7 @@ pub(crate) fn convert_module_import(import: wasmparser::Import<'_>) -> Result<Im
+         wasmparser::TypeRef::Global(ty) => {
+             ImportKind::Global(GlobalType::new(convert_valtype(&ty.content_type)?, ty.mutable))
+         }
+-        wasmparser::TypeRef::Tag(ty) => {
+-            return Err(crate::ParseError::UnsupportedOperator(format!("Unsupported import kind: {ty:?}")));
+-        }
++        wasmparser::TypeRef::Tag(ty) => ImportKind::Tag(TagType { func_type_idx: ty.func_type_idx }),
+         _ => {
+             return Err(crate::ParseError::UnsupportedOperator(format!("Unsupported import kind: {:?}", import.ty)));
+         }
+@@ -110,7 +108,8 @@ pub(crate) fn convert_module_export(export: wasmparser::Export<'_>) -> Result<Ex
+         wasmparser::ExternalKind::Table => ExternalKind::Table,
+         wasmparser::ExternalKind::Memory => ExternalKind::Memory,
+         wasmparser::ExternalKind::Global => ExternalKind::Global,
+-        wasmparser::ExternalKind::Tag | wasmparser::ExternalKind::FuncExact => {
++        wasmparser::ExternalKind::Tag => ExternalKind::Tag,
++        wasmparser::ExternalKind::FuncExact => {
+             return Err(crate::ParseError::UnsupportedOperator(format!("Unsupported export kind: {:?}", export.kind)));
+         }
+     };
+@@ -189,6 +188,16 @@ pub(crate) fn convert_reftype(reftype: wasmparser::RefType) -> Result<WasmType>
+     match reftype {
+         _ if reftype.is_func_ref() => Ok(WasmType::RefFunc),
+         _ if reftype.is_extern_ref() => Ok(WasmType::RefExtern),
++        _ if matches!(
++            reftype.heap_type(),
++            wasmparser::HeapType::Abstract {
++                ty: wasmparser::AbstractHeapType::Exn | wasmparser::AbstractHeapType::NoExn,
++                ..
++            }
++        ) =>
++        {
++            Ok(WasmType::RefExn)
++        }
+         _ => Err(crate::ParseError::UnsupportedOperator(format!(
+             "Unsupported reference type: {reftype:?}, {:?}",
+             reftype.heap_type()
+@@ -224,6 +233,7 @@ pub(crate) fn process_const_operators(ops: OperatorsReader<'_>) -> Result<Box<[C
+             wasmparser::Operator::RefNull { hty } => match convert_heaptype(hty)? {
+                 WasmType::RefFunc => ConstInstruction::RefFunc(None),
+                 WasmType::RefExtern => ConstInstruction::RefExtern(None),
++                WasmType::RefExn => ConstInstruction::RefExn,
+                 other => {
+                     return Err(crate::ParseError::UnsupportedOperator(format!(
+                         "Unsupported ref.null heap type lowered to {other:?}"
+@@ -267,6 +277,10 @@ pub(crate) fn convert_heaptype(heap: wasmparser::HeapType) -> Result<WasmType> {
+         wasmparser::HeapType::Abstract { shared: false, ty: wasmparser::AbstractHeapType::Extern } => {
+             Ok(WasmType::RefExtern)
+         }
++        wasmparser::HeapType::Abstract {
++            shared: false,
++            ty: wasmparser::AbstractHeapType::Exn | wasmparser::AbstractHeapType::NoExn,
++        } => Ok(WasmType::RefExn),
+         _ => Err(crate::ParseError::UnsupportedOperator(format!("Unsupported heap type: {heap:?}"))),
+     }
+ }
+diff --git a/crates/parser/src/lib.rs b/crates/parser/src/lib.rs
+index 7936675..5d485f6 100644
+--- a/crates/parser/src/lib.rs
++++ b/crates/parser/src/lib.rs
+@@ -170,6 +170,8 @@ impl Parser {
+             | WasmFeatures::SIMD
+             | WasmFeatures::MEMORY64
+             | WasmFeatures::CUSTOM_PAGE_SIZES
++            | WasmFeatures::EXCEPTIONS
++            | WasmFeatures::LEGACY_EXCEPTIONS
+             | WasmFeatures::WIDE_ARITHMETIC;
+         Validator::new_with_features(features)
+     }
+diff --git a/crates/parser/src/macros.rs b/crates/parser/src/macros.rs
+index ff216a5..13dfd2e 100644
+--- a/crates/parser/src/macros.rs
++++ b/crates/parser/src/macros.rs
+@@ -129,6 +129,8 @@ pub(crate) mod visit {
+         (@@wide_arithmetic $($rest:tt)* ) => {};
+         (@@relaxed_simd $($rest:tt)* ) => {};
+         (@@tail_call $($rest:tt)* ) => {};
++        (@@exceptions $($rest:tt)* ) => {};
++        (@@legacy_exceptions $($rest:tt)* ) => {};
+ 
+         (@@$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident ($($ann:tt)*)) => {
+             fn $visit(&mut self $($(,_: $argty)*)?) -> Self::Output {
+diff --git a/crates/parser/src/module.rs b/crates/parser/src/module.rs
+index 05811ec..fea5e0b 100644
+--- a/crates/parser/src/module.rs
++++ b/crates/parser/src/module.rs
+@@ -52,6 +52,7 @@ pub(crate) struct ModuleReader<'a> {
+     pub(crate) code: Vec<FunctionCode>,
+     pub(crate) globals: Box<[Global]>,
+     pub(crate) table_types: Box<[TableType]>,
++    pub(crate) tag_types: Box<[TagType]>,
+     pub(crate) memory_types: Box<[MemoryType]>,
+     pub(crate) imports: Box<[Import]>,
+     pub(crate) data: Box<[Data]>,
+@@ -74,6 +75,7 @@ impl<'a> ModuleReader<'a> {
+                 &self.globals,
+                 &self.memory_types,
+                 &self.table_types,
++                &self.tag_types,
+             )));
+         }
+         self.translation_metadata.as_deref().unwrap()
+@@ -141,6 +143,16 @@ impl<'a> ModuleReader<'a> {
+                     })
+                     .collect::<Result<_>>()?;
+             }
++            Payload::TagSection(reader) => {
++                check_section("tag", !self.tag_types.is_empty())?;
++                if let Some(validator) = validator.as_mut() {
++                    validator.tag_section(&reader)?;
++                }
++                self.tag_types = reader
++                    .into_iter()
++                    .map(|tag| Ok(TagType { func_type_idx: tag?.func_type_idx }))
++                    .collect::<Result<_>>()?;
++            }
+             Payload::MemorySection(reader) => {
+                 check_section("memory", !self.memory_types.is_empty())?;
+                 if let Some(validator) = validator.as_mut() {
+@@ -477,6 +489,7 @@ impl<'a> ModuleReader<'a> {
+             func_type_idxs,
+             globals: self.globals,
+             table_types: self.table_types,
++            tag_types: self.tag_types,
+             imports: self.imports,
+             start_func: self.start_func,
+             data: self.data,
+diff --git a/crates/parser/src/optimize.rs b/crates/parser/src/optimize.rs
+index a26142c..4ba208d 100644
+--- a/crates/parser/src/optimize.rs
++++ b/crates/parser/src/optimize.rs
+@@ -812,6 +812,9 @@ fn is_unconditional_terminator(instr: Instruction) -> bool {
+             | Instruction::ReturnCall(_)
+             | Instruction::ReturnCallSelf
+             | Instruction::ReturnCallIndirect(..)
++            | Instruction::Throw(_)
++            | Instruction::ThrowRef
++            | Instruction::Rethrow(_)
+     )
+ }
+ 
+@@ -839,6 +842,14 @@ fn target_boundaries(instructions: &[Instruction], function_data: &WasmFunctionD
+             }
+         }
+     }
++    for handler in &*function_data.handlers {
++        for clause in &*handler.clauses {
++            let boundary = boundaries
++                .get_mut(clause.pad_ip as usize)
++                .ok_or_else(|| ParseError::Other(alloc::format!("handler pad out of bounds: {}", clause.pad_ip)))?;
++            *boundary = true;
++        }
++    }
+     Ok(boundaries)
+ }
+ 
+@@ -860,6 +871,18 @@ fn finalize(
+             return Err(ParseError::Other(alloc::format!("branch table target out of bounds: {target}")));
+         }
+     }
++    for handler in &mut *function_data.handlers {
++        for clause in &mut *handler.clauses {
++            if let Some(old_to_new) = old_to_new {
++                clause.pad_ip = *old_to_new
++                    .get(clause.pad_ip as usize)
++                    .ok_or_else(|| ParseError::Other(alloc::format!("handler pad out of bounds: {}", clause.pad_ip)))?;
++            }
++            if clause.pad_ip >= len {
++                return Err(ParseError::Other(alloc::format!("handler pad out of bounds: {}", clause.pad_ip)));
++            }
++        }
++    }
+ 
+     let mut uses_local_memory = false;
+     for instr in instructions {
+diff --git a/crates/parser/src/visit.rs b/crates/parser/src/visit.rs
+index cb13387..6c1bcd7 100644
+--- a/crates/parser/src/visit.rs
++++ b/crates/parser/src/visit.rs
+@@ -3,8 +3,8 @@ use alloc::string::ToString;
+ use alloc::sync::Arc;
+ use alloc::vec::Vec;
+ use tinywasm_types::{
+-    FuncType, Global, Import, ImportKind, Instruction, MemoryArch, MemoryArg, MemoryType, TableType, ValueCounts,
+-    WasmFunctionData, WasmType,
++    CatchClause, CatchKind, FuncType, Global, HandlerData, HandlerKind, Import, ImportKind, Instruction, MemoryArch,
++    MemoryArg, MemoryType, TableType, TagType, ValueCounts, WasmFunctionData, WasmType,
+ };
+ use wasmparser::{
+     FuncValidator, FuncValidatorAllocations, FunctionBody, OperatorsReader, OperatorsReaderAllocations,
+@@ -17,6 +17,8 @@ enum BlockKind {
+     Block,
+     Loop,
+     If,
++    TryTable,
++    LegacyTry,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -49,7 +51,7 @@ impl From<wasmparser::ValType> for OperandSize {
+ impl From<&WasmType> for OperandSize {
+     fn from(ty: &WasmType) -> Self {
+         match ty {
+-            WasmType::I32 | WasmType::F32 | WasmType::RefFunc | WasmType::RefExtern => Self::S32,
++            WasmType::I32 | WasmType::F32 | WasmType::RefFunc | WasmType::RefExtern | WasmType::RefExn => Self::S32,
+             WasmType::I64 | WasmType::F64 => Self::S64,
+             WasmType::V128 => Self::S128,
+         }
+@@ -77,6 +79,9 @@ struct ControlFrame {
+     unreachable: bool,
+     entry_unreachable: bool,
+     end_reachable: bool,
++    handlers_at_entry: u32,
++    handler_table: u32,
++    catch_end_jumps: Vec<usize>,
+ }
+ 
+ #[derive(Clone)]
+@@ -91,12 +96,21 @@ pub(crate) struct ModuleMetadata {
+     globals: Vec<OperandSize>,
+     memories: Vec<OperandSize>,
+     tables: Vec<OperandSize>,
++    tags: Vec<Signature>,
+ }
+ 
+ #[derive(Default)]
+ struct FunctionDataBuilder {
+     v128_constants: Vec<[u8; 16]>,
+     branch_table_targets: Vec<u32>,
++    handlers: Vec<HandlerBuild>,
++}
++
++struct HandlerBuild {
++    kind: HandlerKind,
++    params: ValueCounts,
++    delegate: u32,
++    clauses: Vec<CatchClause>,
+ }
+ 
+ pub(crate) struct FunctionBuilder<'a> {
+@@ -108,6 +122,7 @@ pub(crate) struct FunctionBuilder<'a> {
+     metadata: &'a ModuleMetadata,
+     local_types: Vec<OperandSize>,
+     local_addr_map: Vec<u16>,
++    active_handlers: u32,
+ }
+ 
+ impl<'a> FunctionBuilder<'a> {
+@@ -136,9 +151,13 @@ impl<'a> FunctionBuilder<'a> {
+                 unreachable: false,
+                 entry_unreachable: false,
+                 end_reachable: false,
++                handlers_at_entry: 0,
++                handler_table: 0,
++                catch_end_jumps: Vec::new(),
+             }],
+             operand_stack: Vec::new(),
+             lane_counts: ValueCounts::default(),
++            active_handlers: 0,
+         }
+     }
+ }
+@@ -157,11 +176,13 @@ impl ModuleMetadata {
+         globals: &[Global],
+         memories: &[MemoryType],
+         tables: &[TableType],
++        tag_types: &[TagType],
+     ) -> Self {
+         let mut functions = Vec::with_capacity(imports.len() + code_type_addrs.len());
+         let mut global_sizes = Vec::with_capacity(imports.len() + globals.len());
+         let mut memory_sizes = Vec::with_capacity(imports.len() + memories.len());
+         let mut table_sizes = Vec::with_capacity(imports.len() + tables.len());
++        let mut tag_type_idxs = Vec::with_capacity(imports.len() + tag_types.len());
+ 
+         for import in imports {
+             match &import.kind {
+@@ -169,6 +190,7 @@ impl ModuleMetadata {
+                 ImportKind::Global(ty) => global_sizes.push(OperandSize::from(&ty.ty)),
+                 ImportKind::Memory(ty) => memory_sizes.push(OperandSize::from(ty.arch())),
+                 ImportKind::Table(ty) => table_sizes.push(OperandSize::from(ty.arch())),
++                ImportKind::Tag(ty) => tag_type_idxs.push(ty.func_type_idx),
+             }
+         }
+ 
+@@ -176,15 +198,20 @@ impl ModuleMetadata {
+         global_sizes.extend(globals.iter().map(|global| OperandSize::from(&global.ty.ty)));
+         memory_sizes.extend(memories.iter().map(|ty| OperandSize::from(ty.arch())));
+         table_sizes.extend(tables.iter().map(|ty| OperandSize::from(ty.arch())));
++        tag_type_idxs.extend(tag_types.iter().map(|ty| ty.func_type_idx));
+ 
+-        let signatures = types
++        let signatures: Vec<Signature> = types
+             .iter()
+             .map(|ty| Signature {
+                 params: ty.params().iter().map(OperandSize::from).collect(),
+                 results: ty.results().iter().map(OperandSize::from).collect(),
+             })
+             .collect();
+-        Self { signatures, functions, globals: global_sizes, memories: memory_sizes, tables: table_sizes }
++        let tags = tag_type_idxs
++            .iter()
++            .map(|idx| signatures.get(*idx as usize).cloned().unwrap_or(Signature { params: Vec::new(), results: Vec::new() }))
++            .collect();
++        Self { signatures, functions, globals: global_sizes, memories: memory_sizes, tables: table_sizes, tags }
+     }
+ 
+     pub(crate) fn signature(&self, idx: u32) -> Result<&Signature> {
+@@ -201,6 +228,12 @@ impl ModuleMetadata {
+         self.signature(ty)
+     }
+ 
++    fn tag_signature(&self, idx: u32) -> Result<&Signature> {
++        self.tags
++            .get(idx as usize)
++            .ok_or_else(|| crate::ParseError::Other(alloc::format!("tag index out of bounds: {idx}")))
++    }
++
+     fn global_size(&self, idx: u32) -> Result<OperandSize> {
+         Self::indexed_size(&self.globals, "global", idx)
+     }
+@@ -268,6 +301,17 @@ pub(crate) fn process_operators_and_validate(
+     let data = WasmFunctionData {
+         v128_constants: builder.data.v128_constants.into_boxed_slice(),
+         branch_table_targets: builder.data.branch_table_targets.into_boxed_slice(),
++        handlers: builder
++            .data
++            .handlers
++            .into_iter()
++            .map(|h| HandlerData {
++                kind: h.kind,
++                params: h.params,
++                delegate: h.delegate,
++                clauses: h.clauses.into_boxed_slice(),
++            })
++            .collect(),
+     };
+     Ok((builder.instructions, data, validator_allocations, reader.into_allocations()))
+ }
+@@ -371,7 +415,7 @@ impl<'a> wasmparser::VisitOperator<'a> for FunctionBuilder<'_> {
+         effect [] => [] { visit_nop }
+         effect [S32] => [S32] { visit_f32_reinterpret_i32, visit_i32_reinterpret_f32 }
+         effect [S64] => [S64] { visit_f64_reinterpret_i64, visit_i64_reinterpret_f64 }
+-        terminating [] => [] { visit_unreachable => Unreachable, visit_return => Return }
++        terminating [] => [] { visit_unreachable => Unreachable }
+         global [] => [Addr] { visit_global_get(global_index: u32) => GlobalGet }
+         memory_index [] => [Addr] { visit_memory_size(memory: u32) => MemorySize }
+         memory_index [Addr] => [Addr] { visit_memory_grow(memory: u32) => MemoryGrow }
+@@ -399,9 +443,17 @@ impl<'a> wasmparser::VisitOperator<'a> for FunctionBuilder<'_> {
+         self.emit(&inputs, &signature.results, Instruction::CallIndirect(type_index, table_index))
+     }
+ 
++    fn visit_return(&mut self) -> Self::Output {
++        self.emit_pop_handlers_to(0);
++        self.mark_unreachable();
++        self.instructions.push(Instruction::Return);
++        Ok(())
++    }
++
+     fn visit_return_call(&mut self, function_index: u32) -> Self::Output {
+         let signature = self.metadata.function_signature(function_index)?.clone();
+         self.apply_effect(&signature.params, &[])?;
++        self.emit_pop_handlers_to(0);
+         self.mark_unreachable();
+         self.instructions.push(Instruction::ReturnCall(function_index));
+         Ok(())
+@@ -412,11 +464,126 @@ impl<'a> wasmparser::VisitOperator<'a> for FunctionBuilder<'_> {
+         let mut inputs = signature.params;
+         inputs.push(self.metadata.table_size(table_index)?);
+         self.apply_effect(&inputs, &[])?;
++        self.emit_pop_handlers_to(0);
+         self.mark_unreachable();
+         self.instructions.push(Instruction::ReturnCallIndirect(type_index, table_index));
+         Ok(())
+     }
+ 
++    fn visit_try_table(&mut self, try_table: wasmparser::TryTable) -> Self::Output {
++        self.push_control(BlockKind::TryTable, try_table.ty, None)?;
++        self.active_handlers += 1;
++        let params = Self::value_counts(&self.control_stack.last().unwrap().params);
++
++        let table_idx = self.data.handlers.len() as u32;
++        self.instructions.push(Instruction::PushHandler(table_idx));
++        let skip_jump_ip = self.instructions.len();
++        self.instructions.push(Instruction::Jump(0));
++
++        let mut clauses = Vec::with_capacity(try_table.catches.len());
++        for catch in &try_table.catches {
++            let (kind, tag, label) = match *catch {
++                wasmparser::Catch::One { tag, label } => (CatchKind::Catch, tag, label),
++                wasmparser::Catch::OneRef { tag, label } => (CatchKind::CatchRef, tag, label),
++                wasmparser::Catch::All { label } => (CatchKind::CatchAll, 0, label),
++                wasmparser::Catch::AllRef { label } => (CatchKind::CatchAllRef, 0, label),
++            };
++            let target_depth = label + 1;
++            let pad_ip = self.instructions.len() as u32;
++            let ctx_idx = self.get_ctx_idx(target_depth)?;
++            self.emit_pop_handlers_to(ctx_idx);
++            self.emit_dropkeep_to_label(target_depth)?;
++            self.emit_branch_jump_or_return(target_depth)?;
++            clauses.push(CatchClause { kind, tag, pad_ip });
++        }
++
++        self.data.handlers.push(HandlerBuild { kind: HandlerKind::TryTable, params, delegate: 0, clauses });
++        self.patch_jump(skip_jump_ip, self.instructions.len());
++        Ok(())
++    }
++
++    fn visit_throw(&mut self, tag_index: u32) -> Self::Output {
++        let signature = self.metadata.tag_signature(tag_index)?.clone();
++        self.apply_effect(&signature.params, &[])?;
++        self.mark_unreachable();
++        self.instructions.push(Instruction::Throw(tag_index));
++        Ok(())
++    }
++
++    fn visit_throw_ref(&mut self) -> Self::Output {
++        self.apply_effect(&[OperandSize::S32], &[])?;
++        self.mark_unreachable();
++        self.instructions.push(Instruction::ThrowRef);
++        Ok(())
++    }
++
++    fn visit_try(&mut self, blockty: wasmparser::BlockType) -> Self::Output {
++        self.push_control(BlockKind::LegacyTry, blockty, None)?;
++        self.active_handlers += 1;
++        let params = Self::value_counts(&self.control_stack.last().unwrap().params);
++        let table_idx = self.data.handlers.len() as u32;
++        self.data.handlers.push(HandlerBuild { kind: HandlerKind::Legacy, params, delegate: 0, clauses: Vec::new() });
++        self.control_stack.last_mut().unwrap().handler_table = table_idx;
++        self.instructions.push(Instruction::PushHandler(table_idx));
++        Ok(())
++    }
++
++    fn visit_catch(&mut self, tag_index: u32) -> Self::Output {
++        let params = self.metadata.tag_signature(tag_index)?.params.clone();
++        let (table_idx, pad_ip) = self.legacy_catch_section(Some(&params))?;
++        self.data.handlers[table_idx as usize].clauses.push(CatchClause {
++            kind: CatchKind::Catch,
++            tag: tag_index,
++            pad_ip,
++        });
++        Ok(())
++    }
++
++    fn visit_catch_all(&mut self) -> Self::Output {
++        let (table_idx, pad_ip) = self.legacy_catch_section(None)?;
++        self.data.handlers[table_idx as usize].clauses.push(CatchClause {
++            kind: CatchKind::CatchAll,
++            tag: 0,
++            pad_ip,
++        });
++        Ok(())
++    }
++
++    fn visit_delegate(&mut self, relative_depth: u32) -> Self::Output {
++        let target_ctx = self.get_ctx_idx(relative_depth + 1)?;
++        let delegate_at_entry = self.control_stack.last().unwrap().handlers_at_entry;
++        let table_idx = self.control_stack.last().unwrap().handler_table;
++        let target = &self.control_stack[target_ctx];
++        let resume = if matches!(target.kind, BlockKind::TryTable | BlockKind::LegacyTry) {
++            i64::from(target.handlers_at_entry)
++        } else {
++            i64::from(target.handlers_at_entry) - 1
++        };
++        let down = (i64::from(delegate_at_entry) - resume) as u32;
++        self.data.handlers[table_idx as usize].kind = HandlerKind::Delegate;
++        self.data.handlers[table_idx as usize].delegate = down;
++
++        let ctx = self.control_stack.pop().ok_or_else(|| crate::ParseError::Other("delegate without try".into()))?;
++        let reachable = !ctx.entry_unreachable && !ctx.unreachable;
++        self.instructions.push(Instruction::EndTryTable);
++        self.active_handlers -= 1;
++        self.reset_stack(ctx.height, ctx.base);
++        self.push_sizes(&ctx.results)?;
++        if let Some(parent) = self.control_stack.last_mut() {
++            parent.unreachable = !reachable;
++        }
++        self.patch_end_jumps(ctx, self.instructions.len());
++        Ok(())
++    }
++
++    fn visit_rethrow(&mut self, relative_depth: u32) -> Self::Output {
++        let target_ctx = self.get_ctx_idx(relative_depth)?;
++        let offset = self.active_handlers - 1 - self.control_stack[target_ctx].handlers_at_entry;
++        self.mark_unreachable();
++        self.instructions.push(Instruction::Rethrow(offset));
++        Ok(())
++    }
++
+     fn visit_global_set(&mut self, global_index: u32) -> Self::Output {
+         let size = self.metadata.global_size(global_index)?;
+         let instruction = size.choose(
+@@ -527,6 +694,17 @@ impl<'a> wasmparser::VisitOperator<'a> for FunctionBuilder<'_> {
+         if matches!(ctx.kind, BlockKind::Function) {
+             self.instructions.push(Instruction::Return);
+         } else {
++            if matches!(ctx.kind, BlockKind::TryTable) {
++                self.instructions.push(Instruction::EndTryTable);
++                self.active_handlers -= 1;
++            } else if matches!(ctx.kind, BlockKind::LegacyTry) {
++                let cleanup = self.instructions.len();
++                for &jump in &ctx.catch_end_jumps {
++                    self.patch_jump(jump, cleanup);
++                }
++                self.instructions.push(Instruction::EndTryTable);
++                self.active_handlers -= 1;
++            }
+             let reachable = !ctx.entry_unreachable
+                 && (!ctx.unreachable || ctx.end_reachable || matches!(ctx.kind, BlockKind::If) && !ctx.has_else);
+             self.reset_stack(ctx.height, ctx.base);
+@@ -540,6 +718,8 @@ impl<'a> wasmparser::VisitOperator<'a> for FunctionBuilder<'_> {
+     }
+ 
+     fn visit_br(&mut self, depth: u32) -> Self::Output {
++        let ctx_idx = self.get_ctx_idx(depth)?;
++        self.emit_pop_handlers_to(ctx_idx);
+         self.emit_dropkeep_to_label(depth)?;
+         self.emit_branch_jump_or_return(depth)?;
+         self.mark_unreachable();
+@@ -552,6 +732,8 @@ impl<'a> wasmparser::VisitOperator<'a> for FunctionBuilder<'_> {
+         self.instructions.push(Instruction::JumpIfZero32(0));
+ 
+         let branch_side_start = self.instructions.len();
++        let branch_ctx_idx = self.get_ctx_idx(depth)?;
++        self.emit_pop_handlers_to(branch_ctx_idx);
+         self.emit_dropkeep_to_label(depth)?;
+ 
+         if self.instructions.len() == branch_side_start
+@@ -599,7 +781,9 @@ impl<'a> wasmparser::VisitOperator<'a> for FunctionBuilder<'_> {
+                 self.instructions.push(Instruction::Return);
+                 (pad_start, true)
+             } else {
+-                let frame = &self.control_stack[self.get_ctx_idx(depth)?];
++                let ctx_idx = self.get_ctx_idx(depth)?;
++                self.emit_pop_handlers_to(ctx_idx);
++                let frame = &self.control_stack[ctx_idx];
+                 let base = frame.base;
+                 let label_types = if matches!(frame.kind, BlockKind::Loop) { &frame.params } else { &frame.results };
+                 self.emit_dropkeep(base, Self::value_counts(label_types));
+@@ -1011,6 +1195,9 @@ impl FunctionBuilder<'_> {
+             unreachable: entry_unreachable,
+             entry_unreachable,
+             end_reachable: false,
++            handlers_at_entry: self.active_handlers,
++            handler_table: 0,
++            catch_end_jumps: Vec::new(),
+         });
+         Ok(())
+     }
+@@ -1061,7 +1248,7 @@ impl FunctionBuilder<'_> {
+         match self.control_stack[ctx_idx].kind {
+             BlockKind::Function => self.instructions.push(Instruction::Return),
+             BlockKind::Loop => self.instructions.push(Instruction::Jump(self.control_stack[ctx_idx].start_ip as u32)),
+-            BlockKind::Block | BlockKind::If => {
++            BlockKind::Block | BlockKind::If | BlockKind::TryTable | BlockKind::LegacyTry => {
+                 self.control_stack[ctx_idx].branch_jumps.push(self.instructions.len());
+                 self.control_stack[ctx_idx].end_reachable = true;
+                 self.instructions.push(Instruction::Jump(0));
+@@ -1070,6 +1257,41 @@ impl FunctionBuilder<'_> {
+         Ok(())
+     }
+ 
++    /// Ends the previous section of a legacy `try` and opens a catch body: jumps to the
++    /// cleanup point, restores the operand stack to the try's base, and pushes the caught
++    /// values so the catch body starts with the exception's parameters on the stack.
++    fn legacy_catch_section(&mut self, tag_params: Option<&[OperandSize]>) -> Result<(u32, u32)> {
++        let (height, base, table_idx) = {
++            let frame = self
++                .control_stack
++                .last_mut()
++                .filter(|frame| matches!(frame.kind, BlockKind::LegacyTry))
++                .ok_or_else(|| crate::ParseError::Other("catch without matching try".into()))?;
++            frame.end_reachable = true;
++            (frame.height, frame.base, frame.handler_table)
++        };
++        let jump_ip = self.instructions.len();
++        self.instructions.push(Instruction::Jump(0));
++        self.control_stack.last_mut().unwrap().catch_end_jumps.push(jump_ip);
++        self.reset_stack(height, base);
++        if let Some(params) = tag_params {
++            self.push_sizes(params)?;
++        }
++        self.control_stack.last_mut().unwrap().unreachable = false;
++        let pad_ip = self.instructions.len() as u32;
++        Ok((table_idx, pad_ip))
++    }
++
++    /// Emits one `EndTryTable` per `try_table` handler unwound by a branch to `ctx_idx`.
++    fn emit_pop_handlers_to(&mut self, ctx_idx: usize) {
++        if self.is_unreachable() {
++            return;
++        }
++        for _ in self.control_stack[ctx_idx].handlers_at_entry..self.active_handlers {
++            self.instructions.push(Instruction::EndTryTable);
++        }
++    }
++
+     /// Resolves all jumps owned by a completed control frame.
+     fn patch_end_jumps(&mut self, ctx: ControlFrame, end_ip: usize) {
+         let target = if matches!(ctx.kind, BlockKind::Loop) { ctx.start_ip } else { end_ip };
+diff --git a/crates/tinywasm/src/error.rs b/crates/tinywasm/src/error.rs
+index 4f187e5..c30f2a6 100644
+--- a/crates/tinywasm/src/error.rs
++++ b/crates/tinywasm/src/error.rs
+@@ -175,6 +175,9 @@ pub enum Trap {
+         actual: Arc<FuncType>,
+     },
+ 
++    /// A thrown exception reached the top of the call stack with no matching handler.
++    UncaughtException,
++
+     /// Catch-all for other messages
+     Other(&'static str),
+ }
+@@ -197,6 +200,7 @@ impl Trap {
+             Self::IndirectCallTypeMismatch { .. } => "indirect call type mismatch",
+             Self::HostFunction(_) => "host function trap",
+             Self::InvalidStore => "invalid store",
++            Self::UncaughtException => "uncaught exception",
+             Self::Other(message) => message,
+         }
+     }
+@@ -295,6 +299,7 @@ impl Display for Trap {
+                 write!(f, "uninitialized element: index={index}")
+             }
+             Self::InvalidStore => write!(f, "invalid store"),
++            Self::UncaughtException => write!(f, "uncaught exception"),
+             #[cfg(feature = "debug")]
+             Self::IndirectCallTypeMismatch { expected, actual } => {
+                 write!(f, "indirect call type mismatch: expected={expected:?}, actual={actual:?}")
+diff --git a/crates/tinywasm/src/func.rs b/crates/tinywasm/src/func.rs
+index 9777a47..69a48ed 100644
+--- a/crates/tinywasm/src/func.rs
++++ b/crates/tinywasm/src/func.rs
+@@ -13,6 +13,8 @@ impl Function {
+     pub fn call(&self, store: &mut Store, params: &[WasmValue]) -> Result<Vec<WasmValue>> {
+         #[inline]
+         fn call_inner(func: &Function, store: &mut Store, params: &[WasmValue]) -> Result<Vec<WasmValue>> {
++            store.state.handlers.clear();
++            store.state.exceptions.clear();
+             let func_instance = store.state.get_func(func.addr);
+             let wasm_func = match func_instance {
+                 FunctionInstance::Host(host_func) => {
+@@ -59,6 +61,8 @@ impl Function {
+             store: &mut Store,
+             params: &[WasmValue],
+         ) -> Result<FuncExecutionState> {
++            store.state.handlers.clear();
++            store.state.exceptions.clear();
+             let func_instance = store.state.get_func(func.addr);
+             match func_instance {
+                 FunctionInstance::Host(host_func) => host_func
+@@ -337,6 +341,8 @@ impl FuncContext<'_> {
+             FunctionInstance::Wasm(wasm_func) => {
+                 let call_stack_base = self.store.call_stack.len();
+                 let value_stack_base = self.store.value_stack.base();
++                let handler_base = self.store.state.handlers.len();
++                let exception_base = self.store.state.exceptions.len();
+ 
+                 self.store.value_stack.extend_from_wasmvalues(args).inspect_err(|_| {
+                     self.store.value_stack.truncate_to_base(value_stack_base);
+@@ -352,6 +358,8 @@ impl FuncContext<'_> {
+                 InterpreterRuntime::exec(self.store, callframe, call_stack_base).inspect_err(|_| {
+                     self.store.call_stack.truncate_to(call_stack_base);
+                     self.store.value_stack.truncate_to_base(value_stack_base);
++                    self.store.state.handlers.truncate(handler_base);
++                    self.store.state.exceptions.truncate(exception_base);
+                 })?;
+ 
+                 collect_call_results(&mut self.store.value_stack, &func.ty)
+diff --git a/crates/tinywasm/src/imports.rs b/crates/tinywasm/src/imports.rs
+index 056d706..02aba70 100644
+--- a/crates/tinywasm/src/imports.rs
++++ b/crates/tinywasm/src/imports.rs
+@@ -20,6 +20,8 @@ pub enum Extern {
+     Memory(Memory),
+     /// A function import.
+     Function(Function),
++    /// An exception tag, referenced by its store address.
++    Tag(TagAddr),
+ }
+ 
+ impl From<Global> for Extern {
+@@ -114,6 +116,7 @@ pub(crate) struct ResolvedImports {
+     pub(crate) tables: Vec<TableAddr>,
+     pub(crate) memories: Vec<MemAddr>,
+     pub(crate) funcs: Vec<FuncAddr>,
++    pub(crate) tags: Vec<TagAddr>,
+ }
+ 
+ impl Imports {
+@@ -209,6 +212,7 @@ impl Imports {
+                 ImportKind::Table(_) => (g, t + 1, m, f),
+                 ImportKind::Memory(_) => (g, t, m + 1, f),
+                 ImportKind::Function(_) => (g, t, m, f + 1),
++                ImportKind::Tag(_) => (g, t, m, f),
+             });
+ 
+         let mut imports = ResolvedImports {
+@@ -216,6 +220,7 @@ impl Imports {
+             tables: Vec::with_capacity(table_count + module.table_types.len()),
+             memories: Vec::with_capacity(mem_count + module.memory_types.len()),
+             funcs: Vec::with_capacity(func_count + module.funcs.len()),
++            tags: Vec::with_capacity(module.tag_types.len()),
+         };
+ 
+         for import in &*module.imports {
+@@ -225,6 +230,7 @@ impl Imports {
+                     Extern::Table(table) => (ExternVal::Table(table.0.addr), None),
+                     Extern::Memory(memory) => (ExternVal::Memory(memory.0.addr), None),
+                     Extern::Function(func) => (ExternVal::Func(func.addr), Some(func)),
++                    Extern::Tag(addr) => (ExternVal::Tag(addr), None),
+                 }
+             } else {
+                 let name = ExternName::from(import);
+@@ -273,6 +279,15 @@ impl Imports {
+                     Self::compare_types(import, actual_ty, import_func_type)?;
+                     imports.funcs.push(func_addr);
+                 }
++                (ExternVal::Tag(tag_addr), ImportKind::Tag(ty)) => {
++                    let expected = module
++                        .func_types
++                        .get(ty.func_type_idx as usize)
++                        .ok_or_else(|| LinkingError::incompatible_import_type(import))?;
++                    let actual = store.state.get_tag(tag_addr).ty.clone();
++                    Self::compare_types(import, actual.as_ref(), expected.as_ref())?;
++                    imports.tags.push(tag_addr);
++                }
+                 _ => unreachable!("import kind checked above"),
+             }
+         }
+diff --git a/crates/tinywasm/src/instance.rs b/crates/tinywasm/src/instance.rs
+index 8cff310..3781160 100644
+--- a/crates/tinywasm/src/instance.rs
++++ b/crates/tinywasm/src/instance.rs
+@@ -16,6 +16,8 @@ pub enum ExternItem {
+     Table(Table),
+     /// Exported global reference.
+     Global(Global),
++    /// Exported exception tag.
++    Tag(TagAddr),
+ }
+ 
+ /// An instantiated WebAssembly module
+@@ -55,6 +57,7 @@ struct ModuleInstanceInner {
+     global_addrs: Box<[GlobalAddr]>,
+     elem_addrs: Box<[ElemAddr]>,
+     data_addrs: Box<[DataAddr]>,
++    tag_addrs: Box<[TagAddr]>,
+     func_start: Option<FuncAddr>,
+     exports: Arc<[Export]>,
+ }
+@@ -118,6 +121,12 @@ impl ModuleInstance {
+         *self.0.global_addrs.get(addr as usize).unwrap_or_else(|| unreachable!("invalid global address: {addr}"))
+     }
+ 
++    /// resolve a tag address to the tag store address
++    #[inline]
++    pub(crate) fn resolve_tag_addr(&self, addr: TagAddr) -> TagAddr {
++        *self.0.tag_addrs.get(addr as usize).unwrap_or_else(|| unreachable!("invalid tag address: {addr}"))
++    }
++
+     #[inline]
+     pub(crate) fn validate_store(&self, store: &Store) -> Result<()> {
+         if self.0.store_id != store.id() {
+@@ -187,6 +196,7 @@ impl ModuleInstance {
+         }
+ 
+         store.init_globals(&mut addrs.globals, &module.globals, &addrs.funcs)?;
++        addrs.tags.extend(store.init_tags(&module.tag_types, &module.func_types)?);
+         let (elem_addrs, elem_trapped) =
+             store.init_elements(&addrs.tables, &addrs.funcs, &addrs.globals, &module.elements)?;
+         let (data_addrs, data_trapped) =
+@@ -203,6 +213,7 @@ impl ModuleInstance {
+             global_addrs: addrs.globals.into_boxed_slice(),
+             elem_addrs,
+             data_addrs,
++            tag_addrs: addrs.tags.into_boxed_slice(),
+             func_start: module.start_func,
+             exports: module.exports.clone(),
+         };
+@@ -225,6 +236,7 @@ impl ModuleInstance {
+             ExternalKind::Table => self.0.table_addrs.get(export.index as usize)?,
+             ExternalKind::Memory => self.0.mem_addrs.get(export.index as usize)?,
+             ExternalKind::Global => self.0.global_addrs.get(export.index as usize)?,
++            ExternalKind::Tag => self.0.tag_addrs.get(export.index as usize)?,
+         };
+         Some(ExternVal::new(export.kind, *addr))
+     }
+@@ -278,6 +290,7 @@ impl ModuleInstance {
+                 ExternalKind::Global => {
+                     ExternItem::Global(Global(StoreItem::new(self.0.store_id, self.resolve_global_addr(export.index))))
+                 }
++                ExternalKind::Tag => ExternItem::Tag(self.resolve_tag_addr(export.index)),
+             };
+ 
+             (export.name.as_ref(), item)
+@@ -337,6 +350,7 @@ impl ModuleInstance {
+             ExternVal::Memory(addr) => Ok(ExternItem::Memory(Memory(StoreItem::new(self.0.store_id, addr)))),
+             ExternVal::Table(addr) => Ok(ExternItem::Table(Table(StoreItem::new(self.0.store_id, addr)))),
+             ExternVal::Global(addr) => Ok(ExternItem::Global(Global(StoreItem::new(self.0.store_id, addr)))),
++            ExternVal::Tag(addr) => Ok(ExternItem::Tag(addr)),
+         }
+     }
+ 
+diff --git a/crates/tinywasm/src/interpreter/executor.rs b/crates/tinywasm/src/interpreter/executor.rs
+index e4bb6c5..f4cb0a1 100644
+--- a/crates/tinywasm/src/interpreter/executor.rs
++++ b/crates/tinywasm/src/interpreter/executor.rs
+@@ -9,7 +9,7 @@ use alloc::rc::Rc;
+ use alloc::vec::Vec;
+ 
+ use alloc::sync::Arc;
+-use interpreter::stack::CallFrame;
++use interpreter::stack::{CallFrame, StackBase};
+ use tinywasm_types::*;
+ 
+ use super::ExecState;
+@@ -17,6 +17,7 @@ use super::num_helpers::*;
+ use super::values::*;
+ use crate::engine::FuelPolicy;
+ use crate::func::{FuncContext, HostFunction};
++use crate::store::{ExceptionObject, Handler, HandlerClause};
+ use crate::interpreter::Value128;
+ use crate::*;
+ 
+@@ -287,6 +288,11 @@ impl<'store, const BUDGETED: bool> Executor<'store, BUDGETED> {
+             Return32 => { if self.exec_return_32() { return Ok(Some(())); } return Ok(None); }
+             Return64 => { if self.exec_return_64() { return Ok(Some(())); } return Ok(None); }
+             Return128 => { if self.exec_return_128() { return Ok(Some(())); } return Ok(None); }
++            PushHandler(table_idx) => self.exec_push_handler(*table_idx),
++            EndTryTable => { self.store.state.handlers.pop(); }
++            Throw(tag) => return self.exec_throw(*tag),
++            ThrowRef => return self.exec_throw_ref(),
++            Rethrow(offset) => return self.exec_rethrow(*offset),
+             LocalGet32(local_index) => self.store.value_stack.push(Value32::local_get(&self.store.value_stack, &self.cf, *local_index))?,
+             LocalGet64(local_index) => self.store.value_stack.push(Value64::local_get(&self.store.value_stack, &self.cf, *local_index))?,
+             LocalGet128(local_index) => self.store.value_stack.push(Value128::local_get(&self.store.value_stack, &self.cf, *local_index))?,
+@@ -1134,6 +1140,141 @@ impl<'store, const BUDGETED: bool> Executor<'store, BUDGETED> {
+         self.finish_return()
+     }
+ 
++    fn exec_push_handler(&mut self, table_idx: u32) {
++        let data = &self.func.data.handlers[table_idx as usize];
++        let kind = data.kind;
++        let params = data.params;
++        let delegate_offset = data.delegate;
++        let clauses: Box<[HandlerClause]> = data
++            .clauses
++            .iter()
++            .map(|clause| {
++                let tag = match clause.kind {
++                    CatchKind::CatchAll | CatchKind::CatchAllRef => None,
++                    CatchKind::Catch | CatchKind::CatchRef => Some(self.module.resolve_tag_addr(clause.tag)),
++                };
++                let is_ref = matches!(clause.kind, CatchKind::CatchRef | CatchKind::CatchAllRef);
++                HandlerClause { tag, is_ref, pad_ip: clause.pad_ip }
++            })
++            .collect();
++
++        let base = self.store.value_stack.base();
++        let restore = StackBase {
++            s32: base.s32 - params.c32 as u32,
++            s64: base.s64 - params.c64 as u32,
++            s128: base.s128 - params.c128 as u32,
++        };
++        let handler = Handler {
++            frame_depth: self.store.call_stack.len(),
++            restore,
++            legacy: matches!(kind, HandlerKind::Legacy),
++            delegate: matches!(kind, HandlerKind::Delegate).then_some(delegate_offset),
++            caught: None,
++            clauses,
++        };
++        self.store.state.handlers.push(handler);
++    }
++
++    fn exec_throw(&mut self, tag_local: u32) -> Result<Option<()>, Trap> {
++        let tag_addr = self.module.resolve_tag_addr(tag_local);
++        let params = self.store.state.get_tag(tag_addr).ty.params().to_vec();
++        let mut values = Vec::with_capacity(params.len());
++        for ty in params.iter().rev() {
++            values.push(self.store.value_stack.pop_wasmvalue(*ty));
++        }
++        values.reverse();
++        let exn_idx = self.store.state.exceptions.len() as u32;
++        self.store.state.exceptions.push(ExceptionObject { tag: tag_addr, values: values.into_boxed_slice() });
++        self.do_throw(exn_idx)
++    }
++
++    fn exec_throw_ref(&mut self) -> Result<Option<()>, Trap> {
++        let reference = <ValueRef>::stack_pop(&mut self.store.value_stack);
++        if reference.is_null() {
++            cold_path();
++            return Err(Trap::Other("null exception reference"));
++        }
++        self.do_throw(reference.raw())
++    }
++
++    fn do_throw(&mut self, exn_idx: u32) -> Result<Option<()>, Trap> {
++        let exn_tag = self.store.state.exceptions[exn_idx as usize].tag;
++
++        let mut hit = None;
++        let mut k = self.store.state.handlers.len();
++        while k > 0 {
++            k -= 1;
++            let handler = &self.store.state.handlers[k];
++            if handler.frame_depth < self.call_stack_base {
++                break;
++            }
++            if handler.caught.is_some() {
++                continue;
++            }
++            if let Some(down) = handler.delegate {
++                if down as usize > k {
++                    break;
++                }
++                k = k - down as usize + 1;
++                continue;
++            }
++            let matched_clause = handler
++                .clauses
++                .iter()
++                .find(|clause| clause.tag.is_none_or(|tag| tag == exn_tag))
++                .map(|clause| (clause.pad_ip, clause.is_ref, clause.tag.is_some()));
++            if let Some((pad_ip, is_ref, has_values)) = matched_clause {
++                hit = Some((k, pad_ip, is_ref, has_values, handler.frame_depth, handler.restore, handler.legacy));
++                break;
++            }
++        }
++
++        let Some((matched, pad_ip, is_ref, has_values, frame_depth, restore, legacy)) = hit else {
++            cold_path();
++            return Err(Trap::UncaughtException);
++        };
++
++        self.store.state.handlers.truncate(matched + 1);
++        if legacy {
++            self.store.state.handlers[matched].caught = Some(exn_idx);
++        }
++
++        if self.store.call_stack.len() > frame_depth {
++            self.store.call_stack.truncate_to(frame_depth + 1);
++            let frame = self
++                .store
++                .call_stack
++                .pop_frame(self.call_stack_base)
++                .unwrap_or_else(|| unreachable!("handler frame missing"));
++            self.cf = frame;
++            let wasm_func = self.store.state.get_wasm_func(self.cf.func_addr);
++            self.func = wasm_func.func.clone();
++            if wasm_func.owner != self.module.idx() {
++                self.module = self.store.get_module_instance_internal(wasm_func.owner);
++            }
++        }
++
++        if legacy {
++            self.store.value_stack.truncate_to_base(restore);
++        }
++        if has_values {
++            let values = self.store.state.exceptions[exn_idx as usize].values.clone();
++            self.store.value_stack.extend_from_wasmvalues(&values)?;
++        }
++        if is_ref {
++            self.store.value_stack.stack_32.push(exn_idx)?;
++        }
++        self.cf.instr_ptr = pad_ip as usize;
++        Ok(None)
++    }
++
++    fn exec_rethrow(&mut self, offset: u32) -> Result<Option<()>, Trap> {
++        let idx = self.store.state.handlers.len() - 1 - offset as usize;
++        let exn_idx =
++            self.store.state.handlers[idx].caught.unwrap_or_else(|| unreachable!("rethrow outside of a catch body"));
++        self.do_throw(exn_idx)
++    }
++
+     fn exec_store_local_local<T: InternalValue + MemValue<N>, const N: usize>(
+         &mut self,
+         memarg: MemoryArg,
+@@ -1226,7 +1367,9 @@ impl<'store, const BUDGETED: bool> Executor<'store, BUDGETED> {
+         let raw = <Value32>::stack_pop(&mut self.store.value_stack);
+         let value = match self.store.state.get_global(global_addr).ty.ty {
+             WasmType::I32 | WasmType::F32 => TinyWasmValue::Value32(raw),
+-            WasmType::RefExtern | WasmType::RefFunc => TinyWasmValue::ValueRef(ValueRef::from_raw(raw)),
++            WasmType::RefExtern | WasmType::RefFunc | WasmType::RefExn => {
++                TinyWasmValue::ValueRef(ValueRef::from_raw(raw))
++            }
+             WasmType::I64 | WasmType::F64 | WasmType::V128 => unreachable!("invalid global.set.32 target type"),
+         };
+         self.store.state.set_global_val(global_addr, value);
+diff --git a/crates/tinywasm/src/interpreter/stack/value_stack.rs b/crates/tinywasm/src/interpreter/stack/value_stack.rs
+index 1b06317..f38b7ec 100644
+--- a/crates/tinywasm/src/interpreter/stack/value_stack.rs
++++ b/crates/tinywasm/src/interpreter/stack/value_stack.rs
+@@ -1,6 +1,6 @@
+ use alloc::vec::Vec;
+ use core::hint::cold_path;
+-use tinywasm_types::{ExternRef, FuncRef, ValueCounts, WasmType, WasmValue};
++use tinywasm_types::{ExnRef, ExternRef, FuncRef, ValueCounts, WasmType, WasmValue};
+ 
+ use super::StackBase;
+ use crate::engine::{Config, StackConfig};
+@@ -255,6 +255,7 @@ impl ValueStack {
+             WasmType::F64 => WasmValue::F64(f64::stack_pop(self)),
+             WasmType::RefExtern => WasmValue::RefExtern(ExternRef::from_raw(ValueRef::stack_pop(self).raw())),
+             WasmType::RefFunc => WasmValue::RefFunc(FuncRef::from_raw(ValueRef::stack_pop(self).raw())),
++            WasmType::RefExn => WasmValue::ExnRef(ExnRef::from_raw(ValueRef::stack_pop(self).raw())),
+             WasmType::V128 => WasmValue::V128(Value128::stack_pop(self).0),
+         }
+     }
+@@ -268,6 +269,7 @@ impl ValueStack {
+                 WasmValue::F64(v) => self.stack_64.push(v.to_bits())?,
+                 WasmValue::RefExtern(v) => self.stack_32.push(v.raw())?,
+                 WasmValue::RefFunc(v) => self.stack_32.push(v.raw())?,
++                WasmValue::ExnRef(v) => self.stack_32.push(v.raw())?,
+                 WasmValue::V128(v) => self.stack_128.push((*v).into())?,
+             }
+         }
+diff --git a/crates/tinywasm/src/interpreter/values.rs b/crates/tinywasm/src/interpreter/values.rs
+index b312b5d..43dacdb 100644
+--- a/crates/tinywasm/src/interpreter/values.rs
++++ b/crates/tinywasm/src/interpreter/values.rs
+@@ -1,6 +1,6 @@
+ use super::stack::{CallFrame, ValueStack};
+ use crate::{Result, interpreter::simd::Value128};
+-use tinywasm_types::{ExternRef, FuncRef, LocalAddr, WasmType, WasmValue};
++use tinywasm_types::{ExnRef, ExternRef, FuncRef, LocalAddr, WasmType, WasmValue};
+ 
+ pub(crate) type Value32 = u32;
+ pub(crate) type Value64 = u64;
+@@ -103,10 +103,11 @@ impl TinyWasmValue {
+             (Self::Value64(v), WasmType::F64) => Some(WasmValue::F64(f64::from_bits(v))),
+             (Self::ValueRef(v), WasmType::RefExtern) => Some(WasmValue::RefExtern(ExternRef::from_raw(v.raw()))),
+             (Self::ValueRef(v), WasmType::RefFunc) => Some(WasmValue::RefFunc(FuncRef::from_raw(v.raw()))),
++            (Self::ValueRef(v), WasmType::RefExn) => Some(WasmValue::ExnRef(ExnRef::from_raw(v.raw()))),
+             (Self::Value128(v), WasmType::V128) => Some(WasmValue::V128(v.0)),
+             (_, WasmType::I32 | WasmType::F32) => None,
+             (_, WasmType::I64 | WasmType::F64) => None,
+-            (_, WasmType::RefExtern | WasmType::RefFunc) => None,
++            (_, WasmType::RefExtern | WasmType::RefFunc | WasmType::RefExn) => None,
+             (_, WasmType::V128) => None,
+         }
+     }
+@@ -121,6 +122,7 @@ impl From<&WasmValue> for TinyWasmValue {
+             WasmValue::F64(v) => Self::Value64(v.to_bits()),
+             WasmValue::RefExtern(v) => Self::ValueRef(ValueRef::from_addr(v.addr())),
+             WasmValue::RefFunc(v) => Self::ValueRef(ValueRef::from_addr(v.addr())),
++            WasmValue::ExnRef(v) => Self::ValueRef(ValueRef::from_addr(v.addr())),
+             WasmValue::V128(v) => Self::Value128((*v).into()),
+         }
+     }
+diff --git a/crates/tinywasm/src/store/mod.rs b/crates/tinywasm/src/store/mod.rs
+index 1723bfe..1fed503 100644
+--- a/crates/tinywasm/src/store/mod.rs
++++ b/crates/tinywasm/src/store/mod.rs
+@@ -4,10 +4,39 @@ use core::hint::cold_path;
+ use core::sync::atomic::{AtomicUsize, Ordering};
+ use tinywasm_types::*;
+ 
+-use crate::interpreter::stack::{CallStack, ValueStack};
++use crate::interpreter::stack::{CallStack, StackBase, ValueStack};
+ use crate::interpreter::{TinyWasmValue, ValueRef};
+ use crate::{Engine, Error, ModuleInstance, Result, Trap};
+ 
++/// A runtime exception tag instance, addressed by [`TagAddr`].
++pub(crate) struct TagInstance {
++    pub(crate) ty: Arc<FuncType>,
++}
++
++/// A thrown exception object: the tag it carries plus its argument values.
++pub(crate) struct ExceptionObject {
++    pub(crate) tag: TagAddr,
++    pub(crate) values: Box<[WasmValue]>,
++}
++
++/// A single resolved catch clause of an installed `try_table` handler.
++pub(crate) struct HandlerClause {
++    pub(crate) tag: Option<TagAddr>,
++    pub(crate) is_ref: bool,
++    pub(crate) pad_ip: u32,
++}
++
++/// An installed exception handler on the runtime handler stack (a `try_table`, a legacy
++/// `try`, or a `delegate`).
++pub(crate) struct Handler {
++    pub(crate) frame_depth: u32,
++    pub(crate) restore: StackBase,
++    pub(crate) legacy: bool,
++    pub(crate) delegate: Option<u32>,
++    pub(crate) caught: Option<u32>,
++    pub(crate) clauses: Box<[HandlerClause]>,
++}
++
+ mod data;
+ mod element;
+ mod function;
+@@ -131,6 +160,9 @@ pub(crate) struct State {
+     pub(crate) globals: Vec<GlobalInstance>,
+     pub(crate) elements: Vec<ElementInstance>,
+     pub(crate) data: Vec<DataInstance>,
++    pub(crate) tags: Vec<TagInstance>,
++    pub(crate) exceptions: Vec<ExceptionObject>,
++    pub(crate) handlers: Vec<Handler>,
+ }
+ 
+ impl State {
+@@ -206,6 +238,11 @@ impl State {
+         Self::get_mut(&mut self.elements, addr, "element")
+     }
+ 
++    /// Get the tag at the actual index in the store
++    pub(crate) fn get_tag(&self, addr: TagAddr) -> &TagInstance {
++        Self::get(&self.tags, addr, "tag")
++    }
++
+     /// Get the global at the actual index in the store
+     pub(crate) fn get_global(&self, addr: GlobalAddr) -> &GlobalInstance {
+         Self::get(&self.globals, addr, "global")
+@@ -280,6 +317,24 @@ impl Store {
+         Ok(start..start + tables.len() as TableAddr)
+     }
+ 
++    /// Add exception tags to the store, returning their addresses in the store
++    pub(crate) fn init_tags(
++        &mut self,
++        tag_types: &[TagType],
++        func_types: &[Arc<FuncType>],
++    ) -> Result<impl ExactSizeIterator<Item = TagAddr>> {
++        let start = self.state.tags.len() as TagAddr;
++        self.state.tags.reserve_exact(tag_types.len());
++        for tag in tag_types {
++            let ty = func_types
++                .get(tag.func_type_idx as usize)
++                .ok_or_else(|| Error::Other(format!("tag type index out of bounds: {}", tag.func_type_idx)))?
++                .clone();
++            self.state.tags.push(TagInstance { ty });
++        }
++        Ok(start..start + tag_types.len() as TagAddr)
++    }
++
+     /// Add memories to the store, returning their addresses in the store
+     pub(crate) fn init_memories(
+         &mut self,
+@@ -526,6 +581,7 @@ impl Store {
+                 GlobalGet(addr) => resolve_global(*addr)?,
+                 RefFunc(None) => TinyWasmValue::ValueRef(ValueRef::NULL),
+                 RefExtern(None) => TinyWasmValue::ValueRef(ValueRef::NULL),
++                RefExn => TinyWasmValue::ValueRef(ValueRef::NULL),
+                 RefFunc(Some(idx)) => TinyWasmValue::ValueRef(ValueRef::from_addr(Some(resolve_func(*idx)?))),
+                 _ => {
+                     cold_path();
+@@ -545,7 +601,7 @@ impl Store {
+                 F64Const(f) => stack.push(TinyWasmValue::Value64(f.to_bits())),
+                 V128Const(i) => stack.push(TinyWasmValue::Value128((*i).into())),
+                 GlobalGet(addr) => stack.push(resolve_global(*addr)?),
+-                RefFunc(None) | RefExtern(None) => stack.push(TinyWasmValue::ValueRef(ValueRef::NULL)),
++                RefFunc(None) | RefExtern(None) | RefExn => stack.push(TinyWasmValue::ValueRef(ValueRef::NULL)),
+                 RefFunc(Some(idx)) => {
+                     stack.push(TinyWasmValue::ValueRef(ValueRef::from_addr(Some(resolve_func(*idx)?))))
+                 }
+diff --git a/crates/tinywasm/tests/host_func_signature_check.rs b/crates/tinywasm/tests/host_func_signature_check.rs
+index b0e50b2..b6ee089 100644
+--- a/crates/tinywasm/tests/host_func_signature_check.rs
++++ b/crates/tinywasm/tests/host_func_signature_check.rs
+@@ -123,6 +123,7 @@ fn to_name(ty: &WasmType) -> &str {
+         WasmType::V128 => "v128",
+         WasmType::RefFunc => "funcref",
+         WasmType::RefExtern => "externref",
++        WasmType::RefExn => "exnref",
+     }
+ }
+ 
+diff --git a/crates/types/src/instructions.rs b/crates/types/src/instructions.rs
+index c104ce0..c3382d2 100644
+--- a/crates/types/src/instructions.rs
++++ b/crates/types/src/instructions.rs
+@@ -55,6 +55,7 @@ pub enum ConstInstruction {
+     GlobalGet(GlobalAddr),
+     RefFunc(Option<FuncAddr>),
+     RefExtern(Option<ExternAddr>),
++    RefExn,
+     I32Add,
+     I32Sub,
+     I32Mul,
+@@ -203,6 +204,14 @@ pub enum Instruction {
+     ReturnCallSelf,
+     ReturnCallIndirect(TypeAddr, TableAddr),
+ 
++    // > Exception Handling (try_table lowered to a handler push/pop plus jump-oriented landing pads)
++    // See <https://webassembly.github.io/spec/core/binary/instructions.html#control-instructions>
++    PushHandler(u32),
++    EndTryTable,
++    Throw(u32),
++    ThrowRef,
++    Rethrow(u32),
++
+     // > Parametric Instructions
+     // See <https://webassembly.github.io/spec/core/binary/instructions.html#parametric-instructions>
+     Drop32, Select32,
+diff --git a/crates/types/src/lib.rs b/crates/types/src/lib.rs
+index fcac23c..704529c 100644
+--- a/crates/types/src/lib.rs
++++ b/crates/types/src/lib.rs
+@@ -104,6 +104,11 @@ pub struct ModuleInner {
+     /// Corresponds to the `table` section of the original WebAssembly module.
+     pub table_types: Box<[TableType]>,
+ 
++    /// Exception tag components of the WebAssembly module.
++    ///
++    /// Corresponds to the `tag` section of the original WebAssembly module.
++    pub tag_types: Box<[TagType]>,
++
+     /// Memory components of the WebAssembly module used to initialize memories.
+     ///
+     /// Corresponds to the `memory` section of the original WebAssembly module.
+@@ -139,6 +144,9 @@ impl Module {
+                 ImportKind::Table(table_ty) => Some(ImportType::Table(table_ty)),
+                 ImportKind::Memory(memory_ty) => Some(ImportType::Memory(memory_ty)),
+                 ImportKind::Global(global_ty) => Some(ImportType::Global(global_ty)),
++                ImportKind::Tag(tag_ty) => {
++                    Some(ImportType::Tag(self.0.func_types.get(tag_ty.func_type_idx as usize)?))
++                }
+             }?;
+ 
+             Some(ModuleImport { module: import.module.as_ref(), name: import.name.as_ref(), ty })
+@@ -160,6 +168,7 @@ impl Module {
+                             | (ExternalKind::Table, ImportKind::Table(_))
+                             | (ExternalKind::Memory, ImportKind::Memory(_))
+                             | (ExternalKind::Global, ImportKind::Global(_))
++                            | (ExternalKind::Tag, ImportKind::Tag(_))
+                     )
+                 })
+                 .count()
+@@ -173,6 +182,7 @@ impl Module {
+                         | (ExternalKind::Table, ImportKind::Table(_))
+                         | (ExternalKind::Memory, ImportKind::Memory(_))
+                         | (ExternalKind::Global, ImportKind::Global(_))
++                        | (ExternalKind::Tag, ImportKind::Tag(_))
+                 )
+             });
+             let import = imports.nth(index)?;
+@@ -182,6 +192,7 @@ impl Module {
+                 ImportKind::Table(table_ty) => Some(ExportType::Table(table_ty)),
+                 ImportKind::Memory(memory_ty) => Some(ExportType::Memory(memory_ty)),
+                 ImportKind::Global(global_ty) => Some(ExportType::Global(global_ty)),
++                ImportKind::Tag(tag_ty) => Some(ExportType::Tag(module.func_types.get(tag_ty.func_type_idx as usize)?)),
+             }
+         }
+ 
+@@ -220,6 +231,15 @@ impl Module {
+                         ExportType::Global(&self.0.globals.get(idx - imported_globals)?.ty)
+                     }
+                 }
++                ExternalKind::Tag => {
++                    let imported_tags = imported_count(&self.0, ExternalKind::Tag);
++                    if idx < imported_tags {
++                        imported_type(&self.0, ExternalKind::Tag, idx)?
++                    } else {
++                        let tag = self.0.tag_types.get(idx - imported_tags)?;
++                        ExportType::Tag(self.0.func_types.get(tag.func_type_idx as usize)?)
++                    }
++                }
+             };
+ 
+             Some(ModuleExport { name: export.name.as_ref(), ty })
+@@ -255,6 +275,8 @@ pub enum ImportType<'a> {
+     Memory(&'a MemoryType),
+     /// Imported global type.
+     Global(&'a GlobalType),
++    /// Imported exception tag, described by its parameter signature.
++    Tag(&'a FuncType),
+ }
+ 
+ /// Exported entity type.
+@@ -267,6 +289,8 @@ pub enum ExportType<'a> {
+     Memory(&'a MemoryType),
+     /// Exported global type.
+     Global(&'a GlobalType),
++    /// Exported exception tag, described by its parameter signature.
++    Tag(&'a FuncType),
+ }
+ 
+ /// How instantiation should prepare local memories declared by the module.
+@@ -298,6 +322,8 @@ pub enum ExternalKind {
+     Memory,
+     /// A WebAssembly Global.
+     Global,
++    /// A WebAssembly exception Tag.
++    Tag,
+ }
+ 
+ /// A WebAssembly Address.
+@@ -319,6 +345,7 @@ pub type ConstIdx = Addr;
+ 
+ // additional internal addresses
+ pub type TypeAddr = Addr;
++pub type TagAddr = Addr;
+ pub type LocalAddr = u16; // there can't be more than 50.000 locals in a function
+ pub type ModuleInstanceAddr = Addr;
+ 
+@@ -332,6 +359,7 @@ pub enum ExternVal {
+     Table(TableAddr),
+     Memory(MemAddr),
+     Global(GlobalAddr),
++    Tag(TagAddr),
+ }
+ 
+ impl ExternVal {
+@@ -342,6 +370,7 @@ impl ExternVal {
+             Self::Table(_) => ExternalKind::Table,
+             Self::Memory(_) => ExternalKind::Memory,
+             Self::Global(_) => ExternalKind::Global,
++            Self::Tag(_) => ExternalKind::Tag,
+         }
+     }
+ 
+@@ -352,10 +381,20 @@ impl ExternVal {
+             ExternalKind::Table => Self::Table(addr),
+             ExternalKind::Memory => Self::Memory(addr),
+             ExternalKind::Global => Self::Global(addr),
++            ExternalKind::Tag => Self::Tag(addr),
+         }
+     }
+ }
+ 
++/// The type of a WebAssembly exception Tag.
++#[derive(Clone, Copy, PartialEq, Eq)]
++#[cfg_attr(feature = "debug", derive(Debug))]
++#[cfg_attr(feature = "archive", derive(serde::Serialize, serde::Deserialize))]
++pub struct TagType {
++    /// Index of the function type describing this tag's parameters.
++    pub func_type_idx: TypeAddr,
++}
++
+ /// The type of a WebAssembly Function.
+ ///
+ /// See <https://webassembly.github.io/spec/core/syntax/types.html#function-types>
+@@ -408,7 +447,9 @@ impl<'a> FromIterator<&'a WasmType> for ValueCounts {
+ 
+         for ty in iter {
+             match ty {
+-                WasmType::I32 | WasmType::F32 | WasmType::RefExtern | WasmType::RefFunc => counts.c32 += 1,
++                WasmType::I32 | WasmType::F32 | WasmType::RefExtern | WasmType::RefFunc | WasmType::RefExn => {
++                    counts.c32 += 1
++                }
+                 WasmType::I64 | WasmType::F64 => counts.c64 += 1,
+                 WasmType::V128 => counts.c128 += 1,
+             }
+@@ -435,6 +476,48 @@ pub struct WasmFunction {
+ pub struct WasmFunctionData {
+     pub v128_constants: Box<[[u8; 16]]>,
+     pub branch_table_targets: Box<[u32]>,
++    pub handlers: Box<[HandlerData]>,
++}
++
++/// An installed exception handler: a `try_table`, a legacy `try`, or a `delegate`.
++#[derive(Clone, PartialEq, Eq, Default)]
++#[cfg_attr(feature = "debug", derive(Debug))]
++#[cfg_attr(feature = "archive", derive(serde::Serialize, serde::Deserialize))]
++pub struct HandlerData {
++    pub kind: HandlerKind,
++    pub params: ValueCounts,
++    pub delegate: u32,
++    pub clauses: Box<[CatchClause]>,
++}
++
++#[derive(Clone, Copy, PartialEq, Eq, Default)]
++#[cfg_attr(feature = "debug", derive(Debug))]
++#[cfg_attr(feature = "archive", derive(serde::Serialize, serde::Deserialize))]
++pub enum HandlerKind {
++    #[default]
++    TryTable,
++    Legacy,
++    Delegate,
++}
++
++/// A single catch clause of a handler, resolved to a landing pad.
++#[derive(Clone, Copy, PartialEq, Eq)]
++#[cfg_attr(feature = "debug", derive(Debug))]
++#[cfg_attr(feature = "archive", derive(serde::Serialize, serde::Deserialize))]
++pub struct CatchClause {
++    pub kind: CatchKind,
++    pub tag: u32,
++    pub pad_ip: u32,
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++#[cfg_attr(feature = "debug", derive(Debug))]
++#[cfg_attr(feature = "archive", derive(serde::Serialize, serde::Deserialize))]
++pub enum CatchKind {
++    Catch,
++    CatchRef,
++    CatchAll,
++    CatchAllRef,
+ }
+ 
+ impl WasmFunctionData {
+@@ -638,6 +721,7 @@ pub enum ImportKind {
+     Table(TableType),
+     Memory(MemoryType),
+     Global(GlobalType),
++    Tag(TagType),
+ }
+ 
+ impl From<&ImportKind> for ExternalKind {
+@@ -647,6 +731,7 @@ impl From<&ImportKind> for ExternalKind {
+             ImportKind::Table(_) => Self::Table,
+             ImportKind::Memory(_) => Self::Memory,
+             ImportKind::Global(_) => Self::Global,
++            ImportKind::Tag(_) => Self::Tag,
+         }
+     }
+ }
+diff --git a/crates/types/src/reference.rs b/crates/types/src/reference.rs
+index 7970dc8..6c9c697 100644
+--- a/crates/types/src/reference.rs
++++ b/crates/types/src/reference.rs
+@@ -8,6 +8,9 @@ pub struct ExternRef(u32);
+ #[derive(Clone, Copy, PartialEq, Eq)]
+ pub struct FuncRef(u32);
+ 
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub struct ExnRef(u32);
++
+ #[cfg(feature = "debug")]
+ impl core::fmt::Debug for ExternRef {
+     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+@@ -28,6 +31,58 @@ impl core::fmt::Debug for FuncRef {
+     }
+ }
+ 
++#[cfg(feature = "debug")]
++impl core::fmt::Debug for ExnRef {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        match self.addr() {
++            Some(addr) => write!(f, "exn({addr:?})"),
++            None => write!(f, "exn(null)"),
++        }
++    }
++}
++
++impl ExnRef {
++    #[inline]
++    /// Create a new [`ExnRef`] wrapping an exception-store index.
++    /// Should only be used by the runtime.
++    pub const fn new(addr: Option<u32>) -> Self {
++        match addr {
++            Some(addr) => Self(addr),
++            None => Self::null(),
++        }
++    }
++
++    /// Create a null [`ExnRef`].
++    #[inline]
++    pub const fn null() -> Self {
++        Self(NULL_REF)
++    }
++
++    /// Check if the [`ExnRef`] is null.
++    #[inline]
++    pub const fn is_null(&self) -> bool {
++        self.0 == NULL_REF
++    }
++
++    /// Get the exception-store index from the [`ExnRef`].
++    #[inline]
++    pub const fn addr(&self) -> Option<u32> {
++        if self.is_null() { None } else { Some(self.0) }
++    }
++
++    #[inline]
++    #[doc(hidden)]
++    pub const fn from_raw(raw: u32) -> Self {
++        Self(raw)
++    }
++
++    #[inline]
++    #[doc(hidden)]
++    pub const fn raw(&self) -> u32 {
++        self.0
++    }
++}
++
+ impl FuncRef {
+     #[inline]
+     /// Create a new [`FuncRef`] from a [`FuncAddr`].
+diff --git a/crates/types/src/value.rs b/crates/types/src/value.rs
+index 782cdb8..b0d4377 100644
+--- a/crates/types/src/value.rs
++++ b/crates/types/src/value.rs
+@@ -1,6 +1,6 @@
+ use core::fmt::Debug;
+ 
+-use crate::{ConstInstruction, ExternRef, FuncRef};
++use crate::{ConstInstruction, ExnRef, ExternRef, FuncRef};
+ 
+ /// A WebAssembly value.
+ ///
+@@ -20,6 +20,8 @@ pub enum WasmValue {
+     V128([u8; 16]),
+     RefExtern(ExternRef),
+     RefFunc(FuncRef),
++    /// A reference to an exception.
++    ExnRef(ExnRef),
+ }
+ 
+ impl Debug for WasmValue {
+@@ -34,10 +36,14 @@ impl Debug for WasmValue {
+             Self::RefExtern(i) => write!(f, "ref({i:?})"),
+             #[cfg(feature = "debug")]
+             Self::RefFunc(i) => write!(f, "func({i:?})"),
++            #[cfg(feature = "debug")]
++            Self::ExnRef(i) => write!(f, "exn({i:?})"),
+             #[cfg(not(feature = "debug"))]
+             Self::RefExtern(_) => write!(f, "ref()"),
+             #[cfg(not(feature = "debug"))]
+             Self::RefFunc(_) => write!(f, "func()"),
++            #[cfg(not(feature = "debug"))]
++            Self::ExnRef(_) => write!(f, "exn()"),
+         }
+     }
+ }
+@@ -54,6 +60,7 @@ impl WasmValue {
+             Self::V128(i) => ConstInstruction::V128Const(*i),
+             Self::RefFunc(i) => ConstInstruction::RefFunc(i.addr()),
+             Self::RefExtern(i) => ConstInstruction::RefExtern(i.addr()),
++            Self::ExnRef(_) => ConstInstruction::RefExn,
+         }])
+     }
+ 
+@@ -68,6 +75,7 @@ impl WasmValue {
+             WasmType::V128 => Self::V128([0; 16]),
+             WasmType::RefFunc => Self::RefFunc(FuncRef::null()),
+             WasmType::RefExtern => Self::RefExtern(ExternRef::null()),
++            WasmType::RefExn => Self::ExnRef(ExnRef::null()),
+         }
+     }
+ 
+@@ -80,6 +88,7 @@ impl WasmValue {
+             (Self::V128(a), Self::V128(b)) => a == b || Self::v128_nan_eq(*a, *b),
+             (Self::RefExtern(addr), Self::RefExtern(addr2)) => addr == addr2,
+             (Self::RefFunc(addr), Self::RefFunc(addr2)) => addr == addr2,
++            (Self::ExnRef(addr), Self::ExnRef(addr2)) => addr == addr2,
+             (Self::F32(a), Self::F32(b)) => a.is_nan() && b.is_nan() || a.to_bits() == b.to_bits(),
+             (Self::F64(a), Self::F64(b)) => a.is_nan() && b.is_nan() || a.to_bits() == b.to_bits(),
+             _ => false,
+@@ -146,6 +155,7 @@ impl From<&WasmValue> for WasmType {
+             WasmValue::V128(_) => WasmType::V128,
+             WasmValue::RefExtern(_) => WasmType::RefExtern,
+             WasmValue::RefFunc(_) => WasmType::RefFunc,
++            WasmValue::ExnRef(_) => WasmType::RefExn,
+         }
+     }
+ }
+@@ -175,6 +185,8 @@ pub enum WasmType {
+     RefFunc,
+     /// A reference to an external value.
+     RefExtern,
++    /// A reference to an exception.
++    RefExn,
+ }
+ 
+ impl WasmType {
+@@ -231,4 +243,5 @@ impl_conversion_for_wasmvalue! {
+     [u8; 16] => V128, as_v128, "Return the raw little-endian bytes from a `WasmValue`, if it is a `V128`.";
+     ExternRef => RefExtern, as_ref_extern, "Return the [`ExternRef`] from a `WasmValue`, if it is one";
+     FuncRef => RefFunc, as_ref_func, "Return the [`FuncRef`] from a `WasmValue`, if it is one";
++    ExnRef => ExnRef, as_ref_exn, "Return the [`ExnRef`] from a `WasmValue`, if it is one";
+ }

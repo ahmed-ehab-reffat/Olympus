@@ -1,0 +1,17 @@
+Title: Add opaque NTPv4 extension-field parsing and editing
+
+Add support for NTPv4 extension fields that may follow the 48-byte header.
+
+`NtpExtensionField` is a borrowed view with `bool isNull() const`, `uint16_t getFieldType() const`, `size_t getTotalSize() const`, `size_t getDataSize() const`, `uint8_t* getData() const`, `uint8_t* getRecordBasePtr() const`, and `void purgeRecordData()`. Expose `NtpExtensionFieldBuilder(uint16_t fieldType, const uint8_t* fieldData, size_t fieldDataLength)` with `NtpExtensionField build() const`. Each call to `build()` returns an independently owned record that can be released with `purgeRecordData()`. Copying or copy-assigning an owned record creates another independently owned allocation, so mutating or purging either copy does not affect the other. Views returned by a layer point into that layer's encoded storage. Purging a borrowed view makes that view null without releasing or altering the layer storage.
+
+Add `NtpExtensionField getFirstExtensionField() const`, `NtpExtensionField getNextExtensionField(const NtpExtensionField&) const`, `size_t getExtensionFieldCount() const`, `NtpExtensionField addExtensionField(const NtpExtensionFieldBuilder&)`, `NtpExtensionField addExtensionFieldBefore(const NtpExtensionFieldBuilder&, uint16_t nextFieldType)`, `bool removeExtensionField(uint16_t fieldType)`, and `bool removeAllExtensionFields()` to `NtpLayer`. On success, the add methods return borrowed views into the edited layer that can be used as traversal cursors; on failure, they return null fields. The remove methods return `false` on failure.
+
+Treat field type and encoded length as network-order 16-bit values. The encoded length includes the four-byte field header and padding, is at least 16, is divisible by four, and cannot exceed the remaining layer data. Treat extension fields as opaque, preserve order and duplicates, and include encoded padding in field data.
+
+Only NTPv4 has extension fields. A field-only list is valid when its final field is at least 28 bytes; earlier fields may be 16 bytes. A terminal 4-, 20-, or 24-byte remainder is supported authentication data. A field-free tail of any of those sizes is authentication even when its first bytes resemble a field header. `getKeyID()` exposes the terminal four-byte key identifier for all three supported sizes, and `getDigest()` is empty for the 4-byte form. These results must also be available when authentication follows extension fields. Other malformed or ambiguous tails expose no extension fields or authentication.
+
+The builder preserves the supplied bytes, zero-pads to a four-byte boundary and the 16-byte minimum, and encodes the padded total length. It accepts at most 65,528 data bytes, producing at most 65,532 encoded bytes, and rejects a null pointer with nonzero length.
+
+Appending requires a valid final field of at least 28 bytes. Insertion goes before the first matching type; when no type matches, it behaves as append. Removing by type removes only the first match. Refuse an edit that would leave an invalid list. Refuse every edit atomically when supported authentication is present or the tail is malformed. Removing all fields from an already field-free, unauthenticated NTPv4 layer succeeds without changing it.
+
+Editing must work both on detached layers and on layers attached to a `Packet`, including packets parsed from raw data. A field view obtained from one layer is not a valid traversal cursor for another layer.

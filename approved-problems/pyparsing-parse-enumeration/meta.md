@@ -1,0 +1,17 @@
+---
+Repository: https://github.com/pyparsing/pyparsing
+Language: Python
+Issue: Enumerate every parse of an ambiguous expression
+Commit: d3388aaf5c60d1069b7294a743ccd0e7c87a1d1d
+Title: Enumerate all parses of an ambiguous grammar
+---
+
+# Enumerate every parse of an ambiguous expression
+
+An expression built from alternations, repetitions or optional elements can match the same text in more than one way, and `parse_string` commits to one match. Add three generator methods on `ParserElement` that walk them all: `enumerate_parses(instring, *, parse_all=False, max_parses=None, unique=False)`, `enumerate_scan(instring, *, max_parses=None, overlap=False, unique=False)` and `enumerate_transforms(instring, *, max_parses=None)`. The first two yield `(tokens, start, end)` triples like `scan_string`, over the same tab-expanded input `parse_string` uses, start being the location reached after skipping leading whitespace and ignored expressions. Export the name `EnumeratedParse` for that triple.
+
+Parses come out most-preferred first, preference being the order the ordinary parser tries things. A sequence varies its last element fastest. `MatchFirst` gives every parse of one alternative before moving to the next, while `Or` examines its alternatives and orders all their parses together by decreasing end location, breaking ties by operand order. Repetition is greedy the same way: it takes the body's parses in their own order and extends as far as it can before falling back to fewer repetitions, so the zero-repetition parse of `ZeroOrMore` comes last; a body match that consumes nothing counts as one repetition and then ends it, so a body able to match empty still enumerates finitely. An optional element is present before absent, and the absent parse carries the default value when one was given. `SkipTo` yields one parse per position its target matches, nearest first. A lookahead contributes a single parse of no tokens when it holds. Wrappers transform each parse exactly as they transform an ordinary one. `Each` yields those orderings of its operands that match, taking its earliest-listed operand first at each step, or the single ordinary parse when an operand is optional or repeated.
+
+For each parse yielded, that expression's actions and conditions run once, in order. One raising `ParseException` discards only its own parse and enumeration continues; `ParseFatalException` propagates, as does the commitment an error stop (`-`) makes, so a following element that cannot match raises instead of backtracking. Enumeration is lazy, so no action runs for a parse never yielded, and ordering `^` examines its alternatives in a pass that runs no actions at all. An expression that cannot match yields nothing rather than raising.
+
+Under `parse_all` only parses that reach the end of the input, ignoring trailing whitespace, are yielded. `max_parses` stops the enumeration once that many results have been yielded, and `unique` skips a parse whose tokens, names and end location repeat one already yielded. An enumeration that is abandoned, or stopped early by `max_parses`, leaves nothing behind, so the same expression enumerates again in full. Scanning resumes past the end of the first parse reported at a location, or one character on from that location when `overlap` is set. `enumerate_transforms` yields each distinct string `transform_string` could produce once. Enumeration must terminate on a recursive grammar. The parses reported must not depend on whether `enable_packrat` is in effect.

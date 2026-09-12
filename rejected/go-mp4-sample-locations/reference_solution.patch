@@ -1,0 +1,508 @@
+diff --git a/probe.go b/probe.go
+index 82fd249..d635060 100644
+--- a/probe.go
++++ b/probe.go
+@@ -4,6 +4,7 @@ import (
+ 	"bytes"
+ 	"errors"
+ 	"io"
++	"math"
+ 
+ 	"github.com/abema/go-mp4/internal/bitio"
+ )
+@@ -61,6 +62,10 @@ type Sample struct {
+ 	Size                  uint32
+ 	TimeDelta             uint32
+ 	CompositionTimeOffset int64
++	Offset                uint64
++	DecodeTime            uint64
++	PresentationTime      int64
++	IsSync                bool
+ }
+ 
+ type Chunks []*Chunk
+@@ -100,8 +105,11 @@ type Segment struct {
+ 	Duration              uint32
+ 	CompositionTimeOffset int32
+ 	Size                  uint32
++	Samples               Samples
+ }
+ 
++type mediaRange struct{ start, end uint64 }
++
+ // Probe probes MP4 file
+ func Probe(r io.ReadSeeker) (*ProbeInfo, error) {
+ 	probeInfo := &ProbeInfo{
+@@ -113,12 +121,16 @@ func Probe(r io.ReadSeeker) (*ProbeInfo, error) {
+ 		{BoxTypeMoov()},
+ 		{BoxTypeMoov(), BoxTypeMvhd()},
+ 		{BoxTypeMoov(), BoxTypeTrak()},
++		{BoxTypeMoov(), BoxTypeMvex(), BoxTypeTrex()},
+ 		{BoxTypeMoof()},
+ 		{BoxTypeMdat()},
+ 	})
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	mdats := make([]mediaRange, 0, 8)
++	trexes := make(map[uint32]*Trex)
++	decodeTimes := make(map[uint32]uint64)
+ 	var mdatAppeared bool
+ 	for _, bi := range bis {
+ 		switch bi.Type {
+@@ -164,16 +176,39 @@ func Probe(r io.ReadSeeker) (*ProbeInfo, error) {
+ 				return nil, err
+ 			}
+ 			probeInfo.Tracks = append(probeInfo.Tracks, track)
++		case BoxTypeTrex():
++			var trex Trex
++			if _, err := bi.SeekToPayload(r); err != nil {
++				return nil, err
++			}
++			if _, err := Unmarshal(r, bi.Size-bi.HeaderSize, &trex, bi.Context); err != nil {
++				return nil, err
++			}
++			trexes[trex.TrackID] = &trex
+ 		case BoxTypeMoof():
+-			segment, err := probeMoof(r, bi)
++			segments, err := probeMoof(r, bi, trexes, decodeTimes)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+-			probeInfo.Segments = append(probeInfo.Segments, segment)
++			probeInfo.Segments = append(probeInfo.Segments, segments...)
+ 		case BoxTypeMdat():
++			if bi.HeaderSize > bi.Size || bi.Offset > math.MaxUint64-bi.Size {
++				return nil, errors.New("invalid mdat range")
++			}
++			mdats = append(mdats, mediaRange{start: bi.Offset + bi.HeaderSize, end: bi.Offset + bi.Size})
+ 			mdatAppeared = true
+ 		}
+ 	}
++	for _, track := range probeInfo.Tracks {
++		if err := validateSampleRanges(track.Samples, mdats); err != nil {
++			return nil, err
++		}
++	}
++	for _, segment := range probeInfo.Segments {
++		if err := validateSampleRanges(segment.Samples, mdats); err != nil {
++			return nil, err
++		}
++	}
+ 	return probeInfo, nil
+ }
+ 
+@@ -206,6 +241,7 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
+ 		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeCtts()},
+ 		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsc()},
+ 		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsz()},
++		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStss()},
+ 	})
+ 	if err != nil {
+ 		return nil, err
+@@ -222,6 +258,7 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
+ 	var stsc *Stsc
+ 	var ctts *Ctts
+ 	var stsz *Stsz
++	var stss *Stss
+ 	var co64 *Co64
+ 	for _, bip := range bips {
+ 		switch bip.Info.Type {
+@@ -260,6 +297,8 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
+ 			stsz = bip.Payload.(*Stsz)
+ 		case BoxTypeCo64():
+ 			co64 = bip.Payload.(*Co64)
++		case BoxTypeStss():
++			stss = bip.Payload.(*Stss)
+ 		}
+ 	}
+ 
+@@ -309,6 +348,9 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
+ 		}
+ 	}
+ 
++	if stco != nil && co64 != nil {
++		return nil, errors.New("both stco and co64 found")
++	}
+ 	track.Chunks = make([]*Chunk, 0)
+ 	if stco != nil {
+ 		for _, offset := range stco.ChunkOffset {
+@@ -326,49 +368,105 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
+ 		return nil, errors.New("stco/co64 box not found")
+ 	}
+ 
+-	if stts == nil {
+-		return nil, errors.New("stts box not found")
++	if stts == nil || stsc == nil || stsz == nil {
++		return nil, errors.New("required sample table not found")
++	}
++	if stsz.SampleSize == 0 && len(stsz.EntrySize) != int(stsz.SampleCount) {
++		return nil, errors.New("invalid stsz sample count")
+ 	}
+-	track.Samples = make([]*Sample, 0)
++	track.Samples = make(Samples, 0, stsz.SampleCount)
+ 	for _, entry := range stts.Entries {
++		if uint64(len(track.Samples))+uint64(entry.SampleCount) > uint64(stsz.SampleCount) {
++			return nil, errors.New("invalid stts sample count")
++		}
+ 		for i := uint32(0); i < entry.SampleCount; i++ {
+-			track.Samples = append(track.Samples, &Sample{
+-				TimeDelta: entry.SampleDelta,
+-			})
++			size := stsz.SampleSize
++			if size == 0 {
++				size = stsz.EntrySize[len(track.Samples)]
++			}
++			track.Samples = append(track.Samples, &Sample{Size: size, TimeDelta: entry.SampleDelta, IsSync: stss == nil})
+ 		}
+ 	}
+-
+-	if stsc == nil {
+-		return nil, errors.New("stsc box not found")
++	if len(track.Samples) != int(stsz.SampleCount) {
++		return nil, errors.New("invalid stts sample count")
+ 	}
+-	for si, entry := range stsc.Entries {
+-		end := uint32(len(track.Chunks))
+-		if si != len(stsc.Entries)-1 && stsc.Entries[si+1].FirstChunk-1 < end {
+-			end = stsc.Entries[si+1].FirstChunk - 1
++	if ctts != nil {
++		sampleIndex := 0
++		for i, entry := range ctts.Entries {
++			if uint64(sampleIndex)+uint64(entry.SampleCount) > uint64(len(track.Samples)) {
++				return nil, errors.New("invalid ctts sample count")
++			}
++			for j := uint32(0); j < entry.SampleCount; j++ {
++				track.Samples[sampleIndex].CompositionTimeOffset = ctts.GetSampleOffset(i)
++				sampleIndex++
++			}
+ 		}
+-		for ci := entry.FirstChunk - 1; ci < end; ci++ {
+-			track.Chunks[ci].SamplesPerChunk = entry.SamplesPerChunk
++		if sampleIndex != len(track.Samples) {
++			return nil, errors.New("invalid ctts sample count")
+ 		}
+ 	}
+-
+-	if ctts != nil {
+-		var si uint32
+-		for ci, entry := range ctts.Entries {
+-			for i := uint32(0); i < entry.SampleCount; i++ {
+-				if si >= uint32(len(track.Samples)) {
+-					break
+-				}
+-				track.Samples[si].CompositionTimeOffset = ctts.GetSampleOffset(ci)
+-				si++
++	if stss != nil {
++		for _, number := range stss.SampleNumber {
++			if number == 0 || number > uint32(len(track.Samples)) || track.Samples[number-1].IsSync {
++				return nil, errors.New("invalid stss sample number")
+ 			}
++			track.Samples[number-1].IsSync = true
+ 		}
+ 	}
+-
+-	if stsz != nil {
+-		for i := 0; i < len(stsz.EntrySize) && i < len(track.Samples); i++ {
+-			track.Samples[i].Size = stsz.EntrySize[i]
++	if len(track.Samples) == 0 {
++		if len(track.Chunks) != 0 || len(stsc.Entries) != 0 {
++			return nil, errors.New("chunks found for empty track")
++		}
++		return track, nil
++	}
++	if len(track.Chunks) == 0 || len(stsc.Entries) == 0 || stsc.Entries[0].FirstChunk != 1 {
++		return nil, errors.New("invalid stsc")
++	}
++	for i, entry := range stsc.Entries {
++		if entry.FirstChunk == 0 || entry.FirstChunk > uint32(len(track.Chunks)) || entry.SamplesPerChunk == 0 {
++			return nil, errors.New("invalid stsc")
++		}
++		end := uint32(len(track.Chunks))
++		if i+1 < len(stsc.Entries) {
++			next := stsc.Entries[i+1].FirstChunk
++			if next <= entry.FirstChunk || next > uint32(len(track.Chunks)) {
++				return nil, errors.New("invalid stsc")
++			}
++			end = next - 1
++		}
++		for chunkIndex := entry.FirstChunk - 1; chunkIndex < end; chunkIndex++ {
++			track.Chunks[chunkIndex].SamplesPerChunk = entry.SamplesPerChunk
++		}
++	}
++	var sampleIndex int
++	var decodeTime uint64
++	for _, chunk := range track.Chunks {
++		offset := chunk.DataOffset
++		for i := uint32(0); i < chunk.SamplesPerChunk; i++ {
++			if sampleIndex >= len(track.Samples) {
++				return nil, errors.New("chunk sample coverage exceeds stsz")
++			}
++			sample := track.Samples[sampleIndex]
++			sample.Offset = offset
++			sample.DecodeTime = decodeTime
++			sample.PresentationTime, err = presentationTime(decodeTime, sample.CompositionTimeOffset)
++			if err != nil {
++				return nil, err
++			}
++			offset, err = addUint64(offset, uint64(sample.Size))
++			if err != nil {
++				return nil, err
++			}
++			decodeTime, err = addUint64(decodeTime, uint64(sample.TimeDelta))
++			if err != nil {
++				return nil, err
++			}
++			sampleIndex++
+ 		}
+ 	}
++	if sampleIndex != len(track.Samples) {
++		return nil, errors.New("chunk sample coverage does not match stsz")
++	}
+ 
+ 	return track, nil
+ }
+@@ -492,84 +590,182 @@ func getAudioObjectType(r bitio.Reader) (byte, int, error) {
+ 	return audioObjectType[0] + 32, 11, nil
+ }
+ 
+-func probeMoof(r io.ReadSeeker, bi *BoxInfo) (*Segment, error) {
+-	bips, err := ExtractBoxesWithPayload(r, bi, []BoxPath{
+-		{BoxTypeTraf(), BoxTypeTfhd()},
+-		{BoxTypeTraf(), BoxTypeTfdt()},
+-		{BoxTypeTraf(), BoxTypeTrun()},
+-	})
++func probeMoof(r io.ReadSeeker, bi *BoxInfo, trexes map[uint32]*Trex, decodeTimes map[uint32]uint64) (Segments, error) {
++	trafs, err := ExtractBox(r, bi, BoxPath{BoxTypeTraf()})
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	segments := make(Segments, 0, len(trafs))
++	previousDataEnd, havePreviousData := uint64(0), false
++	for _, traf := range trafs {
++		bips, err := ExtractBoxesWithPayload(r, traf, []BoxPath{{BoxTypeTfhd()}, {BoxTypeTfdt()}, {BoxTypeTrun()}})
++		if err != nil {
++			return nil, err
++		}
++		var tfhd *Tfhd
++		var tfdt *Tfdt
++		truns := make([]*Trun, 0, len(bips))
++		for _, bip := range bips {
++			switch payload := bip.Payload.(type) {
++			case *Tfhd:
++				if tfhd != nil {
++					return nil, errors.New("duplicate tfhd")
++				}
++				tfhd = payload
++			case *Tfdt:
++				if tfdt != nil {
++					return nil, errors.New("duplicate tfdt")
++				}
++				tfdt = payload
++			case *Trun:
++				truns = append(truns, payload)
++			}
++		}
++		if tfhd == nil {
++			return nil, errors.New("tfhd not found")
++		}
++		segment := &Segment{TrackID: tfhd.TrackID, MoofOffset: bi.Offset, DefaultSampleDuration: tfhd.DefaultSampleDuration}
++		decodeTime := decodeTimes[tfhd.TrackID]
++		if tfdt != nil {
++			decodeTime = tfdt.GetBaseMediaDecodeTime()
++		}
++		segment.BaseMediaDecodeTime = decodeTime
++		base := bi.Offset
++		if tfhd.CheckFlag(TfhdBaseDataOffsetPresent) {
++			base = tfhd.BaseDataOffset
++		} else if !tfhd.CheckFlag(TfhdDefaultBaseIsMoof) && havePreviousData {
++			base = previousDataEnd
++		}
++		runEnd, haveRun := base, false
++		defaults := trexes[tfhd.TrackID]
++		if defaults == nil {
++			return nil, errors.New("trex not found")
++		}
++		for _, trun := range truns {
++			offset := base
++			if trun.CheckFlag(0x000001) {
++				value, err := presentationTime(base, int64(trun.DataOffset))
++				if err != nil || value < 0 {
++					return nil, errors.New("invalid fragment data offset")
++				}
++				offset = uint64(value)
++			} else if haveRun {
++				offset = runEnd
++			}
++			for i := range trun.Entries {
++				duration, size, flags := fragmentSampleFields(trun, tfhd, defaults, i)
++				compositionOffset := int64(0)
++				if trun.CheckFlag(0x000800) {
++					compositionOffset = trun.GetSampleCompositionTimeOffset(i)
++				}
++				presentation, err := presentationTime(decodeTime, compositionOffset)
++				if err != nil {
++					return nil, err
++				}
++				composition, err := presentationTime(uint64(segment.Duration), compositionOffset)
++				if err != nil || composition < math.MinInt32 || composition > math.MaxInt32 {
++					return nil, errors.New("fragment composition offset overflow")
++				}
++				if len(segment.Samples) == 0 || composition < int64(segment.CompositionTimeOffset) {
++					segment.CompositionTimeOffset = int32(composition)
++				}
++				sample := &Sample{Size: size, TimeDelta: duration, CompositionTimeOffset: compositionOffset,
++					Offset: offset, DecodeTime: decodeTime, PresentationTime: presentation,
++					IsSync: flags&0x00010000 == 0}
++				segment.Samples = append(segment.Samples, sample)
++				if segment.SampleCount == math.MaxUint32 || duration > math.MaxUint32-segment.Duration || size > math.MaxUint32-segment.Size {
++					return nil, errors.New("fragment aggregate overflow")
++				}
++				segment.SampleCount++
++				segment.Duration += duration
++				segment.Size += size
++				offset, err = addUint64(offset, uint64(size))
++				if err != nil {
++					return nil, err
++				}
++				decodeTime, err = addUint64(decodeTime, uint64(duration))
++				if err != nil {
++					return nil, err
++				}
++			}
++			runEnd, haveRun = offset, true
++		}
++		previousDataEnd, havePreviousData = runEnd, true
++		decodeTimes[tfhd.TrackID] = decodeTime
++		segments = append(segments, segment)
++	}
++	return segments, nil
++}
+ 
+-	var tfhd *Tfhd
+-	var tfdt *Tfdt
+-	var trun *Trun
+-
+-	segment := &Segment{
+-		MoofOffset: bi.Offset,
++func fragmentSampleFields(trun *Trun, tfhd *Tfhd, trex *Trex, index int) (duration, size, flags uint32) {
++	duration, size, flags = trex.DefaultSampleDuration, trex.DefaultSampleSize, trex.DefaultSampleFlags
++	if tfhd.CheckFlag(TfhdDefaultSampleDurationPresent) {
++		duration = tfhd.DefaultSampleDuration
+ 	}
+-	for _, bip := range bips {
+-		switch bip.Info.Type {
+-		case BoxTypeTfhd():
+-			tfhd = bip.Payload.(*Tfhd)
+-		case BoxTypeTfdt():
+-			tfdt = bip.Payload.(*Tfdt)
+-		case BoxTypeTrun():
+-			trun = bip.Payload.(*Trun)
+-		}
++	if tfhd.CheckFlag(TfhdDefaultSampleSizePresent) {
++		size = tfhd.DefaultSampleSize
++	}
++	if tfhd.CheckFlag(TfhdDefaultSampleFlagsPresent) {
++		flags = tfhd.DefaultSampleFlags
+ 	}
++	entry := &trun.Entries[index]
++	if trun.CheckFlag(0x000100) {
++		duration = entry.SampleDuration
++	}
++	if trun.CheckFlag(0x000200) {
++		size = entry.SampleSize
++	}
++	if trun.CheckFlag(0x000400) {
++		flags = entry.SampleFlags
++	} else if index == 0 && trun.CheckFlag(0x000004) {
++		flags = trun.FirstSampleFlags
++	}
++	return duration, size, flags
++}
+ 
+-	if tfhd == nil {
+-		return nil, errors.New("tfhd not found")
++func addUint64(a, b uint64) (uint64, error) {
++	if b > math.MaxUint64-a {
++		return 0, errors.New("integer overflow")
+ 	}
+-	segment.TrackID = tfhd.TrackID
+-	segment.DefaultSampleDuration = tfhd.DefaultSampleDuration
++	return a + b, nil
++}
+ 
+-	if tfdt != nil {
+-		if tfdt.Version == 0 {
+-			segment.BaseMediaDecodeTime = uint64(tfdt.BaseMediaDecodeTimeV0)
+-		} else {
+-			segment.BaseMediaDecodeTime = tfdt.BaseMediaDecodeTimeV1
++func presentationTime(decodeTime uint64, offset int64) (int64, error) {
++	if offset >= 0 {
++		if decodeTime > uint64(math.MaxInt64-offset) {
++			return 0, errors.New("presentation time overflow")
+ 		}
++		return int64(decodeTime) + offset, nil
+ 	}
++	magnitude := uint64(-offset)
++	if decodeTime < magnitude {
++		return -int64(magnitude - decodeTime), nil
++	}
++	decodeTime -= magnitude
++	if decodeTime > math.MaxInt64 {
++		return 0, errors.New("presentation time overflow")
++	}
++	return int64(decodeTime), nil
++}
+ 
+-	if trun != nil {
+-		segment.SampleCount = trun.SampleCount
+-
+-		if trun.CheckFlag(0x000100) {
+-			segment.Duration = 0
+-			for ei := range trun.Entries {
+-				segment.Duration += trun.Entries[ei].SampleDuration
+-			}
+-		} else {
+-			segment.Duration = tfhd.DefaultSampleDuration * segment.SampleCount
++func validateSampleRanges(samples Samples, mdats []mediaRange) error {
++samplesLoop:
++	for _, sample := range samples {
++		if sample.Size == 0 {
++			continue
+ 		}
+-
+-		if trun.CheckFlag(0x000200) {
+-			segment.Size = 0
+-			for ei := range trun.Entries {
+-				segment.Size += trun.Entries[ei].SampleSize
+-			}
+-		} else {
+-			segment.Size = tfhd.DefaultSampleSize * segment.SampleCount
++		end, err := addUint64(sample.Offset, uint64(sample.Size))
++		if err != nil {
++			return err
+ 		}
+-
+-		var duration uint32
+-		for ei := range trun.Entries {
+-			offset := int32(duration) + int32(trun.GetSampleCompositionTimeOffset(ei))
+-			if ei == 0 || offset < segment.CompositionTimeOffset {
+-				segment.CompositionTimeOffset = offset
+-			}
+-			if trun.CheckFlag(0x000100) {
+-				duration += trun.Entries[ei].SampleDuration
+-			} else {
+-				duration += tfhd.DefaultSampleDuration
++		for _, mdat := range mdats {
++			if sample.Offset >= mdat.start && end <= mdat.end {
++				continue samplesLoop
+ 			}
+ 		}
++		return errors.New("sample range is outside mdat")
+ 	}
+-
+-	return segment, nil
++	return nil
+ }
+ 
+ func FindIDRFrames(r io.ReadSeeker, trackInfo *TrackInfo) ([]int, error) {

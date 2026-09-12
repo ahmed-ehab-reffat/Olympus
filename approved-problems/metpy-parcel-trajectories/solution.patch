@@ -1,0 +1,966 @@
+diff --git a/docs/_templates/overrides/metpy.calc.rst b/docs/_templates/overrides/metpy.calc.rst
+index 926a82b58..264a1e27e 100644
+--- a/docs/_templates/overrides/metpy.calc.rst
++++ b/docs/_templates/overrides/metpy.calc.rst
+@@ -207,6 +207,21 @@ Smoothing
+       smooth_n_point
+       zoom_xarray
+ 
++Trajectories
++------------
++
++   .. autosummary::
++      :toctree: ./
++
++      extend_trajectory
++      parcel_trajectory
++      sample_trajectory
++      trajectory_crossings
++      trajectory_density
++      trajectory_length
++      trajectory_spread
++
++
+ Other
+ -----
+ 
+diff --git a/src/metpy/calc/__init__.py b/src/metpy/calc/__init__.py
+index 736a35f09..e2b00bf18 100644
+--- a/src/metpy/calc/__init__.py
++++ b/src/metpy/calc/__init__.py
+@@ -10,6 +10,7 @@ from .indices import *  # noqa: F403
+ from .kinematics import *  # noqa: F403
+ from .thermo import *  # noqa: F403
+ from .tools import *  # noqa: F403
++from .trajectory import *  # noqa: F403
+ from .turbulence import *  # noqa: F403
+ from ..package_tools import set_module
+ 
+@@ -19,6 +20,7 @@ __all__.extend(indices.__all__)  # pylint: disable=undefined-variable
+ __all__.extend(kinematics.__all__)  # pylint: disable=undefined-variable
+ __all__.extend(thermo.__all__)  # pylint: disable=undefined-variable
+ __all__.extend(tools.__all__)  # pylint: disable=undefined-variable
++__all__.extend(trajectory.__all__)  # pylint: disable=undefined-variable
+ __all__.extend(turbulence.__all__)  # pylint: disable=undefined-variable
+ 
+ set_module(globals())
+diff --git a/src/metpy/calc/trajectory.py b/src/metpy/calc/trajectory.py
+new file mode 100644
+index 000000000..98449e408
+--- /dev/null
++++ b/src/metpy/calc/trajectory.py
+@@ -0,0 +1,596 @@
++# Copyright (c) 2026 MetPy Developers.
++# Distributed under the terms of the BSD 3-Clause License.
++# SPDX-License-Identifier: BSD-3-Clause
++"""Calculate Lagrangian parcel trajectories through gridded wind fields.
++
++Like the cross-section calculations, this module is based around xarray DataArrays so that
++coordinate and projection metadata are available to locate a parcel within a field.
++"""
++from functools import partial
++
++import numpy as np
++import xarray as xr
++
++from ..constants import earth_avg_radius
++from ..interpolate.track import (_check_method, _FieldSampler, _has_axis, _horizontal_grid,
++                                 _nearest_index)
++from ..package_tools import Exporter
++from ..units import units
++
++exporter = Exporter(globals())
++
++_TOL = 1e-9
++
++
++def _surface_level(sampler, target, time, lon, lat):
++    """Find the vertical coordinate at which a field takes the given values.
++
++    The vertical axis is scanned from its own start and the first pair of levels that
++    brackets the target is used, interpolating in the logarithm of pressure for an isobaric
++    coordinate. Positions where no pair brackets the target give NaN.
++    """
++    levels = sampler.levels
++    profile = np.stack([sampler(time, lon, lat, np.full(np.shape(lon), level))
++                        for level in levels])
++    offset = profile - target
++    found = np.full(np.shape(lon), np.nan)
++
++    for index in range(levels.size - 1):
++        lower, upper = offset[index], offset[index + 1]
++        with np.errstate(invalid='ignore'):
++            brackets = ((((lower <= 0.0) & (upper > 0.0))
++                         | ((lower >= 0.0) & (upper < 0.0)))
++                        & np.isfinite(lower) & np.isfinite(upper))
++        brackets &= np.isnan(found)
++        if not brackets.any():
++            continue
++        with np.errstate(invalid='ignore', divide='ignore'):
++            fraction = -lower / (upper - lower)
++            if sampler.log_vertical:
++                edges = np.log(levels[index:index + 2])
++                between = np.exp(edges[0] + fraction * (edges[1] - edges[0]))
++            else:
++                between = levels[index] + fraction * (levels[index + 1] - levels[index])
++        found = np.where(brackets, between, found)
++
++    return found
++
++
++def _matching_grid(first, second):
++    """Check whether two fields carry the same dimensions and coordinate values."""
++    if first.dims != second.dims or len(first.coords) != len(second.coords):
++        return False
++    for name, coord in first.coords.items():
++        if name not in second.coords:
++            return False
++        other = second[name]
++        if coord.shape != other.shape or not np.array_equal(coord.values, other.values):
++            return False
++    return True
++
++
++def _step_seconds(step):
++    """Convert a supported step specification into a number of seconds."""
++    if isinstance(step, np.timedelta64):
++        return float(step / np.timedelta64(1, 's'))
++    if hasattr(step, 'total_seconds'):
++        return float(step.total_seconds())
++    return float(units.Quantity(step).m_as('second'))
++
++
++def _to_datetime64(value):
++    """Convert a supported time specification into a nanosecond datetime64."""
++    return np.datetime64(value, 'ns')
++
++
++def _wrap_longitude(lon):
++    """Wrap longitudes into the interval [-180, 180)."""
++    with np.errstate(invalid='ignore'):
++        return np.where(np.isfinite(lon), (np.asarray(lon) + 180.0) % 360.0 - 180.0, np.nan)
++
++
++def _rates(u, v, w, lat):
++    """Convert wind components into rates of change of the parcel coordinates."""
++    radius = earth_avg_radius.m_as('meter')
++    with np.errstate(invalid='ignore', divide='ignore'):
++        cos_lat = np.cos(np.deg2rad(lat))
++        cos_lat = np.where(np.abs(cos_lat) < _TOL, np.nan, cos_lat)
++        dlon = np.rad2deg(u / (radius * cos_lat))
++        dlat = np.rad2deg(v / radius)
++    return dlon, dlat, w
++
++
++def _start_points(start, expected):
++    """Normalize the requested start points into an array of the expected width."""
++    points = np.atleast_2d(np.asarray(start, dtype=np.float64))
++    if points.ndim != 2 or points.shape[1] != expected:
++        raise ValueError(f'start points must each have {expected} values')
++    return points
++
++
++@exporter.export
++def parcel_trajectory(u, v, start, step, count, *, w=None, surface=None, start_time=None):
++    r"""Integrate parcel trajectories through a gridded wind field.
++
++    Parameters
++    ----------
++    u, v : `xarray.DataArray`
++        Grids of the eastward and northward wind components, parsed by MetPy so that their
++        coordinates can be identified. A field without a time coordinate is steady.
++    start : array-like
++        One start point, or a sequence of them, given as longitude and latitude in degrees,
++        with the vertical coordinate appended when the wind field has one.
++    step : `datetime.timedelta` or `pint.Quantity`
++        The integration step. A negative step integrates backward in time.
++    count : int
++        The number of steps to take, so the result holds ``count`` + 1 samples.
++    w : `xarray.DataArray`, optional
++        Grid of the rate of change of the vertical coordinate. Without it, and without
++        `surface`, a parcel keeps the level it started on.
++    surface : `xarray.DataArray`, optional
++        Grid of a quantity the parcel conserves, such as potential temperature, whose level
++        is found afresh at every stage of every step.
++    start_time : `datetime.datetime` or `numpy.datetime64`, optional
++        The time of the start points. Defaults to the earliest time of the wind field for a
++        forward step and the latest for a backward one.
++
++    Returns
++    -------
++    `xarray.Dataset`
++        Parcel positions with dimensions ``trajectory`` and ``step``.
++
++    See Also
++    --------
++    sample_trajectory, trajectory_length
++
++    """
++    count = int(count)
++    if count < 1:
++        raise ValueError('count must be at least 1')
++
++    seconds = _step_seconds(step)
++    if abs(seconds) < _TOL:
++        raise ValueError('step must not be zero')
++
++    moving_vertically = w is not None
++    conserving = surface is not None
++    if moving_vertically and conserving:
++        raise ValueError('a vertical velocity and a conserved surface cannot be combined')
++
++    others = [v] + [other for other in (w, surface) if other is not None]
++    if not all(_matching_grid(u, other) for other in others):
++        raise ValueError('the wind components must share the same grid')
++
++    layered = _has_axis(u, 'vertical')
++    if (moving_vertically or conserving) and not layered:
++        raise ValueError('a vertical velocity requires a vertical coordinate')
++
++    points = _start_points(start, 3 if layered else 2)
++
++    if start_time is None:
++        if not _has_axis(u, 'time'):
++            raise ValueError('start_time is required for a steady wind field')
++        stamps = u[u.metpy.find_axis_name('time')].values
++        start_time = stamps.min() if seconds > 0 else stamps.max()
++    start_time = _to_datetime64(start_time)
++
++    vertical_units = None
++    if layered:
++        vertical_units = u[u.metpy.find_axis_name('vertical')].metpy.units
++
++    sample_u = _FieldSampler(u, start_time, 'm/s')
++    sample_v = _FieldSampler(v, start_time, 'm/s')
++    sample_w = (_FieldSampler(w, start_time, vertical_units / units.second)
++                if moving_vertically else None)
++
++    lon = _wrap_longitude(points[:, 0])
++    lat = points[:, 1].copy()
++    vertical = points[:, 2].copy() if layered else None
++
++    locate = None
++    if conserving:
++        sample_surface = _FieldSampler(surface, start_time)
++        locate = partial(_surface_level, sample_surface,
++                         sample_surface(np.zeros_like(lat), lon, lat, vertical))
++        vertical = locate(0.0, lon, lat)
++
++    lons = [lon]
++    lats = [lat]
++    verticals = [vertical]
++
++    for index in range(count):
++        offset = index * seconds
++        lon, lat, vertical = _rk4_step(sample_u, sample_v, sample_w, offset, seconds,
++                                       lon, lat, vertical, locate)
++        lons.append(lon)
++        lats.append(lat)
++        verticals.append(vertical)
++
++    times = start_time + np.arange(count + 1) * np.timedelta64(round(seconds * 1e9), 'ns')
++    coords = {'step': np.arange(count + 1), 'time': ('step', times)}
++    dims = ('trajectory', 'step')
++    data = {
++        'longitude': (dims, units.Quantity(np.stack(lons, axis=-1), 'degrees_east')),
++        'latitude': (dims, units.Quantity(np.stack(lats, axis=-1), 'degrees_north'))
++    }
++    if layered:
++        data['vertical'] = (dims, units.Quantity(np.stack(verticals, axis=-1),
++                                                 vertical_units))
++
++    return xr.Dataset(data, coords=coords)
++
++
++def _rk4_step(sample_u, sample_v, sample_w, offset, seconds, lon, lat, vertical,
++              locate=None):
++    """Advance one classical fourth-order Runge-Kutta step."""
++    def stage(time, lon, lat, vertical):
++        if locate is not None:
++            vertical = locate(time, lon, lat)
++        wind_u = sample_u(time, lon, lat, vertical)
++        wind_v = sample_v(time, lon, lat, vertical)
++        if sample_w is not None:
++            wind_w = sample_w(time, lon, lat, vertical)
++        else:
++            wind_w = None if vertical is None else 0.0 * wind_u
++        return _rates(wind_u, wind_v, wind_w, lat)
++
++    def advance(rates, fraction):
++        dlon, dlat, dvert = rates
++        moved = (lon + fraction * seconds * dlon, lat + fraction * seconds * dlat)
++        if vertical is None:
++            return *moved, None
++        return *moved, vertical + fraction * seconds * dvert
++
++    first = stage(offset, lon, lat, vertical)
++    second = stage(offset + seconds / 2.0, *advance(first, 0.5))
++    third = stage(offset + seconds / 2.0, *advance(second, 0.5))
++    fourth = stage(offset + seconds, *advance(third, 1.0))
++
++    combined = tuple(None if a is None else (a + 2.0 * b + 2.0 * c + d) / 6.0
++                     for a, b, c, d in zip(first, second, third, fourth, strict=True))
++    moved_lon, moved_lat, moved_vertical = advance(combined, 1.0)
++    moved_lon = _wrap_longitude(moved_lon)
++    if locate is not None:
++        moved_vertical = locate(offset + seconds, moved_lon, moved_lat)
++    return moved_lon, moved_lat, moved_vertical
++
++
++def _sample_one(trajectory, field, offsets, method):
++    """Interpolate a single field onto the samples of a trajectory."""
++    if _has_axis(field, 'vertical') and 'vertical' not in trajectory:
++        raise ValueError('a field with a vertical coordinate needs a vertical trajectory')
++
++    sampler = _FieldSampler(field, trajectory['time'].values[0], method=method)
++    lon = trajectory['longitude'].metpy.magnitude
++    lat = trajectory['latitude'].metpy.magnitude
++    vertical = trajectory['vertical'].metpy.magnitude if 'vertical' in trajectory else None
++
++    values = sampler(np.broadcast_to(offsets, lon.shape), lon, lat, vertical)
++    values = np.where(np.isfinite(lon) & np.isfinite(lat), values, np.nan)
++
++    return xr.DataArray(units.Quantity(values, sampler.units), dims=('trajectory', 'step'),
++                        coords={'step': trajectory['step'], 'time': trajectory['time']})
++
++
++@exporter.export
++def sample_trajectory(trajectory, field, *, method='linear'):
++    r"""Interpolate a field onto the samples of a trajectory.
++
++    Parameters
++    ----------
++    trajectory : `xarray.Dataset`
++        The result of `parcel_trajectory`.
++    field : `xarray.DataArray` or `xarray.Dataset`
++        The field or fields to interpolate, parsed by MetPy. A field without a time
++        coordinate is steady, and one without a vertical coordinate is sampled horizontally.
++        A Dataset is sampled variable by variable.
++    method : str, optional
++        Either ``'linear'``, the default, or ``'nearest'``, as for
++        `metpy.interpolate.interpolate_to_track`.
++
++    Returns
++    -------
++    `xarray.DataArray` or `xarray.Dataset`
++        The field along the trajectory, with dimensions ``trajectory`` and ``step``.
++
++    See Also
++    --------
++    parcel_trajectory
++
++    """
++    _check_method(method)
++
++    start_time = trajectory['time'].values[0]
++    offsets = ((trajectory['time'].values - start_time) / np.timedelta64(1, 's')).astype(float)
++
++    if isinstance(field, xr.Dataset):
++        return xr.Dataset({name: _sample_one(trajectory, field[name], offsets, method)
++                           for name in field.data_vars})
++
++    return _sample_one(trajectory, field, offsets, method)
++
++
++@exporter.export
++def trajectory_density(trajectory, template, *, weights=None):
++    r"""Accumulate the time parcels spend over each cell of a grid.
++
++    Every sample of every trajectory adds one step length to the cell of `template` whose
++    grid point is closest to it, so a cell owns the region nearer to its own point than to
++    any other. Samples that have terminated, and samples beyond the coverage of the
++    template, add nothing.
++
++    Parameters
++    ----------
++    trajectory : `xarray.Dataset`
++        The result of `parcel_trajectory`.
++    template : `xarray.DataArray`
++        A field whose horizontal grid the residence time is accumulated onto.
++    weights : `xarray.DataArray` or array-like, optional
++        A quantity along the trajectory that scales the contribution of each step, such as
++        the result of `sample_trajectory`. A step whose weight is not finite adds nothing.
++
++    Returns
++    -------
++    `xarray.DataArray`
++        Residence time in seconds on the horizontal grid of `template`, scaled by the
++        weights when they are given.
++
++    See Also
++    --------
++    parcel_trajectory, sample_trajectory
++
++    """
++    to_grid, x_values, y_values, periodic = _horizontal_grid(template)
++
++    lon = trajectory['longitude'].metpy.magnitude
++    lat = trajectory['latitude'].metpy.magnitude
++    grid_x, grid_y = to_grid(lon, lat)
++
++    columns, beyond_x = _nearest_index(x_values, grid_x)
++    rows, beyond_y = _nearest_index(y_values, grid_y)
++    if periodic:
++        columns = columns % (x_values.size - 1)
++
++    reached = np.isfinite(grid_x) & np.isfinite(grid_y)
++    counted = reached & ~beyond_x & ~beyond_y
++    counted[:, :-1] &= reached[:, 1:]
++    counted[:, -1] = False
++    shares = np.full(grid_x.shape, abs(_trajectory_step(trajectory)))
++    if weights is not None:
++        scale = _magnitudes(weights)
++        counted &= np.isfinite(scale)
++        shares = shares * np.where(np.isfinite(scale), scale, 0.0)
++
++    y_name = template.metpy.find_axis_name('y')
++    x_name = template.metpy.find_axis_name('x')
++
++    total = np.zeros((template[y_name].size, template[x_name].size))
++    np.add.at(total, (rows[counted], columns[counted]), shares[counted])
++
++    return xr.DataArray(units.Quantity(total, 'second'), dims=(y_name, x_name),
++                        coords={y_name: template[y_name], x_name: template[x_name]})
++
++
++@exporter.export
++def trajectory_crossings(trajectory, series, level):
++    r"""Locate where a quantity along a trajectory crosses a level.
++
++    A crossing lies between two consecutive samples whose values sit on opposite sides of
++    `level`, taking a sample exactly on the level as being on the upper side, so a
++    trajectory that touches the level and turns back does not count twice. Times and
++    positions are interpolated linearly between the two samples.
++
++    Parameters
++    ----------
++    trajectory : `xarray.Dataset`
++        The result of `parcel_trajectory`.
++    series : `xarray.DataArray`
++        A quantity along the same trajectory, such as its vertical coordinate or the result
++        of `sample_trajectory`.
++    level : `pint.Quantity` or float
++        The level to look for, in the units of `series` when given as a plain number.
++
++    Returns
++    -------
++    `xarray.Dataset`
++        The ``time``, ``longitude``, ``latitude`` and ``direction`` of each crossing, with
++        dimensions ``trajectory`` and ``crossing``, padded where a trajectory has fewer
++        crossings than another. ``direction`` is 1 for an upward crossing and -1 for a
++        downward one.
++
++    See Also
++    --------
++    parcel_trajectory, sample_trajectory
++
++    """
++    values = series.metpy.unit_array
++    threshold = units.Quantity(level).m_as(values.units) if hasattr(level, 'units') \
++        else float(level)
++    offset = np.asarray(values.magnitude, dtype=np.float64) - threshold
++
++    lower, upper = offset[:, :-1], offset[:, 1:]
++    with np.errstate(invalid='ignore'):
++        rising = (lower < 0.0) & (upper >= 0.0)
++        falling = (lower >= 0.0) & (upper < 0.0)
++    found = (rising | falling) & np.isfinite(lower) & np.isfinite(upper)
++
++    with np.errstate(invalid='ignore', divide='ignore'):
++        fraction = np.where(found, -lower / (upper - lower), np.nan)
++
++    stamps = trajectory['time'].values
++    seconds = ((stamps - stamps[0]) / np.timedelta64(1, 's')).astype(float)
++    lon = trajectory['longitude'].metpy.magnitude
++    lat = trajectory['latitude'].metpy.magnitude
++    span = _wrap_longitude(lon[:, 1:] - lon[:, :-1])
++
++    at_time = seconds[:-1] + fraction * (seconds[1:] - seconds[:-1])
++    at_lon = _wrap_longitude(lon[:, :-1] + fraction * span)
++    at_lat = lat[:, :-1] + fraction * (lat[:, 1:] - lat[:, :-1])
++    heading = np.where(rising, 1.0, -1.0)
++
++    width = int(found.sum(axis=1).max(initial=0))
++    packed = [np.full((found.shape[0], width), np.nan) for _ in range(4)]
++    for row in range(found.shape[0]):
++        picked = np.flatnonzero(found[row])
++        for target, source in zip(packed, (at_time, at_lon, at_lat, heading), strict=True):
++            target[row, :picked.size] = source[row, picked]
++
++    times = np.full(packed[0].shape, np.datetime64('NaT'), dtype='datetime64[ns]')
++    finite = np.isfinite(packed[0])
++    times[finite] = stamps[0] + (packed[0][finite] * 1e9).round().astype('timedelta64[ns]')
++
++    dims = ('trajectory', 'crossing')
++    return xr.Dataset({
++        'time': (dims, times),
++        'longitude': (dims, units.Quantity(packed[1], 'degrees_east')),
++        'latitude': (dims, units.Quantity(packed[2], 'degrees_north')),
++        'direction': (dims, packed[3])
++    })
++
++
++@exporter.export
++def trajectory_spread(trajectory):
++    r"""Summarize where a set of trajectories is and how far it has spread apart.
++
++    The centre of a step is the mean of the unit vectors pointing at the samples that are
++    still running, brought back onto the sphere, and the spread is the mean great circle
++    distance of those samples from that centre. A step that no trajectory reached is NaN.
++
++    Parameters
++    ----------
++    trajectory : `xarray.Dataset`
++        The result of `parcel_trajectory`.
++
++    Returns
++    -------
++    `xarray.Dataset`
++        The ``longitude`` and ``latitude`` of the centre and the ``spread`` in metres, with
++        dimension ``step``.
++
++    See Also
++    --------
++    parcel_trajectory, trajectory_length
++
++    """
++    lon = np.deg2rad(trajectory['longitude'].metpy.magnitude)
++    lat = np.deg2rad(trajectory['latitude'].metpy.magnitude)
++    running = np.isfinite(lon) & np.isfinite(lat)
++    alive = running.sum(axis=0)
++
++    unit = np.stack([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)])
++    unit = np.where(running, unit, 0.0)
++    mean = unit.sum(axis=1) / np.where(alive > 0, alive, np.nan)
++
++    norm = np.sqrt((mean ** 2).sum(axis=0))
++    mean = mean / np.where(norm > _TOL, norm, np.nan)
++    centre_lat = np.arcsin(np.clip(mean[2], -1.0, 1.0))
++    centre_lon = np.arctan2(mean[1], mean[0])
++
++    separation = np.clip((unit * mean[:, None, :]).sum(axis=0), -1.0, 1.0)
++    distance = earth_avg_radius.m_as('meter') * np.arccos(separation)
++    spread = (np.where(running, distance, 0.0).sum(axis=0)
++              / np.where(alive > 0, alive, np.nan))
++
++    return xr.Dataset(
++        {'longitude': ('step', units.Quantity(_wrap_longitude(np.rad2deg(centre_lon)),
++                                              'degrees_east')),
++         'latitude': ('step', units.Quantity(np.rad2deg(centre_lat), 'degrees_north')),
++         'spread': ('step', units.Quantity(spread, 'meter'))},
++        coords={'step': trajectory['step'], 'time': trajectory['time']})
++
++
++def _magnitudes(data):
++    """Return the plain values of a quantity, a DataArray or an array."""
++    if isinstance(data, xr.DataArray):
++        data = data.data
++    return np.asarray(getattr(data, 'magnitude', data), dtype=np.float64)
++
++
++def _trajectory_step(trajectory):
++    """Return the step length of a trajectory in seconds."""
++    stamps = trajectory['time'].values
++    return float((stamps[1] - stamps[0]) / np.timedelta64(1, 's'))
++
++
++@exporter.export
++def trajectory_length(trajectory):
++    r"""Calculate the horizontal path length travelled along a trajectory.
++
++    Parameters
++    ----------
++    trajectory : `xarray.Dataset`
++        The result of `parcel_trajectory`.
++
++    Returns
++    -------
++    `xarray.DataArray`
++        The cumulative great circle distance travelled up to each sample, zero at the start
++        point, with dimensions ``trajectory`` and ``step``.
++
++    See Also
++    --------
++    parcel_trajectory
++
++    """
++    lon = np.deg2rad(trajectory['longitude'].metpy.magnitude)
++    lat = np.deg2rad(trajectory['latitude'].metpy.magnitude)
++
++    with np.errstate(invalid='ignore'):
++        haversine = (np.sin((lat[:, 1:] - lat[:, :-1]) / 2.0) ** 2
++                     + np.cos(lat[:, :-1]) * np.cos(lat[:, 1:])
++                     * np.sin((lon[:, 1:] - lon[:, :-1]) / 2.0) ** 2)
++        legs = (2.0 * earth_avg_radius.m_as('meter')
++                * np.arcsin(np.sqrt(np.clip(haversine, 0.0, 1.0))))
++
++    total = np.zeros(lon.shape)
++    total[:, 1:] = np.cumsum(np.where(np.isfinite(legs), legs, np.nan), axis=1)
++    total = np.where(np.isfinite(lon), total, np.nan)
++
++    return xr.DataArray(units.Quantity(total, 'meter'), dims=('trajectory', 'step'),
++                        coords={'step': trajectory['step'], 'time': trajectory['time']})
++
++
++@exporter.export
++def extend_trajectory(trajectory, u, v, count, *, w=None, surface=None):
++    r"""Carry a trajectory further through another wind field.
++
++    The last sample of `trajectory` becomes the start point of the extension, which keeps
++    the step length and the direction of the original, so a run can be carried across
++    several files of wind data. A parcel that has already terminated stays terminated.
++
++    Parameters
++    ----------
++    trajectory : `xarray.Dataset`
++        The result of `parcel_trajectory` or of an earlier extension.
++    u, v : `xarray.DataArray`
++        The wind components to carry the parcels through.
++    count : int
++        The number of further steps to take.
++    w : `xarray.DataArray`, optional
++        Grid of the rate of change of the vertical coordinate.
++    surface : `xarray.DataArray`, optional
++        Grid of a quantity the parcel conserves.
++
++    Returns
++    -------
++    `xarray.Dataset`
++        The original samples followed by the new ones, with the steps renumbered from zero.
++
++    See Also
++    --------
++    parcel_trajectory
++
++    """
++    last = trajectory.isel(step=-1)
++    columns = [last['longitude'].metpy.magnitude, last['latitude'].metpy.magnitude]
++    if 'vertical' in trajectory:
++        columns.append(last['vertical'].metpy.magnitude)
++
++    grown = parcel_trajectory(u, v, np.stack(columns, axis=-1),
++                              np.timedelta64(round(_trajectory_step(trajectory) * 1e9), 'ns'),
++                              count, w=w, surface=surface,
++                              start_time=last['time'].values)
++
++    joined = xr.concat([trajectory, grown.isel(step=slice(1, None))], dim='step',
++                       data_vars='all')
++    return joined.assign_coords(step=np.arange(joined.sizes['step']))
+diff --git a/src/metpy/interpolate/__init__.py b/src/metpy/interpolate/__init__.py
+index 59f8788f6..7ff7ed41a 100644
+--- a/src/metpy/interpolate/__init__.py
++++ b/src/metpy/interpolate/__init__.py
+@@ -8,6 +8,7 @@ from .one_dimension import *  # noqa: F403
+ from .points import *  # noqa: F403
+ from .slices import *  # noqa: F403
+ from .tools import *  # noqa: F403
++from .track import *  # noqa: F403
+ from ..package_tools import set_module
+ 
+ __all__ = grid.__all__[:]  # pylint: disable=undefined-variable
+@@ -15,5 +16,6 @@ __all__.extend(one_dimension.__all__)  # pylint: disable=undefined-variable
+ __all__.extend(points.__all__)  # pylint: disable=undefined-variable
+ __all__.extend(slices.__all__)  # pylint: disable=undefined-variable
+ __all__.extend(tools.__all__)  # pylint: disable=undefined-variable
++__all__.extend(track.__all__)  # pylint: disable=undefined-variable
+ 
+ set_module(globals())
+diff --git a/src/metpy/interpolate/track.py b/src/metpy/interpolate/track.py
+new file mode 100644
+index 000000000..6f91b937c
+--- /dev/null
++++ b/src/metpy/interpolate/track.py
+@@ -0,0 +1,293 @@
++# Copyright (c) 2026 MetPy Developers.
++# Distributed under the terms of the BSD 3-Clause License.
++# SPDX-License-Identifier: BSD-3-Clause
++"""Interpolate gridded fields onto a track of points in space and time."""
++import itertools
++
++import numpy as np
++import xarray as xr
++
++from ..package_tools import Exporter
++from ..units import units
++from ..xarray import check_axis
++
++exporter = Exporter(globals())
++
++_TOL = 1e-9
++
++
++def _coordinate_values(coord):
++    """Return the magnitude of a coordinate in its own units as a float array."""
++    return np.asarray(coord.metpy.unit_array.magnitude, dtype=np.float64)
++
++
++def _is_pressure(coord):
++    """Check whether a coordinate is a pressure."""
++    return coord.metpy.units.dimensionality == units('Pa').dimensionality
++
++
++def _spans_the_globe(lons):
++    """Check whether a longitude coordinate covers the whole globe."""
++    if lons.size < 2:
++        return False
++    spacing = lons[1] - lons[0]
++    return abs(abs(lons[-1] - lons[0] + spacing) - 360.0) < 1e-6
++
++
++def _axis_weights(coord, values, *, log=False):
++    """Locate values within a monotonic coordinate.
++
++    Returns the index of the lower bracketing point, the weight of the upper point, and a
++    mask of the values that fall outside the coordinate.
++    """
++    values = np.asarray(values, dtype=np.float64)
++    size = coord.size
++    if size < 2:
++        inside = np.isclose(values, coord[0], atol=_TOL, rtol=0.0)
++        return np.zeros(values.shape, dtype=int), np.zeros(values.shape), ~inside
++
++    if log:
++        coord = np.log(coord)
++        with np.errstate(invalid='ignore', divide='ignore'):
++            values = np.log(np.where(values > 0.0, values, np.nan))
++
++    ascending = coord[-1] > coord[0]
++    ordered = coord if ascending else coord[::-1]
++
++    with np.errstate(invalid='ignore'):
++        outside = ~((values >= ordered[0] - _TOL) & (values <= ordered[-1] + _TOL))
++    filled = np.where(np.isfinite(values), values, ordered[0])
++
++    index = np.clip(np.searchsorted(ordered, filled, side='right') - 1, 0, size - 2)
++    lower = ordered[index]
++    weight = (filled - lower) / (ordered[index + 1] - lower)
++
++    if not ascending:
++        index = size - 2 - index
++        weight = 1.0 - weight
++
++    return index, np.clip(weight, 0.0, 1.0), outside
++
++
++def _horizontal_grid(field):
++    """Return the mapping onto a field's horizontal grid along with that grid.
++
++    The returned callable takes longitude and latitude in degrees and gives back the
++    coordinates the field itself is indexed by. A longitude coordinate that covers the
++    globe is extended by one column so that the seam is crossed by interpolation.
++    """
++    geographic = (check_axis(field.metpy.x, 'longitude')
++                  and check_axis(field.metpy.y, 'latitude'))
++    x_values = _coordinate_values(field[field.metpy.find_axis_name('x')])
++    y_values = _coordinate_values(field[field.metpy.find_axis_name('y')])
++
++    periodic = geographic and _spans_the_globe(x_values)
++    if periodic:
++        x_values = np.append(x_values, 2.0 * x_values[-1] - x_values[-2])
++
++    if geographic:
++        start = min(x_values[0], x_values[-1])
++
++        def to_grid(lon, lat):
++            with np.errstate(invalid='ignore'):
++                return start + np.mod(lon - start, 360.0), lat
++    else:
++        from pyproj import Proj
++        proj = Proj(field.metpy.pyproj_crs)
++        scale = units.Quantity(1.0, field.metpy.x.metpy.units).m_as('meter')
++
++        def to_grid(lon, lat):
++            valid = np.isfinite(lon) & np.isfinite(lat)
++            x = np.full(np.shape(lon), np.nan)
++            y = np.full(np.shape(lat), np.nan)
++            if valid.any():
++                proj_x, proj_y = proj(np.asarray(lon)[valid], np.asarray(lat)[valid])
++                x[valid] = np.asarray(proj_x) / scale
++                y[valid] = np.asarray(proj_y) / scale
++            return x, y
++
++    return to_grid, x_values, y_values, periodic
++
++
++def _nearest_index(coord, values):
++    """Return the index of the closest coordinate point, and a mask of the values outside."""
++    order = np.argsort(coord)
++    ordered = coord[order]
++    with np.errstate(invalid='ignore'):
++        outside = ~((values >= ordered[0] - _TOL) & (values <= ordered[-1] + _TOL))
++    filled = np.where(np.isfinite(values), values, ordered[0])
++    upper = np.clip(np.searchsorted(ordered, filled), 1, ordered.size - 1)
++    closer = np.abs(filled - ordered[upper - 1]) <= np.abs(ordered[upper] - filled)
++    return order[np.where(closer, upper - 1, upper)], outside
++
++
++class _FieldSampler:
++    """Sample a gridded field at arbitrary times and positions.
++
++    The field is transposed into time, vertical, y, x order, keeping only the dimensions it
++    actually has, so that every sample is a multilinear interpolation over the axes present.
++    """
++
++    def __init__(self, field, reference_time, target_units=None, method='linear'):
++        self.reference_time = reference_time
++        self.method = method
++        self.horizontal, x_values, y_values, periodic = _horizontal_grid(field)
++
++        self.axes = []
++        dims = []
++
++        time = field.metpy.find_axis_name('time') if _has_axis(field, 'time') else None
++        if time is not None:
++            dims.append(time)
++            offsets = (field[time].values - reference_time) / np.timedelta64(1, 's')
++            self.axes.append(('time', np.asarray(offsets, dtype=np.float64), False))
++
++        vertical = field.metpy.find_axis_name('vertical') if _has_axis(field, 'vertical') \
++            else None
++        self.levels = None
++        self.log_vertical = False
++        if vertical is not None:
++            dims.append(vertical)
++            self.levels = _coordinate_values(field[vertical])
++            self.log_vertical = _is_pressure(field[vertical])
++            self.axes.append(('vertical', self.levels, self.log_vertical))
++
++        dims.extend((field.metpy.find_axis_name('y'), field.metpy.find_axis_name('x')))
++        self.axes.append(('y', y_values, False))
++        self.axes.append(('x', x_values, False))
++
++        ordered = field.transpose(*dims)
++        data = ordered.metpy.unit_array
++        if target_units is not None:
++            data = data.to(target_units)
++        self.units = data.units
++        values = np.asarray(data.magnitude, dtype=np.float64)
++        self.values = (np.concatenate([values, values[..., :1]], axis=-1) if periodic
++                       else values)
++
++    def __call__(self, time, lon, lat, vertical=None):
++        """Interpolate the field at the given times and positions."""
++        grid_x, grid_y = self.horizontal(lon, lat)
++        requested = {'time': time, 'vertical': vertical, 'y': grid_y, 'x': grid_x}
++
++        indices = []
++        weights = []
++        outside = np.zeros(np.shape(grid_x), dtype=bool)
++        for name, coord, log in self.axes:
++            values = requested[name]
++            if values is None:
++                values = np.full(np.shape(grid_x), np.nan)
++            index, weight, missing = _axis_weights(coord, np.broadcast_to(
++                np.asarray(values, dtype=np.float64), np.shape(grid_x)), log=log)
++            if self.method == 'nearest':
++                weight = np.round(weight)
++            indices.append(index)
++            weights.append(weight)
++            outside |= missing
++
++        total = np.zeros(np.shape(grid_x))
++        for corner in itertools.product((0, 1), repeat=len(self.axes)):
++            share = np.ones(np.shape(grid_x))
++            for offset, weight in zip(corner, weights, strict=True):
++                share = share * (weight if offset else 1.0 - weight)
++            total = total + share * self.values[tuple(index + offset for index, offset
++                                                      in zip(indices, corner, strict=True))]
++
++        return np.where(outside, np.nan, total)
++
++
++def _has_axis(field, axis):
++    """Check whether a field is laid out along the requested MetPy axis type."""
++    try:
++        return field.metpy.find_axis_name(axis) in field.dims
++    except (AttributeError, KeyError, ValueError):
++        return False
++
++
++def _check_method(method):
++    """Check that an interpolation method is one of the supported ones."""
++    if method not in ('linear', 'nearest'):
++        raise ValueError("method must be either 'linear' or 'nearest'")
++
++
++def _track_values(field, longitude, latitude, time, vertical, method):
++    """Interpolate one field onto a track of points."""
++    if _has_axis(field, 'time') and time is None:
++        raise ValueError('a field with a time coordinate needs times along the track')
++    if _has_axis(field, 'vertical') and vertical is None:
++        raise ValueError('a field with a vertical coordinate needs levels along the track')
++
++    stamps = np.asarray(time) if time is not None else None
++    reference = stamps.min() if stamps is not None else None
++    sampler = _FieldSampler(field, reference, method=method)
++
++    offsets = (((stamps - reference) / np.timedelta64(1, 's')).astype(float)
++               if stamps is not None else None)
++    return sampler(offsets, np.asarray(longitude, dtype=np.float64),
++                   np.asarray(latitude, dtype=np.float64),
++                   None if vertical is None else np.asarray(vertical, dtype=np.float64)
++                   ), sampler.units
++
++
++@exporter.export
++def interpolate_to_track(data, longitude, latitude, *, time=None, vertical=None,
++                         method='linear'):
++    r"""Interpolate gridded data onto a track of points in space and time.
++
++    The track is followed point by point: the horizontal position is located on the grid of
++    `data`, converting longitude and latitude into the grid's own coordinates through its
++    projection, and time and the vertical coordinate are followed as well when the data has
++    them. A longitude coordinate that covers the globe is treated as continuous across the
++    seam, an isobaric coordinate is interpolated in the logarithm of pressure, and a point
++    outside the data gives NaN rather than an extrapolation.
++
++    Parameters
++    ----------
++    data : `xarray.DataArray` or `xarray.Dataset`
++        The field or fields to interpolate, parsed by MetPy. A Dataset is interpolated
++        variable by variable.
++    longitude, latitude : array-like
++        The track, in degrees east and degrees north, of the same shape as each other and as
++        any times and levels given. A track of more than one dimension is flattened.
++    time : array-like, optional
++        The time of each point of the track, needed when the data has a time coordinate.
++    vertical : array-like, optional
++        The vertical coordinate of each point of the track, in the units the data uses,
++        needed when the data has a vertical coordinate.
++    method : str, optional
++        Either ``'linear'``, the default, for a multilinear interpolation over every
++        coordinate, or ``'nearest'`` to take the value of the closest grid point.
++
++    Returns
++    -------
++    `xarray.DataArray` or `xarray.Dataset`
++        The data along the track, with the single dimension ``track``.
++
++    See Also
++    --------
++    metpy.calc.parcel_trajectory, interpolate_to_slice
++
++    """
++    _check_method(method)
++
++    longitude = np.atleast_1d(np.asarray(longitude, dtype=np.float64))
++    latitude = np.atleast_1d(np.asarray(latitude, dtype=np.float64))
++    along_track = [np.atleast_1d(np.asarray(along)) for along in (time, vertical)
++                   if along is not None]
++    for other in (latitude, *along_track):
++        if other.shape != longitude.shape:
++            raise ValueError('every quantity along the track must have the same shape')
++
++    longitude, latitude = longitude.ravel(), latitude.ravel()
++    time, vertical = (None if along is None else np.asarray(along).ravel()
++                      for along in (time, vertical))
++
++    if isinstance(data, xr.Dataset):
++        return xr.Dataset({name: interpolate_to_track(data[name], longitude, latitude,
++                                                      time=time, vertical=vertical,
++                                                      method=method)
++                           for name in data.data_vars})
++
++    values, found_units = _track_values(data, longitude, latitude, time, vertical, method)
++    return xr.DataArray(units.Quantity(values, found_units), dims=('track',),
++                        coords={'track': np.arange(longitude.size)})

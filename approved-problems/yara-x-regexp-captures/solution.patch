@@ -1,0 +1,3750 @@
+diff --git a/lib/src/compiler/emit.rs b/lib/src/compiler/emit.rs
+index 8584d808..527cc86c 100644
+--- a/lib/src/compiler/emit.rs
++++ b/lib/src/compiler/emit.rs
+@@ -1147,14 +1147,14 @@ fn emit_pattern_offset(
+ ) {
+     emit_lazy_call_to_search_for_patterns(ctx, instr);
+ 
+-    let index = match ir.get(expr) {
++    let (index, group) = match ir.get(expr) {
+         // Cases where the pattern ID is known, simply push the ID into the
+         // stack.
+-        Expr::PatternOffset { pattern, index } => {
++        Expr::PatternOffset { pattern, index, group } => {
+             instr.i32_const(ctx.pattern_id(*pattern).into());
+-            index
++            (index, group)
+         }
+-        Expr::PatternOffsetVar { symbol, index } => {
++        Expr::PatternOffsetVar { symbol, index, group } => {
+             match symbol.as_ref() {
+                 Symbol::Var { var, .. } => {
+                     load_var(ctx, instr, *var);
+@@ -1163,7 +1163,7 @@ fn emit_pattern_offset(
+                 }
+                 _ => unreachable!(),
+             }
+-            index
++            (index, group)
+         }
+         _ => unreachable!(),
+     };
+@@ -1180,6 +1180,18 @@ fn emit_pattern_offset(
+         }
+     }
+ 
++    match group {
++        // The group was specified, like in `@a[1][2]`
++        Some(group) => {
++            emit_expr(ctx, ir, *group, instr);
++        }
++        // The group was not specified, like in `@a[1]`, which is
++        // equivalent to `@a[1][0]`.
++        None => {
++            instr.i64_const(0);
++        }
++    }
++
+     emit_call_and_handle_undef(
+         ctx,
+         instr,
+@@ -1196,14 +1208,14 @@ fn emit_pattern_length(
+ ) {
+     emit_lazy_call_to_search_for_patterns(ctx, instr);
+ 
+-    let index = match ir.get(expr) {
++    let (index, group) = match ir.get(expr) {
+         // Cases where the pattern ID is known, simply push the ID into the
+         // stack.
+-        Expr::PatternLength { pattern, index } => {
++        Expr::PatternLength { pattern, index, group } => {
+             instr.i32_const(ctx.pattern_id(*pattern).into());
+-            index
++            (index, group)
+         }
+-        Expr::PatternLengthVar { symbol, index } => {
++        Expr::PatternLengthVar { symbol, index, group } => {
+             match symbol.as_ref() {
+                 Symbol::Var { var, .. } => {
+                     load_var(ctx, instr, *var);
+@@ -1212,7 +1224,7 @@ fn emit_pattern_length(
+                 }
+                 _ => unreachable!(),
+             }
+-            index
++            (index, group)
+         }
+         _ => unreachable!(),
+     };
+@@ -1229,6 +1241,18 @@ fn emit_pattern_length(
+         }
+     }
+ 
++    match group {
++        // The group was specified, like in `!a[1][2]`
++        Some(group) => {
++            emit_expr(ctx, ir, *group, instr);
++        }
++        // The group was not specified, like in `!a[1]`, which is
++        // equivalent to `!a[1][0]`.
++        None => {
++            instr.i64_const(0);
++        }
++    }
++
+     emit_call_and_handle_undef(
+         ctx,
+         instr,
+diff --git a/lib/src/compiler/errors.rs b/lib/src/compiler/errors.rs
+index 7287844b..638876dc 100644
+--- a/lib/src/compiler/errors.rs
++++ b/lib/src/compiler/errors.rs
+@@ -115,6 +115,7 @@ pub enum CompileError {
+     UnknownField(Box<UnknownField>),
+     UnknownIdentifier(Box<UnknownIdentifier>),
+     UnknownModule(Box<UnknownModule>),
++    UnknownCaptureGroup(Box<UnknownCaptureGroup>),
+     UnknownPattern(Box<UnknownPattern>),
+     UnknownTag(Box<UnknownTag>),
+     UnusedPattern(Box<UnusedPattern>),
+@@ -545,6 +546,28 @@ pub struct UnknownPattern {
+     error_loc: CodeLoc,
+ }
+ 
++/// A capture group name that the pattern doesn't define.
++///
++/// ## Example
++///
++/// ```text
++/// error[E048]: unknown capture group `day`
++///  --> line:5:23
++///   |
++/// 5 |    condition: @a[1]["day"] == 0
++///   |                     ^^^^^ this pattern has no group with this name
++///   |
++/// ```
++#[derive(ErrorStruct, Clone, Debug, PartialEq, Eq)]
++#[associated_enum(CompileError)]
++#[error(code = "E048", title = "unknown capture group `{group_name}`")]
++#[label("this pattern has no group with this name", error_loc)]
++pub struct UnknownCaptureGroup {
++    report: Report,
++    group_name: String,
++    error_loc: CodeLoc,
++}
++
+ /// Wrong alphabet for the `base64` or `base64wide` modifiers.
+ #[derive(ErrorStruct, Clone, Debug, PartialEq, Eq)]
+ #[associated_enum(CompileError)]
+diff --git a/lib/src/compiler/ir/ast2ir.rs b/lib/src/compiler/ir/ast2ir.rs
+index 1491f204..77c0eeea 100644
+--- a/lib/src/compiler/ir/ast2ir.rs
++++ b/lib/src/compiler/ir/ast2ir.rs
+@@ -22,7 +22,8 @@ use crate::compiler::errors::{
+     InvalidBase64Alphabet, InvalidModifier, InvalidModifierCombination,
+     InvalidPattern, InvalidRange, InvalidRegexp, MismatchingTypes,
+     MixedGreediness, NumberOutOfRange, SyntaxError, TooManyPatterns,
+-    TooManyVariables, UnexpectedNegativeNumber, WrongArguments, WrongType,
++    TooManyVariables, UnexpectedNegativeNumber, UnknownCaptureGroup,
++    WrongArguments, WrongType,
+ };
+ use crate::compiler::ir::hex2hir::hex_pattern_hir_from_ast;
+ use crate::compiler::ir::{
+@@ -873,26 +874,31 @@ fn expr_from_ast<'src>(
+                 ("@", Some(index)) => {
+                     let range =
+                         integer_in_range_from_ast(ctx, index, 1..=i64::MAX)?;
++                    let group = group_from_ast(ctx, &p.group, None)?;
+                     ctx.ir.pattern_offset_var(
+                         ctx.symbol_table.lookup("$").unwrap(),
+                         Some(range),
++                        group,
+                     )
+                 }
+                 ("@", None) => ctx.ir.pattern_offset_var(
+                     ctx.symbol_table.lookup("$").unwrap(),
+                     None,
++                    None,
+                 ),
+                 // Cases where the identifier is not `@`.
+                 (_, Some(index)) => {
+                     let range =
+                         integer_in_range_from_ast(ctx, index, 1..=i64::MAX)?;
++                    let group =
++                        group_from_ast(ctx, &p.group, Some(&p.identifier))?;
+                     let (pattern_idx, pattern) =
+                         ctx.get_pattern_mut(&p.identifier)?;
+                     pattern
+                         .make_non_anchorable()
+                         .mark_as_used()
+                         .disallow_fast_scan();
+-                    ctx.ir.pattern_offset(pattern_idx, Some(range))
++                    ctx.ir.pattern_offset(pattern_idx, Some(range), group)
+                 }
+                 (_, None) => {
+                     let (pattern_idx, pattern) =
+@@ -901,7 +907,7 @@ fn expr_from_ast<'src>(
+                         .make_non_anchorable()
+                         .mark_as_used()
+                         .disallow_fast_scan();
+-                    ctx.ir.pattern_offset(pattern_idx, None)
++                    ctx.ir.pattern_offset(pattern_idx, None, None)
+                 }
+             }
+         }
+@@ -921,26 +927,31 @@ fn expr_from_ast<'src>(
+                 ("!", Some(index)) => {
+                     let index =
+                         integer_in_range_from_ast(ctx, index, 1..=i64::MAX)?;
++                    let group = group_from_ast(ctx, &p.group, None)?;
+                     ctx.ir.pattern_length_var(
+                         ctx.symbol_table.lookup("$").unwrap(),
+                         Some(index),
++                        group,
+                     )
+                 }
+                 ("!", None) => ctx.ir.pattern_length_var(
+                     ctx.symbol_table.lookup("$").unwrap(),
+                     None,
++                    None,
+                 ),
+                 // Cases where the identifier is not `!`.
+                 (_, Some(index)) => {
+                     let index =
+                         integer_in_range_from_ast(ctx, index, 1..=i64::MAX)?;
++                    let group =
++                        group_from_ast(ctx, &p.group, Some(&p.identifier))?;
+                     let (pattern_idx, pattern) =
+                         ctx.get_pattern_mut(&p.identifier)?;
+                     pattern
+                         .make_non_anchorable()
+                         .mark_as_used()
+                         .disallow_fast_scan();
+-                    ctx.ir.pattern_length(pattern_idx, Some(index))
++                    ctx.ir.pattern_length(pattern_idx, Some(index), group)
+                 }
+                 (_, None) => {
+                     let (pattern_idx, pattern) =
+@@ -949,7 +960,7 @@ fn expr_from_ast<'src>(
+                         .make_non_anchorable()
+                         .mark_as_used()
+                         .disallow_fast_scan();
+-                    ctx.ir.pattern_length(pattern_idx, None)
++                    ctx.ir.pattern_length(pattern_idx, None, None)
+                 }
+             }
+         }
+@@ -3227,3 +3238,49 @@ fn shx_check(
+     }
+     Ok(())
+ }
++
++/// Lowers the capture group of a pattern accessor like `@a[1][2]`.
++///
++/// The group is either a number, or the name of a group in `pattern`. Names
++/// are resolved here, so the rest of the compiler only deals with numbers.
++/// The pattern is not known when the accessor is the `@` or `!` form used
++/// inside a `for .. of` statement, and a name can't be used in that case.
++fn group_from_ast<'src>(
++    ctx: &mut CompileContext<'_, 'src>,
++    group: &Option<ast::Expr<'src>>,
++    pattern: Option<&ast::Ident<'src>>,
++) -> Result<Option<ExprId>, CompileError> {
++    let group = match group {
++        Some(group) => group,
++        None => return Ok(None),
++    };
++
++    if let ast::Expr::LiteralString(name) = group {
++        let span = name.span();
++        let number = pattern
++            .and_then(|ident| ctx.get_pattern_mut(ident).ok())
++            .and_then(|(_, pattern)| match pattern.pattern() {
++                Pattern::Regexp(re) | Pattern::Hex(re) => Some(&re.hir),
++                Pattern::Text(_) => None,
++            })
++            .and_then(|hir| {
++                hir.capture_names()
++                    .into_iter()
++                    .find(|(n, _)| n.as_str() == name.value.as_ref())
++                    .map(|(_, group)| group)
++            });
++
++        return match number {
++            Some(number) => Ok(Some(ctx.ir.constant(TypeValue::const_integer_from(
++                number as i64,
++            )))),
++            None => Err(UnknownCaptureGroup::build(
++                ctx.report_builder,
++                name.value.to_string(),
++                ctx.report_builder.span_to_code_loc(span),
++            )),
++        };
++    }
++
++    Ok(Some(integer_in_range_from_ast(ctx, group, 0..=i64::MAX)?))
++}
+diff --git a/lib/src/compiler/ir/mod.rs b/lib/src/compiler/ir/mod.rs
+index 74fb17b8..67aa1885 100644
+--- a/lib/src/compiler/ir/mod.rs
++++ b/lib/src/compiler/ir/mod.rs
+@@ -2035,13 +2035,17 @@ impl IR {
+         &mut self,
+         pattern: PatternIdx,
+         index: Option<ExprId>,
++        group: Option<ExprId>,
+     ) -> ExprId {
+         let expr_id = ExprId::from(self.nodes.len());
+         if let Some(index) = &index {
+             self.parents[index.0 as usize] = expr_id;
+         }
++        if let Some(group) = &group {
++            self.parents[group.0 as usize] = expr_id;
++        }
+         self.parents.push(ExprId::none());
+-        self.nodes.push(Expr::PatternLength { pattern, index });
++        self.nodes.push(Expr::PatternLength { pattern, index, group });
+         debug_assert_eq!(self.parents.len(), self.nodes.len());
+         expr_id
+     }
+@@ -2051,14 +2055,21 @@ impl IR {
+         &mut self,
+         symbol: Symbol,
+         index: Option<ExprId>,
++        group: Option<ExprId>,
+     ) -> ExprId {
+         let expr_id = ExprId::from(self.nodes.len());
+         if let Some(index) = &index {
+             self.parents[index.0 as usize] = expr_id;
+         }
++        if let Some(group) = &group {
++            self.parents[group.0 as usize] = expr_id;
++        }
+         self.parents.push(ExprId::none());
+-        self.nodes
+-            .push(Expr::PatternLengthVar { symbol: Box::new(symbol), index });
++        self.nodes.push(Expr::PatternLengthVar {
++            symbol: Box::new(symbol),
++            index,
++            group,
++        });
+         debug_assert_eq!(self.parents.len(), self.nodes.len());
+         expr_id
+     }
+@@ -2068,13 +2079,17 @@ impl IR {
+         &mut self,
+         pattern: PatternIdx,
+         index: Option<ExprId>,
++        group: Option<ExprId>,
+     ) -> ExprId {
+         let expr_id = ExprId::from(self.nodes.len());
+         if let Some(index) = &index {
+             self.parents[index.0 as usize] = expr_id;
+         }
++        if let Some(group) = &group {
++            self.parents[group.0 as usize] = expr_id;
++        }
+         self.parents.push(ExprId::none());
+-        self.nodes.push(Expr::PatternOffset { pattern, index });
++        self.nodes.push(Expr::PatternOffset { pattern, index, group });
+         debug_assert_eq!(self.parents.len(), self.nodes.len());
+         expr_id
+     }
+@@ -2084,14 +2099,21 @@ impl IR {
+         &mut self,
+         symbol: Symbol,
+         index: Option<ExprId>,
++        group: Option<ExprId>,
+     ) -> ExprId {
+         let expr_id = ExprId::from(self.nodes.len());
+         if let Some(index) = &index {
+             self.parents[index.0 as usize] = expr_id;
+         }
++        if let Some(group) = &group {
++            self.parents[group.0 as usize] = expr_id;
++        }
+         self.parents.push(ExprId::none());
+-        self.nodes
+-            .push(Expr::PatternOffsetVar { symbol: Box::new(symbol), index });
++        self.nodes.push(Expr::PatternOffsetVar {
++            symbol: Box::new(symbol),
++            index,
++            group,
++        });
+         debug_assert_eq!(self.parents.len(), self.nodes.len());
+         expr_id
+     }
+@@ -2484,28 +2506,28 @@ impl Debug for IR {
+                             range_str(range),
+                             expr_hash
+                         )?,
+-                        Expr::PatternOffset { pattern, index } => writeln!(
++                        Expr::PatternOffset { pattern, index, .. } => writeln!(
+                             f,
+                             "PATTERN_OFFSET {:?}{} -- hash: {:#08x}",
+                             pattern,
+                             index_str(index),
+                             expr_hash
+                         )?,
+-                        Expr::PatternOffsetVar { symbol, index } => writeln!(
++                        Expr::PatternOffsetVar { symbol, index, .. } => writeln!(
+                             f,
+                             "PATTERN_OFFSET {:?}{} -- hash: {:#08x}",
+                             symbol,
+                             index_str(index),
+                             expr_hash
+                         )?,
+-                        Expr::PatternLength { pattern, index } => writeln!(
++                        Expr::PatternLength { pattern, index, .. } => writeln!(
+                             f,
+                             "PATTERN_LENGTH {:?}{} -- hash: {:#08x}",
+                             pattern,
+                             index_str(index),
+                             expr_hash
+                         )?,
+-                        Expr::PatternLengthVar { symbol, index } => writeln!(
++                        Expr::PatternLengthVar { symbol, index, .. } => writeln!(
+                             f,
+                             "PATTERN_LENGTH {:?}{} -- hash: {:#08x}",
+                             symbol,
+@@ -2683,16 +2705,32 @@ pub(crate) enum Expr {
+     PatternCountVar { symbol: Box<Symbol>, range: Option<Range> },
+ 
+     /// Pattern offset expression (e.g. `@a`, `@a[1]`)
+-    PatternOffset { pattern: PatternIdx, index: Option<ExprId> },
++    PatternOffset {
++        pattern: PatternIdx,
++        index: Option<ExprId>,
++        group: Option<ExprId>,
++    },
+ 
+     /// Pattern count expression where the pattern is variable (e.g. `@`, `@[1]`)
+-    PatternOffsetVar { symbol: Box<Symbol>, index: Option<ExprId> },
++    PatternOffsetVar {
++        symbol: Box<Symbol>,
++        index: Option<ExprId>,
++        group: Option<ExprId>,
++    },
+ 
+     /// Pattern length expression (e.g. `!a`, `!a[1]`)
+-    PatternLength { pattern: PatternIdx, index: Option<ExprId> },
++    PatternLength {
++        pattern: PatternIdx,
++        index: Option<ExprId>,
++        group: Option<ExprId>,
++    },
+ 
+     /// Pattern count expression where the pattern is variable (e.g. `!`, `![1]`)
+-    PatternLengthVar { symbol: Box<Symbol>, index: Option<ExprId> },
++    PatternLengthVar {
++        symbol: Box<Symbol>,
++        index: Option<ExprId>,
++        group: Option<ExprId>,
++    },
+ 
+     /// A symbol can be a variable, rule, field or function.
+     Symbol(Box<Symbol>),
+@@ -2921,21 +2959,25 @@ impl Hash for Expr {
+                 symbol.hash(state);
+                 discriminant(range).hash(state);
+             }
+-            Expr::PatternOffset { pattern, index } => {
++            Expr::PatternOffset { pattern, index, group } => {
+                 pattern.hash(state);
+                 discriminant(index).hash(state);
++                discriminant(group).hash(state);
+             }
+-            Expr::PatternOffsetVar { symbol, index } => {
++            Expr::PatternOffsetVar { symbol, index, group } => {
+                 symbol.hash(state);
+                 discriminant(index).hash(state);
++                discriminant(group).hash(state);
+             }
+-            Expr::PatternLength { pattern, index } => {
++            Expr::PatternLength { pattern, index, group } => {
+                 pattern.hash(state);
+                 discriminant(index).hash(state);
++                discriminant(group).hash(state);
+             }
+-            Expr::PatternLengthVar { symbol, index } => {
++            Expr::PatternLengthVar { symbol, index, group } => {
+                 symbol.hash(state);
+                 discriminant(index).hash(state);
++                discriminant(group).hash(state);
+             }
+             Expr::FuncCall(func_call) => {
+                 func_call.signature.hash(state);
+@@ -3137,15 +3179,20 @@ impl Expr {
+                 }
+             }
+ 
+-            Expr::PatternOffset { index, .. }
+-            | Expr::PatternOffsetVar { index, .. }
+-            | Expr::PatternLength { index, .. }
+-            | Expr::PatternLengthVar { index, .. } => {
++            Expr::PatternOffset { index, group, .. }
++            | Expr::PatternOffsetVar { index, group, .. }
++            | Expr::PatternLength { index, group, .. }
++            | Expr::PatternLengthVar { index, group, .. } => {
+                 if let Some(index) = index
+                     && *index == child
+                 {
+                     *index = replacement
+                 }
++                if let Some(group) = group
++                    && *group == child
++                {
++                    *group = replacement
++                }
+             }
+ 
+             Expr::With(with) => {
+diff --git a/lib/src/compiler/ir/tests/mod.rs b/lib/src/compiler/ir/tests/mod.rs
+index 91d92c4b..d727d35a 100644
+--- a/lib/src/compiler/ir/tests/mod.rs
++++ b/lib/src/compiler/ir/tests/mod.rs
+@@ -286,14 +286,22 @@ fn replace_child() {
+ 
+     // PatternOffset, PatternLength
+     let mut expr =
+-        Expr::PatternOffset { pattern: PatternIdx::from(0), index: Some(c1) };
++        Expr::PatternOffset {
++            pattern: PatternIdx::from(0),
++            index: Some(c1),
++            group: None,
++        };
+     expr.replace_child(c1, repl);
+     assert!(
+         matches!(expr, Expr::PatternOffset { index: Some(idx), .. } if idx == repl)
+     );
+ 
+     let mut expr =
+-        Expr::PatternLength { pattern: PatternIdx::from(0), index: Some(c1) };
++        Expr::PatternLength {
++            pattern: PatternIdx::from(0),
++            index: Some(c1),
++            group: None,
++        };
+     expr.replace_child(c1, repl);
+     assert!(
+         matches!(expr, Expr::PatternLength { index: Some(idx), .. } if idx == repl)
+diff --git a/lib/src/compiler/ir/tests/testdata/10.cse.ir b/lib/src/compiler/ir/tests/testdata/10.cse.ir
+index 510fcb58..567db8d8 100644
+--- a/lib/src/compiler/ir/tests/testdata/10.cse.ir
++++ b/lib/src/compiler/ir/tests/testdata/10.cse.ir
+@@ -1,5 +1,5 @@
+ RULE test
+-  13: FOR_IN -- hash: 0xfd14d4882d1f6026
++  13: FOR_IN -- hash: 0x7ad0095b9cc35d20
+         n: Var { frame_id: 1, ty: integer, index: 0 }
+         i: Var { frame_id: 1, ty: integer, index: 1 }
+         max_count: Var { frame_id: 1, ty: integer, index: 2 }
+@@ -7,10 +7,10 @@ RULE test
+         item: Var { frame_id: 1, ty: unknown, index: 4 }
+     0: CONST integer(1)
+     1: CONST integer(10)
+-    12: WITH -- hash: 0xe5f28003804fec06
+-      6: FN_CALL uint32@offset:i@i:R0:4294967295u -- hash: 0xedfbb8eef52ecd47
+-        5: ADD -- hash: 0xd087500d7c07b7de
+-          3: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x96059519ea655987
++    12: WITH -- hash: 0x99e791b741f8b397
++      6: FN_CALL uint32@offset:i@i:R0:4294967295u -- hash: 0x8db36dad97cadce1
++        5: ADD -- hash: 0xb001eff43f03a3db
++          3: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x2bb38b4cc8774845
+             2: SYMBOL Var { var: Var { frame_id: 1, ty: integer, index: 5 }, type_value: integer(unknown) }
+           4: CONST integer(16)
+       8: FN_CALL uint32be@offset:i@i:R0:4294967295u -- hash: 0xae9a6e5779a03664
+diff --git a/lib/src/compiler/ir/tests/testdata/10.hoisting.ir b/lib/src/compiler/ir/tests/testdata/10.hoisting.ir
+index 510fcb58..567db8d8 100644
+--- a/lib/src/compiler/ir/tests/testdata/10.hoisting.ir
++++ b/lib/src/compiler/ir/tests/testdata/10.hoisting.ir
+@@ -1,5 +1,5 @@
+ RULE test
+-  13: FOR_IN -- hash: 0xfd14d4882d1f6026
++  13: FOR_IN -- hash: 0x7ad0095b9cc35d20
+         n: Var { frame_id: 1, ty: integer, index: 0 }
+         i: Var { frame_id: 1, ty: integer, index: 1 }
+         max_count: Var { frame_id: 1, ty: integer, index: 2 }
+@@ -7,10 +7,10 @@ RULE test
+         item: Var { frame_id: 1, ty: unknown, index: 4 }
+     0: CONST integer(1)
+     1: CONST integer(10)
+-    12: WITH -- hash: 0xe5f28003804fec06
+-      6: FN_CALL uint32@offset:i@i:R0:4294967295u -- hash: 0xedfbb8eef52ecd47
+-        5: ADD -- hash: 0xd087500d7c07b7de
+-          3: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x96059519ea655987
++    12: WITH -- hash: 0x99e791b741f8b397
++      6: FN_CALL uint32@offset:i@i:R0:4294967295u -- hash: 0x8db36dad97cadce1
++        5: ADD -- hash: 0xb001eff43f03a3db
++          3: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x2bb38b4cc8774845
+             2: SYMBOL Var { var: Var { frame_id: 1, ty: integer, index: 5 }, type_value: integer(unknown) }
+           4: CONST integer(16)
+       8: FN_CALL uint32be@offset:i@i:R0:4294967295u -- hash: 0xae9a6e5779a03664
+diff --git a/lib/src/compiler/ir/tests/testdata/10.ir b/lib/src/compiler/ir/tests/testdata/10.ir
+index 510fcb58..567db8d8 100644
+--- a/lib/src/compiler/ir/tests/testdata/10.ir
++++ b/lib/src/compiler/ir/tests/testdata/10.ir
+@@ -1,5 +1,5 @@
+ RULE test
+-  13: FOR_IN -- hash: 0xfd14d4882d1f6026
++  13: FOR_IN -- hash: 0x7ad0095b9cc35d20
+         n: Var { frame_id: 1, ty: integer, index: 0 }
+         i: Var { frame_id: 1, ty: integer, index: 1 }
+         max_count: Var { frame_id: 1, ty: integer, index: 2 }
+@@ -7,10 +7,10 @@ RULE test
+         item: Var { frame_id: 1, ty: unknown, index: 4 }
+     0: CONST integer(1)
+     1: CONST integer(10)
+-    12: WITH -- hash: 0xe5f28003804fec06
+-      6: FN_CALL uint32@offset:i@i:R0:4294967295u -- hash: 0xedfbb8eef52ecd47
+-        5: ADD -- hash: 0xd087500d7c07b7de
+-          3: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x96059519ea655987
++    12: WITH -- hash: 0x99e791b741f8b397
++      6: FN_CALL uint32@offset:i@i:R0:4294967295u -- hash: 0x8db36dad97cadce1
++        5: ADD -- hash: 0xb001eff43f03a3db
++          3: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x2bb38b4cc8774845
+             2: SYMBOL Var { var: Var { frame_id: 1, ty: integer, index: 5 }, type_value: integer(unknown) }
+           4: CONST integer(16)
+       8: FN_CALL uint32be@offset:i@i:R0:4294967295u -- hash: 0xae9a6e5779a03664
+diff --git a/lib/src/compiler/ir/tests/testdata/15.cse.ir b/lib/src/compiler/ir/tests/testdata/15.cse.ir
+index ce8858d2..ab70f783 100644
+--- a/lib/src/compiler/ir/tests/testdata/15.cse.ir
++++ b/lib/src/compiler/ir/tests/testdata/15.cse.ir
+@@ -1,5 +1,5 @@
+ RULE test
+-  171: AND -- hash: 0x550720c3956843bf
++  171: AND -- hash: 0xd7ef9454e552c4e4
+     0: PATTERN_MATCH PatternIdx(0) -- hash: 0x5a276c8d75077d2b
+     2: PATTERN_MATCH PatternIdx(0) AT -- hash: 0xfb7f3424e7aabb50
+       1: CONST integer(0)
+@@ -14,18 +14,18 @@ RULE test
+         9: CONST integer(0)
+         10: CONST integer(100)
+       12: CONST integer(0)
+-    16: GT -- hash: 0x2c7be90e3169df71
+-      14: PATTERN_OFFSET PatternIdx(0) -- hash: 0xf879c749467cc2a4
++    16: GT -- hash: 0x81846868058e32b
++      14: PATTERN_OFFSET PatternIdx(0) -- hash: 0x3689c14555c5d8c9
+       15: CONST integer(0)
+-    20: GT -- hash: 0x8bb5a93875bc3546
+-      18: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x3a988b42c9d1c021
++    20: GT -- hash: 0xc06bdb5914430c8b
++      18: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x3a83e53828749394
+         17: CONST integer(1)
+       19: CONST integer(0)
+-    23: GT -- hash: 0x77abcf49989af6e3
+-      21: PATTERN_LENGTH PatternIdx(0) -- hash: 0xc7a2f4a72d376561
++    23: GT -- hash: 0x625f79e589930f53
++      21: PATTERN_LENGTH PatternIdx(0) -- hash: 0x1dcf78b0dd6fad27
+       22: CONST integer(0)
+-    27: GT -- hash: 0xf87b38b95dae2020
+-      25: PATTERN_LENGTH PatternIdx(0) INDEX -- hash: 0x85c8717e3102d793
++    27: GT -- hash: 0x93832b39fb0be3e
++      25: PATTERN_LENGTH PatternIdx(0) INDEX -- hash: 0x94cb189731aebfbc
+         24: CONST integer(1)
+       26: CONST integer(0)
+     35: FOR_OF -- hash: 0x987e0cb4f38e5d95
+@@ -56,32 +56,32 @@ RULE test
+             39: CONST integer(0)
+             40: CONST integer(100)
+           42: CONST integer(0)
+-    54: FOR_OF -- hash: 0xb649de6a3c0b0603
++    54: FOR_OF -- hash: 0xb3c4bcbf5e12cde4
+           n: Var { frame_id: 3, ty: integer, index: 0 }
+           i: Var { frame_id: 3, ty: integer, index: 1 }
+           max_count: Var { frame_id: 3, ty: integer, index: 2 }
+           count: Var { frame_id: 3, ty: integer, index: 3 }
+           item: Var { frame_id: 3, ty: integer, index: 4 }
+-      53: AND -- hash: 0xada51cbb798a9af6
+-        48: GT -- hash: 0xeeaeb61296e7af4e
+-          46: PATTERN_OFFSET Var { var: Var { frame_id: 3, ty: integer, index: 4 }, type_value: integer(unknown) } -- hash: 0xb04c0a9329e733c9
++      53: AND -- hash: 0x2e98c1c838ba4e0c
++        48: GT -- hash: 0xb02e38eb745ce7f9
++          46: PATTERN_OFFSET Var { var: Var { frame_id: 3, ty: integer, index: 4 }, type_value: integer(unknown) } -- hash: 0xeb0498a5c8a93a2b
+           47: CONST integer(0)
+-        52: GT -- hash: 0x77ae50bc98adf661
+-          50: PATTERN_OFFSET Var { var: Var { frame_id: 3, ty: integer, index: 4 }, type_value: integer(unknown) } INDEX -- hash: 0x43dbbef46c221d0a
++        52: GT -- hash: 0x4468c7ccc8d9fb45
++          50: PATTERN_OFFSET Var { var: Var { frame_id: 3, ty: integer, index: 4 }, type_value: integer(unknown) } INDEX -- hash: 0x55d3ba2f5fbc6591
+             49: CONST integer(1)
+           51: CONST integer(0)
+-    63: FOR_OF -- hash: 0xe68ac61aa5953ab8
++    63: FOR_OF -- hash: 0x67c9a08d97e541d2
+           n: Var { frame_id: 4, ty: integer, index: 0 }
+           i: Var { frame_id: 4, ty: integer, index: 1 }
+           max_count: Var { frame_id: 4, ty: integer, index: 2 }
+           count: Var { frame_id: 4, ty: integer, index: 3 }
+           item: Var { frame_id: 4, ty: integer, index: 4 }
+-      62: AND -- hash: 0xdde6046be314cfab
+-        57: GT -- hash: 0x2f970015e0e80db6
+-          55: PATTERN_LENGTH Var { var: Var { frame_id: 4, ty: integer, index: 4 }, type_value: integer(unknown) } -- hash: 0x4dbda69535834f3e
++      62: AND -- hash: 0xe29da596728cc1f9
++        57: GT -- hash: 0x60b672a0f2fc42bc
++          55: PATTERN_LENGTH Var { var: Var { frame_id: 4, ty: integer, index: 4 }, type_value: integer(unknown) } -- hash: 0x225f982504c315f6
+           56: CONST integer(0)
+-        61: GT -- hash: 0x95f4118d25b93df3
+-          59: PATTERN_LENGTH Var { var: Var { frame_id: 4, ty: integer, index: 4 }, type_value: integer(unknown) } INDEX -- hash: 0x84c408f7ba227b71
++        61: GT -- hash: 0xdd5d6cb484c64163
++          59: PATTERN_LENGTH Var { var: Var { frame_id: 4, ty: integer, index: 4 }, type_value: integer(unknown) } INDEX -- hash: 0x65bf3e4da5bc054
+             58: CONST integer(1)
+           60: CONST integer(0)
+     65: FOR_OF -- hash: 0xe716d23849fe7860
+diff --git a/lib/src/compiler/ir/tests/testdata/15.hoisting.ir b/lib/src/compiler/ir/tests/testdata/15.hoisting.ir
+index ce8858d2..ab70f783 100644
+--- a/lib/src/compiler/ir/tests/testdata/15.hoisting.ir
++++ b/lib/src/compiler/ir/tests/testdata/15.hoisting.ir
+@@ -1,5 +1,5 @@
+ RULE test
+-  171: AND -- hash: 0x550720c3956843bf
++  171: AND -- hash: 0xd7ef9454e552c4e4
+     0: PATTERN_MATCH PatternIdx(0) -- hash: 0x5a276c8d75077d2b
+     2: PATTERN_MATCH PatternIdx(0) AT -- hash: 0xfb7f3424e7aabb50
+       1: CONST integer(0)
+@@ -14,18 +14,18 @@ RULE test
+         9: CONST integer(0)
+         10: CONST integer(100)
+       12: CONST integer(0)
+-    16: GT -- hash: 0x2c7be90e3169df71
+-      14: PATTERN_OFFSET PatternIdx(0) -- hash: 0xf879c749467cc2a4
++    16: GT -- hash: 0x81846868058e32b
++      14: PATTERN_OFFSET PatternIdx(0) -- hash: 0x3689c14555c5d8c9
+       15: CONST integer(0)
+-    20: GT -- hash: 0x8bb5a93875bc3546
+-      18: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x3a988b42c9d1c021
++    20: GT -- hash: 0xc06bdb5914430c8b
++      18: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x3a83e53828749394
+         17: CONST integer(1)
+       19: CONST integer(0)
+-    23: GT -- hash: 0x77abcf49989af6e3
+-      21: PATTERN_LENGTH PatternIdx(0) -- hash: 0xc7a2f4a72d376561
++    23: GT -- hash: 0x625f79e589930f53
++      21: PATTERN_LENGTH PatternIdx(0) -- hash: 0x1dcf78b0dd6fad27
+       22: CONST integer(0)
+-    27: GT -- hash: 0xf87b38b95dae2020
+-      25: PATTERN_LENGTH PatternIdx(0) INDEX -- hash: 0x85c8717e3102d793
++    27: GT -- hash: 0x93832b39fb0be3e
++      25: PATTERN_LENGTH PatternIdx(0) INDEX -- hash: 0x94cb189731aebfbc
+         24: CONST integer(1)
+       26: CONST integer(0)
+     35: FOR_OF -- hash: 0x987e0cb4f38e5d95
+@@ -56,32 +56,32 @@ RULE test
+             39: CONST integer(0)
+             40: CONST integer(100)
+           42: CONST integer(0)
+-    54: FOR_OF -- hash: 0xb649de6a3c0b0603
++    54: FOR_OF -- hash: 0xb3c4bcbf5e12cde4
+           n: Var { frame_id: 3, ty: integer, index: 0 }
+           i: Var { frame_id: 3, ty: integer, index: 1 }
+           max_count: Var { frame_id: 3, ty: integer, index: 2 }
+           count: Var { frame_id: 3, ty: integer, index: 3 }
+           item: Var { frame_id: 3, ty: integer, index: 4 }
+-      53: AND -- hash: 0xada51cbb798a9af6
+-        48: GT -- hash: 0xeeaeb61296e7af4e
+-          46: PATTERN_OFFSET Var { var: Var { frame_id: 3, ty: integer, index: 4 }, type_value: integer(unknown) } -- hash: 0xb04c0a9329e733c9
++      53: AND -- hash: 0x2e98c1c838ba4e0c
++        48: GT -- hash: 0xb02e38eb745ce7f9
++          46: PATTERN_OFFSET Var { var: Var { frame_id: 3, ty: integer, index: 4 }, type_value: integer(unknown) } -- hash: 0xeb0498a5c8a93a2b
+           47: CONST integer(0)
+-        52: GT -- hash: 0x77ae50bc98adf661
+-          50: PATTERN_OFFSET Var { var: Var { frame_id: 3, ty: integer, index: 4 }, type_value: integer(unknown) } INDEX -- hash: 0x43dbbef46c221d0a
++        52: GT -- hash: 0x4468c7ccc8d9fb45
++          50: PATTERN_OFFSET Var { var: Var { frame_id: 3, ty: integer, index: 4 }, type_value: integer(unknown) } INDEX -- hash: 0x55d3ba2f5fbc6591
+             49: CONST integer(1)
+           51: CONST integer(0)
+-    63: FOR_OF -- hash: 0xe68ac61aa5953ab8
++    63: FOR_OF -- hash: 0x67c9a08d97e541d2
+           n: Var { frame_id: 4, ty: integer, index: 0 }
+           i: Var { frame_id: 4, ty: integer, index: 1 }
+           max_count: Var { frame_id: 4, ty: integer, index: 2 }
+           count: Var { frame_id: 4, ty: integer, index: 3 }
+           item: Var { frame_id: 4, ty: integer, index: 4 }
+-      62: AND -- hash: 0xdde6046be314cfab
+-        57: GT -- hash: 0x2f970015e0e80db6
+-          55: PATTERN_LENGTH Var { var: Var { frame_id: 4, ty: integer, index: 4 }, type_value: integer(unknown) } -- hash: 0x4dbda69535834f3e
++      62: AND -- hash: 0xe29da596728cc1f9
++        57: GT -- hash: 0x60b672a0f2fc42bc
++          55: PATTERN_LENGTH Var { var: Var { frame_id: 4, ty: integer, index: 4 }, type_value: integer(unknown) } -- hash: 0x225f982504c315f6
+           56: CONST integer(0)
+-        61: GT -- hash: 0x95f4118d25b93df3
+-          59: PATTERN_LENGTH Var { var: Var { frame_id: 4, ty: integer, index: 4 }, type_value: integer(unknown) } INDEX -- hash: 0x84c408f7ba227b71
++        61: GT -- hash: 0xdd5d6cb484c64163
++          59: PATTERN_LENGTH Var { var: Var { frame_id: 4, ty: integer, index: 4 }, type_value: integer(unknown) } INDEX -- hash: 0x65bf3e4da5bc054
+             58: CONST integer(1)
+           60: CONST integer(0)
+     65: FOR_OF -- hash: 0xe716d23849fe7860
+diff --git a/lib/src/compiler/ir/tests/testdata/15.ir b/lib/src/compiler/ir/tests/testdata/15.ir
+index ce8858d2..ab70f783 100644
+--- a/lib/src/compiler/ir/tests/testdata/15.ir
++++ b/lib/src/compiler/ir/tests/testdata/15.ir
+@@ -1,5 +1,5 @@
+ RULE test
+-  171: AND -- hash: 0x550720c3956843bf
++  171: AND -- hash: 0xd7ef9454e552c4e4
+     0: PATTERN_MATCH PatternIdx(0) -- hash: 0x5a276c8d75077d2b
+     2: PATTERN_MATCH PatternIdx(0) AT -- hash: 0xfb7f3424e7aabb50
+       1: CONST integer(0)
+@@ -14,18 +14,18 @@ RULE test
+         9: CONST integer(0)
+         10: CONST integer(100)
+       12: CONST integer(0)
+-    16: GT -- hash: 0x2c7be90e3169df71
+-      14: PATTERN_OFFSET PatternIdx(0) -- hash: 0xf879c749467cc2a4
++    16: GT -- hash: 0x81846868058e32b
++      14: PATTERN_OFFSET PatternIdx(0) -- hash: 0x3689c14555c5d8c9
+       15: CONST integer(0)
+-    20: GT -- hash: 0x8bb5a93875bc3546
+-      18: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x3a988b42c9d1c021
++    20: GT -- hash: 0xc06bdb5914430c8b
++      18: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x3a83e53828749394
+         17: CONST integer(1)
+       19: CONST integer(0)
+-    23: GT -- hash: 0x77abcf49989af6e3
+-      21: PATTERN_LENGTH PatternIdx(0) -- hash: 0xc7a2f4a72d376561
++    23: GT -- hash: 0x625f79e589930f53
++      21: PATTERN_LENGTH PatternIdx(0) -- hash: 0x1dcf78b0dd6fad27
+       22: CONST integer(0)
+-    27: GT -- hash: 0xf87b38b95dae2020
+-      25: PATTERN_LENGTH PatternIdx(0) INDEX -- hash: 0x85c8717e3102d793
++    27: GT -- hash: 0x93832b39fb0be3e
++      25: PATTERN_LENGTH PatternIdx(0) INDEX -- hash: 0x94cb189731aebfbc
+         24: CONST integer(1)
+       26: CONST integer(0)
+     35: FOR_OF -- hash: 0x987e0cb4f38e5d95
+@@ -56,32 +56,32 @@ RULE test
+             39: CONST integer(0)
+             40: CONST integer(100)
+           42: CONST integer(0)
+-    54: FOR_OF -- hash: 0xb649de6a3c0b0603
++    54: FOR_OF -- hash: 0xb3c4bcbf5e12cde4
+           n: Var { frame_id: 3, ty: integer, index: 0 }
+           i: Var { frame_id: 3, ty: integer, index: 1 }
+           max_count: Var { frame_id: 3, ty: integer, index: 2 }
+           count: Var { frame_id: 3, ty: integer, index: 3 }
+           item: Var { frame_id: 3, ty: integer, index: 4 }
+-      53: AND -- hash: 0xada51cbb798a9af6
+-        48: GT -- hash: 0xeeaeb61296e7af4e
+-          46: PATTERN_OFFSET Var { var: Var { frame_id: 3, ty: integer, index: 4 }, type_value: integer(unknown) } -- hash: 0xb04c0a9329e733c9
++      53: AND -- hash: 0x2e98c1c838ba4e0c
++        48: GT -- hash: 0xb02e38eb745ce7f9
++          46: PATTERN_OFFSET Var { var: Var { frame_id: 3, ty: integer, index: 4 }, type_value: integer(unknown) } -- hash: 0xeb0498a5c8a93a2b
+           47: CONST integer(0)
+-        52: GT -- hash: 0x77ae50bc98adf661
+-          50: PATTERN_OFFSET Var { var: Var { frame_id: 3, ty: integer, index: 4 }, type_value: integer(unknown) } INDEX -- hash: 0x43dbbef46c221d0a
++        52: GT -- hash: 0x4468c7ccc8d9fb45
++          50: PATTERN_OFFSET Var { var: Var { frame_id: 3, ty: integer, index: 4 }, type_value: integer(unknown) } INDEX -- hash: 0x55d3ba2f5fbc6591
+             49: CONST integer(1)
+           51: CONST integer(0)
+-    63: FOR_OF -- hash: 0xe68ac61aa5953ab8
++    63: FOR_OF -- hash: 0x67c9a08d97e541d2
+           n: Var { frame_id: 4, ty: integer, index: 0 }
+           i: Var { frame_id: 4, ty: integer, index: 1 }
+           max_count: Var { frame_id: 4, ty: integer, index: 2 }
+           count: Var { frame_id: 4, ty: integer, index: 3 }
+           item: Var { frame_id: 4, ty: integer, index: 4 }
+-      62: AND -- hash: 0xdde6046be314cfab
+-        57: GT -- hash: 0x2f970015e0e80db6
+-          55: PATTERN_LENGTH Var { var: Var { frame_id: 4, ty: integer, index: 4 }, type_value: integer(unknown) } -- hash: 0x4dbda69535834f3e
++      62: AND -- hash: 0xe29da596728cc1f9
++        57: GT -- hash: 0x60b672a0f2fc42bc
++          55: PATTERN_LENGTH Var { var: Var { frame_id: 4, ty: integer, index: 4 }, type_value: integer(unknown) } -- hash: 0x225f982504c315f6
+           56: CONST integer(0)
+-        61: GT -- hash: 0x95f4118d25b93df3
+-          59: PATTERN_LENGTH Var { var: Var { frame_id: 4, ty: integer, index: 4 }, type_value: integer(unknown) } INDEX -- hash: 0x84c408f7ba227b71
++        61: GT -- hash: 0xdd5d6cb484c64163
++          59: PATTERN_LENGTH Var { var: Var { frame_id: 4, ty: integer, index: 4 }, type_value: integer(unknown) } INDEX -- hash: 0x65bf3e4da5bc054
+             58: CONST integer(1)
+           60: CONST integer(0)
+     65: FOR_OF -- hash: 0xe716d23849fe7860
+diff --git a/lib/src/compiler/ir/tests/testdata/2.cse.ir b/lib/src/compiler/ir/tests/testdata/2.cse.ir
+index 8ef5c115..459ed29a 100644
+--- a/lib/src/compiler/ir/tests/testdata/2.cse.ir
++++ b/lib/src/compiler/ir/tests/testdata/2.cse.ir
+@@ -1,5 +1,5 @@
+ RULE test
+-  42: FOR_IN -- hash: 0x5a8b495d9ca0365f
++  42: FOR_IN -- hash: 0xc1bdbbd94e5e06d5
+         n: Var { frame_id: 1, ty: integer, index: 0 }
+         i: Var { frame_id: 1, ty: integer, index: 1 }
+         max_count: Var { frame_id: 1, ty: integer, index: 2 }
+@@ -7,7 +7,7 @@ RULE test
+         item: Var { frame_id: 1, ty: unknown, index: 4 }
+     0: CONST integer(0)
+     1: PATTERN_COUNT PatternIdx(0) -- hash: 0x295099eb5fc21fe8
+-    41: FOR_IN -- hash: 0xc59e62932f94ad94
++    41: FOR_IN -- hash: 0xea16d2cddd4fc07c
+           n: Var { frame_id: 2, ty: integer, index: 7 }
+           i: Var { frame_id: 2, ty: integer, index: 8 }
+           max_count: Var { frame_id: 2, ty: integer, index: 9 }
+@@ -15,7 +15,7 @@ RULE test
+           item: Var { frame_id: 2, ty: unknown, index: 11 }
+       2: CONST integer(0)
+       3: PATTERN_COUNT PatternIdx(1) -- hash: 0xde2e40b1c012bed4
+-      40: FOR_IN -- hash: 0x43fb933d283b1ad6
++      40: FOR_IN -- hash: 0xac7fd4221b8b0765
+             n: Var { frame_id: 3, ty: integer, index: 14 }
+             i: Var { frame_id: 3, ty: integer, index: 15 }
+             max_count: Var { frame_id: 3, ty: integer, index: 16 }
+@@ -24,15 +24,15 @@ RULE test
+         6: FIELD_ACCESS -- hash: 0x874667d74d3e43c4
+           4: SYMBOL Field { index: 0, is_root: true, type_value: struct, acl: None, deprecation_notice: None }
+           5: SYMBOL Field { index: 19, is_root: false, type_value: array, acl: None, deprecation_notice: None }
+-        39: AND -- hash: 0x7633aa85f81db2b
+-          12: LE -- hash: 0xe9f7e368f4dece6e
++        39: AND -- hash: 0x4095f1980e413117
++          12: LE -- hash: 0xe146950d05355d80
+             9: FIELD_ACCESS -- hash: 0x6542d2870b7a1b93
+               7: SYMBOL Var { var: Var { frame_id: 3, ty: struct, index: 19 }, type_value: struct }
+               8: SYMBOL Field { index: 0, is_root: false, type_value: integer(unknown), acl: None, deprecation_notice: None }
+-            11: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x96059519ea655987
++            11: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x2bb38b4cc8774845
+               10: SYMBOL Var { var: Var { frame_id: 1, ty: integer, index: 5 }, type_value: integer(unknown) }
+-          22: LE -- hash: 0xe67373d7ab0aa8d1
+-            14: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x96059519ea655987
++          22: LE -- hash: 0xcc1f88b0d95465cb
++            14: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x2bb38b4cc8774845
+               13: SYMBOL Var { var: Var { frame_id: 1, ty: integer, index: 5 }, type_value: integer(unknown) }
+             21: ADD -- hash: 0xa39958692f6255bc
+               17: FIELD_ACCESS -- hash: 0x6542d2870b7a1b93
+@@ -41,14 +41,14 @@ RULE test
+               20: FIELD_ACCESS -- hash: 0x1a20794d6fcaba80
+                 18: SYMBOL Var { var: Var { frame_id: 3, ty: struct, index: 19 }, type_value: struct }
+                 19: SYMBOL Field { index: 1, is_root: false, type_value: integer(unknown), acl: None, deprecation_notice: None }
+-          28: LE -- hash: 0x143737c7283684f8
++          28: LE -- hash: 0x13118ffd09919e65
+             25: FIELD_ACCESS -- hash: 0x6542d2870b7a1b93
+               23: SYMBOL Var { var: Var { frame_id: 3, ty: struct, index: 19 }, type_value: struct }
+               24: SYMBOL Field { index: 0, is_root: false, type_value: integer(unknown), acl: None, deprecation_notice: None }
+-            27: PATTERN_OFFSET PatternIdx(1) INDEX -- hash: 0xc044e9781dbd1010
++            27: PATTERN_OFFSET PatternIdx(1) INDEX -- hash: 0x5d7e863cccd38929
+               26: SYMBOL Var { var: Var { frame_id: 2, ty: integer, index: 12 }, type_value: integer(unknown) }
+-          38: LE -- hash: 0x184730be6c281364
+-            30: PATTERN_OFFSET PatternIdx(1) INDEX -- hash: 0xc044e9781dbd1010
++          38: LE -- hash: 0x678feadfad326288
++            30: PATTERN_OFFSET PatternIdx(1) INDEX -- hash: 0x5d7e863cccd38929
+               29: SYMBOL Var { var: Var { frame_id: 2, ty: integer, index: 12 }, type_value: integer(unknown) }
+             37: ADD -- hash: 0xa39958692f6255bc
+               33: FIELD_ACCESS -- hash: 0x6542d2870b7a1b93
+diff --git a/lib/src/compiler/ir/tests/testdata/2.hoisting.ir b/lib/src/compiler/ir/tests/testdata/2.hoisting.ir
+index eca01095..dcac01d9 100644
+--- a/lib/src/compiler/ir/tests/testdata/2.hoisting.ir
++++ b/lib/src/compiler/ir/tests/testdata/2.hoisting.ir
+@@ -1,11 +1,11 @@
+ RULE test
+-  44: WITH -- hash: 0x7c91d0cccb598c8a
++  44: WITH -- hash: 0x1e31a2b3f857314a
+     43: PATTERN_COUNT PatternIdx(1) -- hash: 0xde2e40b1c012bed4
+-    46: WITH -- hash: 0x43de2be682efd642
++    46: WITH -- hash: 0xfa45786633a74f8d
+       45: FIELD_ACCESS -- hash: 0x874667d74d3e43c4
+         4: SYMBOL Field { index: 0, is_root: true, type_value: struct, acl: None, deprecation_notice: None }
+         5: SYMBOL Field { index: 19, is_root: false, type_value: array, acl: None, deprecation_notice: None }
+-      42: FOR_IN -- hash: 0x69ea51737f0ab559
++      42: FOR_IN -- hash: 0x8b00b8ed6d687e06
+             n: Var { frame_id: 1, ty: integer, index: 2 }
+             i: Var { frame_id: 1, ty: integer, index: 3 }
+             max_count: Var { frame_id: 1, ty: integer, index: 4 }
+@@ -13,13 +13,13 @@ RULE test
+             item: Var { frame_id: 1, ty: unknown, index: 6 }
+         0: CONST integer(0)
+         1: PATTERN_COUNT PatternIdx(0) -- hash: 0x295099eb5fc21fe8
+-        48: WITH -- hash: 0xf4e938698d476707
+-          47: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0xe778aa6811ef055e
++        48: WITH -- hash: 0xd2c5d85a7e682caa
++          47: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x7d26a09af000f41c
+             10: SYMBOL Var { var: Var { frame_id: 1, ty: integer, index: 7 }, type_value: integer(unknown) }
+-          50: WITH -- hash: 0xaed4c90a75f90eb3
+-            49: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0xe778aa6811ef055e
++          50: WITH -- hash: 0x88c7fba3c7d87339
++            49: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x7d26a09af000f41c
+               13: SYMBOL Var { var: Var { frame_id: 1, ty: integer, index: 7 }, type_value: integer(unknown) }
+-            41: FOR_IN -- hash: 0x49d99373f68e4c7
++            41: FOR_IN -- hash: 0xd03ea8e54ce53095
+                   n: Var { frame_id: 2, ty: integer, index: 11 }
+                   i: Var { frame_id: 2, ty: integer, index: 12 }
+                   max_count: Var { frame_id: 2, ty: integer, index: 13 }
+@@ -27,11 +27,11 @@ RULE test
+                   item: Var { frame_id: 2, ty: unknown, index: 15 }
+               2: CONST integer(0)
+               3: SYMBOL Var { var: Var { frame_id: 0, ty: integer, index: 0 }, type_value: integer(unknown) }
+-              52: WITH -- hash: 0xb5960acd8155f7b4
+-                51: PATTERN_OFFSET PatternIdx(1) INDEX -- hash: 0x632b14146cd067bf
++              52: WITH -- hash: 0x2e8154b7f007e564
++                51: PATTERN_OFFSET PatternIdx(1) INDEX -- hash: 0x64b0d91fe6e0d8
+                   26: SYMBOL Var { var: Var { frame_id: 2, ty: integer, index: 16 }, type_value: integer(unknown) }
+-                54: WITH -- hash: 0x3c39252d4e265253
+-                  53: PATTERN_OFFSET PatternIdx(1) INDEX -- hash: 0x632b14146cd067bf
++                54: WITH -- hash: 0xb7966b16de1d5c6d
++                  53: PATTERN_OFFSET PatternIdx(1) INDEX -- hash: 0x64b0d91fe6e0d8
+                     29: SYMBOL Var { var: Var { frame_id: 2, ty: integer, index: 16 }, type_value: integer(unknown) }
+                   40: FOR_IN -- hash: 0x9e7b3fb228ae7b95
+                         n: Var { frame_id: 3, ty: integer, index: 20 }
+diff --git a/lib/src/compiler/ir/tests/testdata/2.ir b/lib/src/compiler/ir/tests/testdata/2.ir
+index 8ef5c115..459ed29a 100644
+--- a/lib/src/compiler/ir/tests/testdata/2.ir
++++ b/lib/src/compiler/ir/tests/testdata/2.ir
+@@ -1,5 +1,5 @@
+ RULE test
+-  42: FOR_IN -- hash: 0x5a8b495d9ca0365f
++  42: FOR_IN -- hash: 0xc1bdbbd94e5e06d5
+         n: Var { frame_id: 1, ty: integer, index: 0 }
+         i: Var { frame_id: 1, ty: integer, index: 1 }
+         max_count: Var { frame_id: 1, ty: integer, index: 2 }
+@@ -7,7 +7,7 @@ RULE test
+         item: Var { frame_id: 1, ty: unknown, index: 4 }
+     0: CONST integer(0)
+     1: PATTERN_COUNT PatternIdx(0) -- hash: 0x295099eb5fc21fe8
+-    41: FOR_IN -- hash: 0xc59e62932f94ad94
++    41: FOR_IN -- hash: 0xea16d2cddd4fc07c
+           n: Var { frame_id: 2, ty: integer, index: 7 }
+           i: Var { frame_id: 2, ty: integer, index: 8 }
+           max_count: Var { frame_id: 2, ty: integer, index: 9 }
+@@ -15,7 +15,7 @@ RULE test
+           item: Var { frame_id: 2, ty: unknown, index: 11 }
+       2: CONST integer(0)
+       3: PATTERN_COUNT PatternIdx(1) -- hash: 0xde2e40b1c012bed4
+-      40: FOR_IN -- hash: 0x43fb933d283b1ad6
++      40: FOR_IN -- hash: 0xac7fd4221b8b0765
+             n: Var { frame_id: 3, ty: integer, index: 14 }
+             i: Var { frame_id: 3, ty: integer, index: 15 }
+             max_count: Var { frame_id: 3, ty: integer, index: 16 }
+@@ -24,15 +24,15 @@ RULE test
+         6: FIELD_ACCESS -- hash: 0x874667d74d3e43c4
+           4: SYMBOL Field { index: 0, is_root: true, type_value: struct, acl: None, deprecation_notice: None }
+           5: SYMBOL Field { index: 19, is_root: false, type_value: array, acl: None, deprecation_notice: None }
+-        39: AND -- hash: 0x7633aa85f81db2b
+-          12: LE -- hash: 0xe9f7e368f4dece6e
++        39: AND -- hash: 0x4095f1980e413117
++          12: LE -- hash: 0xe146950d05355d80
+             9: FIELD_ACCESS -- hash: 0x6542d2870b7a1b93
+               7: SYMBOL Var { var: Var { frame_id: 3, ty: struct, index: 19 }, type_value: struct }
+               8: SYMBOL Field { index: 0, is_root: false, type_value: integer(unknown), acl: None, deprecation_notice: None }
+-            11: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x96059519ea655987
++            11: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x2bb38b4cc8774845
+               10: SYMBOL Var { var: Var { frame_id: 1, ty: integer, index: 5 }, type_value: integer(unknown) }
+-          22: LE -- hash: 0xe67373d7ab0aa8d1
+-            14: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x96059519ea655987
++          22: LE -- hash: 0xcc1f88b0d95465cb
++            14: PATTERN_OFFSET PatternIdx(0) INDEX -- hash: 0x2bb38b4cc8774845
+               13: SYMBOL Var { var: Var { frame_id: 1, ty: integer, index: 5 }, type_value: integer(unknown) }
+             21: ADD -- hash: 0xa39958692f6255bc
+               17: FIELD_ACCESS -- hash: 0x6542d2870b7a1b93
+@@ -41,14 +41,14 @@ RULE test
+               20: FIELD_ACCESS -- hash: 0x1a20794d6fcaba80
+                 18: SYMBOL Var { var: Var { frame_id: 3, ty: struct, index: 19 }, type_value: struct }
+                 19: SYMBOL Field { index: 1, is_root: false, type_value: integer(unknown), acl: None, deprecation_notice: None }
+-          28: LE -- hash: 0x143737c7283684f8
++          28: LE -- hash: 0x13118ffd09919e65
+             25: FIELD_ACCESS -- hash: 0x6542d2870b7a1b93
+               23: SYMBOL Var { var: Var { frame_id: 3, ty: struct, index: 19 }, type_value: struct }
+               24: SYMBOL Field { index: 0, is_root: false, type_value: integer(unknown), acl: None, deprecation_notice: None }
+-            27: PATTERN_OFFSET PatternIdx(1) INDEX -- hash: 0xc044e9781dbd1010
++            27: PATTERN_OFFSET PatternIdx(1) INDEX -- hash: 0x5d7e863cccd38929
+               26: SYMBOL Var { var: Var { frame_id: 2, ty: integer, index: 12 }, type_value: integer(unknown) }
+-          38: LE -- hash: 0x184730be6c281364
+-            30: PATTERN_OFFSET PatternIdx(1) INDEX -- hash: 0xc044e9781dbd1010
++          38: LE -- hash: 0x678feadfad326288
++            30: PATTERN_OFFSET PatternIdx(1) INDEX -- hash: 0x5d7e863cccd38929
+               29: SYMBOL Var { var: Var { frame_id: 2, ty: integer, index: 12 }, type_value: integer(unknown) }
+             37: ADD -- hash: 0xa39958692f6255bc
+               33: FIELD_ACCESS -- hash: 0x6542d2870b7a1b93
+diff --git a/lib/src/compiler/ir/tests/testdata/9.cse.ir b/lib/src/compiler/ir/tests/testdata/9.cse.ir
+index b55039d9..16759ecd 100644
+--- a/lib/src/compiler/ir/tests/testdata/9.cse.ir
++++ b/lib/src/compiler/ir/tests/testdata/9.cse.ir
+@@ -1,11 +1,11 @@
+ RULE test_1
+-  7: AND -- hash: 0xc5b3f5bfb52edf4f
++  7: AND -- hash: 0x5a47c34517e6fd84
+     0: PATTERN_MATCH PatternIdx(0) -- hash: 0x5a276c8d75077d2b
+     3: EQ -- hash: 0x29ac06b50265bae
+       1: PATTERN_COUNT PatternIdx(0) -- hash: 0x295099eb5fc21fe8
+       2: CONST integer(1)
+-    6: EQ -- hash: 0xa5111bffa7929d34
+-      4: PATTERN_OFFSET PatternIdx(0) -- hash: 0xf879c749467cc2a4
++    6: EQ -- hash: 0x3cd047e8c4509372
++      4: PATTERN_OFFSET PatternIdx(0) -- hash: 0x3689c14555c5d8c9
+       5: CONST integer(0)
+ 
+ RULE test_2
+diff --git a/lib/src/compiler/ir/tests/testdata/9.hoisting.ir b/lib/src/compiler/ir/tests/testdata/9.hoisting.ir
+index b55039d9..16759ecd 100644
+--- a/lib/src/compiler/ir/tests/testdata/9.hoisting.ir
++++ b/lib/src/compiler/ir/tests/testdata/9.hoisting.ir
+@@ -1,11 +1,11 @@
+ RULE test_1
+-  7: AND -- hash: 0xc5b3f5bfb52edf4f
++  7: AND -- hash: 0x5a47c34517e6fd84
+     0: PATTERN_MATCH PatternIdx(0) -- hash: 0x5a276c8d75077d2b
+     3: EQ -- hash: 0x29ac06b50265bae
+       1: PATTERN_COUNT PatternIdx(0) -- hash: 0x295099eb5fc21fe8
+       2: CONST integer(1)
+-    6: EQ -- hash: 0xa5111bffa7929d34
+-      4: PATTERN_OFFSET PatternIdx(0) -- hash: 0xf879c749467cc2a4
++    6: EQ -- hash: 0x3cd047e8c4509372
++      4: PATTERN_OFFSET PatternIdx(0) -- hash: 0x3689c14555c5d8c9
+       5: CONST integer(0)
+ 
+ RULE test_2
+diff --git a/lib/src/compiler/ir/tests/testdata/9.ir b/lib/src/compiler/ir/tests/testdata/9.ir
+index b55039d9..16759ecd 100644
+--- a/lib/src/compiler/ir/tests/testdata/9.ir
++++ b/lib/src/compiler/ir/tests/testdata/9.ir
+@@ -1,11 +1,11 @@
+ RULE test_1
+-  7: AND -- hash: 0xc5b3f5bfb52edf4f
++  7: AND -- hash: 0x5a47c34517e6fd84
+     0: PATTERN_MATCH PatternIdx(0) -- hash: 0x5a276c8d75077d2b
+     3: EQ -- hash: 0x29ac06b50265bae
+       1: PATTERN_COUNT PatternIdx(0) -- hash: 0x295099eb5fc21fe8
+       2: CONST integer(1)
+-    6: EQ -- hash: 0xa5111bffa7929d34
+-      4: PATTERN_OFFSET PatternIdx(0) -- hash: 0xf879c749467cc2a4
++    6: EQ -- hash: 0x3cd047e8c4509372
++      4: PATTERN_OFFSET PatternIdx(0) -- hash: 0x3689c14555c5d8c9
+       5: CONST integer(0)
+ 
+ RULE test_2
+diff --git a/lib/src/compiler/mod.rs b/lib/src/compiler/mod.rs
+index 34ef44a2..70e63021 100644
+--- a/lib/src/compiler/mod.rs
++++ b/lib/src/compiler/mod.rs
+@@ -2305,7 +2305,15 @@ impl Compiler<'_> {
+         // is chained to `{ 01 02 03 }`.
+         //
+         // If the regexp can't be split then `head` is the whole regexp.
+-        let (head, tail) = pattern.hir.split_at_large_gaps();
++        //
++        // Regexps with capturing groups are never split, every piece of a
++        // chain is verified on its own and the positions recorded by one piece
++        // are not visible to the others.
++        let (head, tail) = if pattern.hir.num_captures() > 0 {
++            (pattern.hir.clone(), vec![])
++        } else {
++            pattern.hir.split_at_large_gaps()
++        };
+ 
+         if !tail.is_empty() {
+             // The pattern was split into multiple chained regexps.
+@@ -2318,13 +2326,17 @@ impl Compiler<'_> {
+             );
+         }
+ 
+-        if head.is_alternation_literal() {
++        if head.is_alternation_literal() && head.num_captures() == 0 {
+             // The pattern is either a literal, or an alternation of literals.
+             // Examples:
+             //   /foo/
+             //   /foo|bar|baz/
+             //   { 01 02 03 }
+             //   { (01 02 03 | 04 05 06 ) }
++            //
++            // Patterns with capturing groups are excluded, they must go
++            // through the regexp engine, which is what keeps track of the
++            // positions of the groups.
+             return self.c_alternation_literal(
+                 pattern_id,
+                 head,
+@@ -2355,7 +2367,10 @@ impl Compiler<'_> {
+         // is a simple literal pattern with masks (e.g., `{ 01 02 ?? 04 }` or
+         // `{ 1? 2? 3? }`), we can treat it as a `LiteralWithMask` sub-pattern.
+         // This is much more efficient than executing it as a regular expression.
+-        if !pattern.flags.contains(PatternFlags::Nocase)
++        // Patterns with capturing groups are excluded, they must go through
++        // the regexp engine, which is what records the positions of the groups.
++        if head.num_captures() == 0
++            && !pattern.flags.contains(PatternFlags::Nocase)
+             && !pattern.flags.intersects(
+                 PatternFlags::WideOnly | PatternFlags::WideAndAscii,
+             )
+@@ -2373,7 +2388,18 @@ impl Compiler<'_> {
+             return Ok(());
+         };
+ 
+-        let (atoms, is_fast_regexp) = self.c_regexp(&head, span)?;
++        let num_slots = u16::try_from(head.num_capture_slots()).unwrap_or(0);
++
++        let (mut atoms, is_fast_regexp) = self.c_regexp(&head, span)?;
++
++        // An exact atom is a match on its own, the scanner reports it without
++        // running the regexp engine. A pattern with capturing groups needs the
++        // engine to run, as that's what records the positions of the groups.
++        if num_slots > 0 {
++            for atom in atoms.iter_mut() {
++                atom.set_exact(false);
++            }
++        }
+ 
+         if is_fast_regexp {
+             flags.insert(SubPatternFlags::FastRegexp);
+@@ -2385,7 +2411,10 @@ impl Compiler<'_> {
+         {
+             self.add_sub_pattern(
+                 pattern_id,
+-                SubPattern::Regexp { flags: flags | SubPatternFlags::Wide },
++                SubPattern::Regexp {
++                    flags: flags | SubPatternFlags::Wide,
++                    num_slots,
++                },
+                 atoms.iter().cloned().map(|atom| atom.make_wide()),
+                 SubPatternAtom::from_regexp_atom,
+             );
+@@ -2394,7 +2423,7 @@ impl Compiler<'_> {
+         if !pattern.flags.contains(PatternFlags::WideOnly) {
+             self.add_sub_pattern(
+                 pattern_id,
+-                SubPattern::Regexp { flags },
++                SubPattern::Regexp { flags, num_slots },
+                 atoms.into_iter(),
+                 SubPatternAtom::from_regexp_atom,
+             );
+@@ -2563,6 +2592,7 @@ impl Compiler<'_> {
+                     pattern_id,
+                     SubPattern::RegexpChainHead {
+                         flags: flags | SubPatternFlags::Wide,
++                        num_slots: 0,
+                     },
+                     atoms.iter().cloned().map(|atom| atom.make_wide()),
+                     SubPatternAtom::from_regexp_atom,
+@@ -2572,7 +2602,7 @@ impl Compiler<'_> {
+             if raw {
+                 prev_sub_pattern_raw = self.add_sub_pattern(
+                     pattern_id,
+-                    SubPattern::RegexpChainHead { flags },
++                    SubPattern::RegexpChainHead { flags, num_slots: 0 },
+                     atoms.into_iter(),
+                     SubPatternAtom::from_regexp_atom,
+                 );
+@@ -2631,6 +2661,7 @@ impl Compiler<'_> {
+                             chained_to: prev_sub_pattern_wide,
+                             gap: p.gap.clone(),
+                             flags: flags | SubPatternFlags::Wide,
++                            num_slots: 0,
+                         },
+                         atoms.iter().cloned().map(|atom| atom.make_wide()),
+                         SubPatternAtom::from_regexp_atom,
+@@ -2644,6 +2675,7 @@ impl Compiler<'_> {
+                             chained_to: prev_sub_pattern_raw,
+                             gap: p.gap.clone(),
+                             flags,
++                            num_slots: 0,
+                         },
+                         atoms.into_iter(),
+                         SubPatternAtom::from_regexp_atom,
+@@ -2663,16 +2695,23 @@ impl Compiler<'_> {
+         // When the `fast-regexp` feature is enabled, try to compile the regexp
+         // for `FastVM` first, if it fails with `Error::FastIncompatible`, the
+         // regexp is not compatible for `FastVM` and `PikeVM` must be used
+-        // instead.
++        // instead. Regexps with capturing groups always go to `PikeVM`, as
++        // `FastVM` doesn't keep track of the positions of the groups.
+         #[cfg(feature = "fast-regexp")]
+-        let (result, is_fast_regexp) = match re::fast::Compiler::new()
+-            .compile(hir, &mut self.re_code)
+-        {
+-            Err(re::Error::FastIncompatible) => (
++        let (result, is_fast_regexp) = if hir.num_captures() > 0 {
++            (
+                 re::thompson::Compiler::new().compile(hir, &mut self.re_code),
+                 false,
+-            ),
+-            result => (result, true),
++            )
++        } else {
++            match re::fast::Compiler::new().compile(hir, &mut self.re_code) {
++                Err(re::Error::FastIncompatible) => (
++                    re::thompson::Compiler::new()
++                        .compile(hir, &mut self.re_code),
++                    false,
++                ),
++                result => (result, true),
++            }
+         };
+ 
+         #[cfg(not(feature = "fast-regexp"))]
+@@ -3152,16 +3191,24 @@ pub(crate) enum SubPattern {
+ 
+     Regexp {
+         flags: SubPatternFlags,
++        /// Number of capture slots, two per capturing group in the regexp.
++        num_slots: u16,
+     },
+ 
+     RegexpChainHead {
+         flags: SubPatternFlags,
++        /// Number of capture slots. Always zero, a regexp with capturing
++        /// groups is never split into a chain.
++        num_slots: u16,
+     },
+ 
+     RegexpChainTail {
+         chained_to: SubPatternId,
+         gap: ChainedPatternGap,
+         flags: SubPatternFlags,
++        /// Number of capture slots. Always zero, a regexp with capturing
++        /// groups is never split into a chain.
++        num_slots: u16,
+     },
+ 
+     Xor {
+diff --git a/lib/src/re/hir.rs b/lib/src/re/hir.rs
+index 3f72a37e..22d18f83 100644
+--- a/lib/src/re/hir.rs
++++ b/lib/src/re/hir.rs
+@@ -392,6 +392,54 @@ impl Hir {
+ }
+ 
+ impl Hir {
++    /// Number of capturing groups in the regexp.
++    ///
++    /// Non-capturing groups (i.e: `(?:...)`) are not counted.
++    pub fn num_captures(&self) -> usize {
++        self.inner.properties().explicit_captures_len()
++    }
++
++    /// Number of capture slots required by the regexp, two per capturing
++    /// group: one for the start of the group and one for its end.
++    pub fn num_capture_slots(&self) -> usize {
++        self.num_captures() * 2
++    }
++
++    /// Names of the capturing groups in the regexp, together with the number
++    /// of the group each name refers to.
++    ///
++    /// Unnamed groups are not included. When the same name is used more than
++    /// once only the first group carrying it is included.
++    pub fn capture_names(&self) -> Vec<(String, u16)> {
++        let mut names: Vec<(String, u16)> = Vec::new();
++        let mut stack = vec![&self.inner];
++
++        while let Some(hir) = stack.pop() {
++            match hir.kind() {
++                regex_syntax::hir::HirKind::Capture(capture) => {
++                    if let Some(name) = &capture.name
++                        && let Ok(group) = u16::try_from(capture.index)
++                        && !names.iter().any(|(n, _)| n == name.as_ref())
++                    {
++                        names.push((name.to_string(), group));
++                    }
++                    stack.push(&capture.sub);
++                }
++                regex_syntax::hir::HirKind::Concat(subs)
++                | regex_syntax::hir::HirKind::Alternation(subs) => {
++                    stack.extend(subs.iter().rev());
++                }
++                regex_syntax::hir::HirKind::Repetition(rep) => {
++                    stack.push(&rep.sub);
++                }
++                _ => {}
++            }
++        }
++
++        names.sort_by(|a, b| a.1.cmp(&b.1));
++        names
++    }
++
+     #[cfg(test)]
+     pub fn literal<B: Into<Box<[u8]>>>(lit: B) -> Hir {
+         regex_syntax::hir::Hir::literal(lit).into()
+diff --git a/lib/src/re/thompson/compiler.rs b/lib/src/re/thompson/compiler.rs
+index a1127e03..4e82e610 100644
+--- a/lib/src/re/thompson/compiler.rs
++++ b/lib/src/re/thompson/compiler.rs
+@@ -21,7 +21,8 @@ use bitvec::order::Lsb0;
+ use regex_syntax::hir;
+ use regex_syntax::hir::literal::Seq;
+ use regex_syntax::hir::{
+-    Class, ClassBytes, Hir, HirKind, Literal, Look, Repetition, Visitor, visit,
++    Capture, Class, ClassBytes, Hir, HirKind, Literal, Look, Repetition,
++    Visitor, visit,
+ };
+ 
+ use super::instr;
+@@ -34,7 +35,7 @@ use crate::compiler::{
+ 
+ use crate::re;
+ use crate::re::hir::HexByte;
+-use crate::re::thompson::instr::{InstrParser, SplitId};
++use crate::re::thompson::instr::{InstrParser, SlotId, SplitId};
+ use crate::re::{BckCodeLoc, Error, FwdCodeLoc, MAX_ALTERNATIVES};
+ 
+ #[derive(Eq, PartialEq, Clone, Copy, Debug, Default)]
+@@ -375,6 +376,20 @@ impl Compiler {
+         })
+     }
+ 
++    /// Emits a [`Instr::Save`] instruction in both the forward and the
++    /// backward code, possibly using a different slot in each one.
++    ///
++    /// The backward code traverses the pattern from right to left, so the
++    /// instruction that the forward code executes when entering a group is
++    /// the one the backward code executes when leaving it.
++    fn emit_save(&mut self, fwd_slot: SlotId, bck_slot: SlotId) -> CodeLoc {
++        CodeLoc {
++            fwd: self.forward_code_mut().emit_save(fwd_slot),
++            bck_seq_id: self.backward_code().seq_id(),
++            bck: self.backward_code_mut().emit_save(bck_slot),
++        }
++    }
++
+     fn emit_repeat(&mut self, min: u32, max: u32, greedy: bool) -> CodeLoc {
+         CodeLoc {
+             fwd: self.forward_code_mut().emit_repeat(min, max, greedy),
+@@ -1009,8 +1024,11 @@ impl hir::Visitor for Compiler {
+             HirKind::Literal(_) => {}
+             HirKind::Class(_) => {}
+             HirKind::Look(_) => {}
+-            HirKind::Capture(_) => {
++            HirKind::Capture(capture) => {
+                 self.bookmarks.push(self.location());
++                if let Some((start, end)) = capture_slots(capture) {
++                    self.emit_save(start, end);
++                }
+             }
+             HirKind::Concat(_) => {
+                 self.visit_pre_concat();
+@@ -1090,9 +1108,13 @@ impl hir::Visitor for Compiler {
+ 
+                 (Some(vec![best_atom]), code_loc)
+             }
+-            HirKind::Capture(_) => {
++            HirKind::Capture(capture) => {
+                 let mut code_loc = self.bookmarks.pop().unwrap();
+ 
++                if let Some((start, end)) = capture_slots(capture) {
++                    self.emit_save(end, start);
++                }
++
+                 code_loc.bck_seq_id = self.backward_code().seq_id();
+                 code_loc.bck = self.backward_code().location();
+ 
+@@ -1431,6 +1453,17 @@ impl InstrSeq {
+         Ok(location)
+     }
+ 
++    /// Adds a [`Instr::Save`] instruction at the end of the sequence and
++    /// returns the location where the newly added instruction resides.
++    pub fn emit_save(&mut self, slot: SlotId) -> usize {
++        let location = self.location();
++
++        self.seq.write_all(&[OPCODE_PREFIX, Instr::SAVE]).unwrap();
++        self.seq.write_all(slot.to_le_bytes().as_slice()).unwrap();
++
++        location
++    }
++
+     /// Adds a [`Instr::SplitN`] instruction at the end of the sequence and
+     /// returns the location where the newly added instruction resides.
+     pub fn emit_split_n(&mut self, n: NumAlt) -> Result<usize, Error> {
+@@ -1724,6 +1757,9 @@ impl Display for InstrSeq {
+                 Instr::AnyByte => {
+                     writeln!(f, "{addr:05x}: ANY_BYTE")?;
+                 }
++                Instr::Save(slot) => {
++                    writeln!(f, "{addr:05x}: SAVE {slot}")?;
++                }
+                 Instr::Byte(byte) => {
+                     writeln!(f, "{addr:05x}: LIT {byte:#04x}")?;
+                 }
+@@ -2084,6 +2120,19 @@ struct RegexpAtoms {
+     quality: AtomsQuality,
+ }
+ 
++/// Returns the pair of slots where the start and the end of a capturing group
++/// are stored, or [`None`] if the group is not numbered.
++///
++/// Groups are numbered from one, in the order in which their opening
++/// parenthesis appears, and non-capturing groups don't get a number. That
++/// numbering comes from `regex-syntax`, which is also what every other regexp
++/// engine does.
++fn capture_slots(capture: &Capture) -> Option<(SlotId, SlotId)> {
++    let index = capture.index.checked_sub(1)?;
++    let start = u16::try_from(index.checked_mul(2)?).ok()?;
++    Some((SlotId::from(start), SlotId::from(start.checked_add(1)?)))
++}
++
+ impl RegexpAtoms {
+     /// Create a new empty list of atoms.
+     fn empty() -> Self {
+diff --git a/lib/src/re/thompson/instr.rs b/lib/src/re/thompson/instr.rs
+index abf8fe5f..e3678fbe 100644
+--- a/lib/src/re/thompson/instr.rs
++++ b/lib/src/re/thompson/instr.rs
+@@ -285,6 +285,53 @@ pub enum Instr<'a> {
+     /// character and the following character is not a word character. This is a
+     /// zero-length match.
+     WordEnd,
++
++    /// Stores the current position in one of the capture slots of the running
++    /// thread. This is a zero-length match, the thread continues with the
++    /// next instruction after storing the position.
++    Save(SlotId),
++}
++
++/// Identifies one of the capture slots maintained by a thread in the Pike VM.
++///
++/// A regexp with N capturing groups has `2 * N` slots. The start of the group
++/// number `n` (groups are numbered from 1) goes to the slot `2 * (n - 1)` and
++/// its end to the slot `2 * (n - 1) + 1`. The whole match is not stored in any
++/// slot, it is already known by the code that runs the VM.
++#[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
++pub struct SlotId(u16);
++
++impl From<SlotId> for usize {
++    fn from(value: SlotId) -> Self {
++        value.0 as Self
++    }
++}
++
++impl From<u16> for SlotId {
++    fn from(value: u16) -> Self {
++        Self(value)
++    }
++}
++
++impl Display for SlotId {
++    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
++        write!(f, "{}", self.0)
++    }
++}
++
++impl SlotId {
++    /// Maximum number of capture slots in a regexp.
++    pub const MAX: usize = u16::MAX as usize;
++
++    #[inline]
++    pub fn to_le_bytes(self) -> [u8; size_of::<Self>()] {
++        self.0.to_le_bytes()
++    }
++
++    #[inline]
++    pub fn from_le_bytes(bytes: [u8; size_of::<Self>()]) -> Self {
++        Self(u16::from_le_bytes(bytes))
++    }
+ }
+ 
+ impl Instr<'_> {
+@@ -308,6 +355,7 @@ impl Instr<'_> {
+     pub const REPEAT_NON_GREEDY: u8 = 0x11;
+     pub const LINE_START: u8 = 0x12;
+     pub const LINE_END: u8 = 0x13;
++    pub const SAVE: u8 = 0x14;
+ }
+ 
+ /// Parses a slice of bytes that contains Pike VM instructions, returning
+@@ -451,6 +499,10 @@ impl<'a> InstrParser<'a> {
+             }
+             [OPCODE_PREFIX, Instr::WORD_START, ..] => (Instr::WordStart, 2),
+             [OPCODE_PREFIX, Instr::WORD_END, ..] => (Instr::WordEnd, 2),
++            [OPCODE_PREFIX, Instr::SAVE, ..] => {
++                let slot = Self::decode_slot_id(&code[2..]);
++                (Instr::Save(slot), 2 + size_of::<SlotId>())
++            }
+             [OPCODE_PREFIX, Instr::MATCH, ..] => (Instr::Match, 2),
+             [_, ..] => {
+                 if decode_literal_runs && Self::is_bytes_run(code) {
+@@ -489,6 +541,14 @@ impl<'a> InstrParser<'a> {
+         NumAlt::from_le_bytes(*bytes)
+     }
+ 
++    #[inline(always)]
++    fn decode_slot_id(slice: &[u8]) -> SlotId {
++        let bytes: &[u8; size_of::<SlotId>()] =
++            unsafe { &*(slice.as_ptr() as *const [u8; size_of::<SlotId>()]) };
++
++        SlotId::from_le_bytes(*bytes)
++    }
++
+     #[inline(always)]
+     fn decode_split_id(slice: &[u8]) -> SplitId {
+         let bytes: &[u8; size_of::<SplitId>()] =
+diff --git a/lib/src/re/thompson/mod.rs b/lib/src/re/thompson/mod.rs
+index baf59b03..46863a3d 100644
+--- a/lib/src/re/thompson/mod.rs
++++ b/lib/src/re/thompson/mod.rs
+@@ -25,7 +25,7 @@ instruction pointer and the repetition count are part of the thread's state.
+ */
+ 
+ pub(crate) use compiler::Compiler;
+-pub(crate) use pikevm::PikeVM;
++pub(crate) use pikevm::{PikeVM, UNSET_SLOT};
+ 
+ mod compiler;
+ mod instr;
+diff --git a/lib/src/re/thompson/pikevm.rs b/lib/src/re/thompson/pikevm.rs
+index 57f1984d..2f4303b3 100644
+--- a/lib/src/re/thompson/pikevm.rs
++++ b/lib/src/re/thompson/pikevm.rs
+@@ -2,11 +2,63 @@ use bitvec::array::BitArray;
+ use std::cell::Cell;
+ use std::mem;
+ use std::ops::ControlFlow;
++use std::rc::Rc;
+ 
+ use super::instr::{Instr, InstrParser, Offset};
+ use crate::re::thompson::instr::SplitId;
+ use crate::re::{CodeLoc, DEFAULT_SCAN_LIMIT, WideIter};
+ 
++/// Value stored in a capture slot that was never filled.
++pub(crate) const UNSET_SLOT: u32 = u32::MAX;
++
++/// Positions recorded by the [`Instr::Save`] instructions executed by a
++/// thread.
++///
++/// This is [`None`] for regexps without capturing groups, which is the
++/// common case, so threads for those regexps don't pay for this. When it is
++/// [`Some`], the vector has two slots per capturing group and every slot
++/// starts as [`UNSET_SLOT`]. Slots are shared between threads and copied only
++/// when one of them writes, as a thread inherits the positions recorded by the
++/// thread it was split from.
++pub(crate) type Captures = Option<Rc<Vec<u32>>>;
++
++/// Creates the initial capture slots for a regexp with `num_slots` slots.
++#[inline]
++pub(crate) fn new_captures(num_slots: usize) -> Captures {
++    if num_slots == 0 {
++        None
++    } else {
++        Some(Rc::new(vec![UNSET_SLOT; num_slots]))
++    }
++}
++
++/// Converts positions recorded while matching a `wide` pattern into positions
++/// in the scanned data.
++///
++/// The VM sees a `wide` pattern as if the interleaved zero bytes were not
++/// there, so every position it records covers half the bytes it actually
++/// spans in the scanned data.
++fn widen(captures: &Captures) -> Captures {
++    let slots = captures.as_ref()?;
++    Some(Rc::new(
++        slots
++            .iter()
++            .map(|pos| if *pos == UNSET_SLOT { *pos } else { *pos * 2 })
++            .collect(),
++    ))
++}
++
++/// Returns a copy of `captures` where `slot` holds `pos`.
++#[inline]
++fn save_slot(captures: &Captures, slot: usize, pos: u32) -> Captures {
++    let slots = captures.as_ref()?;
++    let mut slots = slots.clone();
++    if let Some(s) = Rc::make_mut(&mut slots).get_mut(slot) {
++        *s = pos;
++    }
++    Some(slots)
++}
++
+ /// Represents a [Pike's VM](https://swtch.com/~rsc/regexp/regexp2.html) that
+ /// executes VM code produced by the [compiler][`crate::re::compiler::Compiler`].
+ pub(crate) struct PikeVM<'r> {
+@@ -16,10 +68,10 @@ pub(crate) struct PikeVM<'r> {
+     /// position within the VM code, pointing to some VM instruction. Each item
+     /// in the set is unique, the VM guarantees that there aren't two active
+     /// threads at the same VM instruction.
+-    threads: Vec<(usize, u32)>,
++    threads: Vec<(usize, u32, Captures)>,
+     /// The set of threads that will become the active threads when the next
+     /// byte is read from the input.
+-    next_threads: Vec<(usize, u32)>,
++    next_threads: Vec<(usize, u32, Captures)>,
+     /// Maximum number of bytes to scan. The VM will abort after ingesting
+     /// this number of bytes from the input.
+     scan_limit: u16,
+@@ -80,15 +132,21 @@ impl<'r> PikeVM<'r> {
+         right: &[u8],
+         left: &[u8],
+         wide: bool,
+-        mut f: impl FnMut(usize) -> ControlFlow<()>,
++        num_slots: usize,
++        mut f: impl FnMut(usize, &Captures) -> ControlFlow<()>,
+     ) where
+         C: CodeLoc,
+     {
++        let captures = new_captures(num_slots);
+         match (start.backwards(), wide) {
+             // Going forward, not wide.
+-            (false, false) => {
+-                self.try_match_impl(start, right.iter(), left.iter().rev(), f)
+-            }
++            (false, false) => self.try_match_impl(
++                start,
++                right.iter(),
++                left.iter().rev(),
++                captures,
++                f,
++            ),
+             // Going forward, wide.
+             (false, true) => {
+                 let error_fwd = Cell::new(None);
+@@ -97,16 +155,21 @@ impl<'r> PikeVM<'r> {
+                     start,
+                     WideIter::non_zero_first(right.iter(), &error_fwd),
+                     WideIter::zero_first(left.iter().rev(), &error_bck),
+-                    |match_len| match error_fwd.get() {
++                    captures,
++                    |match_len, captures| match error_fwd.get() {
+                         Some(pos) if pos < match_len => ControlFlow::Break(()),
+-                        _ => f(match_len * 2),
++                        _ => f(match_len * 2, &widen(captures)),
+                     },
+                 )
+             }
+             // Going backward, not wide.
+-            (true, false) => {
+-                self.try_match_impl(start, left.iter().rev(), right.iter(), f)
+-            }
++            (true, false) => self.try_match_impl(
++                start,
++                left.iter().rev(),
++                right.iter(),
++                captures,
++                f,
++            ),
+             // Going backward, wide.
+             (true, true) => {
+                 let error_fwd = Cell::new(None);
+@@ -115,9 +178,10 @@ impl<'r> PikeVM<'r> {
+                     start,
+                     WideIter::zero_first(left.iter().rev(), &error_fwd),
+                     WideIter::non_zero_first(right.iter(), &error_bck),
+-                    |match_len| match error_fwd.get() {
++                    captures,
++                    |match_len, captures| match error_fwd.get() {
+                         Some(pos) if pos < match_len => ControlFlow::Break(()),
+-                        _ => f(match_len * 2),
++                        _ => f(match_len * 2, &widen(captures)),
+                     },
+                 )
+             }
+@@ -156,7 +220,8 @@ impl<'r> PikeVM<'r> {
+         start: C,
+         mut fwd_input: F,
+         mut bck_input: B,
+-        mut f: impl FnMut(usize) -> ControlFlow<()>,
++        captures: Captures,
++        mut f: impl FnMut(usize, &Captures) -> ControlFlow<()>,
+     ) where
+         C: CodeLoc,
+         F: Iterator<Item = &'a u8>,
+@@ -173,6 +238,8 @@ impl<'r> PikeVM<'r> {
+             self.code,
+             start,
+             0,
++            0,
++            captures,
+             curr_byte,
+             bck_input.next(),
+             &mut self.cache,
+@@ -194,7 +261,7 @@ impl<'r> PikeVM<'r> {
+             // always to false, it will simply disable the optimization.
+             let decode_literal_runs = self.threads.len() == 1;
+ 
+-            for (ip, rep_count) in self.threads.iter() {
++            for (ip, rep_count, captures) in self.threads.iter() {
+                 let (instr, mut instr_size) = InstrParser::decode_instr(
+                     unsafe { self.code.get_unchecked(*ip..) },
+                     decode_literal_runs,
+@@ -273,7 +340,7 @@ impl<'r> PikeVM<'r> {
+                     Instr::ClassRanges(class) => {
+                         matches!(curr_byte, Some(b) if class.contains(*b))
+                     }
+-                    Instr::Match => match f(current_pos) {
++                    Instr::Match => match f(current_pos, captures) {
+                         ControlFlow::Break(_) => break,
+                         ControlFlow::Continue(_) => false,
+                     },
+@@ -285,6 +352,8 @@ impl<'r> PikeVM<'r> {
+                         self.code,
+                         C::from(*ip + instr_size),
+                         *rep_count,
++                        current_pos as u32 + 1,
++                        captures.clone(),
+                         next_byte,
+                         curr_byte,
+                         &mut self.cache,
+@@ -311,9 +380,9 @@ impl<'r> PikeVM<'r> {
+ /// its state during the computation of an epsilon closure. See the
+ /// documentation of [`epsilon_closure`] for details.
+ pub struct EpsilonClosureState {
+-    /// Pairs (instruction pointer, repetition count) describing the existing
+-    /// threads.
+-    threads: Vec<(usize, u32)>,
++    /// Tuples (instruction pointer, repetition count, capture slots)
++    /// describing the existing threads.
++    threads: Vec<(usize, u32, Captures)>,
+     /// This bit array has one bit per possible value of SplitId. If the
+     /// split instruction with SplitId = N is executed, the N-th bit in the
+     /// array is set to 1.
+@@ -381,12 +450,14 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
+     code: &[u8],
+     start: C,
+     rep_count: u32,
++    pos: u32,
++    captures: Captures,
+     curr_byte: Option<&u8>,
+     prev_byte: Option<&u8>,
+     state: &mut EpsilonClosureState,
+-    closure: &mut Vec<(usize, u32)>,
++    closure: &mut Vec<(usize, u32, Captures)>,
+ ) {
+-    state.threads.push((start.location(), rep_count));
++    state.threads.push((start.location(), rep_count, captures));
+     state.dirty = true;
+ 
+     let is_word_char = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
+@@ -395,7 +466,7 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
+         (ip as isize).saturating_add(offset.into()).try_into().unwrap()
+     };
+ 
+-    while let Some((ip, mut rep_count)) = state.threads.pop() {
++    while let Some((ip, mut rep_count, captures)) = state.threads.pop() {
+         let (instr, instr_size) = InstrParser::decode_instr(
+             unsafe { code.get_unchecked(ip..) },
+             false,
+@@ -409,16 +480,21 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
+             | Instr::ClassBitmap(_)
+             | Instr::ClassRanges(_)
+             | Instr::Match => {
+-                if !closure.iter().any(|(i, _)| *i == ip) {
+-                    closure.push((ip, rep_count));
++                if !closure.iter().any(|(i, ..)| *i == ip) {
++                    closure.push((ip, rep_count, captures));
+                 }
+             }
+             Instr::SplitA(id, offset) => {
+                 if !state.executed(id) {
+-                    state.threads.push((apply_offset(ip, offset), rep_count));
++                    state.threads.push((
++                        apply_offset(ip, offset),
++                        rep_count,
++                        captures.clone(),
++                    ));
+                     state.threads.push((
+                         apply_offset(ip, instr_size.into()),
+                         rep_count,
++                        captures.clone(),
+                     ));
+                 }
+             }
+@@ -427,43 +503,73 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
+                     state.threads.push((
+                         apply_offset(ip, instr_size.into()),
+                         rep_count,
++                        captures.clone(),
++                    ));
++                    state.threads.push((
++                        apply_offset(ip, offset),
++                        rep_count,
++                        captures.clone(),
+                     ));
+-                    state.threads.push((apply_offset(ip, offset), rep_count));
+                 }
+             }
+             Instr::SplitN(split) => {
+                 if !state.executed(split.id()) {
+                     for offset in split.offsets().rev() {
+-                        state
+-                            .threads
+-                            .push((apply_offset(ip, offset), rep_count));
++                        state.threads.push((
++                            apply_offset(ip, offset),
++                            rep_count,
++                            captures.clone(),
++                        ));
+                     }
+                 }
+             }
+             Instr::RepeatGreedy { offset, min, max } => {
+                 rep_count += 1;
+                 if rep_count >= min {
+-                    state
+-                        .threads
+-                        .push((apply_offset(ip, instr_size.into()), 0));
++                    state.threads.push((
++                        apply_offset(ip, instr_size.into()),
++                        0,
++                        captures.clone(),
++                    ));
+                 }
+                 if rep_count < max {
+-                    state.threads.push((apply_offset(ip, offset), rep_count));
++                    state.threads.push((
++                        apply_offset(ip, offset),
++                        rep_count,
++                        captures.clone(),
++                    ));
+                 }
+             }
+             Instr::RepeatNonGreedy { offset, min, max } => {
+                 rep_count += 1;
+                 if rep_count < max {
+-                    state.threads.push((apply_offset(ip, offset), rep_count));
++                    state.threads.push((
++                        apply_offset(ip, offset),
++                        rep_count,
++                        captures.clone(),
++                    ));
+                 }
+                 if rep_count >= min {
+-                    state
+-                        .threads
+-                        .push((apply_offset(ip, instr_size.into()), 0));
++                    state.threads.push((
++                        apply_offset(ip, instr_size.into()),
++                        0,
++                        captures.clone(),
++                    ));
+                 }
+             }
+             Instr::Jump(offset) => {
+-                state.threads.push((apply_offset(ip, offset), rep_count));
++                state.threads.push((
++                        apply_offset(ip, offset),
++                        rep_count,
++                        captures.clone(),
++                    ));
++            }
++            Instr::Save(slot) => {
++                state.threads.push((
++                    apply_offset(ip, instr_size.into()),
++                    rep_count,
++                    save_slot(&captures, slot.into(), pos),
++                ));
+             }
+             Instr::Start => {
+                 let is_match = match (start.backwards(), prev_byte, curr_byte)
+@@ -480,6 +586,7 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
+                     state.threads.push((
+                         apply_offset(ip, instr_size.into()),
+                         rep_count,
++                        captures.clone(),
+                     ));
+                 }
+             }
+@@ -498,6 +605,7 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
+                     state.threads.push((
+                         apply_offset(ip, instr_size.into()),
+                         rep_count,
++                        captures.clone(),
+                     ));
+                 }
+             }
+@@ -548,6 +656,7 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
+                     state.threads.push((
+                         apply_offset(ip, instr_size.into()),
+                         rep_count,
++                        captures.clone(),
+                     ));
+                 }
+             }
+@@ -592,6 +701,7 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
+                     state.threads.push((
+                         apply_offset(ip, instr_size.into()),
+                         rep_count,
++                        captures.clone(),
+                     ));
+                 }
+             }
+@@ -610,6 +720,7 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
+                     state.threads.push((
+                         apply_offset(ip, instr_size.into()),
+                         rep_count,
++                        captures.clone(),
+                     ));
+                 }
+             }
+@@ -628,6 +739,7 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
+                     state.threads.push((
+                         apply_offset(ip, instr_size.into()),
+                         rep_count,
++                        captures.clone(),
+                     ));
+                 }
+             }
+@@ -646,6 +758,7 @@ pub(crate) fn epsilon_closure<C: CodeLoc>(
+                     state.threads.push((
+                         apply_offset(ip, instr_size.into()),
+                         rep_count,
++                        captures.clone(),
+                     ));
+                 }
+             }
+diff --git a/lib/src/re/thompson/tests.rs b/lib/src/re/thompson/tests.rs
+index d7b8773b..bc0f0f3b 100644
+--- a/lib/src/re/thompson/tests.rs
++++ b/lib/src/re/thompson/tests.rs
+@@ -31,6 +31,8 @@ macro_rules! assert_re_code {
+             fwd_code.as_ref(),
+             FwdCodeLoc::try_from(0_usize).unwrap(),
+             0,
++            0,
++            None,
+             None,
+             None,
+             &mut cache,
+@@ -39,7 +41,7 @@ macro_rules! assert_re_code {
+ 
+         assert_eq!(
+             $fwd_closure,
+-            fwd_closure.iter().map(|(ip, _)| *ip).collect::<Vec<_>>()
++            fwd_closure.iter().map(|(ip, ..)| *ip).collect::<Vec<_>>()
+         );
+ 
+         let mut bck_closure = Vec::new();
+@@ -47,6 +49,8 @@ macro_rules! assert_re_code {
+             bck_code.as_ref(),
+             BckCodeLoc::try_from(0_usize).unwrap(),
+             0,
++            0,
++            None,
+             None,
+             None,
+             &mut cache,
+@@ -55,7 +59,7 @@ macro_rules! assert_re_code {
+ 
+         assert_eq!(
+             $bck_closure,
+-            bck_closure.iter().map(|(ip, _)| *ip).collect::<Vec<_>>()
++            bck_closure.iter().map(|(ip, ..)| *ip).collect::<Vec<_>>()
+         );
+     }};
+ }
+@@ -112,7 +116,7 @@ fn re_code_1() {
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::exact(vec![0x61, 0x62, 0x63, 0x64]),
+-            code_loc: CodeLoc { fwd: 0x00, bck: 0x04, bck_seq_id: 0 }
++            code_loc: CodeLoc { fwd: 0, bck: 0x4, bck_seq_id: 0 }
+         }],
+         // Epsilon closure starting at forward code 0.
+         vec![0x00],
+@@ -146,7 +150,7 @@ fn re_code_2() {
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::inexact(vec![0x61, 0x62, 0x63, 0x64]),
+-            code_loc: CodeLoc { fwd: 0x00, bck: 0x05, bck_seq_id: 0 }
++            code_loc: CodeLoc { fwd: 0, bck: 0x5, bck_seq_id: 0 }
+         }],
+         // Epsilon closure starting at forward code 0.
+         vec![0x00],
+@@ -178,7 +182,7 @@ fn re_code_3() {
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::inexact(vec![0x61, 0x62, 0x63]),
+-            code_loc: CodeLoc { fwd: 0x00, bck: 0x05, bck_seq_id: 0 }
++            code_loc: CodeLoc { fwd: 0, bck: 0x5, bck_seq_id: 0 }
+         }],
+         // Epsilon closure starting at forward code 0.
+         vec![0x00],
+@@ -218,7 +222,7 @@ fn re_code_4() {
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::inexact(vec![0x65, 0x31, 0x32, 0x33]),
+-            code_loc: CodeLoc { fwd: 0x05, bck: 0x04, bck_seq_id: 0 }
++            code_loc: CodeLoc { fwd: 5, bck: 0x4, bck_seq_id: 0 }
+         }],
+         // Epsilon closure starting at forward code 0.
+         vec![0x00],
+@@ -261,15 +265,15 @@ fn re_code_5() {
+         vec![
+             RegexpAtom {
+                 atom: Atom::exact(vec![0x61, 0x62]),
+-                code_loc: CodeLoc { fwd: 0x00, bck: 0x23, bck_seq_id: 0 }
++                code_loc: CodeLoc { fwd: 0, bck: 0x23, bck_seq_id: 0 }
+             },
+             RegexpAtom {
+                 atom: Atom::exact(vec![0x63, 0x64]),
+-                code_loc: CodeLoc { fwd: 0x00, bck: 0x23, bck_seq_id: 0 }
++                code_loc: CodeLoc { fwd: 0, bck: 0x23, bck_seq_id: 0 }
+             },
+             RegexpAtom {
+                 atom: Atom::exact(vec![0x65, 0x66]),
+-                code_loc: CodeLoc { fwd: 0x00, bck: 0x23, bck_seq_id: 0 }
++                code_loc: CodeLoc { fwd: 0, bck: 0x23, bck_seq_id: 0 }
+             }
+         ],
+         // Epsilon closure starting at forward code 0.
+@@ -286,50 +290,54 @@ fn re_code_6() {
+         // Forward code
+         r#"
+ 00000: LIT 0x31
+-00001: SPLIT_N(0) 00012 0001a 00022
+-00012: LIT 0x61
+-00013: LIT 0x62
+-00014: JUMP 00024
+-0001a: LIT 0x63
+-0001b: LIT 0x64
+-0001c: JUMP 00024
+-00022: LIT 0x65
+-00023: LIT 0x66
+-00024: MATCH
++00001: SAVE 0
++00005: SPLIT_N(0) 00016 0001e 00026
++00016: LIT 0x61
++00017: LIT 0x62
++00018: JUMP 00028
++0001e: LIT 0x63
++0001f: LIT 0x64
++00020: JUMP 00028
++00026: LIT 0x65
++00027: LIT 0x66
++00028: SAVE 1
++0002c: MATCH
+ "#,
+         // Backward code
+         r#"
+-00000: SPLIT_N(0) 00011 00019 00021
+-00011: LIT 0x62
+-00012: LIT 0x61
+-00013: JUMP 00023
+-00019: LIT 0x64
+-0001a: LIT 0x63
+-0001b: JUMP 00023
+-00021: LIT 0x66
+-00022: LIT 0x65
+-00023: LIT 0x31
+-00024: MATCH
++00000: SAVE 1
++00004: SPLIT_N(0) 00015 0001d 00025
++00015: LIT 0x62
++00016: LIT 0x61
++00017: JUMP 00027
++0001d: LIT 0x64
++0001e: LIT 0x63
++0001f: JUMP 00027
++00025: LIT 0x66
++00026: LIT 0x65
++00027: SAVE 0
++0002b: LIT 0x31
++0002c: MATCH
+ "#,
+         // Atoms
+         vec![
+             RegexpAtom {
+                 atom: Atom::exact(vec![0x31, 0x61, 0x62]),
+-                code_loc: CodeLoc { fwd: 0, bck: 0x24, bck_seq_id: 0 }
++                code_loc: CodeLoc { fwd: 0, bck: 0x2c, bck_seq_id: 0 }
+             },
+             RegexpAtom {
+                 atom: Atom::exact(vec![0x31, 0x63, 0x64]),
+-                code_loc: CodeLoc { fwd: 0, bck: 0x24, bck_seq_id: 0 }
++                code_loc: CodeLoc { fwd: 0, bck: 0x2c, bck_seq_id: 0 }
+             },
+             RegexpAtom {
+                 atom: Atom::exact(vec![0x31, 0x65, 0x66]),
+-                code_loc: CodeLoc { fwd: 0, bck: 0x24, bck_seq_id: 0 }
++                code_loc: CodeLoc { fwd: 0, bck: 0x2c, bck_seq_id: 0 }
+             }
+         ],
+         // Epsilon closure starting at forward code 0.
+         vec![0x00],
+         // Epsilon closure starting at backward code 0.
+-        vec![0x11, 0x19, 0x21]
++        vec![0x15, 0x1d, 0x25]
+     );
+ }
+ 
+@@ -340,42 +348,46 @@ fn re_code_7() {
+         // Forward code
+         r#"
+ 00000: LIT 0x61
+-00001: SPLIT_A(0) 0001d
+-00009: LIT 0x62
+-0000a: LIT 0x63
+-0000b: LIT 0x64
+-0000c: ANY_BYTE
+-0000e: SPLIT_B(1) 0000c
+-00016: LIT 0x65
+-00017: JUMP 00001
+-0001d: LIT 0x66
+-0001e: LIT 0x67
+-0001f: MATCH
++00001: SPLIT_A(0) 00025
++00009: SAVE 0
++0000d: LIT 0x62
++0000e: LIT 0x63
++0000f: LIT 0x64
++00010: ANY_BYTE
++00012: SPLIT_B(1) 00010
++0001a: LIT 0x65
++0001b: SAVE 1
++0001f: JUMP 00001
++00025: LIT 0x66
++00026: LIT 0x67
++00027: MATCH
+ "#,
+         // Backward code
+         r#"
+ 00000: LIT 0x67
+ 00001: LIT 0x66
+-00002: SPLIT_A(0) 0001e
+-0000a: LIT 0x65
+-0000b: ANY_BYTE
+-0000d: SPLIT_B(1) 0000b
+-00015: LIT 0x64
+-00016: LIT 0x63
+-00017: LIT 0x62
+-00018: JUMP 00002
+-0001e: LIT 0x61
+-0001f: MATCH
++00002: SPLIT_A(0) 00026
++0000a: SAVE 1
++0000e: LIT 0x65
++0000f: ANY_BYTE
++00011: SPLIT_B(1) 0000f
++00019: LIT 0x64
++0001a: LIT 0x63
++0001b: LIT 0x62
++0001c: SAVE 0
++00020: JUMP 00002
++00026: LIT 0x61
++00027: MATCH
+ "#,
+         // Atoms
+         vec![
+             RegexpAtom {
+                 atom: Atom::inexact(vec![97, 98, 99, 100]),
+-                code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x1f },
++                code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x27 },
+             },
+             RegexpAtom {
+                 atom: Atom::exact(vec![97, 102, 103]),
+-                code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x1f },
++                code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x27 },
+             },
+         ],
+         // Epsilon closure starting at forward code 0.
+@@ -392,44 +404,48 @@ fn re_code_8() {
+         // Forward code
+         r#"
+ 00000: LIT 0x61
+-00001: SPLIT_B(0) 0001e
+-00009: LIT 0x62
+-0000a: LIT 0x63
+-0000b: LIT 0x64
+-0000c: ANY_BYTE
+-0000e: SPLIT_A(1) 0000c
+-00016: LIT 0x64
+-00017: LIT 0x65
+-00018: JUMP 00001
+-0001e: LIT 0x66
+-0001f: LIT 0x67
+-00020: MATCH
++00001: SPLIT_B(0) 00026
++00009: SAVE 0
++0000d: LIT 0x62
++0000e: LIT 0x63
++0000f: LIT 0x64
++00010: ANY_BYTE
++00012: SPLIT_A(1) 00010
++0001a: LIT 0x64
++0001b: LIT 0x65
++0001c: SAVE 1
++00020: JUMP 00001
++00026: LIT 0x66
++00027: LIT 0x67
++00028: MATCH
+ "#,
+         // Backward code
+         r#"
+ 00000: LIT 0x67
+ 00001: LIT 0x66
+-00002: SPLIT_B(0) 0001f
+-0000a: LIT 0x65
+-0000b: LIT 0x64
+-0000c: ANY_BYTE
+-0000e: SPLIT_A(1) 0000c
+-00016: LIT 0x64
+-00017: LIT 0x63
+-00018: LIT 0x62
+-00019: JUMP 00002
+-0001f: LIT 0x61
+-00020: MATCH
++00002: SPLIT_B(0) 00027
++0000a: SAVE 1
++0000e: LIT 0x65
++0000f: LIT 0x64
++00010: ANY_BYTE
++00012: SPLIT_A(1) 00010
++0001a: LIT 0x64
++0001b: LIT 0x63
++0001c: LIT 0x62
++0001d: SAVE 0
++00021: JUMP 00002
++00027: LIT 0x61
++00028: MATCH
+ "#,
+         // Atoms
+         vec![
+             RegexpAtom {
+                 atom: Atom::inexact(vec![0x61, 0x62, 0x63, 0x64]),
+-                code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x20 },
++                code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x28 },
+             },
+             RegexpAtom {
+                 atom: Atom::exact(vec![0x61, 0x66, 0x67]),
+-                code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x20 },
++                code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x28 },
+             },
+         ],
+         // Epsilon closure starting at forward code 0.
+@@ -539,35 +555,43 @@ fn re_code_11() {
+         "(?s)(abc){2,}",
+         // Forward code
+         r#"
+-00000: LIT 0x61
+-00001: LIT 0x62
+-00002: LIT 0x63
+-00003: SPLIT_B(0) 00000
+-0000b: LIT 0x61
+-0000c: LIT 0x62
+-0000d: LIT 0x63
+-0000e: MATCH
++00000: SAVE 0
++00004: LIT 0x61
++00005: LIT 0x62
++00006: LIT 0x63
++00007: SAVE 1
++0000b: SPLIT_B(0) 00000
++00013: SAVE 0
++00017: LIT 0x61
++00018: LIT 0x62
++00019: LIT 0x63
++0001a: SAVE 1
++0001e: MATCH
+ "#,
+         // Backward code
+         r#"
+-00000: LIT 0x63
+-00001: LIT 0x62
+-00002: LIT 0x61
+-00003: SPLIT_B(0) 00000
+-0000b: LIT 0x63
+-0000c: LIT 0x62
+-0000d: LIT 0x61
+-0000e: MATCH
++00000: SAVE 1
++00004: LIT 0x63
++00005: LIT 0x62
++00006: LIT 0x61
++00007: SAVE 0
++0000b: SPLIT_B(0) 00000
++00013: SAVE 1
++00017: LIT 0x63
++00018: LIT 0x62
++00019: LIT 0x61
++0001a: SAVE 0
++0001e: MATCH
+ "#,
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::inexact(vec![0x61, 0x62, 0x63, 0x61]),
+-            code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x0e }
++            code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x1e }
+         }],
+         // Epsilon closure starting at forward code 0.
+-        vec![0x00],
++        vec![0x04],
+         // Epsilon closure starting at backward code 0.
+-        vec![0x00]
++        vec![0x04]
+     );
+ }
+ 
+@@ -577,59 +601,71 @@ fn re_code_12() {
+         "(?s)(abc123){3,}",
+         // Forward code
+         r#"
+-00000: LIT 0x61
+-00001: LIT 0x62
+-00002: LIT 0x63
+-00003: LIT 0x31
+-00004: LIT 0x32
+-00005: LIT 0x33
+-00006: LIT 0x61
+-00007: LIT 0x62
+-00008: LIT 0x63
+-00009: LIT 0x31
+-0000a: LIT 0x32
+-0000b: LIT 0x33
+-0000c: SPLIT_B(0) 00006
+-00014: LIT 0x61
+-00015: LIT 0x62
+-00016: LIT 0x63
+-00017: LIT 0x31
+-00018: LIT 0x32
+-00019: LIT 0x33
+-0001a: MATCH
++00000: SAVE 0
++00004: LIT 0x61
++00005: LIT 0x62
++00006: LIT 0x63
++00007: LIT 0x31
++00008: LIT 0x32
++00009: LIT 0x33
++0000a: SAVE 1
++0000e: SAVE 0
++00012: LIT 0x61
++00013: LIT 0x62
++00014: LIT 0x63
++00015: LIT 0x31
++00016: LIT 0x32
++00017: LIT 0x33
++00018: SAVE 1
++0001c: SPLIT_B(0) 0000e
++00024: SAVE 0
++00028: LIT 0x61
++00029: LIT 0x62
++0002a: LIT 0x63
++0002b: LIT 0x31
++0002c: LIT 0x32
++0002d: LIT 0x33
++0002e: SAVE 1
++00032: MATCH
+ "#,
+         // Backward code
+         r#"
+-00000: LIT 0x33
+-00001: LIT 0x32
+-00002: LIT 0x31
+-00003: LIT 0x63
+-00004: LIT 0x62
+-00005: LIT 0x61
+-00006: LIT 0x33
+-00007: LIT 0x32
+-00008: LIT 0x31
+-00009: LIT 0x63
+-0000a: LIT 0x62
+-0000b: LIT 0x61
+-0000c: SPLIT_B(0) 00006
+-00014: LIT 0x33
+-00015: LIT 0x32
+-00016: LIT 0x31
+-00017: LIT 0x63
+-00018: LIT 0x62
+-00019: LIT 0x61
+-0001a: MATCH
++00000: SAVE 1
++00004: LIT 0x33
++00005: LIT 0x32
++00006: LIT 0x31
++00007: LIT 0x63
++00008: LIT 0x62
++00009: LIT 0x61
++0000a: SAVE 0
++0000e: SAVE 1
++00012: LIT 0x33
++00013: LIT 0x32
++00014: LIT 0x31
++00015: LIT 0x63
++00016: LIT 0x62
++00017: LIT 0x61
++00018: SAVE 0
++0001c: SPLIT_B(0) 0000e
++00024: SAVE 1
++00028: LIT 0x33
++00029: LIT 0x32
++0002a: LIT 0x31
++0002b: LIT 0x63
++0002c: LIT 0x62
++0002d: LIT 0x61
++0002e: SAVE 0
++00032: MATCH
+ "#,
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::inexact(vec![0x63, 0x31, 0x32, 0x33]),
+-            code_loc: CodeLoc { fwd: 2, bck_seq_id: 0, bck: 0x18 }
++            code_loc: CodeLoc { fwd: 6, bck_seq_id: 0, bck: 0x2c }
+         }],
+         // Epsilon closure starting at forward code 0.
+-        vec![0x00],
++        vec![0x04],
+         // Epsilon closure starting at backward code 0.
+-        vec![0x00]
++        vec![0x04]
+     );
+ }
+ 
+@@ -639,85 +675,93 @@ fn re_code_13() {
+         "(?s)(abcdef|ghijkl){2,}",
+         // Forward code
+         r#"
+-00000: SPLIT_N(0) 0000d 00019
+-0000d: LIT 0x61
+-0000e: LIT 0x62
+-0000f: LIT 0x63
+-00010: LIT 0x64
+-00011: LIT 0x65
+-00012: LIT 0x66
+-00013: JUMP 0001f
+-00019: LIT 0x67
+-0001a: LIT 0x68
+-0001b: LIT 0x69
+-0001c: LIT 0x6a
+-0001d: LIT 0x6b
+-0001e: LIT 0x6c
+-0001f: SPLIT_B(1) 00000
+-00027: SPLIT_N(2) 00034 00040
+-00034: LIT 0x61
+-00035: LIT 0x62
+-00036: LIT 0x63
+-00037: LIT 0x64
+-00038: LIT 0x65
+-00039: LIT 0x66
+-0003a: JUMP 00046
+-00040: LIT 0x67
+-00041: LIT 0x68
+-00042: LIT 0x69
+-00043: LIT 0x6a
+-00044: LIT 0x6b
+-00045: LIT 0x6c
+-00046: MATCH
++00000: SAVE 0
++00004: SPLIT_N(0) 00011 0001d
++00011: LIT 0x61
++00012: LIT 0x62
++00013: LIT 0x63
++00014: LIT 0x64
++00015: LIT 0x65
++00016: LIT 0x66
++00017: JUMP 00023
++0001d: LIT 0x67
++0001e: LIT 0x68
++0001f: LIT 0x69
++00020: LIT 0x6a
++00021: LIT 0x6b
++00022: LIT 0x6c
++00023: SAVE 1
++00027: SPLIT_B(1) 00000
++0002f: SAVE 0
++00033: SPLIT_N(2) 00040 0004c
++00040: LIT 0x61
++00041: LIT 0x62
++00042: LIT 0x63
++00043: LIT 0x64
++00044: LIT 0x65
++00045: LIT 0x66
++00046: JUMP 00052
++0004c: LIT 0x67
++0004d: LIT 0x68
++0004e: LIT 0x69
++0004f: LIT 0x6a
++00050: LIT 0x6b
++00051: LIT 0x6c
++00052: SAVE 1
++00056: MATCH
+ "#,
+         // Backward code
+         r#"
+-00000: SPLIT_N(0) 0000d 00019
+-0000d: LIT 0x66
+-0000e: LIT 0x65
+-0000f: LIT 0x64
+-00010: LIT 0x63
+-00011: LIT 0x62
+-00012: LIT 0x61
+-00013: JUMP 0001f
+-00019: LIT 0x6c
+-0001a: LIT 0x6b
+-0001b: LIT 0x6a
+-0001c: LIT 0x69
+-0001d: LIT 0x68
+-0001e: LIT 0x67
+-0001f: SPLIT_B(1) 00000
+-00027: SPLIT_N(2) 00034 00040
+-00034: LIT 0x66
+-00035: LIT 0x65
+-00036: LIT 0x64
+-00037: LIT 0x63
+-00038: LIT 0x62
+-00039: LIT 0x61
+-0003a: JUMP 00046
+-00040: LIT 0x6c
+-00041: LIT 0x6b
+-00042: LIT 0x6a
+-00043: LIT 0x69
+-00044: LIT 0x68
+-00045: LIT 0x67
+-00046: MATCH
++00000: SAVE 1
++00004: SPLIT_N(0) 00011 0001d
++00011: LIT 0x66
++00012: LIT 0x65
++00013: LIT 0x64
++00014: LIT 0x63
++00015: LIT 0x62
++00016: LIT 0x61
++00017: JUMP 00023
++0001d: LIT 0x6c
++0001e: LIT 0x6b
++0001f: LIT 0x6a
++00020: LIT 0x69
++00021: LIT 0x68
++00022: LIT 0x67
++00023: SAVE 0
++00027: SPLIT_B(1) 00000
++0002f: SAVE 1
++00033: SPLIT_N(2) 00040 0004c
++00040: LIT 0x66
++00041: LIT 0x65
++00042: LIT 0x64
++00043: LIT 0x63
++00044: LIT 0x62
++00045: LIT 0x61
++00046: JUMP 00052
++0004c: LIT 0x6c
++0004d: LIT 0x6b
++0004e: LIT 0x6a
++0004f: LIT 0x69
++00050: LIT 0x68
++00051: LIT 0x67
++00052: SAVE 0
++00056: MATCH
+ "#,
+         // Atoms
+         vec![
+             RegexpAtom {
+                 atom: Atom::inexact(vec![0x61, 0x62, 0x63, 0x64]),
+-                code_loc: CodeLoc { fwd: 0x0d, bck_seq_id: 0, bck: 0x3a }
++                code_loc: CodeLoc { fwd: 17, bck_seq_id: 0, bck: 0x46 }
+             },
+             RegexpAtom {
+                 atom: Atom::inexact(vec![0x67, 0x68, 0x69, 0x6a]),
+-                code_loc: CodeLoc { fwd: 0x19, bck_seq_id: 0, bck: 0x46 }
++                code_loc: CodeLoc { fwd: 29, bck_seq_id: 0, bck: 0x52 }
+             }
+         ],
+         // Epsilon closure starting at forward code 0.
+-        vec![0x0d, 0x19],
++        vec![0x11, 0x1d],
+         // Epsilon closure starting at backward code 0.
+-        vec![0x0d, 0x19]
++        vec![0x11, 0x1d]
+     );
+ }
+ 
+@@ -727,37 +771,45 @@ fn re_code_14() {
+         "(?s)(abc){0,2}",
+         // Forward code
+         r#"
+-00000: SPLIT_A(0) 00016
+-00008: LIT 0x61
+-00009: LIT 0x62
+-0000a: LIT 0x63
+-0000b: SPLIT_A(1) 00016
+-00013: LIT 0x61
+-00014: LIT 0x62
+-00015: LIT 0x63
+-00016: MATCH
++00000: SPLIT_A(0) 00026
++00008: SAVE 0
++0000c: LIT 0x61
++0000d: LIT 0x62
++0000e: LIT 0x63
++0000f: SAVE 1
++00013: SPLIT_A(1) 00026
++0001b: SAVE 0
++0001f: LIT 0x61
++00020: LIT 0x62
++00021: LIT 0x63
++00022: SAVE 1
++00026: MATCH
+ "#,
+         // Backward code
+         r#"
+-00000: SPLIT_A(0) 00016
+-00008: LIT 0x63
+-00009: LIT 0x62
+-0000a: LIT 0x61
+-0000b: SPLIT_A(1) 00016
+-00013: LIT 0x63
+-00014: LIT 0x62
+-00015: LIT 0x61
+-00016: MATCH
++00000: SPLIT_A(0) 00026
++00008: SAVE 1
++0000c: LIT 0x63
++0000d: LIT 0x62
++0000e: LIT 0x61
++0000f: SAVE 0
++00013: SPLIT_A(1) 00026
++0001b: SAVE 1
++0001f: LIT 0x63
++00020: LIT 0x62
++00021: LIT 0x61
++00022: SAVE 0
++00026: MATCH
+ "#,
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::inexact(vec![]),
+-            code_loc: CodeLoc { fwd: 0x00, bck_seq_id: 0, bck: 0x16 }
++            code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x26 }
+         }],
+         // Epsilon closure starting at forward code 0.
+-        vec![0x08, 0x16],
++        vec![0x0c, 0x26],
+         // Epsilon closure starting at backward code 0.
+-        vec![0x08, 0x16]
++        vec![0x0c, 0x26]
+     );
+ }
+ 
+@@ -767,35 +819,39 @@ fn re_code_15() {
+         "(?s)(a+|b)*",
+         // Forward code
+         r#"
+-00000: SPLIT_A(0) 0002b
+-00008: SPLIT_N(1) 00015 00024
+-00015: LIT 0x61
+-00016: SPLIT_B(2) 00015
+-0001e: JUMP 00025
+-00024: LIT 0x62
+-00025: JUMP 00000
+-0002b: MATCH
++00000: SPLIT_A(0) 00033
++00008: SAVE 0
++0000c: SPLIT_N(1) 00019 00028
++00019: LIT 0x61
++0001a: SPLIT_B(2) 00019
++00022: JUMP 00029
++00028: LIT 0x62
++00029: SAVE 1
++0002d: JUMP 00000
++00033: MATCH
+ "#,
+         // Backward code
+         r#"
+-00000: SPLIT_A(0) 0002b
+-00008: SPLIT_N(1) 00015 00024
+-00015: LIT 0x61
+-00016: SPLIT_B(2) 00015
+-0001e: JUMP 00025
+-00024: LIT 0x62
+-00025: JUMP 00000
+-0002b: MATCH
++00000: SPLIT_A(0) 00033
++00008: SAVE 1
++0000c: SPLIT_N(1) 00019 00028
++00019: LIT 0x61
++0001a: SPLIT_B(2) 00019
++00022: JUMP 00029
++00028: LIT 0x62
++00029: SAVE 0
++0002d: JUMP 00000
++00033: MATCH
+ "#,
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::inexact(vec![]),
+-            code_loc: CodeLoc { fwd: 0x00, bck_seq_id: 0, bck: 0x2b }
++            code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x33 }
+         }],
+         // Epsilon closure starting at forward code 0.
+-        vec![0x15, 0x24, 0x2b],
++        vec![0x19, 0x28, 0x33],
+         // Epsilon closure starting at backward code 0.
+-        vec![0x15, 0x24, 0x2b]
++        vec![0x19, 0x28, 0x33]
+     );
+ }
+ 
+@@ -805,39 +861,43 @@ fn re_code_16() {
+         "(?s)(|abc)de",
+         // Forward code
+         r#"
+-00000: SPLIT_N(0) 0000d 00013
+-0000d: JUMP 00016
+-00013: LIT 0x61
+-00014: LIT 0x62
+-00015: LIT 0x63
+-00016: LIT 0x64
+-00017: LIT 0x65
+-00018: MATCH
++00000: SAVE 0
++00004: SPLIT_N(0) 00011 00017
++00011: JUMP 0001a
++00017: LIT 0x61
++00018: LIT 0x62
++00019: LIT 0x63
++0001a: SAVE 1
++0001e: LIT 0x64
++0001f: LIT 0x65
++00020: MATCH
+ "#,
+         // Backward code
+         r#"
+ 00000: LIT 0x65
+ 00001: LIT 0x64
+-00002: SPLIT_N(0) 0000f 00015
+-0000f: JUMP 00018
+-00015: LIT 0x63
+-00016: LIT 0x62
+-00017: LIT 0x61
+-00018: MATCH
++00002: SAVE 1
++00006: SPLIT_N(0) 00013 00019
++00013: JUMP 0001c
++00019: LIT 0x63
++0001a: LIT 0x62
++0001b: LIT 0x61
++0001c: SAVE 0
++00020: MATCH
+ "#,
+         // Atoms
+         vec![
+             RegexpAtom {
+                 atom: Atom::inexact(vec![0x61, 0x62, 0x63, 0x64]),
+-                code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x18 }
++                code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x20 }
+             },
+             RegexpAtom {
+                 atom: Atom::exact(vec![0x64, 0x65]),
+-                code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x18 }
++                code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x20 }
+             }
+         ],
+         // Epsilon closure starting at forward code 0.
+-        vec![0x16, 0x13],
++        vec![0x1e, 0x17],
+         // Epsilon closure starting at backward code 0.
+         vec![0x00]
+     );
+@@ -849,58 +909,70 @@ fn re_code_17() {
+         "(?s)(|abc){3,}",
+         // Forward code
+         r#"
+-00000: SPLIT_N(0) 0000d 00013
+-0000d: JUMP 00016
+-00013: LIT 0x61
+-00014: LIT 0x62
+-00015: LIT 0x63
+-00016: SPLIT_N(1) 00023 00029
+-00023: JUMP 0002c
+-00029: LIT 0x61
+-0002a: LIT 0x62
+-0002b: LIT 0x63
+-0002c: SPLIT_B(2) 00016
+-00034: SPLIT_N(3) 00041 00047
+-00041: JUMP 0004a
+-00047: LIT 0x61
+-00048: LIT 0x62
+-00049: LIT 0x63
+-0004a: MATCH
++00000: SAVE 0
++00004: SPLIT_N(0) 00011 00017
++00011: JUMP 0001a
++00017: LIT 0x61
++00018: LIT 0x62
++00019: LIT 0x63
++0001a: SAVE 1
++0001e: SAVE 0
++00022: SPLIT_N(1) 0002f 00035
++0002f: JUMP 00038
++00035: LIT 0x61
++00036: LIT 0x62
++00037: LIT 0x63
++00038: SAVE 1
++0003c: SPLIT_B(2) 0001e
++00044: SAVE 0
++00048: SPLIT_N(3) 00055 0005b
++00055: JUMP 0005e
++0005b: LIT 0x61
++0005c: LIT 0x62
++0005d: LIT 0x63
++0005e: SAVE 1
++00062: MATCH
+ "#,
+         // Backward code
+         r#"
+-00000: SPLIT_N(0) 0000d 00013
+-0000d: JUMP 00016
+-00013: LIT 0x63
+-00014: LIT 0x62
+-00015: LIT 0x61
+-00016: SPLIT_N(1) 00023 00029
+-00023: JUMP 0002c
+-00029: LIT 0x63
+-0002a: LIT 0x62
+-0002b: LIT 0x61
+-0002c: SPLIT_B(2) 00016
+-00034: SPLIT_N(3) 00041 00047
+-00041: JUMP 0004a
+-00047: LIT 0x63
+-00048: LIT 0x62
+-00049: LIT 0x61
+-0004a: MATCH
++00000: SAVE 1
++00004: SPLIT_N(0) 00011 00017
++00011: JUMP 0001a
++00017: LIT 0x63
++00018: LIT 0x62
++00019: LIT 0x61
++0001a: SAVE 0
++0001e: SAVE 1
++00022: SPLIT_N(1) 0002f 00035
++0002f: JUMP 00038
++00035: LIT 0x63
++00036: LIT 0x62
++00037: LIT 0x61
++00038: SAVE 0
++0003c: SPLIT_B(2) 0001e
++00044: SAVE 1
++00048: SPLIT_N(3) 00055 0005b
++00055: JUMP 0005e
++0005b: LIT 0x63
++0005c: LIT 0x62
++0005d: LIT 0x61
++0005e: SAVE 0
++00062: MATCH
+ "#,
+         vec![
+             RegexpAtom {
+                 atom: Atom::inexact(vec![]),
+-                code_loc: CodeLoc { fwd: 0x0D, bck_seq_id: 0, bck: 0x41 },
++                code_loc: CodeLoc { fwd: 17, bck_seq_id: 0, bck: 0x55 },
+             },
+             RegexpAtom {
+                 atom: Atom::inexact(vec![0x61, 0x62, 0x63]),
+-                code_loc: CodeLoc { fwd: 0x13, bck_seq_id: 0, bck: 0x4A },
++                code_loc: CodeLoc { fwd: 23, bck_seq_id: 0, bck: 0x5e },
+             },
+         ],
+         // Epsilon closure starting at forward code 0.
+-        vec![0x4a, 0x47, 0x29, 0x13],
++        vec![0x62, 0x5b, 0x35, 0x17],
+         // Epsilon closure starting at backward code 0.
+-        vec![0x4a, 0x47, 0x29, 0x13]
++        vec![0x62, 0x5b, 0x35, 0x17]
+     );
+ }
+ 
+@@ -925,7 +997,7 @@ fn re_code_18() {
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::inexact(vec![0x62, 0x62]),
+-            code_loc: CodeLoc { fwd: 0x02, bck_seq_id: 0, bck: 0x02 }
++            code_loc: CodeLoc { fwd: 2, bck_seq_id: 0, bck: 0x2 }
+         },],
+         // Epsilon closure starting at forward code 0.
+         vec![0x00],
+@@ -942,35 +1014,43 @@ fn re_code_19() {
+         r#"
+ 00000: LIT 0x61
+ 00001: ANY_BYTE
+-00003: LIT 0x62
+-00004: LIT 0x63
+-00005: ANY_BYTE
++00003: SAVE 0
+ 00007: LIT 0x62
+ 00008: LIT 0x63
+ 00009: ANY_BYTE
+-0000b: MATCH
++0000b: SAVE 1
++0000f: SAVE 0
++00013: LIT 0x62
++00014: LIT 0x63
++00015: ANY_BYTE
++00017: SAVE 1
++0001b: MATCH
+ "#,
+         // Backward code
+         r#"
+-00000: ANY_BYTE
+-00002: LIT 0x63
+-00003: LIT 0x62
++00000: SAVE 1
+ 00004: ANY_BYTE
+ 00006: LIT 0x63
+ 00007: LIT 0x62
+-00008: ANY_BYTE
+-0000a: LIT 0x61
+-0000b: MATCH
++00008: SAVE 0
++0000c: SAVE 1
++00010: ANY_BYTE
++00012: LIT 0x63
++00013: LIT 0x62
++00014: SAVE 0
++00018: ANY_BYTE
++0001a: LIT 0x61
++0001b: MATCH
+ "#,
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::inexact(vec![0x62, 0x63]),
+-            code_loc: CodeLoc { fwd: 0x03, bck_seq_id: 0, bck: 0x08 }
++            code_loc: CodeLoc { fwd: 7, bck_seq_id: 0, bck: 0x14 }
+         },],
+         // Epsilon closure starting at forward code 0.
+         vec![0x00],
+         // Epsilon closure starting at backward code 0.
+-        vec![0x00]
++        vec![0x04]
+     );
+ }
+ 
+@@ -996,11 +1076,11 @@ fn re_code_20() {
+         vec![
+             RegexpAtom {
+                 atom: Atom::exact(vec![0x41, 0x31, 0x32]),
+-                code_loc: CodeLoc { fwd: 0x00, bck_seq_id: 0, bck: 0x06 }
++                code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x6 }
+             },
+             RegexpAtom {
+                 atom: Atom::exact(vec![0x61, 0x31, 0x32]),
+-                code_loc: CodeLoc { fwd: 0x00, bck_seq_id: 0, bck: 0x06 }
++                code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0x6 }
+             },
+         ],
+         // Epsilon closure starting at forward code 0.
+@@ -1036,19 +1116,19 @@ fn re_code_21() {
+         vec![
+             RegexpAtom {
+                 atom: Atom::inexact(vec![0x41, 0x42]),
+-                code_loc: CodeLoc { fwd: 0x16, bck_seq_id: 0, bck: 0x08 }
++                code_loc: CodeLoc { fwd: 22, bck_seq_id: 0, bck: 0x8 }
+             },
+             RegexpAtom {
+                 atom: Atom::inexact(vec![0x41, 0x62]),
+-                code_loc: CodeLoc { fwd: 0x16, bck_seq_id: 0, bck: 0x08 }
++                code_loc: CodeLoc { fwd: 22, bck_seq_id: 0, bck: 0x8 }
+             },
+             RegexpAtom {
+                 atom: Atom::inexact(vec![0x61, 0x42]),
+-                code_loc: CodeLoc { fwd: 0x16, bck_seq_id: 0, bck: 0x08 }
++                code_loc: CodeLoc { fwd: 22, bck_seq_id: 0, bck: 0x8 }
+             },
+             RegexpAtom {
+                 atom: Atom::inexact(vec![0x61, 0x62]),
+-                code_loc: CodeLoc { fwd: 0x16, bck_seq_id: 0, bck: 0x08 }
++                code_loc: CodeLoc { fwd: 22, bck_seq_id: 0, bck: 0x8 }
+             },
+         ],
+         // Epsilon closure starting at forward code 0.
+@@ -1064,50 +1144,54 @@ fn re_code_22() {
+         r#"(0?F1?|2?f3?)abcd"#,
+         // Forward code
+         r#"
+-00000: SPLIT_N(0) 0000d 00026
+-0000d: SPLIT_A(1) 00016
+-00015: LIT 0x30
+-00016: LIT 0x46
+-00017: SPLIT_A(2) 00020
+-0001f: LIT 0x31
+-00020: JUMP 00039
+-00026: SPLIT_A(3) 0002f
+-0002e: LIT 0x32
+-0002f: LIT 0x66
+-00030: SPLIT_A(4) 00039
+-00038: LIT 0x33
+-00039: LIT 0x61
+-0003a: LIT 0x62
+-0003b: LIT 0x63
+-0003c: LIT 0x64
+-0003d: MATCH
++00000: SAVE 0
++00004: SPLIT_N(0) 00011 0002a
++00011: SPLIT_A(1) 0001a
++00019: LIT 0x30
++0001a: LIT 0x46
++0001b: SPLIT_A(2) 00024
++00023: LIT 0x31
++00024: JUMP 0003d
++0002a: SPLIT_A(3) 00033
++00032: LIT 0x32
++00033: LIT 0x66
++00034: SPLIT_A(4) 0003d
++0003c: LIT 0x33
++0003d: SAVE 1
++00041: LIT 0x61
++00042: LIT 0x62
++00043: LIT 0x63
++00044: LIT 0x64
++00045: MATCH
+ "#, // Backward code
+         r#"
+ 00000: LIT 0x64
+ 00001: LIT 0x63
+ 00002: LIT 0x62
+ 00003: LIT 0x61
+-00004: SPLIT_N(0) 00011 0002a
+-00011: SPLIT_A(2) 0001a
+-00019: LIT 0x31
+-0001a: LIT 0x46
+-0001b: SPLIT_A(1) 00024
+-00023: LIT 0x30
+-00024: JUMP 0003d
+-0002a: SPLIT_A(4) 00033
+-00032: LIT 0x33
+-00033: LIT 0x66
+-00034: SPLIT_A(3) 0003d
+-0003c: LIT 0x32
+-0003d: MATCH
++00004: SAVE 1
++00008: SPLIT_N(0) 00015 0002e
++00015: SPLIT_A(2) 0001e
++0001d: LIT 0x31
++0001e: LIT 0x46
++0001f: SPLIT_A(1) 00028
++00027: LIT 0x30
++00028: JUMP 00041
++0002e: SPLIT_A(4) 00037
++00036: LIT 0x33
++00037: LIT 0x66
++00038: SPLIT_A(3) 00041
++00040: LIT 0x32
++00041: SAVE 0
++00045: MATCH
+ "#,
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::inexact(vec![0x61, 0x62, 0x63, 0x64]),
+-            code_loc: CodeLoc { fwd: 0x39, bck_seq_id: 0, bck: 0x04 }
++            code_loc: CodeLoc { fwd: 65, bck_seq_id: 0, bck: 0x4 }
+         },],
+         // Epsilon closure starting at forward code 0.
+-        vec![0x15, 0x16, 0x2e, 0x2f],
++        vec![0x19, 0x1a, 0x32, 0x33],
+         // Epsilon closure starting at backward code 0.
+         vec![0x00]
+     );
+@@ -1119,47 +1203,55 @@ fn re_code_23() {
+         r#"(abc+d+){200}"#,
+         // Forward code
+         r#"
+-00000: LIT 0x61
+-00001: LIT 0x62
+-00002: LIT 0x63
+-00003: SPLIT_B(0) 00002
+-0000b: LIT 0x64
+-0000c: SPLIT_B(1) 0000b
+-00014: LIT 0x61
+-00015: LIT 0x62
+-00016: LIT 0x63
+-00017: SPLIT_B(2) 00016
+-0001f: LIT 0x64
+-00020: SPLIT_B(3) 0001f
+-00028: REPEAT_GREEDY 00014 199-199
+-00036: MATCH
++00000: SAVE 0
++00004: LIT 0x61
++00005: LIT 0x62
++00006: LIT 0x63
++00007: SPLIT_B(0) 00006
++0000f: LIT 0x64
++00010: SPLIT_B(1) 0000f
++00018: SAVE 1
++0001c: SAVE 0
++00020: LIT 0x61
++00021: LIT 0x62
++00022: LIT 0x63
++00023: SPLIT_B(2) 00022
++0002b: LIT 0x64
++0002c: SPLIT_B(3) 0002b
++00034: SAVE 1
++00038: REPEAT_GREEDY 0001c 199-199
++00046: MATCH
+ "#,
+         // Backward code
+         r#"
+-00000: LIT 0x64
+-00001: SPLIT_B(2) 00000
+-00009: LIT 0x63
+-0000a: SPLIT_B(3) 00009
+-00012: LIT 0x62
+-00013: LIT 0x61
+-00014: REPEAT_GREEDY 00000 199-199
+-00022: LIT 0x64
+-00023: SPLIT_B(1) 00022
+-0002b: LIT 0x63
+-0002c: SPLIT_B(0) 0002b
+-00034: LIT 0x62
+-00035: LIT 0x61
+-00036: MATCH
++00000: SAVE 1
++00004: LIT 0x64
++00005: SPLIT_B(2) 00004
++0000d: LIT 0x63
++0000e: SPLIT_B(3) 0000d
++00016: LIT 0x62
++00017: LIT 0x61
++00018: SAVE 0
++0001c: REPEAT_GREEDY 00000 199-199
++0002a: SAVE 1
++0002e: LIT 0x64
++0002f: SPLIT_B(1) 0002e
++00037: LIT 0x63
++00038: SPLIT_B(0) 00037
++00040: LIT 0x62
++00041: LIT 0x61
++00042: SAVE 0
++00046: MATCH
+ "#,
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::inexact(vec![0x61, 0x62, 0x63]),
+-            code_loc: CodeLoc { fwd: 0x00, bck_seq_id: 0, bck: 0x36 }
++            code_loc: CodeLoc { fwd: 4, bck_seq_id: 0, bck: 0x42 }
+         },],
+         // Epsilon closure starting at forward code 0.
+-        vec![0x00],
++        vec![0x04],
+         // Epsilon closure starting at backward code 0.
+-        vec![0x00]
++        vec![0x04]
+     );
+ }
+ 
+@@ -1169,45 +1261,53 @@ fn re_code_24() {
+         r#"(a{2,3}?b){1,13}?"#,
+         // Forward code
+         r#"
+-00000: LIT 0x61
+-00001: LIT 0x61
+-00002: SPLIT_B(0) 0000b
+-0000a: LIT 0x61
+-0000b: LIT 0x62
+-0000c: SPLIT_B(1) 0002e
+-00014: LIT 0x61
+-00015: LIT 0x61
+-00016: SPLIT_B(2) 0001f
+-0001e: LIT 0x61
+-0001f: LIT 0x62
+-00020: REPEAT_NON_GREEDY 00014 0-12
+-0002e: MATCH
++00000: SAVE 0
++00004: LIT 0x61
++00005: LIT 0x61
++00006: SPLIT_B(0) 0000f
++0000e: LIT 0x61
++0000f: LIT 0x62
++00010: SAVE 1
++00014: SPLIT_B(1) 0003e
++0001c: SAVE 0
++00020: LIT 0x61
++00021: LIT 0x61
++00022: SPLIT_B(2) 0002b
++0002a: LIT 0x61
++0002b: LIT 0x62
++0002c: SAVE 1
++00030: REPEAT_NON_GREEDY 0001c 0-12
++0003e: MATCH
+ "#,
+         // Backward code
+         r#"
+-00000: SPLIT_B(1) 00022
+-00008: LIT 0x62
+-00009: LIT 0x61
+-0000a: LIT 0x61
+-0000b: SPLIT_B(2) 00014
+-00013: LIT 0x61
+-00014: REPEAT_NON_GREEDY 00008 0-12
+-00022: LIT 0x62
+-00023: LIT 0x61
+-00024: LIT 0x61
+-00025: SPLIT_B(0) 0002e
+-0002d: LIT 0x61
+-0002e: MATCH
++00000: SPLIT_B(1) 0002a
++00008: SAVE 1
++0000c: LIT 0x62
++0000d: LIT 0x61
++0000e: LIT 0x61
++0000f: SPLIT_B(2) 00018
++00017: LIT 0x61
++00018: SAVE 0
++0001c: REPEAT_NON_GREEDY 00008 0-12
++0002a: SAVE 1
++0002e: LIT 0x62
++0002f: LIT 0x61
++00030: LIT 0x61
++00031: SPLIT_B(0) 0003a
++00039: LIT 0x61
++0003a: SAVE 0
++0003e: MATCH
+ "#,
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::inexact(vec![0x61, 0x61]),
+-            code_loc: CodeLoc { fwd: 0x00, bck_seq_id: 0, bck: 0x2e }
++            code_loc: CodeLoc { fwd: 4, bck_seq_id: 0, bck: 0x3a }
+         },],
+         // Epsilon closure starting at forward code 0.
+-        vec![0x00],
++        vec![0x04],
+         // Epsilon closure starting at backward code 0.
+-        vec![0x22, 0x08]
++        vec![0x2e, 0x0c]
+     );
+ }
+ 
+@@ -1244,7 +1344,7 @@ fn re_code_25() {
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::inexact(vec![0x61, 0x62, 0x63, 0x78]),
+-            code_loc: CodeLoc { fwd: 0x00, bck_seq_id: 0, bck: 0x0c }
++            code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0xc }
+         },],
+         // Epsilon closure starting at forward code 0.
+         vec![0x02],
+@@ -1286,7 +1386,7 @@ fn re_code_26() {
+         // Atoms
+         vec![RegexpAtom {
+             atom: Atom::inexact(vec![0x61, 0x62, 0x63, 0x78]),
+-            code_loc: CodeLoc { fwd: 0x00, bck_seq_id: 0, bck: 0x0c }
++            code_loc: CodeLoc { fwd: 0, bck_seq_id: 0, bck: 0xc }
+         },],
+         // Epsilon closure starting at forward code 0.
+         vec![0x02],
+diff --git a/lib/src/scanner/context.rs b/lib/src/scanner/context.rs
+index 104e3a0c..7ebdd5eb 100644
+--- a/lib/src/scanner/context.rs
++++ b/lib/src/scanner/context.rs
+@@ -33,6 +33,7 @@ use crate::re::fast::FastVM;
+ 
+ use crate::re::hir::ChainedPatternGap;
+ use crate::re::thompson::PikeVM;
++use crate::re::thompson::UNSET_SLOT;
+ #[cfg(feature = "rules-profiling")]
+ use crate::scanner::ProfilingData;
+ use crate::scanner::matches::{
+@@ -991,25 +992,30 @@ impl ScanContext<'_, '_> {
+                     }
+                 }
+             }
+-            SubPattern::Regexp { flags, .. }
+-            | SubPattern::RegexpChainHead { flags, .. }
+-            | SubPattern::RegexpChainTail { flags, .. } => verify_regexp(
+-                &mut self.vm,
+-                data,
+-                atom_pos,
+-                atom,
+-                *flags,
+-                |match_range| {
+-                    handle_sub_pattern_match(
+-                        &mut self.tracker,
+-                        &mut self.wasm,
+-                        sub_pattern_id,
+-                        sub_pattern,
+-                        *pattern_id,
+-                        Match::new(match_range).rebase(base),
+-                    );
+-                },
+-            ),
++            SubPattern::Regexp { flags, num_slots }
++            | SubPattern::RegexpChainHead { flags, num_slots }
++            | SubPattern::RegexpChainTail { flags, num_slots, .. } => {
++                verify_regexp(
++                    &mut self.vm,
++                    data,
++                    atom_pos,
++                    atom,
++                    *flags,
++                    *num_slots as usize,
++                    |match_range, captures| {
++                        handle_sub_pattern_match(
++                            &mut self.tracker,
++                            &mut self.wasm,
++                            sub_pattern_id,
++                            sub_pattern,
++                            *pattern_id,
++                            Match::new(match_range)
++                                .captures(captures)
++                                .rebase(base),
++                        );
++                    },
++                )
++            }
+ 
+             SubPattern::Xor { pattern, flags } => {
+                 let pattern = self
+@@ -1462,6 +1468,7 @@ fn verify_chain_of_matches(
+                         base: tail_match.base,
+                         range: current_match.range.start..tail_match.range.end,
+                         xor_key: None,
++                        captures: Box::new([]),
+                     },
+                     flags.contains(SubPatternFlags::GreedyRegexp),
+                 );
+@@ -1534,9 +1541,11 @@ fn verify_regexp(
+     match_start: usize,
+     atom: &SubPatternAtom,
+     flags: SubPatternFlags,
+-    mut f: impl FnMut(Range<usize>),
++    num_slots: usize,
++    mut f: impl FnMut(Range<usize>, Box<[Option<Range<usize>>]>),
+ ) {
+     let mut fwd_match_len = None;
++    let mut fwd_slots = None;
+ 
+     // If the atom has some forward code, that's the code that should execute
+     // the VM for matching the portion that pattern that comes after the atom.
+@@ -1564,8 +1573,10 @@ fn verify_regexp(
+                 &scanned_data[match_start..],
+                 &scanned_data[..match_start],
+                 flags.contains(SubPatternFlags::Wide),
+-                |match_len| {
++                num_slots,
++                |match_len, slots| {
+                     fwd_match_len = Some(match_len);
++                    fwd_slots = slots.clone();
+                     ControlFlow::Break(())
+                 },
+             );
+@@ -1589,7 +1600,7 @@ fn verify_regexp(
+                     let range = match_start - bck_match_len
+                         ..match_start + fwd_match_len;
+                     if verify_full_word(scanned_data, &range, flags, None) {
+-                        f(range);
++                        f(range, Box::new([]));
+                     }
+                     ControlFlow::Continue(())
+                 },
+@@ -1600,11 +1611,18 @@ fn verify_regexp(
+                 &scanned_data[match_start..],
+                 &scanned_data[..match_start],
+                 flags.contains(SubPatternFlags::Wide),
+-                |bck_match_len| {
++                num_slots,
++                |bck_match_len, bck_slots| {
+                     let range = match_start - bck_match_len
+                         ..match_start + fwd_match_len;
+                     if verify_full_word(scanned_data, &range, flags, None) {
+-                        f(range);
++                        let captures = capture_ranges(
++                            num_slots,
++                            match_start,
++                            fwd_slots.as_ref().map(|s| s.as_slice()),
++                            bck_slots.as_ref().map(|s| s.as_slice()),
++                        );
++                        f(range, captures);
+                     }
+                     ControlFlow::Continue(())
+                 },
+@@ -1613,11 +1631,60 @@ fn verify_regexp(
+     } else {
+         let range = match_start..match_start + fwd_match_len;
+         if verify_full_word(scanned_data, &range, flags, None) {
+-            f(range);
++            let captures = capture_ranges(
++                num_slots,
++                match_start,
++                fwd_slots.as_ref().map(|s| s.as_slice()),
++                None,
++            );
++            f(range, captures);
+         }
+     }
+ }
+ 
++/// Builds the ranges covered by the capturing groups of a regexp, given the
++/// positions recorded while verifying the match.
++///
++/// A match is verified in two runs: one that goes forward from the point where
++/// the atom was found, and one that goes backward from that same point. Each
++/// run records the positions of the groups it covers, so a group that encloses
++/// the atom has its start recorded by the backward run and its end recorded by
++/// the forward run. Positions recorded by the forward run are distances to the
++/// right of the atom, while the ones recorded by the backward run are
++/// distances to the left of it.
++fn capture_ranges(
++    num_slots: usize,
++    match_start: usize,
++    fwd_slots: Option<&[u32]>,
++    bck_slots: Option<&[u32]>,
++) -> Box<[Option<Range<usize>>]> {
++    if num_slots == 0 {
++        return Box::new([]);
++    }
++
++    let position = |slot: usize| -> Option<usize> {
++        if let Some(pos) = fwd_slots.and_then(|s| s.get(slot)) {
++            if *pos != UNSET_SLOT {
++                return Some(match_start + *pos as usize);
++            }
++        }
++        if let Some(pos) = bck_slots.and_then(|s| s.get(slot)) {
++            if *pos != UNSET_SLOT {
++                return match_start.checked_sub(*pos as usize);
++            }
++        }
++        None
++    };
++
++    (0..num_slots / 2)
++        .map(|group| {
++            let start = position(group * 2)?;
++            let end = position(group * 2 + 1)?;
++            if start <= end { Some(start..end) } else { None }
++        })
++        .collect()
++}
++
+ /// Verifies that `pattern` actually matches in XORed form at `match_start`
+ /// within `scanned_data`.
+ ///
+diff --git a/lib/src/scanner/matches.rs b/lib/src/scanner/matches.rs
+index 5f625ea9..08868f3a 100644
+--- a/lib/src/scanner/matches.rs
++++ b/lib/src/scanner/matches.rs
+@@ -20,11 +20,42 @@ pub(crate) struct Match {
+     /// where `k` is the XOR key (it may be 0). For any other type of
+     /// pattern this is `None`.
+     pub xor_key: Option<u8>,
++    /// Ranges covered by the capturing groups of a regexp pattern, in the
++    /// same absolute coordinates used by `range`. The item at position `n`
++    /// corresponds to the group number `n + 1`, and is `None` when the group
++    /// didn't take part in the match. This is an empty slice for patterns
++    /// without capturing groups.
++    pub captures: Box<[Option<Range<usize>>]>,
+ }
+ 
+ impl Match {
+     pub fn new(range: Range<usize>) -> Self {
+-        Self { base: 0, range, xor_key: None }
++        Self {
++            base: 0,
++            range,
++            xor_key: None,
++            captures: Box::new([]),
++        }
++    }
++
++    /// Sets the ranges covered by the capturing groups.
++    pub fn captures(
++        mut self,
++        captures: Box<[Option<Range<usize>>]>,
++    ) -> Self {
++        self.captures = captures;
++        self
++    }
++
++    /// Returns the range covered by the capturing group number `group`.
++    ///
++    /// The group number zero is the whole match. Returns [`None`] if the
++    /// group doesn't exist or didn't take part in the match.
++    pub fn capture(&self, group: usize) -> Option<Range<usize>> {
++        if group == 0 {
++            return Some(self.range.clone());
++        }
++        self.captures.get(group - 1).cloned().flatten()
+     }
+ 
+     /// Sets the base for the match.
+@@ -32,8 +63,15 @@ impl Match {
+     /// Subtract the previous base from the match start and end, and
+     /// adds the new one.
+     pub fn rebase(mut self, base: usize) -> Self {
+-        self.range = self.range.start.sub(self.base).add(base)
+-            ..self.range.end.sub(self.base).add(base);
++        let rebase_range = |r: &Range<usize>| {
++            r.start.sub(self.base).add(base)..r.end.sub(self.base).add(base)
++        };
++        self.captures = self
++            .captures
++            .iter()
++            .map(|c| c.as_ref().map(&rebase_range))
++            .collect();
++        self.range = rebase_range(&self.range);
+         self.base = base;
+         self
+     }
+diff --git a/lib/src/wasm/mod.rs b/lib/src/wasm/mod.rs
+index 3a71b2e4..0bdc37c3 100644
+--- a/lib/src/wasm/mod.rs
++++ b/lib/src/wasm/mod.rs
+@@ -1036,21 +1036,26 @@ pub(crate) fn pat_matches_in(
+ /// Invoked from WASM to ask for the offset where a pattern matched
+ ///
+ /// Returns the length for the index-th occurrence of the pattern identified
+-/// by `pattern_id`. The index is 1-based. Returns `None` if the pattern
+-/// has not matched or there are less than `index` matches.
++/// by `pattern_id`. The index is 1-based. The `group` is the number of a
++/// capturing group, where zero is the whole match. Returns `None` if the
++/// pattern has not matched, there are less than `index` matches, or the group
++/// didn't take part in the match.
+ #[wasm_export(sync = "none")]
+ pub(crate) fn pat_length(
+     caller: &mut Caller<'_, ScanContext>,
+     pattern_id: PatternId,
+     index: i64,
++    group: i64,
+ ) -> Option<i64> {
+     if let Some(matches) =
+         caller.data().tracker.pattern_matches.get(pattern_id)
+     {
+         let index: usize = index.try_into().ok()?;
++        let group: usize = group.try_into().ok()?;
+         // Index is 1-based, convert it to 0-based before calling `matches.get`
+         let m = matches.get(index.checked_sub(1)?)?;
+-        Some(ExactSizeIterator::len(&m.range) as i64)
++        let range = m.capture(group)?;
++        Some(ExactSizeIterator::len(&range) as i64)
+     } else {
+         None
+     }
+@@ -1059,21 +1064,25 @@ pub(crate) fn pat_length(
+ /// Invoked from WASM to ask for the length of some pattern match
+ ///
+ /// Returns the offset for the index-th occurrence of the pattern identified
+-/// by `pattern_id`. The index is 1-based. Returns `None` if the pattern
+-/// has not matched or there are less than `index` matches.
++/// by `pattern_id`. The index is 1-based. The `group` is the number of a
++/// capturing group, where zero is the whole match. Returns `None` if the
++/// pattern has not matched, there are less than `index` matches, or the group
++/// didn't take part in the match.
+ #[wasm_export(sync = "none")]
+ pub(crate) fn pat_offset(
+     caller: &mut Caller<'_, ScanContext>,
+     pattern_id: PatternId,
+     index: i64,
++    group: i64,
+ ) -> Option<i64> {
+     if let Some(matches) =
+         caller.data().tracker.pattern_matches.get(pattern_id)
+     {
+         let index: usize = index.try_into().ok()?;
++        let group: usize = group.try_into().ok()?;
+         // Index is 1-based, convert it to 0-based before calling `matches.get`
+         let m = matches.get(index.checked_sub(1)?)?;
+-        Some(m.range.start as i64)
++        Some(m.capture(group)?.start as i64)
+     } else {
+         None
+     }
+diff --git a/parser/src/ast/cst2ast.rs b/parser/src/ast/cst2ast.rs
+index bb65559b..75d14ead 100644
+--- a/parser/src/ast/cst2ast.rs
++++ b/parser/src/ast/cst2ast.rs
+@@ -1380,46 +1380,62 @@ where
+                 let span = self.expect(PATTERN_OFFSET)?;
+                 let name = self.get_source_str(&span)?;
+ 
+-                let (span_with_index, index) = if let Event::Token {
+-                    kind: L_BRACKET,
+-                    ..
+-                } = self.peek()
+-                {
+-                    self.expect(L_BRACKET)?;
+-                    let index = self.expr()?;
+-                    let r_bracket_span = self.expect(R_BRACKET)?;
+-                    (span.combine(&r_bracket_span), Some(index))
+-                } else {
+-                    (span.clone(), None)
+-                };
++                let (mut span_with_index, index, mut group) =
++                    if let Event::Token { kind: L_BRACKET, .. } = self.peek() {
++                        self.expect(L_BRACKET)?;
++                        let index = self.expr()?;
++                        let r_bracket_span = self.expect(R_BRACKET)?;
++                        (span.combine(&r_bracket_span), Some(index), None)
++                    } else {
++                        (span.clone(), None, None)
++                    };
++
++                if index.is_some() {
++                    if let Event::Token { kind: L_BRACKET, .. } = self.peek() {
++                        self.expect(L_BRACKET)?;
++                        group = Some(self.expr()?);
++                        let r_bracket_span = self.expect(R_BRACKET)?;
++                        span_with_index =
++                            span_with_index.combine(&r_bracket_span);
++                    }
++                }
+ 
+                 Expr::PatternOffset(Box::new(IdentWithIndex {
+                     span: span_with_index,
+                     identifier: Ident { span, name },
+                     index,
++                    group,
+                 }))
+             }
+             Event::Token { kind: PATTERN_LENGTH, .. } => {
+                 let span = self.expect(PATTERN_LENGTH)?;
+                 let name = self.get_source_str(&span)?;
+ 
+-                let (span_with_index, index) = if let Event::Token {
+-                    kind: L_BRACKET,
+-                    ..
+-                } = self.peek()
+-                {
+-                    self.expect(L_BRACKET)?;
+-                    let index = self.expr()?;
+-                    let r_bracket_span = self.expect(R_BRACKET)?;
+-                    (span.combine(&r_bracket_span), Some(index))
+-                } else {
+-                    (span.clone(), None)
+-                };
++                let (mut span_with_index, index, mut group) =
++                    if let Event::Token { kind: L_BRACKET, .. } = self.peek() {
++                        self.expect(L_BRACKET)?;
++                        let index = self.expr()?;
++                        let r_bracket_span = self.expect(R_BRACKET)?;
++                        (span.combine(&r_bracket_span), Some(index), None)
++                    } else {
++                        (span.clone(), None, None)
++                    };
++
++                if index.is_some() {
++                    if let Event::Token { kind: L_BRACKET, .. } = self.peek() {
++                        self.expect(L_BRACKET)?;
++                        group = Some(self.expr()?);
++                        let r_bracket_span = self.expect(R_BRACKET)?;
++                        span_with_index =
++                            span_with_index.combine(&r_bracket_span);
++                    }
++                }
+ 
+                 Expr::PatternLength(Box::new(IdentWithIndex {
+                     span: span_with_index,
+                     identifier: Ident { span, name },
+                     index,
++                    group,
+                 }))
+             }
+             Event::Token { kind: BITWISE_NOT, .. } => {
+diff --git a/parser/src/ast/mod.rs b/parser/src/ast/mod.rs
+index 506756e3..9e6640e8 100644
+--- a/parser/src/ast/mod.rs
++++ b/parser/src/ast/mod.rs
+@@ -256,6 +256,9 @@ pub struct IdentWithIndex<'src> {
+     span: Span,
+     pub identifier: Ident<'src>,
+     pub index: Option<Expr<'src>>,
++    /// Number of the capturing group, when the pattern is followed by a
++    /// second index, as in `@a[1][2]`.
++    pub group: Option<Expr<'src>>,
+ }
+ 
+ /// Types of patterns (a.k.a. strings) that can appear in a YARA rule.
+diff --git a/parser/src/parser/mod.rs b/parser/src/parser/mod.rs
+index f619423d..f331c00a 100644
+--- a/parser/src/parser/mod.rs
++++ b/parser/src/parser/mod.rs
+@@ -1524,8 +1524,8 @@ impl ParserImpl<'_> {
+     ///     `filesize`                         |
+     ///     `entrypoint`                       |
+     ///     PATTERN_COUNT (`in` RANGE)?        |
+-    ///     PATTERN_OFFSET (`[` EXPR `]`)?     |
+-    ///     PATTERN_LENGTH (`[` EXPR `]`)?     |
++    ///     PATTERN_OFFSET (`[` EXPR `]` (`[` EXPR `]`)?)?  |
++    ///     PATTERN_LENGTH (`[` EXPR `]` (`[` EXPR `]`)?)?  |
+     ///     `-` TERM                           |
+     ///     `~` TERM                           |
+     ///     `(` EXPR `)`                       |
+@@ -1556,7 +1556,10 @@ impl ParserImpl<'_> {
+                 .alt(|p| {
+                     p.expect_d(t!(PATTERN_OFFSET | PATTERN_LENGTH), DESC)
+                         .cond(t!(L_BRACKET), |p| {
+-                            p.expr().expect(t!(R_BRACKET))
++                            p.expr().expect(t!(R_BRACKET)).cond(
++                                t!(L_BRACKET),
++                                |p| p.expr().expect(t!(R_BRACKET)),
++                            )
+                         })
+                 })
+                 .alt(|p| p.expect_d(t!(MINUS), DESC).then(Self::term))

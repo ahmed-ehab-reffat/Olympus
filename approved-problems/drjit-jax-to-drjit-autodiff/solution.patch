@@ -1,0 +1,345 @@
+diff --git a/drjit/interop.py b/drjit/interop.py
+index 8e76c77a..e89cd91b 100644
+--- a/drjit/interop.py
++++ b/drjit/interop.py
+@@ -425,6 +425,9 @@ torch_wrapper = None
+ # See https://github.com/pytorch/pytorch/issues/117491
+ torch_desc_o = None
+ 
++# Lazily initialized wrapper used for JAX -> Dr.Jit calls
++jax_wrapper = None
++
+ def new_drjit_scope():
+     if dr.has_backend(dr.JitBackend.LLVM):
+         dr.detail.new_scope(dr.JitBackend.LLVM)
+@@ -520,6 +523,299 @@ def create_torch_wrapper():
+ 
+     return TorchWrapper
+ 
++
++def create_jax_wrapper():
++    """Create the eager-mode JAX -> Dr.Jit interoperability bridge."""
++    import jax
++    import numpy as np
++    from jax.extend.core import Primitive
++    from jax.interpreters import ad, batching
++
++    def is_grad_enabled(value):
++        return dr.is_array_v(value) and dr.grad_enabled(value)
++
++    def tangent_zero(aval):
++        return np.zeros(aval.shape, dtype=aval.to_tangent_aval().dtype)
++
++    class JaxWrapOp:
++        """Call-local description of one wrapped invocation."""
++
++        def __init__(self, func, input_desc, input_avals):
++            self.func = func
++            self.input_desc = input_desc
++            self.input_avals = input_avals
++
++            # JAX transformations call the wrapper with abstract tracers. Run
++            # the pure function once on representative values to determine its
++            # output PyTree and abstract values.
++            sample = tuple(
++                jax.numpy.zeros(aval.shape, aval.dtype)
++                for aval in input_avals
++            )
++            _, output_desc, output = self.run(sample)
++            self.output_desc = output_desc
++            output = from_drjit(tuple(output), 'jax')[0]
++            self.output_avals = tuple(jax.typeof(value) for value in output)
++            new_drjit_scope()
++
++        def run(self, inputs, enable_grad=False):
++            new_drjit_scope()
++            inputs = tuple(
++                jax.numpy.asarray(value)
++                if type(value) in (int, float, complex) or
++                   type(value).__module__ == 'jax._src.literals'
++                else value
++                for value in inputs
++            )
++            inputs = to_drjit(tuple(inputs), 'jax')
++
++            if enable_grad:
++                for value in inputs:
++                    if dr.is_array_v(value) and dr.is_diff_v(value) and \
++                       dr.is_float_v(value):
++                        dr.enable_grad(value)
++
++            args, kwargs = unflatten(self.input_desc, *inputs)
++            output_desc, *output = flatten(self.func(*args, **kwargs))
++
++            if hasattr(self, 'output_desc') and \
++               output_desc != self.output_desc:
++                raise TypeError(
++                    'drjit.wrap(): the wrapped function changed its output '
++                    'PyTree structure or leaf types.'
++                )
++
++            return inputs, output_desc, tuple(output)
++
++        def eval(self, *inputs):
++            _, _, output = self.run(inputs)
++            result = tuple(from_drjit(output, 'jax')[0])
++            new_drjit_scope()
++            return result
++
++        def jvp(self, inputs, tangents):
++            inputs_dr, _, output_dr = self.run(inputs, True)
++            tangents_dr = to_drjit(tuple(tangents), 'jax')
++
++            for value, tangent in zip(inputs_dr, tangents_dr):
++                if is_grad_enabled(value):
++                    dr.set_grad(value, tangent)
++
++            grad_output = dr.forward_to(output_dr)
++            result = []
++            for value, grad, aval in zip(
++                    output_dr, grad_output, self.output_avals):
++                if is_grad_enabled(value):
++                    result.append(from_drjit(grad, 'jax')[0])
++                else:
++                    result.append(tangent_zero(aval))
++
++            new_drjit_scope()
++            return tuple(result)
++
++        def vjp(self, inputs, cotangents):
++            inputs_dr, _, output_dr = self.run(inputs, True)
++            cotangents_dr = to_drjit(tuple(cotangents), 'jax')
++
++            dr.set_grad(output_dr, cotangents_dr)
++
++            grad_inputs = dr.backward_to(inputs_dr)
++            result = []
++            for value, grad, aval in zip(
++                    inputs_dr, grad_inputs, self.input_avals):
++                if is_grad_enabled(value):
++                    result.append(from_drjit(grad, 'jax')[0])
++                else:
++                    result.append(tangent_zero(aval))
++
++            new_drjit_scope()
++            return tuple(result)
++
++    # JAX reverse mode is implemented by transposing the linear JVP
++    # primitive. Keeping primal, JVP, and VJP as distinct primitives ensures
++    # that foreign Dr.Jit execution only happens once concrete values reach an
++    # eager implementation.
++    primal_p = Primitive('drjit_wrap')
++    primal_p.multiple_results = True
++    jvp_p = Primitive('drjit_wrap_jvp')
++    jvp_p.multiple_results = True
++    vjp_p = Primitive('drjit_wrap_vjp')
++    vjp_p.multiple_results = True
++
++    primal_p.def_impl(lambda *values, op: op.eval(*values))
++    primal_p.def_abstract_eval(
++        lambda *avals, op: op.output_avals
++    )
++
++    def jvp_impl(*values, op):
++        count = len(op.input_avals)
++        return op.jvp(values[:count], values[count:])
++
++    jvp_p.def_impl(jvp_impl)
++    jvp_p.def_abstract_eval(
++        lambda *avals, op: tuple(
++            aval.to_tangent_aval() for aval in op.output_avals
++        )
++    )
++
++    def vjp_impl(*values, op):
++        count = len(op.input_avals)
++        return op.vjp(values[:count], values[count:])
++
++    vjp_p.def_impl(vjp_impl)
++    vjp_p.def_abstract_eval(
++        lambda *avals, op: tuple(
++            aval.to_tangent_aval() for aval in op.input_avals
++        )
++    )
++
++    def jvp_rule(primals, tangents, *, op):
++        tangents = tuple(ad.instantiate_zeros(value) for value in tangents)
++        return (
++            primal_p.bind(*primals, op=op),
++            jvp_p.bind(*primals, *tangents, op=op)
++        )
++
++    def transpose_rule(cotangents, *values, op):
++        count = len(op.input_avals)
++        primals, tangents = values[:count], values[count:]
++        cotangents = tuple(
++            ad.instantiate_zeros(value) for value in cotangents
++        )
++        input_cotangents = vjp_p.bind(
++            *primals, *cotangents, op=op
++        )
++        return (None,) * count + tuple(
++            cotangent if ad.is_undefined_primal(tangent) else None
++            for tangent, cotangent in zip(tangents, input_cotangents)
++        )
++
++    ad.primitive_jvps[primal_p] = jvp_rule
++    ad.primitive_transposes[jvp_p] = transpose_rule
++
++    def normalize_batch_axis(value, batch_dim):
++        if batch_dim is None:
++            return None
++        if not isinstance(batch_dim, int):
++            raise TypeError(
++                'drjit.wrap(): only integer vmap axes are supported.'
++            )
++
++        rank = len(value.shape)
++        if batch_dim < -rank or batch_dim >= rank:
++            raise ValueError(
++                f'drjit.wrap(): mapped axis {batch_dim} is invalid for '
++                f'an input of rank {rank}.'
++            )
++        return batch_dim % rank
++
++    def batch_size_of(values, batch_dims):
++        axes = tuple(
++            normalize_batch_axis(value, dim)
++            for value, dim in zip(values, batch_dims)
++        )
++        sizes = tuple(
++            value.shape[axis]
++            for value, axis in zip(values, axes)
++            if axis is not None
++        )
++        if not sizes:
++            raise ValueError(
++                'drjit.wrap(): a batching rule requires a mapped input.'
++            )
++        if any(size != sizes[0] for size in sizes[1:]):
++            raise ValueError(
++                'drjit.wrap(): mapped inputs must have a common batch size.'
++            )
++        return sizes[0], axes
++
++    def batch_inputs(values, axes, batch_size):
++        return tuple(
++            batching.bdim_at_front(value, axis, batch_size)
++            for value, axis in zip(values, axes)
++        )
++
++    def evaluate_batch(primitive, values, batch_size, *, op):
++        result = []
++        output_count = None
++        for index in range(batch_size):
++            output = tuple(primitive.bind(
++                *(value[index] for value in values), op=op
++            ))
++            if output_count is None:
++                output_count = len(output)
++            elif len(output) != output_count:
++                raise TypeError(
++                    'drjit.wrap(): batched calls returned inconsistent '
++                    'numbers of output leaves.'
++                )
++            result.append(output)
++        return tuple(result)
++
++    def batch_output_avals(primitive, op):
++        if primitive is primal_p:
++            return op.output_avals
++        elif primitive is jvp_p:
++            return tuple(
++                aval.to_tangent_aval() for aval in op.output_avals
++            )
++        elif primitive is vjp_p:
++            return tuple(
++                aval.to_tangent_aval() for aval in op.input_avals
++            )
++        raise AssertionError('drjit.wrap(): unknown batched primitive.')
++
++    def stack_batch_outputs(per_example, output_avals):
++        if not per_example:
++            return tuple(
++                jax.numpy.empty((0,) + aval.shape, dtype=aval.dtype)
++                for aval in output_avals
++            )
++
++        output = []
++        for leaves in zip(*per_example):
++            first = jax.typeof(leaves[0])
++            if any(jax.typeof(value) != first for value in leaves[1:]):
++                raise TypeError(
++                    'drjit.wrap(): batched calls returned inconsistent '
++                    'output shapes or dtypes.'
++                )
++            output.append(jax.numpy.stack(leaves, axis=0))
++        return tuple(output)
++
++    def batching_rule(primitive, values, batch_dims, *, op):
++        batch_size, axes = batch_size_of(values, batch_dims)
++        values = batch_inputs(values, axes, batch_size)
++        per_example = evaluate_batch(
++            primitive, values, batch_size, op=op
++        )
++        result = stack_batch_outputs(
++            per_example, batch_output_avals(primitive, op)
++        )
++        return result, (0,) * len(result)
++
++    batching.primitive_batchers[primal_p] = \
++        lambda values, dims, *, op: \
++            batching_rule(primal_p, values, dims, op=op)
++    batching.primitive_batchers[jvp_p] = \
++        lambda values, dims, *, op: \
++            batching_rule(jvp_p, values, dims, op=op)
++    batching.primitive_batchers[vjp_p] = \
++        lambda values, dims, *, op: \
++            batching_rule(vjp_p, values, dims, op=op)
++
++    def decorate(func):
++        def wrapper(*args, **kwargs):
++            input_desc, *inputs = flatten((args, kwargs))
++            input_avals = tuple(jax.typeof(value) for value in inputs)
++            op = JaxWrapOp(func, input_desc, input_avals)
++            output = primal_p.bind(*inputs, op=op)
++            return unflatten(op.output_desc, *output)
++
++        return wrapper
++
++    return decorate
++
+ T = typing.TypeVar("T")
+ 
+ def wrap(source: typing.Union[str, types.ModuleType],
+@@ -604,11 +900,12 @@ def wrap(source: typing.Union[str, types.ModuleType],
+            errors.
+ 
+        * - ``jax`` → ``drjit``
+-         - .. centered:: ❌
+-         - .. centered:: ❌
+-         - .. centered:: ❌
+-         - This direction is currently unsupported. We plan to add it in
+-           the future.
++         - .. centered:: ✅
++         - .. centered:: ✅
++         - .. centered:: ✅
++         - **Limitation**: This direction supports eager JAX execution. The
++           wrapped operation cannot be staged using transformations such as
++           ``jax.jit``.
+ 
+     Please also refer to the documentation sections on :ref:`multi-framework
+     differentiation <interop_ad>` :ref:`associated caveats <interop_caveats>`.
+@@ -689,5 +986,12 @@ def wrap(source: typing.Union[str, types.ModuleType],
+             return wrapper_2
+ 
+         return wrapper
++    elif target == 'drjit' and source == 'jax':
++        global jax_wrapper
++
++        if jax_wrapper is None:
++            jax_wrapper = create_jax_wrapper()
++
++        return jax_wrapper
+     else:
+         raise ValueError("drjit.wrap(): unsupported combination of 'source' and 'target'.")

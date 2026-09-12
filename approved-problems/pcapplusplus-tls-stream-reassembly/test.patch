@@ -1,0 +1,1324 @@
+diff --git a/Tests/CMakeLists.txt b/Tests/CMakeLists.txt
+index f684a169..befd5a14 100644
+--- a/Tests/CMakeLists.txt
++++ b/Tests/CMakeLists.txt
+@@ -2,6 +2,7 @@ if(PCAPPP_BUILD_TESTS)
+   add_subdirectory(PcppTestFramework)
+   add_subdirectory(PcppTestUtilities)
+   add_subdirectory(Packet++Test)
++  add_subdirectory(TlsStreamTest)
+ 
+   if(PCAPPP_BUILD_PCAPPP)
+     add_subdirectory(Pcap++Test)
+diff --git a/Tests/TlsStreamTest/CMakeLists.txt b/Tests/TlsStreamTest/CMakeLists.txt
+new file mode 100644
+index 00000000..c95fe7b2
+--- /dev/null
++++ b/Tests/TlsStreamTest/CMakeLists.txt
+@@ -0,0 +1,28 @@
++add_executable(TlsStreamTest TlsStreamTest_d307d4.cpp)
++
++target_link_libraries(TlsStreamTest PRIVATE Packet++ EndianPortable)
++
++foreach(
++  scenario
++  RequiredCallbackOnly
++  SegmentedRecords
++  CoalescedRecords
++  HandshakeFraming
++  DirectionAndConnectionIsolation
++  OutOfOrderAndRetransmission
++  MissingDataRecovery
++  MalformedAndConfiguredBounds
++  ConnectionLifecycle
++  RawPacketAndCloseAll
++  PurgeClosedConnections
++  AutomaticFinRstLifecycle
++  IPv6Stream
++  InitialResynchronization
++)
++  add_test(
++    NAME TlsStream.${scenario}
++    COMMAND $<TARGET_FILE:TlsStreamTest> ${scenario}
++    WORKING_DIRECTORY $<TARGET_FILE_DIR:TlsStreamTest>
++  )
++  set_tests_properties(TlsStream.${scenario} PROPERTIES TIMEOUT 15)
++endforeach()
+diff --git a/Tests/TlsStreamTest/TlsStreamTest_d307d4.cpp b/Tests/TlsStreamTest/TlsStreamTest_d307d4.cpp
+new file mode 100644
+index 00000000..8f2db9f4
+--- /dev/null
++++ b/Tests/TlsStreamTest/TlsStreamTest_d307d4.cpp
+@@ -0,0 +1,1079 @@
++#include "EndianPortable.h"
++#include "EthLayer.h"
++#include "IPv4Layer.h"
++#include "IPv6Layer.h"
++#include "Packet.h"
++#include "PayloadLayer.h"
++#include "TcpLayer.h"
++#include "TlsReassembly.h"
++#include "UdpLayer.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdint>
++#include <ctime>
++#include <functional>
++#include <iostream>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <type_traits>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++namespace
++{
++	bool g_UseControlledTime = false;
++	std::time_t g_ControlledTime = 0;
++}
++
++extern "C" std::time_t time(std::time_t* result) noexcept
++{
++	std::time_t value = g_ControlledTime;
++	if (!g_UseControlledTime)
++	{
++		timespec currentTime = {};
++		clock_gettime(CLOCK_REALTIME, &currentTime);
++		value = currentTime.tv_sec;
++	}
++	if (result != nullptr)
++		*result = value;
++	return value;
++}
++
++namespace
++{
++	using Bytes = std::vector<uint8_t>;
++
++	void require(bool condition, const std::string& message)
++	{
++		if (!condition)
++			throw std::runtime_error(message);
++	}
++
++	Bytes makeRecord(uint8_t type, const Bytes& payload, uint16_t version = 0x0303)
++	{
++		Bytes result = { type, static_cast<uint8_t>(version >> 8), static_cast<uint8_t>(version),
++		                 static_cast<uint8_t>(payload.size() >> 8), static_cast<uint8_t>(payload.size()) };
++		result.insert(result.end(), payload.begin(), payload.end());
++		return result;
++	}
++
++	Bytes makeHandshake(uint8_t type, const Bytes& payload)
++	{
++		require(payload.size() <= 0xffffff, "test handshake is too large");
++		Bytes result = { type, static_cast<uint8_t>(payload.size() >> 16), static_cast<uint8_t>(payload.size() >> 8),
++		                 static_cast<uint8_t>(payload.size()) };
++		result.insert(result.end(), payload.begin(), payload.end());
++		return result;
++	}
++
++	struct RecordResult
++	{
++		int8_t side;
++		Bytes bytes;
++		Bytes payload;
++		pcpp::SSLRecordType type;
++		uint16_t version;
++		pcpp::ConnectionData connection;
++		std::chrono::time_point<std::chrono::high_resolution_clock> timestamp;
++	};
++
++	struct HandshakeResult
++	{
++		int8_t side;
++		Bytes bytes;
++		Bytes payload;
++		pcpp::SSLHandshakeType type;
++		pcpp::ConnectionData connection;
++	};
++
++	struct EventResult
++	{
++		int8_t side;
++		pcpp::TlsReassemblyEvent::EventType type;
++		size_t missingBytes;
++		size_t discardedBytes;
++		pcpp::ConnectionData connection;
++	};
++
++	struct EndResult
++	{
++		pcpp::ConnectionData connection;
++		pcpp::TcpReassembly::ConnectionEndReason reason;
++	};
++
++	struct Collector
++	{
++		std::vector<RecordResult> records;
++		std::vector<HandshakeResult> handshakes;
++		std::vector<EventResult> events;
++		std::vector<pcpp::ConnectionData> starts;
++		std::vector<EndResult> ends;
++		std::vector<std::string> closeOrder;
++	};
++
++	std::unique_ptr<pcpp::TlsReassembly> makeReassembly(
++	    Collector& collector, const pcpp::TlsReassemblyConfiguration& tlsConfig = pcpp::TlsReassemblyConfiguration(),
++	    const pcpp::TcpReassemblyConfiguration& tcpConfig = pcpp::TcpReassemblyConfiguration(),
++	    void* userCookie = nullptr)
++	{
++		return std::unique_ptr<pcpp::TlsReassembly>(new pcpp::TlsReassembly(
++		    [&collector, userCookie](int8_t side, const pcpp::TlsRecordData& data, void* cookie) {
++			    require(cookie == userCookie, "record callback changed the user cookie");
++			    RecordResult result;
++			    result.side = side;
++			    result.bytes.assign(data.getData(), data.getData() + data.getDataLength());
++			    result.payload.assign(data.getPayload(), data.getPayload() + data.getPayloadLength());
++			    result.type = data.getRecordType();
++			    result.version = data.getRecordVersion().asUInt();
++			    result.connection = data.getConnectionData();
++			    result.timestamp = data.getTimeStampPrecise();
++			    collector.records.push_back(result);
++		    },
++		    userCookie,
++		    [&collector, userCookie](int8_t side, const pcpp::TlsHandshakeData& data, void* cookie) {
++			    require(cookie == userCookie, "handshake callback changed the user cookie");
++			    HandshakeResult result;
++			    result.side = side;
++			    result.bytes.assign(data.getData(), data.getData() + data.getDataLength());
++			    result.payload.assign(data.getPayload(), data.getPayload() + data.getPayloadLength());
++			    result.type = data.getHandshakeType();
++			    result.connection = data.getConnectionData();
++			    collector.handshakes.push_back(result);
++		    },
++		    [&collector, userCookie](int8_t side, const pcpp::TlsReassemblyEvent& data, void* cookie) {
++			    require(cookie == userCookie, "event callback changed the user cookie");
++			    EventResult result;
++			    result.side = side;
++			    result.type = data.getType();
++			    result.missingBytes = data.getMissingByteCount();
++			    result.discardedBytes = data.getDiscardedByteCount();
++			    result.connection = data.getConnectionData();
++			    collector.events.push_back(result);
++			    if (result.type == pcpp::TlsReassemblyEvent::IncompleteDataOnConnectionEnd)
++				    collector.closeOrder.push_back("event");
++		    },
++		    [&collector, userCookie](const pcpp::ConnectionData& data, void* cookie) {
++			    require(cookie == userCookie, "connection-start callback changed the user cookie");
++			    collector.starts.push_back(data);
++		    },
++		    [&collector, userCookie](const pcpp::ConnectionData& data,
++			                             pcpp::TcpReassembly::ConnectionEndReason reason, void* cookie) {
++			    require(cookie == userCookie, "connection-end callback changed the user cookie");
++			    collector.ends.push_back({ data, reason });
++			    collector.closeOrder.push_back("end");
++		    },
++		    tcpConfig, tlsConfig));
++	}
++
++	pcpp::TcpReassembly::ReassemblyStatus feedIPv4(
++	    pcpp::TlsReassembly& reassembly, const Bytes& payload, uint32_t sequence,
++	    const char* source = "192.0.2.1", const char* destination = "198.51.100.2", uint16_t sourcePort = 443,
++	    uint16_t destinationPort = 50000, bool syn = false, bool fin = false, bool useRawPacket = false,
++	    bool rst = false)
++	{
++		pcpp::EthLayer eth(pcpp::MacAddress("00:11:22:33:44:55"), pcpp::MacAddress("00:66:77:88:99:aa"),
++		                   PCPP_ETHERTYPE_IP);
++		pcpp::IPv4Layer ip{ pcpp::IPv4Address(source), pcpp::IPv4Address(destination) };
++		pcpp::TcpLayer tcp(sourcePort, destinationPort);
++		tcp.getTcpHeader()->sequenceNumber = htobe32(sequence);
++		tcp.getTcpHeader()->synFlag = syn ? 1 : 0;
++		tcp.getTcpHeader()->finFlag = fin ? 1 : 0;
++		tcp.getTcpHeader()->rstFlag = rst ? 1 : 0;
++		tcp.getTcpHeader()->ackFlag = syn ? 0 : 1;
++		pcpp::Packet packet(256 + payload.size());
++		if (useRawPacket)
++			require(packet.addLayer(&eth), "cannot add Ethernet layer");
++		require(packet.addLayer(&ip), "cannot add IPv4 layer");
++		require(packet.addLayer(&tcp), "cannot add TCP layer");
++		if (!payload.empty())
++		{
++			pcpp::PayloadLayer data(payload.data(), payload.size());
++			require(packet.addLayer(&data), "cannot add payload layer");
++			packet.computeCalculateFields();
++			return useRawPacket ? reassembly.reassemblePacket(packet.getRawPacket())
++			                    : reassembly.reassemblePacket(packet);
++		}
++		packet.computeCalculateFields();
++		return useRawPacket ? reassembly.reassemblePacket(packet.getRawPacket()) : reassembly.reassemblePacket(packet);
++	}
++
++	pcpp::TcpReassembly::ReassemblyStatus feedIPv4(
++	    const std::unique_ptr<pcpp::TlsReassembly>& reassembly, const Bytes& payload, uint32_t sequence,
++	    const char* source = "192.0.2.1", const char* destination = "198.51.100.2", uint16_t sourcePort = 443,
++	    uint16_t destinationPort = 50000, bool syn = false, bool fin = false, bool useRawPacket = false,
++	    bool rst = false)
++	{
++		return feedIPv4(*reassembly, payload, sequence, source, destination, sourcePort, destinationPort, syn, fin,
++		                useRawPacket, rst);
++	}
++
++	pcpp::TcpReassembly::ReassemblyStatus feedIPv6(pcpp::TlsReassembly& reassembly, const Bytes& payload,
++	                                                  uint32_t sequence, bool syn = false)
++	{
++		pcpp::IPv6Layer ip(pcpp::IPv6Address("2001:db8::1"), pcpp::IPv6Address("2001:db8::2"));
++		pcpp::TcpLayer tcp(443, 50001);
++		tcp.getTcpHeader()->sequenceNumber = htobe32(sequence);
++		tcp.getTcpHeader()->synFlag = syn ? 1 : 0;
++		tcp.getTcpHeader()->ackFlag = syn ? 0 : 1;
++		pcpp::Packet packet(256 + payload.size());
++		require(packet.addLayer(&ip), "cannot add IPv6 layer");
++		require(packet.addLayer(&tcp), "cannot add TCP layer");
++		if (!payload.empty())
++		{
++			pcpp::PayloadLayer data(payload.data(), payload.size());
++			require(packet.addLayer(&data), "cannot add IPv6 payload");
++			packet.computeCalculateFields();
++			return reassembly.reassemblePacket(packet);
++		}
++		packet.computeCalculateFields();
++		return reassembly.reassemblePacket(packet);
++	}
++
++	pcpp::TcpReassembly::ReassemblyStatus feedIPv6(const std::unique_ptr<pcpp::TlsReassembly>& reassembly,
++	                                                  const Bytes& payload, uint32_t sequence, bool syn = false)
++	{
++		return feedIPv6(*reassembly, payload, sequence, syn);
++	}
++
++	void feedChunks(pcpp::TlsReassembly& reassembly, const Bytes& stream, uint32_t firstSequence,
++	                const std::vector<size_t>& chunkSizes)
++	{
++		size_t offset = 0;
++		uint32_t sequence = firstSequence;
++		for (size_t chunkSize : chunkSizes)
++		{
++			require(offset + chunkSize <= stream.size(), "chunk fixture overruns stream");
++			Bytes chunk(stream.begin() + offset, stream.begin() + offset + chunkSize);
++			feedIPv4(reassembly, chunk, sequence);
++			offset += chunkSize;
++			sequence += static_cast<uint32_t>(chunkSize);
++		}
++		if (offset < stream.size())
++		{
++			Bytes chunk(stream.begin() + offset, stream.end());
++			feedIPv4(reassembly, chunk, sequence);
++		}
++	}
++
++	void feedChunks(const std::unique_ptr<pcpp::TlsReassembly>& reassembly, const Bytes& stream,
++	                uint32_t firstSequence, const std::vector<size_t>& chunkSizes)
++	{
++		feedChunks(*reassembly, stream, firstSequence, chunkSizes);
++	}
++
++	void requiredCallbackOnly()
++	{
++		static_assert(
++		    std::is_same<decltype(pcpp::TlsReassemblyConfiguration::maxRecordPayloadSize), size_t>::value,
++		    "record payload limit must have type size_t");
++		static_assert(
++		    std::is_same<decltype(pcpp::TlsReassemblyConfiguration::maxHandshakeMessageSize), size_t>::value,
++		    "handshake payload limit must have type size_t");
++		static_assert(std::is_same<decltype(std::declval<const pcpp::TlsRecordData&>().getConnectionData()),
++		                           const pcpp::ConnectionData&>::value,
++		              "record connection getter must return a const reference");
++		static_assert(std::is_same<decltype(std::declval<const pcpp::TlsHandshakeData&>().getConnectionData()),
++		                           const pcpp::ConnectionData&>::value,
++		              "handshake connection getter must return a const reference");
++		static_assert(std::is_same<decltype(std::declval<const pcpp::TlsReassemblyEvent&>().getConnectionData()),
++		                           const pcpp::ConnectionData&>::value,
++		              "event connection getter must return a const reference");
++		static_assert(std::is_same<decltype(std::declval<const pcpp::TlsReassembly&>().getConnectionInformation()),
++		                           const pcpp::TcpReassembly::ConnectionInfoList&>::value,
++		              "connection information must be a const query returning a const reference");
++		static_assert(std::is_same<decltype(std::declval<const pcpp::TlsReassembly&>().isConnectionOpen(
++		                               std::declval<const pcpp::ConnectionData&>())),
++		                           int>::value,
++		              "connection-open query must preserve the TcpReassembly return type");
++
++		std::vector<Bytes> records;
++		int8_t observedSide = -1;
++		bool cookieWasNull = false;
++		pcpp::TlsReassembly reassembly(
++		    [&records, &observedSide, &cookieWasNull](int8_t side, const pcpp::TlsRecordData& record, void* cookie) {
++			    observedSide = side;
++			    cookieWasNull = cookie == nullptr;
++			    records.emplace_back(record.getData(), record.getData() + record.getDataLength());
++		    });
++
++		feedIPv4(reassembly, {}, 500, "192.0.2.90", "198.51.100.90", 8443, 59000, true);
++		Bytes expected = makeRecord(23, { 0x10, 0x20, 0x30 });
++		feedIPv4(reassembly, expected, 501, "192.0.2.90", "198.51.100.90", 8443, 59000);
++		require(records.size() == 1 && records[0] == expected, "record-only construction did not emit the record");
++		require(observedSide == 0 && cookieWasNull, "record-only construction did not use callback defaults");
++	}
++
++	void segmentedRecords()
++	{
++		Collector collector;
++		pcpp::TlsReassemblyConfiguration defaults;
++		require(defaults.maxRecordPayloadSize == 18 * 1024 && defaults.maxHandshakeMessageSize == 0xffffff,
++		        "TLS reassembly configuration defaults changed");
++		auto reassembly = makeReassembly(collector);
++		feedIPv4(reassembly, {}, 1000, "192.0.2.1", "198.51.100.2", 443, 50000, true);
++
++		Bytes payload(37);
++		for (size_t index = 0; index < payload.size(); ++index)
++			payload[index] = static_cast<uint8_t>(0x30 + index);
++		Bytes expected = makeRecord(23, payload);
++		feedChunks(reassembly, expected, 1001, { 1, 1, 1, 1, 1, 2, 7, 3 });
++
++		require(collector.records.size() == 1, "segmented record was not emitted exactly once");
++		const RecordResult& actual = collector.records[0];
++		require(actual.bytes == expected && actual.payload == payload, "segmented record bytes changed");
++		require(actual.type == pcpp::SSL_APPLICATION_DATA && actual.version == 0x0303,
++		        "record header getters changed values");
++		require(actual.connection.srcPort == 443 && actual.connection.dstPort == 50000,
++		        "record lost connection metadata");
++		require(actual.timestamp.time_since_epoch().count() != 0, "record lost its TCP packet timestamp");
++		require(reassembly->getConnectionInformation().size() == 1, "connection forwarding is unavailable");
++		require(reassembly->isConnectionOpen(actual.connection) > 0, "open TLS connection is not reported open");
++
++		Bytes aboveConventionalLimit = makeRecord(23, Bytes(17 * 1024, 0x7a));
++		const uint32_t aboveLimitSequence = 1001 + static_cast<uint32_t>(expected.size());
++		feedIPv4(reassembly, aboveConventionalLimit, aboveLimitSequence);
++		require(collector.records.size() == 2 && collector.records[1].bytes == aboveConventionalLimit,
++		        "default record limit rejected a payload between 16 KiB and 18 KiB");
++
++		Bytes exactLimit = makeRecord(23, Bytes(18 * 1024, 0x7b));
++		const uint32_t exactLimitSequence = aboveLimitSequence + static_cast<uint32_t>(aboveConventionalLimit.size());
++		feedIPv4(reassembly, Bytes(exactLimit.begin(), exactLimit.begin() + 4), exactLimitSequence);
++		require(collector.records.size() == 2, "four-byte record-header prefix emitted a record early");
++		feedIPv4(reassembly, Bytes(exactLimit.begin() + 4, exactLimit.end()), exactLimitSequence + 4);
++		require(collector.records.size() == 3 && collector.records[2].bytes == exactLimit,
++		        "split record at the inclusive default payload limit was rejected");
++
++		feedIPv4(reassembly, {}, 26000, "192.0.2.91", "198.51.100.91", 9443, 59001, true);
++		Bytes timestampedRecord = makeRecord(23, { 0x81, 0x82 });
++		auto feedTimestampedFragment = [&](const Bytes& fragment, uint32_t sequence, const timespec& timestamp) {
++			pcpp::IPv4Layer timestampIp(pcpp::IPv4Address("192.0.2.91"), pcpp::IPv4Address("198.51.100.91"));
++			pcpp::TcpLayer timestampTcp(9443, 59001);
++			timestampTcp.getTcpHeader()->sequenceNumber = htobe32(sequence);
++			timestampTcp.getTcpHeader()->ackFlag = 1;
++			pcpp::PayloadLayer timestampPayload(fragment.data(), fragment.size());
++			pcpp::Packet timestampPacket(256);
++			require(timestampPacket.addLayer(&timestampIp) && timestampPacket.addLayer(&timestampTcp) &&
++			            timestampPacket.addLayer(&timestampPayload),
++			        "cannot construct timestamp fixture");
++			timestampPacket.computeCalculateFields();
++			require(timestampPacket.getRawPacket()->setPacketTimeStamp(timestamp),
++			        "cannot set timestamp fixture");
++			reassembly->reassemblePacket(timestampPacket);
++		};
++		timespec firstFragmentTimestamp = { 123456700, 111111111 };
++		timespec completingFragmentTimestamp = { 123456789, 987654321 };
++		feedTimestampedFragment(Bytes(timestampedRecord.begin(), timestampedRecord.begin() + 4), 26001,
++		                        firstFragmentTimestamp);
++		require(collector.records.size() == 3, "timestamp fixture emitted before its header was complete");
++		feedTimestampedFragment(Bytes(timestampedRecord.begin() + 4, timestampedRecord.end()), 26005,
++		                        completingFragmentTimestamp);
++		auto expectedTimestamp = std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(
++		    std::chrono::seconds(completingFragmentTimestamp.tv_sec) +
++		    std::chrono::nanoseconds(completingFragmentTimestamp.tv_nsec));
++		require(collector.records.size() == 4 && collector.records.back().bytes == timestampedRecord &&
++		            collector.records.back().timestamp.time_since_epoch() == expectedTimestamp,
++		        "record timestamp did not preserve the TCP packet timestamp that completed it");
++	}
++
++	void coalescedRecords()
++	{
++		Collector collector;
++		auto reassembly = makeReassembly(collector);
++		feedIPv4(reassembly, {}, 2000, "192.0.2.3", "198.51.100.4", 8443, 50002, true);
++		Bytes first = makeRecord(20, { 1 }, 0x0300);
++		Bytes second = makeRecord(21, { 2, 40 }, 0x0301);
++		Bytes third = makeRecord(23, { 3 }, 0x0302);
++		Bytes fourth = makeRecord(23, { 4, 5, 6, 7 });
++		Bytes stream = first;
++		stream.insert(stream.end(), second.begin(), second.end());
++		stream.insert(stream.end(), third.begin(), third.end());
++		stream.insert(stream.end(), fourth.begin(), fourth.end());
++		feedIPv4(reassembly, stream, 2001, "192.0.2.3", "198.51.100.4", 8443, 50002);
++
++		require(collector.records.size() == 4, "coalesced records were not separated");
++		require(collector.records[0].bytes == first && collector.records[1].bytes == second &&
++		            collector.records[2].bytes == third && collector.records[3].bytes == fourth,
++		        "coalesced record order or bytes changed");
++		require(collector.records[0].type == pcpp::SSL_CHANGE_CIPHER_SPEC &&
++		            collector.records[1].type == pcpp::SSL_ALERT,
++		        "coalesced record types changed");
++		require(collector.records[0].version == 0x0300 && collector.records[1].version == 0x0301 &&
++		            collector.records[2].version == 0x0302 && collector.records[3].version == 0x0303,
++		        "a supported TLS record version was not preserved");
++	}
++
++	void handshakeFraming()
++	{
++		Collector collector;
++		auto reassembly = makeReassembly(collector);
++		feedIPv4(reassembly, {}, 3000, "192.0.2.1", "198.51.100.2", 443, 50000, true);
++
++		Bytes largePayload(70000);
++		for (size_t index = 0; index < largePayload.size(); ++index)
++			largePayload[index] = static_cast<uint8_t>(index * 17);
++		Bytes expectedHandshake = makeHandshake(11, largePayload);
++		Bytes recordStream;
++		for (size_t offset = 0; offset < expectedHandshake.size();)
++		{
++			size_t chunkSize = std::min<size_t>(15000, expectedHandshake.size() - offset);
++			Bytes recordPayload(expectedHandshake.begin() + offset, expectedHandshake.begin() + offset + chunkSize);
++			Bytes encoded = makeRecord(22, recordPayload);
++			recordStream.insert(recordStream.end(), encoded.begin(), encoded.end());
++			offset += chunkSize;
++		}
++		feedChunks(reassembly, recordStream, 3001, { 2, 4, 9000, 7000, 16000, 13000 });
++		require(collector.handshakes.size() == 1, "cross-record 24-bit handshake was not emitted once");
++		require(collector.handshakes[0].bytes == expectedHandshake && collector.handshakes[0].payload == largePayload,
++		        "large handshake bytes changed");
++		require(collector.handshakes[0].type == pcpp::SSL_CERTIFICATE,
++		        "large handshake type was decoded incorrectly");
++		require(collector.handshakes[0].connection.srcPort == 443 &&
++		            collector.handshakes[0].connection.dstPort == 50000,
++		        "handshake lost connection metadata");
++
++		Bytes smallOne = makeHandshake(0, {});
++		Bytes smallTwo = makeHandshake(250, { 9, 8, 7 });
++		Bytes combined = smallOne;
++		combined.insert(combined.end(), smallTwo.begin(), smallTwo.end());
++		Bytes encoded = makeRecord(22, combined);
++		feedIPv4(reassembly, encoded, 3001 + static_cast<uint32_t>(recordStream.size()));
++		require(collector.handshakes.size() == 3, "multiple handshakes in one record were collapsed");
++		require(collector.handshakes[1].bytes == smallOne && collector.handshakes[2].bytes == smallTwo,
++		        "coalesced handshake bytes or order changed");
++
++		Bytes interrupted = makeHandshake(2, { 1, 2, 3, 4, 5 });
++		Bytes interruptedFirst = makeRecord(22, Bytes(interrupted.begin(), interrupted.begin() + 3));
++		Bytes application = makeRecord(23, { 0xaa, 0xbb });
++		Bytes interruptedSecond = makeRecord(22, Bytes(interrupted.begin() + 3, interrupted.end()));
++		Bytes mixedStream = interruptedFirst;
++		mixedStream.insert(mixedStream.end(), application.begin(), application.end());
++		mixedStream.insert(mixedStream.end(), interruptedSecond.begin(), interruptedSecond.end());
++		feedIPv4(reassembly, mixedStream,
++		         3001 + static_cast<uint32_t>(recordStream.size() + encoded.size()));
++		require(collector.handshakes.size() == 4 && collector.handshakes[3].bytes == interrupted,
++		        "a non-handshake record discarded or contaminated an incomplete handshake");
++	}
++
++	void directionAndConnectionIsolation()
++	{
++		Collector collector;
++		auto reassembly = makeReassembly(collector);
++		Bytes first = makeRecord(23, { 1, 2, 3, 4 });
++		Bytes second = makeRecord(21, { 2, 10 });
++		Bytes reverse = makeRecord(20, { 1 });
++
++		feedIPv4(reassembly, {}, 4000, "192.0.2.10", "198.51.100.10", 443, 51000, true);
++		feedIPv4(reassembly, {}, 5000, "192.0.2.20", "198.51.100.20", 443, 52000, true);
++		feedIPv4(reassembly, {}, 6000, "198.51.100.10", "192.0.2.10", 51000, 443, true);
++
++		feedIPv4(reassembly, Bytes(first.begin(), first.begin() + 3), 4001, "192.0.2.10", "198.51.100.10", 443,
++		         51000);
++		feedIPv4(reassembly, Bytes(second.begin(), second.begin() + 4), 5001, "192.0.2.20", "198.51.100.20", 443,
++		         52000);
++		feedIPv4(reassembly, Bytes(reverse.begin(), reverse.begin() + 2), 6001, "198.51.100.10", "192.0.2.10",
++		         51000, 443);
++		require(collector.records.empty(), "partial streams leaked across a direction or connection");
++
++		feedIPv4(reassembly, Bytes(second.begin() + 4, second.end()), 5005, "192.0.2.20", "198.51.100.20", 443,
++		         52000);
++		feedIPv4(reassembly, Bytes(first.begin() + 3, first.end()), 4004, "192.0.2.10", "198.51.100.10", 443,
++		         51000);
++		feedIPv4(reassembly, Bytes(reverse.begin() + 2, reverse.end()), 6003, "198.51.100.10", "192.0.2.10",
++		         51000, 443);
++
++		require(collector.records.size() == 3, "isolated streams did not all complete");
++		require(collector.records[0].bytes == second && collector.records[1].bytes == first &&
++		            collector.records[2].bytes == reverse,
++		        "interleaved streams changed record ownership or order");
++		require(collector.records[1].connection.flowKey == collector.records[2].connection.flowKey &&
++		            collector.records[1].side != collector.records[2].side,
++		        "two directions of one connection were not distinguished");
++		require(collector.records[0].connection.flowKey != collector.records[1].connection.flowKey,
++		        "different connections shared state");
++
++		Bytes forwardHandshake = makeHandshake(1, { 0xa1, 0xa2, 0xa3 });
++		Bytes reverseHandshake = makeHandshake(2, { 0xb1, 0xb2 });
++		Bytes forwardFirst = makeRecord(22, Bytes(forwardHandshake.begin(), forwardHandshake.begin() + 3));
++		Bytes forwardSecond = makeRecord(22, Bytes(forwardHandshake.begin() + 3, forwardHandshake.end()));
++		Bytes reverseFirst = makeRecord(22, Bytes(reverseHandshake.begin(), reverseHandshake.begin() + 3));
++		Bytes reverseSecond = makeRecord(22, Bytes(reverseHandshake.begin() + 3, reverseHandshake.end()));
++
++		feedIPv4(reassembly, forwardFirst, 4001 + static_cast<uint32_t>(first.size()), "192.0.2.10",
++		         "198.51.100.10", 443, 51000);
++		feedIPv4(reassembly, reverseFirst, 6001 + static_cast<uint32_t>(reverse.size()), "198.51.100.10",
++		         "192.0.2.10", 51000, 443);
++		require(collector.handshakes.empty(), "partial handshakes completed across directions");
++		feedIPv4(reassembly, reverseSecond,
++		         6001 + static_cast<uint32_t>(reverse.size() + reverseFirst.size()), "198.51.100.10",
++		         "192.0.2.10", 51000, 443);
++		feedIPv4(reassembly, forwardSecond,
++		         4001 + static_cast<uint32_t>(first.size() + forwardFirst.size()), "192.0.2.10",
++		         "198.51.100.10", 443, 51000);
++		require(collector.handshakes.size() == 2, "directional handshakes did not complete independently");
++		require(collector.handshakes[0].bytes == reverseHandshake && collector.handshakes[0].side == 1 &&
++		            collector.handshakes[1].bytes == forwardHandshake && collector.handshakes[1].side == 0,
++		        "interleaved handshake bytes or callback sides crossed directions");
++	}
++
++	void outOfOrderAndRetransmission()
++	{
++		Collector collector;
++		auto reassembly = makeReassembly(collector);
++		require(feedIPv4(reassembly, {}, 7000, "203.0.113.1", "203.0.113.2", 443, 53000, true) ==
++		            pcpp::TcpReassembly::TcpMessageHandled,
++		        "ordinary TCP packet status was not forwarded");
++		Bytes expected = makeRecord(23, { 9, 8, 7, 6, 5, 4, 3, 2 });
++		Bytes head(expected.begin(), expected.begin() + 4);
++		Bytes tail(expected.begin() + 4, expected.end());
++		require(feedIPv4(reassembly, tail, 7005, "203.0.113.1", "203.0.113.2", 443, 53000) ==
++		            pcpp::TcpReassembly::OutOfOrderTcpMessageBuffered,
++		        "out-of-order record tail was not buffered");
++		require(collector.records.empty(), "out-of-order tail emitted a record early");
++		require(feedIPv4(reassembly, head, 7001, "203.0.113.1", "203.0.113.2", 443, 53000) ==
++		            pcpp::TcpReassembly::TcpMessageHandled,
++		        "in-order TCP packet status was not forwarded");
++		require(collector.records.size() == 1 && collector.records[0].bytes == expected,
++		        "out-of-order record was not reconstructed");
++
++		require(feedIPv4(reassembly, head, 7001, "203.0.113.1", "203.0.113.2", 443, 53000) ==
++		            pcpp::TcpReassembly::Ignore_Retransimission,
++		        "retransmission status was not forwarded");
++		require(feedIPv4(reassembly, tail, 7005, "203.0.113.1", "203.0.113.2", 443, 53000) ==
++		            pcpp::TcpReassembly::Ignore_Retransimission,
++		        "tail retransmission status was not forwarded");
++		require(collector.records.size() == 1, "retransmission emitted a duplicate TLS record");
++
++		require(feedIPv4(reassembly, {}, 7014, "203.0.113.1", "203.0.113.2", 443, 53000) ==
++		            pcpp::TcpReassembly::Ignore_PacketWithNoData,
++		        "no-data ACK status was not forwarded");
++		require(feedIPv4(reassembly, {}, 7014, "203.0.113.1", "203.0.113.2", 443, 53000, false, false,
++		                 false, true) == pcpp::TcpReassembly::FIN_RSTWithNoData,
++		        "RST status was not forwarded");
++		require(feedIPv4(reassembly, expected, 7014, "203.0.113.1", "203.0.113.2", 443, 53000) ==
++		            pcpp::TcpReassembly::Ignore_PacketOfClosedFlow,
++		        "closed-flow status was not forwarded");
++
++		pcpp::EthLayer ethernet(pcpp::MacAddress("00:11:22:33:44:55"), pcpp::MacAddress("00:66:77:88:99:aa"),
++		                        PCPP_ETHERTYPE_ARP);
++		pcpp::PayloadLayer ethernetPayload(expected.data(), expected.size());
++		pcpp::Packet nonIpPacket(256);
++		require(nonIpPacket.addLayer(&ethernet) && nonIpPacket.addLayer(&ethernetPayload),
++		        "cannot construct non-IP status fixture");
++		nonIpPacket.computeCalculateFields();
++		require(reassembly->reassemblePacket(nonIpPacket) == pcpp::TcpReassembly::NonIpPacket,
++		        "non-IP status was not forwarded");
++		require(reassembly->reassemblePacket(nonIpPacket.getRawPacket()) == pcpp::TcpReassembly::NonIpPacket,
++		        "raw non-IP status was not forwarded");
++
++		pcpp::IPv4Layer ip(pcpp::IPv4Address("192.0.2.80"), pcpp::IPv4Address("198.51.100.80"));
++		pcpp::UdpLayer udp(1234, 4321);
++		pcpp::PayloadLayer udpPayload(expected.data(), expected.size());
++		pcpp::EthLayer ipv4Ethernet(pcpp::MacAddress("00:11:22:33:44:55"),
++		                            pcpp::MacAddress("00:66:77:88:99:aa"), PCPP_ETHERTYPE_IP);
++		pcpp::Packet nonTcpPacket(256);
++		require(nonTcpPacket.addLayer(&ipv4Ethernet) && nonTcpPacket.addLayer(&ip) && nonTcpPacket.addLayer(&udp) &&
++		            nonTcpPacket.addLayer(&udpPayload),
++		        "cannot construct non-TCP status fixture");
++		nonTcpPacket.computeCalculateFields();
++		require(reassembly->reassemblePacket(nonTcpPacket) == pcpp::TcpReassembly::NonTcpPacket,
++		        "non-TCP status was not forwarded");
++		require(reassembly->reassemblePacket(nonTcpPacket.getRawPacket()) == pcpp::TcpReassembly::NonTcpPacket,
++		        "raw non-TCP status was not forwarded");
++	}
++
++	void missingDataRecovery()
++	{
++		Collector collector;
++		auto reassembly = makeReassembly(collector);
++		feedIPv4(reassembly, {}, 8000, "203.0.113.10", "203.0.113.20", 443, 54000, true);
++		feedIPv4(reassembly, {}, 9000, "203.0.113.20", "203.0.113.10", 54000, 443, true);
++		Bytes unaffectedHandshake = makeHandshake(2, { 7, 8, 9, 10 });
++		Bytes unaffectedFirst = makeRecord(
++		    22, Bytes(unaffectedHandshake.begin(), unaffectedHandshake.begin() + 3));
++		Bytes unaffectedSecond = makeRecord(
++		    22, Bytes(unaffectedHandshake.begin() + 3, unaffectedHandshake.end()));
++		feedIPv4(reassembly, unaffectedFirst, 9001, "203.0.113.20", "203.0.113.10", 54000, 443);
++
++		Bytes partialHandshake = makeRecord(22, { 1, 0, 0 });
++		feedIPv4(reassembly, partialHandshake, 8001, "203.0.113.10", "203.0.113.20", 443, 54000);
++		Bytes partialRecord = { 23, 3, 3, 0, 6 };
++		feedIPv4(reassembly, partialRecord, 8001 + partialHandshake.size(), "203.0.113.10", "203.0.113.20", 443,
++		         54000);
++		Bytes recovered = makeRecord(23, { 0x71, 0x72 });
++		uint32_t recoveredSequence = 8001 + static_cast<uint32_t>(partialHandshake.size() + partialRecord.size()) + 4;
++		feedIPv4(reassembly, recovered, recoveredSequence, "203.0.113.10", "203.0.113.20", 443, 54000);
++		Bytes crossGapContinuation = makeRecord(22, { 2, 0xc1, 0xc2 });
++		feedIPv4(reassembly, crossGapContinuation,
++		         recoveredSequence + static_cast<uint32_t>(recovered.size()), "203.0.113.10", "203.0.113.20",
++		         443, 54000);
++		require(collector.records.size() == 2 && collector.records[0].bytes == unaffectedFirst &&
++		            collector.records[1].bytes == partialHandshake,
++		        "out-of-order bytes emitted before loss was declared");
++
++		Bytes reverseTrigger = makeRecord(21, { 1, 0 });
++		feedIPv4(reassembly, reverseTrigger, 9001 + static_cast<uint32_t>(unaffectedFirst.size()),
++		         "203.0.113.20", "203.0.113.10", 54000, 443);
++		feedIPv4(reassembly, unaffectedSecond,
++		         9001 + static_cast<uint32_t>(unaffectedFirst.size() + reverseTrigger.size()),
++		         "203.0.113.20", "203.0.113.10", 54000, 443);
++		auto loss = std::find_if(collector.events.begin(), collector.events.end(), [](const EventResult& event) {
++			return event.type == pcpp::TlsReassemblyEvent::TcpDataMissing;
++		});
++		require(loss != collector.events.end(), "TCP loss was not surfaced");
++		require(loss->side == 0 && loss->missingBytes == 4 && loss->discardedBytes == 8,
++		        "loss event has the wrong side, missing count, or discarded count");
++		require(loss->connection.flowKey == collector.starts[0].flowKey,
++		        "loss event lost connection metadata");
++		require(collector.events.size() == 1,
++		        "synthetic TCP missing-data text was reported as invalid network TLS data");
++		require(collector.records.size() == 6 && collector.records[0].bytes == unaffectedFirst &&
++		            collector.records[1].bytes == partialHandshake && collector.records[2].bytes == recovered &&
++		            collector.records[3].bytes == crossGapContinuation && collector.records[4].bytes == reverseTrigger &&
++		            collector.records[5].bytes == unaffectedSecond,
++		        "TCP loss fabricated a record or failed to recover the later records in order");
++		require(collector.handshakes.size() == 1 && collector.handshakes[0].bytes == unaffectedHandshake &&
++		            collector.handshakes[0].side == 1,
++		        "a TCP gap discarded the unaffected direction's handshake or completed the affected one");
++
++		Collector cleanGapCollector;
++		auto cleanGapReassembly = makeReassembly(cleanGapCollector);
++		feedIPv4(cleanGapReassembly, {}, 34000, "192.0.2.103", "198.51.100.103", 7446, 60003, true);
++		feedIPv4(cleanGapReassembly, {}, 35000, "198.51.100.103", "192.0.2.103", 60003, 7446, true);
++		Bytes beforeCleanGap = makeRecord(23, { 0xe1 });
++		feedIPv4(cleanGapReassembly, beforeCleanGap, 34001, "192.0.2.103", "198.51.100.103", 7446, 60003);
++		Bytes afterCleanGap = makeRecord(23, { 0xe2 });
++		feedIPv4(cleanGapReassembly, afterCleanGap,
++		         34001 + static_cast<uint32_t>(beforeCleanGap.size()) + 5, "192.0.2.103", "198.51.100.103",
++		         7446, 60003);
++		feedIPv4(cleanGapReassembly, makeRecord(23, { 0xe3 }), 35001, "198.51.100.103", "192.0.2.103", 60003,
++		         7446);
++		auto cleanLoss = std::find_if(cleanGapCollector.events.begin(), cleanGapCollector.events.end(),
++		                              [](const EventResult& event) {
++			                              return event.type == pcpp::TlsReassemblyEvent::TcpDataMissing;
++		                              });
++		require(cleanLoss != cleanGapCollector.events.end() && cleanLoss->side == 0 &&
++		            cleanLoss->missingBytes == 5 && cleanLoss->discardedBytes == 0,
++		        "a TCP gap with no buffered TLS state was not reported accurately");
++	}
++
++	void malformedAndConfiguredBounds()
++	{
++		Collector collector;
++		pcpp::TlsReassemblyConfiguration config(16, 6);
++		auto reassembly = makeReassembly(collector, config);
++		feedIPv4(reassembly, {}, 10000, "192.0.2.30", "198.51.100.30", 1234, 55000, true);
++
++		Bytes malformed = { 19, 3, 3, 0, 1, 0xaa, 23, 3, 4, 0, 1, 0xbb, 23, 3, 3, 0, 0,
++		                    23, 3, 3, 0, 17, 0x99, 0x99, 0x99 };
++		Bytes maximum = makeRecord(23, Bytes(16, 0x5a));
++		malformed.insert(malformed.end(), maximum.begin(), maximum.end());
++		feedIPv4(reassembly, malformed, 10001, "192.0.2.30", "198.51.100.30", 1234, 55000);
++		require(collector.records.size() == 1 && collector.records[0].bytes == maximum,
++		        "malformed or over-limit data blocked the next bounded record");
++		require(std::any_of(collector.events.begin(), collector.events.end(), [](const EventResult& event) {
++			return event.type == pcpp::TlsReassemblyEvent::InvalidTlsData && event.discardedBytes > 0;
++		}),
++		        "discarded malformed TLS data was not reported");
++
++		Bytes oversizedHandshake = makeHandshake(1, Bytes(7, 0x60));
++		Bytes validHandshake = makeHandshake(0, Bytes(6, 0x61));
++		Bytes firstRecord = makeRecord(22, oversizedHandshake);
++		Bytes secondRecord = makeRecord(22, validHandshake);
++		size_t recordsBeforeOversizedHandshake = collector.records.size();
++		size_t eventsBeforeOversizedHandshake = collector.events.size();
++		feedIPv4(reassembly, firstRecord, 10001 + malformed.size(), "192.0.2.30", "198.51.100.30", 1234, 55000);
++		require(collector.handshakes.empty(), "oversized handshake was emitted");
++		require(collector.records.size() == recordsBeforeOversizedHandshake + 1 &&
++		            collector.records.back().bytes == firstRecord,
++		        "rejecting an inner handshake suppressed its complete TLS record");
++		size_t oversizedHandshakeDiscarded = 0;
++		for (size_t index = eventsBeforeOversizedHandshake; index < collector.events.size(); ++index)
++			if (collector.events[index].type == pcpp::TlsReassemblyEvent::InvalidTlsData)
++				oversizedHandshakeDiscarded += collector.events[index].discardedBytes;
++		require(oversizedHandshakeDiscarded == oversizedHandshake.size(),
++		        "oversized handshake rejection was not reported as invalid TLS data");
++
++		feedIPv4(reassembly, {}, 10100, "192.0.2.31", "198.51.100.31", 4321, 55001, true);
++		feedIPv4(reassembly, secondRecord, 10101, "192.0.2.31", "198.51.100.31", 4321, 55001);
++		require(collector.handshakes.size() == 1 && collector.handshakes[0].bytes == validHandshake &&
++		            collector.handshakes[0].connection.srcPort == 4321,
++		        "handshake bound rejected its boundary or affected another connection");
++
++		Collector splitOversizedCollector;
++		auto splitOversizedReassembly =
++		    makeReassembly(splitOversizedCollector, pcpp::TlsReassemblyConfiguration(64, 2));
++		feedIPv4(splitOversizedReassembly, {}, 10700, "192.0.2.37", "198.51.100.37", 4327, 55007, true);
++		Bytes splitOversizedHandshake = makeHandshake(1, { 0xaa, 0xbb, 2, 0, 0, 0 });
++		Bytes firstOversizedFragment(splitOversizedHandshake.begin(), splitOversizedHandshake.begin() + 6);
++		Bytes secondOversizedFragment(splitOversizedHandshake.begin() + 6, splitOversizedHandshake.end());
++		Bytes validAfterSplitOversized = makeHandshake(3, { 0x44 });
++		secondOversizedFragment.insert(secondOversizedFragment.end(), validAfterSplitOversized.begin(),
++		                               validAfterSplitOversized.end());
++		Bytes firstOversizedRecord = makeRecord(22, firstOversizedFragment);
++		Bytes secondOversizedRecord = makeRecord(22, secondOversizedFragment);
++		feedIPv4(splitOversizedReassembly, firstOversizedRecord, 10701, "192.0.2.37", "198.51.100.37", 4327,
++		         55007);
++		feedIPv4(splitOversizedReassembly, secondOversizedRecord,
++		         10701 + static_cast<uint32_t>(firstOversizedRecord.size()), "192.0.2.37", "198.51.100.37",
++		         4327, 55007);
++		require(splitOversizedCollector.records.size() == 2 &&
++		            splitOversizedCollector.records[0].bytes == firstOversizedRecord &&
++		            splitOversizedCollector.records[1].bytes == secondOversizedRecord,
++		        "split oversized handshake suppressed a containing TLS record");
++		require(splitOversizedCollector.handshakes.size() == 1 &&
++		            splitOversizedCollector.handshakes[0].bytes == validAfterSplitOversized,
++		        "split oversized body bytes were decoded as a handshake or blocked the later valid message");
++		size_t splitOversizedDiscarded = 0;
++		for (const EventResult& event : splitOversizedCollector.events)
++			if (event.type == pcpp::TlsReassemblyEvent::InvalidTlsData)
++				splitOversizedDiscarded += event.discardedBytes;
++		require(splitOversizedDiscarded == splitOversizedHandshake.size(),
++		        "split oversized handshake bytes were not all reported as discarded");
++
++		feedIPv4(reassembly, {}, 10200, "192.0.2.32", "198.51.100.32", 4322, 55002, true);
++		Bytes invalidUpper = makeRecord(24, { 0xaa });
++		Bytes validAfterUpper = makeRecord(23, { 0xbb });
++		Bytes upperBoundaryStream = invalidUpper;
++		upperBoundaryStream.insert(upperBoundaryStream.end(), validAfterUpper.begin(), validAfterUpper.end());
++		size_t recordsBeforeUpperBoundary = collector.records.size();
++		size_t eventsBeforeUpperBoundary = collector.events.size();
++		feedIPv4(reassembly, upperBoundaryStream, 10201, "192.0.2.32", "198.51.100.32", 4322, 55002);
++		require(collector.records.size() == recordsBeforeUpperBoundary + 1 &&
++		            collector.records.back().bytes == validAfterUpper,
++		        "record type 24 was accepted or blocked the following valid record");
++		size_t upperBoundaryDiscarded = 0;
++		for (size_t index = eventsBeforeUpperBoundary; index < collector.events.size(); ++index)
++			if (collector.events[index].type == pcpp::TlsReassemblyEvent::InvalidTlsData)
++				upperBoundaryDiscarded += collector.events[index].discardedBytes;
++		require(upperBoundaryDiscarded == invalidUpper.size(),
++		        "upper-bound invalid record bytes were not all reported as discarded");
++
++		feedIPv4(reassembly, {}, 10500, "192.0.2.35", "198.51.100.35", 4325, 55005, true);
++		Bytes invalidLower = makeRecord(23, { 0xcc }, 0x02ff);
++		Bytes validAfterLower = makeRecord(23, { 0xdd }, 0x0300);
++		Bytes lowerBoundaryStream = invalidLower;
++		lowerBoundaryStream.insert(lowerBoundaryStream.end(), validAfterLower.begin(), validAfterLower.end());
++		size_t recordsBeforeLowerBoundary = collector.records.size();
++		size_t eventsBeforeLowerBoundary = collector.events.size();
++		feedIPv4(reassembly, lowerBoundaryStream, 10501, "192.0.2.35", "198.51.100.35", 4325, 55005);
++		require(collector.records.size() == recordsBeforeLowerBoundary + 1 &&
++		            collector.records.back().bytes == validAfterLower,
++		        "record version below 0x0300 was accepted or blocked the following valid record");
++		size_t lowerBoundaryDiscarded = 0;
++		for (size_t index = eventsBeforeLowerBoundary; index < collector.events.size(); ++index)
++			if (collector.events[index].type == pcpp::TlsReassemblyEvent::InvalidTlsData)
++				lowerBoundaryDiscarded += collector.events[index].discardedBytes;
++		require(lowerBoundaryDiscarded == invalidLower.size(),
++		        "lower-bound invalid record bytes were not all reported as discarded");
++
++		feedIPv4(reassembly, {}, 10600, "192.0.2.36", "198.51.100.36", 4326, 55006, true);
++		Bytes overLimitRecord = makeRecord(23, Bytes(17, 0xee));
++		Bytes validAfterOverLimit = makeRecord(23, Bytes(16, 0xef));
++		Bytes overLimitStream = overLimitRecord;
++		overLimitStream.insert(overLimitStream.end(), validAfterOverLimit.begin(), validAfterOverLimit.end());
++		size_t recordsBeforeOverLimit = collector.records.size();
++		size_t eventsBeforeOverLimit = collector.events.size();
++		feedIPv4(reassembly, overLimitStream, 10601, "192.0.2.36", "198.51.100.36", 4326, 55006);
++		require(collector.records.size() == recordsBeforeOverLimit + 1 &&
++		            collector.records.back().bytes == validAfterOverLimit,
++		        "over-limit record was accepted or blocked the following boundary-sized record");
++		size_t overLimitDiscarded = 0;
++		for (size_t index = eventsBeforeOverLimit; index < collector.events.size(); ++index)
++			if (collector.events[index].type == pcpp::TlsReassemblyEvent::InvalidTlsData)
++				overLimitDiscarded += collector.events[index].discardedBytes;
++		require(overLimitDiscarded == overLimitRecord.size(),
++		        "over-limit record bytes were not all reported as discarded");
++
++		Collector zeroRecordCollector;
++		auto zeroRecordReassembly =
++		    makeReassembly(zeroRecordCollector, pcpp::TlsReassemblyConfiguration(0, 0xffffff));
++		feedIPv4(zeroRecordReassembly, {}, 10300, "192.0.2.33", "198.51.100.33", 4323, 55003, true);
++		feedIPv4(zeroRecordReassembly, makeRecord(23, { 0x01 }), 10301, "192.0.2.33", "198.51.100.33", 4323,
++		         55003);
++		require(zeroRecordCollector.records.empty(), "zero record-payload maximum was treated as unlimited");
++		require(std::any_of(zeroRecordCollector.events.begin(), zeroRecordCollector.events.end(),
++		                    [](const EventResult& event) {
++			                    return event.type == pcpp::TlsReassemblyEvent::InvalidTlsData &&
++			                           event.discardedBytes > 0;
++		                    }),
++		        "zero record-payload maximum silently ignored invalid captured data");
++
++		Collector zeroHandshakeCollector;
++		auto zeroHandshakeReassembly =
++		    makeReassembly(zeroHandshakeCollector, pcpp::TlsReassemblyConfiguration(32, 0));
++		feedIPv4(zeroHandshakeReassembly, {}, 10400, "192.0.2.34", "198.51.100.34", 4324, 55004, true);
++		Bytes emptyHandshake = makeHandshake(0, {});
++		Bytes nonemptyHandshake = makeHandshake(1, { 0x02 });
++		Bytes zeroHandshakePayload = emptyHandshake;
++		zeroHandshakePayload.insert(zeroHandshakePayload.end(), nonemptyHandshake.begin(), nonemptyHandshake.end());
++		Bytes zeroHandshakeRecord = makeRecord(22, zeroHandshakePayload);
++		feedIPv4(zeroHandshakeReassembly, zeroHandshakeRecord, 10401, "192.0.2.34", "198.51.100.34", 4324,
++		         55004);
++		require(zeroHandshakeCollector.records.size() == 1 &&
++		            zeroHandshakeCollector.records[0].bytes == zeroHandshakeRecord,
++		        "zero handshake maximum suppressed the containing TLS record");
++		require(zeroHandshakeCollector.handshakes.size() == 1 &&
++		            zeroHandshakeCollector.handshakes[0].bytes == emptyHandshake,
++		        "zero handshake maximum did not accept only the zero-length message");
++		size_t zeroHandshakeDiscarded = 0;
++		for (const EventResult& event : zeroHandshakeCollector.events)
++			if (event.type == pcpp::TlsReassemblyEvent::InvalidTlsData)
++				zeroHandshakeDiscarded += event.discardedBytes;
++		require(zeroHandshakeDiscarded == nonemptyHandshake.size(),
++		        "zero handshake maximum silently ignored its rejected message");
++	}
++
++	void connectionLifecycle()
++	{
++		Collector collector;
++		auto reassembly = makeReassembly(collector);
++		feedIPv4(reassembly, {}, 11000, "192.0.2.40", "198.51.100.40", 443, 56000, true);
++		feedIPv4(reassembly, {}, 12000, "198.51.100.40", "192.0.2.40", 56000, 443, true);
++		require(collector.starts.size() == 1, "connection start callback count is wrong");
++
++		feedIPv4(reassembly, { 23, 3, 3 }, 11001, "192.0.2.40", "198.51.100.40", 443, 56000);
++		Bytes partialHandshake = makeRecord(22, { 1, 0, 0 });
++		feedIPv4(reassembly, partialHandshake, 12001, "198.51.100.40", "192.0.2.40", 56000, 443);
++		reassembly->closeConnection(collector.starts[0].flowKey);
++
++		require(collector.ends.size() == 1 &&
++		            collector.ends[0].reason == pcpp::TcpReassembly::TcpReassemblyConnectionClosedManually,
++		        "manual close was not forwarded");
++		require(reassembly->isConnectionOpen(collector.starts[0]) == 0, "closed connection is still open");
++		bool incompleteSides[2] = { false, false };
++		for (const EventResult& event : collector.events)
++		{
++			if (event.type == pcpp::TlsReassemblyEvent::IncompleteDataOnConnectionEnd)
++			{
++				require(event.side == 0 || event.side == 1, "close event has an invalid side");
++				require(!incompleteSides[event.side], "close reported one direction more than once");
++				incompleteSides[event.side] = true;
++				require(event.discardedBytes == 3, "close reported the wrong partial-state size");
++				require(event.connection.flowKey == collector.starts[0].flowKey,
++				        "close event lost connection metadata");
++			}
++		}
++		require(incompleteSides[0] && incompleteSides[1], "close did not report both incomplete directions");
++		require(collector.closeOrder == std::vector<std::string>({ "event", "event", "end" }),
++		        "connection-end callback ran before incomplete TLS state was reported");
++
++		feedIPv4(reassembly, {}, 13000, "192.0.2.43", "198.51.100.43", 443, 56300, true);
++		Bytes sameSideHandshake = makeRecord(22, { 1, 0, 0 });
++		feedIPv4(reassembly, sameSideHandshake, 13001, "192.0.2.43", "198.51.100.43", 443, 56300);
++		Bytes sameSideRecord = { 23, 3, 3, 0, 5 };
++		feedIPv4(reassembly, sameSideRecord, 13001 + static_cast<uint32_t>(sameSideHandshake.size()),
++		         "192.0.2.43", "198.51.100.43", 443, 56300);
++		size_t eventsBeforeCombinedClose = collector.events.size();
++		reassembly->closeConnection(collector.starts[1].flowKey);
++		require(collector.events.size() == eventsBeforeCombinedClose + 1,
++		        "close emitted separate events for one direction's record and handshake state");
++		const EventResult& combined = collector.events.back();
++		require(combined.type == pcpp::TlsReassemblyEvent::IncompleteDataOnConnectionEnd && combined.side == 0 &&
++		            combined.discardedBytes == 8 && combined.connection.flowKey == collector.starts[1].flowKey,
++		        "close did not combine one direction's incomplete record and handshake bytes");
++		require(collector.ends.size() == 2 && collector.closeOrder.size() == 5 &&
++		            collector.closeOrder[3] == "event" && collector.closeOrder[4] == "end",
++		        "combined incomplete event did not precede the connection-end callback");
++	}
++
++	void rawPacketAndCloseAll()
++	{
++		Collector collector;
++		int cookie = 42;
++		auto reassembly = makeReassembly(collector, pcpp::TlsReassemblyConfiguration(),
++		                                 pcpp::TcpReassemblyConfiguration(), &cookie);
++		require(feedIPv4(reassembly, {}, 12100, "192.0.2.41", "198.51.100.41", 9443, 56100, true, false, true) ==
++		            pcpp::TcpReassembly::TcpMessageHandled,
++		        "raw ordinary TCP status was not forwarded");
++		Bytes expectedHandshake = makeHandshake(1, { 0x71, 0x72, 0x73 });
++		Bytes expected = makeRecord(22, expectedHandshake);
++		require(feedIPv4(reassembly, expected, 12101, "192.0.2.41", "198.51.100.41", 9443, 56100, false, false,
++		                 true) == pcpp::TcpReassembly::TcpMessageHandled,
++		        "raw TLS-data status was not forwarded");
++		feedIPv4(reassembly, {}, 12200, "192.0.2.42", "198.51.100.42", 10443, 56200, true);
++		feedIPv4(reassembly, { 23, 3, 3 }, 12201, "192.0.2.42", "198.51.100.42", 10443, 56200);
++
++		require(collector.records.size() == 1 && collector.records[0].bytes == expected,
++		        "RawPacket input did not produce a TLS record");
++		require(collector.handshakes.size() == 1 && collector.handshakes[0].bytes == expectedHandshake,
++		        "non-null-cookie input did not produce its handshake callback");
++		require(collector.starts.size() == 2 && reassembly->getConnectionInformation().size() == 2,
++		        "connection information did not include both flows");
++		require(reassembly->purgeClosedConnections(1) == 0, "purge removed an open connection");
++		reassembly->closeAllConnections();
++		require(collector.ends.size() == 2, "close-all did not close every connection");
++		require(collector.events.size() == 1 &&
++		            collector.events[0].type == pcpp::TlsReassemblyEvent::IncompleteDataOnConnectionEnd &&
++		            collector.events[0].discardedBytes == 3,
++		        "non-null-cookie close did not produce its incomplete-data event callback");
++		for (const pcpp::ConnectionData& connection : collector.starts)
++			require(reassembly->isConnectionOpen(connection) == 0, "close-all left a connection open");
++	}
++
++	void purgeClosedConnections()
++	{
++		Collector collector;
++		g_UseControlledTime = true;
++		g_ControlledTime = 1000;
++		pcpp::TcpReassemblyConfiguration tcpConfig(true, 1, 30);
++		auto reassembly = makeReassembly(collector, pcpp::TlsReassemblyConfiguration(), tcpConfig);
++		feedIPv4(reassembly, {}, 18000, "192.0.2.70", "198.51.100.70", 443, 59000, true);
++		Bytes partialHandshake = makeRecord(22, { 1, 0, 0 });
++		feedIPv4(reassembly, partialHandshake, 18001, "192.0.2.70", "198.51.100.70", 443, 59000);
++		Bytes partialRecord = { 23, 3, 3 };
++		feedIPv4(reassembly, partialRecord, 18001 + static_cast<uint32_t>(partialHandshake.size()),
++		         "192.0.2.70", "198.51.100.70", 443, 59000);
++		feedIPv4(reassembly, {}, 19000, "192.0.2.71", "198.51.100.71", 443, 59001, true);
++		feedIPv4(reassembly, {}, 20000, "192.0.2.72", "198.51.100.72", 443, 59002, true);
++		require(collector.starts.size() == 3 && reassembly->getConnectionInformation().size() == 3,
++		        "purge fixture did not create three connections");
++		reassembly->closeAllConnections();
++		for (const pcpp::ConnectionData& connection : collector.starts)
++			require(reassembly->isConnectionOpen(connection) == 0, "purge fixture did not close a connection");
++
++		g_ControlledTime = 1002;
++		require(reassembly->purgeClosedConnections(1) == 1,
++		        "bounded purge did not remove exactly one expired connection");
++		require(reassembly->getConnectionInformation().size() == 2,
++		        "bounded purge changed the wrong number of connection records");
++		size_t unmanagedAfterBoundedPurge = 0;
++		for (const pcpp::ConnectionData& connection : collector.starts)
++			if (reassembly->isConnectionOpen(connection) < 0)
++				++unmanagedAfterBoundedPurge;
++		require(unmanagedAfterBoundedPurge == 1, "bounded purge did not release one closed connection");
++
++		require(reassembly->purgeClosedConnections() == 2,
++		        "default purge did not remove the remaining expired connections");
++		require(reassembly->getConnectionInformation().empty(), "default purge retained closed connection records");
++		for (const pcpp::ConnectionData& connection : collector.starts)
++			require(reassembly->isConnectionOpen(connection) < 0, "purged connection is still managed");
++
++		size_t recordsBeforeRecreate = collector.records.size();
++		size_t handshakesBeforeRecreate = collector.handshakes.size();
++		size_t eventsBeforeRecreate = collector.events.size();
++		feedIPv4(reassembly, {}, 28000, "192.0.2.70", "198.51.100.70", 443, 59000, true);
++		Bytes freshRecord = makeRecord(23, { 0xa1, 0xa2 });
++		feedIPv4(reassembly, freshRecord, 28001, "192.0.2.70", "198.51.100.70", 443, 59000);
++		require(collector.starts.size() == 4, "recreated tuple did not start a new connection");
++		require(collector.records.size() == recordsBeforeRecreate + 1 && collector.records.back().bytes == freshRecord,
++		        "closed TLS state contaminated a recreated connection tuple");
++		require(collector.handshakes.size() == handshakesBeforeRecreate,
++		        "closed handshake state completed on a recreated connection tuple");
++		require(collector.events.size() == eventsBeforeRecreate,
++		        "closed TLS state produced an event on a recreated connection tuple");
++		g_UseControlledTime = false;
++	}
++
++	void automaticFinRstLifecycle()
++	{
++		Collector collector;
++		auto reassembly = makeReassembly(collector);
++
++		feedIPv4(reassembly, {}, 15000, "192.0.2.60", "198.51.100.60", 443, 58000, true);
++		feedIPv4(reassembly, { 23, 3, 3 }, 15001, "192.0.2.60", "198.51.100.60", 443, 58000);
++		require(feedIPv4(reassembly, {}, 15004, "192.0.2.60", "198.51.100.60", 443, 58000, false, false,
++		                 false, true) == pcpp::TcpReassembly::FIN_RSTWithNoData,
++		        "RST packet was not handled by TCP reassembly");
++		require(collector.ends.size() == 1 &&
++		            collector.ends[0].reason == pcpp::TcpReassembly::TcpReassemblyConnectionClosedByFIN_RST,
++		        "RST did not close the TLS connection");
++		require(reassembly->isConnectionOpen(collector.starts[0]) == 0, "RST-closed connection remained open");
++
++		feedIPv4(reassembly, {}, 16000, "192.0.2.61", "198.51.100.61", 443, 58001, true);
++		feedIPv4(reassembly, {}, 17000, "198.51.100.61", "192.0.2.61", 58001, 443, true);
++		Bytes partialHandshake = makeRecord(22, { 1, 0, 0 });
++		feedIPv4(reassembly, partialHandshake, 16001, "192.0.2.61", "198.51.100.61", 443, 58001);
++		feedIPv4(reassembly, {}, 16001 + static_cast<uint32_t>(partialHandshake.size()), "192.0.2.61",
++		         "198.51.100.61", 443, 58001, false, true);
++		require(collector.ends.size() == 1, "one-sided FIN closed the connection early");
++		feedIPv4(reassembly, {}, 17001, "198.51.100.61", "192.0.2.61", 58001, 443, false, true);
++		require(collector.ends.size() == 2 &&
++		            collector.ends[1].reason == pcpp::TcpReassembly::TcpReassemblyConnectionClosedByFIN_RST,
++		        "two-sided FIN did not close the TLS connection");
++		require(reassembly->isConnectionOpen(collector.starts[1]) == 0, "FIN-closed connection remained open");
++
++		size_t automaticIncompleteEvents = 0;
++		for (const EventResult& event : collector.events)
++		{
++			if (event.type == pcpp::TlsReassemblyEvent::IncompleteDataOnConnectionEnd)
++			{
++				++automaticIncompleteEvents;
++				require(event.discardedBytes == 3, "automatic close reported the wrong incomplete byte count");
++			}
++		}
++		require(automaticIncompleteEvents == 2, "automatic closes did not report both incomplete streams");
++	}
++
++	void ipv6Stream()
++	{
++		Collector collector;
++		auto reassembly = makeReassembly(collector);
++		feedIPv6(reassembly, {}, 13000, true);
++		Bytes expected = makeRecord(23, { 0x81, 0x82, 0x83, 0x84 });
++		feedIPv6(reassembly, Bytes(expected.begin(), expected.begin() + 2), 13001);
++		feedIPv6(reassembly, Bytes(expected.begin() + 2, expected.end()), 13003);
++		require(collector.records.size() == 1 && collector.records[0].bytes == expected,
++		        "segmented IPv6 TLS record was not reconstructed");
++		require(collector.records[0].connection.srcIP.isIPv6() && collector.records[0].connection.dstIP.isIPv6(),
++		        "IPv6 connection metadata was lost");
++	}
++
++	void initialResynchronization()
++	{
++		Collector collector;
++		auto reassembly = makeReassembly(collector);
++		Bytes expected = makeRecord(23, { 0x91, 0x92, 0x93 });
++		Bytes first = { 0xde, 0xad, 0xbe, expected[0], expected[1], expected[2] };
++		Bytes second(expected.begin() + 3, expected.end());
++		feedIPv4(reassembly, first, 14000, "192.0.2.50", "198.51.100.50", 12345, 23456);
++		feedIPv4(reassembly, second, 14006, "192.0.2.50", "198.51.100.50", 12345, 23456);
++		require(collector.records.size() == 1 && collector.records[0].bytes == expected,
++		        "initial junk or split header prevented TLS resynchronization");
++		size_t invalidDiscardedBytes = 0;
++		for (const EventResult& event : collector.events)
++			if (event.type == pcpp::TlsReassemblyEvent::InvalidTlsData)
++				invalidDiscardedBytes += event.discardedBytes;
++		require(invalidDiscardedBytes == 3, "invalid-data events did not account for every discarded captured byte");
++	}
++}  // namespace
++
++int main(int argc, char* argv[])
++{
++	const std::unordered_map<std::string, std::function<void()>> scenarios = {
++		{ "RequiredCallbackOnly", requiredCallbackOnly },
++		{ "SegmentedRecords", segmentedRecords },
++		{ "CoalescedRecords", coalescedRecords },
++		{ "HandshakeFraming", handshakeFraming },
++		{ "DirectionAndConnectionIsolation", directionAndConnectionIsolation },
++		{ "OutOfOrderAndRetransmission", outOfOrderAndRetransmission },
++		{ "MissingDataRecovery", missingDataRecovery },
++		{ "MalformedAndConfiguredBounds", malformedAndConfiguredBounds },
++		{ "ConnectionLifecycle", connectionLifecycle },
++		{ "RawPacketAndCloseAll", rawPacketAndCloseAll },
++		{ "PurgeClosedConnections", purgeClosedConnections },
++		{ "AutomaticFinRstLifecycle", automaticFinRstLifecycle },
++		{ "IPv6Stream", ipv6Stream },
++		{ "InitialResynchronization", initialResynchronization },
++	};
++
++	if (argc != 2 || scenarios.count(argv[1]) == 0)
++	{
++		std::cerr << "usage: " << argv[0] << " SCENARIO\n";
++		return 2;
++	}
++
++	try
++	{
++		scenarios.at(argv[1])();
++		std::cout << argv[1] << ": passed\n";
++		return 0;
++	}
++	catch (const std::exception& error)
++	{
++		std::cerr << argv[1] << ": " << error.what() << '\n';
++		return 1;
++	}
++}
+diff --git a/Tests/TlsStreamTest/ptf_to_junit.py b/Tests/TlsStreamTest/ptf_to_junit.py
+new file mode 100755
+index 00000000..0f651e67
+--- /dev/null
++++ b/Tests/TlsStreamTest/ptf_to_junit.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++
++import argparse
++import re
++import sys
++import xml.etree.ElementTree as ET
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("log")
++    parser.add_argument("output")
++    parser.add_argument("status", type=int)
++    parser.add_argument("--expected-test", action="append", default=[])
++    args = parser.parse_args()
++
++    with open(args.log, encoding="utf-8", errors="replace") as handle:
++        log = handle.read()
++
++    pattern = re.compile(r"^(Test[A-Za-z0-9_]+)\s*:\s*(PASSED|FAILED|SKIPPED)\s*$", re.MULTILINE)
++    results = pattern.findall(log)
++    suite = ET.Element("testsuite", name="Packet++Test")
++    failures = 0
++    skipped = 0
++
++    for name, result in results:
++        case = ET.SubElement(suite, "testcase", classname="Packet++Test", name=name)
++        if result == "FAILED":
++            failures += 1
++            failure = ET.SubElement(case, "failure", message="test failed")
++            failure.text = log
++        elif result == "SKIPPED":
++            skipped += 1
++            ET.SubElement(case, "skipped")
++
++    if not results:
++        expected_tests = args.expected_test or ["Harness"]
++        for name in expected_tests:
++            failures += 1
++            case = ET.SubElement(suite, "testcase", classname=name, name=name)
++            failure = ET.SubElement(case, "failure", message="test command failed")
++            failure.text = log
++    elif args.status != 0 and failures == 0:
++        failures += 1
++        case = ET.SubElement(suite, "testcase", classname="Packet++Test", name="Harness")
++        failure = ET.SubElement(case, "failure", message="test command failed")
++        failure.text = log
++
++    suite.set("tests", str(len(suite.findall("testcase"))))
++    suite.set("failures", str(failures))
++    suite.set("errors", "0")
++    suite.set("skipped", str(skipped))
++    ET.ElementTree(suite).write(args.output, encoding="utf-8", xml_declaration=True)
++    return 0 if args.status == 0 and failures == 0 else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..14d89bbb
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,123 @@
++#!/bin/bash
++
++set -u
++
++export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
++
++output_path=""
++mode=""
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --output_path)
++      output_path="$2"
++      shift 2
++      ;;
++    base|new)
++      mode="$1"
++      shift
++      ;;
++    *)
++      echo "usage: $0 --output_path FILE {base|new}" >&2
++      exit 2
++      ;;
++  esac
++done
++
++if [[ -z "$output_path" || -z "$mode" ]]; then
++  echo "usage: $0 --output_path FILE {base|new}" >&2
++  exit 2
++fi
++
++output_path="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$output_path")"
++new_test_args=(--expected-test Harness)
++if [[ "$mode" == "new" ]]; then
++  new_test_args=(
++    --expected-test TlsStream.RequiredCallbackOnly
++    --expected-test TlsStream.SegmentedRecords
++    --expected-test TlsStream.CoalescedRecords
++    --expected-test TlsStream.HandshakeFraming
++    --expected-test TlsStream.DirectionAndConnectionIsolation
++    --expected-test TlsStream.OutOfOrderAndRetransmission
++    --expected-test TlsStream.MissingDataRecovery
++    --expected-test TlsStream.MalformedAndConfiguredBounds
++    --expected-test TlsStream.ConnectionLifecycle
++    --expected-test TlsStream.RawPacketAndCloseAll
++    --expected-test TlsStream.PurgeClosedConnections
++    --expected-test TlsStream.AutomaticFinRstLifecycle
++    --expected-test TlsStream.IPv6Stream
++    --expected-test TlsStream.InitialResynchronization
++  )
++fi
++
++cmake_bin="$(command -v cmake 2>/dev/null || true)"
++ctest_bin="$(command -v ctest 2>/dev/null || true)"
++if [[ -z "$cmake_bin" || -z "$ctest_bin" ]]; then
++  dependency_log="${output_path}.dependency.log"
++  {
++    printf 'required CMake tools are unavailable\n'
++    printf 'PATH=%s\n' "$PATH"
++    printf 'cmake=%s ctest=%s\n' "$cmake_bin" "$ctest_bin"
++  } >"$dependency_log"
++  python3 Tests/TlsStreamTest/ptf_to_junit.py \
++    "$dependency_log" "$output_path" 127 "${new_test_args[@]}"
++  result=$?
++  rm -f "$dependency_log"
++  exit "$result"
++fi
++
++build_dir="$(mktemp -d "${TMPDIR:-/tmp}/pcapplusplus-tls-stream-tests.XXXXXX" 2>/dev/null)"
++setup_status=$?
++if [[ $setup_status -ne 0 || -z "$build_dir" ]]; then
++  setup_log="${output_path}.setup.log"
++  printf 'unable to create a temporary build directory\n' >"$setup_log"
++  python3 Tests/TlsStreamTest/ptf_to_junit.py \
++    "$setup_log" "$output_path" "$setup_status" "${new_test_args[@]}"
++  result=$?
++  rm -f "$setup_log"
++  exit "$result"
++fi
++trap 'rm -rf "$build_dir"' EXIT
++configure_log="$build_dir/configure.log"
++
++"$cmake_bin" -S . -B "$build_dir" \
++  -DCMAKE_BUILD_TYPE=Debug \
++  -DPCAPPP_BUILD_PCAPPP=OFF \
++  -DPCAPPP_BUILD_TESTS=ON \
++  -DPCAPPP_BUILD_EXAMPLES=OFF \
++  -DPCAPPP_BUILD_TUTORIALS=OFF >"$configure_log" 2>&1
++configure_status=$?
++if [[ $configure_status -ne 0 ]]; then
++  python3 Tests/TlsStreamTest/ptf_to_junit.py \
++    "$configure_log" "$output_path" "$configure_status" "${new_test_args[@]}"
++  exit $?
++fi
++
++if [[ "$mode" == "base" ]]; then
++  build_log="$build_dir/base-build.log"
++  "$cmake_bin" --build "$build_dir" --target Packet++Test --parallel 2 >"$build_log" 2>&1
++  build_status=$?
++  if [[ $build_status -ne 0 ]]; then
++    python3 Tests/TlsStreamTest/ptf_to_junit.py "$build_log" "$output_path" "$build_status"
++    exit $?
++  fi
++
++  "$ctest_bin" --test-dir "$build_dir" \
++    --output-on-failure \
++    --output-junit "$output_path" \
++    -R '^Packet\+\+Test$'
++  exit $?
++fi
++
++build_log="$build_dir/new-build.log"
++"$cmake_bin" --build "$build_dir" --target TlsStreamTest --parallel 2 >"$build_log" 2>&1
++build_status=$?
++if [[ $build_status -ne 0 ]]; then
++  python3 Tests/TlsStreamTest/ptf_to_junit.py \
++    "$build_log" "$output_path" "$build_status" "${new_test_args[@]}"
++  exit $?
++fi
++
++"$ctest_bin" --test-dir "$build_dir" \
++  --output-on-failure \
++  --output-junit "$output_path" \
++  -R '^TlsStream\.'

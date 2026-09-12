@@ -1,0 +1,481 @@
+diff --git a/src/asm/resolver/eval_asm.rs b/src/asm/resolver/eval_asm.rs
+index 29c60f2..60db117 100644
+--- a/src/asm/resolver/eval_asm.rs
++++ b/src/asm/resolver/eval_asm.rs
+@@ -12,6 +12,7 @@ struct AsmBlockInstruction<'opts>
+ {
+     pub src: String,
+     pub substs: Vec<AsmSubstitution>,
++    pub deferred: Vec<AsmDeferredSubstitution>,
+     pub eval_ctx: expr::EvalContext<'opts>,
+     pub matches: asm::InstructionMatches,
+     pub encoding: expr::Value,
+@@ -19,6 +20,15 @@ struct AsmBlockInstruction<'opts>
+ }
+ 
+ 
++struct AsmDeferredSubstitution
++{
++    pub variable: String,
++    pub expr: expr::Expr,
++    pub span: diagn::Span,
++    pub value: expr::Value,
++}
++
++
+ pub fn eval_asm(
+     fileserver: &mut dyn util::FileServer,
+     opts: &asm::AssemblyOptions,
+@@ -42,6 +52,8 @@ pub fn eval_asm(
+     let mut labels = Vec::new();
+     let mut instrs = Vec::new();
+ 
++    let label_names = collect_label_names(&query.ast);
++
+     for node in &query.ast.nodes
+     {
+         if let asm::AstAny::Symbol(ast_symbol) = node
+@@ -51,7 +63,7 @@ pub fn eval_asm(
+                 query.report.error_span(
+                     "only labels are permitted in `asm` blocks",
+                     node.span());
+-    
++
+                 return Err(());
+             }
+ 
+@@ -60,7 +72,7 @@ pub fn eval_asm(
+                 query.report.error_span(
+                     "only top-level labels are permitted in `asm` blocks",
+                     node.span());
+-    
++
+                 return Err(());
+             }
+ 
+@@ -86,12 +98,17 @@ pub fn eval_asm(
+             let mut new_eval_ctx = expr::EvalContext::new_deepened(
+                 query.eval_ctx);
+ 
++            let mut deferred = Vec::new();
++
+             let new_excerpt = perform_substitutions(
+                 &ast_instr.src,
+                 &substs,
++                &label_names,
++                decls,
+                 &mut new_eval_ctx,
++                &mut deferred,
+                 query)?;
+-            
++
+             let matches = asm::matcher::match_instr(
+                 query.eval_ctx.opts,
+                 defs,
+@@ -117,7 +134,7 @@ pub fn eval_asm(
+                     excerpt.clone(),
+                     ast_instr.span);
+             }
+-            
++
+             let maybe_no_matches = asm::matcher::error_on_no_matches(
+                 query.report,
+                 ast_instr.span,
+@@ -129,10 +146,11 @@ pub fn eval_asm(
+             }
+ 
+             maybe_no_matches?;
+-            
++
+             instrs.push(AsmBlockInstruction {
+                 src: new_excerpt,
+                 substs,
++                deferred,
+                 eval_ctx: new_eval_ctx,
+                 matches,
+                 encoding: expr::Value::make_unknown(),
+@@ -232,7 +250,7 @@ fn resolve_iteratively(
+         {
+             break;
+         }
+-    
++
+         if ctx.is_first_iteration &&
+             ctx.can_guess()
+         {
+@@ -277,7 +295,7 @@ fn resolve_iteratively(
+     {
+         return Ok(result.value);
+     }
+-    
++
+     if ctx.can_guess()
+     {
+         return Ok(expr::Value::make_unknown());
+@@ -300,7 +318,7 @@ struct AsmBlockResult
+ 
+ fn resolve_once(
+     fileserver: &mut dyn util::FileServer,
+-    _opts: &asm::AssemblyOptions,
++    opts: &asm::AssemblyOptions,
+     decls: &asm::ItemDecls,
+     defs: &asm::ItemDefs,
+     ctx: &asm::ResolverContext,
+@@ -321,7 +339,7 @@ fn resolve_once(
+ 
+     let mut cur_label = 0;
+     let mut cur_instr = 0;
+-    
++
+     for node in &query.ast.nodes
+     {
+         // Clone the context to use our own position
+@@ -397,6 +415,34 @@ fn resolve_once(
+                 }
+             };
+ 
++            let mut subst_eval_ctx = query.eval_ctx.clone();
++
++            for label in labels.iter()
++            {
++                subst_eval_ctx.set_local(
++                    label.name.clone(),
++                    label.value.clone());
++            }
++
++            let mut deferred = std::mem::replace(
++                &mut instrs[cur_instr].deferred,
++                Vec::new());
++
++            let deferred_resolution = resolve_deferred_substitutions(
++                fileserver,
++                opts,
++                decls,
++                defs,
++                &inner_ctx,
++                query.report,
++                &mut subst_eval_ctx,
++                &mut new_eval_ctx,
++                &mut deferred);
++
++            instrs[cur_instr].deferred = deferred;
++
++            resolution.merge(deferred_resolution?);
++
+             if let Some(ref s) = attempted_match_excerpt
+             {
+                 query.report.push_parent_short_note(
+@@ -412,7 +458,7 @@ fn resolve_once(
+ 
+             let mut new_encoding = expr::Value::make_unknown();
+             let mut is_resolved = false;
+-            
++
+             let instr_resolution = asm::resolver::instruction::resolve_instruction_inner(
+                 query.report,
+                 ast_instr.span,
+@@ -428,7 +474,7 @@ fn resolve_once(
+                 true,
+                 &mut inner_ctx,
+                 &mut new_eval_ctx);
+-                
++
+             if let Some(_) = attempted_match_excerpt
+             {
+                 query.report.pop_parent();
+@@ -469,7 +515,7 @@ fn resolve_once(
+                     return Err(());
+                 }
+             }
+-            
++
+             cur_instr += 1;
+         }
+ 
+@@ -492,7 +538,7 @@ struct AsmSubstitution
+ {
+     pub start: usize,
+     pub end: usize,
+-    pub name: String,
++    pub expr: expr::Expr,
+     pub span: diagn::Span,
+ }
+ 
+@@ -518,24 +564,29 @@ fn parse_substitutions<'excerpt>(
+         {
+             let start = walker.get_index_at_span_start(
+                 tk_brace_open.span);
+-            
+-            let tk_name = walker.expect(
+-                report,
+-                syntax::TokenKind::Identifier)?;
+-            
+-            let name = walker.get_span_excerpt(tk_name.span).to_string();
+-            let span = tk_name.span;
++
++            if walker.next_useful_is(0, syntax::TokenKind::BraceClose)
++            {
++                walker.expect(
++                    report,
++                    syntax::TokenKind::Identifier)?;
++
++                return Err(());
++            }
++
++            let parsed = expr::parse(report, &mut walker)?;
++            let span = parsed.span();
+ 
+             walker.expect(
+                 report,
+                 syntax::TokenKind::BraceClose)?;
+-            
++
+             let end = walker.get_cursor_index();
+-            
++
+             substs.push(AsmSubstitution {
+                 start,
+                 end,
+-                name,
++                expr: parsed,
+                 span,
+             });
+         }
+@@ -549,10 +600,34 @@ fn parse_substitutions<'excerpt>(
+ }
+ 
+ 
++fn collect_label_names(
++    ast: &asm::AstTopLevel)
++    -> Vec<String>
++{
++    let mut names = Vec::new();
++
++    for node in &ast.nodes
++    {
++        if let asm::AstAny::Symbol(ast_symbol) = node
++        {
++            if matches!(ast_symbol.kind, asm::AstSymbolKind::Label)
++            {
++                names.push(ast_symbol.name.clone());
++            }
++        }
++    }
++
++    names
++}
++
++
+ fn perform_substitutions<'src, 'opts>(
+     excerpt: &'src str,
+     substs: &Vec<AsmSubstitution>,
++    label_names: &Vec<String>,
++    decls: &asm::ItemDecls,
+     new_eval_ctx: &mut expr::EvalContext<'opts>,
++    deferred: &mut Vec<AsmDeferredSubstitution>,
+     info: &mut expr::EvalAsmBlockQuery)
+     -> Result<String, ()>
+ {
+@@ -567,28 +642,36 @@ fn perform_substitutions<'src, 'opts>(
+             result.push_str(&excerpt[copied_up_to..subst.start]);
+             copied_up_to = subst.start;
+         }
+-        
++
+         let subst_str = {
+-            if let Some(t) = info.eval_ctx.get_token_subst(&subst.name)
++            if let Some(t) = get_token_substitution(&subst.expr, info)
+             {
+                 t
+             }
+-            else if let Some(value) = info.eval_ctx.get_local(&subst.name)
++            else
+             {
++                check_substitution_in_scope(
++                    &subst.expr,
++                    subst.span,
++                    label_names,
++                    decls,
++                    info)?;
++
+                 let new_name = new_eval_ctx.new_asm_subst();
+-                new_eval_ctx.set_local(&new_name, value);
++
++                new_eval_ctx.set_local(
++                    &new_name,
++                    expr::Value::make_unknown());
++
++                deferred.push(AsmDeferredSubstitution {
++                    variable: new_name.clone(),
++                    expr: subst.expr.clone(),
++                    span: subst.span,
++                    value: expr::Value::make_unknown(),
++                });
++
+                 std::borrow::Cow::Owned(new_name)
+             }
+-            else
+-            {
+-                info.report.error_span(
+-                    format!(
+-                        "unknown substitution argument `{}`",
+-                        subst.name),
+-                    subst.span);
+-                
+-                return Err(());
+-            }
+         };
+ 
+         result.push_str(&subst_str);
+@@ -603,3 +686,151 @@ fn perform_substitutions<'src, 'opts>(
+ 
+     Ok(result)
+ }
++
++
++fn check_substitution_in_scope(
++    subst_expr: &expr::Expr,
++    span: diagn::Span,
++    label_names: &Vec<String>,
++    decls: &asm::ItemDecls,
++    info: &mut expr::EvalAsmBlockQuery)
++    -> Result<(), ()>
++{
++    let expr::Expr::Variable(_, name) = subst_expr
++        else { return Ok(()) };
++
++    if info.eval_ctx.get_local(name).is_some()
++    {
++        return Ok(());
++    }
++
++    if label_names.iter().any(|l| l == name)
++    {
++        return Ok(());
++    }
++
++    if asm::resolver::resolve_builtin_symbol(name, info.eval_ctx.opts).is_some()
++    {
++        return Ok(());
++    }
++
++    let global_ctx = util::SymbolContext::new_global();
++
++    if decls.symbols.try_get_by_name(&global_ctx, 0, &[name.as_str()]).is_some()
++    {
++        return Ok(());
++    }
++
++    info.report.error_span(
++        format!(
++            "unknown substitution argument `{}`",
++            name),
++        span);
++
++    Err(())
++}
++
++
++fn get_token_substitution<'query>(
++    subst_expr: &expr::Expr,
++    info: &'query expr::EvalAsmBlockQuery)
++    -> Option<std::borrow::Cow<'query, String>>
++{
++    let expr::Expr::Variable(_, name) = subst_expr
++        else { return None };
++
++    info.eval_ctx.get_token_subst(name)
++}
++
++
++fn resolve_deferred_substitutions(
++    fileserver: &mut dyn util::FileServer,
++    opts: &asm::AssemblyOptions,
++    decls: &asm::ItemDecls,
++    defs: &asm::ItemDefs,
++    inner_ctx: &asm::ResolverContext,
++    report: &mut diagn::Report,
++    scope_eval_ctx: &mut expr::EvalContext,
++    target_eval_ctx: &mut expr::EvalContext,
++    deferred: &mut Vec<AsmDeferredSubstitution>)
++    -> Result<asm::ResolutionState, ()>
++{
++    let mut resolution = asm::ResolutionState::Resolved;
++
++    for subst in deferred.iter_mut()
++    {
++        let value = asm::resolver::eval(
++            report,
++            fileserver,
++            opts,
++            decls,
++            defs,
++            inner_ctx,
++            scope_eval_ctx,
++            &subst.expr)?;
++
++        let value = check_substitution_value(
++            report,
++            subst.span,
++            inner_ctx.can_guess(),
++            value)?;
++
++        let is_stable = value.is_stable(&subst.value);
++        let mut is_resolved = false;
++
++        let subst_resolution = asm::resolver::handle_value_resolution(
++            target_eval_ctx.opts,
++            report,
++            subst.span,
++            inner_ctx.can_guess(),
++            value.is_guess(),
++            is_stable,
++            &mut is_resolved,
++            true,
++            "substitution",
++            "substitution value",
++            None,
++            &value)?;
++
++        resolution.merge(subst_resolution);
++
++        target_eval_ctx.set_local(
++            &subst.variable,
++            value.clone());
++
++        subst.value = value;
++    }
++
++    Ok(resolution)
++}
++
++
++fn check_substitution_value(
++    report: &mut diagn::Report,
++    span: diagn::Span,
++    can_guess: bool,
++    value: expr::Value)
++    -> Result<expr::Value, ()>
++{
++    match value
++    {
++        expr::Value::Integer(..) |
++        expr::Value::Unknown(..) => Ok(value),
++
++        _ =>
++        {
++            if can_guess
++            {
++                return Ok(expr::Value::make_unknown().as_guess());
++            }
++
++            report.error_span(
++                format!(
++                    "invalid type for substitution: {}",
++                    value.type_name()),
++                span);
++
++            Err(())
++        }
++    }
++}

@@ -1,0 +1,949 @@
+diff --git a/cfgrammar/src/lib/yacc/ast.rs b/cfgrammar/src/lib/yacc/ast.rs
+index b860385..130a1a9 100644
+--- a/cfgrammar/src/lib/yacc/ast.rs
++++ b/cfgrammar/src/lib/yacc/ast.rs
+@@ -175,6 +175,8 @@ pub struct GrammarAST {
+     // The set of symbol names that, if unused in a
+     // grammar, will not cause a warning or error.
+     pub expect_unused: Vec<Symbol>,
++    // The name spans of parameterised rules which no production instantiated.
++    pub(crate) uninstantiated_params: Vec<Span>,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -183,6 +185,9 @@ pub struct Rule {
+     pub name: (String, Span),
+     pub pidxs: Vec<usize>, // index into GrammarAST.prod
+     pub actiont: Option<String>,
++    /// The parameters of a parameterised rule, in the order they were written; empty for an
++    /// ordinary rule.
++    pub params: Vec<(String, Span)>,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -252,16 +257,28 @@ impl GrammarAST {
+             parse_generics: None,
+             programs: None,
+             expect_unused: Vec::new(),
++            uninstantiated_params: Vec::new(),
+         }
+     }
+ 
+     pub fn add_rule(&mut self, (name, name_span): (String, Span), actiont: Option<String>) {
++        self.add_rule_with_params((name, name_span), Vec::new(), actiont)
++    }
++
++    /// Add a rule which takes the parameters `params`. An empty `params` adds an ordinary rule.
++    pub fn add_rule_with_params(
++        &mut self,
++        (name, name_span): (String, Span),
++        params: Vec<(String, Span)>,
++        actiont: Option<String>,
++    ) {
+         self.rules.insert(
+             name.clone(),
+             Rule {
+                 name: (name, name_span),
+                 pidxs: Vec::new(),
+                 actiont,
++                params,
+             },
+         );
+     }
+@@ -310,6 +327,7 @@ impl GrammarAST {
+     ///
+     /// If the validation succeeds, None is returned.
+     pub(crate) fn complete_and_validate(&mut self) -> Result<(), YaccGrammarError> {
++        super::expand::expand_params(self)?;
+         match self.start {
+             None => {
+                 return Err(YaccGrammarError {
+@@ -405,18 +423,28 @@ impl GrammarAST {
+     }
+ 
+     pub fn warnings(&self) -> Vec<YaccGrammarWarning> {
+-        self.unused_symbols()
+-            .map(|symidx| {
+-                let (kind, span) = match symidx.symbol(self) {
+-                    Symbol::Rule(_, span) => (YaccGrammarWarningKind::UnusedRule, span),
+-                    Symbol::Token(_, span) => (YaccGrammarWarningKind::UnusedToken, span),
+-                };
+-                YaccGrammarWarning {
+-                    kind,
++        let mut rules = Vec::new();
++        let mut tokens = Vec::new();
++        for symidx in self.unused_symbols() {
++            match symidx.symbol(self) {
++                Symbol::Rule(_, span) => rules.push(YaccGrammarWarning {
++                    kind: YaccGrammarWarningKind::UnusedRule,
+                     spans: vec![span],
+-                }
+-            })
+-            .collect()
++                }),
++                Symbol::Token(_, span) => tokens.push(YaccGrammarWarning {
++                    kind: YaccGrammarWarningKind::UnusedToken,
++                    spans: vec![span],
++                }),
++            }
++        }
++        for span in &self.uninstantiated_params {
++            rules.push(YaccGrammarWarning {
++                kind: YaccGrammarWarningKind::UnusedRule,
++                spans: vec![*span],
++            });
++        }
++        rules.extend(tokens);
++        rules
+     }
+ 
+     /// Return the indices of unexpectedly unused rules (relative to ast.rules)
+diff --git a/cfgrammar/src/lib/yacc/expand.rs b/cfgrammar/src/lib/yacc/expand.rs
+new file mode 100644
+index 0000000..a5b32fa
+--- /dev/null
++++ b/cfgrammar/src/lib/yacc/expand.rs
+@@ -0,0 +1,567 @@
++use std::collections::{HashMap, HashSet};
++
++use indexmap::IndexMap;
++
++use super::{
++    ast::{GrammarAST, Production, Rule, Symbol},
++    parser::{YaccGrammarError, YaccGrammarErrorKind},
++};
++use crate::Span;
++
++const INSTANTIATION_LIMIT: usize = 128;
++
++enum Call {
++    Name(String),
++    Apply(String, Vec<Call>),
++}
++
++impl Call {
++    fn render(&self) -> String {
++        match self {
++            Call::Name(n) => n.clone(),
++            Call::Apply(base, args) => {
++                let args = args.iter().map(Call::render).collect::<Vec<_>>();
++                format!("{}<{}>", base, args.join(","))
++            }
++        }
++    }
++
++    fn substitute(&self, subst: &HashMap<String, String>) -> Call {
++        match self {
++            Call::Name(n) => match subst.get(n) {
++                Some(replacement) => Call::Name(replacement.clone()),
++                None => Call::Name(n.clone()),
++            },
++            Call::Apply(base, args) => Call::Apply(
++                base.clone(),
++                args.iter().map(|arg| arg.substitute(subst)).collect(),
++            ),
++        }
++    }
++}
++
++fn parse_call(s: &str) -> Call {
++    match call_open(s) {
++        None => Call::Name(s.to_string()),
++        Some(open) => {
++            let base = s[..open].to_string();
++            let inner = &s[open + 1..s.len() - 1];
++            let mut args = Vec::new();
++            let mut depth = 0;
++            let mut quote = None;
++            let mut escaped = false;
++            let mut start = 0;
++            for (i, c) in inner.char_indices() {
++                if escaped {
++                    escaped = false;
++                    continue;
++                }
++                match quote {
++                    Some(q) => match c {
++                        '\\' => escaped = true,
++                        _ if c == q => quote = None,
++                        _ => (),
++                    },
++                    None => match c {
++                        '\'' | '"' => quote = Some(c),
++                        '<' => depth += 1,
++                        '>' => depth -= 1,
++                        ',' if depth == 0 => {
++                            args.push(parse_call(&inner[start..i]));
++                            start = i + 1;
++                        }
++                        _ => (),
++                    },
++                }
++            }
++            args.push(parse_call(&inner[start..]));
++            Call::Apply(base, args)
++        }
++    }
++}
++
++/// The offset of the `<` which opens a call's argument list, ignoring any `<` inside a quoted
++/// token name.
++fn call_open(s: &str) -> Option<usize> {
++    let mut quote = None;
++    let mut escaped = false;
++    for (i, c) in s.char_indices() {
++        if escaped {
++            escaped = false;
++            continue;
++        }
++        match quote {
++            Some(q) => match c {
++                '\\' => escaped = true,
++                _ if c == q => quote = None,
++                _ => (),
++            },
++            None => match c {
++                '\'' | '"' => quote = Some(c),
++                '<' => return Some(i),
++                _ => (),
++            },
++        }
++    }
++    None
++}
++
++fn is_call(s: &str) -> bool {
++    call_open(s).is_some()
++}
++
++/// Write a token's name so that it can be read back out of an instantiated rule's name.
++pub(super) fn escape_token(name: &str) -> String {
++    let mut out = String::with_capacity(name.len());
++    for c in name.chars() {
++        if c == '\\' || c == '\'' {
++            out.push('\\');
++        }
++        out.push(c);
++    }
++    out
++}
++
++/// The name of the token an argument refers to, or `None` if it refers to a rule.
++fn quoted_token(arg: &str) -> Option<String> {
++    let mut cs = arg.chars();
++    let first = cs.next()?;
++    if (first != '\'' && first != '"') || arg.len() < 2 || !arg.ends_with(first) {
++        return None;
++    }
++    let inner = &arg[1..arg.len() - 1];
++    let mut out = String::with_capacity(inner.len());
++    let mut escaped = false;
++    for c in inner.chars() {
++        if escaped {
++            out.push(c);
++            escaped = false;
++        } else if c == '\\' {
++            escaped = true;
++        } else {
++            out.push(c);
++        }
++    }
++    Some(out)
++}
++
++/// Does `src` contain `ident` as a whole identifier?
++fn mentions_ident(src: &str, ident: &str) -> bool {
++    let mut run = String::new();
++    for c in src.chars().chain(std::iter::once(' ')) {
++        if c.is_alphanumeric() || c == '_' {
++            run.push(c);
++        } else {
++            if run == ident {
++                return true;
++            }
++            run.clear();
++        }
++    }
++    false
++}
++
++/// Replace every whole-identifier occurrence of a key of `subst` in `src` with its value.
++fn substitute_idents(src: &str, subst: &HashMap<String, String>) -> String {
++    let mut out = String::with_capacity(src.len());
++    let mut ident = String::new();
++    let flush = |ident: &mut String, out: &mut String| {
++        if !ident.is_empty() {
++            match subst.get(ident.as_str()) {
++                Some(replacement) => out.push_str(replacement),
++                None => out.push_str(ident),
++            }
++            ident.clear();
++        }
++    };
++    for c in src.chars() {
++        if c.is_alphanumeric() || c == '_' {
++            ident.push(c);
++        } else {
++            flush(&mut ident, &mut out);
++            out.push(c);
++        }
++    }
++    flush(&mut ident, &mut out);
++    out
++}
++
++struct Template {
++    params: Vec<String>,
++    pidxs: Vec<usize>,
++    actiont: Option<String>,
++    name_span: Span,
++}
++
++struct Instantiated {
++    actiont: Option<String>,
++    prods: Vec<Production>,
++}
++
++struct Expander<'a> {
++    ast: &'a GrammarAST,
++    templates: HashMap<String, Template>,
++    done: IndexMap<String, usize>,
++    instantiated: Vec<Instantiated>,
++    used: HashSet<String>,
++}
++
++impl Expander<'_> {
++    fn actiont_of(&self, rule_name: &str) -> Option<String> {
++        if let Some(idx) = self.done.get(rule_name) {
++            return self.instantiated[*idx].actiont.clone();
++        }
++        self.ast
++            .rules
++            .get(rule_name)
++            .and_then(|r| r.actiont.clone())
++    }
++
++    fn known_rule(&self, rule_name: &str) -> bool {
++        self.done.contains_key(rule_name)
++            || self
++                .ast
++                .rules
++                .get(rule_name)
++                .is_some_and(|r| r.params.is_empty())
++    }
++
++    /// The token an argument stands for: either one written between quotes, or a name introduced
++    /// by a `%token` directive.
++    fn token_arg(&self, arg: &str) -> Option<String> {
++        if let Some(name) = quoted_token(arg) {
++            return Some(name);
++        }
++        self.ast
++            .tokens
++            .get_index_of(arg)
++            .filter(|idx| self.ast.token_directives.contains(idx))
++            .map(|_| arg.to_string())
++    }
++
++    fn symbol_for(&self, name: &str, span: Span) -> Symbol {
++        match self.token_arg(name) {
++            Some(tok) => Symbol::Token(tok, span),
++            None => Symbol::Rule(name.to_string(), span),
++        }
++    }
++
++    fn resolve(&mut self, call: &Call, span: Span) -> Result<String, YaccGrammarError> {
++        let (base, args) = match call {
++            Call::Name(n) => {
++                if self.ast.rules.get(n).is_some_and(|r| !r.params.is_empty()) {
++                    return Err(err(
++                        YaccGrammarErrorKind::MacroWithoutArguments(n.clone()),
++                        span,
++                    ));
++                }
++                return Ok(n.clone());
++            }
++            Call::Apply(base, args) => (base, args),
++        };
++        let mut arg_names = Vec::with_capacity(args.len());
++        for arg in args {
++            let resolved = self.resolve(arg, span)?;
++            arg_names.push(match self.token_arg(&resolved) {
++                Some(tok) => format!("'{}'", escape_token(&tok)),
++                None => resolved,
++            });
++        }
++        let name = Call::Apply(
++            base.clone(),
++            arg_names.iter().map(|n| Call::Name(n.clone())).collect(),
++        )
++        .render();
++        if self.done.contains_key(&name) {
++            return Ok(name);
++        }
++        let template = match self.templates.get(base) {
++            Some(t) => t,
++            None => {
++                if self.ast.rules.contains_key(base) {
++                    return Err(err(
++                        YaccGrammarErrorKind::UnexpectedMacroArguments(base.clone()),
++                        span,
++                    ));
++                }
++                return Err(err(
++                    YaccGrammarErrorKind::UnknownMacroRef(base.clone()),
++                    span,
++                ));
++            }
++        };
++        if template.params.len() != arg_names.len() {
++            return Err(err(
++                YaccGrammarErrorKind::MacroArityMismatch(
++                    base.clone(),
++                    template.params.len(),
++                    arg_names.len(),
++                ),
++                span,
++            ));
++        }
++        for arg in &arg_names {
++            if self.token_arg(arg).is_none() && !self.known_rule(arg) {
++                return Err(err(YaccGrammarErrorKind::UnknownRuleRef(arg.clone()), span));
++            }
++        }
++        if self.instantiated.len() >= INSTANTIATION_LIMIT {
++            return Err(err(YaccGrammarErrorKind::MacroExpansionLimit, span));
++        }
++        self.used.insert(base.clone());
++        let mut sym_subst = HashMap::new();
++        let mut type_subst = HashMap::new();
++        for (param, arg) in template.params.iter().zip(arg_names.iter()) {
++            sym_subst.insert(param.clone(), arg.clone());
++            let arg_type = match self.token_arg(arg) {
++                Some(_) => None,
++                None => self.actiont_of(arg),
++            };
++            match arg_type {
++                Some(t) => {
++                    type_subst.insert(param.clone(), t);
++                }
++                None => {
++                    if template
++                        .actiont
++                        .as_ref()
++                        .is_some_and(|t| mentions_ident(t, param))
++                    {
++                        return Err(err(
++                            YaccGrammarErrorKind::MacroTokenArgumentType(param.clone()),
++                            span,
++                        ));
++                    }
++                }
++            }
++        }
++        let actiont = template
++            .actiont
++            .as_ref()
++            .map(|t| substitute_idents(t, &type_subst));
++        let pidxs = template.pidxs.clone();
++        let slot = self.instantiated.len();
++        self.done.insert(name.clone(), slot);
++        self.instantiated.push(Instantiated {
++            actiont,
++            prods: Vec::new(),
++        });
++        let mut prods = Vec::with_capacity(pidxs.len());
++        for pidx in pidxs {
++            let template_prod = &self.ast.prods[pidx];
++            let mut symbols = Vec::with_capacity(template_prod.symbols.len());
++            for sym in template_prod.symbols.clone() {
++                match sym {
++                    Symbol::Rule(n, sym_span) => {
++                        let call = parse_call(&n).substitute(&sym_subst);
++                        let resolved = self.resolve(&call, sym_span)?;
++                        symbols.push(self.symbol_for(&resolved, sym_span));
++                    }
++                    Symbol::Token(n, sym_span) => symbols.push(Symbol::Token(n, sym_span)),
++                }
++            }
++            let precedence = match &template_prod.precedence {
++                Some(name) => match sym_subst.get(name) {
++                    Some(arg) => match self.token_arg(arg) {
++                        Some(tok) => Some(tok),
++                        None => {
++                            return Err(err(
++                                YaccGrammarErrorKind::MacroPrecArgumentNotAToken(name.clone()),
++                                span,
++                            ));
++                        }
++                    },
++                    None => Some(name.clone()),
++                },
++                None => None,
++            };
++            prods.push(Production {
++                symbols,
++                precedence,
++                action: template_prod.action.clone(),
++                prod_span: template_prod.prod_span,
++            });
++        }
++        self.instantiated[slot].prods = prods;
++        Ok(name)
++    }
++}
++
++fn err(kind: YaccGrammarErrorKind, span: Span) -> YaccGrammarError {
++    YaccGrammarError {
++        kind,
++        spans: vec![span],
++    }
++}
++
++/// Replace every call to a parameterised rule with a rule instantiated for those arguments, and
++/// remove the parameterised rules themselves from `ast`.
++pub(crate) fn expand_params(ast: &mut GrammarAST) -> Result<(), YaccGrammarError> {
++    let mut templates = HashMap::new();
++    for (name, rule) in &ast.rules {
++        if rule.params.is_empty() {
++            continue;
++        }
++        templates.insert(
++            name.clone(),
++            Template {
++                params: rule.params.iter().map(|(p, _)| p.clone()).collect(),
++                pidxs: rule.pidxs.clone(),
++                actiont: rule.actiont.clone(),
++                name_span: rule.name.1,
++            },
++        );
++    }
++    let start_call = ast.start.as_ref().is_some_and(|(n, _)| is_call(n));
++    let has_calls = ast.prods.iter().any(|p| {
++        p.symbols
++            .iter()
++            .any(|s| matches!(s, Symbol::Rule(n, _) if is_call(n)))
++    });
++    let expected_call = ast
++        .expect_unused
++        .iter()
++        .any(|s| matches!(s, Symbol::Rule(n, _) if is_call(n)));
++    if templates.is_empty() && !has_calls && !start_call && !expected_call {
++        return Ok(());
++    }
++    if let Some((start, span)) = &ast.start
++        && templates.contains_key(start)
++    {
++        return Err(err(
++            YaccGrammarErrorKind::MacroStartRule(start.clone()),
++            *span,
++        ));
++    }
++
++    let mut expander = Expander {
++        ast,
++        templates,
++        done: IndexMap::new(),
++        instantiated: Vec::new(),
++        used: HashSet::new(),
++    };
++    let mut new_start = None;
++    if let Some((start, span)) = &ast.start
++        && is_call(start)
++    {
++        new_start = Some((expander.resolve(&parse_call(start), *span)?, *span));
++    }
++    let mut rewrites: Vec<(usize, usize, String)> = Vec::new();
++    for rule in ast.rules.values() {
++        if !rule.params.is_empty() {
++            continue;
++        }
++        for &pidx in &rule.pidxs {
++            for (sidx, sym) in ast.prods[pidx].symbols.iter().enumerate() {
++                if let Symbol::Rule(n, span) = sym {
++                    let call = parse_call(n);
++                    let resolved = expander.resolve(&call, *span)?;
++                    if &resolved != n {
++                        rewrites.push((pidx, sidx, resolved));
++                    }
++                }
++            }
++        }
++    }
++
++    let mut expected_rewrites: Vec<(usize, String)> = Vec::new();
++    for (eidx, sym) in ast.expect_unused.iter().enumerate() {
++        if let Symbol::Rule(n, span) = sym
++            && is_call(n)
++        {
++            expected_rewrites.push((eidx, expander.resolve(&parse_call(n), *span)?));
++        }
++    }
++
++    let Expander {
++        templates,
++        done,
++        instantiated,
++        used,
++        ..
++    } = expander;
++
++    for (eidx, name) in expected_rewrites {
++        if let Symbol::Rule(n, _) = &mut ast.expect_unused[eidx] {
++            *n = name;
++        }
++    }
++
++    for (pidx, sidx, name) in rewrites {
++        if let Symbol::Rule(n, _) = &mut ast.prods[pidx].symbols[sidx] {
++            *n = name;
++        }
++    }
++    if let Some(start) = new_start {
++        ast.start = Some(start);
++    }
++
++    let mut expected_unused: HashSet<String> = HashSet::new();
++    ast.expect_unused.retain(|sym| match sym {
++        Symbol::Rule(n, _) if templates.contains_key(n) => {
++            expected_unused.insert(n.clone());
++            false
++        }
++        _ => true,
++    });
++    for (name, template) in &templates {
++        if !used.contains(name) && !expected_unused.contains(name) {
++            ast.uninstantiated_params.push(template.name_span);
++        }
++    }
++
++    let mut prods: Vec<Production> = Vec::with_capacity(ast.prods.len());
++    let mut rules: IndexMap<String, Rule> = IndexMap::with_capacity(ast.rules.len());
++    for (name, rule) in ast.rules.iter() {
++        if !rule.params.is_empty() {
++            continue;
++        }
++        let mut pidxs = Vec::with_capacity(rule.pidxs.len());
++        for &pidx in &rule.pidxs {
++            pidxs.push(prods.len());
++            prods.push(ast.prods[pidx].clone());
++        }
++        rules.insert(
++            name.clone(),
++            Rule {
++                name: rule.name.clone(),
++                pidxs,
++                actiont: rule.actiont.clone(),
++                params: Vec::new(),
++            },
++        );
++    }
++    for (name, slot) in &done {
++        let inst = &instantiated[*slot];
++        let mut pidxs = Vec::with_capacity(inst.prods.len());
++        for prod in &inst.prods {
++            pidxs.push(prods.len());
++            prods.push(prod.clone());
++        }
++        let span = ast
++            .rules
++            .get(base_of(name))
++            .map(|r| r.name.1)
++            .unwrap_or_else(|| Span::new(0, 0));
++        rules.insert(
++            name.clone(),
++            Rule {
++                name: (name.clone(), span),
++                pidxs,
++                actiont: inst.actiont.clone(),
++                params: Vec::new(),
++            },
++        );
++    }
++    ast.rules = rules;
++    ast.prods = prods;
++    Ok(())
++}
++
++fn base_of(name: &str) -> &str {
++    match name.find('<') {
++        Some(i) => &name[..i],
++        None => name,
++    }
++}
+diff --git a/cfgrammar/src/lib/yacc/mod.rs b/cfgrammar/src/lib/yacc/mod.rs
+index cdea495..2771926 100644
+--- a/cfgrammar/src/lib/yacc/mod.rs
++++ b/cfgrammar/src/lib/yacc/mod.rs
+@@ -1,6 +1,7 @@
+ #![deny(unreachable_pub)]
+ 
+ pub mod ast;
++mod expand;
+ pub mod firsts;
+ pub mod follows;
+ pub mod grammar;
+diff --git a/cfgrammar/src/lib/yacc/parser.rs b/cfgrammar/src/lib/yacc/parser.rs
+index c452d4a..fc30430 100644
+--- a/cfgrammar/src/lib/yacc/parser.rs
++++ b/cfgrammar/src/lib/yacc/parser.rs
+@@ -64,6 +64,16 @@ pub enum YaccGrammarErrorKind {
+     UnknownEPP(String),
+     ExpectedInput(char),
+     InvalidYaccKind,
++    IncompleteMacroCall,
++    DuplicateMacroParameter(String),
++    UnknownMacroRef(String),
++    MacroArityMismatch(String, usize, usize),
++    MacroWithoutArguments(String),
++    UnexpectedMacroArguments(String),
++    MacroTokenArgumentType(String),
++    MacroPrecArgumentNotAToken(String),
++    MacroStartRule(String),
++    MacroExpansionLimit,
+     Header(HeaderErrorKind, SpansKind),
+ }
+ 
+@@ -152,6 +162,46 @@ impl fmt::Display for YaccGrammarErrorKind {
+                 );
+             }
+             YaccGrammarErrorKind::InvalidYaccKind => "Invalid yacc kind",
++            YaccGrammarErrorKind::IncompleteMacroCall => "Incomplete parameter list",
++            YaccGrammarErrorKind::DuplicateMacroParameter(name) => {
++                return write!(f, "Duplicate parameter '{}'", name);
++            }
++            YaccGrammarErrorKind::UnknownMacroRef(name) => {
++                return write!(f, "Unknown reference to parameterised rule '{}'", name);
++            }
++            YaccGrammarErrorKind::MacroArityMismatch(name, expected, found) => {
++                return write!(
++                    f,
++                    "Parameterised rule '{}' takes {} arguments but {} were given",
++                    name, expected, found
++                );
++            }
++            YaccGrammarErrorKind::MacroWithoutArguments(name) => {
++                return write!(f, "Parameterised rule '{}' used without arguments", name);
++            }
++            YaccGrammarErrorKind::UnexpectedMacroArguments(name) => {
++                return write!(f, "Rule '{}' does not take arguments", name);
++            }
++            YaccGrammarErrorKind::MacroPrecArgumentNotAToken(name) => {
++                return write!(
++                    f,
++                    "Parameter '{}' used in %prec was not given a token",
++                    name
++                );
++            }
++            YaccGrammarErrorKind::MacroTokenArgumentType(name) => {
++                return write!(
++                    f,
++                    "Parameter '{}' is used in a type but was given a token",
++                    name
++                );
++            }
++            YaccGrammarErrorKind::MacroStartRule(name) => {
++                return write!(f, "Start rule '{}' is parameterised", name);
++            }
++            YaccGrammarErrorKind::MacroExpansionLimit => {
++                "Expanding parameterised rules exceeded the instantiation limit"
++            }
+             YaccGrammarErrorKind::Header(hk, _) => &format!("Error in '%grmtools' {}", hk),
+         };
+         write!(f, "{}", s)
+@@ -264,6 +314,16 @@ impl Spanned for YaccGrammarError {
+             | YaccGrammarErrorKind::NoPrecForToken(_)
+             | YaccGrammarErrorKind::InvalidYaccKind
+             | YaccGrammarErrorKind::ExpectedInput(_)
++            | YaccGrammarErrorKind::IncompleteMacroCall
++            | YaccGrammarErrorKind::DuplicateMacroParameter(_)
++            | YaccGrammarErrorKind::UnknownMacroRef(_)
++            | YaccGrammarErrorKind::MacroArityMismatch(..)
++            | YaccGrammarErrorKind::MacroWithoutArguments(_)
++            | YaccGrammarErrorKind::UnexpectedMacroArguments(_)
++            | YaccGrammarErrorKind::MacroTokenArgumentType(_)
++            | YaccGrammarErrorKind::MacroPrecArgumentNotAToken(_)
++            | YaccGrammarErrorKind::MacroStartRule(_)
++            | YaccGrammarErrorKind::MacroExpansionLimit
+             | YaccGrammarErrorKind::UnknownEPP(_) => SpansKind::Error,
+             YaccGrammarErrorKind::DuplicatePrecedence
+             | YaccGrammarErrorKind::DuplicateAvoidInsertDeclaration
+@@ -410,6 +470,11 @@ impl YaccParser<'_> {
+             if let Some(j) = self.lookahead_is("%start", i) {
+                 i = self.parse_ws(j, false)?;
+                 let (j, n) = self.parse_name(i)?;
++                let (j, n) = if self.lookahead_is("<", j).is_some() {
++                    self.parse_call_args(j, &n)?
++                } else {
++                    (j, n)
++                };
+                 let span = Span::new(i, j);
+                 if let Some((_, orig_span)) = self.ast.start {
+                     add_duplicate_occurrence(
+@@ -470,6 +535,11 @@ impl YaccParser<'_> {
+                 while i < self.src.len() && self.lookahead_is("%", i).is_none() {
+                     let j = match self.parse_name(i) {
+                         Ok((j, n)) => {
++                            let (j, n) = if self.lookahead_is("<", j).is_some() {
++                                self.parse_call_args(j, &n)?
++                            } else {
++                                (j, n)
++                            };
+                             self.ast
+                                 .expect_unused
+                                 .push(Symbol::Rule(n, Span::new(i, j)));
+@@ -649,14 +719,17 @@ impl YaccParser<'_> {
+     fn parse_rule(&mut self, mut i: usize) -> Result<usize, YaccGrammarError> {
+         let (j, rn) = self.parse_name(i)?;
+         let span = Span::new(i, j);
++        let (j, params) = self.parse_rule_params(j)?;
++        let param_names = params.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>();
+         if self.ast.start.is_none() {
+             self.ast.start = Some((rn.clone(), span));
+         }
+         match self.yacc_kind {
+             YaccKind::Original(_) | YaccKind::Eco => {
+                 if self.ast.get_rule(&rn).is_none() {
+-                    self.ast.add_rule(
++                    self.ast.add_rule_with_params(
+                         (rn.clone(), span),
++                        params,
+                         self.global_actiontype.clone().map(|(s, _)| s),
+                     );
+                 }
+@@ -672,7 +745,8 @@ impl YaccParser<'_> {
+                 i = self.parse_ws(i, true)?;
+                 let (j, actiont) = self.parse_to_single_colon(i)?;
+                 if self.ast.get_rule(&rn).is_none() {
+-                    self.ast.add_rule((rn.clone(), span), Some(actiont));
++                    self.ast
++                        .add_rule_with_params((rn.clone(), span), params, Some(actiont));
+                 }
+                 i = j;
+             }
+@@ -727,7 +801,7 @@ impl YaccParser<'_> {
+             } else if let Some(j) = self.lookahead_is("%prec", i) {
+                 i = self.parse_ws(j, true)?;
+                 let (k, sym, span, _) = self.parse_token(i)?;
+-                if self.ast.tokens.insert(sym.clone()) {
++                if !param_names.iter().any(|p| p == &sym) && self.ast.tokens.insert(sym.clone()) {
+                     self.ast.spans.push(span);
+                 }
+                 prec = Some(sym);
+@@ -762,6 +836,14 @@ impl YaccParser<'_> {
+                 i = k;
+             } else {
+                 let (j, sym, span, quoted) = self.parse_token(i)?;
++                if !quoted && self.lookahead_is("<", j).is_some() {
++                    let (k, call) = self.parse_call_args(j, &sym)?;
++                    pos_prod_end = Some(k);
++                    syms.push(Symbol::Rule(call, Span::new(span.start(), k)));
++                    i = k;
++                    i = self.parse_ws(i, true)?;
++                    continue;
++                }
+                 pos_prod_end = Some(j);
+                 if self
+                     .ast
+@@ -780,6 +862,101 @@ impl YaccParser<'_> {
+         Err(self.mk_error(YaccGrammarErrorKind::IncompleteRule, i))
+     }
+ 
++    /// Parse the parameter list of a parameterised rule, which must follow the rule's name with no
++    /// intervening whitespace. Returns the offset after the list and the parameters in the order
++    /// they were written.
++    fn parse_rule_params(
++        &mut self,
++        i: usize,
++    ) -> Result<(usize, Vec<(String, Span)>), YaccGrammarError> {
++        let open = i;
++        let mut j = match self.lookahead_is("<", i) {
++            Some(j) => j,
++            None => return Ok((i, Vec::new())),
++        };
++        let mut params: Vec<(String, Span)> = Vec::new();
++        loop {
++            j = self.parse_ws(j, true)?;
++            let (k, name) = self.parse_name(j).map_err(|_| YaccGrammarError {
++                kind: YaccGrammarErrorKind::IncompleteMacroCall,
++                spans: vec![Span::new(open, open + 1)],
++            })?;
++            let span = Span::new(j, k);
++            if let Some((dup, _)) = params.iter().find(|(p, _)| p == &name) {
++                return Err(YaccGrammarError {
++                    kind: YaccGrammarErrorKind::DuplicateMacroParameter(dup.clone()),
++                    spans: vec![span],
++                });
++            }
++            params.push((name, span));
++            j = self.parse_ws(k, true)?;
++            if let Some(k) = self.lookahead_is(",", j) {
++                j = k;
++                continue;
++            }
++            match self.lookahead_is(">", j) {
++                Some(k) => return Ok((k, params)),
++                None => {
++                    return Err(YaccGrammarError {
++                        kind: YaccGrammarErrorKind::IncompleteMacroCall,
++                        spans: vec![Span::new(open, open + 1)],
++                    });
++                }
++            }
++        }
++    }
++
++    /// Parse the argument list of a call to a parameterised rule, returning the offset after the
++    /// list and the name of the rule the call instantiates.
++    fn parse_call_args(
++        &mut self,
++        i: usize,
++        base: &str,
++    ) -> Result<(usize, String), YaccGrammarError> {
++        let open = i;
++        let mut j = self
++            .lookahead_is("<", i)
++            .ok_or_else(|| self.mk_error(YaccGrammarErrorKind::IncompleteMacroCall, i))?;
++        let mut args: Vec<String> = Vec::new();
++        loop {
++            j = self.parse_ws(j, true)?;
++            if self.lookahead_is("\"", j).is_some() || self.lookahead_is("'", j).is_some() {
++                let (k, name, span, _) = self.parse_token(j)?;
++                if self.ast.tokens.insert(name.clone()) {
++                    self.ast.spans.push(span);
++                }
++                args.push(format!("'{}'", super::expand::escape_token(&name)));
++                j = self.parse_ws(k, true)?;
++            } else {
++                let (k, name) = self.parse_name(j).map_err(|_| YaccGrammarError {
++                    kind: YaccGrammarErrorKind::IncompleteMacroCall,
++                    spans: vec![Span::new(open, open + 1)],
++                })?;
++                if self.lookahead_is("<", k).is_some() {
++                    let (k, nested) = self.parse_call_args(k, &name)?;
++                    args.push(nested);
++                    j = self.parse_ws(k, true)?;
++                } else {
++                    args.push(name);
++                    j = self.parse_ws(k, true)?;
++                }
++            }
++            if let Some(k) = self.lookahead_is(",", j) {
++                j = k;
++                continue;
++            }
++            match self.lookahead_is(">", j) {
++                Some(k) => return Ok((k, format!("{}<{}>", base, args.join(",")))),
++                None => {
++                    return Err(YaccGrammarError {
++                        kind: YaccGrammarErrorKind::IncompleteMacroCall,
++                        spans: vec![Span::new(open, open + 1)],
++                    });
++                }
++            }
++        }
++    }
++
+     fn parse_name(&self, i: usize) -> Result<(usize, String), YaccGrammarError> {
+         match RE_NAME.find(&self.src[i..]) {
+             Some(m) => {

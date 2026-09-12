@@ -1,0 +1,1371 @@
+diff --git a/src/compaction/compactor.rs b/src/compaction/compactor.rs
+index 72c4a1b..82fc967 100644
+--- a/src/compaction/compactor.rs
++++ b/src/compaction/compactor.rs
+@@ -191,7 +191,8 @@ impl Compactor {
+ 			self.options.lopts.versioned_history_retention_ns,
+ 			Arc::clone(&self.options.lopts.clock),
+ 			snapshots,
+-		);
++		)
++		.with_vlog(self.options.vlog.clone());
+ 
+ 		let mut entries = 0;
+ 		for item in &mut comp_iter {
+diff --git a/src/iter.rs b/src/iter.rs
+index 9724635..26a0798 100644
+--- a/src/iter.rs
++++ b/src/iter.rs
+@@ -3,7 +3,12 @@ use std::sync::Arc;
+ 
+ use crate::clock::LogicalClock;
+ use crate::error::{Error, Result};
+-use crate::{Comparator, InternalKey, InternalKeyRef, LSMIterator, Value};
++use crate::vlog::ValueLocation;
++use crate::{Comparator, InternalKey, InternalKeyKind, InternalKeyRef, LSMIterator, Value};
++
++fn encode_inline(value: Value) -> Value {
++	ValueLocation::with_inline_value(value).encode()
++}
+ 
+ // ============================================================================
+ // SNAPSHOT VISIBILITY
+@@ -754,6 +759,8 @@ pub(crate) struct CompactionIterator<'a> {
+ 	/// active snapshot must be preserved. The list is sorted in ascending
+ 	/// order for efficient binary search.
+ 	snapshots: Vec<u64>,
++
++	vlog: Option<Arc<crate::vlog::VLog>>,
+ }
+ 
+ impl<'a> CompactionIterator<'a> {
+@@ -790,9 +797,15 @@ impl<'a> CompactionIterator<'a> {
+ 			clock,
+ 			initialized: false,
+ 			snapshots,
++			vlog: None,
+ 		}
+ 	}
+ 
++	pub(crate) fn with_vlog(mut self, vlog: Option<Arc<crate::vlog::VLog>>) -> Self {
++		self.vlog = vlog;
++		self
++	}
++
+ 	/// Initialize the iterator by seeking to the first entry.
+ 	fn initialize(&mut self) -> Result<()> {
+ 		self.merge_iter.seek_first()?;
+@@ -1004,6 +1017,77 @@ impl<'a> CompactionIterator<'a> {
+ 	/// Output: [seq=100, seq=50]
+ 	/// delete_list: [seq=20]
+ 	/// ```
++	fn resolve_encoded(&self, encoded: &[u8]) -> Result<Value> {
++		let loc = ValueLocation::decode(encoded)?;
++		loc.resolve_value(self.vlog.as_ref())
++	}
++
++	fn fold_merge_runs(&mut self) -> Result<()> {
++		let versions = std::mem::take(&mut self.accumulated_versions);
++		let mut out: Vec<(InternalKey, Value)> = Vec::with_capacity(versions.len());
++
++		let mut i = 0usize;
++		while i < versions.len() {
++			let (key, value) = &versions[i];
++			if !key.is_merge() {
++				out.push((key.clone(), value.clone()));
++				i += 1;
++				continue;
++			}
++
++			let run_seq = key.seq_num();
++			let run_vis = self.find_earliest_visible_snapshot(run_seq)?;
++			let mut operands: Vec<(u64, u64, Value)> =
++				vec![(run_seq, key.timestamp, self.resolve_encoded(value)?)];
++			let mut j = i + 1;
++			let mut base: Option<Value> = None;
++			let mut base_index: Option<usize> = None;
++			let mut crossed_boundary = false;
++
++			while j < versions.len() {
++				let (nkey, nval) = &versions[j];
++				let nvis = self.find_earliest_visible_snapshot(nkey.seq_num())?;
++				if !self.same_visibility_boundary(run_vis, nvis) {
++					crossed_boundary = true;
++					break;
++				}
++				if nkey.is_merge() {
++					operands.push((nkey.seq_num(), nkey.timestamp, self.resolve_encoded(nval)?));
++					j += 1;
++				} else if nkey.is_hard_delete_marker() || nkey.is_tombstone() {
++					base = Some(Vec::new());
++					base_index = Some(j);
++					break;
++				} else {
++					base = Some(self.resolve_encoded(nval)?);
++					base_index = Some(j);
++					break;
++				}
++			}
++
++			operands.reverse();
++			let base_reachable = base.is_some() && !crossed_boundary;
++			if base_reachable && self.is_bottom_level && !self.enable_versioning {
++				let raw: Vec<Value> = operands.into_iter().map(|(_, _, v)| v).collect();
++				let merged = crate::merge::fold(base.as_deref(), &raw);
++				let new_key =
++					InternalKey::new(key.user_key.clone(), run_seq, InternalKeyKind::Set, key.timestamp);
++				out.push((new_key, encode_inline(merged)));
++				i = base_index.unwrap() + 1;
++			} else {
++				let grouped = crate::merge::partial_fold_stamped(&operands);
++				for (seq, ts, op) in grouped.into_iter().rev() {
++					let new_key = InternalKey::new(key.user_key.clone(), seq, InternalKeyKind::Merge, ts);
++					out.push((new_key, encode_inline(op)));
++				}
++				i = j;
++			}
++		}
++
++		self.accumulated_versions = out;
++		Ok(())
++	}
++
+ 	fn process_accumulated_versions(&mut self) -> Result<()> {
+ 		if self.accumulated_versions.is_empty() {
+ 			return Ok(());
+@@ -1033,6 +1117,10 @@ impl<'a> CompactionIterator<'a> {
+ 		// zero rows.
+ 		self.accumulated_versions.dedup_by_key(|b| b.0.seq_num());
+ 
++		if self.accumulated_versions.iter().any(|(k, _)| k.is_merge()) {
++			self.fold_merge_runs()?;
++		}
++
+ 		// Check if latest version is DELETE at bottom level
+ 		// If so, we can completely remove this key from the database
+ 		let latest_is_delete_at_bottom = self.is_bottom_level
+@@ -1043,6 +1131,8 @@ impl<'a> CompactionIterator<'a> {
+ 		// REPLACE semantics: delete all older versions regardless of retention
+ 		let has_set_with_delete = self.accumulated_versions.iter().any(|(key, _)| key.is_replace());
+ 
++		let has_merge = self.accumulated_versions.iter().any(|(key, _)| key.is_merge());
++
+ 		// Track the visibility of the previous (newer) version we processed.
+ 		// Used to detect when a newer version supersedes an older one.
+ 		let mut newer_version_visibility: Option<SnapshotVisibility> = None;
+@@ -1073,7 +1163,9 @@ impl<'a> CompactionIterator<'a> {
+ 			let current_visibility = self.find_earliest_visible_snapshot(seq_num)?;
+ 
+ 			// Check if this version is superseded by a newer version
+-			let superseded = if let Some(newer_vis) = newer_version_visibility {
++			let superseded = if has_merge {
++				false
++			} else if let Some(newer_vis) = newer_version_visibility {
+ 				// Can we drop superseded versions in this scenario?
+ 				let snapshot_allows_drop = match current_visibility {
+ 					// Active snapshots exist - use visibility boundaries to decide
+@@ -1100,7 +1192,9 @@ impl<'a> CompactionIterator<'a> {
+ 			// ===== DETERMINE IF ENTRY IS STALE =====
+ 			// Stale entries are filtered out during compaction
+ 
+-			let should_mark_stale = if superseded {
++			let should_mark_stale = if has_merge {
++				false
++			} else if superseded {
+ 				// Superseded: a newer version in the same visibility boundary
+ 				// makes this version redundant - safe to drop
+ 				true
+@@ -1150,7 +1244,9 @@ impl<'a> CompactionIterator<'a> {
+ 
+ 			// ===== DETERMINE IF ENTRY SHOULD BE OUTPUT =====
+ 
+-			let should_output = if superseded {
++			let should_output = if has_merge {
++				true
++			} else if superseded {
+ 				// Superseded by newer version: don't output
+ 				false
+ 			} else if latest_is_delete_at_bottom {
+diff --git a/src/lib.rs b/src/lib.rs
+index 66e177e..1099d80 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -13,6 +13,7 @@ mod levels;
+ mod lockfile;
+ mod lsm;
+ mod memtable;
++mod merge;
+ mod oracle;
+ mod snapshot;
+ mod sstable;
+@@ -728,7 +729,7 @@ fn trailer_to_seq_num(trailer: u64) -> u64 {
+ 
+ /// Checks if a key kind represents a tombstone (delete operation)
+ #[inline(always)]
+-fn is_delete_kind(kind: InternalKeyKind) -> bool {
++pub(crate) fn is_delete_kind(kind: InternalKeyKind) -> bool {
+ 	matches!(
+ 		kind,
+ 		InternalKeyKind::Delete | InternalKeyKind::SoftDelete | InternalKeyKind::RangeDelete
+@@ -856,6 +857,11 @@ impl InternalKey {
+ 		is_replace_kind(self.kind())
+ 	}
+ 
++	#[inline]
++	pub(crate) fn is_merge(&self) -> bool {
++		crate::merge::is_merge_kind(self.kind())
++	}
++
+ 	/// Compares this key with another key using timestamp-based ordering
+ 	/// First compares by user key, then by timestamp (descending - newer
+ 	/// timestamps first, matching LSM seq_num ordering)
+@@ -961,6 +967,11 @@ impl<'a> InternalKeyRef<'a> {
+ 		is_replace_kind(self.kind())
+ 	}
+ 
++	#[inline]
++	pub fn is_merge(&self) -> bool {
++		crate::merge::is_merge_kind(self.kind())
++	}
++
+ 	pub(crate) fn to_owned(self) -> InternalKey {
+ 		InternalKey::decode(self.encoded)
+ 	}
+diff --git a/src/merge.rs b/src/merge.rs
+new file mode 100644
+index 0000000..03f20f6
+--- /dev/null
++++ b/src/merge.rs
+@@ -0,0 +1,102 @@
++use crate::{InternalKeyKind, Value};
++
++pub(crate) const OP_ADD: u8 = 0;
++pub(crate) const OP_MIN: u8 = 1;
++pub(crate) const OP_MAX: u8 = 2;
++
++#[inline]
++pub(crate) fn is_merge_kind(kind: InternalKeyKind) -> bool {
++	matches!(kind, InternalKeyKind::Merge)
++}
++
++#[inline]
++pub(crate) fn encode_operand(op: u8, value: u64) -> Value {
++	let mut buf = Vec::with_capacity(9);
++	buf.push(op);
++	buf.extend_from_slice(&value.to_le_bytes());
++	buf
++}
++
++#[inline]
++fn decode_operand(bytes: &[u8]) -> Option<(u8, u64)> {
++	if bytes.len() == 9 {
++		let mut v = [0u8; 8];
++		v.copy_from_slice(&bytes[1..9]);
++		Some((bytes[0], u64::from_le_bytes(v)))
++	} else {
++		None
++	}
++}
++
++#[inline]
++fn decode_base(bytes: &[u8]) -> u64 {
++	if bytes.len() == 8 {
++		let mut v = [0u8; 8];
++		v.copy_from_slice(bytes);
++		u64::from_le_bytes(v)
++	} else {
++		0
++	}
++}
++
++#[inline]
++fn apply(acc: u64, op: u8, value: u64) -> u64 {
++	match op {
++		OP_ADD => acc.saturating_add(value),
++		OP_MIN => acc.min(value),
++		OP_MAX => acc.max(value),
++		_ => acc,
++	}
++}
++
++#[inline]
++fn encode_base(value: u64) -> Value {
++	value.to_le_bytes().to_vec()
++}
++
++pub(crate) fn fold(base: Option<&[u8]>, operands: &[Value]) -> Value {
++	let mut acc: u64 = base.map_or(0, decode_base);
++	for op in operands {
++		if let Some((kind, value)) = decode_operand(op) {
++			acc = apply(acc, kind, value);
++		}
++	}
++	encode_base(acc)
++}
++
++pub(crate) fn partial_fold_stamped(operands: &[(u64, u64, Value)]) -> Vec<(u64, u64, Value)> {
++	let mut out: Vec<(u64, u64, Value)> = Vec::new();
++	let mut run_op: Option<u8> = None;
++	let mut run_acc: u64 = 0;
++	let mut run_seq: u64 = 0;
++	let mut run_ts: u64 = 0;
++	for (seq, ts, op) in operands {
++		let (kind, value) = match decode_operand(op) {
++			Some(d) => d,
++			None => continue,
++		};
++		match run_op {
++			Some(prev) if prev == kind && *ts == run_ts => {
++				run_acc = apply(run_acc, prev, value);
++				run_seq = run_seq.max(*seq);
++			}
++			Some(prev) => {
++				out.push((run_seq, run_ts, encode_operand(prev, run_acc)));
++				run_op = Some(kind);
++				run_acc = value;
++				run_seq = *seq;
++				run_ts = *ts;
++			}
++			None => {
++				run_op = Some(kind);
++				run_acc = value;
++				run_seq = *seq;
++				run_ts = *ts;
++			}
++		}
++	}
++	if let Some(op) = run_op {
++		out.push((run_seq, run_ts, encode_operand(op, run_acc)));
++	}
++	out
++}
+diff --git a/src/snapshot.rs b/src/snapshot.rs
+index 1f655d0..8084f83 100644
+--- a/src/snapshot.rs
++++ b/src/snapshot.rs
+@@ -12,7 +12,10 @@ use crate::iter::BoxedLSMIterator;
+ use crate::levels::Levels;
+ use crate::lsm::Core;
+ use crate::memtable::MemTable;
++use crate::merge::is_merge_kind;
++use crate::vlog::ValueLocation;
+ use crate::{
++	is_delete_kind,
+ 	BytewiseComparator,
+ 	Comparator,
+ 	InternalKey,
+@@ -178,81 +181,125 @@ impl Snapshot {
+ 	/// The search stops at the first version found with seq_num <= snapshot
+ 	/// seq_num.
+ 	pub(crate) fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
+-		// self.core.get_internal(key, self.seq_num)
+-		// Read lock on the active memtable
+-		let memtable_lock = self.core.active_memtable.read()?;
+-
+-		// Check the active memtable for the key
+-		if let Some(item) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
+-			if item.0.is_tombstone() {
+-				return Ok(None); // Key is a tombstone, return None
++		{
++			let memtable_lock = self.core.active_memtable.read()?;
++			if let Some(item) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
++				if item.0.is_tombstone() {
++					return Ok(None);
++				}
++				if item.0.is_merge() {
++					return self.fold_key(key);
++				}
++				return Ok(Some((item.1, item.0.seq_num())));
+ 			}
+-			return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
+ 		}
+-		drop(memtable_lock); // Release the lock on the active memtable
+-
+-		// Read lock on the immutable memtables
+-		let memtable_lock = self.core.immutable_memtables.read()?;
+ 
+-		// Check the immutable memtables for the key
+-		for entry in memtable_lock.iter().rev() {
+-			let memtable = &entry.memtable;
+-			if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
+-				if item.0.is_tombstone() {
+-					return Ok(None); // Key is a tombstone, return None
++		{
++			let memtable_lock = self.core.immutable_memtables.read()?;
++			for entry in memtable_lock.iter().rev() {
++				let memtable = &entry.memtable;
++				if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
++					if item.0.is_tombstone() {
++						return Ok(None);
++					}
++					if item.0.is_merge() {
++						return self.fold_key(key);
++					}
++					return Ok(Some((item.1, item.0.seq_num())));
+ 				}
+-				return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
+ 			}
+ 		}
+-		drop(memtable_lock); // Release the lock on the immutable memtables
+ 
+-		// Read lock on the level manifest
+ 		let level_manifest = self.core.level_manifest.read()?;
+-
+ 		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
+ 
+-		// Check the tables in each level for the key
+ 		for (level_idx, level) in (&level_manifest.levels).into_iter().enumerate() {
+ 			if level_idx == 0 {
+-				// Level 0: Tables can overlap, check all
+ 				for table in level.tables.iter() {
+ 					if !table.is_key_in_key_range(&ikey) {
+-						continue; // Skip this table if the key is not in its range
++						continue;
+ 					}
+-
+-					let maybe_item = table.get(&ikey)?;
+-
+-					if let Some(item) = maybe_item {
+-						let ikey = &item.0;
+-						if ikey.is_tombstone() {
+-							return Ok(None); // Key is a tombstone, return None
++					if let Some(item) = table.get(&ikey)? {
++						let found = &item.0;
++						if found.is_tombstone() {
++							return Ok(None);
++						}
++						if found.is_merge() {
++							return self.fold_key(key);
+ 						}
+-						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
++						return Ok(Some((item.1, found.seq_num())));
+ 					}
+ 				}
+ 			} else {
+-				// Level 1+: Non-overlapping, binary search for the one table
+ 				let query_range =
+ 					crate::user_range_to_internal_range(Bound::Included(key), Bound::Included(key));
+ 				let start_idx = level.find_first_overlapping_table(&query_range);
+ 				let end_idx = level.find_last_overlapping_table(&query_range);
+ 
+-				// At most one table can contain this exact key
+ 				for table in &level.tables[start_idx..end_idx] {
+-					let maybe_item = table.get(&ikey)?;
+-
+-					if let Some(item) = maybe_item {
+-						let ikey = &item.0;
+-						if ikey.is_tombstone() {
+-							return Ok(None); // Key is a tombstone, return None
++					if let Some(item) = table.get(&ikey)? {
++						let found = &item.0;
++						if found.is_tombstone() {
++							return Ok(None);
++						}
++						if found.is_merge() {
++							return self.fold_key(key);
+ 						}
+-						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
++						return Ok(Some((item.1, found.seq_num())));
+ 					}
+ 				}
+ 			}
+ 		}
+ 
+-		Ok(None) // Key not found in any memtable or table, return None
++		Ok(None)
++	}
++
++	fn fold_key(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
++		let range = crate::user_range_to_internal_range(
++			Bound::Included(key),
++			Bound::Included(key),
++		);
++		let iter_state = self.collect_iter_state()?;
++		let mut iter = KMergeIterator::new_from(iter_state, range);
++		iter.seek_first()?;
++
++		let mut operands: Vec<Value> = Vec::new();
++		let mut base: Option<Value> = None;
++		let mut top_seq: Option<u64> = None;
++
++		while iter.valid() {
++			let key_ref = iter.key();
++			if key_ref.user_key() != key {
++				break;
++			}
++			if key_ref.seq_num() > self.seq_num {
++				iter.next()?;
++				continue;
++			}
++			if top_seq.is_none() {
++				top_seq = Some(key_ref.seq_num());
++			}
++			let kind = key_ref.kind();
++			if is_merge_kind(kind) {
++				let raw = self.core.resolve_value(iter.value_encoded()?)?;
++				operands.push(raw);
++				iter.next()?;
++			} else if is_delete_kind(kind) {
++				break;
++			} else {
++				base = Some(self.core.resolve_value(iter.value_encoded()?)?);
++				break;
++			}
++		}
++
++		operands.reverse();
++		match top_seq {
++			Some(seq) => {
++				let folded = crate::merge::fold(base.as_deref(), &operands);
++				Ok(Some((ValueLocation::with_inline_value(folded).encode(), seq)))
++			}
++			None => Ok(None),
++		}
+ 	}
+ 
+ 	/// Creates an iterator for a range scan within the snapshot
+@@ -313,7 +360,8 @@ impl Snapshot {
+ 				upper,
+ 				ts_range,
+ 				limit,
+-			))
++			)
++			.with_vlog(self.core.vlog.clone()))
+ 		} else {
+ 			// Merge memtables + SSTables (no B+tree)
+ 			Ok(HistoryIterator::new_lsm(
+@@ -325,7 +373,8 @@ impl Snapshot {
+ 				limit,
+ 				lower,
+ 				upper,
+-			))
++			)
++			.with_vlog(self.core.vlog.clone()))
+ 		}
+ 	}
+ 
+@@ -334,45 +383,73 @@ impl Snapshot {
+ 	///
+ 	/// Uses the unified `history_iter()` for both B+tree and LSM backends.
+ 	pub(crate) fn get_at(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
+-		// Use unified history iterator for both backends
+ 		let mut iter = self.history_iter(Some(key), None, true, None, None)?;
+ 		iter.seek_first()?;
+ 
+-		// Track the best match (latest version at or before requested timestamp)
+-		let mut best_value: Option<Value> = None;
+-		let mut best_timestamp: u64 = 0;
++		let mut versions: Vec<(u64, u64, InternalKeyKind, Value)> = Vec::new();
+ 
+ 		while iter.valid() {
+ 			let entry_key = iter.key();
+ 
+-			// Stop if we've moved past our key
+ 			if entry_key.user_key() != key {
+ 				break;
+ 			}
+ 
+-			// Only consider versions visible to this snapshot
+ 			if entry_key.seq_num() > self.seq_num {
+ 				iter.next()?;
+ 				continue;
+ 			}
+ 
+ 			let entry_ts = entry_key.timestamp();
+-
+-			// Only consider versions at or before the requested timestamp
+-			if entry_ts <= timestamp && entry_ts >= best_timestamp {
+-				if entry_key.is_tombstone() {
+-					// Key was deleted at this timestamp
+-					best_value = None;
++			if entry_ts <= timestamp {
++				let kind = entry_key.kind();
++				let raw = if is_delete_kind(kind) {
++					Vec::new()
+ 				} else {
+-					best_value = Some(self.core.resolve_value(iter.value_encoded()?)?);
+-				}
+-				best_timestamp = entry_ts;
++					self.core.resolve_value(iter.value_encoded()?)?
++				};
++				versions.push((entry_ts, entry_key.seq_num(), kind, raw));
+ 			}
+ 
+ 			iter.next()?;
+ 		}
+ 
+-		Ok(best_value)
++		if versions.is_empty() {
++			return Ok(None);
++		}
++
++		versions.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
++
++		let greatest_ts = versions.last().unwrap().0;
++		let dom_idx = versions.iter().position(|v| v.0 == greatest_ts).unwrap();
++		let dominant = &versions[dom_idx];
++		if is_delete_kind(dominant.2) {
++			return Ok(None);
++		}
++		if !is_merge_kind(dominant.2) {
++			return Ok(Some(dominant.3.clone()));
++		}
++
++		let mut base_pos: Option<usize> = None;
++		for (idx, v) in versions.iter().enumerate().take(dom_idx + 1) {
++			if !is_merge_kind(v.2) {
++				base_pos = Some(idx);
++			}
++		}
++
++		let base = match base_pos {
++			Some(idx) if is_delete_kind(versions[idx].2) => None,
++			Some(idx) => Some(versions[idx].3.clone()),
++			None => None,
++		};
++		let start = base_pos.map(|i| i + 1).unwrap_or(0);
++		let operands: Vec<Value> = versions[start..=dom_idx]
++			.iter()
++			.filter(|v| is_merge_kind(v.2))
++			.map(|v| v.3.clone())
++			.collect();
++
++		Ok(Some(crate::merge::fold(base.as_deref(), &operands)))
+ 	}
+ }
+ 
+@@ -911,6 +988,10 @@ pub(crate) struct SnapshotIterator<'a> {
+ 
+ 	/// Whether the iterator has been initialized
+ 	initialized: bool,
++
++	fold_fwd_key: Vec<u8>,
++	fold_fwd_value: Vec<u8>,
++	has_fold_fwd: bool,
+ }
+ 
+ impl SnapshotIterator<'_> {
+@@ -938,6 +1019,9 @@ impl SnapshotIterator<'_> {
+ 			has_current_back: false,
+ 			direction: MergeDirection::Forward,
+ 			initialized: false,
++			fold_fwd_key: Vec::new(),
++			fold_fwd_value: Vec::new(),
++			has_fold_fwd: false,
+ 		})
+ 	}
+ 
+@@ -949,6 +1033,7 @@ impl SnapshotIterator<'_> {
+ 	/// Skip to the next valid entry in forward direction.
+ 	/// Valid = visible, latest version of user key, not a tombstone.
+ 	fn skip_to_valid_forward(&mut self) -> Result<bool> {
++		self.has_fold_fwd = false;
+ 		while self.merge_iter.valid() {
+ 			let key_ref = self.merge_iter.key();
+ 
+@@ -975,12 +1060,82 @@ impl SnapshotIterator<'_> {
+ 				continue;
+ 			}
+ 
++			if key_ref.is_merge() {
++				self.fold_forward_run()?;
++				return Ok(true);
++			}
++
+ 			// Found valid entry
+ 			return Ok(true);
+ 		}
+ 		Ok(false)
+ 	}
+ 
++	fn fold_visible_run(&self, visible: &[(InternalKeyKind, Value)]) -> Result<Value> {
++		let mut operands: Vec<Value> = Vec::new();
++		let mut base: Option<Value> = None;
++		for (kind, raw) in visible.iter().rev() {
++			if is_merge_kind(*kind) {
++				operands.push(self.core.resolve_value(raw)?);
++			} else if is_delete_kind(*kind) {
++				break;
++			} else {
++				base = Some(self.core.resolve_value(raw)?);
++				break;
++			}
++		}
++		operands.reverse();
++		let folded = crate::merge::fold(base.as_deref(), &operands);
++		Ok(ValueLocation::with_inline_value(folded).encode())
++	}
++
++	fn fold_forward_run(&mut self) -> Result<()> {
++		let key_ref = self.merge_iter.key();
++		let dom_seq = key_ref.seq_num();
++		let dom_ts = key_ref.timestamp();
++		let user_key = key_ref.user_key().to_vec();
++
++		let mut operands: Vec<Value> = Vec::new();
++		let mut base: Option<Value> = None;
++
++		while self.merge_iter.valid() {
++			let kr = self.merge_iter.key();
++			if kr.user_key() != user_key.as_slice() {
++				break;
++			}
++			if kr.seq_num() > self.snapshot_seq_num {
++				self.merge_iter.next()?;
++				continue;
++			}
++			let kind = kr.kind();
++			if is_merge_kind(kind) {
++				operands.push(self.core.resolve_value(self.merge_iter.value_encoded()?)?);
++				self.merge_iter.next()?;
++			} else if is_delete_kind(kind) {
++				self.merge_iter.next()?;
++				break;
++			} else {
++				base = Some(self.core.resolve_value(self.merge_iter.value_encoded()?)?);
++				self.merge_iter.next()?;
++				break;
++			}
++		}
++
++		while self.merge_iter.valid() && self.merge_iter.key().user_key() == user_key.as_slice() {
++			self.merge_iter.next()?;
++		}
++
++		operands.reverse();
++		let folded = crate::merge::fold(base.as_deref(), &operands);
++		let synth = InternalKey::new(user_key, dom_seq, InternalKeyKind::Set, dom_ts);
++		self.fold_fwd_key.clear();
++		self.fold_fwd_key.extend_from_slice(&synth.encode());
++		self.fold_fwd_value.clear();
++		self.fold_fwd_value.extend_from_slice(&ValueLocation::with_inline_value(folded).encode());
++		self.has_fold_fwd = true;
++		Ok(())
++	}
++
+ 	/// Skip to the next valid entry in backward direction.
+ 	/// Thin wrapper kept for symmetry with `skip_to_valid_forward`; all real
+ 	/// work happens in `find_latest_visible_backward`, which loops internally.
+@@ -1023,10 +1178,12 @@ impl SnapshotIterator<'_> {
+ 
+ 			let mut latest_key: Option<Vec<u8>> = None;
+ 			let mut latest_value: Option<Vec<u8>> = None;
++			let mut visible: Vec<(InternalKeyKind, Value)> = Vec::new();
+ 
+ 			if self.is_visible_ref(&first_key_ref) {
+ 				latest_key = Some(first_key_ref.encoded().to_vec());
+ 				latest_value = Some(self.merge_iter.value_encoded()?.to_vec());
++				visible.push((first_key_ref.kind(), self.merge_iter.value_encoded()?.to_vec()));
+ 			}
+ 
+ 			// Walk older versions of this same user key, picking up the latest
+@@ -1055,6 +1212,7 @@ impl SnapshotIterator<'_> {
+ 				if self.is_visible_ref(&key_ref) {
+ 					latest_key = Some(key_ref.encoded().to_vec());
+ 					latest_value = Some(self.merge_iter.value_encoded()?.to_vec());
++					visible.push((key_ref.kind(), self.merge_iter.value_encoded()?.to_vec()));
+ 				}
+ 			}
+ 
+@@ -1069,8 +1227,14 @@ impl SnapshotIterator<'_> {
+ 				}
+ 				self.current_back_key.clear();
+ 				self.current_back_key.extend_from_slice(&key_bytes);
+-				self.current_back_value.clear();
+-				self.current_back_value.extend_from_slice(&value_bytes);
++				if key_ref.is_merge() {
++					let folded = self.fold_visible_run(&visible)?;
++					self.current_back_value.clear();
++					self.current_back_value.extend_from_slice(&folded);
++				} else {
++					self.current_back_value.clear();
++					self.current_back_value.extend_from_slice(&value_bytes);
++				}
+ 				self.has_current_back = true;
+ 				return Ok(true);
+ 			}
+@@ -1175,6 +1339,10 @@ impl LSMIterator for SnapshotIterator<'_> {
+ 		}
+ 
+ 		// Normal forward iteration
++		if self.has_fold_fwd {
++			self.has_fold_fwd = false;
++			return self.skip_to_valid_forward();
++		}
+ 		if !self.merge_iter.valid() {
+ 			return Ok(false);
+ 		}
+@@ -1203,6 +1371,8 @@ impl LSMIterator for SnapshotIterator<'_> {
+ 	fn valid(&self) -> bool {
+ 		if self.direction == MergeDirection::Backward {
+ 			self.has_current_back
++		} else if self.has_fold_fwd {
++			true
+ 		} else {
+ 			self.merge_iter.valid()
+ 		}
+@@ -1212,6 +1382,8 @@ impl LSMIterator for SnapshotIterator<'_> {
+ 		debug_assert!(self.valid());
+ 		if self.direction == MergeDirection::Backward {
+ 			InternalKeyRef::from_encoded(&self.current_back_key)
++		} else if self.has_fold_fwd {
++			InternalKeyRef::from_encoded(&self.fold_fwd_key)
+ 		} else {
+ 			self.merge_iter.key()
+ 		}
+@@ -1221,6 +1393,8 @@ impl LSMIterator for SnapshotIterator<'_> {
+ 		debug_assert!(self.valid());
+ 		if self.direction == MergeDirection::Backward {
+ 			Ok(&self.current_back_value)
++		} else if self.has_fold_fwd {
++			Ok(&self.fold_fwd_value)
+ 		} else {
+ 			self.merge_iter.value_encoded()
+ 		}
+@@ -1338,6 +1512,13 @@ pub struct HistoryIterator<'a> {
+ 	limit: Option<usize>,
+ 	entries_returned: usize,
+ 	limit_reached: bool,
++
++	fold_fwd_key: Vec<u8>,
++	fold_fwd_value: Vec<u8>,
++	has_fold_fwd: bool,
++	pending_fwd_put: Option<(Vec<u8>, Vec<u8>)>,
++
++	vlog: Option<Arc<crate::vlog::VLog>>,
+ }
+ 
+ impl<'a> HistoryIterator<'a> {
+@@ -1372,6 +1553,23 @@ impl<'a> HistoryIterator<'a> {
+ 			limit,
+ 			entries_returned: 0,
+ 			limit_reached: false,
++			fold_fwd_key: Vec::new(),
++			fold_fwd_value: Vec::new(),
++			has_fold_fwd: false,
++			pending_fwd_put: None,
++			vlog: None,
++		}
++	}
++
++	pub(crate) fn with_vlog(mut self, vlog: Option<Arc<crate::vlog::VLog>>) -> Self {
++		self.vlog = vlog;
++		self
++	}
++
++	fn resolve_history_value(&self, encoded: &[u8]) -> Value {
++		match ValueLocation::decode(encoded) {
++			Ok(loc) => loc.resolve_value(self.vlog.as_ref()).unwrap_or_default(),
++			Err(_) => Vec::new(),
+ 		}
+ 	}
+ 
+@@ -1402,6 +1600,7 @@ impl<'a> HistoryIterator<'a> {
+ 		self.first_visible_seen = false;
+ 		self.latest_is_hard_delete = false;
+ 		self.barrier_seen = false;
++		self.pending_fwd_put = None;
+ 	}
+ 
+ 	fn clear_backward_buffer(&mut self) {
+@@ -1517,6 +1716,7 @@ impl<'a> HistoryIterator<'a> {
+ 	/// - HARD_DELETE: skip it and everything older
+ 	/// - REPLACE: output it, skip everything older
+ 	fn skip_to_valid_forward(&mut self) -> Result<bool> {
++		self.has_fold_fwd = false;
+ 		while self.inner_valid() {
+ 			// Check limit before returning any entry
+ 			if let Some(limit) = self.limit {
+@@ -1621,6 +1821,13 @@ impl<'a> HistoryIterator<'a> {
+ 				continue;
+ 			}
+ 
++			if !self.include_tombstones && self.inner_key().is_merge() {
++				let uk = self.current_user_key.clone();
++				self.fold_forward_run(&uk, seq_num, timestamp)?;
++				self.entries_returned += 1;
++				return Ok(true);
++			}
++
+ 			// Found valid entry - increment counter
+ 			self.entries_returned += 1;
+ 			return Ok(true);
+@@ -1628,6 +1835,61 @@ impl<'a> HistoryIterator<'a> {
+ 		Ok(false)
+ 	}
+ 
++	fn fold_forward_run(&mut self, user_key: &[u8], dom_seq: u64, dom_ts: u64) -> Result<()> {
++		let mut operands: Vec<Value> = Vec::new();
++		let mut base: Option<Value> = None;
++		let mut base_stamp: Option<(u64, u64)> = None;
++		while self.inner_valid() {
++			let kr = self.inner_key();
++			if kr.user_key() != user_key {
++				break;
++			}
++			if kr.seq_num() > self.snapshot_seq_num {
++				self.inner_next()?;
++				continue;
++			}
++			let kind = kr.kind();
++			if is_merge_kind(kind) {
++				let raw = self.resolve_history_value(self.inner_value()?);
++				operands.push(raw);
++				self.inner_next()?;
++			} else if is_delete_kind(kind) {
++				self.inner_next()?;
++				break;
++			} else {
++				let seq = kr.seq_num();
++				let ts = kr.timestamp();
++				let raw = self.resolve_history_value(self.inner_value()?);
++				base = Some(raw.clone());
++				base_stamp = Some((seq, ts));
++				self.inner_next()?;
++				break;
++			}
++		}
++		while self.inner_valid() && self.inner_key().user_key() == user_key {
++			self.inner_next()?;
++		}
++		operands.reverse();
++		let folded = crate::merge::fold(base.as_deref(), &operands);
++		let synth = InternalKey::new(user_key.to_vec(), dom_seq, InternalKeyKind::Set, dom_ts);
++		self.fold_fwd_key.clear();
++		self.fold_fwd_key.extend_from_slice(&synth.encode());
++		self.fold_fwd_value.clear();
++		self.fold_fwd_value.extend_from_slice(&ValueLocation::with_inline_value(folded).encode());
++		self.has_fold_fwd = true;
++		self.pending_fwd_put = match (base, base_stamp) {
++			(Some(value), Some((seq, ts))) => {
++				let put_key = InternalKey::new(user_key.to_vec(), seq, InternalKeyKind::Set, ts);
++				Some((
++					put_key.encode(),
++					ValueLocation::with_inline_value(value).encode(),
++				))
++			}
++			_ => None,
++		};
++		Ok(())
++	}
++
+ 	// === BACKWARD ITERATION (Buffered) ===
+ 
+ 	/// Collect all visible versions of current user key, apply filtering,
+@@ -1660,6 +1922,7 @@ impl<'a> HistoryIterator<'a> {
+ 			is_hard_delete: bool,
+ 			is_replace: bool,
+ 			is_tombstone: bool,
++			is_merge: bool,
+ 			encoded_key: Vec<u8>,
+ 			value: Vec<u8>,
+ 		}
+@@ -1687,6 +1950,7 @@ impl<'a> HistoryIterator<'a> {
+ 					is_hard_delete: key_ref.is_hard_delete_marker(),
+ 					is_replace: key_ref.is_replace(),
+ 					is_tombstone: key_ref.is_tombstone(),
++					is_merge: key_ref.is_merge(),
+ 					encoded_key: key_ref.encoded().to_vec(),
+ 					value: self.inner_value()?.to_vec(),
+ 				});
+@@ -1733,22 +1997,52 @@ impl<'a> HistoryIterator<'a> {
+ 			None => 0,                                      // No barrier, include all
+ 		};
+ 
+-		// Output versions[valid_start_idx..] in ASC order (oldest first for backward)
+-		for v in versions.into_iter().skip(valid_start_idx) {
+-			// Skip HARD_DELETE markers (shouldn't happen after valid_start_idx, but be safe)
+-			if v.is_hard_delete {
+-				continue;
++		let valid: Vec<VersionInfo> = versions.into_iter().skip(valid_start_idx).collect();
++		let newest_is_merge = !self.include_tombstones
++			&& valid.last().map_or(false, |v| v.is_merge && !v.is_hard_delete && !v.is_tombstone);
++
++		if newest_is_merge {
++			let mut operands: Vec<Value> = Vec::new();
++			let mut base: Option<Value> = None;
++			let mut base_entry: Option<(Vec<u8>, Vec<u8>)> = None;
++			for v in valid.iter().rev() {
++				if v.is_merge {
++					operands.push(self.resolve_history_value(&v.value));
++				} else if v.is_hard_delete || v.is_tombstone {
++					break;
++				} else {
++					let resolved = self.resolve_history_value(&v.value);
++					base = Some(resolved.clone());
++					base_entry = Some((
++						v.encoded_key.clone(),
++						ValueLocation::with_inline_value(resolved).encode(),
++					));
++					break;
++				}
+ 			}
+-
+-			// Tombstone filtering
+-			if !self.include_tombstones && v.is_tombstone {
+-				continue;
++			operands.reverse();
++			let folded = crate::merge::fold(base.as_deref(), &operands);
++			let newest = valid.last().unwrap();
++			if let Some((key, value)) = base_entry {
++				self.backward_buffer.push(BufferedEntry { key, value });
+ 			}
+-
+ 			self.backward_buffer.push(BufferedEntry {
+-				key: v.encoded_key,
+-				value: v.value,
++				key: newest.encoded_key.clone(),
++				value: ValueLocation::with_inline_value(folded).encode(),
+ 			});
++		} else {
++			for v in valid.into_iter() {
++				if v.is_hard_delete {
++					continue;
++				}
++				if !self.include_tombstones && v.is_tombstone {
++					continue;
++				}
++				self.backward_buffer.push(BufferedEntry {
++					key: v.encoded_key,
++					value: v.value,
++				});
++			}
+ 		}
+ 
+ 		if self.backward_buffer.is_empty() {
+@@ -1911,6 +2205,18 @@ impl LSMIterator for HistoryIterator<'_> {
+ 		}
+ 
+ 		// Normal forward iteration
++		if self.has_fold_fwd {
++			if let Some((key, value)) = self.pending_fwd_put.take() {
++				self.fold_fwd_key.clear();
++				self.fold_fwd_key.extend_from_slice(&key);
++				self.fold_fwd_value.clear();
++				self.fold_fwd_value.extend_from_slice(&value);
++				self.entries_returned += 1;
++				return Ok(true);
++			}
++			self.has_fold_fwd = false;
++			return self.skip_to_valid_forward();
++		}
+ 		if !self.inner_valid() {
+ 			return Ok(false);
+ 		}
+@@ -1942,7 +2248,9 @@ impl LSMIterator for HistoryIterator<'_> {
+ 			return false;
+ 		}
+ 		match self.direction {
+-			MergeDirection::Forward => self.inner_valid() && self.within_upper_bound(),
++			MergeDirection::Forward => {
++				self.has_fold_fwd || (self.inner_valid() && self.within_upper_bound())
++			}
+ 			MergeDirection::Backward => self.has_buffered_entry(),
+ 		}
+ 	}
+@@ -1950,7 +2258,13 @@ impl LSMIterator for HistoryIterator<'_> {
+ 	fn key(&self) -> InternalKeyRef<'_> {
+ 		debug_assert!(self.valid());
+ 		match self.direction {
+-			MergeDirection::Forward => self.inner_key(),
++			MergeDirection::Forward => {
++				if self.has_fold_fwd {
++					InternalKeyRef::from_encoded(&self.fold_fwd_key)
++				} else {
++					self.inner_key()
++				}
++			}
+ 			MergeDirection::Backward => self.buffered_key(),
+ 		}
+ 	}
+@@ -1958,7 +2272,13 @@ impl LSMIterator for HistoryIterator<'_> {
+ 	fn value_encoded(&self) -> Result<&[u8]> {
+ 		debug_assert!(self.valid());
+ 		match self.direction {
+-			MergeDirection::Forward => self.inner_value(),
++			MergeDirection::Forward => {
++				if self.has_fold_fwd {
++					Ok(&self.fold_fwd_value)
++				} else {
++					self.inner_value()
++				}
++			}
+ 			MergeDirection::Backward => Ok(self.buffered_value()),
+ 		}
+ 	}
+diff --git a/src/transaction.rs b/src/transaction.rs
+index 6692587..ec6f291 100644
+--- a/src/transaction.rs
++++ b/src/transaction.rs
+@@ -405,6 +405,26 @@ impl Transaction {
+ 		Ok(())
+ 	}
+ 
++	pub fn merge<K, V>(&mut self, key: K, operand: V) -> Result<()>
++	where
++		K: IntoBytes,
++		V: IntoBytes,
++	{
++		let write_seqno = self.next_write_seqno();
++
++		let entry = Entry::new(
++			key,
++			Some(operand),
++			InternalKeyKind::Merge,
++			self.savepoints,
++			write_seqno,
++			Entry::COMMIT_TIME,
++		);
++
++		self.write(entry)?;
++		Ok(())
++	}
++
+ 	/// Gets a value for a key if it exists.
+ 	pub fn get<K>(&self, key: K) -> Result<Option<Value>>
+ 	where
+@@ -446,6 +466,34 @@ impl Transaction {
+ 					return Ok(None);
+ 				}
+ 
++				if entry.is_merge() && entry.timestamp <= timestamp {
++					let mut operands: Vec<Value> = Vec::new();
++					let mut base: Option<Value> = None;
++					for e in entries.iter().rev() {
++						if e.timestamp > timestamp {
++							continue;
++						}
++						if e.is_merge() {
++							operands.push(e.value.clone().unwrap_or_default());
++						} else if e.is_tombstone() {
++							base = Some(Vec::new());
++							break;
++						} else {
++							base = Some(e.value.clone().unwrap_or_default());
++							break;
++						}
++					}
++					operands.reverse();
++					let resolved_base = match base {
++						Some(b) => Some(b),
++						None => match &self.snapshot {
++							Some(s) => s.get_at(key.as_slice(), timestamp)?,
++							None => return Err(Error::NoSnapshot),
++						},
++					};
++					return Ok(Some(crate::merge::fold(resolved_base.as_deref(), &operands)));
++				}
++
+ 				// Write set entry is visible if its timestamp <= query timestamp
+ 				if entry.timestamp <= timestamp {
+ 					if entry.is_tombstone() {
+@@ -485,24 +533,26 @@ impl Transaction {
+ 
+ 		// RYOW semantics: Read your own writes. If the value is in the write set,
+ 		// return it.
+-		if let Some(last_entry) =
+-			self.write_set.get(key.as_slice()).and_then(|entries| entries.last())
+-		{
+-			// If the entry is a tombstone, return None.
+-			if last_entry.is_tombstone() {
++		if let Some(entries) = self.write_set.get(key.as_slice()) {
++			let last = match entries.last() {
++				Some(e) => e,
++				None => return self.committed_get(key.as_slice()),
++			};
++			if last.is_tombstone() {
+ 				return Ok(None);
+ 			}
+-			if let Some(v) = &last_entry.value {
+-				return Ok(Some(v.clone()));
++			if !last.is_merge() {
++				return Ok(last.value.clone());
+ 			}
+-			// If the entry has no value, it means the key was deleted in this transaction.
+-			return Ok(None);
++			return Ok(Some(self.fold_write_set(key.as_slice(), entries)?));
+ 		}
+ 
+-		// The value is not in the write set, so attempt to get it from the snapshot.
+-		match self.snapshot.as_ref().unwrap().get(key.as_slice())? {
++		self.committed_get(key.as_slice())
++	}
++
++	fn committed_get(&self, key: &[u8]) -> Result<Option<Value>> {
++		match self.snapshot.as_ref().unwrap().get(key)? {
+ 			Some(val) => {
+-				// Resolve the value reference through VLog if needed
+ 				let resolved_value = self.core.resolve_value(&val.0)?;
+ 				Ok(Some(resolved_value))
+ 			}
+@@ -510,6 +560,28 @@ impl Transaction {
+ 		}
+ 	}
+ 
++	fn fold_write_set(&self, key: &[u8], entries: &[Entry]) -> Result<Value> {
++		let mut operands: Vec<Value> = Vec::new();
++		let mut base: Option<Value> = None;
++		for entry in entries.iter().rev() {
++			if entry.is_merge() {
++				operands.push(entry.value.clone().unwrap_or_default());
++			} else if entry.is_tombstone() {
++				base = Some(Vec::new());
++				break;
++			} else {
++				base = Some(entry.value.clone().unwrap_or_default());
++				break;
++			}
++		}
++		operands.reverse();
++		let resolved_base = match base {
++			Some(b) => Some(b),
++			None => self.committed_get(key)?,
++		};
++		Ok(crate::merge::fold(resolved_base.as_deref(), &operands))
++	}
++
+ 	/// Gets keys in a key range at a specific timestamp.
+ 	///
+ 	/// Gets keys and values in a range, at the current timestamp.
+@@ -633,6 +705,7 @@ impl Transaction {
+ 		// RYOW: Collect write-set entries in the key range
+ 		// Hard deletes are tracked separately and skip all snapshot history for that key
+ 		let mut write_set_entries: Vec<(&Key, &Entry)> = Vec::new();
++		let mut folded_ws: Vec<Option<Value>> = Vec::new();
+ 		let mut hard_delete_keys: std::collections::HashSet<&[u8]> =
+ 			std::collections::HashSet::new();
+ 
+@@ -651,9 +724,19 @@ impl Transaction {
+ 				if let Some((ts_start, ts_end)) = opts.ts_range {
+ 					if entry.timestamp >= ts_start && entry.timestamp <= ts_end {
+ 						write_set_entries.push((key, entry));
++						folded_ws.push(if entry.is_merge() {
++							Some(self.fold_write_set(key.as_slice(), entry_list)?)
++						} else {
++							None
++						});
+ 					}
+ 				} else {
+ 					write_set_entries.push((key, entry));
++					folded_ws.push(if entry.is_merge() {
++						Some(self.fold_write_set(key.as_slice(), entry_list)?)
++					} else {
++						None
++					});
+ 				}
+ 			}
+ 		}
+@@ -662,6 +745,7 @@ impl Transaction {
+ 			inner,
+ 			Arc::clone(&self.core),
+ 			write_set_entries,
++			folded_ws,
+ 			hard_delete_keys,
+ 			opts.include_tombstones,
+ 		))
+@@ -698,7 +782,9 @@ impl Transaction {
+ 				// Exception: When using explicit timestamps (set_at), entries with
+ 				// different timestamps should be preserved as separate versions, not replaced.
+ 				if let Some(last_entry) = entries.last() {
+-					if last_entry.savepoint_no == e.savepoint_no {
++					if e.is_merge() {
++						entries.push(e);
++					} else if last_entry.savepoint_no == e.savepoint_no {
+ 						// Same savepoint - check if timestamps differ
+ 						// If both have explicit timestamps and they're different,
+ 						// preserve both as separate versions
+@@ -933,6 +1019,10 @@ impl Entry {
+ 	fn is_hard_delete(&self) -> bool {
+ 		self.kind == InternalKeyKind::Delete || self.kind == InternalKeyKind::RangeDelete
+ 	}
++
++	fn is_merge(&self) -> bool {
++		self.kind == InternalKeyKind::Merge
++	}
+ }
+ 
+ /// Current source for the transaction iterator
+@@ -955,6 +1045,8 @@ pub(crate) struct TransactionRangeIterator<'a> {
+ 	/// Write-set entries for the range (collected, filtered for tombstones on access)
+ 	write_set_entries: Vec<(&'a Key, &'a Entry)>,
+ 
++	folded_ws: Vec<Option<Value>>,
++
+ 	/// Current position in write-set entries.
+ 	/// None means write-set is exhausted/not positioned.
+ 	/// Uses single index for both forward and backward iteration.
+@@ -1004,9 +1096,15 @@ impl<'a> TransactionRangeIterator<'a> {
+ 		// Collect write-set entries for the range
+ 		// We collect references to avoid cloning, and filter tombstones during iteration
+ 		let mut write_set_entries: Vec<(&'a Key, &'a Entry)> = Vec::new();
++		let mut folded_ws: Vec<Option<Value>> = Vec::new();
+ 		for (key, entry_list) in tx.write_set.range(start_key..end_key) {
+ 			if let Some(entry) = entry_list.last() {
+ 				write_set_entries.push((key, entry));
++				if entry.is_merge() {
++					folded_ws.push(Some(tx.fold_write_set(key.as_slice(), entry_list)?));
++				} else {
++					folded_ws.push(None);
++				}
+ 			}
+ 		}
+ 
+@@ -1014,6 +1112,7 @@ impl<'a> TransactionRangeIterator<'a> {
+ 			snapshot_iter,
+ 			core,
+ 			write_set_entries,
++			folded_ws,
+ 			ws_pos: None,
+ 			is_key_equal: false,
+ 			current_source: CurrentSource::None,
+@@ -1364,7 +1463,11 @@ impl LSMIterator for TransactionRangeIterator<'_> {
+ 		match self.current_source {
+ 			CurrentSource::Snapshot => self.snapshot_iter.value_encoded(),
+ 			CurrentSource::WriteSet => {
+-				let entry = self.write_set_entries[self.ws_pos.unwrap()].1;
++				let pos = self.ws_pos.unwrap();
++				if let Some(folded) = &self.folded_ws[pos] {
++					return Ok(folded.as_slice());
++				}
++				let entry = self.write_set_entries[pos].1;
+ 				Ok(entry.value.as_ref().map_or(&[], |v| v.as_slice()))
+ 			}
+ 			CurrentSource::None => panic!("value() called on invalid iterator"),
+@@ -1492,6 +1595,8 @@ pub(crate) struct TransactionHistoryIterator<'a> {
+ 	/// Note: Hard delete entries are excluded (they go to `hard_delete_keys`).
+ 	write_set_entries: Vec<(&'a Key, &'a Entry)>,
+ 
++	folded_ws: Vec<Option<Value>>,
++
+ 	/// Keys that have hard deletes in write-set.
+ 	///
+ 	/// Hard deletes differ from tombstones:
+@@ -1562,6 +1667,7 @@ impl<'a> TransactionHistoryIterator<'a> {
+ 		inner: HistoryIterator<'a>,
+ 		core: Arc<Core>,
+ 		write_set_entries: Vec<(&'a Key, &'a Entry)>,
++		folded_ws: Vec<Option<Value>>,
+ 		hard_delete_keys: std::collections::HashSet<&'a [u8]>,
+ 		include_tombstones: bool,
+ 	) -> Self {
+@@ -1569,6 +1675,7 @@ impl<'a> TransactionHistoryIterator<'a> {
+ 			inner,
+ 			core,
+ 			write_set_entries,
++			folded_ws,
+ 			hard_delete_keys,
+ 			ws_pos: None,
+ 			is_key_equal: false,
+@@ -2127,7 +2234,11 @@ impl LSMIterator for TransactionHistoryIterator<'_> {
+ 		match self.current_source {
+ 			CurrentSource::Snapshot => self.inner.value_encoded(),
+ 			CurrentSource::WriteSet => {
+-				let entry = self.write_set_entries[self.ws_pos.unwrap()].1;
++				let pos = self.ws_pos.unwrap();
++				if let Some(folded) = &self.folded_ws[pos] {
++					return Ok(folded.as_slice());
++				}
++				let entry = self.write_set_entries[pos].1;
+ 				Ok(entry.value.as_ref().map_or(&[], |v| v.as_slice()))
+ 			}
+ 			CurrentSource::None => panic!("value() called on invalid iterator"),

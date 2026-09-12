@@ -1,0 +1,1193 @@
+diff --git a/starlark/eval.go b/starlark/eval.go
+index c50f079..2836994 100644
+--- a/starlark/eval.go
++++ b/starlark/eval.go
+@@ -1560,11 +1560,25 @@ func interpolate(format string, x Value) (Value, error) {
+ 			}
+ 		}
+ 
+-		// NOTE: Starlark does not support any of these optional Python features:
+-		// - optional conversion flags: [#0- +], etc.
+-		// - optional minimum field width (number or *).
+-		// - optional precision (.123 or *)
+-		// - optional length modifier
++		// An optional [flags][width][.precision] specifier before the
++		// conversion is rendered through the same engine as str.format, so the
++		// two formatting surfaces agree. A bare conversion takes the legacy
++		// path below. The '*' width/precision and length modifiers are still
++		// unsupported.
++		if fs, consumed, present := parsePercentSpec(format); present {
++			if consumed >= len(format) {
++				return nil, fmt.Errorf("incomplete format")
++			}
++			conv := format[consumed]
++			rendered, err := renderPercentVerb(arg, fs, conv)
++			if err != nil {
++				return nil, err
++			}
++			buf.WriteString(rendered)
++			format = format[consumed+1:]
++			index++
++			continue
++		}
+ 
+ 		// conversion type
+ 		if format == "" {
+@@ -1636,3 +1650,77 @@ func is[T any](x any) bool {
+ 	_, ok := x.(T)
+ 	return ok
+ }
++
++// renderPercentVerb formats one %-interpolation argument that carried an
++// explicit [flags][width][.precision] specifier, reusing the str.format
++// renderers. Integers and the 'c' type follow printf conventions (precision is
++// a minimum digit count for integers); string conversions default to right
++// alignment and ignore the numeric flags, as the 'c' type ignores the zero flag.
++func renderPercentVerb(arg Value, fs formatSpec, conv byte) (string, error) {
++	switch conv {
++	case 's', 'r':
++		var s string
++		if str, ok := AsString(arg); ok && conv == 's' {
++			s = str
++		} else {
++			b := new(strings.Builder)
++			writeValue(b, arg, nil)
++			s = b.String()
++		}
++		// printf ignores the numeric flags for string conversions.
++		fs.sign, fs.alt, fs.group = 0, false, 0
++		if fs.zero {
++			fs.zero = false
++			fs.fill = ' '
++			if fs.align == '=' {
++				fs.align = 0
++			}
++		}
++		if fs.align == 0 {
++			fs.align = '>'
++		}
++		return formatString(s, fs)
++	case 'd', 'i', 'o', 'x', 'X':
++		i, err := NumberToInt(arg)
++		if err != nil {
++			return "", fmt.Errorf("%%%c format requires integer: %v", conv, err)
++		}
++		c := conv
++		if c == 'i' {
++			c = 'd'
++		}
++		return formatPercentInt(i.bigInt(), fs, c)
++	case 'e', 'E', 'f', 'F', 'g', 'G':
++		f, ok := AsFloat(arg)
++		if !ok {
++			return "", fmt.Errorf("%%%c format requires float, not %s", conv, arg.Type())
++		}
++		fs.typ = conv
++		return formatFloat(f, fs)
++	case 'c':
++		// printf ignores the zero flag for %c (it space-pads).
++		if fs.zero {
++			fs.zero = false
++			fs.fill = ' '
++			if fs.align == '=' {
++				fs.align = 0
++			}
++		}
++		switch a := arg.(type) {
++		case Int:
++			return formatChar(a.bigInt(), fs)
++		case String:
++			r, size := utf8.DecodeRuneInString(string(a))
++			if size != len(a) || a == "" {
++				return "", fmt.Errorf("%%c format requires a single-character string")
++			}
++			if fs.align == 0 {
++				fs.align = '>'
++			}
++			return applyAlign("", "", string(r), fs), nil
++		default:
++			return "", fmt.Errorf("%%c format requires int or single-character string, not %s", a.Type())
++		}
++	}
++	return "", fmt.Errorf("unknown conversion %%%c", conv)
++}
+diff --git a/starlark/format.go b/starlark/format.go
+new file mode 100644
+index 0000000..20b5e32
+--- /dev/null
++++ b/starlark/format.go
+@@ -0,0 +1,336 @@
++// Copyright 2017 The Bazel Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package starlark
++
++// This file implements the Python str.format() format specifier mini-language:
++//
++//	[[fill]align][sign][#][0][width][grouping_option][.precision][type]
++//
++// The grammar parser and the alignment/padding/grouping engine live here as
++// pure functions with no dependence on Value; the per-type renderers
++// (formatInteger, formatFloat, formatString) consume a formatSpec and call
++// applyAlign and groupDigits.
++
++import (
++	"fmt"
++	"strconv"
++	"strings"
++	"unicode/utf8"
++)
++
++// formatSpec is a parsed format specifier.
++type formatSpec struct {
++	fill     rune // pad rune (default ' ')
++	align    byte // '<', '>', '^', '=', or 0 if unset
++	sign     byte // '+', '-', ' ', or 0 (default '-')
++	alt      bool // '#': alternate form
++	zero     bool // leading '0': sign-aware zero padding
++	width    int
++	hasWidth bool
++	group    byte // ',', '_', or 0
++	prec     int
++	hasPrec  bool
++	typ      byte // presentation type, or 0 if empty
++}
++
++func isAlignByte(c byte) bool {
++	return c == '<' || c == '>' || c == '^' || c == '='
++}
++
++// parseFormatSpec parses a fully-resolved (no nested fields) format specifier.
++func parseFormatSpec(spec string) (formatSpec, error) {
++	fs := formatSpec{fill: ' '}
++	r := []rune(spec)
++	n := len(r)
++	i := 0
++
++	fillSpecified := false
++	if n >= 2 && r[1] < utf8.RuneSelf && isAlignByte(byte(r[1])) {
++		fs.fill = r[0]
++		fs.align = byte(r[1])
++		fillSpecified = true
++		i = 2
++	} else if n >= 1 && r[0] < utf8.RuneSelf && isAlignByte(byte(r[0])) {
++		fs.align = byte(r[0])
++		i = 1
++	}
++
++	if i < n && (r[i] == '+' || r[i] == '-' || r[i] == ' ') {
++		fs.sign = byte(r[i])
++		i++
++	}
++
++	if i < n && r[i] == '#' {
++		fs.alt = true
++		i++
++	}
++
++	// A leading '0' before the width sets sign-aware zero padding. It supplies
++	// the fill character only when no explicit fill was given, and leaves the
++	// default alignment to the per-type renderer.
++	if i < n && r[i] == '0' && !fillSpecified {
++		fs.fill = '0'
++		fs.zero = true
++		i++
++	}
++
++	w := i
++	for i < n && r[i] >= '0' && r[i] <= '9' {
++		i++
++	}
++	if i > w {
++		width, ok := decimal(string(r[w:i]))
++		if !ok {
++			return fs, fmt.Errorf("format: invalid width in format specifier %q", spec)
++		}
++		fs.width = width
++		fs.hasWidth = true
++	}
++
++	if i < n && (r[i] == ',' || r[i] == '_') {
++		fs.group = byte(r[i])
++		i++
++	}
++
++	if i < n && r[i] == '.' {
++		i++
++		p := i
++		for i < n && r[i] >= '0' && r[i] <= '9' {
++			i++
++		}
++		if i == p {
++			return fs, fmt.Errorf("format: format specifier missing precision: %q", spec)
++		}
++		prec, ok := decimal(string(r[p:i]))
++		if !ok {
++			return fs, fmt.Errorf("format: invalid precision in format specifier %q", spec)
++		}
++		fs.prec = prec
++		fs.hasPrec = true
++	}
++
++	if i < n {
++		fs.typ = byte(r[i])
++		i++
++	}
++
++	if i != n {
++		return fs, fmt.Errorf("format: invalid format specifier %q", spec)
++	}
++	return fs, nil
++}
++
++// applyAlign pads sign+prefix+body to spec.width using the alignment and fill.
++// For '=' alignment the fill is inserted between the prefix and the body so the
++// sign and any base prefix stay leftmost.
++func applyAlign(sign, prefix, body string, fs formatSpec) string {
++	if !fs.hasWidth {
++		return sign + prefix + body
++	}
++	total := utf8.RuneCountInString(sign) + utf8.RuneCountInString(prefix) + utf8.RuneCountInString(body)
++	if total >= fs.width {
++		return sign + prefix + body
++	}
++	pad := fs.width - total
++	fill := string(fs.fill)
++	switch fs.align {
++	case '>':
++		return strings.Repeat(fill, pad) + sign + prefix + body
++	case '^':
++		left := pad / 2
++		return strings.Repeat(fill, left) + sign + prefix + body + strings.Repeat(fill, pad-left)
++	case '=':
++		return sign + prefix + strings.Repeat(fill, pad) + body
++	default: // '<'
++		return sign + prefix + body + strings.Repeat(fill, pad)
++	}
++}
++
++// groupingFor returns the separator and group size for a base, or (0, 0) when
++// no grouping was requested. The ',' separator groups by three; '_' groups
++// decimal digits by three and binary/octal/hexadecimal digits by four.
++func groupingFor(group byte, base int) (byte, int) {
++	if group == 0 {
++		return 0, 0
++	}
++	if base == 10 {
++		return group, 3
++	}
++	return group, 4
++}
++
++// groupDigits inserts sep into a run of digits, grouping from the right in
++// chunks of g. When minWidth > 0 the digit run is first left-extended with '0'
++// to the fewest digits whose grouped form spans at least minWidth characters,
++// implementing grouping-aware zero padding.
++func groupDigits(digits string, sep byte, g int, minWidth int) string {
++	if g == 0 {
++		if minWidth > len(digits) {
++			return strings.Repeat("0", minWidth-len(digits)) + digits
++		}
++		return digits
++	}
++	d := len(digits)
++	if minWidth > 0 {
++		for d+(d-1)/g < minWidth {
++			d++
++		}
++	}
++	if d > len(digits) {
++		digits = strings.Repeat("0", d-len(digits)) + digits
++	}
++	n := len(digits)
++	var b strings.Builder
++	for i := 0; i < n; i++ {
++		if i > 0 && (n-i)%g == 0 {
++			b.WriteByte(sep)
++		}
++		b.WriteByte(digits[i])
++	}
++	return b.String()
++}
++
++// parsePercentSpec parses the optional [flags][width][.precision] that may
++// follow a '%' in string interpolation (before the conversion character),
++// translating the printf flags into a formatSpec. It returns the spec, the
++// number of bytes consumed, and whether any field was present; a bare
++// conversion (no fields) leaves the legacy interpolation path in charge.
++func parsePercentSpec(s string) (formatSpec, int, bool) {
++	fs := formatSpec{fill: ' '}
++	i, n := 0, len(s)
++	present := false
++	minus, zero := false, false
++flags:
++	for i < n {
++		switch s[i] {
++		case '-':
++			minus = true
++		case '+':
++			fs.sign = '+'
++		case ' ':
++			if fs.sign == 0 {
++				fs.sign = ' '
++			}
++		case '#':
++			fs.alt = true
++		case '0':
++			zero = true
++		default:
++			break flags
++		}
++		present = true
++		i++
++	}
++
++	w := i
++	for i < n && s[i] >= '0' && s[i] <= '9' {
++		i++
++	}
++	if i > w {
++		if width, ok := decimal(s[w:i]); ok {
++			fs.width = width
++			fs.hasWidth = true
++			present = true
++		}
++	}
++
++	if i < n && s[i] == '.' {
++		i++
++		p := i
++		for i < n && s[i] >= '0' && s[i] <= '9' {
++			i++
++		}
++		prec, _ := decimal(s[p:i])
++		fs.prec = prec
++		fs.hasPrec = true
++		present = true
++	}
++
++	// A '-' flag left-aligns and overrides the zero flag; otherwise a '0' flag
++	// requests sign-aware zero padding.
++	if minus {
++		fs.align = '<'
++	} else if zero {
++		fs.align = '='
++		fs.fill = '0'
++		fs.zero = true
++	}
++	return fs, i, present
++}
++
++// signString returns the leading sign for a magnitude, given whether the value
++// is negative and the requested sign mode.
++func signString(neg bool, sign byte) string {
++	if neg {
++		return "-"
++	}
++	switch sign {
++	case '+':
++		return "+"
++	case ' ':
++		return " "
++	}
++	return ""
++}
++
++// renderSig builds the significant-digit form of a non-negative magnitude from
++// its shortest/rounded decimal digits and decimal exponent X (value =
++// digits[0].digits[1:] x 10**X). useExp selects scientific notation; alt keeps
++// trailing zeros and the decimal point; upper uppercases the exponent marker.
++func renderSig(digits string, X int, useExp, alt, upper bool) string {
++	if useExp {
++		mant := digits[:1]
++		frac := digits[1:]
++		if !alt {
++			frac = strings.TrimRight(frac, "0")
++		}
++		var b strings.Builder
++		b.WriteString(mant)
++		if len(frac) > 0 || alt {
++			b.WriteByte('.')
++			b.WriteString(frac)
++		}
++		if upper {
++			b.WriteByte('E')
++		} else {
++			b.WriteByte('e')
++		}
++		e := X
++		if e < 0 {
++			b.WriteByte('-')
++			e = -e
++		} else {
++			b.WriteByte('+')
++		}
++		es := strconv.Itoa(e)
++		if len(es) < 2 {
++			b.WriteByte('0')
++		}
++		b.WriteString(es)
++		return b.String()
++	}
++
++	n := len(digits)
++	point := X + 1
++	var intPart, fracPart string
++	switch {
++	case point <= 0:
++		intPart = "0"
++		fracPart = strings.Repeat("0", -point) + digits
++	case point >= n:
++		intPart = digits + strings.Repeat("0", point-n)
++		fracPart = ""
++	default:
++		intPart = digits[:point]
++		fracPart = digits[point:]
++	}
++	if !alt {
++		fracPart = strings.TrimRight(fracPart, "0")
++	}
++	if len(fracPart) > 0 || alt {
++		return intPart + "." + fracPart
++	}
++	return intPart
++}
+diff --git a/starlark/int.go b/starlark/int.go
+index 31f594b..4373fc5 100644
+--- a/starlark/int.go
++++ b/starlark/int.go
+@@ -10,6 +10,7 @@ import (
+ 	"math/big"
+ 	"reflect"
+ 	"strconv"
++	"strings"
+ 
+ 	"go.starlark.net/syntax"
+ )
+@@ -457,3 +458,143 @@ func finiteFloatToInt(f Float) Int {
+ 	}
+ 	return MakeBigInt(new(big.Int).Div(rat.Num(), rat.Denom()))
+ }
++
++// formatInteger renders an arbitrary-precision integer for str.format using
++// the parsed spec. It operates on the *big.Int magnitude so values outside the
++// int64 range format correctly. The 'c' type is handled by formatChar.
++func formatInteger(x *big.Int, fs formatSpec) (string, error) {
++	if fs.hasPrec {
++		return "", fmt.Errorf("format: precision not allowed with integer type")
++	}
++	typ := fs.typ
++	if typ == 0 {
++		typ = 'd'
++	}
++	if typ == 'c' {
++		return formatChar(x, fs)
++	}
++
++	var base int
++	var prefix string
++	upper := false
++	switch typ {
++	case 'b':
++		base, prefix = 2, "0b"
++	case 'o':
++		base, prefix = 8, "0o"
++	case 'x':
++		base, prefix = 16, "0x"
++	case 'X':
++		base, prefix, upper = 16, "0X", true
++	case 'd':
++		base = 10
++	case 'n':
++		base = 10
++		if fs.group != 0 {
++			return "", fmt.Errorf("format: cannot specify a grouping option with the 'n' type")
++		}
++	default:
++		return "", fmt.Errorf("format: unknown format code %q for integer", typ)
++	}
++	if fs.group == ',' && base != 10 {
++		return "", fmt.Errorf("format: cannot specify ',' with the %q type", typ)
++	}
++
++	if fs.align == 0 {
++		if fs.zero {
++			fs.align = '='
++		} else {
++			fs.align = '>'
++		}
++	}
++	if !fs.alt {
++		prefix = ""
++	}
++
++	neg := x.Sign() < 0
++	mag := new(big.Int).Abs(x)
++	digits := mag.Text(base)
++	if upper {
++		digits = strings.ToUpper(digits)
++	}
++	sign := signString(neg, fs.sign)
++	sep, gsize := groupingFor(fs.group, base)
++
++	if fs.align == '=' && fs.fill == '0' {
++		minWidth := 0
++		if fs.hasWidth {
++			minWidth = fs.width - len(sign) - len(prefix)
++			if minWidth < 0 {
++				minWidth = 0
++			}
++		}
++		return applyAlign(sign, prefix, groupDigits(digits, sep, gsize, minWidth), fs), nil
++	}
++	return applyAlign(sign, prefix, groupDigits(digits, sep, gsize, 0), fs), nil
++}
++
++// formatChar renders an integer codepoint as a single character. The 'c' type
++// rejects the sign, alternate-form, grouping, and precision options.
++func formatChar(x *big.Int, fs formatSpec) (string, error) {
++	if fs.sign != 0 || fs.alt || fs.group != 0 || fs.hasPrec {
++		return "", fmt.Errorf("format: sign, '#', grouping, and precision are not allowed with the 'c' type")
++	}
++	if !x.IsInt64() {
++		return "", fmt.Errorf("format: 'c' argument out of range")
++	}
++	cp := x.Int64()
++	if cp < 0 || cp > 0x10FFFF {
++		return "", fmt.Errorf("format: 'c' argument out of range")
++	}
++	if fs.align == 0 {
++		if fs.zero {
++			fs.align = '='
++		} else {
++			fs.align = '>'
++		}
++	}
++	return applyAlign("", "", string(rune(cp)), fs), nil
++}
++
++// formatPercentInt renders an integer for %-interpolation. Unlike the
++// str.format integer renderer a precision sets the minimum number of digits
++// (zero-extending the magnitude) and there is no grouping; the zero-padding
++// flag still applies and is performed by the '=' branch of applyAlign.
++func formatPercentInt(x *big.Int, fs formatSpec, conv byte) (string, error) {
++	var base int
++	var prefix string
++	upper := false
++	switch conv {
++	case 'd':
++		base = 10
++	case 'o':
++		base, prefix = 8, "0o"
++	case 'x':
++		base, prefix = 16, "0x"
++	case 'X':
++		base, prefix, upper = 16, "0X", true
++	default:
++		return "", fmt.Errorf("unknown conversion %%%c", conv)
++	}
++
++	neg := x.Sign() < 0
++	digits := new(big.Int).Abs(x).Text(base)
++	if upper {
++		digits = strings.ToUpper(digits)
++	}
++	if fs.hasPrec && len(digits) < fs.prec {
++		digits = strings.Repeat("0", fs.prec-len(digits)) + digits
++	}
++	if !fs.alt {
++		prefix = ""
++	}
++	sign := signString(neg, fs.sign)
++	if fs.align == 0 {
++		if fs.zero {
++			fs.align = '='
++		} else {
++			fs.align = '>'
++		}
++	}
++	return applyAlign(sign, prefix, digits, fs), nil
++}
+diff --git a/starlark/library.go b/starlark/library.go
+index 0640b3e..dbb7647 100644
+--- a/starlark/library.go
++++ b/starlark/library.go
+@@ -1726,106 +1726,322 @@ func string_format(_ *Thread, b *Builtin, args Tuple, kwargs []Tuple) (Value, er
+ 			continue
+ 		}
+ 
++		// Find the '}' that closes this field, accounting for the nested
++		// replacement fields a format spec may contain.
+ 		format = format[i+1:]
+-		i = strings.IndexByte(format, '}')
+-		if i < 0 {
++		depth, end := 1, -1
++		for j := 0; j < len(format) && end < 0; j++ {
++			switch format[j] {
++			case '{':
++				depth++
++			case '}':
++				if depth--; depth == 0 {
++					end = j
++				}
++			}
++		}
++		if end < 0 {
+ 			return nil, fmt.Errorf("format: unmatched '{' in format")
+ 		}
++		field := format[:end]
++		format = format[end+1:]
++
++		// Split the field into "name [!conv] [:spec]". The first colon ends the
++		// name and conversion and begins the (possibly nested) format spec.
++		var name, conv, spec string
++		hasSpec := false
++		if ci := strings.IndexByte(field, ':'); ci >= 0 {
++			spec = field[ci+1:]
++			field = field[:ci]
++			hasSpec = true
++		}
++		if bi := strings.IndexByte(field, '!'); bi >= 0 {
++			name = field[:bi]
++			conv = field[bi+1:]
++			if conv != "s" && conv != "r" {
++				return nil, fmt.Errorf("format: unknown conversion %q", conv)
++			}
++		} else {
++			name = field
++		}
+ 
+-		var arg Value
+-		conv := "s"
+-		var spec string
+-
+-		field := format[:i]
+-		format = format[i+1:]
++		arg, err := resolveArg(name, args, kwargs, &index, &auto, &manual)
++		if err != nil {
++			return nil, err
++		}
++		if conv != "" {
++			converted, err := convertValue(arg, conv)
++			if err != nil {
++				return nil, err
++			}
++			arg = String(converted)
++		}
+ 
+-		var name string
+-		if i := strings.IndexByte(field, '!'); i < 0 {
+-			// "name" or "name:spec"
+-			if i := strings.IndexByte(field, ':'); i < 0 {
+-				name = field
++		if !hasSpec || spec == "" {
++			if str, ok := AsString(arg); ok {
++				buf.WriteString(str)
+ 			} else {
+-				name = field[:i]
+-				spec = field[i+1:]
++				writeValue(buf, arg, nil)
+ 			}
+-		} else {
+-			// "name!conv" or "name!conv:spec"
+-			name = field[:i]
+-			field = field[i+1:]
+-			// "conv" or "conv:spec"
+-			if before, after, ok := strings.Cut(field, ":"); !ok {
+-				conv = field
+-			} else {
+-				conv = before
+-				spec = after
++			continue
++		}
++
++		resolved, err := resolveNestedSpec(spec, args, kwargs, &index, &auto, &manual)
++		if err != nil {
++			return nil, err
++		}
++		out, err := renderFormatValue(arg, resolved)
++		if err != nil {
++			return nil, err
++		}
++		buf.WriteString(out)
++	}
++	return String(buf.String()), nil
++}
++
++// resolveArg looks up the value named by a replacement field, walking any
++// attribute (.name) and element ([key]) accessors that follow the base name.
++// An empty base selects the next positional argument; a decimal base selects a
++// positional argument by index; anything else selects a keyword argument.
++func resolveArg(name string, args Tuple, kwargs []Tuple, index *int, auto, manual *bool) (Value, error) {
++	baseEnd := len(name)
++	for i := 0; i < len(name); i++ {
++		if name[i] == '.' || name[i] == '[' {
++			baseEnd = i
++			break
++		}
++	}
++	base, rest := name[:baseEnd], name[baseEnd:]
++
++	var arg Value
++	if base == "" {
++		if *manual {
++			return nil, fmt.Errorf("format: cannot switch from manual field specification to automatic field numbering")
++		}
++		*auto = true
++		if *index >= len(args) {
++			return nil, fmt.Errorf("format: tuple index out of range")
++		}
++		arg = args[*index]
++		*index++
++	} else if num, ok := decimal(base); ok {
++		if *auto {
++			return nil, fmt.Errorf("format: cannot switch from automatic field numbering to manual field specification")
++		}
++		*manual = true
++		if num >= len(args) {
++			return nil, fmt.Errorf("format: tuple index out of range")
++		}
++		arg = args[num]
++	} else {
++		for _, kv := range kwargs {
++			if string(kv[0].(String)) == base {
++				arg = kv[1]
++				break
+ 			}
+ 		}
++		if arg == nil {
++			return nil, fmt.Errorf("format: keyword %s not found", base)
++		}
++	}
+ 
+-		if name == "" {
+-			// "{}": automatic indexing
+-			if manual {
+-				return nil, fmt.Errorf("format: cannot switch from manual field specification to automatic field numbering")
++	for rest != "" {
++		switch rest[0] {
++		case '.':
++			j := 1
++			for j < len(rest) && rest[j] != '.' && rest[j] != '[' {
++				j++
+ 			}
+-			auto = true
+-			if index >= len(args) {
+-				return nil, fmt.Errorf("format: tuple index out of range")
++			attr := rest[1:j]
++			rest = rest[j:]
++			next, err := getAttrField(arg, attr)
++			if err != nil {
++				return nil, err
+ 			}
+-			arg = args[index]
+-			index++
+-		} else if num, ok := decimal(name); ok {
+-			// positional argument
+-			if auto {
+-				return nil, fmt.Errorf("format: cannot switch from automatic field numbering to manual field specification")
++			arg = next
++		case '[':
++			j := strings.IndexByte(rest, ']')
++			if j < 0 {
++				return nil, fmt.Errorf("format: missing ']' in field name %q", name)
+ 			}
+-			manual = true
+-			if num >= len(args) {
+-				return nil, fmt.Errorf("format: tuple index out of range")
+-			} else {
+-				arg = args[num]
++			key := rest[1:j]
++			rest = rest[j+1:]
++			next, err := getItemField(arg, key)
++			if err != nil {
++				return nil, err
+ 			}
+-		} else {
+-			// keyword argument
+-			for _, kv := range kwargs {
+-				if string(kv[0].(String)) == name {
+-					arg = kv[1]
+-					break
+-				}
++			arg = next
++		default:
++			return nil, fmt.Errorf("format: invalid field name %q", name)
++		}
++	}
++	return arg, nil
++}
++
++// getAttrField reads an attribute of a value for {name.attr} access.
++func getAttrField(arg Value, name string) (Value, error) {
++	if h, ok := arg.(HasAttrs); ok {
++		v, err := h.Attr(name)
++		if err != nil {
++			return nil, err
++		}
++		if v != nil {
++			return v, nil
++		}
++	}
++	return nil, fmt.Errorf("format: %s value has no attribute %s", arg.Type(), name)
++}
++
++// getItemField reads an element of a value for {name[key]} access. A decimal
++// key indexes an Indexable (or is looked up as an integer in a Mapping); any
++// other key is looked up as a string in a Mapping.
++func getItemField(arg Value, key string) (Value, error) {
++	if n, ok := decimal(key); ok {
++		if ix, ok := arg.(Indexable); ok {
++			if n < 0 || n >= ix.Len() {
++				return nil, fmt.Errorf("format: index %d out of range", n)
+ 			}
+-			if arg == nil {
+-				// Starlark does not support Python's x.y or a[i] syntaxes,
+-				// or nested use of {...}.
+-				if strings.Contains(name, ".") {
+-					return nil, fmt.Errorf("format: attribute syntax x.y is not supported in replacement fields: %s", name)
+-				}
+-				if strings.Contains(name, "[") {
+-					return nil, fmt.Errorf("format: element syntax a[i] is not supported in replacement fields: %s", name)
+-				}
+-				if strings.Contains(name, "{") {
+-					return nil, fmt.Errorf("format: nested replacement fields not supported")
+-				}
+-				return nil, fmt.Errorf("format: keyword %s not found", name)
++			return ix.Index(n), nil
++		}
++		if m, ok := arg.(Mapping); ok {
++			v, found, err := m.Get(MakeInt(n))
++			if err != nil {
++				return nil, err
+ 			}
++			if !found {
++				return nil, fmt.Errorf("format: key %d not found", n)
++			}
++			return v, nil
+ 		}
+-
+-		if spec != "" {
+-			// Starlark does not support Python's format_spec features.
+-			return nil, fmt.Errorf("format spec features not supported in replacement fields: %s", spec)
++		return nil, fmt.Errorf("format: %s value is not subscriptable", arg.Type())
++	}
++	if m, ok := arg.(Mapping); ok {
++		v, found, err := m.Get(String(key))
++		if err != nil {
++			return nil, err
+ 		}
++		if !found {
++			return nil, fmt.Errorf("format: key %s not found", key)
++		}
++		return v, nil
++	}
++	return nil, fmt.Errorf("format: %s value is not subscriptable with a string key", arg.Type())
++}
+ 
+-		switch conv {
+-		case "s":
+-			if str, ok := AsString(arg); ok {
+-				buf.WriteString(str)
+-			} else {
+-				writeValue(buf, arg, nil)
++// convertValue applies the !s (str) or !r (repr) conversion to a value.
++func convertValue(arg Value, conv string) (string, error) {
++	buf := new(strings.Builder)
++	switch conv {
++	case "s":
++		if s, ok := AsString(arg); ok {
++			return s, nil
++		}
++		writeValue(buf, arg, nil)
++	case "r":
++		writeValue(buf, arg, nil)
++	default:
++		return "", fmt.Errorf("format: unknown conversion %q", conv)
++	}
++	return buf.String(), nil
++}
++
++// resolveNestedSpec replaces the nested replacement fields inside a format spec
++// with their formatted values, sharing the parent's positional counter and
++// auto/manual numbering so that all fields consume arguments in order.
++func resolveNestedSpec(spec string, args Tuple, kwargs []Tuple, index *int, auto, manual *bool) (string, error) {
++	if !strings.ContainsRune(spec, '{') {
++		return spec, nil
++	}
++	var b strings.Builder
++	for spec != "" {
++		i := strings.IndexByte(spec, '{')
++		if i < 0 {
++			b.WriteString(spec)
++			break
++		}
++		b.WriteString(spec[:i])
++		spec = spec[i+1:]
++		j := strings.IndexByte(spec, '}')
++		if j < 0 {
++			return "", fmt.Errorf("format: unmatched '{' in format spec")
++		}
++		inner := spec[:j]
++		spec = spec[j+1:]
++
++		iname, iconv := inner, ""
++		if bi := strings.IndexByte(inner, '!'); bi >= 0 {
++			iname = inner[:bi]
++			iconv = inner[bi+1:]
++			if iconv != "s" && iconv != "r" {
++				return "", fmt.Errorf("format: unknown conversion %q", iconv)
+ 			}
+-		case "r":
+-			writeValue(buf, arg, nil)
+-		default:
+-			return nil, fmt.Errorf("format: unknown conversion %q", conv)
++		}
++		v, err := resolveArg(iname, args, kwargs, index, auto, manual)
++		if err != nil {
++			return "", err
++		}
++		if iconv != "" {
++			s, err := convertValue(v, iconv)
++			if err != nil {
++				return "", err
++			}
++			b.WriteString(s)
++		} else if s, ok := AsString(v); ok {
++			b.WriteString(s)
++		} else {
++			writeValue(&b, v, nil)
+ 		}
+ 	}
+-	return String(buf.String()), nil
++	return b.String(), nil
++}
++
++// renderFormatValue formats a value with a resolved (non-nested) format spec,
++// dispatching by the value's type and by the spec's presentation type: the
++// e/E/f/F/g/G/% types coerce an integer to a float, while b/o/d/x/X/c require
++// an integer.
++func renderFormatValue(arg Value, spec string) (string, error) {
++	fs, err := parseFormatSpec(spec)
++	if err != nil {
++		return "", err
++	}
++	switch v := arg.(type) {
++	case Int:
++		return renderIntValue(v.bigInt(), fs)
++	case Bool:
++		if v {
++			return renderIntValue(big.NewInt(1), fs)
++		}
++		return renderIntValue(big.NewInt(0), fs)
++	case Float:
++		return renderFloatValue(float64(v), fs)
++	case String:
++		return formatString(string(v), fs)
++	default:
++		return "", fmt.Errorf("format: unsupported format string for %s value", arg.Type())
++	}
++}
++
++func renderIntValue(x *big.Int, fs formatSpec) (string, error) {
++	switch fs.typ {
++	case 'e', 'E', 'f', 'F', 'g', 'G', '%':
++		f, _ := new(big.Float).SetInt(x).Float64()
++		return formatFloat(f, fs)
++	case 's':
++		return "", fmt.Errorf("format: 's' format code not allowed for integer")
++	default:
++		return formatInteger(x, fs)
++	}
++}
++
++func renderFloatValue(f float64, fs formatSpec) (string, error) {
++	switch fs.typ {
++	case 'b', 'o', 'd', 'x', 'X', 'c':
++		return "", fmt.Errorf("format: %q format code not allowed for float", fs.typ)
++	case 's':
++		return "", fmt.Errorf("format: 's' format code not allowed for float")
++	default:
++		return formatFloat(f, fs)
++	}
+ }
+ 
+ // decimal interprets s as a sequence of decimal digits.
+diff --git a/starlark/value.go b/starlark/value.go
+index 027c60f..c46df3f 100644
+--- a/starlark/value.go
++++ b/starlark/value.go
+@@ -1700,3 +1700,172 @@ func (b Bytes) Has(y Value) (bool, error) {
+ 		return false, fmt.Errorf("'in bytes' requires bytes or int as left operand, not %s", y.Type())
+ 	}
+ }
++
++// formatFloat renders a float for str.format and %-interpolation using the
++// parsed spec. An empty presentation type with no precision delegates to
++// Float.format so it matches str; an explicit type, or an empty type with a
++// precision, uses the renderers below, and inf and NaN go through
++// formatSpecialFloat.
++func formatFloat(f float64, fs formatSpec) (string, error) {
++	switch fs.typ {
++	case 0, 'e', 'E', 'f', 'F', 'g', 'G', 'n', '%':
++		// supported
++	default:
++		return "", fmt.Errorf("format: unknown format code %q for float", fs.typ)
++	}
++	if fs.typ == 'n' && fs.group != 0 {
++		return "", fmt.Errorf("format: cannot specify a grouping option with the 'n' type")
++	}
++	if fs.align == 0 {
++		if fs.zero {
++			fs.align = '='
++		} else {
++			fs.align = '>'
++		}
++	}
++
++	if math.IsInf(f, 0) || math.IsNaN(f) {
++		return formatSpecialFloat(f, fs), nil
++	}
++
++	neg := math.Signbit(f)
++	mag := math.Abs(f)
++	sign := signString(neg, fs.sign)
++
++	prec := 6
++	if fs.hasPrec {
++		prec = fs.prec
++	}
++
++	var body string
++	switch fs.typ {
++	case 'f', 'F':
++		body = strconv.FormatFloat(mag, 'f', prec, 64)
++		if fs.alt && !strings.ContainsRune(body, '.') {
++			body += "."
++		}
++	case 'e', 'E':
++		body = formatExponent(mag, byte(fs.typ), prec, fs.alt)
++	case '%':
++		body = strconv.FormatFloat(mag*100, 'f', prec, 64)
++		if fs.alt && !strings.ContainsRune(body, '.') {
++			body += "."
++		}
++		body += "%"
++	case 'g', 'G':
++		sig := prec
++		if sig < 1 {
++			sig = 1
++		}
++		body = formatSignificant(mag, sig, sig, fs.alt, fs.typ == 'G')
++	case 'n':
++		sig := prec
++		if sig < 1 {
++			sig = 1
++		}
++		body = formatSignificant(mag, sig, sig, fs.alt, false)
++	case 0:
++		if fs.hasPrec {
++			sig := fs.prec
++			if sig < 1 {
++				sig = 1
++			}
++			body = formatSignificant(mag, sig, sig, fs.alt, false)
++		} else {
++			var b strings.Builder
++			Float(mag).format(&b, 'g')
++			body = b.String()
++		}
++	}
++	return alignNumberBody(sign, body, fs), nil
++}
++
++// formatExponent renders a magnitude in scientific notation with prec fraction
++// digits, honoring the alternate form when the precision is zero.
++func formatExponent(mag float64, typ byte, prec int, alt bool) string {
++	s := strconv.FormatFloat(mag, typ, prec, 64)
++	if alt && !strings.ContainsRune(s, '.') {
++		if k := strings.IndexByte(s, typ); k >= 0 {
++			s = s[:k] + "." + s[k:]
++		}
++	}
++	return s
++}
++
++// formatSignificant renders a magnitude to sig significant digits, choosing
++// scientific notation when the decimal exponent is below -4 or at least
++// threshold. The 'g' and empty types pass threshold == sig.
++func formatSignificant(mag float64, sig, threshold int, alt, upper bool) string {
++	s := strconv.FormatFloat(mag, 'e', sig-1, 64)
++	mant, expPart, _ := strings.Cut(s, "e")
++	x, _ := strconv.Atoi(expPart)
++	digits := strings.Replace(mant, ".", "", 1)
++	return renderSig(digits, x, x < -4 || x >= threshold, alt, upper)
++}
++
++// formatSpecialFloat renders an infinity or NaN, honoring the sign, fill,
++// alignment, and width but ignoring precision, grouping, and the alternate form.
++func formatSpecialFloat(f float64, fs formatSpec) string {
++	word := "inf"
++	if math.IsNaN(f) {
++		word = "nan"
++	}
++	switch fs.typ {
++	case 'E', 'F', 'G':
++		word = strings.ToUpper(word)
++	}
++	if fs.typ == '%' {
++		word += "%"
++	}
++	neg := math.Signbit(f) && !math.IsNaN(f)
++	return applyAlign(signString(neg, fs.sign), "", word, fs)
++}
++
++// alignNumberBody groups the integer-part digits of a rendered number, applies
++// grouping-aware zero padding when requested, and aligns the result to width.
++func alignNumberBody(sign, body string, fs formatSpec) string {
++	k := 0
++	for k < len(body) && body[k] >= '0' && body[k] <= '9' {
++		k++
++	}
++	intDigits, tail := body[:k], body[k:]
++	sep, gsize := groupingFor(fs.group, 10)
++	if fs.align == '=' && fs.fill == '0' {
++		minWidth := 0
++		if fs.hasWidth {
++			minWidth = fs.width - len(sign) - len(tail)
++			if minWidth < 0 {
++				minWidth = 0
++			}
++		}
++		return applyAlign(sign, "", groupDigits(intDigits, sep, gsize, minWidth)+tail, fs)
++	}
++	return applyAlign(sign, "", groupDigits(intDigits, sep, gsize, 0)+tail, fs)
++}
++
++// formatString renders a string for str.format. It rejects the numeric options
++// and truncates to a code-point precision before padding to width.
++func formatString(s string, fs formatSpec) (string, error) {
++	if fs.typ != 0 && fs.typ != 's' {
++		return "", fmt.Errorf("format: unknown format code %q for string", fs.typ)
++	}
++	if fs.sign != 0 {
++		return "", fmt.Errorf("format: sign not allowed in string format specifier")
++	}
++	if fs.alt {
++		return "", fmt.Errorf("format: alternate form (#) not allowed in string format specifier")
++	}
++	if fs.group != 0 {
++		return "", fmt.Errorf("format: grouping not allowed in string format specifier")
++	}
++	if fs.align == '=' {
++		return "", fmt.Errorf("format: '=' alignment not allowed in string format specifier")
++	}
++	if fs.align == 0 {
++		fs.align = '<'
++	}
++	if fs.hasPrec && fs.prec < utf8.RuneCountInString(s) {
++		s = string([]rune(s)[:fs.prec])
++	}
++	return applyAlign("", "", s, fs), nil
++}

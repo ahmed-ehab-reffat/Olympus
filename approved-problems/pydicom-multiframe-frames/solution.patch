@@ -1,0 +1,1065 @@
+diff --git a/src/pydicom/__init__.py b/src/pydicom/__init__.py
+index 0fd0836..08eb96c 100644
+--- a/src/pydicom/__init__.py
++++ b/src/pydicom/__init__.py
+@@ -32,6 +32,15 @@ from pydicom.dataelem import DataElement
+ from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+ import pydicom.examples
+ from pydicom.filereader import dcmread
++from pydicom.multiframe import (
++    MultiFrameError,
++    extract_frames,
++    frame_attributes,
++    group_frames,
++    merge_frames,
++    sort_frames,
++    varying_attributes,
++)
+ from pydicom.filewriter import dcmwrite
+ from pydicom.pixels.utils import pixel_array, iter_pixels
+ from pydicom.sequence import Sequence
+diff --git a/src/pydicom/errors.py b/src/pydicom/errors.py
+index 1ed20d9..5094fd0 100644
+--- a/src/pydicom/errors.py
++++ b/src/pydicom/errors.py
+@@ -24,3 +24,14 @@ class BytesLengthException(Exception):
+     """Exception that is raised for an unexpected number of bytes."""
+ 
+     pass
++
++
++class MultiFrameError(ValueError):
++    """Exception that is raised when an enhanced multi-frame instance cannot
++    be used as asked.
++
++    Raised for a dataset that carries no per-frame functional groups, for a
++    frame that does not exist, and for instances that cannot be combined.
++    """
++
++    pass
+diff --git a/src/pydicom/multiframe/__init__.py b/src/pydicom/multiframe/__init__.py
+new file mode 100644
+index 0000000..1a94438
+--- /dev/null
++++ b/src/pydicom/multiframe/__init__.py
+@@ -0,0 +1,21 @@
++# Copyright 2008-2026 pydicom authors. See LICENSE file for details.
++"""Working with enhanced multi-frame instances frame by frame."""
++
++from pydicom.errors import MultiFrameError
++from pydicom.multiframe._groups import frame_attributes, varying_attributes
++from pydicom.multiframe._instance import (
++    extract_frames,
++    group_frames,
++    merge_frames,
++    sort_frames,
++)
++
++__all__ = [
++    "MultiFrameError",
++    "extract_frames",
++    "frame_attributes",
++    "group_frames",
++    "merge_frames",
++    "sort_frames",
++    "varying_attributes",
++]
+diff --git a/src/pydicom/multiframe/_dimension.py b/src/pydicom/multiframe/_dimension.py
+new file mode 100644
+index 0000000..d6faced
+--- /dev/null
++++ b/src/pydicom/multiframe/_dimension.py
+@@ -0,0 +1,214 @@
++# Copyright 2008-2026 pydicom authors. See LICENSE file for details.
++"""Dimension index values of enhanced multi-frame instances."""
++
++from pydicom.dataset import Dataset
++from pydicom.multival import MultiValue
++from pydicom.sequence import Sequence
++from pydicom.tag import BaseTag, Tag
++
++FRAME_CONTENT = "FrameContentSequence"
++INDEX_VALUES = "DimensionIndexValues"
++DESCRIPTION = "DimensionIndexSequence"
++INDEX_POINTER = "DimensionIndexPointer"
++STACK_ID = "StackID"
++IN_STACK_POSITION = "InStackPositionNumber"
++
++
++def restack(items: list[Dataset]) -> None:
++    """Renumber the in-stack positions of `items` in place.
++
++    Within each stack the frames that carry an in-stack position number are
++    numbered 1, 2, 3 and so on, in frame order. Frames of different stacks
++    are counted apart, and a frame that carries no stack identifier is
++    counted with the other frames that carry none.
++
++    Parameters
++    ----------
++    items : list[pydicom.dataset.Dataset]
++        The per-frame functional group items, in frame order.
++    """
++    counters: dict[object, int] = {}
++    for item in items:
++        macro = item.get(FRAME_CONTENT, None)
++        if not macro:
++            continue
++
++        content = macro[0]
++        if IN_STACK_POSITION not in content:
++            continue
++
++        stack = content.get(STACK_ID, None)
++        counters[stack] = counters.get(stack, 0) + 1
++        content.InStackPositionNumber = counters[stack]
++
++
++def _values(item: Dataset) -> list | None:
++    """Return the dimension index values of one group item, if it has any."""
++    macro = item.get(FRAME_CONTENT, None)
++    if not macro:
++        return None
++
++    raw = macro[0].get(INDEX_VALUES, None)
++    if raw is None:
++        return None
++
++    if isinstance(raw, int):
++        return [raw]
++
++    values = list(raw)
++
++    return values or None
++
++
++def _store(item: Dataset, values: list) -> None:
++    """Write `values` back into the frame content macro of `item`."""
++    content = item[FRAME_CONTENT].value[0]
++    if values:
++        content.DimensionIndexValues = values
++    elif INDEX_VALUES in content:
++        del content[INDEX_VALUES]
++
++
++def _pointer_tags(ds: Dataset) -> list[BaseTag | None]:
++    """Return the attribute each described dimension indexes, in order.
++
++    An entry is ``None`` where the description item names no attribute, in
++    which case the values stored by the frames are used as they are.
++    """
++    description = ds.get(DESCRIPTION, None)
++    if description is None:
++        return []
++
++    tags: list[BaseTag | None] = []
++    for item in description:
++        raw = item.get(INDEX_POINTER, None)
++        try:
++            tags.append(Tag(raw) if raw is not None else None)
++        except (ValueError, TypeError):
++            tags.append(None)
++
++    return tags
++
++
++def _pointed_value(item: Dataset, tag: BaseTag) -> object | None:
++    """Return the effective value of `tag` inside the macros of `item`."""
++    for elem in item:
++        if not isinstance(elem.value, Sequence):
++            continue
++
++        for macro_item in elem.value:
++            if tag not in macro_item:
++                continue
++
++            value = macro_item[tag].value
++            if isinstance(value, list | tuple | MultiValue):
++                return tuple(value)
++
++            return value
++
++    return None
++
++
++def _apply_pointers(
++    carriers: list[Dataset], vectors: list[list], tags: list[BaseTag | None]
++) -> None:
++    """Replace pointed dimensions with the values they index, in place.
++
++    A frame that does not carry the attribute a dimension indexes does not
++    reach that dimension, so its vector stops there.
++    """
++    for position, tag in enumerate(tags):
++        if tag is None:
++            continue
++
++        for item, vector in zip(carriers, vectors):
++            if position >= len(vector):
++                continue
++
++            value = _pointed_value(item, tag)
++            if value is None:
++                del vector[position:]
++            else:
++                vector[position] = value
++
++
++def _survivors(vectors: list[list], width: int) -> list[int]:
++    """Return the positions that more than one frame value reaches.
++
++    A position is kept unless every frame carries it and they all carry the
++    same value there.
++    """
++    keep = []
++    for position in range(width):
++        seen = set()
++        for vector in vectors:
++            if position >= len(vector):
++                keep.append(position)
++                break
++
++            seen.add(vector[position])
++        else:
++            if len(seen) > 1:
++                keep.append(position)
++
++    return keep
++
++
++def _renumber(vectors: list[list]) -> None:
++    """Renumber each position of `vectors` from one, in place."""
++    if not vectors:
++        return
++
++    for position in range(max(len(vector) for vector in vectors)):
++        mapping: dict[object, int] = {}
++        for vector in vectors:
++            if position < len(vector) and vector[position] not in mapping:
++                mapping[vector[position]] = len(mapping) + 1
++
++        for vector in vectors:
++            if position < len(vector):
++                vector[position] = mapping[vector[position]]
++
++
++def organise(ds: Dataset, items: list[Dataset]) -> None:
++    """Bring the dimension indices of a derived instance into order.
++
++    A dimension whose description names the attribute it indexes takes its
++    values from that attribute rather than from the numbers the frames store,
++    and a frame without that attribute does not reach the dimension.
++
++    A dimension that holds a single value across every frame is dropped, both
++    from *Dimension Index Sequence* and from the index values of each frame.
++    What remains is renumbered, each dimension on its own, so that the values
++    a dimension takes are 1, 2, 3 and so on in the order they are first seen.
++
++    Parameters
++    ----------
++    ds : pydicom.dataset.Dataset
++        The derived instance, whose dimension description is updated.
++    items : list[pydicom.dataset.Dataset]
++        The per-frame functional group items, in frame order.
++    """
++    carriers = [item for item in items if _values(item) is not None]
++    vectors = [_values(item) for item in carriers]
++    if not vectors:
++        return
++
++    _apply_pointers(carriers, vectors, _pointer_tags(ds))
++    width = max(len(vector) for vector in vectors)
++    keep = _survivors(vectors, width)
++    pruned = [[vector[p] for p in keep if p < len(vector)] for vector in vectors]
++    _renumber(pruned)
++    for item, values in zip(carriers, pruned):
++        _store(item, values)
++
++    description = ds.get(DESCRIPTION, None)
++    if description is None:
++        return
++
++    if len(description) == width:
++        remaining = [description[p] for p in keep]
++        if remaining:
++            ds.DimensionIndexSequence = type(description)(remaining)
++        else:
++            del ds[DESCRIPTION]
+diff --git a/src/pydicom/multiframe/_groups.py b/src/pydicom/multiframe/_groups.py
+new file mode 100644
+index 0000000..123a04b
+--- /dev/null
++++ b/src/pydicom/multiframe/_groups.py
+@@ -0,0 +1,243 @@
++# Copyright 2008-2026 pydicom authors. See LICENSE file for details.
++"""Functional group macros of enhanced multi-frame instances."""
++
++from copy import deepcopy
++
++from pydicom.dataelem import DataElement
++from pydicom.dataset import Dataset
++from pydicom.errors import MultiFrameError
++from pydicom.multiframe._pixels import check_length, pixel_keyword
++from pydicom.sequence import Sequence
++from pydicom.tag import BaseTag
++
++SHARED = "SharedFunctionalGroupsSequence"
++PER_FRAME = "PerFrameFunctionalGroupsSequence"
++
++
++def macros(item: Dataset) -> dict[BaseTag, DataElement]:
++    """Return the functional group macros carried by a single group item.
++
++    Parameters
++    ----------
++    item : pydicom.dataset.Dataset
++        An item of *Shared Functional Groups Sequence* or of *Per-frame
++        Functional Groups Sequence*.
++
++    Returns
++    -------
++    dict[pydicom.tag.BaseTag, pydicom.dataelem.DataElement]
++        The macros of `item`, keyed by tag.
++    """
++    return {elem.tag: elem for elem in item}
++
++
++def shared_macros(ds: Dataset) -> dict[BaseTag, DataElement]:
++    """Return the macros that `ds` applies to every one of its frames."""
++    seq = ds.get(SHARED, None)
++    if not seq:
++        return {}
++
++    return macros(seq[0])
++
++
++def frame_groups(ds: Dataset) -> list[Dataset]:
++    """Return the per-frame functional group items of `ds`."""
++    seq = ds.get(PER_FRAME, None)
++    if not seq:
++        return []
++
++    return list(seq)
++
++
++def validate(ds: Dataset) -> list[Dataset]:
++    """Return the per-frame group items of `ds`, or raise for a bad instance.
++
++    Raises
++    ------
++    MultiFrameError
++        If `ds` has no per-frame functional groups, no transfer syntax, no
++        identity and no single pixel data element, holds a shared group
++        sequence that is not a single item,
++        does not say how many frames it has or disagrees with itself about
++        that number, or carries pixel data too short to hold them.
++    """
++    frames = frame_groups(ds)
++    if not frames:
++        raise MultiFrameError(
++            "The dataset has no 'Per-frame Functional Groups Sequence' and so "
++            "is not an enhanced multi-frame instance"
++        )
++
++    shared = ds.get(SHARED, None)
++    if shared is not None and len(shared) != 1:
++        raise MultiFrameError(
++            f"'Shared Functional Groups Sequence' holds {len(shared)} items "
++            "rather than one"
++        )
++
++    for keyword in ("SOPClassUID", "SOPInstanceUID"):
++        if keyword not in ds:
++            raise MultiFrameError(f"The dataset has no '{keyword}'")
++
++    file_meta = getattr(ds, "file_meta", None)
++    if file_meta is None or "TransferSyntaxUID" not in file_meta:
++        raise MultiFrameError(
++            "The dataset has no file meta information with a transfer syntax"
++        )
++
++    pixel_keyword(ds)
++
++    nr_frames = ds.get("NumberOfFrames", None)
++    if nr_frames is None:
++        raise MultiFrameError("The dataset does not say how many frames it has")
++
++    if int(nr_frames) != len(frames):
++        raise MultiFrameError(
++            f"'Number of Frames' is {int(nr_frames)} but the per-frame "
++            f"functional groups describe {len(frames)} frames"
++        )
++
++    check_length(ds, len(frames))
++
++    return frames
++
++
++def effective_macros(ds: Dataset, index: int) -> dict[BaseTag, DataElement]:
++    """Return the macros that apply to the frame at `index`.
++
++    A per-frame macro replaces a shared macro carrying the same tag.
++    """
++    result = dict(shared_macros(ds))
++    result.update(macros(frame_groups(ds)[index]))
++
++    return result
++
++
++def flatten(elements: list[DataElement]) -> Dataset:
++    """Return the contents of the macro `elements` as one flat dataset.
++
++    Later elements overwrite earlier ones tag by tag.
++    """
++    out = Dataset()
++    for elem in elements:
++        if not isinstance(elem.value, Sequence):
++            continue
++
++        for item in elem.value:
++            for sub in item:
++                out[sub.tag] = deepcopy(sub)
++
++    return out
++
++
++def frame_attributes(ds: Dataset, index: int) -> Dataset:
++    """Return the attributes that apply to a single frame of `ds`.
++
++    The contents of the shared macros are written first, then the contents of
++    the frame's own macros, so an attribute of a per-frame macro replaces the
++    same attribute of a shared macro.
++
++    Parameters
++    ----------
++    ds : pydicom.dataset.Dataset
++        An enhanced multi-frame instance.
++    index : int
++        The zero-based index of the frame.
++
++    Returns
++    -------
++    pydicom.dataset.Dataset
++        The effective attributes of the frame.
++    """
++    frames = validate(ds)
++    if not 0 <= index < len(frames):
++        raise MultiFrameError(
++            f"Frame index {index} is out of range for an instance with "
++            f"{len(frames)} frames"
++        )
++
++    shared = shared_macros(ds)
++    own = macros(frames[index])
++    ordered = [elem for tag, elem in shared.items() if tag not in own]
++    ordered.extend(own.values())
++
++    return flatten(ordered)
++
++
++def expand(ds: Dataset) -> list[Dataset]:
++    """Return one group item per frame of `ds`, each carrying every macro
++    that applies to that frame."""
++    items = []
++    for index in range(len(frame_groups(ds))):
++        item = Dataset()
++        for tag, elem in effective_macros(ds, index).items():
++            item[tag] = deepcopy(elem)
++
++        items.append(item)
++
++    return items
++
++
++def common_macros(items: list[Dataset]) -> dict[BaseTag, DataElement]:
++    """Return the macros present with an equal value in every one of `items`."""
++    if not items:
++        return {}
++
++    maps = [macros(item) for item in items]
++    common = {}
++    for tag, elem in maps[0].items():
++        for other in maps[1:]:
++            if tag not in other or other[tag] != elem:
++                break
++        else:
++            common[tag] = elem
++
++    return common
++
++
++def normalise(items: list[Dataset]) -> Dataset:
++    """Split `items` into one shared group item and per-frame remainders.
++
++    Every macro that has the same value in each of `items` is removed from
++    `items` and placed in the returned item.
++    """
++    shared = Dataset()
++    for tag, elem in common_macros(items).items():
++        shared[tag] = deepcopy(elem)
++        for item in items:
++            del item[tag]
++
++    return shared
++
++
++def varying_attributes(ds: Dataset) -> set[BaseTag]:
++    """Return the tags whose effective value is not the same for every frame.
++
++    Parameters
++    ----------
++    ds : pydicom.dataset.Dataset
++        An enhanced multi-frame instance.
++
++    Returns
++    -------
++    set[pydicom.tag.BaseTag]
++        The tags of the attributes that differ between frames, including
++        those that are absent from some of them. Empty for an instance with
++        a single frame.
++    """
++    frames = validate(ds)
++    if len(frames) < 2:
++        return set()
++
++    views = [frame_attributes(ds, index) for index in range(len(frames))]
++    tags: set[BaseTag] = set()
++    for view in views:
++        tags.update(elem.tag for elem in view)
++
++    varying = set()
++    for tag in tags:
++        values = [view[tag] if tag in view else None for view in views]
++        if any(value != values[0] for value in values[1:]):
++            varying.add(tag)
++
++    return varying
+diff --git a/src/pydicom/multiframe/_instance.py b/src/pydicom/multiframe/_instance.py
+new file mode 100644
+index 0000000..9c58011
+--- /dev/null
++++ b/src/pydicom/multiframe/_instance.py
+@@ -0,0 +1,335 @@
++# Copyright 2008-2026 pydicom authors. See LICENSE file for details.
++"""Deriving enhanced multi-frame instances from other ones."""
++
++from collections.abc import Sequence as SequenceType
++from copy import deepcopy
++
++from pydicom.dataset import Dataset
++from pydicom.errors import MultiFrameError
++from pydicom.multiframe._dimension import organise, restack
++from pydicom.multiframe._groups import (
++    PER_FRAME,
++    SHARED,
++    expand,
++    frame_attributes,
++    normalise,
++    validate,
++)
++from pydicom.multiframe._pixels import frame_bytes, pixel_keyword, rebuild
++from pydicom.multival import MultiValue
++from pydicom.sequence import Sequence
++from pydicom.tag import BaseTag, Tag
++from pydicom.uid import generate_uid
++
++#: The attributes every input of :func:`merge_frames` must agree on.
++COMPATIBILITY = (
++    "SOPClassUID",
++    "Rows",
++    "Columns",
++    "SamplesPerPixel",
++    "BitsAllocated",
++    "BitsStored",
++    "HighBit",
++    "PixelRepresentation",
++    "PhotometricInterpretation",
++    "PlanarConfiguration",
++)
++
++
++def _check_selection(indices: list[int], nr_frames: int) -> None:
++    """Raise if `indices` is not a usable selection of `nr_frames` frames."""
++    if not indices:
++        raise MultiFrameError("At least one frame must be selected")
++
++    seen: set[int] = set()
++    for index in indices:
++        if not 0 <= index < nr_frames:
++            raise MultiFrameError(
++                f"Frame index {index} is out of range for an instance with "
++                f"{nr_frames} frames"
++            )
++
++        if index in seen:
++            raise MultiFrameError(f"Frame index {index} is selected more than once")
++
++        seen.add(index)
++
++
++def _check_compatible(datasets: list[Dataset]) -> None:
++    """Raise if the instances cannot be held by one multi-frame instance."""
++    first = datasets[0]
++    syntax = first.file_meta.TransferSyntaxUID
++    keyword = pixel_keyword(first)
++    for other in datasets[1:]:
++        if other.file_meta.TransferSyntaxUID != syntax:
++            raise MultiFrameError(
++                "The instances disagree on their transfer syntax and so cannot "
++                "be combined"
++            )
++
++        if pixel_keyword(other) != keyword:
++            raise MultiFrameError(
++                f"The instances carry different pixel data elements, "
++                f"'{keyword}' and '{pixel_keyword(other)}', and so cannot be "
++                "combined"
++            )
++
++        for keyword in COMPATIBILITY:
++            if first.get(keyword, None) != other.get(keyword, None):
++                raise MultiFrameError(
++                    f"The instances disagree on '{keyword}' and so cannot be "
++                    "combined"
++                )
++
++
++def _source_item(ds: Dataset, numbers: list[int]) -> Dataset:
++    """Return a *Source Image Sequence* item referring to `numbers` of `ds`."""
++    item = Dataset()
++    item.ReferencedSOPClassUID = ds.SOPClassUID
++    item.ReferencedSOPInstanceUID = ds.SOPInstanceUID
++    item.ReferencedFrameNumber = numbers
++
++    return item
++
++
++def _assemble(
++    out: Dataset,
++    items: list[Dataset],
++    frames: list[bytes],
++    sources: list[Dataset],
++) -> Dataset:
++    """Fill `out` with the frames of a derived instance."""
++    restack(items)
++    organise(out, items)
++    shared = normalise(items)
++    out[SHARED] = _sequence_element(SHARED, [shared])
++    out[PER_FRAME] = _sequence_element(PER_FRAME, items)
++    out.NumberOfFrames = len(items)
++    rebuild(out, frames)
++    out.SOPInstanceUID = generate_uid()
++    out.file_meta.MediaStorageSOPInstanceUID = out.SOPInstanceUID
++    out.file_meta.MediaStorageSOPClassUID = out.SOPClassUID
++    out.SourceImageSequence = Sequence(sources)
++
++    return out
++
++
++def _sequence_element(keyword: str, items: list[Dataset]):
++    """Return a sequence data element holding `items`."""
++    holder = Dataset()
++    setattr(holder, keyword, Sequence(items))
++
++    return holder[keyword]
++
++
++def extract_frames(ds: Dataset, indices: SequenceType[int]) -> Dataset:
++    """Return a new instance holding only the frames of `ds` at `indices`.
++
++    The frames appear in the order they are given. A macro that has the same
++    value for every frame of the result is stored once in the shared
++    functional groups; every other macro is stored in each frame's own group.
++    `ds` is left unchanged and shares no object with the result.
++
++    Parameters
++    ----------
++    ds : pydicom.dataset.Dataset
++        An enhanced multi-frame instance.
++    indices : Sequence[int]
++        The zero-based indices of the frames to keep, in the order they
++        should appear. No index may be given twice.
++
++    Returns
++    -------
++    pydicom.dataset.Dataset
++        The derived instance.
++
++    Raises
++    ------
++    MultiFrameError
++        If `ds` is not an enhanced multi-frame instance, or `indices` is
++        empty, repeats an index, or names a frame that does not exist.
++    """
++    frames = validate(ds)
++    selection = [int(index) for index in indices]
++    _check_selection(selection, len(frames))
++
++    out = deepcopy(ds)
++    every = expand(ds)
++    items = [every[index] for index in selection]
++    data = [frame_bytes(ds, index, len(frames)) for index in selection]
++    sources = [_source_item(ds, [index + 1 for index in selection])]
++
++    return _assemble(out, items, data, sources)
++
++
++def _grouping_value(view: Dataset, tag: BaseTag) -> object:
++    """Return a hashable stand-in for the value of `tag` in `view`."""
++    if tag not in view:
++        return None
++
++    value = view[tag].value
++    if isinstance(value, list | tuple | MultiValue):
++        return tuple(value)
++
++    return value
++
++
++def _resolve_keys(keys: SequenceType[str | int], purpose: str) -> list[BaseTag]:
++    """Return the tags `keys` name, or raise if they name nothing."""
++    tags = []
++    for key in keys:
++        try:
++            tags.append(Tag(key))
++        except (ValueError, TypeError):
++            raise MultiFrameError(f"'{key}' does not name an attribute")
++
++    if not tags:
++        raise MultiFrameError(f"At least one attribute must be given to {purpose}")
++
++    return tags
++
++
++def group_frames(ds: Dataset, keys: SequenceType[str | int]) -> list[Dataset]:
++    """Return one instance per distinct combination of `keys` in `ds`.
++
++    A frame belongs to the group named by the effective values of `keys` for
++    that frame; a frame that does not carry one of them is grouped with the
++    other frames that do not carry it either. The groups come back in the
++    order in which they are first seen, and each holds its frames in the
++    order they had in `ds`.
++
++    Parameters
++    ----------
++    ds : pydicom.dataset.Dataset
++        An enhanced multi-frame instance.
++    keys : Sequence[str | int]
++        The attributes to group by, given as keywords or tags.
++
++    Returns
++    -------
++    list[pydicom.dataset.Dataset]
++        The derived instances.
++
++    Raises
++    ------
++    MultiFrameError
++        If `ds` is not an enhanced multi-frame instance, `keys` is empty, or
++        a key names no attribute.
++    """
++    frames = validate(ds)
++    tags = _resolve_keys(keys, "group by")
++    order: list[tuple] = []
++    members: dict[tuple, list[int]] = {}
++    for index in range(len(frames)):
++        view = frame_attributes(ds, index)
++        key = tuple(_grouping_value(view, tag) for tag in tags)
++        if key not in members:
++            members[key] = []
++            order.append(key)
++
++        members[key].append(index)
++
++    return [extract_frames(ds, members[key]) for key in order]
++
++
++def _ordering_value(view: Dataset, tag: BaseTag) -> tuple:
++    """Return a sortable stand-in for the value of `tag` in `view`."""
++    if tag not in view:
++        return (1, ())
++
++    value = view[tag].value
++    if isinstance(value, list | tuple | MultiValue):
++        return (0, tuple(value))
++
++    return (0, (value,))
++
++
++def sort_frames(ds: Dataset, keys: SequenceType[str | int]) -> Dataset:
++    """Return a new instance holding the frames of `ds` in order of `keys`.
++
++    The frames are put in ascending order of the effective values of `keys`,
++    the first of them deciding first. Frames that do not carry one of the
++    attributes come after those that do, and frames that cannot be told apart
++    keep the order they had in `ds`.
++
++    Parameters
++    ----------
++    ds : pydicom.dataset.Dataset
++        An enhanced multi-frame instance.
++    keys : Sequence[str | int]
++        The attributes to order by, given as keywords or tags.
++
++    Returns
++    -------
++    pydicom.dataset.Dataset
++        The derived instance.
++
++    Raises
++    ------
++    MultiFrameError
++        If `ds` is not an enhanced multi-frame instance, `keys` is empty, a
++        key names no attribute, or the frames hold values that cannot be
++        compared.
++    """
++    frames = validate(ds)
++    tags = _resolve_keys(keys, "order by")
++    decorated = []
++    for index in range(len(frames)):
++        view = frame_attributes(ds, index)
++        decorated.append(([_ordering_value(view, tag) for tag in tags], index))
++
++    try:
++        order = [index for _, index in sorted(decorated, key=lambda pair: pair[0])]
++    except TypeError:
++        raise MultiFrameError(
++            "The frames hold values that cannot be compared with each other"
++        )
++
++    return extract_frames(ds, order)
++
++
++def merge_frames(datasets: SequenceType[Dataset]) -> Dataset:
++    """Return a new instance holding every frame of every one of `datasets`.
++
++    The frames appear in the order of `datasets`, and within an instance in
++    its own frame order. A macro that has the same value for every frame of
++    the result is stored once in the shared functional groups; every other
++    macro is stored in each frame's own group, so a macro that one input
++    shared but another does not is written into each of the frames it
++    applied to. The inputs are left unchanged and share no object with the
++    result.
++
++    Parameters
++    ----------
++    datasets : Sequence[pydicom.dataset.Dataset]
++        The enhanced multi-frame instances to combine. They must agree on
++        their SOP class, transfer syntax and image pixel attributes.
++
++    Returns
++    -------
++    pydicom.dataset.Dataset
++        The derived instance.
++
++    Raises
++    ------
++    MultiFrameError
++        If `datasets` is empty, holds something that is not an enhanced
++        multi-frame instance, or holds instances that disagree.
++    """
++    inputs = list(datasets)
++    if not inputs:
++        raise MultiFrameError("At least one instance must be given")
++
++    counts = [len(validate(ds)) for ds in inputs]
++    _check_compatible(inputs)
++
++    out = deepcopy(inputs[0])
++    items: list[Dataset] = []
++    data: list[bytes] = []
++    sources: list[Dataset] = []
++    for ds, count in zip(inputs, counts):
++        items.extend(expand(ds))
++        data.extend(frame_bytes(ds, index, count) for index in range(count))
++        sources.append(_source_item(ds, [index + 1 for index in range(count)]))
++
++    return _assemble(out, items, data, sources)
+diff --git a/src/pydicom/multiframe/_pixels.py b/src/pydicom/multiframe/_pixels.py
+new file mode 100644
+index 0000000..aec6659
+--- /dev/null
++++ b/src/pydicom/multiframe/_pixels.py
+@@ -0,0 +1,183 @@
++# Copyright 2008-2026 pydicom authors. See LICENSE file for details.
++"""Frame level access to the pixel data of multi-frame instances."""
++
++import math
++
++from pydicom.dataset import Dataset
++from pydicom.encaps import encapsulate, get_frame
++from pydicom.errors import MultiFrameError
++from pydicom.pixels.utils import concatenate_packed_frames, get_packed_frame
++
++EXTENDED_OFFSETS = ("ExtendedOffsetTable", "ExtendedOffsetTableLengths")
++
++#: The pixel data elements an instance may carry, and the number of bytes one
++#: pixel of each takes. ``None`` means *Bits Allocated* decides.
++PIXEL_KEYWORDS = (
++    ("PixelData", None),
++    ("FloatPixelData", 4),
++    ("DoubleFloatPixelData", 8),
++)
++
++
++def pixel_keyword(ds: Dataset) -> str:
++    """Return the keyword of the pixel data element `ds` carries."""
++    found = [keyword for keyword, _ in PIXEL_KEYWORDS if keyword in ds]
++    if not found:
++        raise MultiFrameError("The dataset carries no pixel data")
++
++    if len(found) > 1:
++        raise MultiFrameError(
++            f"The dataset carries more than one pixel data element: "
++            f"{', '.join(found)}"
++        )
++
++    return found[0]
++
++
++def is_encapsulated(ds: Dataset) -> bool:
++    """Return ``True`` if the pixel data of `ds` is encapsulated."""
++    return bool(ds.file_meta.TransferSyntaxUID.is_encapsulated)
++
++
++def frame_length(ds: Dataset) -> int:
++    """Return the number of pixels in one frame of `ds`."""
++    try:
++        rows = int(ds.Rows)
++        columns = int(ds.Columns)
++    except AttributeError:
++        raise MultiFrameError(
++            "The dataset has no 'Rows' and 'Columns' and so its frames cannot "
++            "be measured"
++        )
++
++    return rows * columns * int(ds.get("SamplesPerPixel", 1))
++
++
++def _bits(ds: Dataset, keyword: str) -> int:
++    """Return the number of bits one pixel of `keyword` takes in `ds`."""
++    per_pixel = dict(PIXEL_KEYWORDS)[keyword]
++    if per_pixel is not None:
++        return per_pixel * 8
++
++    bits_allocated = int(ds.BitsAllocated)
++    if bits_allocated != 1 and bits_allocated % 8:
++        raise MultiFrameError(
++            f"'Bits Allocated' is {bits_allocated}, which does not divide "
++            "into whole bytes"
++        )
++
++    return bits_allocated
++
++
++def _extended_offsets(ds: Dataset) -> tuple[bytes, bytes] | None:
++    """Return the extended offset table of `ds`, if it has one."""
++    table = ds.get(EXTENDED_OFFSETS[0], None)
++    lengths = ds.get(EXTENDED_OFFSETS[1], None)
++    if table is None or lengths is None:
++        return None
++
++    return (table, lengths)
++
++
++def check_length(ds: Dataset, nr_frames: int) -> None:
++    """Raise if the pixel data of `ds` is too short to hold `nr_frames`.
++
++    Native data is measured; encapsulated data is judged by whether every
++    frame can be reached, since how much room a frame takes is only known
++    once its fragments have been read.
++    """
++    keyword = pixel_keyword(ds)
++    if is_encapsulated(ds):
++        for index in range(nr_frames):
++            frame_bytes(ds, index, nr_frames)
++
++        return
++
++    if "Rows" not in ds or "Columns" not in ds:
++        return
++
++    bits = _bits(ds, keyword)
++    pixels = frame_length(ds) * nr_frames
++    needed = math.ceil(pixels / 8) if bits == 1 else pixels * bits // 8
++    held = len(ds[keyword].value)
++    if held < needed:
++        raise MultiFrameError(
++            f"'{keyword}' is {held} bytes, which is too short to hold the "
++            f"{nr_frames} frames the instance describes"
++        )
++
++
++def frame_bytes(ds: Dataset, index: int, nr_frames: int) -> bytes:
++    """Return the encoded bytes of a single frame of `ds`.
++
++    Parameters
++    ----------
++    ds : pydicom.dataset.Dataset
++        The instance the frame belongs to.
++    index : int
++        The zero-based index of the frame.
++    nr_frames : int
++        The number of frames the instance holds.
++
++    Returns
++    -------
++    bytes
++        The encoded frame.
++    """
++    keyword = pixel_keyword(ds)
++    data = ds[keyword].value
++    if is_encapsulated(ds):
++        if keyword != "PixelData":
++            raise MultiFrameError(
++                f"'{keyword}' is never encapsulated, but the transfer syntax "
++                "says it is"
++            )
++
++        try:
++            return get_frame(
++                data,
++                index,
++                number_of_frames=nr_frames,
++                extended_offsets=_extended_offsets(ds),
++            )
++        except (ValueError, IndexError) as exc:
++            raise MultiFrameError(
++                f"'{keyword}' does not hold the frame at index {index}: {exc}"
++            )
++
++    bits = _bits(ds, keyword)
++    if bits == 1:
++        return get_packed_frame(data, index, frame_length(ds), pad=False)
++
++    length = frame_length(ds) * bits // 8
++    start = index * length
++    if start + length > len(data):
++        raise MultiFrameError(
++            f"'{keyword}' is {len(data)} bytes, which is too short to hold "
++            f"the frame at index {index}"
++        )
++
++    return data[start : start + length]
++
++
++def rebuild(ds: Dataset, frames: list[bytes]) -> None:
++    """Replace the pixel data of `ds` with `frames`, in the given order."""
++    keyword = pixel_keyword(ds)
++    for offsets in EXTENDED_OFFSETS:
++        if offsets in ds:
++            del ds[offsets]
++
++    if is_encapsulated(ds):
++        ds.PixelData = encapsulate(list(frames))
++        ds["PixelData"].is_undefined_length = True
++        return
++
++    if _bits(ds, keyword) == 1:
++        data = concatenate_packed_frames(frames, frame_length(ds))
++    else:
++        data = b"".join(frames)
++        if len(data) % 2:
++            data += b"\x00"
++
++    ds[keyword].value = data
++    ds[keyword].is_undefined_length = False

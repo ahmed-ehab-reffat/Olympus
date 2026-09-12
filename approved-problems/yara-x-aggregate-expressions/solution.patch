@@ -1,0 +1,1884 @@
+diff --git a/cli/src/commands/deps.rs b/cli/src/commands/deps.rs
+index 761e5a8e..7950e866 100644
+--- a/cli/src/commands/deps.rs
++++ b/cli/src/commands/deps.rs
+@@ -10,7 +10,7 @@ use clap::{ArgAction, ArgMatches, Command, arg, value_parser};
+ 
+ use yara_x_parser::Parser;
+ use yara_x_parser::ast::dfs::{DFSContext, DFSEvent, DFSIter};
+-use yara_x_parser::ast::{AST, Expr};
++use yara_x_parser::ast::{AggSource,AST, Expr};
+ 
+ #[derive(Debug, Default)]
+ struct Deps<'a> {
+@@ -160,6 +160,14 @@ fn find_dependencies<'a>(
+                         variables
+                             .extend(for_in.variables.iter().map(|v| v.name));
+                     }
++                    Some(DFSContext::Body(Expr::ForAgg(for_agg))) => {
++                        scopes.push(variables.len());
++                        if let AggSource::In { variables: vars, .. } =
++                            &for_agg.source
++                        {
++                            variables.extend(vars.iter().map(|v| v.name));
++                        }
++                    }
+                     Some(DFSContext::Body(Expr::With(with))) => {
+                         scopes.push(variables.len());
+                         variables.extend(
+@@ -195,7 +203,10 @@ fn find_dependencies<'a>(
+             DFSEvent::Leave(expr) => {
+                 // When leaving a `for` or `with` statement, remove all the
+                 // variables they defined.
+-                if matches!(expr, Expr::ForIn(_) | Expr::With(_)) {
++                if matches!(
++                    expr,
++                    Expr::ForIn(_) | Expr::ForAgg(_) | Expr::With(_)
++                ) {
+                     variables.drain(scopes.pop().unwrap()..);
+                 }
+                 // When leaving the operand of a FieldAccess expression we prune
+diff --git a/lib/src/compiler/context.rs b/lib/src/compiler/context.rs
+index e7165eca..9fd1fa12 100644
+--- a/lib/src/compiler/context.rs
++++ b/lib/src/compiler/context.rs
+@@ -183,6 +183,10 @@ impl VarStack {
+     pub const FOR_OF_FRAME_SIZE: i32 = 5;
+     /// Stack frame size for `for .. in` statements.
+     pub const FOR_IN_FRAME_SIZE: i32 = 7;
++    /// Stack frame size for aggregate statements. Two slots more than a
++    /// `for .. in` statement: one holds the running value and the other tracks
++    /// whether any iteration contributed to it.
++    pub const FOR_AGG_FRAME_SIZE: i32 = 9;
+ 
+     /// Creates a stack of variables.
+     pub fn new() -> Self {
+@@ -313,6 +317,13 @@ impl Var {
+         self.ty
+     }
+ 
++    /// Returns a copy of this variable holding a value of another type. The
++    /// slot it occupies does not change.
++    #[inline]
++    pub fn with_ty(self, ty: Type) -> Self {
++        Self { ty, ..self }
++    }
++
+     #[inline]
+     pub fn index(&self) -> i32 {
+         self.index
+diff --git a/lib/src/compiler/emit.rs b/lib/src/compiler/emit.rs
+index 891b5e54..96a861c0 100644
+--- a/lib/src/compiler/emit.rs
++++ b/lib/src/compiler/emit.rs
+@@ -22,7 +22,7 @@ use walrus::ir::{
+ use walrus::{FunctionId, InstrSeqBuilder, ValType};
+ 
+ use crate::compiler::ir::{
+-    Expr, ExprId, ForIn, ForOf, IR, Iterable, MatchAnchor, PatternIdx,
++    AggOp, Expr, ExprId, ForAgg, ForOf, IR, Iterable, MatchAnchor, PatternIdx,
+     Quantifier,
+ };
+ use crate::compiler::{
+@@ -681,17 +681,22 @@ fn emit_expr(
+             emit_for_of_pattern_set(ctx, ir, for_of, instr);
+         }
+ 
+-        Expr::ForIn(for_in) => match &for_in.iterable {
+-            Iterable::Range(_) => {
+-                emit_for_in_range(ctx, ir, for_in, instr);
+-            }
+-            Iterable::ExprTuple(_) => {
+-                emit_for_in_expr_tuple(ctx, ir, for_in, instr);
+-            }
+-            Iterable::Expr(_) => {
+-                emit_for_in_expr(ctx, ir, for_in, instr);
+-            }
+-        },
++        Expr::ForIn(for_in) => {
++            let loop_ = Loop {
++                iterable: &for_in.iterable,
++                variables: &for_in.variables,
++                for_vars: &for_in.for_vars,
++                quantifier: &for_in.quantifier,
++            };
++            let body = |ctx: &mut EmitContext, instr: &mut InstrSeqBuilder| {
++                emit_bool_expr(ctx, ir, for_in.body, instr);
++            };
++            emit_loop(ctx, ir, &loop_, body, instr);
++        }
++
++        Expr::ForAgg(for_agg) => {
++            emit_for_agg(ctx, ir, for_agg, instr);
++        }
+ 
+         Expr::FuncCall(func_call) => {
+             // If this is method call, the target object (self or this in some
+@@ -1713,25 +1718,28 @@ fn emit_for_of_pattern_set(
+     );
+ }
+ 
+-fn emit_for_in_range(
++fn emit_for_in_range<C>(
+     ctx: &mut EmitContext,
+     ir: &IR,
+-    for_in: &ForIn,
++    loop_: &Loop<'_>,
++    body: C,
+     instr: &mut InstrSeqBuilder,
+-) {
+-    let range = cast!(&for_in.iterable, Iterable::Range);
++) where
++    C: FnOnce(&mut EmitContext, &mut InstrSeqBuilder),
++{
++    let range = cast!(loop_.iterable, Iterable::Range);
+ 
+-    // A `for` loop in a range has exactly one variable.
+-    assert_eq!(for_in.variables.len(), 1);
++    // A loop over a range has exactly one variable.
++    assert_eq!(loop_.variables.len(), 1);
+ 
+     // The only variable contains the loop's next item.
+-    let next_item = for_in.variables[0];
++    let next_item = loop_.variables[0];
+ 
+     emit_for(
+         ctx,
+         ir,
+-        &for_in.for_vars,
+-        &for_in.quantifier,
++        loop_.for_vars,
++        loop_.quantifier,
+         // Loop initialization
+         |ctx, instr, n, loop_end| {
+             // Set n = upper_bound - lower_bound + 1;
+@@ -1782,9 +1790,7 @@ fn emit_for_in_range(
+         // Before each iteration.
+         |_, _, _| {},
+         // Body.
+-        |ctx, instr| {
+-            emit_bool_expr(ctx, ir, for_in.body, instr);
+-        },
++        body,
+         // After each iteration.
+         |ctx, instr, _| {
+             incr_var(ctx, instr, next_item);
+@@ -1793,55 +1799,62 @@ fn emit_for_in_range(
+     );
+ }
+ 
+-fn emit_for_in_expr(
++fn emit_for_in_expr<C>(
+     ctx: &mut EmitContext,
+     ir: &IR,
+-    for_in: &ForIn,
++    loop_: &Loop<'_>,
++    body: C,
+     instr: &mut InstrSeqBuilder,
+-) {
+-    let expr = cast!(for_in.iterable, Iterable::Expr);
++) where
++    C: FnOnce(&mut EmitContext, &mut InstrSeqBuilder),
++{
++    let expr = *cast!(loop_.iterable, Iterable::Expr);
+ 
+     match ir.get(expr).ty() {
+         Type::Array => {
+-            emit_for_in_array(ctx, ir, for_in, instr);
++            emit_for_in_array(ctx, ir, loop_, body, instr);
+         }
+         Type::Map => {
+-            emit_for_in_map(ctx, ir, for_in, instr);
++            emit_for_in_map(ctx, ir, loop_, body, instr);
+         }
+         _ => unreachable!(),
+     }
+ }
+ 
+-fn emit_for_in_array(
++fn emit_for_in_array<C>(
+     ctx: &mut EmitContext,
+     ir: &IR,
+-    for_in: &ForIn,
++    loop_: &Loop<'_>,
++    body: C,
+     instr: &mut InstrSeqBuilder,
+-) {
+-    // A `for` loop in an array has exactly one variable.
+-    assert_eq!(for_in.variables.len(), 1);
++) where
++    C: FnOnce(&mut EmitContext, &mut InstrSeqBuilder),
++{
++    // A loop over an array has exactly one variable.
++    assert_eq!(loop_.variables.len(), 1);
+ 
+-    let expr = cast!(for_in.iterable, Iterable::Expr);
++    let expr = *cast!(loop_.iterable, Iterable::Expr);
+     let array = ir.get(expr).type_value().as_array();
+ 
+     // The only variable contains the loop's next item.
+-    let next_item = for_in.variables[0];
++    let next_item = loop_.variables[0];
++    let item = loop_.for_vars.item;
+ 
+     // Emit the expression that returns the array and stores a reference to
+-    // it in `for_in.for_vars.item`.
+-    set_var(ctx, instr, for_in.for_vars.item, |ctx, instr| {
++    // it in the loop's item variable.
++    set_var(ctx, instr, item, |ctx, instr| {
+         emit_expr(ctx, ir, expr, instr);
+     });
+ 
+     emit_for(
+         ctx,
+         ir,
+-        &for_in.for_vars,
+-        &for_in.quantifier,
++        loop_.for_vars,
++        loop_.quantifier,
+         |ctx, instr, n, loop_end| {
+             // Initialize `n` to the array's length.
+             set_var(ctx, instr, n, |ctx, instr| {
+-                load_var(ctx, instr, for_in.for_vars.item);
++                load_var(ctx, instr, item);
+                 instr.call(
+                     ctx.function_id(wasm::export__array_len.mangled_name),
+                 );
+@@ -1865,51 +1878,53 @@ fn emit_for_in_array(
+             // Get the i-th item in the array and store it in the
+             // local variable `next_item`.
+             set_var(ctx, instr, next_item, |ctx, instr| {
+-                load_var(ctx, instr, for_in.for_vars.item);
++                load_var(ctx, instr, item);
+                 load_var(ctx, instr, i);
+                 emit_array_indexing(ctx, instr, &array);
+             });
+         },
+-        |ctx, instr| {
+-            emit_bool_expr(ctx, ir, for_in.body, instr);
+-        },
++        body,
+         // After each iteration.
+         |_, _, _| {},
+         instr,
+     );
+ }
+ 
+-fn emit_for_in_map(
++fn emit_for_in_map<C>(
+     ctx: &mut EmitContext,
+     ir: &IR,
+-    for_in: &ForIn,
++    loop_: &Loop<'_>,
++    body: C,
+     instr: &mut InstrSeqBuilder,
+-) {
+-    // A `for` loop in a map has exactly two variables, one for the key
++) where
++    C: FnOnce(&mut EmitContext, &mut InstrSeqBuilder),
++{
++    // A loop over a map has exactly two variables, one for the key
+     // and the other for the value.
+-    assert_eq!(for_in.variables.len(), 2);
++    assert_eq!(loop_.variables.len(), 2);
+ 
+-    let expr = cast!(for_in.iterable, Iterable::Expr);
++    let expr = *cast!(loop_.iterable, Iterable::Expr);
+     let map = ir.get(expr).type_value().as_map();
+ 
+-    let next_key = for_in.variables[0];
+-    let next_val = for_in.variables[1];
++    let next_key = loop_.variables[0];
++    let next_val = loop_.variables[1];
++    let item = loop_.for_vars.item;
+ 
+     // Emit the expression that returns the map and stores a reference to
+-    // it in `for_in.for_vars.item`.
+-    set_var(ctx, instr, for_in.for_vars.item, |ctx, instr| {
++    // it in the loop's item variable.
++    set_var(ctx, instr, item, |ctx, instr| {
+         emit_expr(ctx, ir, expr, instr);
+     });
+ 
+     emit_for(
+         ctx,
+         ir,
+-        &for_in.for_vars,
+-        &for_in.quantifier,
++        loop_.for_vars,
++        loop_.quantifier,
+         |ctx, instr, n, loop_end| {
+             // Initialize `n` to the map's length.
+             set_var(ctx, instr, n, |ctx, instr| {
+-                load_var(ctx, instr, for_in.for_vars.item);
++                load_var(ctx, instr, item);
+                 instr
+                     .call(ctx.function_id(wasm::export__map_len.mangled_name));
+             });
+@@ -1930,34 +1945,35 @@ fn emit_for_in_map(
+         // Before each iteration.
+         |ctx, instr, i| {
+             set_vars(ctx, instr, &[next_key, next_val], |ctx, instr| {
+-                load_var(ctx, instr, for_in.for_vars.item);
++                load_var(ctx, instr, item);
+                 load_var(ctx, instr, i);
+                 emit_map_lookup_by_index(ctx, instr, &map);
+             });
+         },
+         // Body.
+-        |ctx, instr| {
+-            emit_bool_expr(ctx, ir, for_in.body, instr);
+-        },
++        body,
+         // After each iteration.
+         |_, _, _| {},
+         instr,
+     );
+ }
+ 
+-fn emit_for_in_expr_tuple(
++fn emit_for_in_expr_tuple<C>(
+     ctx: &mut EmitContext,
+     ir: &IR,
+-    for_in: &ForIn,
++    loop_: &Loop<'_>,
++    body: C,
+     instr: &mut InstrSeqBuilder,
+-) {
+-    // A `for` in a tuple of expressions has exactly one variable.
+-    assert_eq!(for_in.variables.len(), 1);
++) where
++    C: FnOnce(&mut EmitContext, &mut InstrSeqBuilder),
++{
++    // A loop over a tuple of expressions has exactly one variable.
++    assert_eq!(loop_.variables.len(), 1);
+ 
+-    let expressions = cast!(&for_in.iterable, Iterable::ExprTuple);
++    let expressions = cast!(loop_.iterable, Iterable::ExprTuple);
+ 
+     // The only variable contains the loop's next item.
+-    let next_item = for_in.variables[0];
++    let next_item = loop_.variables[0];
+ 
+     let num_expressions = expressions.len();
+     let mut expressions = expressions.iter();
+@@ -1965,8 +1981,8 @@ fn emit_for_in_expr_tuple(
+     emit_for(
+         ctx,
+         ir,
+-        &for_in.for_vars,
+-        &for_in.quantifier,
++        loop_.for_vars,
++        loop_.quantifier,
+         |ctx, instr, n, _| {
+             // Initialize `n` to number of expressions.
+             set_var(ctx, instr, n, |_, instr| {
+@@ -2005,15 +2021,287 @@ fn emit_for_in_expr_tuple(
+             );
+         },
+         // Body.
+-        |ctx, instr| {
+-            emit_bool_expr(ctx, ir, for_in.body, instr);
+-        },
++        body,
+         // After each iteration.
+         |_, _, _| {},
+         instr,
+     );
+ }
+ 
++/// The parts every iterating construct has in common.
++///
++/// The `for` family and the aggregate expressions differ in what they do on
++/// each iteration and in what they leave on the stack, but they walk their
++/// iterables in exactly the same way.
++struct Loop<'a> {
++    iterable: &'a Iterable,
++    variables: &'a [Var],
++    for_vars: &'a ForVars,
++    quantifier: &'a Quantifier,
++}
++
++/// Emits the loop described by `loop_`, using `body` on every iteration.
++///
++/// `body` must leave an I32 on the stack, and the loop keeps going while that
++/// value is 1, exactly as [`emit_for`] describes.
++fn emit_loop<C>(
++    ctx: &mut EmitContext,
++    ir: &IR,
++    loop_: &Loop<'_>,
++    body: C,
++    instr: &mut InstrSeqBuilder,
++) where
++    C: FnOnce(&mut EmitContext, &mut InstrSeqBuilder),
++{
++    match loop_.iterable {
++        Iterable::Range(_) => emit_for_in_range(ctx, ir, loop_, body, instr),
++        Iterable::ExprTuple(_) => {
++            emit_for_in_expr_tuple(ctx, ir, loop_, body, instr)
++        }
++        Iterable::Expr(_) => emit_for_in_expr(ctx, ir, loop_, body, instr),
++        Iterable::PatternSet(_) => {
++            emit_for_in_pattern_set(ctx, ir, loop_, body, instr)
++        }
++    }
++}
++
++/// Iterates over a set of patterns, binding the current pattern's id to the
++/// loop's `item` variable so that `$`, `#`, `@` and `!` inside the body refer
++/// to it.
++fn emit_for_in_pattern_set<C>(
++    ctx: &mut EmitContext,
++    ir: &IR,
++    loop_: &Loop<'_>,
++    body: C,
++    instr: &mut InstrSeqBuilder,
++) where
++    C: FnOnce(&mut EmitContext, &mut InstrSeqBuilder),
++{
++    let Iterable::PatternSet(pattern_set) = loop_.iterable else {
++        unreachable!()
++    };
++
++    let num_patterns = pattern_set.len();
++    let mut patterns = pattern_set.iter();
++    let item = loop_.for_vars.item;
++
++    emit_for(
++        ctx,
++        ir,
++        loop_.for_vars,
++        loop_.quantifier,
++        |ctx, instr, n, _| {
++            set_var(ctx, instr, n, |_, instr| {
++                instr.i64_const(num_patterns as i64);
++            });
++        },
++        |ctx, instr, i| {
++            set_var(ctx, instr, item, |ctx, instr| {
++                load_var(ctx, instr, i);
++                emit_switch(ctx, I64, instr, |ctx, instr| {
++                    if let Some(pattern) = patterns.next() {
++                        instr.i64_const(ctx.pattern_id(*pattern).into());
++                        return true;
++                    }
++                    false
++                });
++            });
++        },
++        body,
++        |_, _, _| {},
++        instr,
++    );
++}
++
++/// Emits an aggregate expression.
++///
++/// The loop itself is the same one the `for` family uses, but the body
++/// accumulates into a variable instead of deciding a quantifier, and the loop
++/// visits every iteration because the body always reports that it can keep
++/// going. Once the loop is done the accumulated value is left on the stack,
++/// unless nothing contributed to it and the operation has no value for that
++/// case, in which case an undefined value is thrown.
++fn emit_for_agg(
++    ctx: &mut EmitContext,
++    ir: &IR,
++    for_agg: &ForAgg,
++    instr: &mut InstrSeqBuilder,
++) {
++    let accum = for_agg.accum;
++    let contributed = for_agg.contributed;
++    let op = for_agg.operation;
++    let is_float = for_agg.is_float;
++    let body_expr = for_agg.body;
++
++    // `min` and `max` start from the first value that contributes, so their
++    // initial value is never read. `count` and `sum` start from zero.
++    set_var(ctx, instr, accum, |_, instr| {
++        if is_float {
++            instr.f64_const(0.0);
++        } else {
++            instr.i64_const(0);
++        }
++    });
++
++    set_var(ctx, instr, contributed, |_, instr| {
++        instr.i64_const(0);
++    });
++
++    let loop_ = Loop {
++        iterable: &for_agg.iterable,
++        variables: &for_agg.variables,
++        for_vars: &for_agg.for_vars,
++        // The aggregate visits every iteration, so the loop keeps going as
++        // long as the body says so, and the body always says so.
++        quantifier: &Quantifier::All,
++    };
++
++    emit_loop(
++        ctx,
++        ir,
++        &loop_,
++        |ctx, instr| {
++            // An iteration whose value is undefined contributes nothing, so
++            // the accumulator and the flag are both left untouched.
++            catch_undef(
++                ctx,
++                None,
++                instr,
++                |ctx, instr| {
++                    emit_agg_accumulate(
++                        ctx, ir, op, is_float, body_expr, accum, contributed,
++                        instr,
++                    );
++                },
++                |_, _| {},
++            );
++            instr.i32_const(1);
++        },
++        instr,
++    );
++
++    // Drop whatever the loop left on the stack, the aggregate's value is in
++    // the accumulator.
++    instr.drop();
++
++    match op {
++        AggOp::Count | AggOp::Sum => {
++            load_var(ctx, instr, accum);
++        }
++        AggOp::Avg => {
++            // An average of nothing has no value, and otherwise it is the
++            // accumulated sum divided by the number of contributions.
++            load_var(ctx, instr, contributed);
++            instr.i64_const(0);
++            instr.binop(BinaryOp::I64Eq);
++            instr.if_else(
++                None,
++                |then_| {
++                    throw_undef(ctx, then_);
++                },
++                |_| {},
++            );
++            load_var(ctx, instr, accum);
++            if !is_float {
++                instr.unop(UnaryOp::F64ConvertSI64);
++            }
++            load_var(ctx, instr, contributed);
++            instr.unop(UnaryOp::F64ConvertSI64);
++            instr.binop(BinaryOp::F64Div);
++        }
++        AggOp::Min | AggOp::Max => {
++            // With nothing to compare there is no minimum nor maximum.
++            load_var(ctx, instr, contributed);
++            instr.i64_const(0);
++            instr.binop(BinaryOp::I64Eq);
++            instr.if_else(
++                None,
++                |then_| {
++                    throw_undef(ctx, then_);
++                },
++                |_| {},
++            );
++            load_var(ctx, instr, accum);
++        }
++    }
++}
++
++/// Emits the code that folds one iteration into the accumulator.
++#[allow(clippy::too_many_arguments)]
++fn emit_agg_accumulate(
++    ctx: &mut EmitContext,
++    ir: &IR,
++    op: AggOp,
++    is_float: bool,
++    body: ExprId,
++    accum: Var,
++    contributed: Var,
++    instr: &mut InstrSeqBuilder,
++) {
++    match op {
++        AggOp::Count => {
++            emit_bool_expr(ctx, ir, body, instr);
++            instr.if_else(
++                None,
++                |then_| {
++                    incr_var(ctx, then_, accum);
++                    incr_var(ctx, then_, contributed);
++                },
++                |_| {},
++            );
++            // `count` is done, an iteration that is false still counts as
++            // having been looked at, but there is nothing to accumulate.
++            return;
++        }
++        AggOp::Sum | AggOp::Avg => {
++            set_var(ctx, instr, accum, |ctx, instr| {
++                load_var(ctx, instr, accum);
++                emit_expr(ctx, ir, body, instr);
++                if is_float {
++                    instr.binop(BinaryOp::F64Add);
++                } else {
++                    instr.binop(BinaryOp::I64Add);
++                }
++            });
++        }
++        AggOp::Min | AggOp::Max => {
++            let tmp = if is_float {
++                ctx.wasm_symbols.f64_tmp
++            } else {
++                ctx.wasm_symbols.i64_tmp_a
++            };
++
++            emit_expr(ctx, ir, body, instr);
++            instr.local_set(tmp);
++
++            // The first value that contributes becomes the accumulator, the
++            // rest replace it only when they compare better against it.
++            set_var(ctx, instr, accum, |ctx, instr| {
++                instr.local_get(tmp);
++                load_var(ctx, instr, accum);
++
++                load_var(ctx, instr, contributed);
++                instr.i64_const(0);
++                instr.binop(BinaryOp::I64Eq);
++
++                instr.local_get(tmp);
++                load_var(ctx, instr, accum);
++                match (op, is_float) {
++                    (AggOp::Min, true) => instr.binop(BinaryOp::F64Lt),
++                    (AggOp::Min, false) => instr.binop(BinaryOp::I64LtS),
++                    (_, true) => instr.binop(BinaryOp::F64Gt),
++                    (_, false) => instr.binop(BinaryOp::I64GtS),
++                };
++
++                instr.binop(BinaryOp::I32Or);
++                instr.select(None);
++            });
++        }
++    }
++
++    incr_var(ctx, instr, contributed);
++}
++
+ /// Emits a `for` loop.
+ ///
+ /// This function allows creating different types of `for` loops by receiving
+@@ -2085,6 +2373,21 @@ fn emit_for<I, B, C, A>(
+     instr.block(I32, |instr| {
+         let loop_end = instr.id();
+ 
++        let p = match quantifier {
++            Quantifier::Percentage(expr) => Some((expr, true)),
++            Quantifier::Expr(expr) => Some((expr, false)),
++            _ => None,
++        };
++
++        // The quantifier is evaluated before the loop variables are
++        // initialized, because evaluating it may itself run a loop, and that
++        // inner loop's variables live on the slots this one is about to use.
++        // The value is parked in a scratch local until the loop is set up.
++        if let Some((quantifier, _)) = p {
++            emit_expr(ctx, ir, *quantifier, instr);
++            instr.local_set(ctx.wasm_symbols.i64_tmp_b);
++        }
++
+         loop_init(ctx, instr, n, loop_end);
+ 
+         // Initialize `i` to zero.
+@@ -2092,14 +2395,8 @@ fn emit_for<I, B, C, A>(
+             instr.i64_const(0);
+         });
+ 
+-        let p = match quantifier {
+-            Quantifier::Percentage(expr) => Some((expr, true)),
+-            Quantifier::Expr(expr) => Some((expr, false)),
+-            _ => None,
+-        };
+-
+         let (max_count, count) = match p {
+-            Some((quantifier, is_percentage)) => {
++            Some((_, is_percentage)) => {
+                 // `max_count` is the number of loop iterations that must return
+                 // `true` for the loop to be `true`.
+                 let max_count = for_vars.max_count;
+@@ -2115,7 +2412,7 @@ fn emit_for<I, B, C, A>(
+                         // n * quantifier
+                         load_var(ctx, instr, n);
+                         instr.unop(UnaryOp::F64ConvertSI64);
+-                        emit_expr(ctx, ir, *quantifier, instr);
++                        instr.local_get(ctx.wasm_symbols.i64_tmp_b);
+                         instr.unop(UnaryOp::F64ConvertSI64);
+                         instr.binop(BinaryOp::F64Mul);
+ 
+@@ -2126,7 +2423,7 @@ fn emit_for<I, B, C, A>(
+                         instr.unop(UnaryOp::I64TruncSF64);
+                     } else {
+                         // Quantifier is not a percentage, use it as is.
+-                        emit_expr(ctx, ir, *quantifier, instr);
++                        instr.local_get(ctx.wasm_symbols.i64_tmp_b);
+                     }
+                 });
+ 
+diff --git a/lib/src/compiler/ir/ast2ir.rs b/lib/src/compiler/ir/ast2ir.rs
+index c7ebac79..d8cf9f40 100644
+--- a/lib/src/compiler/ir/ast2ir.rs
++++ b/lib/src/compiler/ir/ast2ir.rs
+@@ -650,6 +650,7 @@ fn expr_from_ast(
+         ast::Expr::Of(of) => of_expr_from_ast(ctx, of)?,
+         ast::Expr::ForOf(for_of) => for_of_expr_from_ast(ctx, for_of)?,
+         ast::Expr::ForIn(for_in) => for_in_expr_from_ast(ctx, for_in)?,
++        ast::Expr::ForAgg(for_agg) => for_agg_expr_from_ast(ctx, for_agg)?,
+         ast::Expr::With(with) => with_expr_from_ast(ctx, with)?,
+         ast::Expr::FuncCall(func_call) => func_call_from_ast(ctx, func_call)?,
+ 
+@@ -1422,24 +1423,99 @@ fn for_in_expr_from_ast(
+         ctx.loop_iteration_multiplier = combined_iterations;
+     }
+ 
+-    let (expected_vars, iterable_ty) = match &iterable {
++    let (expected_vars, iterable_ty) =
++        loop_vars_from_iterable(ctx, &iterable, for_in.iterable.span())?;
++
++    let loop_vars = &for_in.variables;
++
++    // Make sure that the number of variables in the `for .. in` statement
++    // corresponds to the number of values returned by the iterator. For
++    // example, while most iterators return a single value, maps return two
++    // of them: key and value.
++    if loop_vars.len() != expected_vars.len() {
++        let span = loop_vars.first().unwrap().span();
++        let span = span.combine(&loop_vars.last().unwrap().span());
++        return Err(AssignmentMismatch::build(
++            ctx.report_builder,
++            loop_vars.len() as u8,
++            expected_vars.len() as u8,
++            ctx.report_builder.span_to_code_loc(for_in.iterable.span()),
++            ctx.report_builder.span_to_code_loc(span),
++        ));
++    }
++
++    let mut stack_frame =
++        ctx.vars.new_frame(VarStack::FOR_IN_FRAME_SIZE).ok_or_else(|| {
++            TooManyVariables::build(
++                ctx.report_builder,
++                ctx.report_builder.span_to_code_loc(for_in.span()),
++            )
++        })?;
++
++    let for_vars = ForVars {
++        n: stack_frame.new_var(Type::Integer),
++        i: stack_frame.new_var(Type::Integer),
++        max_count: stack_frame.new_var(Type::Integer),
++        count: stack_frame.new_var(Type::Integer),
++        item: stack_frame.new_var(iterable_ty),
++    };
++
++    let mut symbols = SymbolTable::new();
++    let mut variables = Vec::new();
++
++    // TODO: raise warning when the loop identifier (e.g: "i") hides
++    // an existing identifier with the same name.
++    for (loop_var, type_value) in iter::zip(loop_vars, expected_vars) {
++        let var = stack_frame.new_var(type_value.ty());
++        variables.push(var);
++        symbols.insert(loop_var.name, Symbol::Var { var, type_value });
++    }
++
++    // Put the loop variables into scope.
++    ctx.symbol_table.push(Rc::new(RefCell::new(symbols)));
++
++    let body = bool_expr_from_ast(ctx, &for_in.body)?;
++
++    // Leaving the body's scope. Remove loop variables.
++    ctx.symbol_table.pop();
++
++    ctx.vars.unwind(&stack_frame);
++
++    // Restore the parent multiplier after the loop body has been processed.
++    ctx.loop_iteration_multiplier = parent_multiplier;
++
++    Ok(ctx.ir.for_in(quantifier, variables, for_vars, iterable, body))
++}
++
++/// Returns the type of every variable that an iterable binds, plus the type of
++/// the item the loop carries.
++///
++/// Raises the warning about a loop over a potentially very large range, which
++/// is shared by every construct that iterates.
++fn loop_vars_from_iterable(
++    ctx: &mut CompileContext,
++    iterable: &Iterable,
++    iterable_span: Span,
++) -> Result<(Vec<TypeValue>, Type), CompileError> {
++    Ok(match iterable {
++        // A pattern set never reaches here; it binds `$` instead of named
++        // loop variables.
++        Iterable::PatternSet(_) => unreachable!(),
+         Iterable::Range(range) => {
+-            // Raise warning when the `for` loop iterates over a range that
+-            // may be very large, because it depends on the file size or the
+-            // number of occurrences of some pattern (i.e: #a).
++            // Raise warning when the loop iterates over a range that may be
++            // very large, because it depends on the file size or the number
++            // of occurrences of some pattern (i.e: #a).
+             if is_potentially_large_range(ctx, range) {
+                 if ctx.error_on_slow_loop {
+                     return Err(PotentiallySlowLoop::build(
+                         ctx.report_builder,
+-                        ctx.report_builder
+-                            .span_to_code_loc(for_in.iterable.span()),
++                        ctx.report_builder.span_to_code_loc(iterable_span),
+                     ));
+                 } else {
+                     ctx.warnings.add(|| {
+                         warnings::PotentiallySlowLoop::build(
+                             ctx.report_builder,
+-                            ctx.report_builder
+-                                .span_to_code_loc(for_in.iterable.span()),
++                            ctx.report_builder.span_to_code_loc(iterable_span),
+                         )
+                     })
+                 }
+@@ -1479,31 +1555,24 @@ fn for_in_expr_from_ast(
+             },
+             _ => unreachable!(),
+         },
+-    };
+-
+-    let loop_vars = &for_in.variables;
+-
+-    // Make sure that the number of variables in the `for .. in` statement
+-    // corresponds to the number of values returned by the iterator. For
+-    // example, while most iterators return a single value, maps return two
+-    // of them: key and value.
+-    if loop_vars.len() != expected_vars.len() {
+-        let span = loop_vars.first().unwrap().span();
+-        let span = span.combine(&loop_vars.last().unwrap().span());
+-        return Err(AssignmentMismatch::build(
+-            ctx.report_builder,
+-            loop_vars.len() as u8,
+-            expected_vars.len() as u8,
+-            ctx.report_builder.span_to_code_loc(for_in.iterable.span()),
+-            ctx.report_builder.span_to_code_loc(span),
+-        ));
+-    }
++    })
++}
+ 
+-    let mut stack_frame =
+-        ctx.vars.new_frame(VarStack::FOR_IN_FRAME_SIZE).ok_or_else(|| {
++fn for_agg_expr_from_ast(
++    ctx: &mut CompileContext,
++    for_agg: &ast::ForAgg,
++) -> Result<ExprId, CompileError> {
++    // The frame is reserved before the iterable is built, because the
++    // iterable's own expressions are evaluated while this aggregate's
++    // variables are already live. Anything nested in there must land on
++    // slots of its own.
++    let mut stack_frame = ctx
++        .vars
++        .new_frame(VarStack::FOR_AGG_FRAME_SIZE)
++        .ok_or_else(|| {
+             TooManyVariables::build(
+                 ctx.report_builder,
+-                ctx.report_builder.span_to_code_loc(for_in.span()),
++                ctx.report_builder.span_to_code_loc(for_agg.span()),
+             )
+         })?;
+ 
+@@ -1512,34 +1581,174 @@ fn for_in_expr_from_ast(
+         i: stack_frame.new_var(Type::Integer),
+         max_count: stack_frame.new_var(Type::Integer),
+         count: stack_frame.new_var(Type::Integer),
+-        item: stack_frame.new_var(iterable_ty),
++        item: stack_frame.new_var(Type::Unknown),
++    };
++
++    let contributed = stack_frame.new_var(Type::Integer);
++
++    let (variables_ast, iterable) = match &for_agg.source {
++        ast::AggSource::In { variables, iterable } => {
++            (Some(variables), iterable_from_ast(ctx, iterable)?)
++        }
++        ast::AggSource::Of(pattern_set) => {
++            (None, Iterable::PatternSet(pattern_set_from_ast(ctx, pattern_set)?))
++        }
+     };
+ 
++    let parent_multiplier = ctx.loop_iteration_multiplier;
++
++    if let Some(loop_iterations) = iterable.num_iterations(ctx.ir) {
++        let combined_iterations =
++            parent_multiplier.saturating_mul(loop_iterations);
++        if combined_iterations > MAX_LOOP_ITERATIONS {
++            ctx.warnings.add(|| {
++                warnings::TooManyIterations::build(
++                    ctx.report_builder,
++                    combined_iterations,
++                    ctx.report_builder.span_to_code_loc(for_agg.span()),
++                )
++            });
++        }
++        ctx.loop_iteration_multiplier = combined_iterations;
++    }
++
+     let mut symbols = SymbolTable::new();
+     let mut variables = Vec::new();
++    let over_patterns = variables_ast.is_none();
+ 
+-    // TODO: raise warning when the loop identifier (e.g: "i") hides
+-    // an existing identifier with the same name.
+-    for (loop_var, type_value) in iter::zip(loop_vars, expected_vars) {
+-        let var = stack_frame.new_var(type_value.ty());
+-        variables.push(var);
+-        symbols.insert(loop_var.name, Symbol::Var { var, type_value });
+-    }
++    let for_vars = match variables_ast {
++        Some(loop_vars) => {
++            let iterable_span = match &for_agg.source {
++                ast::AggSource::In { iterable, .. } => iterable.span(),
++                ast::AggSource::Of(_) => unreachable!(),
++            };
++            let (expected_vars, iterable_ty) =
++                loop_vars_from_iterable(ctx, &iterable, iterable_span.clone())?;
++
++            if loop_vars.len() != expected_vars.len() {
++                let span = loop_vars.first().unwrap().span();
++                let span = span.combine(&loop_vars.last().unwrap().span());
++                return Err(AssignmentMismatch::build(
++                    ctx.report_builder,
++                    loop_vars.len() as u8,
++                    expected_vars.len() as u8,
++                    ctx.report_builder.span_to_code_loc(iterable_span),
++                    ctx.report_builder.span_to_code_loc(span),
++                ));
++            }
++
++            for (loop_var, type_value) in iter::zip(loop_vars, expected_vars) {
++                let var = stack_frame.new_var(type_value.ty());
++                variables.push(var);
++                symbols.insert(loop_var.name, Symbol::Var { var, type_value });
++            }
++
++            ForVars { item: for_vars.item.with_ty(iterable_ty), ..for_vars }
++        }
++        None => {
++            // Over a pattern set the loop's item IS the current pattern, and
++            // `$`, `#`, `@` and `!` in the body resolve against it.
++            let for_vars =
++                ForVars { item: for_vars.item.with_ty(Type::Integer), ..for_vars };
++            symbols.insert(
++                "$",
++                Symbol::Var {
++                    var: for_vars.item,
++                    type_value: TypeValue::unknown_integer(),
++                },
++            );
++            for_vars
++        }
++    };
+ 
+-    // Put the loop variables into scope.
+     ctx.symbol_table.push(Rc::new(RefCell::new(symbols)));
++    if over_patterns {
++        ctx.for_of_depth += 1;
++    }
+ 
+-    let body = bool_expr_from_ast(ctx, &for_in.body)?;
++    let body = if matches!(for_agg.operation, ast::AggOp::Count) {
++        bool_expr_from_ast(ctx, &for_agg.body)
++    } else {
++        let body = expr_from_ast(ctx, &for_agg.body);
++        if let Ok(body) = body {
++            check_type(
++                ctx,
++                body,
++                for_agg.body.span(),
++                &[Type::Integer, Type::Float],
++            )
++            .map(|_| body)
++        } else {
++            body
++        }
++    };
+ 
+-    // Leaving the body's scope. Remove loop variables.
+     ctx.symbol_table.pop();
++    if over_patterns {
++        // A body that reaches for the current pattern's matches makes the
++        // fast scan unsafe for every pattern the aggregate walks, exactly as
++        // it does for the quantified form.
++        if let Ok(body) = body
++            && let Iterable::PatternSet(pattern_set) = &iterable
++        {
++            let mut allow_fast_scan = true;
++
++            for event in ctx.ir.dfs_iter(body) {
++                if let dfs::Event::Enter((_, expr, _)) = event
++                    && (matches!(
++                        expr,
++                        Expr::PatternCountVar { .. }
++                            | Expr::PatternOffsetVar { .. }
++                            | Expr::PatternLengthVar { .. }
++                    ) || (match expr {
++                        Expr::PatternMatchVar { anchor, .. } => {
++                            !matches!(anchor, MatchAnchor::None)
++                        }
++                        _ => false,
++                    }))
++                {
++                    allow_fast_scan = false;
++                    break;
++                }
++            }
++
++            if !allow_fast_scan {
++                for &pattern_idx in pattern_set {
++                    ctx.current_rule_patterns[pattern_idx.as_usize()]
++                        .disallow_fast_scan();
++                }
++            }
++        }
++        ctx.for_of_depth -= 1;
++    }
++
++    let body = body?;
++
++    let is_float = !matches!(for_agg.operation, ast::AggOp::Count)
++        && matches!(ctx.ir.get(body).ty(), Type::Float);
++
++    // The accumulator holds a value of the same type as the aggregate's
++    // result, which is not necessarily the type of the loop's item.
++    let accum = stack_frame.new_var(if is_float {
++        Type::Float
++    } else {
++        Type::Integer
++    });
+ 
+     ctx.vars.unwind(&stack_frame);
+ 
+-    // Restore the parent multiplier after the loop body has been processed.
+     ctx.loop_iteration_multiplier = parent_multiplier;
+ 
+-    Ok(ctx.ir.for_in(quantifier, variables, for_vars, iterable, body))
++    Ok(ctx.ir.for_agg(
++        for_agg.operation,
++        is_float,
++        variables,
++        for_vars,
++        accum,
++        contributed,
++        iterable,
++        body,
++    ))
+ }
+ 
+ fn with_expr_from_ast(
+diff --git a/lib/src/compiler/ir/dfs.rs b/lib/src/compiler/ir/dfs.rs
+index 5e49d35c..637f981e 100644
+--- a/lib/src/compiler/ir/dfs.rs
++++ b/lib/src/compiler/ir/dfs.rs
+@@ -185,7 +185,7 @@ impl<'a> DFSWithScopeIter<'a> {
+     /// statements, ignoring the `with` statements.
+     pub fn for_scopes(&self) -> impl Iterator<Item = ExprId> + '_ {
+         self.scopes.iter().filter_map(|expr_id| match self.ir.get(*expr_id) {
+-            Expr::ForIn(_) => Some(*expr_id),
++            Expr::ForIn(_) | Expr::ForAgg(_) => Some(*expr_id),
+             _ => None,
+         })
+     }
+@@ -372,6 +372,7 @@ pub(super) fn dfs_common(
+         Expr::ForIn(for_in) => {
+             stack.push(Event::Enter((for_in.body, EventContext::Body)));
+             match &for_in.iterable {
++                Iterable::PatternSet(_) => {}
+                 Iterable::Range(range) => {
+                     stack.push(Event::Enter((
+                         range.upper_bound,
+@@ -394,6 +395,31 @@ pub(super) fn dfs_common(
+             push_quantifier(&for_in.quantifier, stack);
+         }
+ 
++        Expr::ForAgg(for_agg) => {
++            stack.push(Event::Enter((for_agg.body, EventContext::Body)));
++            match &for_agg.iterable {
++                Iterable::PatternSet(_) => {}
++                Iterable::Range(range) => {
++                    stack.push(Event::Enter((
++                        range.upper_bound,
++                        EventContext::None,
++                    )));
++                    stack.push(Event::Enter((
++                        range.lower_bound,
++                        EventContext::None,
++                    )));
++                }
++                Iterable::ExprTuple(expr_tuple) => {
++                    for expr in expr_tuple.iter().rev() {
++                        stack.push(Event::Enter((*expr, EventContext::None)))
++                    }
++                }
++                Iterable::Expr(expr) => {
++                    stack.push(Event::Enter((*expr, EventContext::None)))
++                }
++            }
++        }
++
+         Expr::Lookup(lookup) => {
+             stack.push(Event::Enter((lookup.index, EventContext::None)));
+             stack.push(Event::Enter((lookup.primary, EventContext::None)));
+diff --git a/lib/src/compiler/ir/mod.rs b/lib/src/compiler/ir/mod.rs
+index 74fb17b8..7ccb5833 100644
+--- a/lib/src/compiler/ir/mod.rs
++++ b/lib/src/compiler/ir/mod.rs
+@@ -45,6 +45,7 @@ use rustc_hash::FxHasher;
+ use serde::{Deserialize, Serialize};
+ 
+ use yara_x_parser::Span;
++pub(crate) use yara_x_parser::ast::AggOp;
+ use yara_x_parser::ast::Ident;
+ 
+ use crate::compiler::context::{Var, VarStack};
+@@ -821,7 +822,7 @@ impl IR {
+                             // If the expression defining the variable is not a
+                             // loop, there's nothing else to do.
+                             match self.get(defining_expr) {
+-                                Expr::ForIn(_) => {}
++                                Expr::ForIn(_) | Expr::ForAgg(_) => {}
+                                 _ => continue,
+                             }
+                             let mut scopes = dfs.for_scopes();
+@@ -2286,6 +2287,8 @@ impl IR {
+             Iterable::Expr(expr) => {
+                 self.parents[expr.0 as usize] = expr_id;
+             }
++            // A pattern set holds no sub-expressions.
++            Iterable::PatternSet(_) => {}
+         }
+         self.parents[body.0 as usize] = expr_id;
+         self.parents.push(ExprId::none());
+@@ -2300,6 +2303,52 @@ impl IR {
+         expr_id
+     }
+ 
++    /// Creates a new [`Expr::ForAgg`].
++    #[allow(clippy::too_many_arguments)]
++    pub fn for_agg(
++        &mut self,
++        operation: AggOp,
++        is_float: bool,
++        variables: Vec<Var>,
++        for_vars: ForVars,
++        accum: Var,
++        contributed: Var,
++        iterable: Iterable,
++        body: ExprId,
++    ) -> ExprId {
++        let expr_id = ExprId::from(self.nodes.len());
++        match &iterable {
++            Iterable::Range(range) => {
++                self.parents[range.lower_bound.0 as usize] = expr_id;
++                self.parents[range.upper_bound.0 as usize] = expr_id;
++            }
++            Iterable::ExprTuple(exprs) => {
++                for expr in exprs.iter() {
++                    self.parents[expr.0 as usize] = expr_id;
++                }
++            }
++            Iterable::Expr(expr) => {
++                self.parents[expr.0 as usize] = expr_id;
++            }
++            // A pattern set holds no sub-expressions.
++            Iterable::PatternSet(_) => {}
++        }
++        self.parents[body.0 as usize] = expr_id;
++        self.parents.push(ExprId::none());
++        self.nodes.push(Expr::ForAgg(Box::new(ForAgg {
++            operation,
++            is_float,
++            variables,
++            for_vars,
++            accum,
++            contributed,
++            iterable,
++            body,
++        })));
++        debug_assert_eq!(self.parents.len(), self.nodes.len());
++        expr_id
++    }
++
+     /// Creates a new [`Expr::With`].
+     pub fn with(
+         &mut self,
+@@ -2450,6 +2499,14 @@ impl Debug for IR {
+                             writeln!(f, "{indentation}      count: {:?}", for_in.for_vars.count)?;
+                             writeln!(f, "{indentation}      item: {:?}", for_in.for_vars.item)?;
+                         },
++                        Expr::ForAgg(for_agg) => {
++                            writeln!(f, "FOR_AGG {} -- hash: {expr_hash:#08x}", for_agg.operation.as_str())?;
++                            writeln!(f, "{indentation}      n: {:?}", for_agg.for_vars.n)?;
++                            writeln!(f, "{indentation}      i: {:?}", for_agg.for_vars.i)?;
++                            writeln!(f, "{indentation}      item: {:?}", for_agg.for_vars.item)?;
++                            writeln!(f, "{indentation}      accum: {:?}", for_agg.accum)?;
++                            writeln!(f, "{indentation}      contributed: {:?}", for_agg.contributed)?;
++                        },
+                         Expr::Lookup(_) => writeln!(f, "LOOKUP -- hash: {expr_hash:#08x}")?,
+                         Expr::FuncCall(func_call) => writeln!(f,
+                             "FN_CALL {} -- hash: {:#08x}",
+@@ -2720,6 +2777,12 @@ pub(crate) enum Expr {
+ 
+     /// Array or dictionary lookup expression (e.g. `array[1]`, `dict["key"]`)
+     Lookup(Box<Lookup>),
++
++    /// A `for <agg op> <vars> in ...` expression. (e.g. `for sum i in (1..100) : ( ... )`)
++    ///
++    /// Kept last so that the discriminant of every other variant, which is
++    /// part of the hash that identifies an expression, does not change.
++    ForAgg(Box<ForAgg>),
+ }
+ 
+ /// A lookup operation in an array or dictionary.
+@@ -2800,6 +2863,34 @@ pub(crate) struct ForIn {
+     pub body: ExprId,
+ }
+ 
++/// A `for .. in` aggregate expression (e.g `for sum x in iterator : (..)`)
++pub(crate) struct ForAgg {
++    pub operation: AggOp,
++    /// True when the aggregate produces a float, which happens when its body
++    /// is a float. `count` always produces an integer.
++    pub is_float: bool,
++    pub variables: Vec<Var>,
++    pub for_vars: ForVars,
++    /// Holds the value accumulated so far.
++    pub accum: Var,
++    /// Holds 1 once some iteration has contributed to `accum`, 0 otherwise.
++    pub contributed: Var,
++    pub iterable: Iterable,
++    pub body: ExprId,
++}
++
++impl ForAgg {
++    /// Returns the type produced by the aggregate. An average is always a
++    /// float, even though it accumulates in the type of its body.
++    pub fn ty(&self) -> Type {
++        if self.is_float || matches!(self.operation, AggOp::Avg) {
++            Type::Float
++        } else {
++            Type::Integer
++        }
++    }
++}
++
+ /// A quantifier used in `for` and `of` expressions.
+ pub(crate) enum Quantifier {
+     None,
+@@ -2863,6 +2954,7 @@ pub(crate) enum Iterable {
+     Range(Range),
+     ExprTuple(Vec<ExprId>),
+     Expr(ExprId),
++    PatternSet(Vec<PatternIdx>),
+ }
+ 
+ impl Iterable {
+@@ -2888,6 +2980,7 @@ impl Iterable {
+             // Cannot determine the size of a generic expression/identifier
+             // at this stage easily. This could be an array or map identifier.
+             Iterable::Expr(_) => None,
++            Iterable::PatternSet(patterns) => Some(patterns.len() as i64),
+         }
+     }
+ }
+@@ -2961,6 +3054,10 @@ impl Hash for Expr {
+                 discriminant(&for_in.quantifier).hash(state);
+                 discriminant(&for_in.iterable).hash(state);
+             }
++            Expr::ForAgg(for_agg) => {
++                for_agg.operation.hash(state);
++                discriminant(&for_agg.iterable).hash(state);
++            }
+             _ => {}
+         }
+     }
+@@ -2973,6 +3070,7 @@ impl Expr {
+             Expr::With(with) => with.declarations.len() as i32,
+             Expr::ForOf(_) => VarStack::FOR_OF_FRAME_SIZE,
+             Expr::ForIn(_) => VarStack::FOR_IN_FRAME_SIZE,
++            Expr::ForAgg(_) => VarStack::FOR_AGG_FRAME_SIZE,
+             Expr::OfExprTuple(_) => VarStack::OF_FRAME_SIZE,
+             Expr::OfPatternSet(_) => VarStack::OF_FRAME_SIZE,
+             _ => 0,
+@@ -3026,6 +3124,15 @@ impl Expr {
+                 for_in.for_vars.shift(from_index, shift_amount);
+             }
+ 
++            Expr::ForAgg(for_agg) => {
++                for v in for_agg.variables.iter_mut() {
++                    v.shift(from_index, shift_amount)
++                }
++                for_agg.for_vars.shift(from_index, shift_amount);
++                for_agg.accum.shift(from_index, shift_amount);
++                for_agg.contributed.shift(from_index, shift_amount);
++            }
++
+             _ => {}
+         }
+     }
+@@ -3195,6 +3302,12 @@ impl Expr {
+                 }
+             }
+ 
++            Expr::ForAgg(for_agg) => {
++                if for_agg.body == child {
++                    for_agg.body = replacement
++                }
++            }
++
+             Expr::Lookup(lookup) => {
+                 if lookup.primary == child {
+                     lookup.primary = replacement;
+@@ -3271,6 +3384,8 @@ impl Expr {
+             | Expr::Shl { .. }
+             | Expr::Shr { .. } => Type::Integer,
+ 
++            Expr::ForAgg(for_agg) => for_agg.ty(),
++
+             Expr::Symbol(symbol) => symbol.ty(),
+             Expr::FieldAccess(field_access) => field_access.type_value.ty(),
+             Expr::FuncCall(func_call) => func_call.signature.result.ty(),
+@@ -3309,6 +3424,16 @@ impl Expr {
+             | Expr::ForOf(_)
+             | Expr::ForIn(_) => TypeValue::unknown_bool(),
+ 
++            Expr::ForAgg(for_agg) => {
++                // Must agree with `ForAgg::ty()`: an average is a float even
++                // when it accumulates in an integer body.
++                if for_agg.ty() == Type::Float {
++                    TypeValue::unknown_float()
++                } else {
++                    TypeValue::unknown_integer()
++                }
++            }
++
+             Expr::Minus { is_float, .. } => {
+                 if *is_float {
+                     TypeValue::unknown_float()
+diff --git a/parser/src/ast/ascii_tree.rs b/parser/src/ast/ascii_tree.rs
+index b38bf904..1e64035f 100644
+--- a/parser/src/ast/ascii_tree.rs
++++ b/parser/src/ast/ascii_tree.rs
+@@ -368,6 +368,84 @@ fn build_tree_for_expr(expr: &Expr, children: Vec<Tree>) -> Tree {
+ 
+             Node(node_title, new_children)
+         }
++        Expr::ForAgg(f) => {
++            let (variables, iterable) = match &f.source {
++                AggSource::In { variables, iterable } => (variables, iterable),
++                AggSource::Of(pattern_set) => {
++                    let op = f.operation.as_str();
++                    let title = match pattern_set {
++                        PatternSet::Them { .. } => {
++                            format!("for {op} of them")
++                        }
++                        PatternSet::Set(set) => {
++                            let s: Vec<String> =
++                                set.iter().map(|p| p.identifier.to_string()).collect();
++                            format!("for {op} of ({})", s.join(", "))
++                        }
++                    };
++                    return Node(title, children);
++                }
++            };
++
++            let mut children_iter = children.into_iter();
++
++            let mut new_children = vec![Node(
++                "<vars>".to_string(),
++                vec![Leaf(
++                    variables.iter().map(|v| v.name.to_string()).collect(),
++                )],
++            )];
++
++            let op = f.operation.as_str();
++
++            let node_title = match iterable {
++                Iterable::Range(_) => {
++                    new_children.push(Node(
++                        "<start>".to_string(),
++                        vec![children_iter.next().unwrap()],
++                    ));
++                    new_children.push(Node(
++                        "<end>".to_string(),
++                        vec![children_iter.next().unwrap()],
++                    ));
++                    format!(
++                        "for {op} <vars> in (<start>..<end>) : ( <condition> )"
++                    )
++                }
++                Iterable::ExprTuple(args) => {
++                    let labelled_args: Vec<String> = (0..args.len())
++                        .map(|i| format!("<expr{i}>"))
++                        .collect();
++
++                    let comma_sep_labels = labelled_args.join(", ");
++
++                    for label in labelled_args {
++                        new_children.push(Node(
++                            label,
++                            vec![children_iter.next().unwrap()],
++                        ));
++                    }
++
++                    format!(
++                        "for {op} <vars> in ({comma_sep_labels}) : ( <condition> )"
++                    )
++                }
++                Iterable::Expr(_) => {
++                    new_children.push(Node(
++                        "<expr>".to_string(),
++                        vec![children_iter.next().unwrap()],
++                    ));
++                    format!("for {op} <vars> in <expr> : ( <condition> )")
++                }
++            };
++
++            new_children.push(Node(
++                "<condition>".to_string(),
++                vec![children_iter.next().unwrap()],
++            ));
++
++            Node(node_title, new_children)
++        }
+         Expr::With(w) => {
+             let mut children_iter = children.into_iter();
+             Node(
+diff --git a/parser/src/ast/cst2ast.rs b/parser/src/ast/cst2ast.rs
+index bb65559b..c0e6b22f 100644
+--- a/parser/src/ast/cst2ast.rs
++++ b/parser/src/ast/cst2ast.rs
+@@ -1003,10 +1003,69 @@ where
+         Ok(expr)
+     }
+ 
++    fn for_agg_expr(
++        &mut self,
++        for_span: Span,
++    ) -> Result<Expr<'src>, BuilderError> {
++        self.begin(AGG_OP)?;
++        let op_ident = self.identifier()?;
++        self.end(AGG_OP)?;
++
++        let operation = match op_ident.name {
++            "count" => AggOp::Count,
++            "sum" => AggOp::Sum,
++            "min" => AggOp::Min,
++            "max" => AggOp::Max,
++            "avg" => AggOp::Avg,
++            name => panic!("unexpected aggregate operation {name}"),
++        };
++
++        let source = if matches!(self.peek(), Event::Token { kind: OF_KW, .. }) {
++            self.expect(OF_KW)?;
++            AggSource::Of(match self.peek() {
++                Event::Token { kind: THEM_KW, .. } => {
++                    PatternSet::Them { span: self.expect(THEM_KW)? }
++                }
++                _ => PatternSet::Set(self.pattern_ident_tuple()?),
++            })
++        } else {
++            let mut variables = Vec::new();
++            loop {
++                variables.push(self.identifier()?);
++                match self.next()? {
++                    Event::Token { kind: COMMA, .. } => {}
++                    Event::Token { kind: IN_KW, .. } => break,
++                    event => panic!("unexpected {event:?}"),
++                }
++            }
++            AggSource::In { variables, iterable: self.iterable()? }
++        };
++
++        self.expect(COLON)?;
++        self.expect(L_PAREN)?;
++
++        let body = self.boolean_expr()?;
++        let span = for_span.combine(&self.expect(R_PAREN)?);
++
++        self.end(FOR_EXPR)?;
++
++        Ok(Expr::ForAgg(Box::new(ForAgg {
++            span,
++            operation,
++            source,
++            body,
++        })))
++    }
++
+     fn for_expr(&mut self) -> Result<Expr<'src>, BuilderError> {
+         self.begin(FOR_EXPR)?;
+ 
+         let for_span = self.expect(FOR_KW)?;
++
++        if matches!(self.peek(), Event::Begin { kind: AGG_OP, .. }) {
++            return self.for_agg_expr(for_span);
++        }
++
+         let quantifier = self.quantifier()?;
+ 
+         let mut pattern_set = None;
+@@ -1357,6 +1416,7 @@ where
+             Event::Token { kind: ENTRYPOINT_KW, .. } => {
+                 Expr::Entrypoint { span: self.expect(ENTRYPOINT_KW)? }
+             }
++            Event::Begin { kind: FOR_EXPR, .. } => self.for_expr()?,
+             Event::Token { kind: PATTERN_COUNT, .. } => {
+                 let span = self.expect(PATTERN_COUNT)?;
+                 let name = self.get_source_str(&span)?;
+diff --git a/parser/src/ast/dfs.rs b/parser/src/ast/dfs.rs
+index ac51e4f4..eedfcb05 100644
+--- a/parser/src/ast/dfs.rs
++++ b/parser/src/ast/dfs.rs
+@@ -534,6 +534,42 @@ fn dfs_enter<'a>(
+                 _ => {}
+             }
+         }
++        Expr::ForAgg(for_agg) => {
++            stack.push(DFSEvent::Enter((
++                &for_agg.body,
++                DFSContext::Body(expr),
++            )));
++            let iterable = match &for_agg.source {
++                AggSource::In { iterable, .. } => iterable,
++                AggSource::Of(_) => return,
++            };
++            match iterable {
++                Iterable::Range(range) => {
++                    stack.push(DFSEvent::Enter((
++                        &range.upper_bound,
++                        DFSContext::Items(expr),
++                    )));
++                    stack.push(DFSEvent::Enter((
++                        &range.lower_bound,
++                        DFSContext::Items(expr),
++                    )));
++                }
++                Iterable::ExprTuple(tuple) => {
++                    for item in tuple.iter().rev() {
++                        stack.push(DFSEvent::Enter((
++                            item,
++                            DFSContext::Items(expr),
++                        )));
++                    }
++                }
++                Iterable::Expr(iterable_expr) => {
++                    stack.push(DFSEvent::Enter((
++                        iterable_expr,
++                        DFSContext::Items(expr),
++                    )));
++                }
++            }
++        }
+         Expr::With(with) => {
+             stack.push(DFSEvent::Enter((&with.body, DFSContext::Body(expr))));
+             for declaration in with.declarations.iter().rev() {
+diff --git a/parser/src/ast/mod.rs b/parser/src/ast/mod.rs
+index 624d0b6c..0ca4d3da 100644
+--- a/parser/src/ast/mod.rs
++++ b/parser/src/ast/mod.rs
+@@ -451,6 +451,45 @@ pub struct ForIn<'src> {
+     pub body: Expr<'src>,
+ }
+ 
++/// An aggregate operation (e.g `count` in `for count x in iterator : (..)`)
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub enum AggOp {
++    Count,
++    Sum,
++    Min,
++    Max,
++    Avg,
++}
++
++impl AggOp {
++    /// Returns the name of the operation, as written in the source code.
++    pub fn as_str(&self) -> &'static str {
++        match self {
++            AggOp::Count => "count",
++            AggOp::Avg => "avg",
++            AggOp::Sum => "sum",
++            AggOp::Min => "min",
++            AggOp::Max => "max",
++        }
++    }
++}
++
++/// A `for .. in` aggregate expression (e.g `for sum x in iterator : (..)`)
++#[derive(Debug)]
++pub struct ForAgg<'src> {
++    span: Span,
++    pub operation: AggOp,
++    pub source: AggSource<'src>,
++    pub body: Expr<'src>,
++}
++
++/// What an aggregate expression iterates over.
++#[derive(Debug)]
++pub enum AggSource<'src> {
++    In { variables: Vec<Ident<'src>>, iterable: Iterable<'src> },
++    Of(PatternSet<'src>),
++}
++
+ /// Items in a `of` expression.
+ #[derive(Debug)]
+ pub enum OfItems<'src> {
+@@ -687,6 +726,9 @@ pub enum Expr<'src> {
+     /// A `for <quantifier> <vars> in ...` expression. (e.g. `for all i in (1..100) : ( ... )`)
+     ForIn(Box<ForIn<'src>>),
+ 
++    /// A `for <agg op> <vars> in ...` expression. (e.g. `for sum i in (1..100) : ( ... )`)
++    ForAgg(Box<ForAgg<'src>>),
++
+     /// A `with` expression (e.g. `with foo = 1 + 1 : ( ... )`)
+     With(Box<With<'src>>),
+ }
+@@ -1174,6 +1216,12 @@ impl WithSpan for ForIn<'_> {
+     }
+ }
+ 
++impl WithSpan for ForAgg<'_> {
++    fn span(&self) -> Span {
++        self.span.clone()
++    }
++}
++
+ impl WithSpan for Of<'_> {
+     fn span(&self) -> Span {
+         self.span.clone()
+@@ -1459,6 +1507,7 @@ impl WithSpan for Expr<'_> {
+             Expr::PatternOffset(p) => p.span(),
+             Expr::ForOf(f) => f.span(),
+             Expr::ForIn(f) => f.span(),
++            Expr::ForAgg(f) => f.span(),
+             Expr::Of(o) => o.span(),
+             Expr::With(w) => w.span(),
+         }
+diff --git a/parser/src/cst/syntax_kind.rs b/parser/src/cst/syntax_kind.rs
+index 45d706d7..db2fc749 100644
+--- a/parser/src/cst/syntax_kind.rs
++++ b/parser/src/cst/syntax_kind.rs
+@@ -134,6 +134,7 @@ pub enum SyntaxKind {
+     WITH_DECL,
+     ITERABLE,
+     QUANTIFIER,
++    AGG_OP,
+     EXPR_TUPLE,
+     BOOLEAN_EXPR_TUPLE,
+     PATTERN_IDENT_TUPLE,
+diff --git a/parser/src/parser/mod.rs b/parser/src/parser/mod.rs
+index f619423d..34b94615 100644
+--- a/parser/src/parser/mod.rs
++++ b/parser/src/parser/mod.rs
+@@ -330,6 +330,68 @@ impl<'src> ParserImpl<'src> {
+         self.tokens.peek_token(token_pos)
+     }
+ 
++    /// Returns the position of the n-th non-trivia token, without consuming
++    /// any token.
++    fn non_trivia_pos(&mut self, n: usize) -> Option<usize> {
++        let mut i = 0;
++        let mut seen = 0;
++        loop {
++            if self.tokens.peek_token(i)?.is_trivia() {
++                i += 1;
++            } else if seen == n {
++                break Some(i);
++            } else {
++                seen += 1;
++                i += 1;
++            }
++        }
++    }
++
++    /// Returns true when the upcoming tokens are the name of an aggregate
++    /// operation followed by an identifier.
++    ///
++    /// The names are not reserved words, they are recognized only here, right
++    /// after the `for` keyword and only when an identifier follows, so that
++    /// `math.min`, `math.max`, `math.count` and rules with those names are not
++    /// affected.
++    fn next_ident_is_agg_op(&mut self) -> bool {
++        self.ident_at_is_agg_op(0)
++    }
++
++    /// Returns true when the upcoming tokens start an aggregate expression,
++    /// which is the `for` keyword followed by the name of an aggregate
++    /// operation and an identifier.
++    fn at_for_agg(&mut self) -> bool {
++        match self.non_trivia_pos(0).and_then(|p| self.tokens.peek_token(p)) {
++            Some(Token::FOR_KW(_)) => {}
++            _ => return false,
++        }
++        self.ident_at_is_agg_op(1)
++    }
++
++    /// Returns true when the n-th non-trivia token is the name of an aggregate
++    /// operation and the one after it is an identifier.
++    fn ident_at_is_agg_op(&mut self, n: usize) -> bool {
++        let op_pos = match self.non_trivia_pos(n) {
++            Some(pos) => pos,
++            None => return false,
++        };
++        let op_span = match self.tokens.peek_token(op_pos) {
++            Some(Token::IDENT(span)) => span.clone(),
++            _ => return false,
++        };
++        if !matches!(
++            &self.tokens.source()[op_span.range()],
++            b"count" | b"sum" | b"min" | b"max" | b"avg"
++        ) {
++            return false;
++        }
++        matches!(
++            self.non_trivia_pos(n + 1).and_then(|p| self.tokens.peek_token(p)),
++            Some(Token::IDENT(_) | Token::OF_KW(_))
++        )
++    }
++
+     /// Consumes the next token and returns it. The consumed token is also
+     /// appended to the output.
+     ///
+@@ -1396,6 +1458,16 @@ impl ParserImpl<'_> {
+     fn boolean_term(&mut self) -> &mut Self {
+         const DESC: Option<&'static str> = Some("expression");
+ 
++        // An aggregate expression produces a number, not a boolean, so it
++        // belongs to the comparison alternative rather than to the `for`
++        // alternative below.
++        if self.at_for_agg() {
++            return self
++                .begin(BOOLEAN_TERM)
++                .then(Self::comparison_chain)
++                .end();
++        }
++
+         self.begin(BOOLEAN_TERM)
+             .begin_alt()
+             .alt(|p| {
+@@ -1410,28 +1482,7 @@ impl ParserImpl<'_> {
+             .alt(Self::for_expr)
+             .alt(Self::of_expr)
+             .alt(Self::with_expr)
+-            .alt(|p| {
+-                p.expr().zero_or_more(|p| {
+-                    p.expect_d(
+-                        t!(EQ
+-                            | NE
+-                            | LE
+-                            | LT
+-                            | GE
+-                            | GT
+-                            | CONTAINS_KW
+-                            | ICONTAINS_KW
+-                            | STARTSWITH_KW
+-                            | ISTARTSWITH_KW
+-                            | ENDSWITH_KW
+-                            | IENDSWITH_KW
+-                            | IEQUALS_KW
+-                            | MATCHES_KW),
+-                        DESC,
+-                    )
+-                    .then(Self::expr)
+-                })
+-            })
++            .alt(Self::comparison_chain)
+             .alt(|p| {
+                 p.expect_d(t!(L_PAREN), DESC)
+                     .then(Self::boolean_expr)
+@@ -1441,6 +1492,34 @@ impl ParserImpl<'_> {
+             .end()
+     }
+ 
++    /// Parses an expression optionally compared against other expressions.
++    ///
++    /// ```text
++    /// COMPARISON_CHAIN := EXPR ( comparison_op EXPR )*
++    /// ```
++    fn comparison_chain(&mut self) -> &mut Self {
++        self.expr().zero_or_more(|p| {
++            p.expect_d(
++                t!(EQ
++                    | NE
++                    | LE
++                    | LT
++                    | GE
++                    | GT
++                    | CONTAINS_KW
++                    | ICONTAINS_KW
++                    | STARTSWITH_KW
++                    | ISTARTSWITH_KW
++                    | ENDSWITH_KW
++                    | IENDSWITH_KW
++                    | IEQUALS_KW
++                    | MATCHES_KW),
++                Some("expression"),
++            )
++            .then(Self::expr)
++        })
++    }
++
+     fn at_or_in(&mut self) -> &mut Self {
+         self.begin_alt()
+             .alt(|p| p.expect(t!(AT_KW)).then(Self::expr))
+@@ -1536,6 +1615,11 @@ impl ParserImpl<'_> {
+         const DESC: Option<&'static str> = Some("expression");
+ 
+         self.cached(TERM, |p| {
++            // An aggregate expression produces a number, so it is a term
++            // rather than a boolean term.
++            if p.at_for_agg() {
++                return p.begin(TERM).then(Self::for_expr).end();
++            }
+             p.begin(TERM)
+                 .begin_alt()
+                 .alt(|p| {
+@@ -1609,9 +1693,36 @@ impl ParserImpl<'_> {
+     /// `:` `(` BOOLEAN_EXPR `)
+     /// ``
+     fn for_expr(&mut self) -> &mut Self {
+-        self.begin(FOR_EXPR)
+-            .expect_d(t!(FOR_KW), Some("expression"))
+-            .then(Self::quantifier)
++        self.begin(FOR_EXPR).expect_d(t!(FOR_KW), Some("expression"));
++
++        if self.next_ident_is_agg_op() {
++            return self
++                .begin(AGG_OP)
++                .expect(t!(IDENT))
++                .end()
++                .begin_alt()
++                .alt(|p| {
++                    p.expect(t!(OF_KW))
++                        .begin_alt()
++                        .alt(|p| p.expect(t!(THEM_KW)))
++                        .alt(Self::pattern_ident_tuple)
++                        .end_alt()
++                })
++                .alt(|p| {
++                    p.expect(t!(IDENT))
++                        .zero_or_more(|p| p.expect(t!(COMMA)).expect(t!(IDENT)))
++                        .expect(t!(IN_KW))
++                        .iterable()
++                })
++                .end_alt()
++                .expect(t!(COLON))
++                .expect(t!(L_PAREN))
++                .then(|p| p.boolean_expr().recover(t!(R_PAREN)))
++                .expect(t!(R_PAREN))
++                .end();
++        }
++
++        self.then(Self::quantifier)
+             .begin_alt()
+             .alt(|p| {
+                 p.expect(t!(OF_KW))

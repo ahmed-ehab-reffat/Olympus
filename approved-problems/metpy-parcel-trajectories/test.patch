@@ -1,0 +1,1773 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..7c83238fd
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,44 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++cd /app
++
++NEW_TESTS="tests/calc/test_trajectory_e16964.py"
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  JUNIT_ARG="--junitxml=$OUTPUT_PATH"
++else
++  JUNIT_ARG=""
++fi
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest "$NEW_TESTS" -p no:cacheprovider $JUNIT_ARG
++else
++  python -m pytest tests --ignore="$NEW_TESTS" -p no:cacheprovider $JUNIT_ARG
++fi
++EXIT_CODE=$?
++
++if [ -n "$OUTPUT_PATH" ] && [ ! -s "$OUTPUT_PATH" ]; then
++  cat > "$OUTPUT_PATH" <<'XMLEOF'
++<?xml version="1.0" encoding="utf-8"?>
++<testsuites><testsuite name="pytest" errors="1" failures="0" tests="1" time="0">
++<testcase classname="test_trajectory" name="collection" time="0">
++<error message="pytest produced no results">The test run did not start.</error>
++</testcase></testsuite></testsuites>
++XMLEOF
++fi
++
++exit $EXIT_CODE
+diff --git a/tests/calc/test_trajectory_e16964.py b/tests/calc/test_trajectory_e16964.py
+new file mode 100644
+index 000000000..a1d8140ef
+--- /dev/null
++++ b/tests/calc/test_trajectory_e16964.py
+@@ -0,0 +1,1717 @@
++# Copyright (c) 2026 MetPy Developers.
++# Distributed under the terms of the BSD 3-Clause License.
++# SPDX-License-Identifier: BSD-3-Clause
++"""Test the parcel trajectory calculations."""
++from datetime import timedelta
++
++import numpy as np
++import pytest
++from scipy.integrate import solve_ivp
++import xarray as xr
++
++from metpy.constants import earth_avg_radius
++import metpy.calc as mpcalc
++import metpy.interpolate as mpinterp
++from metpy.units import units
++
++pytestmark = pytest.mark.filterwarnings('ignore::RuntimeWarning')
++
++RADIUS = earth_avg_radius.m_as('meter')
++LONS = np.arange(-20.0, 20.1, 2.0)
++LATS = np.arange(20.0, 60.1, 2.0)
++LEVELS = np.array([1000.0, 850.0, 700.0, 500.0])
++TIMES = np.array(['2024-03-01T00', '2024-03-01T12'], dtype='datetime64[ns]')
++HOUR = np.timedelta64(3600, 's')
++
++
++def build(func, *, lons=LONS, lats=LATS, times=TIMES, levels=None, unit='m/s',
++          level_units='hPa', level_name='isobaric'):
++    """Build a gridded field from a function of its coordinates."""
++    coords = {}
++    dims = []
++    axes = []
++    if times is not None:
++        coords['time'] = ('time', times)
++        dims.append('time')
++        axes.append(((times - times[0]) / np.timedelta64(1, 's')).astype(float))
++    if levels is not None:
++        coords[level_name] = (level_name, levels, {'units': level_units})
++        dims.append(level_name)
++        axes.append(levels)
++    coords['latitude'] = ('latitude', lats, {'units': 'degrees_north',
++                                             'standard_name': 'latitude'})
++    coords['longitude'] = ('longitude', lons, {'units': 'degrees_east',
++                                               'standard_name': 'longitude'})
++    dims.extend(('latitude', 'longitude'))
++    axes.extend((lats, lons))
++
++    mesh = np.meshgrid(*axes, indexing='ij')
++    values = np.broadcast_to(np.asarray(func(*mesh), dtype=np.float64),
++                             tuple(axis.size for axis in axes)).copy()
++    return xr.DataArray(values, dims=tuple(dims), coords=coords, attrs={'units': unit})
++
++
++def steady(func, **kwargs):
++    """Build a field with no time coordinate."""
++    return build(func, times=None, **kwargs)
++
++
++def uniform(u_value, v_value, **kwargs):
++    """Build a pair of wind components with constant values."""
++    return (build(lambda *mesh: u_value, **kwargs), build(lambda *mesh: v_value, **kwargs))
++
++
++def projected_grid(spacing=100000.0, size=21):
++    """Build wind components on a Lambert conformal grid."""
++    from pyproj import CRS, Proj
++    crs = CRS.from_cf({'grid_mapping_name': 'lambert_conformal_conic',
++                       'standard_parallel': (30.0, 50.0),
++                       'longitude_of_central_meridian': 0.0,
++                       'latitude_of_projection_origin': 40.0,
++                       'earth_radius': RADIUS})
++    origin = Proj(crs)(0.0, 40.0)
++    axes = [origin[index] + (np.arange(size) - size // 2) * spacing for index in (0, 1)]
++    coords = {'time': ('time', TIMES),
++              'y': ('y', axes[1], {'units': 'meter',
++                                   'standard_name': 'projection_y_coordinate'}),
++              'x': ('x', axes[0], {'units': 'meter',
++                                   'standard_name': 'projection_x_coordinate'})}
++    shape = (TIMES.size, size, size)
++    made = [xr.DataArray(np.full(shape, value), dims=('time', 'y', 'x'), coords=coords,
++                         attrs={'units': 'm/s'}).metpy.assign_crs(crs.to_cf())
++            for value in (10.0, 0.0)]
++    return made
++
++
++def zonal_degrees(speed, seconds, latitude):
++    """Return the change in longitude for an eastward wind."""
++    return np.degrees(speed * seconds / (RADIUS * np.cos(np.radians(latitude))))
++
++
++def meridional_degrees(speed, seconds):
++    """Return the change in latitude for a northward wind."""
++    return np.degrees(speed * seconds / RADIUS)
++
++
++def positions(trajectory, index=0):
++    """Return the longitude and latitude of one trajectory."""
++    return (trajectory['longitude'].metpy.magnitude[index],
++            trajectory['latitude'].metpy.magnitude[index])
++
++
++def reference_path(u_func, v_func, start, seconds, count):
++    """Integrate the same system with an adaptive solver."""
++    def rhs(time, state):
++        longitude, latitude = state
++        return [np.degrees(u_func(time, longitude, latitude)
++                           / (RADIUS * np.cos(np.radians(latitude)))),
++                np.degrees(v_func(time, longitude, latitude) / RADIUS)]
++
++    span = np.arange(count + 1) * seconds
++    answer = solve_ivp(rhs, (0.0, span[-1]), list(start), t_eval=span, rtol=1e-12,
++                       atol=1e-12, method='DOP853')
++    return answer.y[0], answer.y[1]
++
++
++def expect_error(call):
++    """Check that a call is rejected."""
++    with pytest.raises(ValueError):
++        call()
++
++
++def test_result_has_trajectory_and_step_dimensions():
++    """Test that result has trajectory and step dimensions."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 4)
++    assert traj.sizes == {'trajectory': 1, 'step': 5}
++
++
++def test_start_point_order_is_preserved():
++    """Test that start point order is preserved."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, [(1.0, 30.0), (-3.0, 50.0)], HOUR, 2)
++    assert traj['longitude'].metpy.magnitude[:, 0] == pytest.approx([1.0, -3.0])
++    assert traj['latitude'].metpy.magnitude[:, 0] == pytest.approx([30.0, 50.0])
++
++
++def test_step_coordinate_counts_from_zero():
++    """Test that step coordinate counts from zero."""
++    u, v = uniform(5.0, 5.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 3)
++    assert traj['step'].values.tolist() == [0, 1, 2, 3]
++
++
++def test_times_advance_by_the_step():
++    """Test that times advance by the step."""
++    u, v = uniform(5.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2)
++    assert (traj['time'].values == np.array(['2024-03-01T00', '2024-03-01T01',
++                                            '2024-03-01T02'],
++                                            dtype='datetime64[ns]')).all()
++
++
++def test_backward_run_starts_at_the_last_field_time():
++    """Test that backward run starts at the last field time."""
++    u, v = uniform(5.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), -HOUR, 2)
++    assert traj['time'].values[0] == np.datetime64('2024-03-01T12')
++    assert traj['time'].values[-1] == np.datetime64('2024-03-01T10')
++
++
++def test_given_start_time_is_used():
++    """Test that given start time is used."""
++    u, v = uniform(5.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 1,
++                                    start_time=np.datetime64('2024-03-01T05'))
++    assert traj['time'].values[0] == np.datetime64('2024-03-01T05')
++
++
++def test_first_sample_is_the_start_point():
++    """Test that first sample is the start point."""
++    u, v = uniform(-7.5, 3.0)
++    traj = mpcalc.parcel_trajectory(u, v, (2.5, 33.0), HOUR, 3)
++    longitude, latitude = positions(traj)
++    assert longitude[0] == pytest.approx(2.5)
++    assert latitude[0] == pytest.approx(33.0)
++
++
++def test_positions_carry_degree_units():
++    """Test that positions carry degree units."""
++    u, v = uniform(5.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 1)
++    assert traj['longitude'].metpy.units == units('degrees_east')
++    assert traj['latitude'].metpy.units == units('degrees_north')
++
++
++def test_two_dimensional_field_has_no_vertical_variable():
++    """Test that two dimensional field has no vertical variable."""
++    u, v = uniform(5.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 1)
++    assert 'vertical' not in traj
++
++
++def test_layered_field_reports_the_vertical():
++    """Test that layered field reports the vertical."""
++    u, v = uniform(5.0, 0.0, levels=LEVELS)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 1)
++    assert traj['vertical'].metpy.units == units('hPa')
++
++
++def test_zonal_step_uses_the_cosine_of_latitude():
++    """Test that zonal step uses the cosine of latitude."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 50.0), HOUR, 3)
++    longitude, latitude = positions(traj)
++    assert longitude == pytest.approx(zonal_degrees(10.0, 3600.0, 50.0) * np.arange(4))
++    assert latitude == pytest.approx(np.full(4, 50.0))
++
++
++def test_zonal_step_at_the_equator_needs_no_cosine():
++    """Test that zonal step at the equator needs no cosine."""
++    u, v = uniform(10.0, 0.0, lats=np.arange(-10.0, 10.1, 2.0))
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 0.0), HOUR, 2)
++    longitude, _ = positions(traj)
++    assert longitude == pytest.approx(meridional_degrees(10.0, 3600.0) * np.arange(3))
++
++
++def test_meridional_step_matches_the_sphere():
++    """Test that meridional step matches the sphere."""
++    u, v = uniform(0.0, 8.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 3)
++    _, latitude = positions(traj)
++    assert latitude == pytest.approx(40.0 + meridional_degrees(8.0, 3600.0) * np.arange(4))
++
++
++def test_zonal_rate_follows_the_latitude_within_a_step():
++    """Test that zonal rate follows the latitude within a step."""
++    u, v = uniform(20.0, 20.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), np.timedelta64(6, 'h'), 2)
++    longitude, latitude = positions(traj)
++    frozen = zonal_degrees(20.0, 6 * 3600.0, 40.0)
++    assert longitude[1] != pytest.approx(frozen, abs=1e-6)
++    assert latitude[1] == pytest.approx(40.0 + meridional_degrees(20.0, 6 * 3600.0))
++
++
++def test_path_matches_an_independent_integration():
++    """Test that path matches an independent integration."""
++    def u_func(time, longitude, latitude):
++        return 8.0 + 0.05 * longitude + 0.03 * latitude + 0.001 * longitude * latitude
++
++    def v_func(time, longitude, latitude):
++        return -3.0 + 0.02 * longitude - 0.04 * latitude + 0.0005 * longitude * latitude
++
++    u = build(lambda t, lat, lon: u_func(t, lon, lat))
++    v = build(lambda t, lat, lon: v_func(t, lon, lat))
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), np.timedelta64(600, 's'), 24)
++    longitude, latitude = positions(traj)
++    want_lon, want_lat = reference_path(u_func, v_func, (0.0, 40.0), 600.0, 24)
++    assert longitude == pytest.approx(want_lon, abs=1e-8)
++    assert latitude == pytest.approx(want_lat, abs=1e-8)
++
++
++def test_backward_path_matches_an_independent_integration():
++    """Test that backward path matches an independent integration."""
++    def u_func(time, longitude, latitude):
++        return 6.0 + 0.04 * longitude * latitude
++
++    def v_func(time, longitude, latitude):
++        return 4.0 - 0.03 * latitude
++
++    u = build(lambda t, lat, lon: u_func(t, lon, lat))
++    v = build(lambda t, lat, lon: v_func(t, lon, lat))
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), np.timedelta64(-600, 's'), 24,
++                                    start_time=TIMES[1])
++    longitude, latitude = positions(traj)
++    want_lon, want_lat = reference_path(u_func, v_func, (0.0, 40.0), -600.0, 24)
++    assert longitude == pytest.approx(want_lon, abs=1e-8)
++    assert latitude == pytest.approx(want_lat, abs=1e-8)
++
++
++def test_time_varying_wind_is_sampled_within_the_step():
++    """Test that time varying wind is sampled within the step."""
++    span = (TIMES[1] - TIMES[0]) / np.timedelta64(1, 's')
++    u = build(lambda t, lat, lon: 10.0 * t / span)
++    v = build(lambda t, lat, lon: 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), np.timedelta64(3, 'h'), 1)
++    longitude, _ = positions(traj)
++    seconds = 3 * 3600.0
++    mean_speed = 10.0 * (seconds / 2.0) / span
++    assert longitude[1] == pytest.approx(zonal_degrees(mean_speed, seconds, 40.0))
++
++
++def test_wind_curving_in_time_follows_the_stored_times():
++    """Test that wind curving in time follows the stored times."""
++    span = (TIMES[1] - TIMES[0]) / np.timedelta64(1, 's')
++    stamps = np.arange('2024-03-01T00', '2024-03-01T13', np.timedelta64(1, 'h'),
++                       dtype='datetime64[ns]')
++    u = build(lambda t, lat, lon: 12.0 * (t / span) ** 2, times=stamps)
++    v = build(lambda t, lat, lon: 0.0, times=stamps)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), np.timedelta64(1, 'h'), 1)
++    longitude, _ = positions(traj)
++    seconds = 3600.0
++    average = 0.5 * 12.0 * (seconds / span) ** 2
++    assert longitude[1] == pytest.approx(zonal_degrees(average, seconds, 40.0), rel=1e-9)
++
++
++def test_longer_run_extends_the_same_path():
++    """Test that longer run extends the same path."""
++    u, v = uniform(9.0, 4.0)
++    short = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2)
++    long_run = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 5)
++    assert positions(long_run)[0][:3] == pytest.approx(positions(short)[0])
++
++
++def test_backward_run_returns_to_the_start():
++    """Test that backward run returns to the start."""
++    u, v = uniform(12.0, -6.0)
++    forward = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), np.timedelta64(600, 's'), 12)
++    ending = (forward['longitude'].metpy.magnitude[0, -1],
++              forward['latitude'].metpy.magnitude[0, -1])
++    back = mpcalc.parcel_trajectory(u, v, ending, np.timedelta64(-600, 's'), 12,
++                                    start_time=forward['time'].values[-1])
++    longitude, latitude = positions(back)
++    assert longitude[-1] == pytest.approx(0.0, abs=1e-9)
++    assert latitude[-1] == pytest.approx(40.0, abs=1e-9)
++
++
++def test_wind_is_interpolated_between_grid_points():
++    """Test that wind is interpolated between grid points."""
++    u = steady(lambda lat, lon: 4.0 + lon)
++    v = steady(lambda lat, lon: 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (1.0, 40.0), np.timedelta64(1, 's'), 1,
++                                    start_time=TIMES[0])
++    longitude, _ = positions(traj)
++    assert longitude[1] == pytest.approx(1.0 + zonal_degrees(5.0, 1.0, 40.0), rel=1e-9)
++
++
++def test_speed_between_levels_is_interpolated_in_log_pressure():
++    """Test that speed between levels is interpolated in log pressure."""
++    u = build(lambda t, level, lat, lon: np.log(level), levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), np.timedelta64(1, 's'), 1)
++    longitude, _ = positions(traj)
++    assert longitude[1] == pytest.approx(zonal_degrees(np.log(900.0), 1.0, 40.0), rel=1e-9)
++
++
++def test_height_coordinate_is_interpolated_linearly():
++    """Test that height coordinate is interpolated linearly."""
++    heights = np.array([0.0, 1000.0, 2000.0, 3000.0])
++    u = build(lambda t, level, lat, lon: level / 100.0, levels=heights, level_units='meter',
++              level_name='height')
++    v = build(lambda t, level, lat, lon: 0.0, levels=heights, level_units='meter',
++              level_name='height')
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 1500.0), np.timedelta64(1, 's'), 1)
++    longitude, _ = positions(traj)
++    assert longitude[1] == pytest.approx(zonal_degrees(15.0, 1.0, 40.0), rel=1e-9)
++
++
++def test_descending_latitude_grid_gives_the_same_path():
++    """Test that descending latitude grid gives the same path."""
++    def wind(t, lat, lon):
++        return 5.0 + 0.1 * lat
++
++    rising = build(wind)
++    falling = build(wind, lats=LATS[::-1])
++    zero = build(lambda t, lat, lon: 0.0)
++    up = mpcalc.parcel_trajectory(rising, zero, (0.0, 41.0), HOUR, 3)
++    down = mpcalc.parcel_trajectory(falling, build(lambda t, lat, lon: 0.0, lats=LATS[::-1]),
++                                    (0.0, 41.0), HOUR, 3)
++    assert positions(down)[0] == pytest.approx(positions(up)[0])
++
++
++def test_descending_pressure_grid_gives_the_same_path():
++    """Test that descending pressure grid gives the same path."""
++    def wind(t, level, lat, lon):
++        return np.log(level)
++
++    rising = build(wind, levels=LEVELS[::-1])
++    falling = build(wind, levels=LEVELS)
++    zero_up = build(lambda t, level, lat, lon: 0.0, levels=LEVELS[::-1])
++    zero_down = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    up = mpcalc.parcel_trajectory(rising, zero_up, (0.0, 40.0, 900.0), HOUR, 2)
++    down = mpcalc.parcel_trajectory(falling, zero_down, (0.0, 40.0, 900.0), HOUR, 2)
++    assert positions(down)[0] == pytest.approx(positions(up)[0])
++
++
++def test_field_is_interpolated_between_times():
++    """Test that field is interpolated between times."""
++    stamps = np.array(['2024-03-01T00', '2024-03-01T02'], dtype='datetime64[ns]')
++    u = build(lambda t, lat, lon: np.where(t > 0.0, 20.0, 0.0), times=stamps)
++    v = build(lambda t, lat, lon: 0.0, times=stamps)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), np.timedelta64(1, 's'), 1)
++    longitude, _ = positions(traj)
++    assert longitude[1] == pytest.approx(zonal_degrees(20.0 / 7200.0 * 0.5, 1.0, 40.0),
++                                         rel=1e-6)
++
++
++def test_leaving_the_grid_gives_missing_values():
++    """Test that leaving the grid gives missing values."""
++    u, v = uniform(20.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (16.0, 40.0), np.timedelta64(2, 'h'), 4)
++    longitude, _ = positions(traj)
++    assert np.isfinite(longitude[:3]).all()
++    assert np.isnan(longitude[3:]).all()
++
++
++def test_samples_before_leaving_are_kept():
++    """Test that samples before leaving are kept."""
++    u, v = uniform(20.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (16.0, 40.0), np.timedelta64(2, 'h'), 4)
++    longitude, _ = positions(traj)
++    assert longitude[1] == pytest.approx(16.0 + zonal_degrees(20.0, 7200.0, 40.0))
++
++
++def test_only_the_parcel_that_leaves_terminates():
++    """Test that only the parcel that leaves terminates."""
++    u, v = uniform(20.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, [(16.0, 40.0), (0.0, 40.0)],
++                                    np.timedelta64(2, 'h'), 4)
++    assert np.isnan(traj['longitude'].metpy.magnitude[0]).any()
++    assert np.isfinite(traj['longitude'].metpy.magnitude[1]).all()
++
++
++def test_running_past_the_last_field_time_terminates():
++    """Test that running past the last field time terminates."""
++    u, v = uniform(5.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), np.timedelta64(5, 'h'), 4)
++    longitude, _ = positions(traj)
++    assert np.isfinite(longitude[:3]).all()
++    assert np.isnan(longitude[3:]).all()
++
++
++def test_leaving_the_vertical_range_terminates():
++    """Test that leaving the vertical range terminates."""
++    u = build(lambda t, level, lat, lon: 5.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    w = build(lambda t, level, lat, lon: 0.5, levels=LEVELS, unit='Pa/s')
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 990.0), HOUR, 4, w=w)
++    vertical = traj['vertical'].metpy.magnitude[0]
++    assert vertical[0] == pytest.approx(990.0)
++    assert np.isnan(vertical[1:]).all()
++
++
++def test_a_kept_level_is_dropped_when_the_parcel_leaves():
++    """Test that a kept level is dropped when the parcel leaves."""
++    u = build(lambda t, level, lat, lon: 20.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    traj = mpcalc.parcel_trajectory(u, v, (16.0, 40.0, 900.0), np.timedelta64(2, 'h'), 4)
++    vertical = traj['vertical'].metpy.magnitude[0]
++    assert vertical[:3] == pytest.approx(np.full(3, 900.0))
++    assert np.isnan(vertical[3:]).all()
++
++
++def test_start_outside_the_grid_terminates_at_once():
++    """Test that start outside the grid terminates at once."""
++    u, v = uniform(5.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (60.0, 40.0), HOUR, 3)
++    longitude, _ = positions(traj)
++    assert longitude[0] == pytest.approx(60.0)
++    assert np.isnan(longitude[1:]).all()
++
++
++def test_reaching_the_pole_terminates():
++    """Test that reaching the pole terminates."""
++    u = build(lambda t, lat, lon: 0.0, lats=np.arange(80.0, 90.1, 1.0))
++    v = build(lambda t, lat, lon: 60.0, lats=np.arange(80.0, 90.1, 1.0))
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 89.0), np.timedelta64(6, 'h'), 3)
++    _, latitude = positions(traj)
++    assert np.isnan(latitude[-1])
++
++
++def test_global_grid_is_continuous_across_the_seam():
++    """Test that global grid is continuous across the seam."""
++    lons = np.arange(0.0, 360.0, 2.5)
++    u = build(lambda t, lat, lon: -30.0, lons=lons)
++    v = build(lambda t, lat, lon: 0.0, lons=lons)
++    traj = mpcalc.parcel_trajectory(u, v, (0.5, 40.0), HOUR, 3)
++    longitude, _ = positions(traj)
++    assert np.isfinite(longitude).all()
++    assert longitude[1] == pytest.approx(0.5 - zonal_degrees(30.0, 3600.0, 40.0))
++
++
++def test_wrapped_longitudes_stay_inside_the_reported_range():
++    """Test that wrapped longitudes stay inside the reported range."""
++    lons = np.arange(0.0, 360.0, 2.5)
++    u = build(lambda t, lat, lon: -30.0, lons=lons)
++    v = build(lambda t, lat, lon: 0.0, lons=lons)
++    traj = mpcalc.parcel_trajectory(u, v, (-175.0, 40.0), np.timedelta64(3, 'h'), 4)
++    longitude, _ = positions(traj)
++    assert np.isfinite(longitude).all()
++    assert (longitude >= -180.0).all()
++    assert (longitude < 180.0).all()
++    assert longitude[-1] > 0.0
++
++
++def test_regional_grid_does_not_wrap():
++    """Test that regional grid does not wrap."""
++    u, v = uniform(-60.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (-19.5, 40.0), np.timedelta64(2, 'h'), 4)
++    longitude, _ = positions(traj)
++    assert np.isnan(longitude[-1])
++
++
++def test_shifted_and_unshifted_global_grids_agree():
++    """Test that shifted and unshifted global grids agree."""
++    east = np.arange(0.0, 360.0, 2.5)
++    centred = np.arange(-180.0, 180.0, 2.5)
++    east_u = build(lambda t, lat, lon: 10.0 + 0.0 * lon, lons=east)
++    east_v = build(lambda t, lat, lon: 0.0, lons=east)
++    centred_u = build(lambda t, lat, lon: 10.0 + 0.0 * lon, lons=centred)
++    centred_v = build(lambda t, lat, lon: 0.0, lons=centred)
++    first = mpcalc.parcel_trajectory(east_u, east_v, (179.0, 40.0), HOUR, 3)
++    second = mpcalc.parcel_trajectory(centred_u, centred_v, (179.0, 40.0), HOUR, 3)
++    assert positions(first)[0] == pytest.approx(positions(second)[0])
++
++
++def test_projected_grid_matches_a_geographic_one():
++    """Test that projected grid matches a geographic one."""
++    u, v = projected_grid()
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 3)
++    longitude, latitude = positions(traj)
++    assert longitude == pytest.approx(zonal_degrees(10.0, 3600.0, 40.0) * np.arange(4))
++    assert latitude == pytest.approx(np.full(4, 40.0))
++
++
++def test_projected_grid_is_read_through_its_projection():
++    """Test that projected grid is read through its projection."""
++    from pyproj import Proj
++    u, _ = projected_grid()
++    shaped = u.copy()
++    shaped.data = np.broadcast_to(u['x'].values[None, None, :] / 1e5, u.shape).copy()
++    spot = Proj(u.metpy.pyproj_crs)(3.0, 43.0)
++    along = mpinterp.interpolate_to_track(shaped, [3.0], [43.0], time=TIMES[:1])
++    assert along.metpy.magnitude == pytest.approx([spot[0] / 1e5], rel=1e-9)
++
++
++def test_leaving_a_projected_grid_terminates():
++    """Test that leaving a projected grid terminates."""
++    u, v = projected_grid(spacing=50000.0, size=7)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), np.timedelta64(6, 'h'), 4)
++    longitude, _ = positions(traj)
++    assert np.isnan(longitude[-1])
++
++
++def test_vertical_velocity_moves_the_parcel_through_levels():
++    """Test that vertical velocity moves the parcel through levels."""
++    u = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    w = build(lambda t, level, lat, lon: -2.0, levels=LEVELS, unit='Pa/s')
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 2, w=w)
++    vertical = traj['vertical'].metpy.magnitude[0]
++    assert vertical == pytest.approx([900.0, 828.0, 756.0])
++
++
++def test_vertical_velocity_units_are_converted():
++    """Test that vertical velocity units are converted."""
++    u = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    w = build(lambda t, level, lat, lon: -0.02, levels=LEVELS, unit='hPa/s')
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 1, w=w)
++    assert traj['vertical'].metpy.magnitude[0, 1] == pytest.approx(828.0)
++
++
++def test_parcel_keeps_its_level_without_a_vertical_velocity():
++    """Test that parcel keeps its level without a vertical velocity."""
++    u = build(lambda t, level, lat, lon: 5.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 780.0), HOUR, 3)
++    assert traj['vertical'].metpy.magnitude[0] == pytest.approx(np.full(4, 780.0))
++
++
++def test_conserved_surface_is_followed():
++    """Test that conserved surface is followed."""
++    theta = build(lambda t, level, lat, lon: 300.0 + (1000.0 - level) * 0.1 + lon,
++                  levels=LEVELS, unit='kelvin')
++    u = build(lambda t, level, lat, lon: 10.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 3, surface=theta)
++    along = mpcalc.sample_trajectory(traj, theta).metpy.magnitude[0]
++    assert along == pytest.approx(np.full(4, along[0]), rel=1e-9)
++
++
++def test_conserved_surface_level_is_found_in_log_pressure():
++    """Test that conserved surface level is found in log pressure."""
++    theta = build(lambda t, level, lat, lon: 300.0 + (1000.0 - level) * 0.1 + lon,
++                  levels=LEVELS, unit='kelvin')
++    u = build(lambda t, level, lat, lon: 10.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 3, surface=theta)
++    ratio = np.log(850.0 / 1000.0)
++    fraction = np.log(900.0 / 1000.0) / ratio - positions(traj)[0] / 15.0
++    assert traj['vertical'].metpy.magnitude[0] == pytest.approx(
++        1000.0 * np.exp(fraction * ratio), rel=1e-9)
++
++
++def test_conserved_surface_level_changes_with_position():
++    """Test that conserved surface level changes with position."""
++    theta = build(lambda t, level, lat, lon: 300.0 + (1000.0 - level) * 0.1 + lon,
++                  levels=LEVELS, unit='kelvin')
++    u = build(lambda t, level, lat, lon: 10.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 3, surface=theta)
++    vertical = traj['vertical'].metpy.magnitude[0]
++    assert (np.diff(vertical) > 0.0).all()
++
++
++def test_conserved_surface_terminates_where_it_is_missing():
++    """Test that conserved surface terminates where it is missing."""
++    theta = build(lambda t, level, lat, lon: 300.0 + (1000.0 - level) * 0.1 - 5.0 * lon,
++                  levels=LEVELS, unit='kelvin')
++    u = build(lambda t, level, lat, lon: 60.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), np.timedelta64(3, 'h'), 4,
++                                    surface=theta)
++    assert np.isnan(traj['vertical'].metpy.magnitude[0]).any()
++
++
++def test_field_is_sampled_along_the_path():
++    """Test that field is sampled along the path."""
++    u, v = uniform(10.0, 0.0)
++    temperature = build(lambda t, lat, lon: lon, unit='degC')
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 3)
++    along = mpcalc.sample_trajectory(traj, temperature)
++    assert along.metpy.magnitude[0] == pytest.approx(positions(traj)[0])
++    assert along.metpy.units == units('degC')
++
++
++def test_sampled_field_keeps_the_trajectory_dimensions():
++    """Test that sampled field keeps the trajectory dimensions."""
++    u, v = uniform(10.0, 0.0)
++    temperature = build(lambda t, lat, lon: lat, unit='degC')
++    traj = mpcalc.parcel_trajectory(u, v, [(0.0, 40.0), (1.0, 30.0)], HOUR, 2)
++    along = mpcalc.sample_trajectory(traj, temperature)
++    assert along.dims == ('trajectory', 'step')
++    assert along.sizes == {'trajectory': 2, 'step': 3}
++
++
++def test_steady_field_is_sampled_without_time():
++    """Test that steady field is sampled without time."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2)
++    height = steady(lambda lat, lon: 2.0 * lon, unit='meter')
++    along = mpcalc.sample_trajectory(traj, height)
++    assert along.metpy.magnitude[0] == pytest.approx(2.0 * positions(traj)[0])
++
++
++def test_dataset_is_sampled_variable_by_variable():
++    """Test that dataset is sampled variable by variable."""
++    u, v = uniform(10.0, 0.0)
++    data = xr.Dataset({'first': build(lambda t, lat, lon: lon, unit='degC'),
++                       'second': build(lambda t, lat, lon: 2.0 * lon, unit='degC')})
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2)
++    along = mpcalc.sample_trajectory(traj, data)
++    assert set(along.data_vars) == {'first', 'second'}
++    assert along['second'].metpy.magnitude[0] == pytest.approx(2.0 * positions(traj)[0])
++
++
++def test_sampling_after_termination_is_missing():
++    """Test that sampling after termination is missing."""
++    u, v = uniform(20.0, 0.0)
++    temperature = build(lambda t, lat, lon: lon, unit='degC')
++    traj = mpcalc.parcel_trajectory(u, v, (16.0, 40.0), np.timedelta64(2, 'h'), 4)
++    along = mpcalc.sample_trajectory(traj, temperature).metpy.magnitude[0]
++    assert np.isfinite(along[:3]).all()
++    assert np.isnan(along[3:]).all()
++
++
++def test_nearest_sampling_takes_the_closest_grid_point():
++    """Test that nearest sampling takes the closest grid point."""
++    u, v = uniform(0.0, 0.0)
++    temperature = build(lambda t, lat, lon: lon, unit='degC')
++    traj = mpcalc.parcel_trajectory(u, v, (0.6, 40.0), HOUR, 1)
++    along = mpcalc.sample_trajectory(traj, temperature, method='nearest')
++    assert along.metpy.magnitude[0] == pytest.approx([0.0, 0.0])
++
++
++def test_sampling_a_layered_field_needs_a_vertical_trajectory():
++    """Test that sampling a layered field needs a vertical trajectory."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 1)
++    temperature = build(lambda t, level, lat, lon: level, levels=LEVELS, unit='kelvin')
++    expect_error(lambda: mpcalc.sample_trajectory(traj, temperature))
++
++
++def test_length_starts_at_zero():
++    """Test that length starts at zero."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 3)
++    assert mpcalc.trajectory_length(traj).metpy.magnitude[0, 0] == pytest.approx(0.0)
++
++
++def test_length_follows_a_meridional_run():
++    """Test that length follows a meridional run."""
++    u, v = uniform(0.0, 10.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 3)
++    length = mpcalc.trajectory_length(traj).metpy.magnitude[0]
++    assert length == pytest.approx(10.0 * 3600.0 * np.arange(4), rel=1e-9)
++
++
++def test_length_is_reported_in_metres():
++    """Test that length is reported in metres."""
++    u, v = uniform(0.0, 10.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 1)
++    assert mpcalc.trajectory_length(traj).metpy.units == units('meter')
++
++
++def test_length_is_missing_after_termination():
++    """Test that length is missing after termination."""
++    u, v = uniform(20.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (16.0, 40.0), np.timedelta64(2, 'h'), 4)
++    length = mpcalc.trajectory_length(traj).metpy.magnitude[0]
++    assert np.isfinite(length[2])
++    assert np.isnan(length[3:]).all()
++
++
++def test_length_ignores_vertical_motion():
++    """Test that length ignores vertical motion."""
++    u = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 10.0, levels=LEVELS)
++    w = build(lambda t, level, lat, lon: -2.0, levels=LEVELS, unit='Pa/s')
++    flat = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 2)
++    rising = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 2, w=w)
++    assert (mpcalc.trajectory_length(rising).metpy.magnitude
++            == pytest.approx(mpcalc.trajectory_length(flat).metpy.magnitude))
++
++
++def test_density_totals_the_time_spent():
++    """Test that density totals the time spent."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, [(0.0, 40.0), (0.0, 30.0)], HOUR, 3)
++    grid = mpcalc.trajectory_density(traj, steady(lambda lat, lon: 0.0))
++    assert grid.metpy.magnitude.sum() == pytest.approx(6 * 3600.0)
++    assert grid.metpy.units == units('second')
++
++
++def test_density_lands_on_the_closest_grid_point():
++    """Test that density lands on the closest grid point."""
++    u, v = uniform(0.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (1.2, 40.4), HOUR, 2)
++    grid = mpcalc.trajectory_density(traj, steady(lambda lat, lon: 0.0))
++    assert grid.sel(latitude=40.0, longitude=2.0).metpy.magnitude == pytest.approx(7200.0)
++
++
++def test_density_uses_the_size_of_a_backward_step():
++    """Test that density uses the size of a backward step."""
++    u, v = uniform(0.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), -HOUR, 2)
++    grid = mpcalc.trajectory_density(traj, steady(lambda lat, lon: 0.0))
++    assert grid.metpy.magnitude.sum() == pytest.approx(2 * 3600.0)
++
++
++def test_density_drops_samples_off_the_template():
++    """Test that density drops samples off the template."""
++    u, v = uniform(0.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, [(0.0, 40.0), (18.0, 40.0)], HOUR, 2)
++    template = steady(lambda lat, lon: 0.0, lons=np.arange(-4.0, 4.1, 2.0))
++    grid = mpcalc.trajectory_density(traj, template)
++    assert grid.metpy.magnitude.sum() == pytest.approx(2 * 3600.0)
++
++
++def test_density_is_scaled_by_weights():
++    """Test that density is scaled by weights."""
++    u, v = uniform(0.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2)
++    counts = mpcalc.sample_trajectory(traj, steady(lambda lat, lon: 3.0, unit='kelvin'))
++    grid = mpcalc.trajectory_density(traj, steady(lambda lat, lon: 0.0), weights=counts)
++    assert grid.metpy.magnitude.sum() == pytest.approx(6 * 3600.0)
++
++
++def test_density_ignores_samples_without_a_weight():
++    """Test that density ignores samples without a weight."""
++    u, v = uniform(0.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2)
++    weights = xr.DataArray(np.array([[2.0, np.nan, 4.0]]), dims=('trajectory', 'step'))
++    grid = mpcalc.trajectory_density(traj, steady(lambda lat, lon: 0.0), weights=weights)
++    assert grid.metpy.magnitude.sum() == pytest.approx(2 * 3600.0)
++
++
++def test_crossing_is_interpolated_between_samples():
++    """Test that crossing is interpolated between samples."""
++    u = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    w = build(lambda t, level, lat, lon: 0.5, levels=LEVELS, unit='Pa/s')
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 800.0), HOUR, 2, w=w)
++    crossings = mpcalc.trajectory_crossings(traj, traj['vertical'],
++                                            units.Quantity(809.0, 'hPa'))
++    assert crossings.sizes == {'trajectory': 1, 'crossing': 1}
++    assert crossings['time'].values[0, 0] == np.datetime64('2024-03-01T00:30:00')
++
++
++def test_crossing_reports_the_direction():
++    """Test that crossing reports the direction."""
++    u = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    rising = build(lambda t, level, lat, lon: -0.5, levels=LEVELS, unit='Pa/s')
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 2, w=rising)
++    crossings = mpcalc.trajectory_crossings(traj, traj['vertical'],
++                                            units.Quantity(890.0, 'hPa'))
++    assert crossings['direction'].values[0, 0] == pytest.approx(-1.0)
++
++
++def test_crossing_positions_are_interpolated():
++    """Test that crossing positions are interpolated."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 3)
++    temperature = build(lambda t, lat, lon: lon, unit='degC')
++    along = mpcalc.sample_trajectory(traj, temperature)
++    crossings = mpcalc.trajectory_crossings(traj, along, 0.2)
++    assert crossings['longitude'].metpy.magnitude[0, 0] == pytest.approx(0.2)
++    assert crossings['latitude'].metpy.magnitude[0, 0] == pytest.approx(40.0)
++
++
++def test_several_crossings_are_reported_in_order():
++    """Test that several crossings are reported in order."""
++    u, v = uniform(20.0, 0.0)
++    temperature = build(lambda t, lat, lon: -np.abs(lon), unit='degC')
++    traj = mpcalc.parcel_trajectory(u, v, (-5.0, 40.0), HOUR, 12)
++    along = mpcalc.sample_trajectory(traj, temperature)
++    crossings = mpcalc.trajectory_crossings(traj, along, -2.0)
++    assert crossings.sizes['crossing'] == 2
++    assert crossings['direction'].values[0] == pytest.approx([1.0, -1.0])
++    assert crossings['time'].values[0, 0] < crossings['time'].values[0, 1]
++    assert crossings['longitude'].metpy.magnitude[0] == pytest.approx([-2.0, 2.0], abs=1e-6)
++
++
++def test_trajectories_with_fewer_crossings_are_padded():
++    """Test that trajectories with fewer crossings are padded."""
++    u = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    w = build(lambda t, level, lat, lon: 0.5, levels=LEVELS, unit='Pa/s')
++    traj = mpcalc.parcel_trajectory(u, v, [(0.0, 40.0, 800.0), (0.0, 40.0, 950.0)],
++                                    HOUR, 2, w=w)
++    crossings = mpcalc.trajectory_crossings(traj, traj['vertical'],
++                                            units.Quantity(809.0, 'hPa'))
++    assert np.isnan(crossings['longitude'].metpy.magnitude[1, 0])
++    assert np.isnat(crossings['time'].values[1, 0])
++
++
++def test_no_crossing_gives_an_empty_result():
++    """Test that no crossing gives an empty result."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2)
++    temperature = build(lambda t, lat, lon: lon, unit='degC')
++    along = mpcalc.sample_trajectory(traj, temperature)
++    crossings = mpcalc.trajectory_crossings(traj, along, 50.0)
++    assert crossings.sizes['crossing'] == 0
++
++
++def test_a_sample_on_the_level_does_not_cross_twice():
++    """Test that a sample on the level does not cross twice."""
++    u = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    w = build(lambda t, level, lat, lon: 0.5, levels=LEVELS, unit='Pa/s')
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 2, w=w)
++    crossings = mpcalc.trajectory_crossings(traj, traj['vertical'],
++                                            units.Quantity(900.0, 'hPa'))
++    assert crossings.sizes['crossing'] == 0
++
++
++def test_crossings_skip_terminated_samples():
++    """Test that crossings skip terminated samples."""
++    u, v = uniform(20.0, 0.0)
++    temperature = build(lambda t, lat, lon: lon, unit='degC')
++    traj = mpcalc.parcel_trajectory(u, v, (16.0, 40.0), np.timedelta64(2, 'h'), 4)
++    along = mpcalc.sample_trajectory(traj, temperature)
++    crossings = mpcalc.trajectory_crossings(traj, along, 17.0)
++    assert crossings.sizes['crossing'] == 1
++
++
++def test_spread_of_a_symmetric_pair_is_half_the_separation():
++    """Test that spread of a symmetric pair is half the separation."""
++    u, v = uniform(0.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, [(0.0, 39.0), (0.0, 41.0)], HOUR, 1)
++    spread = mpcalc.trajectory_spread(traj)
++    assert spread['spread'].metpy.magnitude == pytest.approx(
++        np.full(2, np.radians(1.0) * RADIUS), rel=1e-6)
++
++
++def test_spread_centre_sits_between_the_parcels():
++    """Test that spread centre sits between the parcels."""
++    u, v = uniform(0.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, [(-2.0, 40.0), (2.0, 40.0)], HOUR, 1)
++    spread = mpcalc.trajectory_spread(traj)
++    assert spread['longitude'].metpy.magnitude == pytest.approx(np.zeros(2), abs=1e-9)
++    assert spread['latitude'].metpy.magnitude[0] > 40.0
++
++
++def test_spread_of_one_parcel_is_zero():
++    """Test that spread of one parcel is zero."""
++    u, v = uniform(5.0, 5.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2)
++    spread = mpcalc.trajectory_spread(traj)
++    assert spread['spread'].metpy.magnitude == pytest.approx(np.zeros(3), abs=1e-6)
++
++
++def test_spread_ignores_terminated_parcels():
++    """Test that spread ignores terminated parcels."""
++    u, v = uniform(20.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, [(16.0, 40.0), (0.0, 40.0)],
++                                    np.timedelta64(2, 'h'), 4)
++    spread = mpcalc.trajectory_spread(traj)
++    assert spread['spread'].metpy.magnitude[-1] == pytest.approx(0.0, abs=1e-6)
++    assert spread['latitude'].metpy.magnitude[-1] == pytest.approx(40.0)
++
++
++def test_spread_is_missing_when_every_parcel_has_gone():
++    """Test that spread is missing when every parcel has gone."""
++    u, v = uniform(20.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (16.0, 40.0), np.timedelta64(2, 'h'), 4)
++    spread = mpcalc.trajectory_spread(traj)
++    assert np.isnan(spread['spread'].metpy.magnitude[-1])
++    assert np.isnan(spread['longitude'].metpy.magnitude[-1])
++
++
++def test_extension_continues_the_path():
++    """Test that extension continues the path."""
++    u, v = uniform(10.0, 0.0)
++    short = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2)
++    grown = mpcalc.extend_trajectory(short, u, v, 3)
++    whole = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 5)
++    assert positions(grown)[0] == pytest.approx(positions(whole)[0])
++
++
++def test_extension_renumbers_the_steps():
++    """Test that extension renumbers the steps."""
++    u, v = uniform(10.0, 0.0)
++    short = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2)
++    grown = mpcalc.extend_trajectory(short, u, v, 2)
++    assert grown['step'].values.tolist() == [0, 1, 2, 3, 4]
++    assert grown['time'].values[-1] == np.datetime64('2024-03-01T04')
++
++
++def test_extension_keeps_the_vertical():
++    """Test that extension keeps the vertical."""
++    u = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    w = build(lambda t, level, lat, lon: -2.0, levels=LEVELS, unit='Pa/s')
++    short = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 1, w=w)
++    grown = mpcalc.extend_trajectory(short, u, v, 2, w=w)
++    assert grown['vertical'].metpy.magnitude[0] == pytest.approx([900.0, 828.0, 756.0,
++                                                                  684.0])
++
++
++def test_extension_of_a_terminated_parcel_stays_missing():
++    """Test that extension of a terminated parcel stays missing."""
++    u, v = uniform(20.0, 0.0)
++    short = mpcalc.parcel_trajectory(u, v, (16.0, 40.0), np.timedelta64(2, 'h'), 3)
++    grown = mpcalc.extend_trajectory(short, u, v, 2)
++    assert np.isnan(positions(grown)[0][-3:]).all()
++
++
++def test_extension_may_use_another_field():
++    """Test that extension may use another field."""
++    u, v = uniform(10.0, 0.0)
++    later = np.array(['2024-03-01T01', '2024-03-01T12'], dtype='datetime64[ns]')
++    second_u = build(lambda t, lat, lon: 20.0, times=later)
++    second_v = build(lambda t, lat, lon: 0.0, times=later)
++    short = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 1)
++    grown = mpcalc.extend_trajectory(short, second_u, second_v, 1)
++    longitude, _ = positions(grown)
++    assert longitude[2] - longitude[1] == pytest.approx(zonal_degrees(20.0, 3600.0, 40.0))
++
++
++def test_track_follows_the_given_points():
++    """Test that track follows the given points."""
++    temperature = build(lambda t, lat, lon: lon, unit='degC')
++    stamps = np.array(['2024-03-01T00', '2024-03-01T01'], dtype='datetime64[ns]')
++    along = mpinterp.interpolate_to_track(temperature, [0.5, 1.5], [40.0, 42.0],
++                                          time=stamps)
++    assert along.dims == ('track',)
++    assert along.metpy.magnitude == pytest.approx([0.5, 1.5])
++
++
++def test_track_takes_the_nearest_point_when_asked():
++    """Test that track takes the nearest point when asked."""
++    temperature = build(lambda t, lat, lon: lon, unit='degC')
++    stamps = np.array(['2024-03-01T00', '2024-03-01T01'], dtype='datetime64[ns]')
++    along = mpinterp.interpolate_to_track(temperature, [0.4, 1.6], [40.0, 40.0],
++                                          time=stamps, method='nearest')
++    assert along.metpy.magnitude == pytest.approx([0.0, 2.0])
++
++
++def test_track_reads_a_dataset():
++    """Test that track reads a dataset."""
++    data = xr.Dataset({'first': steady(lambda lat, lon: lon, unit='degC'),
++                       'second': steady(lambda lat, lon: lat, unit='degC')})
++    along = mpinterp.interpolate_to_track(data, [1.0], [41.0])
++    assert along['first'].metpy.magnitude == pytest.approx([1.0])
++    assert along['second'].metpy.magnitude == pytest.approx([41.0])
++
++
++def test_track_reads_a_layered_field():
++    """Test that track reads a layered field."""
++    temperature = build(lambda t, level, lat, lon: np.log(level), levels=LEVELS,
++                        unit='kelvin')
++    stamps = np.array(['2024-03-01T00'], dtype='datetime64[ns]')
++    along = mpinterp.interpolate_to_track(temperature, [0.0], [40.0], time=stamps,
++                                          vertical=[900.0])
++    assert along.metpy.magnitude == pytest.approx([np.log(900.0)])
++
++
++def test_track_outside_the_field_is_missing():
++    """Test that track outside the field is missing."""
++    temperature = steady(lambda lat, lon: lon, unit='degC')
++    along = mpinterp.interpolate_to_track(temperature, [100.0], [40.0])
++    assert np.isnan(along.metpy.magnitude).all()
++
++
++def test_track_needs_times_for_a_changing_field():
++    """Test that track needs times for a changing field."""
++    temperature = build(lambda t, lat, lon: lon, unit='degC')
++    expect_error(lambda: mpinterp.interpolate_to_track(temperature, [0.0], [40.0]))
++
++
++def test_track_needs_levels_for_a_layered_field():
++    """Test that track needs levels for a layered field."""
++    temperature = steady(lambda level, lat, lon: level, levels=LEVELS, unit='kelvin')
++    expect_error(lambda: mpinterp.interpolate_to_track(temperature, [0.0], [40.0]))
++
++
++def test_track_rejects_an_unknown_method():
++    """Test that track rejects an unknown method."""
++    temperature = steady(lambda lat, lon: lon, unit='degC')
++    expect_error(lambda: mpinterp.interpolate_to_track(temperature, [0.0], [40.0],
++                                                       method='cubic'))
++
++
++def test_track_rejects_mismatched_positions():
++    """Test that track rejects mismatched positions."""
++    temperature = steady(lambda lat, lon: lon, unit='degC')
++    expect_error(lambda: mpinterp.interpolate_to_track(temperature, [0.0, 1.0], [40.0]))
++
++
++def test_count_must_be_positive():
++    """Test that count must be positive."""
++    u, v = uniform(5.0, 0.0)
++    expect_error(lambda: mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 0))
++
++
++def test_step_must_not_be_zero():
++    """Test that step must not be zero."""
++    u, v = uniform(5.0, 0.0)
++    expect_error(lambda: mpcalc.parcel_trajectory(u, v, (0.0, 40.0),
++                                                  np.timedelta64(0, 's'), 2))
++
++
++def test_components_must_share_a_grid():
++    """Test that components must share a grid."""
++    u, v = uniform(5.0, 0.0)
++    expect_error(lambda: mpcalc.parcel_trajectory(u, v.isel(longitude=slice(0, 5)),
++                                                  (0.0, 40.0), HOUR, 2))
++
++
++def test_start_points_must_match_the_field():
++    """Test that start points must match the field."""
++    u, v = uniform(5.0, 0.0)
++    expect_error(lambda: mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 2))
++
++
++def test_layered_field_needs_a_level_for_each_start():
++    """Test that layered field needs a level for each start."""
++    u = build(lambda t, level, lat, lon: 5.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    expect_error(lambda: mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2))
++
++
++def test_steady_field_needs_a_start_time():
++    """Test that steady field needs a start time."""
++    u = steady(lambda lat, lon: 5.0)
++    v = steady(lambda lat, lon: 0.0)
++    expect_error(lambda: mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2))
++
++
++def test_vertical_velocity_needs_a_vertical_coordinate():
++    """Test that vertical velocity needs a vertical coordinate."""
++    u, v = uniform(5.0, 0.0)
++    expect_error(lambda: mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2, w=v))
++
++
++def test_vertical_velocity_and_surface_cannot_be_combined():
++    """Test that vertical velocity and surface cannot be combined."""
++    u = build(lambda t, level, lat, lon: 5.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    w = build(lambda t, level, lat, lon: 0.0, levels=LEVELS, unit='Pa/s')
++    expect_error(lambda: mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 2,
++                                                  w=w, surface=u))
++
++
++def test_step_may_be_a_quantity():
++    """Test that step may be a quantity."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), units.Quantity(1, 'hour'), 1)
++    assert positions(traj)[0][1] == pytest.approx(zonal_degrees(10.0, 3600.0, 40.0))
++
++
++def test_wind_units_are_converted():
++    """Test that wind units are converted."""
++    u = build(lambda t, lat, lon: 10.0, unit='knots')
++    v = build(lambda t, lat, lon: 0.0, unit='knots')
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 1)
++    speed = units.Quantity(10.0, 'knots').m_as('m/s')
++    assert positions(traj)[0][1] == pytest.approx(zonal_degrees(speed, 3600.0, 40.0))
++
++
++def test_conserved_parcel_reads_the_wind_at_each_stage():
++    """Test that conserved parcel reads the wind at each stage."""
++    theta = build(lambda t, level, lat, lon: 300.0 + 15.0 * np.log(level / 1000.0)
++                  / np.log(0.85) + lon, levels=LEVELS, unit='kelvin')
++    u = build(lambda t, level, lat, lon: 20.0 - 0.01 * level, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), np.timedelta64(30, 'm'), 12,
++                                    surface=theta)
++
++    ratio = np.log(0.85)
++    start_fraction = np.log(0.9) / ratio
++
++    def speed(longitude):
++        fraction = start_fraction - longitude / 15.0
++        return 10.0 + 1.5 * fraction
++
++    def rhs(time, state):
++        return [np.degrees(speed(state[0]) / (RADIUS * np.cos(np.radians(40.0))))]
++
++    span = np.arange(13) * 1800.0
++    answer = solve_ivp(rhs, (0.0, span[-1]), [0.0], t_eval=span, rtol=1e-12, atol=1e-12,
++                       method='DOP853')
++    assert positions(traj)[0] == pytest.approx(answer.y[0], abs=1e-9)
++
++
++def test_optional_arguments_are_keyword_only():
++    """Test that optional arguments are keyword only."""
++    u, v = uniform(5.0, 0.0)
++    with pytest.raises(TypeError):
++        mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 1, None)
++
++
++def test_conserved_surface_needs_a_vertical_coordinate():
++    """Test that a conserved surface needs a vertical coordinate."""
++    u, v = uniform(5.0, 0.0)
++    expect_error(lambda: mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2, surface=u))
++
++
++def test_sampling_rejects_an_unknown_method():
++    """Test that sampling rejects an unknown method."""
++    u, v = uniform(5.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 1)
++    temperature = build(lambda t, lat, lon: lon, unit='degC')
++    expect_error(lambda: mpcalc.sample_trajectory(traj, temperature, method='cubic'))
++
++
++def test_conserved_surface_takes_the_first_bracketing_pair():
++    """Test that a conserved surface takes the first bracketing pair."""
++    profile = np.array([300.0, 310.0, 305.0, 315.0])
++    theta = build(lambda t, level, lat, lon: np.interp(level, LEVELS[::-1],
++                                                      profile[::-1]),
++                  levels=LEVELS, unit='kelvin')
++    u = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 2, surface=theta)
++    assert traj['vertical'].metpy.magnitude[0] == pytest.approx(np.full(3, 900.0), rel=1e-9)
++
++
++def test_extension_keeps_conserving_the_surface():
++    """Test that an extension keeps conserving the surface."""
++    theta = build(lambda t, level, lat, lon: 300.0 + (1000.0 - level) * 0.1 + lon,
++                  levels=LEVELS, unit='kelvin')
++    u = build(lambda t, level, lat, lon: 10.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    whole = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 4, surface=theta)
++    short = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 2, surface=theta)
++    grown = mpcalc.extend_trajectory(short, u, v, 2, surface=theta)
++    assert (grown['vertical'].metpy.magnitude
++            == pytest.approx(whole['vertical'].metpy.magnitude, rel=1e-9))
++    assert (positions(grown)[0] == pytest.approx(positions(whole)[0]))
++
++
++def test_every_optional_argument_is_keyword_only():
++    """Test that every optional argument is keyword only."""
++    u, v = uniform(5.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 1)
++    template = steady(lambda lat, lon: 0.0)
++    temperature = build(lambda t, lat, lon: lon, unit='degC')
++    weights = xr.DataArray(np.ones(traj['longitude'].shape), dims=('trajectory', 'step'))
++    for call in (lambda: mpcalc.sample_trajectory(traj, temperature, 'nearest'),
++                 lambda: mpcalc.trajectory_density(traj, template, weights),
++                 lambda: mpcalc.extend_trajectory(traj, u, v, 1, None),
++                 lambda: mpinterp.interpolate_to_track(temperature, [0.0], [40.0],
++                                                       TIMES[:1])):
++        with pytest.raises(TypeError):
++            call()
++
++
++def test_track_reads_across_the_seam_of_a_global_grid():
++    """Test that a track reads across the seam of a global grid."""
++    lons = np.arange(0.0, 360.0, 2.5)
++    temperature = steady(lambda lat, lon: lon, lons=lons, unit='degC')
++    along = mpinterp.interpolate_to_track(temperature, [358.75, -2.0], [40.0, 40.0])
++    assert along.metpy.magnitude == pytest.approx([0.5 * 357.5, 0.8 * 357.5])
++
++
++def test_a_sample_on_the_level_crosses_once_on_the_way_through():
++    """Test that a sample on the level crosses once on the way through."""
++    u, v = uniform(0.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2)
++    for values, heading in (([-1.0, 0.0, 1.0], 1.0), ([1.0, 0.0, -1.0], -1.0)):
++        series = xr.DataArray(units.Quantity(np.array([values]), 'kelvin'),
++                              dims=('trajectory', 'step'))
++        crossings = mpcalc.trajectory_crossings(traj, series, 0.0)
++        assert crossings.sizes['crossing'] == 1
++        assert crossings['direction'].values[0, 0] == pytest.approx(heading)
++
++
++def test_descending_longitude_grid_gives_the_same_path():
++    """Test that a descending longitude grid gives the same path."""
++
++    def wind(t, lat, lon):
++        return 6.0 + 0.2 * lon
++
++    rising = build(wind)
++    falling = build(wind, lons=LONS[::-1])
++    up = mpcalc.parcel_trajectory(rising, build(lambda t, lat, lon: 0.0), (1.0, 40.0), HOUR, 3)
++    down = mpcalc.parcel_trajectory(falling,
++                                    build(lambda t, lat, lon: 0.0, lons=LONS[::-1]),
++                                    (1.0, 40.0), HOUR, 3)
++    assert positions(down)[0] == pytest.approx(positions(up)[0])
++
++
++def test_descending_time_coordinate_gives_the_same_path():
++    """Test that a descending time coordinate gives the same path."""
++    span = (TIMES[1] - TIMES[0]) / np.timedelta64(1, 's')
++    rising = build(lambda t, lat, lon: 4.0 + 12.0 * t / span)
++    zero = build(lambda t, lat, lon: 0.0)
++    backwards = slice(None, None, -1)
++    up = mpcalc.parcel_trajectory(rising, zero, (0.0, 40.0), np.timedelta64(3, 'h'), 3,
++                                  start_time=TIMES[0])
++    down = mpcalc.parcel_trajectory(rising.isel(time=backwards), zero.isel(time=backwards),
++                                    (0.0, 40.0), np.timedelta64(3, 'h'), 3,
++                                    start_time=TIMES[0])
++    assert down['time'].values[0] == np.datetime64('2024-03-01T00')
++    assert positions(down)[0] == pytest.approx(positions(up)[0])
++
++
++def test_starting_at_the_pole_terminates_at_once():
++    """Test that starting at the pole terminates at once."""
++    lats = np.arange(80.0, 90.1, 2.0)
++    u = build(lambda t, lat, lon: 5.0, lats=lats)
++    v = build(lambda t, lat, lon: 0.0, lats=lats)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 90.0), HOUR, 3)
++    longitude, latitude = positions(traj)
++    assert latitude[0] == pytest.approx(90.0)
++    assert np.isnan(longitude[1:]).all()
++    assert np.isnan(latitude[1:]).all()
++
++
++def test_track_rejects_times_of_the_wrong_shape():
++    """Test that a track rejects times of the wrong shape."""
++    temperature = build(lambda t, lat, lon: lon, unit='degC')
++    expect_error(lambda: mpinterp.interpolate_to_track(temperature, [0.0, 1.0], [40.0, 41.0],
++                                                       time=TIMES[:1]))
++
++
++def test_track_rejects_levels_of_the_wrong_shape():
++    """Test that a track rejects levels of the wrong shape."""
++    temperature = steady(lambda level, lat, lon: level, levels=LEVELS, unit='kelvin')
++    expect_error(lambda: mpinterp.interpolate_to_track(temperature, [0.0, 1.0], [40.0, 41.0],
++                                                       vertical=[900.0]))
++
++
++def test_backward_extension_keeps_running_backward():
++    """Test that a backward extension keeps running backward."""
++    u, v = uniform(10.0, 0.0)
++    whole = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), -HOUR, 5)
++    short = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), -HOUR, 2)
++    grown = mpcalc.extend_trajectory(short, u, v, 3)
++    assert grown['step'].values.tolist() == [0, 1, 2, 3, 4, 5]
++    assert (grown['time'].values == whole['time'].values).all()
++    assert positions(grown)[0] == pytest.approx(positions(whole)[0])
++
++
++def test_density_ignores_an_unbounded_weight():
++    """Test that density ignores an unbounded weight."""
++    u, v = uniform(0.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2)
++    weights = xr.DataArray(units.Quantity(np.array([[2.0, np.inf, 4.0]]), 'dimensionless'),
++                           dims=('trajectory', 'step'))
++    grid = mpcalc.trajectory_density(traj, steady(lambda lat, lon: 0.0), weights=weights)
++    assert grid.metpy.magnitude.sum() == pytest.approx(2 * 3600.0)
++
++
++def test_extension_count_must_be_positive():
++    """Test that an extension count must be positive."""
++    u, v = uniform(5.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 1)
++    expect_error(lambda: mpcalc.extend_trajectory(traj, u, v, 0))
++
++
++def test_the_far_meridian_is_reported_as_minus_180():
++    """Test that the far meridian is reported as minus 180."""
++    lons = np.arange(0.0, 360.0, 2.5)
++    u = build(lambda t, lat, lon: 0.0, lons=lons)
++    v = build(lambda t, lat, lon: 0.0, lons=lons)
++    traj = mpcalc.parcel_trajectory(u, v, (180.0, 40.0), HOUR, 2)
++    assert positions(traj)[0] == pytest.approx(np.full(3, -180.0))
++
++
++def test_components_on_shifted_grids_do_not_share_one():
++    """Test that components on shifted grids do not share one."""
++    u = build(lambda t, lat, lon: 5.0)
++    v = build(lambda t, lat, lon: 0.0, lons=LONS + 0.5)
++    expect_error(lambda: mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2))
++
++
++def test_projected_path_through_a_varying_wind_matches_an_independent_integration():
++    """Test that a projected path through a varying wind matches an independent integration."""
++    from pyproj import Proj
++    template, zero = projected_grid()
++    projection = Proj(template.metpy.pyproj_crs)
++    origin = projection(0.0, 40.0)[0]
++    shaped = template.copy()
++    shaped.data = np.broadcast_to(
++        10.0 + (template['x'].values[None, None, :] - origin) / 1e5, template.shape).copy()
++
++    seconds = 300.0
++    count = 12
++    traj = mpcalc.parcel_trajectory(shaped, zero, (0.0, 40.0),
++                                    np.timedelta64(int(seconds), 's'), count)
++
++    def rhs(time, state):
++        speed = 10.0 + (projection(state[0], 40.0)[0] - origin) / 1e5
++        return [np.degrees(speed / (RADIUS * np.cos(np.radians(40.0))))]
++
++    span = np.arange(count + 1) * seconds
++    answer = solve_ivp(rhs, (0.0, span[-1]), [0.0], t_eval=span, rtol=1e-12, atol=1e-12,
++                       method='DOP853')
++    assert positions(traj)[0] == pytest.approx(answer.y[0], abs=1e-8)
++    assert positions(traj)[1] == pytest.approx(np.full(count + 1, 40.0))
++
++
++def test_a_plateau_on_the_level_crosses_once():
++    """Test that a plateau on the level crosses once."""
++    u, v = uniform(0.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 3)
++    for values, heading in (([-1.0, 0.0, 0.0, 1.0], 1.0), ([1.0, 0.0, 0.0, -1.0], -1.0)):
++        series = xr.DataArray(units.Quantity(np.array([values]), 'kelvin'),
++                              dims=('trajectory', 'step'))
++        crossings = mpcalc.trajectory_crossings(traj, series, 0.0)
++        assert crossings.sizes['crossing'] == 1
++        assert crossings['direction'].values[0, 0] == pytest.approx(heading)
++
++
++def test_nearest_sampling_also_snaps_time_and_level():
++    """Test that nearest sampling also snaps time and level."""
++    u = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 880.0), np.timedelta64(2, 'h'), 1)
++    marked = build(lambda t, level, lat, lon: t / 3600.0 + level, levels=LEVELS,
++                   unit='kelvin')
++    along = mpcalc.sample_trajectory(traj, marked, method='nearest')
++    assert along.metpy.magnitude[0] == pytest.approx([850.0, 850.0])
++
++
++def test_a_negative_count_is_rejected():
++    """Test that a negative count is rejected."""
++    u, v = uniform(5.0, 0.0)
++    expect_error(lambda: mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, -2))
++
++
++def test_a_negative_extension_count_is_rejected():
++    """Test that a negative extension count is rejected."""
++    u, v = uniform(5.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 1)
++    expect_error(lambda: mpcalc.extend_trajectory(traj, u, v, -1))
++
++
++def test_step_may_be_a_python_timedelta():
++    """Test that step may be a python timedelta."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), timedelta(hours=1), 1)
++    assert positions(traj)[0][1] == pytest.approx(zonal_degrees(10.0, 3600.0, 40.0))
++
++
++def test_a_start_beyond_180_is_matched_into_the_grid():
++    """Test that a start beyond 180 is matched into the grid."""
++    u = build(lambda t, lat, lon: 4.0 + 0.5 * lon)
++    v = build(lambda t, lat, lon: 0.0)
++    far = mpcalc.parcel_trajectory(u, v, (350.0, 40.0), HOUR, 3)
++    near = mpcalc.parcel_trajectory(u, v, (-10.0, 40.0), HOUR, 3)
++    assert positions(far)[0] == pytest.approx(positions(near)[0])
++
++
++def test_spread_centre_can_sit_on_the_antimeridian():
++    """Test that a spread centre can sit on the antimeridian."""
++    lons = np.arange(0.0, 360.0, 2.5)
++    u = build(lambda t, lat, lon: 0.0, lons=lons)
++    v = build(lambda t, lat, lon: 0.0, lons=lons)
++    traj = mpcalc.parcel_trajectory(u, v, [(179.0, 40.0), (-179.0, 40.0)], HOUR, 1)
++    spread = mpcalc.trajectory_spread(traj)
++    assert spread['longitude'].metpy.magnitude == pytest.approx(np.full(2, -180.0))
++
++
++def test_nearest_sampling_does_not_reach_beyond_the_field():
++    """Test that nearest sampling does not reach beyond the field."""
++    temperature = steady(lambda lat, lon: lon, unit='degC')
++    along = mpinterp.interpolate_to_track(temperature, [40.0], [40.0], method='nearest')
++    assert np.isnan(along.metpy.magnitude).all()
++
++
++def test_vertical_velocity_is_read_at_every_stage():
++    """Test that vertical velocity is read at every stage."""
++    span = (TIMES[1] - TIMES[0]) / np.timedelta64(1, 's')
++    u = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    w = build(lambda t, level, lat, lon: -2.0 * t / span, levels=LEVELS, unit='Pa/s')
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), np.timedelta64(3, 'h'), 1, w=w)
++    seconds = 3 * 3600.0
++    average = -2.0 * (seconds / 2.0) / span
++    assert traj['vertical'].metpy.magnitude[0, 1] == pytest.approx(
++        900.0 + units.Quantity(average * seconds, 'Pa').m_as('hPa'))
++
++
++def test_conserved_surface_is_solved_at_each_stage_time():
++    """Test that a conserved surface is solved at each stage time."""
++    span = (TIMES[1] - TIMES[0]) / np.timedelta64(1, 's')
++    ratio = np.log(0.85)
++    theta = build(lambda t, level, lat, lon: 300.0 + 15.0 * np.log(level / 1000.0) / ratio
++                  + 3.0 * t / span, levels=LEVELS, unit='kelvin')
++    u = build(lambda t, level, lat, lon: 20.0 - 0.01 * level, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    seconds = 1800.0
++    count = 12
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), np.timedelta64(1800, 's'),
++                                    count, surface=theta)
++
++    start_fraction = np.log(0.9) / ratio
++
++    def fraction_at(time):
++        return start_fraction - 0.2 * time / span
++
++    def rhs(time, state):
++        speed = 10.0 + 1.5 * fraction_at(time)
++        return [np.degrees(speed / (RADIUS * np.cos(np.radians(40.0))))]
++
++    stamps = np.arange(count + 1) * seconds
++    answer = solve_ivp(rhs, (0.0, stamps[-1]), [0.0], t_eval=stamps, rtol=1e-12, atol=1e-12,
++                       method='DOP853')
++    assert positions(traj)[0] == pytest.approx(answer.y[0], abs=1e-9)
++    assert traj['vertical'].metpy.magnitude[0] == pytest.approx(
++        1000.0 * np.exp(fraction_at(stamps) * ratio), rel=1e-9)
++
++
++def test_descending_projected_axes_give_the_same_path():
++    """Test that descending projected axes give the same path."""
++    from pyproj import Proj
++    template, zero = projected_grid()
++    origin = Proj(template.metpy.pyproj_crs)(0.0, 40.0)[0]
++    shaped = template.copy()
++    shaped.data = np.broadcast_to(
++        10.0 + (template['x'].values[None, None, :] - origin) / 1e5, template.shape).copy()
++    backwards = {'x': slice(None, None, -1), 'y': slice(None, None, -1)}
++    step = np.timedelta64(600, 's')
++    rising = mpcalc.parcel_trajectory(shaped, zero, (0.0, 40.0), step, 6)
++    falling = mpcalc.parcel_trajectory(shaped.isel(**backwards), zero.isel(**backwards),
++                                       (0.0, 40.0), step, 6)
++    assert positions(falling)[0] == pytest.approx(positions(rising)[0])
++    assert positions(falling)[1] == pytest.approx(positions(rising)[1])
++
++
++def test_density_counts_only_the_samples_a_parcel_reached():
++    """Test that density counts only the samples a parcel reached."""
++    u, v = uniform(20.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (16.0, 40.0), np.timedelta64(2, 'h'), 4)
++    grid = mpcalc.trajectory_density(traj, steady(lambda lat, lon: 0.0))
++    assert np.isnan(positions(traj)[0][3:]).all()
++    assert grid.metpy.magnitude.sum() == pytest.approx(2 * 7200.0)
++
++
++def test_crossings_report_positions_the_way_the_trajectory_does():
++    """Test that crossings report positions the way the trajectory does."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 3)
++    temperature = build(lambda t, lat, lon: lon, unit='degC')
++    crossings = mpcalc.trajectory_crossings(traj, mpcalc.sample_trajectory(traj, temperature),
++                                            0.2)
++    assert crossings['longitude'].metpy.units == units('degrees_east')
++    assert crossings['latitude'].metpy.units == units('degrees_north')
++    assert crossings['time'].dtype.kind == 'M'
++    assert crossings['direction'].values[0, 0] == pytest.approx(1.0)
++
++
++def test_track_reads_a_dataset_of_mixed_fields():
++    """Test that a track reads a dataset of mixed fields."""
++    data = xr.Dataset({'surface': steady(lambda lat, lon: lon, unit='degC'),
++                       'aloft': build(lambda t, level, lat, lon: np.log(level) + lon,
++                                      levels=LEVELS, unit='kelvin')})
++    stamps = np.array(['2024-03-01T00', '2024-03-01T03'], dtype='datetime64[ns]')
++    along = mpinterp.interpolate_to_track(data, [1.0, 2.0], [40.0, 41.0], time=stamps,
++                                          vertical=[900.0, 700.0])
++    assert along['surface'].metpy.magnitude == pytest.approx([1.0, 2.0])
++    assert along['aloft'].metpy.magnitude == pytest.approx([np.log(900.0) + 1.0,
++                                                            np.log(700.0) + 2.0])
++
++
++def test_a_track_reads_descending_projected_axes():
++    """Test that a track reads descending projected axes."""
++    from pyproj import Proj
++    template, _ = projected_grid()
++    origin = Proj(template.metpy.pyproj_crs)(0.0, 40.0)[0]
++    shaped = template.copy()
++    shaped.data = np.broadcast_to(
++        (template['x'].values[None, None, :] - origin) / 1e5, template.shape).copy()
++    backwards = {'x': slice(None, None, -1), 'y': slice(None, None, -1)}
++    rising = mpinterp.interpolate_to_track(shaped, [2.0], [41.0], time=TIMES[:1])
++    falling = mpinterp.interpolate_to_track(shaped.isel(**backwards), [2.0], [41.0],
++                                            time=TIMES[:1])
++    assert falling.metpy.magnitude == pytest.approx(rising.metpy.magnitude)
++
++
++def test_a_trajectory_samples_a_dataset_of_mixed_fields():
++    """Test that a trajectory samples a dataset of mixed fields."""
++    u = build(lambda t, level, lat, lon: 10.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 2)
++    data = xr.Dataset({'surface': steady(lambda lat, lon: lon, unit='degC'),
++                       'aloft': build(lambda t, level, lat, lon: np.log(level) + lon,
++                                      levels=LEVELS, unit='kelvin')})
++    along = mpcalc.sample_trajectory(traj, data)
++    longitude = positions(traj)[0]
++    assert along['surface'].metpy.magnitude[0] == pytest.approx(longitude)
++    assert along['aloft'].metpy.magnitude[0] == pytest.approx(np.log(900.0) + longitude)
++
++
++def test_spread_keeps_its_shape_when_every_parcel_has_gone():
++    """Test that spread keeps its shape when every parcel has gone."""
++    u, v = uniform(20.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (16.0, 40.0), np.timedelta64(2, 'h'), 4)
++    spread = mpcalc.trajectory_spread(traj)
++    assert spread.sizes == {'step': 5}
++    assert spread['step'].values.tolist() == [0, 1, 2, 3, 4]
++    assert spread['spread'].metpy.units == units('meter')
++    assert np.isnan(spread['spread'].metpy.magnitude[-1])
++
++
++def test_default_start_time_is_chronological_on_a_descending_axis():
++    """Test that the default start time is chronological on a descending axis."""
++    backwards = slice(None, None, -1)
++    u = build(lambda t, lat, lon: 10.0).isel(time=backwards)
++    v = build(lambda t, lat, lon: 0.0).isel(time=backwards)
++    forward = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 2)
++    back = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), -HOUR, 2)
++    assert forward['time'].values[0] == np.datetime64('2024-03-01T00')
++    assert back['time'].values[0] == np.datetime64('2024-03-01T12')
++    assert positions(forward)[0] == pytest.approx(
++        zonal_degrees(10.0, 3600.0, 40.0) * np.arange(3))
++
++
++def test_a_track_of_more_than_one_dimension_is_flattened():
++    """Test that a track of more than one dimension is flattened."""
++    temperature = steady(lambda lat, lon: lon, unit='degC')
++    along = mpinterp.interpolate_to_track(temperature, [[0.0, 1.0], [2.0, 3.0]],
++                                          [[40.0, 41.0], [42.0, 43.0]])
++    assert along.dims == ('track',)
++    assert along.metpy.magnitude == pytest.approx([0.0, 1.0, 2.0, 3.0])
++
++
++def test_sampling_a_narrower_field_misses_only_where_it_ends():
++    """Test that sampling a narrower field misses only where it ends."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 3)
++    narrow = build(lambda t, lat, lon: lon, lons=np.arange(-20.0, 0.1, 2.0), unit='degC')
++    along = mpcalc.sample_trajectory(traj, narrow).metpy.magnitude[0]
++    assert np.isfinite(positions(traj)[0]).all()
++    assert along[0] == pytest.approx(0.0)
++    assert np.isnan(along[1:]).all()
++
++
++def test_a_moving_parcel_keeps_the_first_bracketing_pair():
++    """Test that a moving parcel keeps the first bracketing pair."""
++    profile = np.array([300.0, 310.0, 305.0, 315.0])
++    theta = build(lambda t, level, lat, lon: np.interp(level, LEVELS[::-1], profile[::-1])
++                  + lon, levels=LEVELS, unit='kelvin')
++    u = build(lambda t, level, lat, lon: 10.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 900.0), HOUR, 3, surface=theta)
++
++    ratio = np.log(0.85)
++    longitude = positions(traj)[0]
++    fraction = np.log(0.9) / ratio - longitude / 10.0
++    assert traj['vertical'].metpy.magnitude[0] == pytest.approx(1000.0 * np.exp(fraction
++                                                                                * ratio),
++                                                                rel=1e-9)
++    assert (traj['vertical'].metpy.magnitude[0] > 850.0).all()
++
++
++def test_a_start_time_outside_the_field_terminates_at_once():
++    """Test that a start time outside the field terminates at once."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 3,
++                                    start_time=np.datetime64('2024-02-28T00'))
++    longitude, latitude = positions(traj)
++    assert longitude[0] == pytest.approx(0.0)
++    assert latitude[0] == pytest.approx(40.0)
++    assert np.isnan(longitude[1:]).all()
++
++
++def test_a_track_flattens_every_quantity_the_same_way():
++    """Test that a track flattens every quantity the same way."""
++    marked = build(lambda t, level, lat, lon: t / 3600.0 + level + lon, levels=LEVELS,
++                   unit='kelvin')
++    stamps = np.array([['2024-03-01T00', '2024-03-01T01'],
++                       ['2024-03-01T02', '2024-03-01T03']], dtype='datetime64[ns]')
++    along = mpinterp.interpolate_to_track(marked, [[0.0, 2.0], [4.0, 6.0]],
++                                          [[40.0, 40.0], [40.0, 40.0]], time=stamps,
++                                          vertical=[[1000.0, 850.0], [700.0, 500.0]])
++    assert along.dims == ('track',)
++    assert along.metpy.magnitude == pytest.approx([1000.0, 851.0 + 2.0,
++                                                   702.0 + 4.0, 503.0 + 6.0])
++
++
++def test_a_descending_global_grid_still_crosses_the_seam():
++    """Test that a descending global grid still crosses the seam."""
++    lons = np.arange(0.0, 360.0, 2.5)
++    rising = build(lambda t, lat, lon: -30.0 + 0.01 * lon, lons=lons)
++    zero = build(lambda t, lat, lon: 0.0, lons=lons)
++    backwards = slice(None, None, -1)
++    up = mpcalc.parcel_trajectory(rising, zero, (1.0, 40.0), HOUR, 4)
++    down = mpcalc.parcel_trajectory(rising.isel(longitude=backwards),
++                                    zero.isel(longitude=backwards), (1.0, 40.0), HOUR, 4)
++    assert np.isfinite(positions(up)[0]).all()
++    assert positions(up)[0][-1] < 0.0
++    assert positions(down)[0] == pytest.approx(positions(up)[0])
++
++
++def test_a_conserved_surface_on_heights_is_found_linearly():
++    """Test that a conserved surface on heights is found linearly."""
++    heights = np.array([0.0, 1000.0, 2000.0, 3000.0])
++    layers = {'levels': heights, 'level_units': 'meter', 'level_name': 'height'}
++    theta = build(lambda t, level, lat, lon: 300.0 + 0.01 * level + lon, unit='kelvin',
++                  **layers)
++    u = build(lambda t, level, lat, lon: 10.0, **layers)
++    v = build(lambda t, level, lat, lon: 0.0, **layers)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 1500.0), HOUR, 3, surface=theta)
++    assert traj['vertical'].metpy.magnitude[0] == pytest.approx(
++        (15.0 - positions(traj)[0]) / 0.01, rel=1e-9)
++
++
++def test_vertical_velocity_may_be_a_speed_on_heights():
++    """Test that a vertical velocity may be a speed on heights."""
++    heights = np.array([0.0, 1000.0, 2000.0, 3000.0])
++    layers = {'levels': heights, 'level_units': 'meter', 'level_name': 'height'}
++    u = build(lambda t, level, lat, lon: 0.0, **layers)
++    v = build(lambda t, level, lat, lon: 0.0, **layers)
++    rising = build(lambda t, level, lat, lon: 0.2, unit='m/s', **layers)
++    faster = build(lambda t, level, lat, lon: 0.72, unit='km/hour', **layers)
++    climbed = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 500.0), HOUR, 2, w=rising)
++    converted = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 500.0), HOUR, 2, w=faster)
++    assert climbed['vertical'].metpy.magnitude[0] == pytest.approx([500.0, 1220.0, 1940.0])
++    assert climbed['vertical'].metpy.units == units('meter')
++    assert (converted['vertical'].metpy.magnitude
++            == pytest.approx(climbed['vertical'].metpy.magnitude))
++
++
++
++def test_density_fills_a_projected_template():
++    """Test that density fills a projected template."""
++    from pyproj import Proj
++    template, _ = projected_grid()
++    u, v = uniform(0.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (1.0, 41.0), HOUR, 2)
++    grid = mpcalc.trajectory_density(traj, template.isel(time=0))
++    spot = Proj(template.metpy.pyproj_crs)(1.0, 41.0)
++    assert grid.dims == ('y', 'x')
++    assert grid.metpy.magnitude.sum() == pytest.approx(7200.0)
++    assert grid.sel(y=spot[1], x=spot[0], method='nearest').metpy.magnitude == \
++        pytest.approx(7200.0)
++
++
++def test_a_crossing_level_may_use_another_pressure_unit():
++    """Test that a crossing level may use another pressure unit."""
++    u = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    v = build(lambda t, level, lat, lon: 0.0, levels=LEVELS)
++    w = build(lambda t, level, lat, lon: 0.5, levels=LEVELS, unit='Pa/s')
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0, 800.0), HOUR, 2, w=w)
++    in_pascals = mpcalc.trajectory_crossings(traj, traj['vertical'],
++                                             units.Quantity(80900.0, 'Pa'))
++    in_hectopascals = mpcalc.trajectory_crossings(traj, traj['vertical'],
++                                                  units.Quantity(809.0, 'hPa'))
++    assert in_pascals['time'].values[0, 0] == np.datetime64('2024-03-01T00:30:00')
++    assert (in_pascals['time'].values == in_hectopascals['time'].values).all()
++
++
++def test_nearest_sampling_stops_at_the_edge_of_a_narrower_field():
++    """Test that nearest sampling stops at the edge of a narrower field."""
++    u, v = uniform(10.0, 0.0)
++    traj = mpcalc.parcel_trajectory(u, v, (0.0, 40.0), HOUR, 3)
++    narrow = build(lambda t, lat, lon: lon, lons=np.arange(-20.0, 0.1, 2.0), unit='degC')
++    along = mpcalc.sample_trajectory(traj, narrow, method='nearest').metpy.magnitude[0]
++    assert np.isfinite(positions(traj)[0]).all()
++    assert along[0] == pytest.approx(0.0)
++    assert np.isnan(along[1:]).all()
++
++
++def test_length_across_the_seam_uses_the_short_arc():
++    """Test that length across the seam uses the short arc."""
++    lons = np.arange(0.0, 360.0, 2.5)
++    u = build(lambda t, lat, lon: 20.0, lons=lons)
++    v = build(lambda t, lat, lon: 0.0, lons=lons)
++    across = mpcalc.parcel_trajectory(u, v, (179.0, 40.0), HOUR, 3)
++    inside = mpcalc.parcel_trajectory(u, v, (10.0, 40.0), HOUR, 3)
++    assert positions(across)[0][-1] < 0.0
++    assert (mpcalc.trajectory_length(across).metpy.magnitude
++            == pytest.approx(mpcalc.trajectory_length(inside).metpy.magnitude))
++
++
++def test_a_crossing_on_the_seam_is_wrapped():
++    """Test that a crossing on the seam is wrapped."""
++    lons = np.arange(0.0, 360.0, 2.5)
++    u = build(lambda t, lat, lon: 20.0, lons=lons)
++    v = build(lambda t, lat, lon: 0.0, lons=lons)
++    traj = mpcalc.parcel_trajectory(u, v, (179.5, 40.0), HOUR, 2)
++    series = xr.DataArray(units.Quantity(np.array([[0.0, 1.0, 2.0]]), 'kelvin'),
++                          dims=('trajectory', 'step'))
++    crossings = mpcalc.trajectory_crossings(traj, series, 0.5)
++    longitude = positions(traj)[0]
++    span = (longitude[1] - longitude[0] + 180.0) % 360.0 - 180.0
++    expected = (longitude[0] + 0.5 * span + 180.0) % 360.0 - 180.0
++    assert longitude[0] > 0.0 and longitude[1] < 0.0
++    assert crossings['longitude'].metpy.magnitude[0, 0] == pytest.approx(expected)
++    assert -180.0 <= crossings['longitude'].metpy.magnitude[0, 0] < 180.0

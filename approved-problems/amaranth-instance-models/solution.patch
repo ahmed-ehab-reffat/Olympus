@@ -1,0 +1,822 @@
+diff --git a/amaranth/sim/__init__.py b/amaranth/sim/__init__.py
+index fa7cc13..b8a6e69 100644
+--- a/amaranth/sim/__init__.py
++++ b/amaranth/sim/__init__.py
+@@ -1,12 +1,13 @@
+ from .core import Simulator
+ from ._async import DomainReset, BrokenTrigger, SimulatorContext, TickTrigger, TriggerCombination
++from ._instance import InstanceModel, SubmoduleModel
+ from ._pycoro import Settle, Delay, Tick, Passive, Active
+ from ..hdl import Period
+ 
+ 
+ __all__ = [
+     "DomainReset", "BrokenTrigger",
+-    "SimulatorContext", "Simulator", "TickTrigger", "TriggerCombination",
++    "SimulatorContext", "Simulator", "TickTrigger", "TriggerCombination", "InstanceModel", "SubmoduleModel",
+     "Period",
+     # deprecated
+     "Settle", "Delay", "Tick", "Passive", "Active",
+diff --git a/amaranth/sim/_async.py b/amaranth/sim/_async.py
+index 3bf7021..0418771 100644
+--- a/amaranth/sim/_async.py
++++ b/amaranth/sim/_async.py
+@@ -14,9 +14,10 @@ from ._base import BaseProcess, BaseEngine
+ 
+ __all__ = [
+     "DomainReset", "BrokenTrigger",
+-    "SampleTrigger", "ChangedTrigger", "EdgeTrigger", "DelayTrigger",
++    "SampleTrigger", "ChangedTrigger", "ValueChangedTrigger", "EdgeTrigger", "DelayTrigger",
+     "TriggerCombination", "TickTrigger",
+-    "SimulatorContext", "ProcessContext", "TestbenchContext", "AsyncProcess",
++    "SimulatorContext", "ProcessContext", "TestbenchContext", "InstanceModelContext",
++    "AsyncProcess",
+ ]
+ 
+ 
+@@ -51,6 +52,17 @@ class ChangedTrigger:
+         return self.signal
+ 
+ 
++class ValueChangedTrigger:
++    def __init__(self, value):
++        cast_value = Value.cast(value)
++        if isinstance(value, ValueCastable):
++            self.shape = value.shape()
++        else:
++            self.shape = cast_value.shape()
++        self.value = cast_value
++        self.signals = tuple(cast_value._rhs_signals())
++
++
+ class EdgeTrigger:
+     def __init__(self, signal, polarity):
+         cast_signal = Value.cast(signal)
+@@ -748,10 +760,58 @@ class TestbenchContext(SimulatorContext):
+         self._engine.step_design()
+ 
+ 
++class InstanceModelContext(SimulatorContext):
++    def __init__(self, design, engine: BaseEngine, process: BaseProcess, instance_model):
++        super().__init__(design, engine, process)
++        self._instance_model = instance_model
++
++    @typing.overload
++    def get(self, expr: Value) -> int: ... # :nocov:
++
++    @typing.overload
++    def get(self, expr: ValueCastable) -> typing.Any: ... # :nocov:
++
++    def get(self, expr):
++        value = self._engine.get_value(expr)
++        if isinstance(expr, ValueCastable):
++            shape = expr.shape()
++            if isinstance(shape, ShapeCastable):
++                return shape.from_bits(value)
++        return value
++
++    @typing.overload
++    def set(self, expr: Value, value: int) -> None: ... # :nocov:
++
++    @typing.overload
++    def set(self, expr: ValueCastable, value: typing.Any) -> None: ... # :nocov:
++
++    def set(self, expr, value):
++        if isinstance(expr, ValueCastable):
++            shape = expr.shape()
++            if isinstance(shape, ShapeCastable):
++                value = shape.const(value)
++        self._instance_model._check_driven(expr)
++        value = Const.cast(value).value
++        self._engine.set_value(expr, value)
++
++    def changed(self, *exprs) -> TriggerCombination:
++        triggers = []
++        for expr in exprs:
++            if isinstance(Value.cast(expr), Signal):
++                triggers.append(ChangedTrigger(expr))
++            else:
++                triggers.append(ValueChangedTrigger(expr))
++        return TriggerCombination(self._engine, self._process, triggers=tuple(triggers))
++
++
+ class AsyncProcess(BaseProcess):
+-    def __init__(self, design, engine, constructor, *, testbench, background):
++    def __init__(self, design, engine, constructor, *, testbench, background,
++                 instance_model=None):
+         self.constructor = constructor
+-        if testbench:
++        self.instance_model = instance_model
++        if instance_model is not None:
++            self.context = InstanceModelContext(design, engine, self, instance_model)
++        elif testbench:
+             self.context = TestbenchContext(design, engine, self)
+         else:
+             self.context = ProcessContext(design, engine, self)
+@@ -763,10 +823,17 @@ class AsyncProcess(BaseProcess):
+         self.runnable = True
+         self.critical = not self.background
+         self.waits_on = None
+-        self.coroutine = self.constructor(self.context)
++        if self.instance_model is not None:
++            self.coroutine = None
++            self.started = False
++        else:
++            self.coroutine = self.constructor(self.context)
+         self.first_await = True
+ 
+     def run(self):
++        if self.instance_model is not None and not self.started:
++            self.started = True
++            self.coroutine = self.constructor(self.context, self.instance_model)
+         try:
+             self.waits_on = self.coroutine.send(None)
+             # Special case to make combination logic replacement work correctly: ensure that
+diff --git a/amaranth/sim/_base.py b/amaranth/sim/_base.py
+index 7e58112..8475ee5 100644
+--- a/amaranth/sim/_base.py
++++ b/amaranth/sim/_base.py
+@@ -82,6 +82,18 @@ class BaseEngine:
+     def add_async_testbench(self, simulator, process, *, background):
+         raise NotImplementedError # :nocov:
+ 
++    def add_instance_model(self, simulator, constructor, *, type, path):
++        raise NotImplementedError # :nocov:
++
++    def add_submodule_model(self, simulator, constructor, *, path):
++        raise NotImplementedError # :nocov:
++
++    def live_instances(self):
++        raise NotImplementedError # :nocov:
++
++    def live_submodules(self):
++        raise NotImplementedError # :nocov:
++
+     def add_trigger_combination(self, combination, *, oneshot):
+         raise NotImplementedError # :nocov:
+ 
+diff --git a/amaranth/sim/_instance.py b/amaranth/sim/_instance.py
+new file mode 100644
+index 0000000..c6063d9
+--- /dev/null
++++ b/amaranth/sim/_instance.py
+@@ -0,0 +1,327 @@
++from collections.abc import Mapping
++
++from ..hdl._ast import Value, IOValue, Const, Operator, Slice, Concat
++from ..hdl._ir import Instance, DriverConflict
++from ..hdl._xfrm import LHSMaskCollector
++
++
++__all__ = ["InstanceModel", "SubmoduleModel"]
++
++
++class _PortMap(Mapping):
++    def __init__(self, ports):
++        self._ports = dict(ports)
++
++    def __getitem__(self, name):
++        return self._ports[name]
++
++    def __iter__(self):
++        return iter(self._ports)
++
++    def __len__(self):
++        return len(self._ports)
++
++    def __repr__(self):
++        ports = ", ".join(f"{name}={value!r}" for name, value in self._ports.items())
++        return f"({ports})"
++
++
++def _assignable(value, collector, mask):
++    """Feed the parts of ``value`` a model can drive to ``collector``, and return the mask of its
++    bits that are drivable at all.
++
++    A port may be connected to something carrying bits nothing can assign, such as a constant, on
++    its own or inside a concatenation. Those bits belong to no target, so they grant no ownership
++    and writing them conflicts like writing any other foreign bit.
++    """
++    if isinstance(value, (Const, IOValue)):
++        return 0
++    mask &= (1 << len(value)) - 1
++    if isinstance(value, Operator) and value.operator in ("s", "u"):
++        return _assignable(value.operands[0], collector, mask)
++    if isinstance(value, Slice):
++        inner = (mask << value.start) & ((1 << value.stop) - (1 << value.start))
++        return (_assignable(value.value, collector, inner) >> value.start) & mask
++    if isinstance(value, Concat):
++        drivable, offset = 0, 0
++        for part in value.parts:
++            part_mask = (mask >> offset) & ((1 << len(part)) - 1)
++            drivable |= _assignable(part, collector, part_mask) << offset
++            offset += len(part)
++        return drivable
++    collector.visit_value(value, mask)
++    return mask
++
++
++def _driven_masks(values):
++    collector = LHSMaskCollector()
++    for value in values:
++        _assignable(Value.cast(value), collector, ~0)
++    return collector.lhs
++
++
++class _Model:
++    def __init__(self, path, inputs, outputs):
++        self.path = path
++        self.inputs = _PortMap(inputs)
++        self.outputs = _PortMap(outputs)
++        self._driven = _driven_masks(outputs.values())
++
++    def _check_driven(self, expr):
++        value = Value.cast(expr)
++        collector = LHSMaskCollector()
++        if _assignable(value, collector, ~0) != (1 << len(value)) - 1:
++            raise DriverConflict(
++                f"Model of {self.path!r} cannot drive {value!r} because part of it is not "
++                f"connected to anything the model replaces drives")
++        for signal, mask in collector.lhs.items():
++            if mask & ~self._driven.get(signal, 0):
++                raise DriverConflict(
++                    f"Model of {self.path!r} cannot drive {signal!r} because it is not connected "
++                    f"to an output of what the model replaces")
++
++
++class InstanceModel(_Model):
++    """InstanceModel(...)
++
++    Handle of an instance of an external module that is replaced with a simulation model.
++
++    Passed as the second argument to the constructor function of a model added with
++    :meth:`Simulator.add_instance_model <amaranth.sim.Simulator.add_instance_model>`, once per
++    instance the model is attached to.
++
++    Attributes
++    ----------
++    type : :class:`str`
++        Type of the instance.
++    path : :class:`str`
++        Path of the instance within the hierarchy of the simulated design, with the components
++        separated by dots.
++    parameters : :class:`dict`
++        Parameters of the instance, keyed by name without the :py:`p_` prefix.
++    attributes : :class:`dict`
++        Attributes of the instance, keyed by name without the :py:`a_` prefix.
++    inputs : :class:`~collections.abc.Mapping` of :class:`str` to :class:`~amaranth.hdl.Value`
++        Values connected to the input ports of the instance, keyed by name without the :py:`i_`
++        prefix.
++    outputs : :class:`~collections.abc.Mapping` of :class:`str` to :class:`~amaranth.hdl.Value`
++        Values connected to the output ports of the instance, keyed by name without the :py:`o_`
++        prefix.
++    """
++    def __init__(self, fragment, path):
++        inputs, outputs = {}, {}
++        for name, (value, kind) in fragment.ports.items():
++            if isinstance(value, IOValue):
++                continue
++            if kind == "i":
++                inputs[name] = value
++            elif kind == "o":
++                outputs[name] = value
++        super().__init__(path, inputs, outputs)
++        self.type = fragment.type
++        self.parameters = dict(fragment.parameters)
++        self.attributes = dict(fragment.attrs)
++
++    def __repr__(self):
++        return f"<amaranth.sim.InstanceModel {self.type!r} at {self.path!r}>"
++
++
++class SubmoduleModel(_Model):
++    """SubmoduleModel(...)
++
++    Handle of a submodule that is replaced with a simulation model.
++
++    Passed as the second argument to the constructor function of a model added with
++    :meth:`Simulator.add_submodule_model <amaranth.sim.Simulator.add_submodule_model>`.
++
++    Attributes
++    ----------
++    path : :class:`str`
++        Path of the submodule within the hierarchy of the simulated design, with the components
++        separated by dots.
++    inputs : :class:`~collections.abc.Mapping` of :class:`str` to :class:`~amaranth.hdl.Value`
++        Values of the members of the submodule's signature that flow into it, keyed by the path of
++        the member with the components separated by dots.
++    outputs : :class:`~collections.abc.Mapping` of :class:`str` to :class:`~amaranth.hdl.Value`
++        Values of the members of the submodule's signature that flow out of it, keyed by the path
++        of the member with the components separated by dots.
++    """
++    def __init__(self, component, path):
++        from ..lib.wiring import Out
++        inputs, outputs = {}, {}
++        for member_path, member, value in component.signature.flatten(component):
++            name = ".".join(str(item) for item in member_path)
++            if member.flow is Out:
++                outputs[name] = value
++            else:
++                inputs[name] = value
++        super().__init__(path, inputs, outputs)
++
++    def __repr__(self):
++        return f"<amaranth.sim.SubmoduleModel at {self.path!r}>"
++
++
++def collect_instances(design):
++    """Collect every instance of an external module in ``design``.
++
++    Returns a list of ``(fragment, path)`` pairs, where ``path`` is the dotted name of
++    the instance within the hierarchy of the design.
++    """
++    instances = []
++    for fragment, fragment_info in design.fragments.items():
++        if isinstance(fragment, Instance):
++            instances.append((fragment, ".".join(fragment_info.name)))
++    return instances
++
++
++def collect_components(design):
++    """Collect every submodule of ``design`` that is an interface object with a signature.
++
++    Returns a dict of dotted hierarchy paths to ``(fragment, elaboratable)`` pairs. The top level
++    of the design is not included.
++    """
++    components = {}
++    for elaboratable, fragment in design.elaboratables.items():
++        if not hasattr(elaboratable, "signature"):
++            continue
++        fragment_info = design.fragments.get(fragment)
++        if fragment_info is None or fragment_info.parent is None:
++            continue
++        components[".".join(fragment_info.name)] = (fragment, elaboratable)
++    return components
++
++
++def subtree(fragment):
++    """Return ``fragment`` and every fragment below it in the hierarchy."""
++    fragments = [fragment]
++    for subfragment, _name, _src_loc in fragment.subfragments:
++        fragments.extend(subtree(subfragment))
++    return fragments
++
++
++class ModelBindings:
++    """Records which model constructor is attached to which part of the design.
++
++    A binding by path is more specific than a binding by type and overrides it for the instance it
++    names; two bindings of the same kind that would attach two models to one part of the design
++    conflict, as does a submodule model that would replace an instance that has a model of its own.
++    """
++    def __init__(self, design):
++        self._design = design
++        self._order = {id(fragment): index for index, fragment in enumerate(design.fragments)}
++        self._instances = collect_instances(design)
++        self._components = collect_components(design)
++        self._by_type = {}
++        self._by_path = {}
++        self._submodules = {}
++
++    def live_instances(self):
++        """Return the instances whose logic is still evaluated, as ``(type, path)`` pairs."""
++        replaced = self._replaced_fragments()
++        return [(fragment.type, path) for fragment, path in self._instances
++                if id(fragment) not in replaced]
++
++    def live_submodules(self):
++        """Return the paths of the submodules that can still be replaced, keeping the ones that
++        already have a model but dropping everything they swallowed."""
++        replaced = self._replaced_fragments()
++        roots = {id(self._components[path][0]) for path in self._submodules}
++        return [path for path, (fragment, _elaboratable) in self._components.items()
++                if id(fragment) not in replaced or id(fragment) in roots]
++
++    def snapshot(self):
++        """Return the bindings recorded so far, so that an addition that turns out to conflict can
++        be rolled back and leave no trace."""
++        return (dict(self._by_type), dict(self._by_path), dict(self._submodules))
++
++    def restore(self, snapshot):
++        by_type, by_path, submodules = snapshot
++        self._by_type = by_type
++        self._by_path = by_path
++        self._submodules = submodules
++
++    def _replaced_fragments(self):
++        replaced = set()
++        for path in self._submodules:
++            fragment, _elaboratable = self._components[path]
++            replaced.update(id(item) for item in subtree(fragment))
++        return replaced
++
++    def add_instance_model(self, constructor, *, type, path):
++        if (type is None) == (path is None):
++            raise ValueError("Exactly one of `type` and `path` must be provided")
++        if type is not None:
++            if type in self._by_type:
++                raise DriverConflict(
++                    f"Instances of type {type!r} already have a model attached to them")
++            if not any(fragment.type == type for fragment, _path in self._instances):
++                raise NameError(f"Design does not contain an instance of type {type!r}")
++            self._by_type[type] = constructor
++        else:
++            if path in self._by_path:
++                raise DriverConflict(f"Instance {path!r} already has a model attached to it")
++            if not any(inst_path == path for _fragment, inst_path in self._instances):
++                raise NameError(f"Design does not contain an instance at path {path!r}")
++            self._by_path[path] = constructor
++        self._check_no_replaced_instance_models()
++
++    def add_submodule_model(self, constructor, *, path):
++        if path not in self._components:
++            raise NameError(
++                f"Design does not contain a submodule with a signature at path {path!r}")
++        if path in self._submodules:
++            raise DriverConflict(f"Submodule {path!r} already has a model attached to it")
++        fragment, _elaboratable = self._components[path]
++        replaced = self._replaced_fragments()
++        if id(fragment) in replaced:
++            raise DriverConflict(
++                f"Submodule {path!r} is already replaced by a model of a submodule containing it")
++        for other_path in self._submodules:
++            other_fragment, _other_elaboratable = self._components[other_path]
++            if id(other_fragment) in {id(item) for item in subtree(fragment)}:
++                raise DriverConflict(
++                    f"Submodule {path!r} contains submodule {other_path!r}, which already has "
++                    f"a model attached to it")
++        self._submodules[path] = constructor
++        self._check_no_replaced_instance_models()
++
++    def _check_no_replaced_instance_models(self):
++        replaced = self._replaced_fragments()
++        for fragment, path in self._instances:
++            if id(fragment) not in replaced:
++                continue
++            if path in self._by_path or fragment.type in self._by_type:
++                raise DriverConflict(
++                    f"Instance {path!r} has a model attached to it and is also replaced by "
++                    f"a model of a submodule containing it")
++
++    def resolve(self):
++        """Return the ``(constructor, model)`` pairs that are in effect, with a binding by path
++        overriding a binding by type."""
++        models = []
++        replaced = self._replaced_fragments()
++        for fragment, path in self._instances:
++            if id(fragment) in replaced:
++                continue
++            if path in self._by_path:
++                constructor = self._by_path[path]
++            elif fragment.type in self._by_type:
++                constructor = self._by_type[fragment.type]
++            else:
++                continue
++            models.append((self._order[id(fragment)], constructor, InstanceModel(fragment, path)))
++        for path, constructor in self._submodules.items():
++            fragment, elaboratable = self._components[path]
++            models.append((self._order[id(fragment)], constructor,
++                           SubmoduleModel(elaboratable, path)))
++        models.sort(key=lambda entry: entry[0])
++        return [(constructor, model) for _index, constructor, model in models]
++
++    def suppressed_fragments(self):
++        """Return the fragments whose own logic must not be evaluated because a model replaces
++        them."""
++        suppressed = []
++        for path in self._submodules:
++            fragment, _elaboratable = self._components[path]
++            suppressed.extend(subtree(fragment))
++        return suppressed
+diff --git a/amaranth/sim/_pyrtl.py b/amaranth/sim/_pyrtl.py
+index 58e8ff3..f3f790a 100644
+--- a/amaranth/sim/_pyrtl.py
++++ b/amaranth/sim/_pyrtl.py
+@@ -472,9 +472,13 @@ def memory_waker(process):
+ class _FragmentCompiler:
+     def __init__(self, state):
+         self.state = state
++        self.fragment_processes = {}
++        self.fragment_comb_signals = {}
+ 
+     def __call__(self, fragment):
+         processes = set()
++        own_processes = self.fragment_processes.setdefault(id(fragment), set())
++        own_comb_signals = self.fragment_comb_signals.setdefault(id(fragment), [])
+ 
+         domains = set(fragment.statements)
+ 
+@@ -503,6 +507,7 @@ class _FragmentCompiler:
+                 for (signal, _) in lhs_masks.masks():
+                     signal_index = self.state.get_signal(signal)
+                     self.state.slots[signal_index].is_comb = True
++                    own_comb_signals.append(signal_index)
+                     emitter.append(f"next_{signal_index} = {signal.init}")
+ 
+                 inputs = SignalSet()
+@@ -619,6 +624,7 @@ class _FragmentCompiler:
+             domain_process.run = exec_locals["run"]
+ 
+             processes.add(domain_process)
++            own_processes.add(domain_process)
+ 
+         for subfragment_index, (subfragment, subfragment_name, _src_loc) in enumerate(fragment.subfragments):
+             if subfragment_name is None:
+diff --git a/amaranth/sim/core.py b/amaranth/sim/core.py
+index e8ebf31..791cbee 100644
+--- a/amaranth/sim/core.py
++++ b/amaranth/sim/core.py
+@@ -290,6 +290,127 @@ class Simulator:
+             wrap_process = coro_wrapper(wrapper, testbench=False)
+             self._engine.add_async_process(self, wrap_process)
+ 
++    def instances(self):
++        """Return the instances of external modules in the simulated design.
++
++        Returns a :class:`list` of :py:`(type, path)` pairs, one per
++        :class:`~amaranth.hdl.Instance` in the design, ordered from the top of the hierarchy down.
++        The paths in it are the ones accepted by the :py:`path` argument of
++        :meth:`add_instance_model`.
++        """
++        return self._engine.live_instances()
++
++    def submodules(self):
++        """Return the submodules of the simulated design that can be replaced with a model.
++
++        Returns a :class:`list` of the paths of the submodules that are interface objects with
++        a signature, ordered from the top of the hierarchy down. The paths in it are the ones
++        accepted by the :py:`path` argument of :meth:`add_submodule_model`.
++        """
++        return self._engine.live_submodules()
++
++    def add_instance_model(self, constructor, *, type=None, path=None):
++        """Add a model of an instance of an external module to the simulation.
++
++        An :class:`~amaranth.hdl.Instance` refers to a module that is external to the design, and
++        the simulator has no way to know what it does; the outputs of an instance that has no model
++        stay at 0. Adding a model gives such an instance behavior, provided by Python code.
++
++        The behavior of the model is defined by its *constructor function*, which is an :py:`async`
++        function taking two arguments, the :class:`SimulatorContext` and
++        the :class:`~amaranth.sim.InstanceModel` handle of the instance it is attached to: ::
++
++            async def model_of_adder(ctx, instance):
++                async for a, b in ctx.changed(instance.inputs["A"], instance.inputs["B"]):
++                    ctx.set(instance.outputs["Y"], a + b)
++
++            sim.add_instance_model(model_of_adder, type="ADDER")
++
++        The instances the model is attached to are selected by exactly one of the :py:`type` and
++        :py:`path` arguments: :py:`type` selects every instance of that type, and :py:`path`
++        selects the single instance at that location in the hierarchy of the design. The
++        constructor function is called once per selected instance, as well as by the :meth:`reset`
++        method.
++
++        A model is evaluated as a part of the :py:`toplevel` elaboratable, like a process, and what
++        it drives becomes visible to the design in the same delta cycle. Unlike a process, a model
++        may call :meth:`~SimulatorContext.get`; unlike a testbench, it may only drive the output
++        ports of the instance it is attached to.
++
++        Models are added as background and do not keep :meth:`run` advancing the simulation.
++
++        Raises
++        ------
++        :exc:`ValueError`
++            If neither or both of :py:`type` and :py:`path` are provided.
++        :exc:`NameError`
++            If the design contains no instance selected by :py:`type` or :py:`path`.
++        :exc:`~amaranth.hdl.DriverConflict`
++            If a model with the same :py:`type` or the same :py:`path` has already been added.
++        :exc:`RuntimeError`
++            If the simulation has been advanced since its creation or last reset.
++        """
++        if self._running:
++            raise RuntimeError(r"Cannot add an instance model to a running simulation")
++        constructor = self._check_function(constructor, kind="instance model")
++        if not inspect.iscoroutinefunction(constructor):
++            raise TypeError(
++                f"Cannot add an instance model {constructor!r} because it is not an async function")
++        self._check_model_arity(constructor, kind="an instance model")
++        self._engine.add_instance_model(self, constructor, type=type, path=path)
++
++    @staticmethod
++    def _check_model_arity(constructor, *, kind):
++        try:
++            inspect.signature(constructor).bind(None, None)
++        except TypeError:
++            raise TypeError(
++                f"Cannot add {kind} {constructor!r} because it does not take two arguments, "
++                f"the simulator context and a handle") from None
++
++    def add_submodule_model(self, constructor, *, path):
++        """Add a model of a submodule to the simulation.
++
++        Replaces the submodule at :py:`path` with Python code: the logic of that submodule, and of
++        everything below it in the hierarchy, is not evaluated, and the model drives the members of
++        its signature that flow out of it instead.
++
++        The behavior of the model is defined by its *constructor function*, which is an :py:`async`
++        function taking two arguments, the :class:`SimulatorContext` and
++        the :class:`~amaranth.sim.SubmoduleModel` handle of the submodule it replaces: ::
++
++            async def model_of_counter(ctx, submodule):
++                async for _clk_edge, in ctx.tick():
++                    ctx.set(submodule.outputs["count"], ctx.get(submodule.outputs["count"]) + 1)
++
++            sim.add_submodule_model(model_of_counter, path="top.u_counter")
++
++        The submodule must be an interface object with a signature, such as
++        a :class:`~amaranth.lib.wiring.Component`, and may not be the top-level elaboratable. Like
++        a model of an instance, a model of a submodule is evaluated as a part of the :py:`toplevel`
++        elaboratable, may call :meth:`~SimulatorContext.get`, and may only drive what the submodule
++        it replaces drives.
++
++        Raises
++        ------
++        :exc:`NameError`
++            If the design contains no submodule with a signature at :py:`path`.
++        :exc:`~amaranth.hdl.DriverConflict`
++            If the submodule already has a model, if it is contained in a submodule that has one,
++            if it contains a submodule that has one, or if it contains an instance that has one.
++        :exc:`RuntimeError`
++            If the simulation has been advanced since its creation or last reset.
++        """
++        if self._running:
++            raise RuntimeError(r"Cannot add a submodule model to a running simulation")
++        constructor = self._check_function(constructor, kind="submodule model")
++        if not inspect.iscoroutinefunction(constructor):
++            raise TypeError(
++                f"Cannot add a submodule model {constructor!r} because it is not an async "
++                f"function")
++        self._check_model_arity(constructor, kind="a submodule model")
++        self._engine.add_submodule_model(self, constructor, path=path)
++
+     @deprecated("The `add_sync_process` method is deprecated per RFC 27. Use `add_process` or "
+                 "`add_testbench` instead.")
+     def add_sync_process(self, process, *, domain="sync"):
+diff --git a/amaranth/sim/pysim.py b/amaranth/sim/pysim.py
+index 13a4eba..31672b1 100644
+--- a/amaranth/sim/pysim.py
++++ b/amaranth/sim/pysim.py
+@@ -5,10 +5,12 @@ import enum as py_enum
+ 
+ from ..hdl import *
+ from ..hdl._mem import MemoryInstance
+-from ..hdl._ast import SignalDict
++from ..hdl._ast import SignalDict, SignalSet
++from ..hdl._ir import DriverConflict
+ from ..lib import data, wiring
+ from ._base import *
+ from ._async import *
++from ._instance import ModelBindings
+ from ._pyeval import eval_format, eval_value, eval_assign
+ from ._pyrtl import _FragmentCompiler
+ from ._pyclock import PyClockProcess
+@@ -516,6 +518,8 @@ class _PyTriggerState:
+                 pass # does not cause a wakeup
+             elif isinstance(trigger, ChangedTrigger):
+                 self.add_changed_waker(trigger)
++            elif isinstance(trigger, ValueChangedTrigger):
++                self.add_value_changed_waker(trigger)
+             elif isinstance(trigger, EdgeTrigger):
+                 self.add_edge_waker(trigger)
+             elif isinstance(trigger, DelayTrigger):
+@@ -531,6 +535,15 @@ class _PyTriggerState:
+             return not self._oneshot
+         self._engine.state.add_signal_waker(trigger.signal, waker)
+ 
++    def add_value_changed_waker(self, trigger):
++        def waker(curr, next):
++            if self._broken:
++                return False
++            self.activate()
++            return not self._oneshot
++        for signal in trigger.signals:
++            self._engine.state.add_signal_waker(signal, waker)
++
+     def add_edge_waker(self, trigger):
+         def waker(curr, next):
+             if self._broken:
+@@ -562,7 +575,7 @@ class _PyTriggerState:
+     def compute_result(self):
+         result = []
+         for trigger in self._combination._triggers:
+-            if isinstance(trigger, (SampleTrigger, ChangedTrigger)):
++            if isinstance(trigger, (SampleTrigger, ChangedTrigger, ValueChangedTrigger)):
+                 value = self._engine.get_value(trigger.value)
+                 if isinstance(trigger.shape, ShapeCastable):
+                     result.append(trigger.shape.from_bits(value))
+@@ -584,7 +597,7 @@ class _PyTriggerState:
+ 
+     def initial_eligible(self):
+         return not self._oneshot and any(
+-            isinstance(trigger, ChangedTrigger)
++            isinstance(trigger, (ChangedTrigger, ValueChangedTrigger))
+             for trigger in self._combination._triggers
+         )
+ 
+@@ -603,8 +616,13 @@ class PySimEngine(BaseEngine):
+         self._design = design
+ 
+         self._state = _PyEngineState()
+-        self._processes = _FragmentCompiler(self._state)(self._design.fragment)
++        self._fragment_compiler = _FragmentCompiler(self._state)
++        self._processes = self._fragment_compiler(self._design.fragment)
+         self._testbenches = []
++        self._model_bindings = ModelBindings(self._design)
++        self._models = []
++        self._model_driven = SignalSet()
++        self._clock_driven = SignalSet()
+         self._delta_cycles = 0
+         self._vcd_writers = []
+         self._active_triggers = set()
+@@ -624,6 +642,8 @@ class PySimEngine(BaseEngine):
+         self._state.reset()
+         for process in self._processes:
+             process.reset()
++        for model in self._models:
++            model.reset()
+         for testbench in self._testbenches:
+             testbench.reset()
+ 
+@@ -631,6 +651,9 @@ class PySimEngine(BaseEngine):
+         slot = self.state.get_signal(clock)
+         if self.state.slots[slot].is_comb:
+             raise DriverConflict("Clock signal is already driven by combinational logic")
++        if clock in self._model_driven:
++            raise DriverConflict("Clock signal is already driven by a model")
++        self._clock_driven.add(clock)
+ 
+         self._processes.add(PyClockProcess(self._state, clock,
+                                            phase=phase, period=period))
+@@ -643,6 +666,52 @@ class PySimEngine(BaseEngine):
+         self._testbenches.append(AsyncProcess(self._design, self, process,
+                                               testbench=True, background=background))
+ 
++    def add_instance_model(self, simulator, constructor, *, type, path):
++        self._add_model(lambda: self._model_bindings.add_instance_model(
++            constructor, type=type, path=path))
++
++    def add_submodule_model(self, simulator, constructor, *, path):
++        self._add_model(lambda: self._model_bindings.add_submodule_model(constructor, path=path))
++
++    def live_instances(self):
++        return self._model_bindings.live_instances()
++
++    def live_submodules(self):
++        return self._model_bindings.live_submodules()
++
++    def _add_model(self, bind):
++        snapshot = self._model_bindings.snapshot()
++        model_driven = SignalSet(self._model_driven)
++        try:
++            bind()
++            self._rebuild_models()
++        except Exception:
++            self._model_bindings.restore(snapshot)
++            self._model_driven = model_driven
++            self._rebuild_models()
++            raise
++
++    def _rebuild_models(self):
++        for _model_constructor, model in self._model_bindings.resolve():
++            for signal in model._driven:
++                if signal in self._clock_driven:
++                    raise DriverConflict(
++                        f"Model of instance {model.path!r} drives {signal!r}, which is already "
++                        f"driven by a clock added to the simulation")
++                self._model_driven.add(signal)
++        for superseded in self._models:
++            if superseded.coroutine is not None:
++                superseded.coroutine.close()
++        self._models = [
++            AsyncProcess(self._design, self, model_constructor,
++                         testbench=False, background=True, instance_model=model)
++            for model_constructor, model in self._model_bindings.resolve()
++        ]
++        for fragment in self._model_bindings.suppressed_fragments():
++            self._processes -= self._fragment_compiler.fragment_processes.get(id(fragment), set())
++            for signal_index in self._fragment_compiler.fragment_comb_signals.get(id(fragment), ()):
++                self._state.slots[signal_index].is_comb = False
++
+     def add_trigger_combination(self, combination, *, oneshot):
+         return _PyTriggerState(self, combination, self._active_triggers, oneshot=oneshot)
+ 
+@@ -665,7 +734,7 @@ class PySimEngine(BaseEngine):
+             self._active_triggers.clear()
+ 
+             # 1b. eval: run every runnable processes once, queueing signal changes;
+-            for process in self._processes:
++            for process in itertools.chain(self._models, self._processes):
+                 if process.runnable:
+                     process.runnable = False
+                     process.run()
+@@ -713,7 +782,7 @@ class PySimEngine(BaseEngine):
+         self._state.timeline.advance()
+ 
+         # Check if the simulation has any critical processes or testbenches.
+-        for runnables in (self._processes, self._testbenches):
++        for runnables in (self._models, self._processes, self._testbenches):
+             for runnable in runnables:
+                 if runnable.critical:
+                     return True

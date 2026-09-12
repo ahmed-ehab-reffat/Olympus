@@ -1,0 +1,1209 @@
+diff --git a/checker/src/diagnostics.rs b/checker/src/diagnostics.rs
+index affe521..5ad8f0b 100644
+--- a/checker/src/diagnostics.rs
++++ b/checker/src/diagnostics.rs
+@@ -454,6 +454,25 @@ pub(crate) enum TypeCheckError<'a> {
+ 		name: String,
+ 		position: SpanWithSource,
+ 	},
++	EnumMemberWithoutInitialiser {
++		position: SpanWithSource,
++	},
++	DuplicateEnumMember {
++		name: String,
++		position: SpanWithSource,
++	},
++	ConstEnumIndexedAccess {
++		position: SpanWithSource,
++	},
++	ConstEnumMemberIsNotConstant {
++		position: SpanWithSource,
++	},
++	EnumDeclarationKindMismatch {
++		position: SpanWithSource,
++	},
++	ConstEnumUsedAsValue {
++		position: SpanWithSource,
++	},
+ 	#[allow(clippy::upper_case_acronyms)]
+ 	VariableUsedInTDZ(VariableUsedInTDZ),
+ 	InvalidMathematicalOrBitwiseOperation {
+@@ -800,6 +819,39 @@ impl From<TypeCheckError<'_>> for Diagnostic {
+ 				position,
+ 				kind,
+ 			},
++			TypeCheckError::EnumMemberWithoutInitialiser { position } => Diagnostic::Position {
++				reason: "Enum member must have initializer".to_owned(),
++				position,
++				kind,
++			},
++			TypeCheckError::DuplicateEnumMember { name, position } => Diagnostic::Position {
++				reason: format!("Duplicate enum member '{name}'"),
++				position,
++				kind,
++			},
++			TypeCheckError::EnumDeclarationKindMismatch { position } => Diagnostic::Position {
++				reason: "Enum declarations can only merge with declarations of the same kind"
++					.to_owned(),
++				position,
++				kind,
++			},
++			TypeCheckError::ConstEnumMemberIsNotConstant { position } => Diagnostic::Position {
++				reason: "const enum member initializers must be constant expressions".to_owned(),
++				position,
++				kind,
++			},
++			TypeCheckError::ConstEnumIndexedAccess { position } => Diagnostic::Position {
++				reason: "A const enum member can only be accessed using a string literal"
++					.to_owned(),
++				position,
++				kind,
++			},
++			TypeCheckError::ConstEnumUsedAsValue { position } => Diagnostic::Position {
++				reason: "'const' enums can only be used in property or index access expressions"
++					.to_owned(),
++				position,
++				kind,
++			},
+ 			TypeCheckError::VariableUsedInTDZ(VariableUsedInTDZ { position, variable_name }) => {
+ 				Diagnostic::Position {
+ 					reason: format!("Variable '{variable_name}' used before declaration"),
+@@ -899,6 +951,14 @@ impl From<TypeCheckError<'_>> for Diagnostic {
+ 				position,
+ 				kind,
+ 			},
++			TypeCheckError::CannotDeleteProperty(CannotDeleteFromError::EnumMember { position }) => {
++				Diagnostic::Position {
++					reason: "The operand of a 'delete' operator cannot be a read-only property"
++						.to_owned(),
++					position,
++					kind,
++				}
++			}
+ 			TypeCheckError::CannotDeleteProperty(CannotDeleteFromError::Constraint {
+ 				constraint,
+ 				position,
+@@ -915,6 +975,20 @@ impl From<TypeCheckError<'_>> for Diagnostic {
+ 				kind,
+ 			},
+ 			TypeCheckError::SetPropertyError(error) => match error {
++				SetPropertyError::EnumMemberIsReadOnly { property, position } => {
++					Diagnostic::Position {
++						reason: match property {
++							PropertyKeyRepresentation::Type(ty) => {
++								format!("Cannot assign to member of type {ty} because it is a read-only property")
++							}
++							PropertyKeyRepresentation::StringKey(property) => {
++								format!("Cannot assign to '{property}' because it is a read-only property")
++							}
++						},
++						position,
++						kind,
++					}
++				}
+ 				SetPropertyError::NotWriteable { property, position } => Diagnostic::Position {
+ 					reason: match property {
+ 						PropertyKeyRepresentation::Type(ty) => {
+diff --git a/checker/src/events/application.rs b/checker/src/events/application.rs
+index ae6913d..b55e3f4 100644
+--- a/checker/src/events/application.rs
++++ b/checker/src/events/application.rs
+@@ -709,7 +709,8 @@ pub(crate) fn apply_events(
+ 										call_site: input.call_site,
+ 									}
+ 								}
+-								CannotDeleteFromError::NonConfigurable { position: _ } => {
++								CannotDeleteFromError::NonConfigurable { position: _ }
++								| CannotDeleteFromError::EnumMember { position: _ } => {
+ 									todo!()
+ 								}
+ 							});
+diff --git a/checker/src/features/enums.rs b/checker/src/features/enums.rs
+new file mode 100644
+index 0000000..26985df
+--- /dev/null
++++ b/checker/src/features/enums.rs
+@@ -0,0 +1,223 @@
++//! Enum declarations. Members are held here rather than only as properties of the value, because
++//! the type of a member is nominal and assignability needs the set of values
++
++use std::collections::HashMap;
++
++use crate::{
++	Constant, TypeId,
++	types::{Type, TypeStore, get_constraint},
++};
++
++/// Declarations of the current check. Not saved with the rest of [`TypeStore`], as definition
++/// files do not carry them
++#[derive(Debug, Default)]
++pub struct EnumRegistry {
++	/// Keyed by the type the declaration introduces
++	pub(crate) declarations: HashMap<TypeId, EnumInfo>,
++	/// Member type to the enum it was declared in
++	pub(crate) members: HashMap<TypeId, TypeId>,
++	/// The object a declaration introduces to the enum it was declared in
++	pub(crate) values: HashMap<TypeId, TypeId>,
++}
++
++impl crate::utilities::serialization::BinarySerializable for EnumRegistry {
++	fn serialize(self, _buf: &mut Vec<u8>) {}
++
++	fn deserialize<I: Iterator<Item = u8>>(_iter: &mut I, _source: source_map::SourceId) -> Self {
++		Self::default()
++	}
++}
++
++/// The value of a member. `Unknown` is for initialisers that are not constant expressions
++#[derive(Clone, Debug, binary_serialize_derive::BinarySerializable)]
++pub enum EnumMemberValue {
++	Number(f64),
++	String(String),
++	Unknown,
++}
++
++impl EnumMemberValue {
++	#[must_use]
++	pub fn as_number(&self) -> Option<f64> {
++		if let Self::Number(value) = self { Some(*value) } else { None }
++	}
++
++	#[must_use]
++	pub fn to_constant(&self) -> Option<Constant> {
++		match self {
++			Self::Number(value) => Some(Constant::Number(*value)),
++			Self::String(value) => Some(Constant::String(value.clone())),
++			Self::Unknown => None,
++		}
++	}
++}
++
++#[derive(Clone, Debug, binary_serialize_derive::BinarySerializable)]
++pub struct EnumMember {
++	pub name: String,
++	/// The nominal type of the member, an alias over the constant
++	pub ty: TypeId,
++	pub value: EnumMemberValue,
++}
++
++#[derive(Clone, Debug, binary_serialize_derive::BinarySerializable)]
++pub struct EnumInfo {
++	pub name: String,
++	/// From `const enum`
++	pub is_constant: bool,
++	pub members: Vec<EnumMember>,
++	/// Where the value is held. The first declaration owns it when several merge
++	pub variable: crate::VariableId,
++}
++
++impl EnumInfo {
++	#[must_use]
++	pub fn get_member(&self, name: &str) -> Option<&EnumMember> {
++		self.members.iter().find(|member| member.name == name)
++	}
++
++	/// For the reverse entries of the value
++	#[must_use]
++	pub fn name_of_value(&self, value: f64) -> Option<&str> {
++		self.members
++			.iter()
++			.find(|member| member.value.as_number().is_some_and(|other| other == value))
++			.map(|member| member.name.as_str())
++	}
++
++	#[must_use]
++	pub fn has_numeric_member(&self) -> bool {
++		self.members.iter().any(|member| matches!(member.value, EnumMemberValue::Number(_)))
++	}
++
++	/// Whether some member has an initialiser that could not be evaluated
++	#[must_use]
++	pub fn has_unknown_member(&self) -> bool {
++		self.members.iter().any(|member| matches!(member.value, EnumMemberValue::Unknown))
++	}
++
++	/// Whether every member has a value. Otherwise the declaration stands for numbers in general
++	#[must_use]
++	pub fn is_literal(&self) -> bool {
++		!self.members.is_empty() && !self.has_unknown_member()
++	}
++
++	/// `NaN` counts as itself here, as it does for [`crate::Constant::equals`]
++	#[allow(clippy::float_cmp)]
++	fn holds_number(&self, value: f64) -> bool {
++		self.members.iter().any(|member| {
++			member
++				.value
++				.as_number()
++				.is_some_and(|held| held == value || (held.is_nan() && value.is_nan()))
++		})
++	}
++}
++
++/// The last member with a value, ignoring ones that failed to evaluate
++#[must_use]
++pub fn next_value(members: &[EnumMember]) -> Option<f64> {
++	match members.last() {
++		None => Some(0f64),
++		Some(member) => member.value.as_number().map(|value| value + 1f64),
++	}
++}
++
++/// Whether `argument` can be assigned to the enum `on`.
++///
++/// Numbers go by value, members of other enums are rejected even when the values line up and
++/// strings are always rejected
++#[must_use]
++pub fn enum_accepts(on: TypeId, info: &EnumInfo, argument: TypeId, types: &TypeStore) -> bool {
++	if argument == TypeId::ERROR_TYPE || argument == TypeId::ANY_TYPE {
++		return true;
++	}
++
++	if let Some(owner) = types.get_owner_of_enum_member(argument) {
++		return owner == on;
++	}
++
++	match types.get_type_by_id(argument) {
++		Type::Constant(Constant::Number(value)) => {
++			!info.is_literal() || info.holds_number(*value)
++		}
++		Type::Constant(_) => false,
++		Type::Or(left, right) => {
++			enum_accepts(on, info, *left, types) && enum_accepts(on, info, *right, types)
++		}
++		Type::AliasTo { to, .. } => enum_accepts(on, info, *to, types),
++		// Narrowing only ever shrinks, so what it came from carries the answer when the narrowed
++		// form does not (`Not<E.A>` is still a member of `E`)
++		Type::Narrowed { from, narrowed_to } => {
++			enum_accepts(on, info, *narrowed_to, types) || enum_accepts(on, info, *from, types)
++		}
++		_ => {
++			if argument == TypeId::NUMBER_TYPE {
++				!info.is_literal() || info.has_numeric_member()
++			} else if let Some(constraint) = get_constraint(argument, types) {
++				enum_accepts(on, info, constraint, types)
++			} else {
++				false
++			}
++		}
++	}
++}
++
++/// Whether `argument` can be assigned to the single member `on` of `info`.
++///
++/// The same rules as the declaration, over the one value the member holds
++#[must_use]
++pub fn member_accepts(on: TypeId, info: &EnumInfo, argument: TypeId, types: &TypeStore) -> bool {
++	if argument == TypeId::ERROR_TYPE || argument == TypeId::ANY_TYPE {
++		return true;
++	}
++
++	if types.get_owner_of_enum_member(argument).is_some() {
++		return argument == on;
++	}
++
++	let Some(member) = info.members.iter().find(|member| member.ty == on) else {
++		return false;
++	};
++
++	match types.get_type_by_id(argument) {
++		Type::Constant(Constant::Number(value)) => member
++			.value
++			.as_number()
++			.is_some_and(|held| held == *value || (held.is_nan() && value.is_nan())),
++		Type::Constant(_) => false,
++		Type::Or(left, right) => {
++			member_accepts(on, info, *left, types) && member_accepts(on, info, *right, types)
++		}
++		Type::AliasTo { to, .. } => member_accepts(on, info, *to, types),
++		Type::Narrowed { from, narrowed_to } => {
++			member_accepts(on, info, *narrowed_to, types)
++				|| member_accepts(on, info, *from, types)
++		}
++		_ => {
++			if argument == TypeId::NUMBER_TYPE {
++				member.value.as_number().is_some()
++			} else if let Some(constraint) = get_constraint(argument, types) {
++				member_accepts(on, info, constraint, types)
++			} else {
++				false
++			}
++		}
++	}
++}
++
++/// The key a numeric member is reachable under on the value
++#[must_use]
++pub fn reverse_key(value: f64) -> String {
++	if value == value.trunc() && value.is_finite() {
++		format!("{}", value as i64)
++	} else {
++		value.to_string()
++	}
++}
++
++/// Whether `on` is the value a `const enum` declaration introduces
++#[must_use]
++pub fn is_const_enum_value(on: TypeId, types: &TypeStore) -> bool {
++	types.get_enum_of_value(on).is_some_and(|(_, info)| info.is_constant)
++}
+diff --git a/checker/src/features/mod.rs b/checker/src/features/mod.rs
+index b55df49..2d4d4be 100644
+--- a/checker/src/features/mod.rs
++++ b/checker/src/features/mod.rs
+@@ -10,6 +10,7 @@
+ pub mod assignments;
+ pub mod conditional;
+ pub mod constant_functions;
++pub mod enums;
+ pub mod exceptions;
+ pub mod functions;
+ pub mod iteration;
+@@ -275,6 +276,8 @@ pub(crate) fn create_closed_over_references(
+ pub enum CannotDeleteFromError {
+ 	Constraint { constraint: TypeStringRepresentation, position: SpanWithSource },
+ 	NonConfigurable { position: SpanWithSource },
++	/// A member of an `enum` declaration
++	EnumMember { position: SpanWithSource },
+ }
+ 
+ /// WIP
+@@ -287,6 +290,10 @@ pub fn delete_operator(
+ ) -> Result<TypeId, CannotDeleteFromError> {
+ 	crate::utilities::notify!("Queue event");
+ 
++	if types.get_enum_of_value(rhs).is_some() {
++		return Err(CannotDeleteFromError::EnumMember { position });
++	}
++
+ 	let existing = has_property((publicity, &under), rhs, environment, types);
+ 
+ 	{
+diff --git a/checker/src/lib.rs b/checker/src/lib.rs
+index 79aff35..befbd25 100644
+--- a/checker/src/lib.rs
++++ b/checker/src/lib.rs
+@@ -312,6 +312,10 @@ pub struct CheckingData<'a, FSResolver, ModuleAST: ASTImplementation> {
+ 
+ 	/// Do not repeat emitting unimplemented parts
+ 	unimplemented_items: HashSet<&'static str>,
++
++	/// Set while the reference a property or index access reads from is being synthesised.
++	/// `const enum` declarations have no value, so only there is a reference to one allowed
++	pub(crate) reading_access_target: bool,
+ }
+ 
+ impl<'a, T, A> CheckingData<'a, T, A>
+@@ -337,6 +341,7 @@ where
+ 			types: Default::default(),
+ 			unimplemented_items: Default::default(),
+ 			chronometer: Default::default(),
++			reading_access_target: false,
+ 		}
+ 	}
+ 
+@@ -524,6 +529,7 @@ pub fn check_project<T: crate::ReadFromFS, A: crate::ASTImplementation>(
+ 		types,
+ 		unimplemented_items: _,
+ 		chronometer,
++		reading_access_target: _,
+ 	} = checking_data;
+ 
+ 	CheckOutput {
+diff --git a/checker/src/synthesis/assignments.rs b/checker/src/synthesis/assignments.rs
+index 99da54d..09ba032 100644
+--- a/checker/src/synthesis/assignments.rs
++++ b/checker/src/synthesis/assignments.rs
+@@ -16,7 +16,7 @@ use crate::{
+ };
+ 
+ use super::{
+-	expressions::{synthesise_expression, synthesise_multiple_expression},
++	expressions::synthesise_multiple_expression,
+ 	parser_property_key_to_checker_property_key,
+ };
+ 
+@@ -233,7 +233,7 @@ pub(crate) fn synthesise_access_to_reference<T: crate::ReadFromFS>(
+ 		}
+ 		VariableOrPropertyAccess::PropertyAccess { parent, property, position } => {
+ 			let parent_ty =
+-				synthesise_expression(parent, environment, checking_data, TypeId::ANY_TYPE);
++				super::expressions::synthesise_access_target(parent, environment, checking_data);
+ 			match property {
+ 				parser::PropertyReference::Standard { property, is_private } => {
+ 					let publicity =
+@@ -255,7 +255,7 @@ pub(crate) fn synthesise_access_to_reference<T: crate::ReadFromFS>(
+ 		}
+ 		VariableOrPropertyAccess::Index { indexee, indexer, position } => {
+ 			let parent_ty =
+-				synthesise_expression(indexee, environment, checking_data, TypeId::ANY_TYPE);
++				super::expressions::synthesise_access_target(indexee, environment, checking_data);
+ 			let key_ty = synthesise_multiple_expression(
+ 				indexer,
+ 				environment,
+diff --git a/checker/src/synthesis/expressions.rs b/checker/src/synthesis/expressions.rs
+index f22ed96..f001896 100644
+--- a/checker/src/synthesis/expressions.rs
++++ b/checker/src/synthesis/expressions.rs
+@@ -527,12 +527,7 @@ pub(super) fn synthesise_expression<T: crate::ReadFromFS>(
+ 							is_optional: _,
+ 							position: _,
+ 						} => {
+-							let on = synthesise_expression(
+-								parent,
+-								environment,
+-								checking_data,
+-								TypeId::ANY_TYPE,
+-							);
++							let on = synthesise_access_target(parent, environment, checking_data);
+ 							match property {
+ 								parser::PropertyReference::Standard { property, is_private } => {
+ 									let publicity = if *is_private {
+@@ -567,12 +562,8 @@ pub(super) fn synthesise_expression<T: crate::ReadFromFS>(
+ 							}
+ 						}
+ 						Expression::Index { indexee, indexer, is_optional: _, position: _ } => {
+-							let being_indexed = synthesise_expression(
+-								indexee,
+-								environment,
+-								checking_data,
+-								TypeId::ANY_TYPE,
+-							);
++							let being_indexed =
++								synthesise_access_target(indexee, environment, checking_data);
+ 							let indexer = synthesise_multiple_expression(
+ 								indexer,
+ 								environment,
+@@ -707,12 +698,27 @@ pub(super) fn synthesise_expression<T: crate::ReadFromFS>(
+ 			);
+ 
+ 			match get_variable_or_alternatives {
+-				Ok(variable) => Instance::LValue(variable),
++				Ok(variable) => {
++					if !checking_data.reading_access_target
++						&& crate::features::enums::is_const_enum_value(
++							variable.1,
++							&checking_data.types,
++						) {
++						checking_data.diagnostics_container.add_error(
++							crate::diagnostics::TypeCheckError::ConstEnumUsedAsValue {
++								position: position.with_source(environment.get_source()),
++							},
++						);
++						return TypeId::ERROR_TYPE;
++					}
++
++					Instance::LValue(variable)
++				}
+ 				Err(_) => Instance::RValue(TypeId::ERROR_TYPE),
+ 			}
+ 		}
+ 		Expression::PropertyAccess { parent, position, property, is_optional, .. } => {
+-			let on = synthesise_expression(parent, environment, checking_data, TypeId::ANY_TYPE);
++			let on = synthesise_access_target(parent, environment, checking_data);
+ 			let (property, publicity) = match property {
+ 				parser::PropertyReference::Standard { property, is_private } => (
+ 					PropertyKey::String(Cow::Borrowed(property.as_str())),
+@@ -772,10 +778,18 @@ pub(super) fn synthesise_expression<T: crate::ReadFromFS>(
+ 			}
+ 		}
+ 		Expression::Index { indexee, indexer, position, is_optional, .. } => {
+-			let being_indexed =
+-				synthesise_expression(indexee, environment, checking_data, TypeId::ANY_TYPE);
++			let being_indexed = synthesise_access_target(indexee, environment, checking_data);
+ 			let site = position.with_source(environment.get_source());
+ 
++			if crate::features::enums::is_const_enum_value(being_indexed, &checking_data.types)
++				&& !matches!(indexer.0, Expression::StringLiteral(..))
++			{
++				checking_data.diagnostics_container.add_error(
++					crate::diagnostics::TypeCheckError::ConstEnumIndexedAccess { position: site },
++				);
++				return TypeId::ERROR_TYPE;
++			}
++
+ 			if *is_optional {
+ 				let null_or_undefined =
+ 					is_null_or_undefined(being_indexed, environment, &mut checking_data.types);
+@@ -1592,3 +1606,20 @@ pub(super) fn synthesise_object_literal<T: crate::ReadFromFS>(
+ 
+ 	object_builder.build_object()
+ }
++
++/// The reference a property or index access reads from. Only here is a `const enum` allowed, as it
++/// has no value of its own
++pub(super) fn synthesise_access_target<T: crate::ReadFromFS>(
++	expression: &Expression,
++	environment: &mut Environment,
++	checking_data: &mut CheckingData<T, super::EznoParser>,
++) -> TypeId {
++	if let Expression::VariableReference(..) = expression {
++		let existing = std::mem::replace(&mut checking_data.reading_access_target, true);
++		let result = synthesise_expression(expression, environment, checking_data, TypeId::ANY_TYPE);
++		checking_data.reading_access_target = existing;
++		result
++	} else {
++		synthesise_expression(expression, environment, checking_data, TypeId::ANY_TYPE)
++	}
++}
+diff --git a/checker/src/synthesis/hoisting.rs b/checker/src/synthesis/hoisting.rs
+index 276b0ab..f515e36 100644
+--- a/checker/src/synthesis/hoisting.rs
++++ b/checker/src/synthesis/hoisting.rs
+@@ -79,7 +79,20 @@ pub(crate) fn hoist_statements<T: crate::ReadFromFS>(
+ 				);
+ 			}
+ 
+-			// TODO WIP implementation
++			// A previous declaration of the same name carries on, rather than clashing
++			if let Some(existing) = environment.get_type_from_name(&r#enum.name)
++				&& checking_data.types.get_enum(existing).is_some()
++			{
++				checking_data
++					.local_type_mappings
++					.types_to_types
++					.push(r#enum.get_position(), existing);
++
++				continue;
++			}
++
++			// The members are not known here. `synthesise_enum_declaration` sets what the name
++			// stands for once they have been evaluated
+ 			let result = environment.declare_alias::<EznoParser>(
+ 				&r#enum.name,
+ 				None,
+@@ -89,7 +102,21 @@ pub(crate) fn hoist_statements<T: crate::ReadFromFS>(
+ 
+ 			if let Ok(ty) = result {
+ 				checking_data.local_type_mappings.types_to_types.push(r#enum.get_position(), ty);
+-				checking_data.types.update_alias(ty, TypeId::NUMBER_TYPE);
++				checking_data.types.update_alias(ty, TypeId::NEVER_TYPE);
++
++				// So that a later declaration of the same name finds this one
++				checking_data.types.register_enum(
++					ty,
++					crate::features::enums::EnumInfo {
++						name: r#enum.name.clone(),
++						is_constant: r#enum.is_constant,
++						members: Vec::new(),
++						variable: crate::VariableId(
++							environment.get_source(),
++							r#enum.get_position().start,
++						),
++					},
++				);
+ 
+ 				if item.on.is_exported
+ 					&& let crate::Scope::Module { ref mut exported, .. } =
+@@ -553,20 +580,39 @@ pub(crate) fn hoist_statements<T: crate::ReadFromFS>(
+ 		} else if let parser::StatementOrDeclaration::Enum(item) = item {
+ 			let r#enum = &item.on.item;
+ 
+-			let argument = VariableRegisterArguments {
+-				constant: true,
+-				space: None,
+-				initial_value: None,
+-				allow_reregistration: false,
+-			};
++			// The value belongs to the first declaration when several merge
++			let merging = environment
++				.get_type_from_name(&r#enum.name)
++				.and_then(|existing| checking_data.types.get_enum(existing))
++				.is_some_and(|info| {
++					info.variable
++						!= crate::VariableId(environment.get_source(), r#enum.get_position().start)
++				});
+ 
+-			environment.register_variable_handle_error(
+-				&r#enum.name,
+-				argument,
+-				r#enum.get_position().with_source(environment.get_source()),
+-				&mut checking_data.diagnostics_container,
+-				&mut checking_data.local_type_mappings,
+-				checking_data.options.record_all_assignments_and_reads,
++			if !merging {
++				let argument = VariableRegisterArguments {
++					constant: true,
++					space: None,
++					initial_value: None,
++					allow_reregistration: false,
++				};
++
++				environment.register_variable_handle_error(
++					&r#enum.name,
++					argument,
++					r#enum.get_position().with_source(environment.get_source()),
++					&mut checking_data.diagnostics_container,
++					&mut checking_data.local_type_mappings,
++					checking_data.options.record_all_assignments_and_reads,
++				);
++			}
++
++			// Here rather than with the statements, as annotations of the declarations after it
++			// are resolved in this stage and can name a member
++			super::statements_and_declarations::synthesise_enum_declaration(
++				r#enum,
++				environment,
++				checking_data,
+ 			);
+ 		} else if let parser::StatementOrDeclaration::Variable(item) = item {
+ 			let declaration = &item.item;
+diff --git a/checker/src/synthesis/statements_and_declarations.rs b/checker/src/synthesis/statements_and_declarations.rs
+index 8e29d28..52d4cf4 100644
+--- a/checker/src/synthesis/statements_and_declarations.rs
++++ b/checker/src/synthesis/statements_and_declarations.rs
+@@ -111,55 +111,7 @@ pub(super) fn synthesise_statement_or_declaration<T: crate::ReadFromFS>(
+ 				_ => {}
+ 			}
+ 		}
+-		StatementOrDeclaration::Enum(item) => {
+-			use crate::types::{
+-				Constant,
+-				properties::{PropertyKey, PropertyValue, Publicity},
+-			};
+-
+-			let r#enum = &item.on.item;
+-
+-			let mut basis = crate::features::objects::ObjectBuilder::new(
+-				None,
+-				&mut checking_data.types,
+-				r#enum.get_position().with_source(environment.get_source()),
+-				&mut environment.info,
+-			);
+-
+-			// TODO remove enumerate, add add function and more
+-			for (idx, member) in r#enum.members.iter().enumerate() {
+-				let parser::ast::EnumMember { name, value, position } = member;
+-				match value {
+-					parser::ast::EnumMemberValue::ClassMembers(_) => {
+-						checking_data.raise_unimplemented_error(
+-							"class enums",
+-							position.with_source(environment.get_source()),
+-						);
+-					}
+-					parser::ast::EnumMemberValue::Value(_) => {
+-						checking_data.raise_unimplemented_error(
+-							"enum with value",
+-							position.with_source(environment.get_source()),
+-						);
+-					}
+-					parser::ast::EnumMemberValue::None => {}
+-				}
+-
+-				let value =
+-					checking_data.types.new_constant_type(Constant::Number((idx as u8).into()));
+-
+-				basis.append(
+-					Publicity::Public,
+-					PropertyKey::from(name.clone()),
+-					PropertyValue::Value(value),
+-					member.get_position().with_source(environment.get_source()),
+-					&mut environment.info,
+-				);
+-			}
+-
+-			let variable = crate::VariableId(environment.get_source(), r#enum.get_position().start);
+-			environment.info.variable_current_value.insert(variable, basis.build_object());
+-		}
++		StatementOrDeclaration::Enum(_) => {}
+ 		StatementOrDeclaration::Expression(expression) => {
+ 			synthesise_multiple_expression(
+ 				expression,
+@@ -452,3 +404,245 @@ pub(super) fn synthesise_variable_declaration<T: crate::ReadFromFS>(
+ 		}
+ 	}
+ }
++
++/// Members are evaluated in order. Each one gets a nominal type over its value, the declaration
++/// gets the union of those and (unless `const`) a value holding them under their name and, for the
++/// numeric ones, under their value
++pub(super) fn synthesise_enum_declaration<T: crate::ReadFromFS>(
++	r#enum: &parser::ast::EnumDeclaration,
++	environment: &mut Environment,
++	checking_data: &mut CheckingData<T, EznoParser>,
++) {
++	use crate::{
++		Constant,
++		features::{
++			enums::{EnumInfo, EnumMember, EnumMemberValue, next_value, reverse_key},
++			objects::ObjectBuilder,
++		},
++		types::{
++			Type,
++			properties::{PropertyKey, PropertyValue, Publicity},
++		},
++	};
++
++	let source = environment.get_source();
++	let Some(on) = environment.get_type_from_name(&r#enum.name) else {
++		return;
++	};
++
++	// A declaration can add to one that came before it. Members carry over for lookups, but the
++	// count starts again, so `declared` marks where this one begins
++	let existing = checking_data.types.get_enum(on).cloned();
++	let variable = existing.as_ref().map_or_else(
++		|| crate::VariableId(source, r#enum.get_position().start),
++		|existing| existing.variable,
++	);
++	if existing.as_ref().is_some_and(|existing| existing.is_constant != r#enum.is_constant) {
++		checking_data.diagnostics_container.add_error(
++			TypeCheckError::EnumDeclarationKindMismatch {
++				position: r#enum.get_position().with_source(source),
++			},
++		);
++	}
++
++	let mut members = existing.map(|existing| existing.members).unwrap_or_default();
++	let declared = members.len();
++
++	for member in &r#enum.members {
++		let position = member.get_position().with_source(source);
++
++		if members.iter().any(|existing| existing.name == member.name) {
++			checking_data.diagnostics_container.add_error(TypeCheckError::DuplicateEnumMember {
++				name: member.name.clone(),
++				position,
++			});
++			continue;
++		}
++
++		let value = match &member.value {
++			parser::ast::EnumMemberValue::ClassMembers(_) => {
++				checking_data.raise_unimplemented_error("class enums", position);
++				EnumMemberValue::Unknown
++			}
++			parser::ast::EnumMemberValue::Value(expression) => {
++				let value = evaluate_enum_member_value(
++					expression,
++					&r#enum.name,
++					&members,
++					environment,
++					&checking_data.types,
++				);
++
++				if value.is_none() && r#enum.is_constant {
++					checking_data.diagnostics_container.add_error(
++						TypeCheckError::ConstEnumMemberIsNotConstant { position },
++					);
++				}
++
++				value.unwrap_or(EnumMemberValue::Unknown)
++			}
++			// Ambient members are only known by their annotation
++			parser::ast::EnumMemberValue::None if r#enum.is_ambient => EnumMemberValue::Unknown,
++			parser::ast::EnumMemberValue::None => match next_value(&members[declared..]) {
++				Some(value) => EnumMemberValue::Number(value),
++				None => {
++					checking_data
++						.diagnostics_container
++						.add_error(TypeCheckError::EnumMemberWithoutInitialiser { position });
++					EnumMemberValue::Unknown
++				}
++			},
++		};
++
++		let to = match value.to_constant() {
++			Some(constant) => checking_data.types.new_constant_type(constant),
++			None => TypeId::NUMBER_TYPE,
++		};
++
++		let ty = checking_data.types.register_type(Type::AliasTo {
++			name: format!("{}.{}", r#enum.name, member.name),
++			parameters: None,
++			to,
++		});
++
++		members.push(EnumMember { name: member.name.clone(), ty, value });
++	}
++
++	let union = checking_data
++		.types
++		.new_or_type_from_iterator(members.iter().map(|member| member.ty).collect::<Vec<_>>());
++
++	checking_data.types.update_alias(on, union);
++
++	let position = r#enum.get_position().with_source(source);
++	let mut basis =
++		ObjectBuilder::new(None, &mut checking_data.types, position, &mut environment.info);
++
++	for member in &members {
++		basis.append(
++			Publicity::Public,
++			PropertyKey::from(member.name.clone()),
++			PropertyValue::Value(member.ty),
++			position,
++			&mut environment.info,
++		);
++	}
++
++	if !r#enum.is_constant {
++		for member in &members {
++			if let Some(value) = member.value.as_number() {
++				let name =
++					checking_data.types.new_constant_type(Constant::String(member.name.clone()));
++
++				basis.append(
++					Publicity::Public,
++					PropertyKey::from(reverse_key(value)),
++					PropertyValue::Value(name),
++					position,
++					&mut environment.info,
++				);
++			}
++		}
++	}
++
++	let object = basis.build_object();
++
++	checking_data.types.register_enum(
++		on,
++		EnumInfo { name: r#enum.name.clone(), is_constant: r#enum.is_constant, members, variable },
++	);
++	checking_data.types.set_enum_value(object, on);
++
++	environment.info.variable_current_value.insert(variable, object);
++}
++
++/// Only constant expressions produce a value. Anything else leaves the member without one, which
++/// stops the members after it from counting up
++fn evaluate_enum_member_value(
++	expression: &parser::Expression,
++	own: &str,
++	members: &[crate::features::enums::EnumMember],
++	environment: &Environment,
++	types: &crate::types::TypeStore,
++) -> Option<crate::features::enums::EnumMemberValue> {
++	use crate::features::enums::EnumMemberValue;
++	use parser::expressions::operators::{BinaryOperator, UnaryOperator};
++
++	match expression {
++		parser::Expression::NumberLiteral(value, ..) => Some(EnumMemberValue::Number(*value)),
++		parser::Expression::StringLiteral(value, ..) => {
++			Some(EnumMemberValue::String(value.clone()))
++		}
++		parser::Expression::Parenthesised(inner, ..) => {
++			evaluate_enum_member_value(&inner.0, own, members, environment, types)
++		}
++		parser::Expression::VariableReference(name, ..) => members
++			.iter()
++			.find(|member| member.name == *name)
++			.map(|member| member.value.clone()),
++		parser::Expression::PropertyAccess { parent, property, .. } => {
++			let parser::Expression::VariableReference(name, ..) = &**parent else {
++				return None;
++			};
++			let parser::PropertyReference::Standard { property, is_private: false } = property
++			else {
++				return None;
++			};
++			// The declaration being evaluated is not registered yet, so its own members are only
++			// in `members`
++			if let Some(member) = members.iter().find(|member| {
++				member.ty != TypeId::ERROR_TYPE && member.name == *property && own == name
++			}) {
++				return Some(member.value.clone());
++			}
++
++			let on = environment.get_type_from_name(name)?;
++			let member = types.get_enum(on)?.get_member(property)?;
++			Some(member.value.clone())
++		}
++		parser::Expression::UnaryOperation { operator, operand, .. } => {
++			let value =
++				evaluate_enum_member_value(operand, own, members, environment, types)?.as_number()?;
++
++			match operator {
++				UnaryOperator::Plus => Some(EnumMemberValue::Number(value)),
++				UnaryOperator::Negation => Some(EnumMemberValue::Number(-value)),
++				UnaryOperator::BitwiseNot => {
++					Some(EnumMemberValue::Number(f64::from(!(value as i32))))
++				}
++				_ => None,
++			}
++		}
++		parser::Expression::BinaryOperation { lhs, operator, rhs, .. } => {
++			let lhs =
++				evaluate_enum_member_value(lhs, own, members, environment, types)?.as_number()?;
++			let rhs =
++				evaluate_enum_member_value(rhs, own, members, environment, types)?.as_number()?;
++
++			let value = match operator {
++				BinaryOperator::Add => lhs + rhs,
++				BinaryOperator::Subtract => lhs - rhs,
++				BinaryOperator::Multiply => lhs * rhs,
++				BinaryOperator::Divide => lhs / rhs,
++				BinaryOperator::Remainder => lhs % rhs,
++				BinaryOperator::Exponent => lhs.powf(rhs),
++				BinaryOperator::BitwiseShiftLeft => {
++					f64::from((lhs as i32).wrapping_shl(rhs as u32))
++				}
++				BinaryOperator::BitwiseShiftRight => {
++					f64::from((lhs as i32).wrapping_shr(rhs as u32))
++				}
++				BinaryOperator::BitwiseShiftRightUnsigned => {
++					f64::from(((lhs as i32) as u32).wrapping_shr(rhs as u32))
++				}
++				BinaryOperator::BitwiseAnd => f64::from((lhs as i32) & (rhs as i32)),
++				BinaryOperator::BitwiseXOr => f64::from((lhs as i32) ^ (rhs as i32)),
++				BinaryOperator::BitwiseOr => f64::from((lhs as i32) | (rhs as i32)),
++				_ => return None,
++			};
++
++			Some(EnumMemberValue::Number(value))
++		}
++		_ => None,
++	}
++}
+diff --git a/checker/src/synthesis/type_annotations.rs b/checker/src/synthesis/type_annotations.rs
+index 35d0060..e8c72ca 100644
+--- a/checker/src/synthesis/type_annotations.rs
++++ b/checker/src/synthesis/type_annotations.rs
+@@ -807,11 +807,31 @@ pub fn synthesise_type_name<T: crate::ReadFromFS>(
+ 	checking_data: &mut CheckingData<T, super::EznoParser>,
+ ) -> TypeId {
+ 	if name.is_namespace_reference() {
+-		checking_data.raise_unimplemented_error(
+-			"namespace item",
+-			position.with_source(environment.get_source()),
+-		);
+-		TypeId::ERROR_TYPE
++		let mut parts = name.parts();
++		let (Some(first), Some(member), None) = (parts.next(), parts.next(), parts.next()) else {
++			checking_data.raise_unimplemented_error(
++				"namespace item",
++				position.with_source(environment.get_source()),
++			);
++			return TypeId::ERROR_TYPE;
++		};
++
++		// The type of a single member, e.g. `Direction.Up`
++		let member = environment
++			.get_type_from_name(first)
++			.and_then(|on| checking_data.types.get_enum(on))
++			.and_then(|info| info.get_member(member))
++			.map(|member| member.ty);
++
++		if let Some(member) = member {
++			member
++		} else {
++			checking_data.raise_unimplemented_error(
++				"namespace item",
++				position.with_source(environment.get_source()),
++			);
++			TypeId::ERROR_TYPE
++		}
+ 	} else {
+ 		let name = name.parts().next().unwrap();
+ 		if let Some(ty) = environment.get_type_from_name(name) {
+diff --git a/checker/src/types/printing.rs b/checker/src/types/printing.rs
+index 5a24b88..e5030f8 100644
+--- a/checker/src/types/printing.rs
++++ b/checker/src/types/printing.rs
+@@ -586,6 +586,15 @@ pub fn print_type_into_buf<C: InformationChain>(
+ 			print_function((*func, ty, r#type), buf, cycles, args, types, info, debug);
+ 		}
+ 		Type::Object(kind) => {
++			// The value of a declaration is written as it is named, rather than as the members and
++			// the entries they are reachable under
++			if !debug
++				&& let Some((_, info)) = types.get_enum_of_value(ty)
++			{
++				write!(buf, "typeof {}", info.name).unwrap();
++				return;
++			}
++
+ 			if debug {
+ 				if let ObjectNature::RealDeal = kind {
+ 					write!(buf, "(obj {}) ", ty.0).unwrap();
+diff --git a/checker/src/types/properties/assignment.rs b/checker/src/types/properties/assignment.rs
+index 338755f..b027dab 100644
+--- a/checker/src/types/properties/assignment.rs
++++ b/checker/src/types/properties/assignment.rs
+@@ -37,6 +37,11 @@ pub enum SetPropertyError {
+ 		property: PropertyKeyRepresentation,
+ 		position: SpanWithSource,
+ 	},
++	/// A member of an `enum` declaration
++	EnumMemberIsReadOnly {
++		property: PropertyKeyRepresentation,
++		position: SpanWithSource,
++	},
+ 	// TODO #170
+ 	// AssigningToTuple,
+ 	AssigningToNonExistent {
+@@ -59,6 +64,14 @@ pub fn set_property<B: CallCheckingBehavior>(
+ 	(behavior, diagnostics): (&mut B, &mut CallingDiagnostics),
+ 	types: &mut TypeStore,
+ ) -> SetPropertyResult {
++	// Members hold the value of the declaration, so they cannot be written to
++	if types.get_enum_of_value(on).is_some() {
++		return Err(SetPropertyError::EnumMemberIsReadOnly {
++			property: PropertyKeyRepresentation::new(under, environment, types),
++			position,
++		});
++	}
++
+ 	// Frozen checks
+ 	let object_protection = environment.get_object_protection(on);
+ 
+diff --git a/checker/src/types/store.rs b/checker/src/types/store.rs
+index a679d31..5d2a298 100644
+--- a/checker/src/types/store.rs
++++ b/checker/src/types/store.rs
+@@ -4,7 +4,12 @@ use source_map::{Nullable, Span, SpanWithSource};
+ 
+ use crate::{
+ 	Constant, Environment, FunctionId, Map as SmallMap, TypeId, VariableId,
+-	features::{functions::ClosureId, objects::SpecialObject, regexp::RegExp},
++	features::{
++		enums::{EnumInfo, EnumRegistry},
++		functions::ClosureId,
++		objects::SpecialObject,
++		regexp::RegExp,
++	},
+ };
+ 
+ use super::{
+@@ -40,6 +45,9 @@ pub struct TypeStore {
+ 
+ 	/// TODO not best place but is passed through everything so
+ 	pub(crate) closure_counter: u32,
++
++	/// Enum declarations, their members and their values
++	pub(crate) enums: EnumRegistry,
+ }
+ 
+ impl Default for TypeStore {
+@@ -216,6 +224,7 @@ impl Default for TypeStore {
+ 			functions: Default::default(),
+ 			called_functions: Default::default(),
+ 			closure_counter: 0,
++			enums: Default::default(),
+ 		}
+ 	}
+ }
+@@ -226,6 +235,35 @@ impl TypeStore {
+ 		self.types.len()
+ 	}
+ 
++	#[must_use]
++	pub fn get_enum(&self, id: TypeId) -> Option<&EnumInfo> {
++		self.enums.declarations.get(&id)
++	}
++
++	#[must_use]
++	pub fn get_owner_of_enum_member(&self, id: TypeId) -> Option<TypeId> {
++		self.enums.members.get(&id).copied()
++	}
++
++	/// From the object a declaration introduces
++	#[must_use]
++	pub fn get_enum_of_value(&self, id: TypeId) -> Option<(TypeId, &EnumInfo)> {
++		let on = *self.enums.values.get(&id)?;
++		self.enums.declarations.get(&on).map(|info| (on, info))
++	}
++
++	pub(crate) fn register_enum(&mut self, on: TypeId, info: EnumInfo) {
++		for member in &info.members {
++			self.enums.members.insert(member.ty, on);
++		}
++		self.enums.declarations.insert(on, info);
++	}
++
++	/// The object the declaration introduces. `const` ones do not have one
++	pub(crate) fn set_enum_value(&mut self, object: TypeId, on: TypeId) {
++		self.enums.values.insert(object, on);
++	}
++
+ 	#[allow(clippy::float_cmp)]
+ 	pub fn new_constant_type(&mut self, constant: Constant) -> crate::TypeId {
+ 		// Reuse existing ids rather than creating new types sometimes
+diff --git a/checker/src/types/subtyping.rs b/checker/src/types/subtyping.rs
+index bca2196..bdf9812 100644
+--- a/checker/src/types/subtyping.rs
++++ b/checker/src/types/subtyping.rs
+@@ -248,6 +248,26 @@ pub(crate) fn type_is_subtype_with_generics(
+ 		return SubTypeResult::IsSubType;
+ 	}
+ 
++	// Before the alias below, as the members of an enum are aliases over their value and would
++	// otherwise be compared by value
++	if let Some(info) = types.get_enum(base_type) {
++		return if crate::features::enums::enum_accepts(base_type, info, ty, types) {
++			SubTypeResult::IsSubType
++		} else {
++			SubTypeResult::IsNotSubType(NonEqualityReason::Mismatch)
++		};
++	}
++
++	if let Some(info) =
++		types.get_owner_of_enum_member(base_type).and_then(|owner| types.get_enum(owner))
++	{
++		return if crate::features::enums::member_accepts(base_type, info, ty, types) {
++			SubTypeResult::IsSubType
++		} else {
++			SubTypeResult::IsNotSubType(NonEqualityReason::Mismatch)
++		};
++	}
++
+ 	{
+ 		// Prevents cycles
+ 		if state.already_checked.iter().any(|(a, b)| *a == base_type && *b == ty) {
+diff --git a/parser/src/statements_and_declarations/mod.rs b/parser/src/statements_and_declarations/mod.rs
+index 5b87ad3..b3f6203 100644
+--- a/parser/src/statements_and_declarations/mod.rs
++++ b/parser/src/statements_and_declarations/mod.rs
+@@ -226,7 +226,10 @@ impl ASTNode for StatementOrDeclaration {
+ 			if after.starts_with("const") {
+ 				reader.advance(export_len);
+ 				// Const can be either variable declaration or `const enum`
+-				if reader.get_current()["const".len()..].trim_start().starts_with("enum ") {
++				let after_const =
++					reader.get_current().trim_start()["const".len()..].trim_start();
++
++				if after_const.starts_with("enum ") {
+ 					let item = EnumDeclaration::from_reader(reader)?;
+ 					let exported = Exportable::exported(item);
+ 					let decorated = Decorated::new(decorators, exported);
+@@ -311,7 +314,17 @@ impl ASTNode for StatementOrDeclaration {
+ 			let start = reader.get_start();
+ 			reader.advance("declare".len() as u32);
+ 			reader.skip();
+-			if let Some(_keyword) = reader.is_one_of_keywords(&["let", "const", "var"]) {
++			let const_enum = reader.is_keyword("const")
++				&& reader.get_current().trim_start()["const".len()..].trim_start().starts_with("enum ");
++
++			if reader.is_keyword("enum") || const_enum {
++				let mut item = EnumDeclaration::from_reader(reader)?;
++				item.is_ambient = true;
++				item.position.start = start.0;
++				let exported = Exportable::not_exported(item);
++				let decorated = Decorated::new(decorators, exported);
++				Ok(StatementOrDeclaration::Enum(Box::new(decorated)))
++			} else if let Some(_keyword) = reader.is_one_of_keywords(&["let", "const", "var"]) {
+ 				let mut declare = DeclareVariableDeclaration::from_reader_without_declare(reader)?;
+ 				// TODO pass these down
+ 				declare.decorators = decorators;
+diff --git a/parser/src/types/enum_declaration.rs b/parser/src/types/enum_declaration.rs
+index c32d6e0..0f2417c 100644
+--- a/parser/src/types/enum_declaration.rs
++++ b/parser/src/types/enum_declaration.rs
+@@ -9,6 +9,8 @@ use visitable_derive::Visitable;
+ #[apply(derive_ASTNode)]
+ pub struct EnumDeclaration {
+ 	pub is_constant: bool,
++	/// From `declare enum`. Members without an initialiser do not have a value
++	pub is_ambient: bool,
+ 	pub name: String,
+ 	pub members: Vec<EnumMember>,
+ 	pub position: Span,
+@@ -45,7 +47,7 @@ impl ASTNode for EnumDeclaration {
+ 		}
+ 		reader.expect('}')?;
+ 		let position = start.union(reader.get_end());
+-		Ok(EnumDeclaration { is_constant, name, members, position })
++		Ok(EnumDeclaration { is_constant, is_ambient: false, name, members, position })
+ 	}
+ 
+ 	fn to_string_from_buffer<T: source_map::ToString>(

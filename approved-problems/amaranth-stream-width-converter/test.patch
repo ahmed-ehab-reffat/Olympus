@@ -1,0 +1,1185 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..5765e87
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,39 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++cd "$(dirname "$0")"
++export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++    case "$1" in
++        --output_path) OUTPUT_PATH="$2"; shift 2 ;;
++        --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++        base|new) MODE="$1"; shift ;;
++        *) shift ;;
++    esac
++done
++MODE="${MODE:-base}"
++[ -z "$OUTPUT_PATH" ] && OUTPUT_PATH="/tmp/report.xml"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++PY="$(command -v python3 || command -v python)"
++
++# Amaranth's simulator is pure Python. The `*Formal` cases (confined to the FIFO suite) drive an
++# external SymbiYosys formal-verification toolchain that is not present offline, so they are
++# deselected here; they are unrelated to this feature, which is verified entirely by simulation.
++BASE_TESTS="tests/test_lib_stream.py tests/test_lib_fifo.py tests/test_lib_data.py \
++tests/test_lib_memory.py tests/test_lib_cdc.py tests/test_lib_crc.py tests/test_lib_wiring.py \
++tests/test_hdl_dsl.py tests/test_sim.py"
++
++case "$MODE" in
++    base)
++        $PY -m pytest $BASE_TESTS -k "not Formal" \
++            --junit-xml="$OUTPUT_PATH" -p no:cacheprovider -q
++        ;;
++    new)
++        $PY -m pytest tests/test_stream_ops_04a981.py \
++            --junit-xml="$OUTPUT_PATH" -p no:cacheprovider -q
++        ;;
++esac
+diff --git a/tests/test_stream_ops_04a981.py b/tests/test_stream_ops_04a981.py
+new file mode 100755
+index 0000000..ec7da4b
+--- /dev/null
++++ b/tests/test_stream_ops_04a981.py
+@@ -0,0 +1,1134 @@
++import random
++import unittest
++
++from amaranth.hdl import *
++from amaranth.hdl import Period
++from amaranth.sim import Simulator
++from amaranth.lib import stream, data
++
++
++def _run_single(dut, inputs, *, p_valid, p_ready, seed):
++    """Drive a 1-in/1-out stream element with a randomised valid/ready waveform, returning the
++    exact sequence of accepted output payloads. Draining is done with ``ready`` held high."""
++    rng = random.Random(seed)
++    outputs = []
++
++    async def testbench(ctx):
++        idx = empty = cyc = 0
++        presenting = False
++        while cyc < 40000:
++            cyc += 1
++            draining = idx >= len(inputs)
++            if not draining and not presenting and rng.random() < p_valid:
++                presenting = True
++            want_send = presenting and not draining
++            want_recv = True if draining else (rng.random() < p_ready)
++            ctx.set(dut.i_stream.valid, 1 if want_send else 0)
++            if want_send:
++                ctx.set(dut.i_stream.payload, inputs[idx])
++            ctx.set(dut.o_stream.ready, 1 if want_recv else 0)
++            i_ready = ctx.get(dut.i_stream.ready)
++            o_valid = ctx.get(dut.o_stream.valid)
++            o_payload = ctx.get(dut.o_stream.payload)
++            recv_now = want_send and i_ready
++            send_now = o_valid and want_recv
++            await ctx.tick()
++            if recv_now:
++                idx += 1
++                presenting = False
++            if send_now:
++                outputs.append(o_payload)
++            if draining:
++                empty = empty + 1 if not o_valid else 0
++                if empty >= 3:
++                    break
++
++    sim = Simulator(dut)
++    sim.add_clock(Period(MHz=1))
++    sim.add_testbench(testbench)
++    sim.run()
++    return outputs
++
++
++def _ref_down(inputs, width, factor):
++    part = width // factor
++    out = []
++    for w in inputs:
++        for i in range(factor):
++            out.append((w >> (i * part)) & ((1 << part) - 1))
++    return out
++
++
++def _ref_up(inputs, width, factor):
++    part = width // factor
++    out = []
++    for g in range(0, len(inputs), factor):
++        val = 0
++        for i in range(factor):
++            val |= (inputs[g + i] & ((1 << part) - 1)) << (i * part)
++        out.append(val)
++    return out
++
++
++def _ref_gearbox(inputs, i_width, o_width):
++    bits = nbits = 0
++    for w in inputs:
++        bits |= (w & ((1 << i_width) - 1)) << nbits
++        nbits += i_width
++    return [(bits >> (g * o_width)) & ((1 << o_width) - 1) for g in range(nbits // o_width)]
++
++
++class WidthDownConverterTestCase(unittest.TestCase):
++    def test_basic(self):
++        dut = stream.WidthDownConverter(8, 2)
++        got = _run_single(dut, [0x21, 0x43], p_valid=1.0, p_ready=1.0, seed=0)
++        self.assertEqual(got, [0x1, 0x2, 0x3, 0x4])
++
++    def test_empty(self):
++        self.assertEqual(_run_single(stream.WidthDownConverter(4, 4), [], p_valid=1.0, p_ready=1.0, seed=1), [])
++
++    def test_factor_one_is_identity(self):
++        got = _run_single(stream.WidthDownConverter(6, 1), [5, 9, 2], p_valid=0.6, p_ready=0.6, seed=2)
++        self.assertEqual(got, [5, 9, 2])
++
++    def test_fuzz_backpressure(self):
++        for seed in range(60):
++            rng = random.Random(seed)
++            factor = rng.choice([1, 2, 3, 4, 5])
++            part = rng.choice([1, 2, 3, 4])
++            width = part * factor
++            inputs = [rng.randrange(1 << width) for _ in range(rng.randint(0, 14))]
++            got = _run_single(stream.WidthDownConverter(width, factor), inputs,
++                              p_valid=rng.uniform(0.2, 1.0), p_ready=rng.uniform(0.2, 1.0), seed=seed)
++            self.assertEqual(got, _ref_down(inputs, width, factor), msg=f"seed={seed}")
++
++    def test_rejects_bad_arguments(self):
++        with self.assertRaises(ValueError):
++            stream.WidthDownConverter(7, 2)
++        with self.assertRaises(ValueError):
++            stream.WidthDownConverter(8, 0)
++
++
++class WidthUpConverterTestCase(unittest.TestCase):
++    def test_basic(self):
++        got = _run_single(stream.WidthUpConverter(8, 2), [0x1, 0x2, 0x3, 0x4], p_valid=1.0, p_ready=1.0, seed=0)
++        self.assertEqual(got, [0x21, 0x43])
++
++    def test_partial_group_is_not_emitted(self):
++        # three inputs, factor 2: only one full group is produced, the trailing word is held.
++        got = _run_single(stream.WidthUpConverter(8, 2), [0x1, 0x2, 0x3], p_valid=1.0, p_ready=1.0, seed=0)
++        self.assertEqual(got, [0x21])
++
++    def test_fuzz_backpressure(self):
++        for seed in range(60):
++            rng = random.Random(seed)
++            factor = rng.choice([1, 2, 3, 4])
++            part = rng.choice([1, 2, 3, 4])
++            width = part * factor
++            n = rng.randint(0, 5) * factor
++            inputs = [rng.randrange(1 << part) for _ in range(n)]
++            got = _run_single(stream.WidthUpConverter(width, factor), inputs,
++                              p_valid=rng.uniform(0.2, 1.0), p_ready=rng.uniform(0.2, 1.0), seed=seed + 500)
++            self.assertEqual(got, _ref_up(inputs, width, factor), msg=f"seed={seed}")
++
++    def test_partial_group_retained_across_gap(self):
++        # A lone first word must be retained internally through an input gap and completed by a later
++        # word, not dropped: with a pause after the first of a factor-2 pair the packed word still
++        # combines the two.
++        dut = stream.WidthUpConverter(8, 2)
++        out = []
++        plan = [0x1, None, None, None, 0x2, 0x3, 0x4]
++
++        async def tb(ctx):
++            ctx.set(dut.o_stream.ready, 1)
++            pi = empty = 0
++            for _ in range(300):
++                word = plan[pi] if pi < len(plan) else None
++                ctx.set(dut.i_stream.valid, 1 if word is not None else 0)
++                if word is not None:
++                    ctx.set(dut.i_stream.payload, word)
++                i_ready = ctx.get(dut.i_stream.ready)
++                o_valid = ctx.get(dut.o_stream.valid)
++                o_payload = ctx.get(dut.o_stream.payload)
++                await ctx.tick()
++                if pi < len(plan) and (word is None or i_ready):
++                    pi += 1
++                if o_valid:
++                    out.append(o_payload)
++                if pi >= len(plan):
++                    empty = empty + 1 if not o_valid else 0
++                    if empty >= 3:
++                        break
++
++        sim = Simulator(dut)
++        sim.add_clock(Period(MHz=1))
++        sim.add_testbench(tb)
++        sim.run()
++        self.assertEqual(out, [0x21, 0x43])
++
++
++class GearboxTestCase(unittest.TestCase):
++    def test_narrow_to_wide(self):
++        got = _run_single(stream.Gearbox(3, 6), [0b101, 0b011, 0b110, 0b001], p_valid=1.0, p_ready=1.0, seed=0)
++        self.assertEqual(got, [0b011101, 0b001110])
++
++    def test_fuzz_non_dividing_widths(self):
++        for seed in range(120):
++            rng = random.Random(seed)
++            i_width = rng.randint(1, 8)
++            o_width = rng.randint(1, 8)
++            inputs = [rng.randrange(1 << i_width) for _ in range(rng.randint(0, 16))]
++            got = _run_single(stream.Gearbox(i_width, o_width), inputs,
++                              p_valid=rng.uniform(0.15, 1.0), p_ready=rng.uniform(0.15, 1.0), seed=seed + 900)
++            self.assertEqual(got, _ref_gearbox(inputs, i_width, o_width),
++                             msg=f"seed={seed} iw={i_width} ow={o_width}")
++
++
++class SkidBufferTestCase(unittest.TestCase):
++    def test_is_order_preserving_identity(self):
++        for seed in range(60):
++            rng = random.Random(seed)
++            width = rng.randint(1, 8)
++            inputs = [rng.randrange(1 << width) for _ in range(rng.randint(0, 16))]
++            got = _run_single(stream.SkidBuffer(width), inputs,
++                              p_valid=rng.uniform(0.15, 1.0), p_ready=rng.uniform(0.15, 1.0), seed=seed + 1300)
++            self.assertEqual(got, inputs, msg=f"seed={seed}")
++
++    def test_output_is_registered(self):
++        # A payload presented on the input is not combinationally forwarded within the same cycle.
++        dut = stream.SkidBuffer(8)
++        seen = []
++
++        async def tb(ctx):
++            ctx.set(dut.i_stream.valid, 1)
++            ctx.set(dut.i_stream.payload, 0xAB)
++            ctx.set(dut.o_stream.ready, 1)
++            seen.append(ctx.get(dut.o_stream.valid))
++            await ctx.tick()
++
++        sim = Simulator(dut)
++        sim.add_clock(Period(MHz=1))
++        sim.add_testbench(tb)
++        sim.run()
++        self.assertEqual(seen, [0])
++
++    def test_input_ready_is_registered(self):
++        # Input `ready` is driven from a register: within a cycle it must not respond
++        # combinationally to the output `ready`.
++        dut = stream.SkidBuffer(8)
++        diffs = []
++
++        async def tb(ctx):
++            for _ in range(6):
++                ctx.set(dut.i_stream.valid, 1)
++                ctx.set(dut.i_stream.payload, 0)
++                ctx.set(dut.o_stream.ready, 0)
++                r0 = ctx.get(dut.i_stream.ready)
++                ctx.set(dut.o_stream.ready, 1)
++                r1 = ctx.get(dut.i_stream.ready)
++                if r0 != r1:
++                    diffs.append((r0, r1))
++                await ctx.tick()
++
++        sim = Simulator(dut)
++        sim.add_clock(Period(MHz=1))
++        sim.add_testbench(tb)
++        sim.run()
++        self.assertEqual(diffs, [])
++
++    def test_accepts_struct_payload_shape(self):
++        # Constructors take a payload shape, not only a bit width: a struct payload round-trips.
++        layout = data.StructLayout({"a": unsigned(4), "b": unsigned(4)})
++        dut = stream.SkidBuffer(layout)
++        items = [(1, 2), (3, 4), (15, 0), (7, 9)]
++        out = []
++
++        async def tb(ctx):
++            idx = cyc = empty = 0
++            while cyc < 500:
++                cyc += 1
++                draining = idx >= len(items)
++                wv = not draining
++                ctx.set(dut.i_stream.valid, 1 if wv else 0)
++                if wv:
++                    ctx.set(dut.i_stream.payload.a, items[idx][0])
++                    ctx.set(dut.i_stream.payload.b, items[idx][1])
++                ctx.set(dut.o_stream.ready, 1)
++                i_ready = ctx.get(dut.i_stream.ready)
++                o_valid = ctx.get(dut.o_stream.valid)
++                oa = ctx.get(dut.o_stream.payload.a)
++                ob = ctx.get(dut.o_stream.payload.b)
++                await ctx.tick()
++                if wv and i_ready:
++                    idx += 1
++                if o_valid:
++                    out.append((oa, ob))
++                if draining:
++                    empty = empty + 1 if not o_valid else 0
++                    if empty >= 3:
++                        break
++
++        sim = Simulator(dut)
++        sim.add_clock(Period(MHz=1))
++        sim.add_testbench(tb)
++        sim.run()
++        self.assertEqual(out, items)
++
++    def test_payload_is_registered_not_forwarded(self):
++        # The output payload itself, not only `valid`, is registered: a word presented on the input
++        # is not combinationally visible on `o_stream.payload` in the same cycle.
++        dut = stream.SkidBuffer(8)
++        first = []
++
++        async def tb(ctx):
++            ctx.set(dut.i_stream.valid, 1)
++            ctx.set(dut.i_stream.payload, 0xAB)
++            ctx.set(dut.o_stream.ready, 1)
++            first.append((ctx.get(dut.o_stream.valid), ctx.get(dut.o_stream.payload)))
++            await ctx.tick()
++
++        sim = Simulator(dut)
++        sim.add_clock(Period(MHz=1))
++        sim.add_testbench(tb)
++        sim.run()
++        valid, payload = first[0]
++        self.assertEqual(valid, 0)
++        self.assertNotEqual(payload, 0xAB)
++
++
++def _clocked(dut):
++    # Wrap a DUT so a `sync` domain always exists, letting the clocked harness drive a component
++    # whether its handshake is registered or purely combinational (both are valid).
++    m = Module()
++    m.submodules.dut = dut
++    keep = Signal()
++    m.d.sync += keep.eq(~keep)
++    return m
++
++
++def _run_many_in(dut, per_input, *, count, seed, tag_bits, group=False, o_width=None):
++    rng = random.Random(seed)
++    out = []
++
++    async def tb(ctx):
++        idx = [0] * count
++        presenting = [False] * count
++        cyc = empty = 0
++        while cyc < 40000:
++            cyc += 1
++            drained = all(idx[k] >= len(per_input[k]) for k in range(count))
++            sending = []
++            for k in range(count):
++                has = idx[k] < len(per_input[k])
++                if has and not presenting[k] and rng.random() < 0.6:
++                    presenting[k] = True
++                wv = has and presenting[k]
++                ctx.set(dut.i_streams[k].valid, 1 if wv else 0)
++                if wv:
++                    ctx.set(dut.i_streams[k].payload, per_input[k][idx[k]])
++                sending.append(wv)
++            want_recv = True if drained else (rng.random() < 0.7)
++            ctx.set(dut.o_stream.ready, 1 if want_recv else 0)
++            i_readies = [ctx.get(dut.i_streams[k].ready) for k in range(count)]
++            o_valid = ctx.get(dut.o_stream.valid)
++            o_payload = ctx.get(dut.o_stream.payload)
++            recvs = [k for k in range(count) if sending[k] and i_readies[k]]
++            send_now = o_valid and want_recv
++            await ctx.tick()
++            for k in recvs:
++                idx[k] += 1
++                presenting[k] = False
++            if send_now:
++                out.append(o_payload)
++            if drained:
++                empty = empty + 1 if not o_valid else 0
++                if empty >= 3:
++                    break
++
++    sim = Simulator(_clocked(dut))
++    sim.add_clock(Period(MHz=1))
++    sim.add_testbench(tb)
++    sim.run()
++    return out
++
++
++class ArbiterTestCase(unittest.TestCase):
++    def test_merge_preserves_per_input_order(self):
++        for seed in range(80):
++            rng = random.Random(seed)
++            count = rng.randint(1, 4)
++            seq_bits = 5
++            width = seq_bits + max(1, (count - 1).bit_length())
++            lens = [rng.randint(0, 8) for _ in range(count)]
++            per_input = [[(k << seq_bits) | i for i in range(lens[k])] for k in range(count)]
++            out = _run_many_in(stream.Arbiter(width, count), per_input, count=count, seed=seed, tag_bits=seq_bits)
++            by_tag = {k: [] for k in range(count)}
++            for p in out:
++                by_tag[p >> seq_bits].append(p & ((1 << seq_bits) - 1))
++            for k in range(count):
++                self.assertEqual(by_tag[k], list(range(lens[k])), msg=f"seed={seed} input={k}")
++
++    def test_round_robin_is_fair(self):
++        # Two inputs always valid; grants must alternate, never starving either.
++        dut = stream.Arbiter(8, 2)
++        order = []
++        steady = [0]
++
++        async def tb(ctx):
++            for k in range(2):
++                ctx.set(dut.i_streams[k].valid, 1)
++                ctx.set(dut.i_streams[k].payload, k)
++            ctx.set(dut.o_stream.ready, 1)
++            warmup, window = 6, 12
++            for cyc in range(warmup + window):
++                if ctx.get(dut.o_stream.valid):
++                    order.append(ctx.get(dut.o_stream.payload))
++                    if cyc >= warmup:
++                        steady[0] += 1
++                await ctx.tick()
++
++        sim = Simulator(dut)
++        sim.add_clock(Period(MHz=1))
++        sim.add_testbench(tb)
++        sim.run()
++        # Work-conserving round robin under constant contention: in steady state (after any initial
++        # fill) it produces an output every cycle, grants alternate, and neither input starves. The
++        # initial grant may be either input, so only alternation and coverage of both are pinned.
++        self.assertEqual(steady[0], 12, msg=f"persistent bubble under contention: {order}")
++        self.assertTrue(all(order[i] != order[i + 1] for i in range(len(order) - 1)),
++                        msg=f"grants not alternating: {order}")
++        self.assertEqual(set(order), {0, 1}, msg=f"an input starved: {order}")
++
++    def test_skips_empty_inputs_without_bubbles(self):
++        # Inputs 0 and 2 are always valid; input 1 is never valid. With the output always ready the
++        # arbiter skips the empty input without wasting steady-state service (near-full throughput,
++        # allowing only an initial fill) and serves both live inputs, resuming round robin over just
++        # the non-empty ones.
++        dut = stream.Arbiter(6, 3)
++        outs = []
++        steady = [0]
++
++        async def tb(ctx):
++            ctx.set(dut.o_stream.ready, 1)
++            ctx.set(dut.i_streams[0].valid, 1)
++            ctx.set(dut.i_streams[0].payload, 0)
++            ctx.set(dut.i_streams[1].valid, 0)
++            ctx.set(dut.i_streams[2].valid, 1)
++            ctx.set(dut.i_streams[2].payload, 2)
++            warmup, window = 6, 16
++            for cyc in range(warmup + window):
++                if ctx.get(dut.o_stream.valid):
++                    outs.append(ctx.get(dut.o_stream.payload))
++                    if cyc >= warmup:
++                        steady[0] += 1
++                await ctx.tick()
++
++        sim = Simulator(dut)
++        sim.add_clock(Period(MHz=1))
++        sim.add_testbench(tb)
++        sim.run()
++        self.assertEqual(steady[0], 16, msg=f"persistent bubble while skipping empty input: {outs}")
++        self.assertEqual(set(outs), {0, 2}, msg=f"a live input starved: {outs}")
++
++    def test_grant_does_not_advance_while_output_blocked(self):
++        # The round-robin pointer advances only on a completed output handshake. While the output is
++        # not ready, no input's turn is consumed, so once ready resumes the same set of inputs is
++        # served in order with no input skipped.
++        dut = stream.Arbiter(8, 3)
++        seen = []
++
++        async def tb(ctx):
++            for k in range(3):
++                ctx.set(dut.i_streams[k].valid, 1)
++                ctx.set(dut.i_streams[k].payload, k)
++            ctx.set(dut.o_stream.ready, 0)
++            for _ in range(5):
++                await ctx.tick()
++            ctx.set(dut.o_stream.ready, 1)
++            for _ in range(9):
++                if ctx.get(dut.o_stream.valid):
++                    seen.append(ctx.get(dut.o_stream.payload))
++                await ctx.tick()
++
++        sim = Simulator(dut)
++        sim.add_clock(Period(MHz=1))
++        sim.add_testbench(tb)
++        sim.run()
++        for k in range(3):
++            self.assertEqual(seen.count(k), 3, msg=f"input {k} served {seen.count(k)} times, not 3: {seen}")
++        self.assertTrue(all(seen[i] != seen[i + 1] for i in range(len(seen) - 1)),
++                        msg=f"grants not alternating after backpressure: {seen}")
++
++
++class JoinTestCase(unittest.TestCase):
++    def test_gather_concatenates(self):
++        for seed in range(80):
++            rng = random.Random(seed)
++            count = rng.randint(1, 4)
++            width = 5
++            n = rng.randint(0, 10)
++            per_input = [[rng.randrange(1 << width) for _ in range(n)] for _ in range(count)]
++            out = _run_many_in(stream.Join(width, count), per_input, count=count, seed=seed + 3000, tag_bits=0)
++            exp = [sum(per_input[k][g] << (k * width) for k in range(count)) for g in range(n)]
++            self.assertEqual(out, exp, msg=f"seed={seed}")
++
++    def test_waits_for_all_inputs_then_consumes_each_once(self):
++        # Input 0 is available immediately, input 1 only after a few cycles; the output is always
++        # ready. Join must present no output while input 1 is missing, then emit the concatenation
++        # (input 0 in the low bits) once both are present. Emission latency is not constrained (the
++        # output may be combinational or registered) and the ready waveform is not probed here:
++        # per-input single-consumption and ordering are covered by test_gather_concatenates over
++        # full randomized sequences.
++        dut = stream.Join(5, 2)
++        waited = []
++        first_payload = []
++
++        async def tb(ctx):
++            ctx.set(dut.o_stream.ready, 1)
++            ctx.set(dut.i_streams[0].valid, 1)
++            ctx.set(dut.i_streams[0].payload, 0b10101)
++            ctx.set(dut.i_streams[1].valid, 0)
++            ctx.set(dut.i_streams[1].payload, 0b01110)
++            for _ in range(3):
++                waited.append(ctx.get(dut.o_stream.valid))
++                await ctx.tick()
++            ctx.set(dut.i_streams[1].valid, 1)
++            for _ in range(4):
++                if ctx.get(dut.o_stream.valid) and not first_payload:
++                    first_payload.append(ctx.get(dut.o_stream.payload))
++                    ctx.set(dut.i_streams[0].valid, 0)
++                    ctx.set(dut.i_streams[1].valid, 0)
++                await ctx.tick()
++
++        sim = Simulator(_clocked(dut))
++        sim.add_clock(Period(MHz=1))
++        sim.add_testbench(tb)
++        sim.run()
++        self.assertEqual(waited, [0, 0, 0], msg="output valid before every input contributed")
++        self.assertEqual(first_payload, [0b10101 | (0b01110 << 5)])
++
++
++class DemuxTestCase(unittest.TestCase):
++    # The demux is combinational: it routes the input to exactly the selected output and takes
++    # backpressure only from that output. This is checked directly against the routing invariant
++    # over randomised combinational vectors.
++    def test_routes_by_select(self):
++        for seed in range(200):
++            rng = random.Random(seed)
++            count = rng.randint(1, 5)
++            width = 6
++            dut = stream.Demux(width, count)
++            bad = []
++
++            def make_tb(rng, count, width, dut, bad):
++                async def tb(ctx):
++                    for _ in range(50):
++                        i_valid = rng.randrange(2)
++                        payload = rng.randrange(1 << width)
++                        select = rng.randrange(count)
++                        readies = [rng.randrange(2) for _ in range(count)]
++                        ctx.set(dut.i_stream.valid, i_valid)
++                        ctx.set(dut.i_stream.payload, payload)
++                        ctx.set(dut.select, select)
++                        for k in range(count):
++                            ctx.set(dut.o_streams[k].ready, readies[k])
++                        await ctx.delay(Period(ns=100))
++                        if ctx.get(dut.i_stream.ready) != readies[select]:
++                            bad.append("i_ready")
++                        for k in range(count):
++                            expect_valid = i_valid & (1 if select == k else 0)
++                            o_valid = ctx.get(dut.o_streams[k].valid)
++                            if o_valid != expect_valid:
++                                bad.append(("o_valid", k))
++                            # Payload is only meaningful when the output presents it (valid == 1);
++                            # unselected outputs may drive an arbitrary payload.
++                            if o_valid and ctx.get(dut.o_streams[k].payload) != payload:
++                                bad.append(("o_payload", k))
++                return tb
++
++            sim = Simulator(dut)
++            sim.add_testbench(make_tb(rng, count, width, dut, bad))
++            sim.run()
++            self.assertEqual(bad, [], msg=f"seed={seed}")
++
++
++class ForkTestCase(unittest.TestCase):
++    def test_broadcasts_to_every_output(self):
++        for seed in range(100):
++            rng = random.Random(seed)
++            count = rng.randint(1, 4)
++            width = 6
++            inputs = [rng.randrange(1 << width) for _ in range(rng.randint(0, 12))]
++            got = {k: [] for k in range(count)}
++            dut = stream.Fork(width, count)
++
++            def make_tb(rng, inputs, count, got, dut):
++                async def tb(ctx):
++                    idx = cyc = empty = 0
++                    presenting = False
++                    while cyc < 40000:
++                        cyc += 1
++                        draining = idx >= len(inputs)
++                        if not draining and not presenting and rng.random() < 0.6:
++                            presenting = True
++                        wv = presenting and not draining
++                        ctx.set(dut.i_stream.valid, 1 if wv else 0)
++                        if wv:
++                            ctx.set(dut.i_stream.payload, inputs[idx])
++                        for k in range(count):
++                            ctx.set(dut.o_streams[k].ready, 1 if (True if draining else rng.random() < 0.5) else 0)
++                        i_ready = ctx.get(dut.i_stream.ready)
++                        ovs = [ctx.get(dut.o_streams[k].valid) for k in range(count)]
++                        ops = [ctx.get(dut.o_streams[k].payload) for k in range(count)]
++                        ords = [ctx.get(dut.o_streams[k].ready) for k in range(count)]
++                        recv_now = wv and i_ready
++                        sends = [k for k in range(count) if ovs[k] and ords[k]]
++                        await ctx.tick()
++                        if recv_now:
++                            idx += 1
++                            presenting = False
++                        for k in sends:
++                            got[k].append(ops[k])
++                        if draining:
++                            empty = empty + 1 if not any(ovs) else 0
++                            if empty >= 3:
++                                break
++                return tb
++
++            sim = Simulator(dut)
++            sim.add_clock(Period(MHz=1))
++            sim.add_testbench(make_tb(rng, inputs, count, got, dut))
++            sim.run()
++            for k in range(count):
++                self.assertEqual(got[k], inputs, msg=f"seed={seed} out={k}")
++
++
++def _run_framed(dut, packets, *, p_valid, p_ready, seed):
++    """Drive a FramedGearbox with a randomised valid/ready waveform, returning the exact sequence
++    of ``(data, last, valid)`` output triples (data masked to its ``valid`` low bits)."""
++    rng = random.Random(seed)
++    flat = [(w, 1 if i == len(words) - 1 else 0) for words in packets for i, w in enumerate(words)]
++    out = []
++
++    async def tb(ctx):
++        idx = cyc = empty = 0
++        presenting = False
++        while cyc < 60000:
++            cyc += 1
++            draining = idx >= len(flat)
++            if not draining and not presenting and rng.random() < p_valid:
++                presenting = True
++            want_send = presenting and not draining
++            want_recv = True if draining else (rng.random() < p_ready)
++            ctx.set(dut.i_stream.valid, 1 if want_send else 0)
++            if want_send:
++                ctx.set(dut.i_stream.payload.data, flat[idx][0])
++                ctx.set(dut.i_stream.payload.last, flat[idx][1])
++            ctx.set(dut.o_stream.ready, 1 if want_recv else 0)
++            i_ready = ctx.get(dut.i_stream.ready)
++            o_valid = ctx.get(dut.o_stream.valid)
++            o_data = ctx.get(dut.o_stream.payload.data)
++            o_last = ctx.get(dut.o_stream.payload.last)
++            o_vbits = ctx.get(dut.o_stream.payload.valid)
++            recv_now = want_send and i_ready
++            send_now = o_valid and want_recv
++            await ctx.tick()
++            if recv_now:
++                idx += 1
++                presenting = False
++            if send_now:
++                out.append((o_data & ((1 << o_vbits) - 1), o_last, o_vbits))
++            if draining:
++                empty = empty + 1 if not o_valid else 0
++                if empty >= 3:
++                    break
++
++    sim = Simulator(dut)
++    sim.add_clock(Period(MHz=1))
++    sim.add_testbench(tb)
++    sim.run()
++    return out
++
++
++def _ref_framed(packets, i_width, o_width):
++    out = []
++    for words in packets:
++        bits = nbits = 0
++        for w in words:
++            bits |= (w & ((1 << i_width) - 1)) << nbits
++            nbits += i_width
++        n_out = (nbits + o_width - 1) // o_width
++        for j in range(n_out):
++            valid = min(o_width, nbits - j * o_width)
++            out.append(((bits >> (j * o_width)) & ((1 << valid) - 1), 1 if j == n_out - 1 else 0, valid))
++    return out
++
++
++class FramedGearboxTestCase(unittest.TestCase):
++    def test_partial_final_word(self):
++        # 3-bit words into 8-bit words: one packet of 3 words = 9 bits -> [8 bits full, 1 bit last].
++        packets = [[0b101, 0b011, 0b001]]  # 9 bits -> one full 8-bit word then a 1-bit last word
++        got = _run_framed(stream.FramedGearbox(3, 8), packets, p_valid=1.0, p_ready=1.0, seed=0)
++        self.assertEqual(got, [(0b01011101, 0, 8), (0b0, 1, 1)])
++        self.assertEqual(got, _ref_framed(packets, 3, 8))
++
++    def test_exact_multiple_marks_last(self):
++        # 4-bit words into 8-bit: two words = 8 bits -> exactly one output word, marked last, valid 8.
++        got = _run_framed(stream.FramedGearbox(4, 8), [[0x1, 0x2]], p_valid=1.0, p_ready=1.0, seed=1)
++        self.assertEqual(got, [(0x21, 1, 8)])
++
++    def test_packets_do_not_merge(self):
++        # Two packets whose bits would fill an output word only if merged; they must stay separate.
++        packets = [[0b1], [0b1]]  # 1-bit words, 4-bit output: each packet -> its own 1-bit last word
++        got = _run_framed(stream.FramedGearbox(1, 4), packets, p_valid=1.0, p_ready=1.0, seed=2)
++        self.assertEqual(got, [(0b1, 1, 1), (0b1, 1, 1)])
++
++    def test_single_word_packet(self):
++        got = _run_framed(stream.FramedGearbox(6, 3), [[0b101010]], p_valid=1.0, p_ready=1.0, seed=3)
++        self.assertEqual(got, _ref_framed([[0b101010]], 6, 3))
++
++    def test_fuzz_orthogonal(self):
++        for seed in range(150):
++            rng = random.Random(seed)
++            i_width = rng.randint(1, 6)
++            o_width = rng.randint(1, 6)
++            n_packets = rng.randint(0, 5)
++            packets = [[rng.randrange(1 << i_width) for _ in range(rng.randint(1, 5))]
++                       for _ in range(n_packets)]
++            got = _run_framed(stream.FramedGearbox(i_width, o_width), packets,
++                              p_valid=rng.uniform(0.2, 1.0), p_ready=rng.uniform(0.2, 1.0), seed=seed + 6000)
++            self.assertEqual(got, _ref_framed(packets, i_width, o_width),
++                             msg=f"seed={seed} iw={i_width} ow={o_width} packets={packets}")
++
++    def test_empty_packet_list(self):
++        # No input words produce no output at all: no spurious last/valid activity.
++        got = _run_framed(stream.FramedGearbox(3, 8), [], p_valid=1.0, p_ready=1.0, seed=0)
++        self.assertEqual(got, [])
++
++    def test_rejects_bad_arguments(self):
++        with self.assertRaises(ValueError):
++            stream.FramedGearbox(0, 4)
++
++
++def _steady_transfers(dut, side, warmup=40, window=80):
++    """Drive input ``valid`` and output ``ready`` high every cycle and count transfers on ``side``
++    ("in" or "out") only during the steady-state window after an initial warmup. Any initial fill
++    latency (of whatever length) is ignored; only a persistent per-cycle bubble reduces the count
++    below ``window``."""
++    count = [0]
++
++    async def tb(ctx):
++        for cyc in range(warmup + window):
++            ctx.set(dut.i_stream.valid, 1)
++            ctx.set(dut.i_stream.payload, 0)
++            ctx.set(dut.o_stream.ready, 1)
++            hit = ctx.get(dut.i_stream.ready) if side == "in" else ctx.get(dut.o_stream.valid)
++            if cyc >= warmup and hit:
++                count[0] += 1
++            await ctx.tick()
++
++    sim = Simulator(dut)
++    sim.add_clock(Period(MHz=1))
++    sim.add_testbench(tb)
++    sim.run()
++    return count[0], window
++
++
++def _framed_input_stalls(dut, packets, warmup=20, window=100):
++    """Offer packet words back to back with the output always ready, counting cycles in the steady
++    state window (after warmup) where an input word is offered but not accepted. Any initial fill is
++    ignored; a per-packet-boundary bubble shows up as a nonzero steady-state stall count."""
++    flat = [(w, 1 if i == len(words) - 1 else 0) for words in packets for i, w in enumerate(words)]
++    stalls = [0]
++
++    async def tb(ctx):
++        idx = 0
++        for cyc in range(warmup + window):
++            offered = idx < len(flat)
++            ctx.set(dut.i_stream.valid, 1 if offered else 0)
++            if offered:
++                ctx.set(dut.i_stream.payload.data, flat[idx][0])
++                ctx.set(dut.i_stream.payload.last, flat[idx][1])
++            ctx.set(dut.o_stream.ready, 1)
++            i_ready = ctx.get(dut.i_stream.ready)
++            if cyc >= warmup and offered and not i_ready:
++                stalls[0] += 1
++            await ctx.tick()
++            if offered and i_ready:
++                idx += 1
++
++    sim = Simulator(dut)
++    sim.add_clock(Period(MHz=1))
++    sim.add_testbench(tb)
++    sim.run()
++    return stalls[0]
++
++
++class ThroughputTestCase(unittest.TestCase):
++    # The narrower side of each converter must transfer once per cycle under a moving stream once
++    # past the initial fill. These tests measure the steady-state window only (after a generous
++    # warmup), so any fill latency is ignored and only a persistent bubble is rejected.
++    def test_down_converter_output_full_rate(self):
++        for width, factor in [(8, 2), (8, 4), (9, 3), (6, 1)]:
++            got, window = _steady_transfers(stream.WidthDownConverter(width, factor), "out")
++            self.assertEqual(got, window, msg=f"{width}/{factor}")
++
++    def test_up_converter_input_full_rate(self):
++        for width, factor in [(8, 2), (8, 4), (9, 3)]:
++            got, window = _steady_transfers(stream.WidthUpConverter(width, factor), "in")
++            self.assertEqual(got, window, msg=f"{width}/{factor}")
++
++    def test_gearbox_narrow_side_full_rate(self):
++        got, window = _steady_transfers(stream.Gearbox(8, 3), "out")
++        self.assertEqual(got, window)
++        got, window = _steady_transfers(stream.Gearbox(3, 8), "in")
++        self.assertEqual(got, window)
++
++    def test_skid_buffer_full_rate(self):
++        for side in ("in", "out"):
++            got, window = _steady_transfers(stream.SkidBuffer(8), side)
++            self.assertEqual(got, window, msg=side)
++
++    def test_framed_gearbox_no_boundary_bubble(self):
++        # Back-to-back packets on the narrower (input) side must incur no per-boundary idle cycle in
++        # steady state. A single-buffer converter that holds the input off while draining each
++        # packet's final word stalls once per boundary (a nonzero steady-state stall count);
++        # sustaining the rate requires accepting the next packet while the current one still flushes.
++        for iw, ow in [(1, 8), (2, 5), (3, 7), (1, 4), (2, 6), (4, 4)]:
++            rng = random.Random(iw * 31 + ow)
++            packets = [[rng.randrange(1 << iw) for _ in range(rng.randint(2, 4))] for _ in range(60)]
++            stalls = _framed_input_stalls(stream.FramedGearbox(iw, ow), packets)
++            self.assertEqual(stalls, 0, msg=f"iw={iw} ow={ow} steady-state stalls={stalls}")
++
++    def test_framed_gearbox_output_side_full_rate(self):
++        # When the output is the narrower side (o_width < i_width), the output transfers once per
++        # cycle in steady state under a moving stream. Measured only after a warmup, so any initial
++        # fill is ignored and only a persistent output bubble is rejected.
++        warmup, window = 20, 100
++        for iw, ow in [(8, 3), (5, 2), (6, 1), (7, 3)]:
++            rng = random.Random(iw * 17 + ow)
++            packets = [[rng.randrange(1 << iw) for _ in range(rng.randint(2, 4))] for _ in range(80)]
++            flat = [(w, 1 if i == len(words) - 1 else 0) for words in packets for i, w in enumerate(words)]
++            dut = stream.FramedGearbox(iw, ow)
++            sends = [0]
++
++            def make_tb(dut, flat, sends, warmup, window):
++                async def tb(ctx):
++                    idx = 0
++                    for cyc in range(warmup + window):
++                        offered = idx < len(flat)
++                        ctx.set(dut.i_stream.valid, 1 if offered else 0)
++                        if offered:
++                            ctx.set(dut.i_stream.payload.data, flat[idx][0])
++                            ctx.set(dut.i_stream.payload.last, flat[idx][1])
++                        ctx.set(dut.o_stream.ready, 1)
++                        i_ready = ctx.get(dut.i_stream.ready)
++                        o_valid = ctx.get(dut.o_stream.valid)
++                        if cyc >= warmup and o_valid:
++                            sends[0] += 1
++                        await ctx.tick()
++                        if offered and i_ready:
++                            idx += 1
++                return tb
++
++            sim = Simulator(dut)
++            sim.add_clock(Period(MHz=1))
++            sim.add_testbench(make_tb(dut, flat, sends, warmup, window))
++            sim.run()
++            self.assertEqual(sends[0], window, msg=f"iw={iw} ow={ow} output bubble: {sends[0]}/{window}")
++
++
++class GearboxEdgeTestCase(unittest.TestCase):
++    def test_equal_widths_is_identity(self):
++        got = _run_single(stream.Gearbox(5, 5), [3, 17, 9, 2], p_valid=0.5, p_ready=0.5, seed=0)
++        self.assertEqual(got, [3, 17, 9, 2])
++
++    def test_dividing_widths(self):
++        # 8 -> 4 (exact down) and 4 -> 8 (exact up) must agree with the bit-concatenation reference.
++        for iw, ow in [(8, 4), (4, 8), (12, 4), (2, 6)]:
++            rng = random.Random(iw * 100 + ow)
++            inputs = [rng.randrange(1 << iw) for _ in range(rng.randint(0, 10))]
++            got = _run_single(stream.Gearbox(iw, ow), inputs, p_valid=0.6, p_ready=0.6, seed=iw + ow)
++            self.assertEqual(got, _ref_gearbox(inputs, iw, ow), msg=f"{iw}/{ow}")
++
++
++class FramedGearboxEdgeTestCase(unittest.TestCase):
++    def test_equal_widths(self):
++        packets = [[0b101, 0b011], [0b111]]
++        got = _run_framed(stream.FramedGearbox(3, 3), packets, p_valid=0.7, p_ready=0.7, seed=0)
++        self.assertEqual(got, _ref_framed(packets, 3, 3))
++
++    def test_wide_to_narrow(self):
++        packets = [[0b10110]]  # 5-bit word into 2-bit output: 3 words, last has valid 1
++        got = _run_framed(stream.FramedGearbox(5, 2), packets, p_valid=1.0, p_ready=1.0, seed=1)
++        self.assertEqual(got, _ref_framed(packets, 5, 2))
++
++
++class SingletonCountTestCase(unittest.TestCase):
++    # count == 1 degenerates each multi-stream component to a pass-through and must still be exact.
++    def test_arbiter_single_input(self):
++        for seed in range(12):
++            rng = random.Random(seed)
++            data = [rng.randrange(1 << 6) for _ in range(rng.randint(0, 8))]
++            out = _run_many_in(stream.Arbiter(6, 1), [data], count=1, seed=seed, tag_bits=0)
++            self.assertEqual(out, data, msg=f"seed={seed}")
++
++    def test_join_single_input(self):
++        for seed in range(12):
++            rng = random.Random(seed)
++            data = [rng.randrange(1 << 5) for _ in range(rng.randint(0, 8))]
++            out = _run_many_in(stream.Join(5, 1), [data], count=1, seed=seed + 100, tag_bits=0)
++            self.assertEqual(out, data, msg=f"seed={seed}")
++
++
++class BackpressureTrackingTestCase(unittest.TestCase):
++    def test_fork_holds_served_output_until_all_accept(self):
++        # Output 0 is always ready; output 1 accepts only every third cycle. Output 0 must receive
++        # each input exactly once (no duplicate while waiting for the slow output).
++        inputs = [1, 2, 3, 4, 5]
++        got = {0: [], 1: []}
++        dut = stream.Fork(4, 2)
++
++        async def tb(ctx):
++            idx = cyc = empty = 0
++            while cyc < 4000:
++                cyc += 1
++                draining = idx >= len(inputs)
++                wv = (not draining)
++                ctx.set(dut.i_stream.valid, 1 if wv else 0)
++                if wv:
++                    ctx.set(dut.i_stream.payload, inputs[idx])
++                ctx.set(dut.o_streams[0].ready, 1)
++                ctx.set(dut.o_streams[1].ready, 1 if (draining or cyc % 3 == 0) else 0)
++                i_ready = ctx.get(dut.i_stream.ready)
++                ovs = [ctx.get(dut.o_streams[k].valid) for k in range(2)]
++                ops = [ctx.get(dut.o_streams[k].payload) for k in range(2)]
++                ords = [ctx.get(dut.o_streams[k].ready) for k in range(2)]
++                recv = wv and i_ready
++                sends = [k for k in range(2) if ovs[k] and ords[k]]
++                await ctx.tick()
++                if recv:
++                    idx += 1
++                for k in sends:
++                    got[k].append(ops[k])
++                if draining:
++                    empty = empty + 1 if not any(ovs) else 0
++                    if empty >= 3:
++                        break
++
++        sim = Simulator(dut)
++        sim.add_clock(Period(MHz=1))
++        sim.add_testbench(tb)
++        sim.run()
++        self.assertEqual(got[0], inputs)
++        self.assertEqual(got[1], inputs)
++
++
++class ArgumentValidationTestCase(unittest.TestCase):
++    def test_all_components_reject_bad_arguments(self):
++        with self.assertRaises(ValueError):
++            stream.WidthUpConverter(7, 2)
++        with self.assertRaises(ValueError):
++            stream.WidthUpConverter(8, 0)
++        with self.assertRaises(ValueError):
++            stream.WidthUpConverter(0, 2)
++        with self.assertRaises(ValueError):
++            stream.WidthDownConverter(0, 2)
++        with self.assertRaises(ValueError):
++            stream.Gearbox(0, 4)
++        with self.assertRaises(ValueError):
++            stream.Gearbox(4, 0)
++        with self.assertRaises(ValueError):
++            stream.FramedGearbox(4, 0)
++        for cls in (stream.Arbiter, stream.Demux, stream.Fork, stream.Join):
++            with self.assertRaises(ValueError):
++                cls(8, 0)
++
++    def test_negative_arguments_rejected(self):
++        # "non-positive" covers negatives as well as zero, for widths, factors, and counts.
++        with self.assertRaises(ValueError):
++            stream.WidthDownConverter(-8, 2)
++        with self.assertRaises(ValueError):
++            stream.WidthDownConverter(8, -2)
++        with self.assertRaises(ValueError):
++            stream.WidthUpConverter(8, -1)
++        with self.assertRaises(ValueError):
++            stream.WidthUpConverter(-8, 2)
++        with self.assertRaises(ValueError):
++            stream.Gearbox(-4, 4)
++        with self.assertRaises(ValueError):
++            stream.FramedGearbox(4, -1)
++        with self.assertRaises(ValueError):
++            stream.SkidBuffer(-8)
++        with self.assertRaises(ValueError):
++            stream.SkidBuffer(0)
++        for cls in (stream.Arbiter, stream.Demux, stream.Fork, stream.Join):
++            with self.assertRaises(ValueError):
++                cls(-8, 2)
++            with self.assertRaises(ValueError):
++                cls(0, 2)
++            with self.assertRaises(ValueError):
++                cls(8, -1)
++
++
++class StructPayloadTestCase(unittest.TestCase):
++    # The multi-stream components take a payload SHAPE, not only a bit width; a data.StructLayout
++    # payload is accepted and its fields are preserved end to end.
++    def test_multi_stream_components_accept_struct_shape(self):
++        layout = data.StructLayout({"a": unsigned(4), "b": unsigned(4)})
++        for cls in (stream.Arbiter, stream.Demux, stream.Fork, stream.Join):
++            dut = cls(layout, 2)
++
++            async def tb(ctx):
++                await ctx.tick()
++
++            sim = Simulator(_clocked(dut))
++            sim.add_clock(Period(MHz=1))
++            sim.add_testbench(tb)
++            sim.run()
++
++    def test_join_concatenates_struct_payloads(self):
++        layout = data.StructLayout({"a": unsigned(4), "b": unsigned(4)})
++        dut = stream.Join(layout, 2)
++        ins = [[(1, 2), (3, 4)], [(5, 6), (7, 8)]]
++        out = []
++
++        async def tb(ctx):
++            idx = [0, 0]
++            cyc = empty = 0
++            while cyc < 2000:
++                cyc += 1
++                drained = all(idx[k] >= 2 for k in range(2))
++                sending = []
++                for k in range(2):
++                    has = idx[k] < 2
++                    ctx.set(dut.i_streams[k].valid, 1 if has else 0)
++                    if has:
++                        ctx.set(dut.i_streams[k].payload.a, ins[k][idx[k]][0])
++                        ctx.set(dut.i_streams[k].payload.b, ins[k][idx[k]][1])
++                    sending.append(has)
++                ctx.set(dut.o_stream.ready, 1)
++                i_readies = [ctx.get(dut.i_streams[k].ready) for k in range(2)]
++                o_valid = ctx.get(dut.o_stream.valid)
++                o_payload = ctx.get(dut.o_stream.payload)
++                recvs = [k for k in range(2) if sending[k] and i_readies[k]]
++                await ctx.tick()
++                for k in recvs:
++                    idx[k] += 1
++                if o_valid:
++                    out.append(o_payload)
++                if drained:
++                    empty = empty + 1 if not o_valid else 0
++                    if empty >= 3:
++                        break
++
++        sim = Simulator(_clocked(dut))
++        sim.add_clock(Period(MHz=1))
++        sim.add_testbench(tb)
++        sim.run()
++        raw = lambda t: t[0] | (t[1] << 4)
++        exp = [raw(ins[0][g]) | (raw(ins[1][g]) << 8) for g in range(2)]
++        self.assertEqual(out, exp)
++
++    def test_arbiter_preserves_struct_payload_contents(self):
++        layout = data.StructLayout({"a": unsigned(4), "b": unsigned(4)})
++        items = [(1, 2), (15, 0), (7, 9)]
++        dut = stream.Arbiter(layout, 1)
++        got = []
++
++        async def tb(ctx):
++            idx = cyc = empty = 0
++            while cyc < 500:
++                cyc += 1
++                has = idx < len(items)
++                ctx.set(dut.i_streams[0].valid, 1 if has else 0)
++                if has:
++                    ctx.set(dut.i_streams[0].payload.a, items[idx][0])
++                    ctx.set(dut.i_streams[0].payload.b, items[idx][1])
++                ctx.set(dut.o_stream.ready, 1)
++                i_ready = ctx.get(dut.i_streams[0].ready)
++                o_valid = ctx.get(dut.o_stream.valid)
++                oa = ctx.get(dut.o_stream.payload.a)
++                ob = ctx.get(dut.o_stream.payload.b)
++                await ctx.tick()
++                if has and i_ready:
++                    idx += 1
++                if o_valid:
++                    got.append((oa, ob))
++                if idx >= len(items):
++                    empty = empty + 1 if not o_valid else 0
++                    if empty >= 3:
++                        break
++
++        sim = Simulator(_clocked(dut))
++        sim.add_clock(Period(MHz=1))
++        sim.add_testbench(tb)
++        sim.run()
++        self.assertEqual(got, items)
++
++    def test_demux_and_fork_preserve_struct_payload_contents(self):
++        layout = data.StructLayout({"a": unsigned(4), "b": unsigned(4)})
++        items = [(1, 2), (15, 0), (7, 9)]
++
++        demux = stream.Demux(layout, 2)
++        routed = {0: [], 1: []}
++
++        async def demux_tb(ctx):
++            for a, b in items:
++                for sel in (0, 1):
++                    ctx.set(demux.i_stream.valid, 1)
++                    ctx.set(demux.i_stream.payload.a, a)
++                    ctx.set(demux.i_stream.payload.b, b)
++                    ctx.set(demux.select, sel)
++                    ctx.set(demux.o_streams[0].ready, 1)
++                    ctx.set(demux.o_streams[1].ready, 1)
++                    await ctx.delay(Period(ns=100))
++                    for k in (0, 1):
++                        if ctx.get(demux.o_streams[k].valid):
++                            routed[k].append((ctx.get(demux.o_streams[k].payload.a),
++                                              ctx.get(demux.o_streams[k].payload.b)))
++
++        sim = Simulator(demux)
++        sim.add_testbench(demux_tb)
++        sim.run()
++        self.assertEqual(routed[0], items)
++        self.assertEqual(routed[1], items)
++
++        fork = stream.Fork(layout, 2)
++        got = {0: [], 1: []}
++
++        async def fork_tb(ctx):
++            idx = cyc = empty = 0
++            while cyc < 500:
++                cyc += 1
++                has = idx < len(items)
++                ctx.set(fork.i_stream.valid, 1 if has else 0)
++                if has:
++                    ctx.set(fork.i_stream.payload.a, items[idx][0])
++                    ctx.set(fork.i_stream.payload.b, items[idx][1])
++                for k in (0, 1):
++                    ctx.set(fork.o_streams[k].ready, 1)
++                i_ready = ctx.get(fork.i_stream.ready)
++                ovs = [ctx.get(fork.o_streams[k].valid) for k in (0, 1)]
++                pays = [(ctx.get(fork.o_streams[k].payload.a), ctx.get(fork.o_streams[k].payload.b)) for k in (0, 1)]
++                await ctx.tick()
++                if has and i_ready:
++                    idx += 1
++                for k in (0, 1):
++                    if ovs[k]:
++                        got[k].append(pays[k])
++                if idx >= len(items):
++                    empty = empty + 1 if not any(ovs) else 0
++                    if empty >= 3:
++                        break
++
++        sim = Simulator(fork)
++        sim.add_clock(Period(MHz=1))
++        sim.add_testbench(fork_tb)
++        sim.run()
++        self.assertEqual(got[0], items)
++        self.assertEqual(got[1], items)
++
++
++if __name__ == "__main__":
++    unittest.main()

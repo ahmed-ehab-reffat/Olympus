@@ -1,0 +1,830 @@
+diff --git a/control/bdalg.py b/control/bdalg.py
+index 0ed49008..c4fe31be 100644
+--- a/control/bdalg.py
++++ b/control/bdalg.py
+@@ -94,7 +94,10 @@ def series(*sys, **kwargs):
+     (2, 1, 5)
+ 
+     """
+-    sys = reduce(lambda x, y: y * x, sys[1:], sys[0])
++    if _has_multirate(sys):
++        sys = reduce(_multirate_series, sys[1:], sys[0])
++    else:
++        sys = reduce(lambda x, y: y * x, sys[1:], sys[0])
+     sys.update_names(**kwargs)
+     return sys
+ 
+@@ -167,10 +170,75 @@ def parallel(*sys, **kwargs):
+     (3, 4, 7)
+ 
+     """
+-    sys = reduce(lambda x, y: x + y, sys[1:], sys[0])
++    if _has_multirate(sys):
++        sys = reduce(_multirate_parallel, sys[1:], sys[0])
++    else:
++        sys = reduce(lambda x, y: x + y, sys[1:], sys[0])
+     sys.update_names(**kwargs)
+     return sys
+ 
++def _has_multirate(syslist):
++    # True when one of the systems repeats over more than one sample time,
++    # so that the combination has to be built one base step at a time
++    from .nlsys import MultirateSystem
++
++    return any(isinstance(sys, MultirateSystem) for sys in syslist)
++
++def _ensure_iosystem(sys):
++    # Turn a scalar or an array into a static system
++    if isinstance(sys, InputOutputSystem):
++        return sys
++    return ss._convert_to_statespace(sys)
++
++def _multirate_series(sys1, sys2):
++    # Connect every output of sys1 to the matching input of sys2
++    from .iosys import common_timebase
++    from .nlsys import interconnect
++
++    sys1, sys2 = _ensure_iosystem(sys1), _ensure_iosystem(sys2)
++    common_timebase(sys1.dt, sys2.dt)
++    if sys1.noutputs != sys2.ninputs:
++        raise ValueError(
++            "can't multiply systems with incompatible inputs and outputs")
++    return interconnect(
++        [sys1, sys2],
++        connections=[[(1, i), (0, i)] for i in range(sys1.noutputs)],
++        inplist=[(0, i) for i in range(sys1.ninputs)],
++        outlist=[(1, i) for i in range(sys2.noutputs)],
++        warn_duplicate=False)
++
++def _multirate_parallel(sys1, sys2):
++    # Drive both systems with the system input and add their outputs
++    from .iosys import common_timebase
++    from .nlsys import interconnect
++
++    sys1, sys2 = _ensure_iosystem(sys1), _ensure_iosystem(sys2)
++    common_timebase(sys1.dt, sys2.dt)
++    if sys1.ninputs != sys2.ninputs or sys1.noutputs != sys2.noutputs:
++        raise ValueError("systems have incompatible shapes")
++    return interconnect(
++        [sys1, sys2], connections=False,
++        inplist=[[(0, i), (1, i)] for i in range(sys1.ninputs)],
++        outlist=[[(0, i), (1, i)] for i in range(sys1.noutputs)],
++        warn_duplicate=False)
++
++def _multirate_feedback(sys1, sys2, sign):
++    # Close the loop around sys1 through sys2, entering with the given sign
++    from .iosys import common_timebase
++    from .nlsys import interconnect
++
++    sys1, sys2 = _ensure_iosystem(sys1), _ensure_iosystem(sys2)
++    common_timebase(sys1.dt, sys2.dt)
++    if sys1.noutputs != sys2.ninputs or sys2.noutputs != sys1.ninputs:
++        raise ValueError("systems have incompatible shapes")
++    connections = [[(1, i), (0, i)] for i in range(sys1.noutputs)]
++    connections += [[(0, i), (1, i, sign)] for i in range(sys1.ninputs)]
++    return interconnect(
++        [sys1, sys2], connections=connections,
++        inplist=[(0, i) for i in range(sys1.ninputs)],
++        outlist=[(0, i) for i in range(sys1.noutputs)],
++        warn_duplicate=False)
++
+ def negate(sys, **kwargs):
+     """Return the negative of a system.
+ 
+@@ -283,6 +351,11 @@ def feedback(sys1, sys2=1, sign=-1, **kwargs):
+     (2, 5, 7)
+ 
+     """
++    if _has_multirate((sys1, sys2)):
++        sys = _multirate_feedback(sys1, _ensure_iosystem(sys2), sign)
++        sys.update_names(**kwargs)
++        return sys
++
+     # Allow anything with a feedback function to call that function
+     # TODO: rewrite to allow __rfeedback__
+     try:
+diff --git a/control/dtime.py b/control/dtime.py
+index 11d2d90d..752709e3 100644
+--- a/control/dtime.py
++++ b/control/dtime.py
+@@ -5,9 +5,11 @@
+ 
+ """Functions for manipulating discrete-time systems."""
+ 
++import numpy as np
++
+ from .iosys import isctime
+ 
+-__all__ = ['sample_system', 'c2d']
++__all__ = ['sample_system', 'c2d', 'lift']
+ 
+ # Sample a continuous-time system
+ def sample_system(sysc, Ts, method='zoh', alpha=None, prewarp_frequency=None,
+@@ -85,5 +87,109 @@ def sample_system(sysc, Ts, method='zoh', alpha=None, prewarp_frequency=None,
+         name=name, copy_names=copy_names, **kwargs)
+ 
+ 
++def lift(sys, dt=None, name=None):
++    """Lift a discrete-time system to a slower sample time.
++
++    Returns the time-invariant system obtained by taking the inputs and the
++    outputs of `sys` over one longer sampling interval as single stacked
++    signals.  The lifted input holds the inputs applied at the successive
++    base steps of that interval, earliest first, and the lifted output holds
++    the outputs produced at those steps in the same order.  The state of the
++    lifted system is the state of `sys` at the start of the interval, so the
++    two systems have the same states and the same initial conditions.
++
++    Lifting a multirate system over its period removes the dependence on
++    which base step is being taken, so the result describes the whole
++    system with a single set of matrices.
++
++    Parameters
++    ----------
++    sys : `StateSpace`, `TransferFunction` or `MultirateSystem`
++        Discrete-time system to lift.
++    dt : float, optional
++        Sample time of the lifted system.  It must be a positive integer
++        multiple of the sample time of `sys`, and for a multirate system
++        also of its period.  Defaults to the period of a multirate system
++        and to the sample time of `sys` otherwise.
++    name : string, optional
++        Name of the lifted system.
++
++    Returns
++    -------
++    sysl : `StateSpace`
++        Lifted system, with `dt` as its sample time.
++
++    Raises
++    ------
++    ValueError
++        If `sys` is not a discrete-time system with a specified sample time,
++        or if `dt` is not an allowed multiple of its sample time.
++
++    Examples
++    --------
++    >>> sys = ct.ss([[0.5]], [[1]], [[1]], [[0]], dt=0.1)
++    >>> ct.lift(sys, 0.2).D
++    array([[0. , 0. ],
++           [1. , 0. ]])
++
++    """
++    from .nlsys import MultirateSystem
++    from .statesp import StateSpace, _convert_to_statespace
++    from .xferfcn import TransferFunction
++
++    if isinstance(sys, TransferFunction):
++        sys = _convert_to_statespace(sys)
++    if not isinstance(sys, (StateSpace, MultirateSystem)):
++        raise ValueError("system must be a linear or multirate system")
++    if sys.dt is None or sys.dt is True or sys.dt == 0:
++        raise ValueError("system must have a specified sample time")
++    if isinstance(sys, MultirateSystem) and not sys._linear:
++        raise ValueError("system must be linear to be lifted")
++
++    nphases = sys.nphases if isinstance(sys, MultirateSystem) else 1
++    period = sys.period if isinstance(sys, MultirateSystem) else sys.dt
++    dt = period if dt is None else dt
++
++    if not isinstance(dt, (int, float, np.integer, np.floating)) or \
++       not np.isfinite(dt):
++        raise ValueError(
++            "sample time of the lifted system must be a finite number")
++
++    nsteps = int(round(dt / sys.dt))
++    if nsteps < 1 or not np.isclose(nsteps * sys.dt, dt) or \
++       nsteps % nphases != 0:
++        raise ValueError(
++            "sample time of the lifted system must be a positive integer "
++            f"multiple of {period}")
++
++    if isinstance(sys, MultirateSystem):
++        models = [sys.phase_system(step) for step in range(nsteps)]
++    else:
++        models = [sys] * nsteps
++
++    nstates, ninputs, noutputs = sys.nstates, sys.ninputs, sys.noutputs
++    A = np.eye(nstates)
++    C = np.zeros((nsteps * noutputs, nstates))
++    for step, model in enumerate(models):
++        C[step * noutputs:(step + 1) * noutputs, :] = model.C @ A
++        A = model.A @ A
++
++    B = np.zeros((nstates, nsteps * ninputs))
++    D = np.zeros((nsteps * noutputs, nsteps * ninputs))
++    for step, model in enumerate(models):
++        # Propagate the effect of the input applied at this step forward
++        reach = model.B
++        D[step * noutputs:(step + 1) * noutputs,
++          step * ninputs:(step + 1) * ninputs] = model.D
++        for later in range(step + 1, nsteps):
++            D[later * noutputs:(later + 1) * noutputs,
++              step * ninputs:(step + 1) * ninputs] = models[later].C @ reach
++            reach = models[later].A @ reach
++        B[:, step * ninputs:(step + 1) * ninputs] = reach
++
++    return StateSpace(
++        A, B, C, D, dt=dt, name=name, states=list(sys.state_labels))
++
++
+ # Convenience aliases
+ c2d = sample_system
+diff --git a/control/iosys.py b/control/iosys.py
+index 42cf4094..64cfc198 100644
+--- a/control/iosys.py
++++ b/control/iosys.py
+@@ -10,8 +10,11 @@ and other similar classes that allow naming of signals.
+ 
+ """
+ 
++import math
+ import re
+ from copy import deepcopy
++from fractions import Fraction
++from functools import reduce
+ 
+ import numpy as np
+ 
+@@ -19,7 +22,8 @@ from . import config
+ from .exception import ControlIndexError
+ 
+ __all__ = ['InputOutputSystem', 'NamedSignal', 'issiso', 'timebase',
+-           'common_timebase', 'isdtime', 'isctime', 'iosys_repr']
++           'common_timebase', 'commensurate_timebase', 'isdtime', 'isctime',
++           'iosys_repr']
+ 
+ # Define module default parameter values
+ _iosys_defaults = {
+@@ -836,6 +840,71 @@ def timebase(sys, strict=True):
+ 
+     return sys.dt
+ 
++# Largest denominator used when a ratio of sample times is written as a
++# fraction; ratios that need a larger one are treated as incommensurate
++_timebase_denominator = 1000
++
++def _timebase_fraction(ratio):
++    frac = Fraction(ratio).limit_denominator(_timebase_denominator)
++    if not np.isclose(float(frac), ratio, rtol=1e-9, atol=0):
++        raise ValueError("systems have incommensurate timebases")
++    return frac
++
++def _fraction_gcd(frac1, frac2):
++    return Fraction(math.gcd(frac1.numerator, frac2.numerator),
++                    math.lcm(frac1.denominator, frac2.denominator))
++
++def commensurate_timebase(dtlist):
++    """Find the base timebase for a set of commensurate sample times.
++
++    Sample times are commensurate when each of them is an integer multiple
++    of their greatest common divisor.  That divisor is the base timebase,
++    the rate at which an interconnection of systems having those sample
++    times has to be simulated.
++
++    Parameters
++    ----------
++    dtlist : list of `InputOutputSystem` or float
++        Sample times, or systems with a 'dt' attribute (e.g.
++        `TransferFunction` or `StateSpace` system).
++
++    Returns
++    -------
++    dt : float
++        The base timebase, the greatest common divisor of the sample times.
++    ratios : list of int
++        The sample time of each entry divided by the base timebase.
++    period : float
++        The least common multiple of the sample times, after which the
++        pattern of which systems act at which time repeats.
++
++    Raises
++    ------
++    ValueError
++        If any entry is continuous time or has an unspecified timebase, or
++        if the sample times are not commensurate.
++
++    Examples
++    --------
++    >>> ct.commensurate_timebase([0.2, 0.3])
++    (0.1, [2, 3], 0.6)
++
++    """
++    dtlist = [dt.dt if hasattr(dt, 'dt') else dt for dt in dtlist]
++    if not dtlist:
++        raise ValueError("systems have incompatible timebases")
++    for dt in dtlist:
++        if dt is None or dt is True or \
++           not isinstance(dt, (int, float, np.integer, np.floating)) or \
++           not np.isfinite(dt) or dt <= 0:
++            raise ValueError("systems have incompatible timebases")
++    shortest = min(float(dt) for dt in dtlist)
++    fractions = [_timebase_fraction(float(dt) / shortest) for dt in dtlist]
++    base = reduce(_fraction_gcd, fractions)
++    ratios = [int(frac / base) for frac in fractions]
++    period = base * reduce(math.lcm, ratios)
++    return float(base) * shortest, ratios, float(period) * shortest
++
+ def common_timebase(dt1, dt2):
+     """
+     Find the common timebase when interconnecting systems.
+diff --git a/control/nlsys.py b/control/nlsys.py
+index 04fda2e4..f26f431d 100644
+--- a/control/nlsys.py
++++ b/control/nlsys.py
+@@ -16,6 +16,7 @@ linearizations.
+ 
+ """
+ 
++import operator
+ from warnings import warn
+ 
+ import numpy as np
+@@ -24,12 +25,12 @@ import scipy as sp
+ from . import config
+ from .config import _process_param, _process_kwargs
+ from .iosys import InputOutputSystem, _parse_spec, _process_iosys_keywords, \
+-    common_timebase, iosys_repr, isctime, isdtime
++    common_timebase, commensurate_timebase, iosys_repr, isctime, isdtime
+ from .timeresp import TimeResponseData, TimeResponseList, \
+     _check_convert_array, _process_time_response, _timeresp_aliases
+ 
+-__all__ = ['NonlinearIOSystem', 'InterconnectedSystem', 'nlsys',
+-           'input_output_response', 'find_eqpt', 'linearize',
++__all__ = ['NonlinearIOSystem', 'InterconnectedSystem', 'MultirateSystem',
++           'nlsys', 'input_output_response', 'find_eqpt', 'linearize',
+            'interconnect', 'connection_table', 'OperatingPoint',
+            'find_operating_point']
+ 
+@@ -1343,6 +1344,424 @@ class InterconnectedSystem(NonlinearIOSystem):
+         return dropped_inputs, dropped_outputs
+ 
+ 
++class MultirateSystem(NonlinearIOSystem):
++    """Interconnection of discrete-time systems with different sample times.
++
++    A multirate system runs at the base timebase of its subsystems, the
++    greatest common divisor of their sample times.  Each subsystem acts once
++    every `ratio` base steps, where `ratio` is its sample time divided by
++    the base timebase; between those steps it holds the input it last read
++    and its state does not move.  The behavior therefore repeats with a
++    period given by the least common multiple of the sample times, and the
++    system is described by one linear model per base step of that period.
++
++    Multirate systems are created by `interconnect` (or by `series`,
++    `parallel` and `feedback`) and are not usually created directly.
++
++    Parameters
++    ----------
++    phase_systems : list of `StateSpace`
++        Linear model that applies at each base step of the period, in order.
++    period : float
++        Least common multiple of the subsystem sample times.
++    name : string, optional
++        System name.
++
++    Attributes
++    ----------
++    ninputs, noutputs, nstates : int
++        Number of input, output and state variables.
++    nphases : int
++        Number of base steps in one period.
++    input_labels, output_labels, state_labels : list of str
++        Names for the input, output, and state variables.
++
++    See Also
++    --------
++    interconnect, lift, NonlinearIOSystem
++
++    """
++    def __init__(self, phase_systems, period, name=None, **kwargs):
++        from .statesp import StateSpace
++
++        self.phase_systems = list(phase_systems)
++        self.period = period
++        self._linear = all(
++            isinstance(sys, StateSpace) for sys in self.phase_systems)
++        template = self.phase_systems[0]
++        super().__init__(
++            lambda t, x, u, params: self._rhs(t, x, u),
++            lambda t, x, u, params: self._out(t, x, u),
++            name=name, dt=template.dt,
++            inputs=template.input_labels, outputs=template.output_labels,
++            states=template.state_labels, **kwargs)
++
++    @property
++    def nphases(self):
++        """Number of base steps in one period."""
++        return len(self.phase_systems)
++
++    def __str__(self):
++        return InputOutputSystem.__str__(self) + \
++            f"\n\nPeriod: {self.period}\nPhases: {self.nphases}"
++
++    def _phase(self, t):
++        # The base step holding t, so a time between two steps belongs to the
++        # one that started; the rounding keeps a step boundary off the step
++        # below it when t / dt lands just under an integer
++        return int(np.floor(round(t / self.dt, 9))) % self.nphases
++
++    def phase_system(self, phase):
++        """Linear model that applies at a given base step.
++
++        Parameters
++        ----------
++        phase : int
++            Index of the base step within the period, taken modulo the
++            number of phases.
++
++        Returns
++        -------
++        sys : `StateSpace`
++            System giving the state update and output at that base step.
++
++        Raises
++        ------
++        ValueError
++            If `phase` is not a base step.
++
++        """
++        step = _base_step(phase, f"phase {phase}")
++        return self.phase_systems[step % self.nphases]
++
++    def __neg__(self):
++        from .statesp import StateSpace
++
++        if not self._linear:
++            raise ValueError("system is not linear")
++        negated = [
++            StateSpace(sys.A, sys.B, -sys.C, -sys.D, dt=sys.dt,
++                       inputs=self.input_labels, outputs=self.output_labels,
++                       states=self.state_labels)
++            for sys in self.phase_systems]
++        return MultirateSystem(negated, self.period)
++
++    def __mul__(self, other):
++        from .bdalg import series
++        return series(other, self)
++
++    def __rmul__(self, other):
++        from .bdalg import series
++        return series(self, other)
++
++    def __add__(self, other):
++        from .bdalg import parallel
++        return parallel(self, other)
++
++    def __radd__(self, other):
++        from .bdalg import parallel
++        return parallel(other, self)
++
++    def _update_params(self, params):
++        super()._update_params(params)
++        for sys in self.phase_systems:
++            sys._update_params(self._current_params)
++
++    def _rhs(self, t, x, u):
++        sys = self.phase_systems[self._phase(t)]
++        if not self._linear:
++            return sys._rhs(t, x, u)
++        return (sys.A @ np.atleast_1d(x) + sys.B @ np.atleast_1d(u)).reshape(-1)
++
++    def _out(self, t, x, u):
++        sys = self.phase_systems[self._phase(t)]
++        if not self._linear:
++            return sys._out(t, x, u)
++        return (sys.C @ np.atleast_1d(x) + sys.D @ np.atleast_1d(u)).reshape(-1)
++
++    def poles(self):
++        """Compute the poles of a multirate system.
++
++        The poles are the eigenvalues of the product of the state matrices
++        of the individual phases, taken over one period.
++
++        Returns
++        -------
++        poles : 1D array
++            Array containing the poles of the system.
++
++        Raises
++        ------
++        ValueError
++            If any of the subsystems is not linear.
++
++        """
++        if not self._linear:
++            raise ValueError("system is not linear")
++        monodromy = np.eye(self.nstates)
++        for sys in self.phase_systems:
++            monodromy = sys.A @ monodromy
++        return np.linalg.eigvals(monodromy)
++
++    def linearize(self, x0, u0=None, t=0, params=None):
++        """Linearize a multirate system at a given base step.
++
++        For a system built from linear subsystems this returns the model
++        that applies at the base step containing `t`, which does not depend
++        on the state or the input.
++
++        Parameters
++        ----------
++        x0 : array_like
++            State at which to linearize.
++        u0 : array_like, optional
++            Input at which to linearize.
++        t : float, optional
++            Time at which to linearize, taken as a base step of the period.
++        params : dict, optional
++            Parameter values for the system.
++
++        Returns
++        -------
++        sys : `StateSpace`
++            Linearization of the system at that base step.
++
++        """
++        from .statesp import StateSpace
++
++        if not self._linear:
++            return super().linearize(x0, u0, t=t, params=params)
++        sys = self.phase_systems[self._phase(t)]
++        return StateSpace(
++            sys.A, sys.B, sys.C, sys.D, dt=self.dt,
++            inputs=self.input_labels, outputs=self.output_labels,
++            states=self.state_labels)
++
++    def dcgain(self):
++        """Steady-state response of a multirate system at each base step.
++
++        Returns the output the system settles to for a constant unit input,
++        one entry for each base step of the period.
++
++        Returns
++        -------
++        gain : 3D array
++            Array of shape (`nphases`, `noutputs`, `ninputs`) holding the
++            steady-state gain at each base step of the period.
++
++        Raises
++        ------
++        ValueError
++            If any of the subsystems is not linear, or if the steady state
++            is not unique.
++
++        """
++        if not self._linear:
++            raise ValueError("system is not linear")
++        monodromy = np.eye(self.nstates)
++        forced = np.zeros((self.nstates, self.ninputs))
++        for sys in self.phase_systems:
++            forced = sys.A @ forced + sys.B
++            monodromy = sys.A @ monodromy
++        try:
++            state = np.linalg.solve(np.eye(self.nstates) - monodromy, forced)
++        except np.linalg.LinAlgError:
++            raise ValueError("system does not have a unique steady state")
++        gain = np.zeros((self.nphases, self.noutputs, self.ninputs))
++        for phase, sys in enumerate(self.phase_systems):
++            gain[phase] = sys.C @ state + sys.D
++            state = sys.A @ state + sys.B
++        return gain
++
++
++def _base_step(value, what):
++    # A base step is identified by value, so a whole valued float counts,
++    # while one that is merely close to a whole number does not
++    try:
++        return operator.index(value)
++    except TypeError:
++        pass
++    if isinstance(value, (float, np.floating)) and float(value).is_integer():
++        return int(value)
++    raise ValueError(f"{what} is not a base step")
++
++
++def _multirate_structure(syslist):
++    # Work out the base timebase, the per-system ratios and the period of a
++    # list of systems, or None when the single rate code path already covers
++    # the list.  Continuous-time systems ride along at the base timebase; a
++    # subsystem that is itself multirate repeats after its own period, not
++    # after its sample time.
++    dtlist = [getattr(sys, 'dt', None) for sys in syslist]
++    unspecified = [dt is None or dt is True for dt in dtlist]
++    continuous = [not free and dt == 0 for dt, free in zip(dtlist, unspecified)]
++
++    sampled = [dt for dt, free, cont in zip(dtlist, unspecified, continuous)
++               if not free and not cont]
++    if not sampled:
++        return None
++    base, _, _ = commensurate_timebase(sampled)
++
++    ratios, cycles = [], []
++    for sys, dt, free, cont in zip(syslist, dtlist, unspecified, continuous):
++        rate = base if free or cont else dt
++        ratios.append(int(round(rate / base)))
++        cycles.append(getattr(sys, 'period', rate))
++    _, _, period = commensurate_timebase(cycles)
++
++    if not any(continuous) and all(ratio == 1 for ratio in ratios) and \
++       np.isclose(period, base):
++        return None
++    return base, ratios, period
++
++
++def _multirate_action(sys, ratio, offset, phase):
++    # Model in force for a subsystem at a given base step, together with
++    # whether the subsystem acts at that step.  A multirate subsystem
++    # advances through its own phases one action at a time, and keeps the
++    # model it last acted with while it holds.
++    from .statesp import StateSpace
++
++    count = (phase - offset) // ratio if phase >= offset else 0
++    acts = phase >= offset and (phase - offset) % ratio == 0
++    if not isinstance(sys, MultirateSystem):
++        return sys, acts
++
++    # Present the phase in force under the name and labels of the subsystem;
++    # the inner model keeps its own name so the wrappers below do not close
++    # over the object they are creating
++    inner = sys.phase_system(count)
++    if isinstance(inner, StateSpace):
++        model = StateSpace(
++            inner.A, inner.B, inner.C, inner.D, dt=inner.dt, name=sys.name,
++            inputs=sys.input_labels, outputs=sys.output_labels,
++            states=sys.state_labels)
++    else:
++        model = NonlinearIOSystem(
++            lambda t, x, u, params: inner.dynamics(t, x, u, params),
++            lambda t, x, u, params: inner.output(t, x, u, params),
++            dt=inner.dt, name=sys.name, inputs=sys.input_labels,
++            outputs=sys.output_labels, states=sys.state_labels)
++    return model, acts
++
++
++def _multirate_subsystem(sys, ratio, offset, phase, dt):
++    # Build the base rate model of a subsystem that acts once every `ratio`
++    # base steps, starting at step `offset`.  A subsystem that acts at every
++    # step is used as is; the others carry one extra state per input, holding
++    # the value that was read when the subsystem last acted.
++    from .statesp import StateSpace
++
++    model, acts = _multirate_action(sys, ratio, offset, phase)
++    if ratio == 1:
++        return model
++
++    nstates, ninputs = model.nstates, model.ninputs
++    noutputs = model.noutputs
++    delim = config.defaults['iosys.state_name_delim']
++    states = list(model.state_labels) + \
++        [label + delim + 'hold' for label in model.output_labels]
++
++    if not isinstance(model, StateSpace):
++        def updfcn(t, x, u, params):
++            if not acts:
++                return x
++            return np.concatenate([
++                np.asarray(model.dynamics(t, x[:nstates], u, params)),
++                np.asarray(model.output(t, x[:nstates], u, params))])
++
++        def outfcn(t, x, u, params):
++            if not acts:
++                return x[nstates:]
++            return model.output(t, x[:nstates], u, params)
++
++        return NonlinearIOSystem(
++            updfcn, outfcn, params=model.params, dt=dt, name=sys.name,
++            inputs=model.input_labels, outputs=model.output_labels,
++            states=states)
++
++    if acts:
++        A = np.block([
++            [model.A, np.zeros((nstates, noutputs))],
++            [model.C, np.zeros((noutputs, noutputs))]])
++        B = np.vstack([model.B, model.D])
++        C = np.hstack([model.C, np.zeros((noutputs, noutputs))])
++        D = model.D
++    else:
++        A = np.eye(nstates + noutputs)
++        B = np.zeros((nstates + noutputs, ninputs))
++        C = np.hstack([np.zeros((noutputs, nstates)), np.eye(noutputs)])
++        D = np.zeros((noutputs, ninputs))
++
++    return StateSpace(
++        A, B, C, D, dt=dt, name=sys.name, inputs=model.input_labels,
++        outputs=model.output_labels, states=states)
++
++
++def _multirate_offsets(offsets, ratios):
++    # Check the requested offsets against the rate of each subsystem
++    if offsets is None:
++        return [0] * len(ratios)
++    if all(ratio == 1 for ratio in ratios):
++        raise ValueError(
++            "`offsets` requires systems with different sample times")
++    if len(offsets) != len(ratios):
++        raise ValueError("`offsets` must have one entry per system")
++
++    checked = []
++    for offset, ratio in zip(offsets, ratios):
++        step = _base_step(offset, f"offset {offset}")
++        if step < 0 or step >= ratio:
++            raise ValueError(
++                f"offset {step} is out of range for a system acting every "
++                f"{ratio} steps")
++        checked.append(step)
++    return checked
++
++
++def _multirate_interconnect(syslist, base, ratios, period, offsets=None,
++                            **kwargs):
++    # Build a multirate interconnection by assembling, for each base step of
++    # the period, the interconnection of the base rate models of the
++    # subsystems at that step.  Continuous-time subsystems see signals that
++    # are constant over a base step, so they enter as their zero order hold
++    # equivalent at the base timebase.
++    from .dtime import sample_system
++    from .statesp import StateSpace, _convert_to_statespace
++    from .xferfcn import TransferFunction
++
++    prepared = []
++    for sys in syslist:
++        if isinstance(sys, TransferFunction):
++            sys = _convert_to_statespace(sys)
++        if sys.dt == 0:
++            if not isinstance(sys, StateSpace):
++                raise ValueError(
++                    f"continuous-time system '{sys.name}' must be linear to "
++                    "take part in a multirate interconnection")
++            sys = sample_system(sys, base, method='zoh', name=sys.name)
++        prepared.append(sys)
++
++    offsets = _multirate_offsets(offsets, ratios)
++    name = kwargs.pop('name', None)
++    check_unused = kwargs.pop('check_unused', True)
++    nphases = int(round(period / base))
++
++    phase_systems = []
++    for phase in range(nphases):
++        phase_list = [
++            _multirate_subsystem(sys, ratio, offset, phase, base)
++            for sys, ratio, offset in zip(prepared, ratios, offsets)]
++        phase_systems.append(interconnect(
++            phase_list, check_unused=check_unused and phase == 0,
++            name=name if nphases == 1 else 'multirate_phase',
++            warn_duplicate=False, **kwargs))
++
++    if nphases == 1:
++        return phase_systems[0]
++    return MultirateSystem(phase_systems, period, name=name)
++
++
+ def nlsys(updfcn, outfcn=None, **kwargs):
+     """Create a nonlinear input/output system.
+ 
+@@ -2336,7 +2755,8 @@ def _find_size(sysval, vecval, name="system component"):
+ def interconnect(
+         syslist, connections=None, inplist=None, outlist=None, params=None,
+         check_unused=True, add_unused=False, ignore_inputs=None,
+-        ignore_outputs=None, warn_duplicate=None, debug=False, **kwargs):
++        ignore_outputs=None, warn_duplicate=None, offsets=None, debug=False,
++        **kwargs):
+     """Interconnect a set of input/output systems.
+ 
+     This function creates a new system that is an interconnection of a set of
+@@ -2511,6 +2931,13 @@ def interconnect(
+         systems that have non-generic names.  If False, warnings are not
+         generated and if True then warnings are always generated.
+ 
++    offsets : list of int, optional
++        Base step at which each subsystem first acts, one entry per system.
++        An entry must be smaller than the number of base steps between two
++        actions of that subsystem.  Only allowed when the subsystems have
++        different sample times; the default is for every subsystem to act at
++        the first step.
++
+     debug : bool, default=False
+         Print out information about how signals are being processed that
+         may be useful in understanding why something is not working.
+@@ -2588,6 +3015,22 @@ def interconnect(
+     """
+     from .statesp import LinearICSystem, StateSpace
+ 
++    # If the subsystems have different sample times, assemble the
++    # interconnection one base step at a time instead
++    if kwargs.get('dt', None) is None:
++        multirate = _multirate_structure(syslist)
++        if multirate is not None:
++            base, ratios, period = multirate
++            return _multirate_interconnect(
++                syslist, base, ratios, period, offsets=offsets,
++                connections=connections, inplist=inplist, outlist=outlist,
++                params=params, check_unused=check_unused,
++                add_unused=add_unused, ignore_inputs=ignore_inputs,
++                ignore_outputs=ignore_outputs, debug=debug, **kwargs)
++    if offsets is not None:
++        raise ValueError(
++            "`offsets` requires systems with different sample times")
++
+     dt = kwargs.pop('dt', None)         # bypass normal 'dt' processing
+     name, inputs, outputs, states, _ = _process_iosys_keywords(kwargs)
+     connection_type = None # explicit, implicit, or None

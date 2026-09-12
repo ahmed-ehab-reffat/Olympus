@@ -1,0 +1,847 @@
+diff --git a/pyparsing/__init__.py b/pyparsing/__init__.py
+index e9418f1..bcaa3de 100644
+--- a/pyparsing/__init__.py
++++ b/pyparsing/__init__.py
+@@ -149,6 +149,7 @@ from .core import __diag__, __compat__
+ from .results import *
+ from .core import *
+ from .core import _builtin_exprs as core_builtin_exprs
++from .enumeration import EnumeratedParse
+ from .helpers import *
+ from .helpers import _builtin_exprs as helper_builtin_exprs
+ 
+@@ -255,6 +256,7 @@ __all__ = [
+     "Dict",
+     "Each",
+     "Empty",
++    "EnumeratedParse",
+     "FollowedBy",
+     "Forward",
+     "GoToColumn",
+diff --git a/pyparsing/core.py b/pyparsing/core.py
+index 3b33295..4742fc1 100644
+--- a/pyparsing/core.py
++++ b/pyparsing/core.py
+@@ -49,6 +49,11 @@ from .util import (
+ from .exceptions import *
+ from .actions import *
+ from .results import ParseResults, _ParseResultsWithOffset
++from .enumeration import (
++    enumerate_parses as _enumerate_parses,
++    enumerate_scan as _enumerate_scan,
++    enumerate_transforms as _enumerate_transforms,
++)
+ from .unicode import pyparsing_unicode
+ 
+ _MAX_INT = sys.maxsize
+@@ -1049,6 +1054,85 @@ class ParserElement(ABC):
+         else:
+             return True
+ 
++    def _enumerate_impl(
++        self, instring, loc, do_actions=True
++    ) -> Generator[ParseImplReturnType, None, None]:
++        """
++        Yield ``(end_loc, tokens)`` for every way this element matches at ``loc``,
++        most-preferred first, before results names and parse actions are applied.
++        An element with a single way to match yields the match ordinary parsing
++        makes; failure to match yields nothing.
++        """
++        yield self.parseImpl(instring, loc, do_actions)
++
++    def _finalize_parse(
++        self, instring, tokens_start, loc, tokens, do_actions
++    ) -> ParseResults:
++        """
++        Apply ``postParse``, the results name and the parse actions to one raw
++        parse, exactly as ``_parseNoCache`` does for the single-parse path.
++        """
++        tokens = self.postParse(instring, loc, tokens)
++        ret_tokens = ParseResults(
++            tokens, self.resultsName, aslist=self.saveAsList, modal=self.modalResults
++        )
++        if not (self.parseAction and (do_actions or self.callDuringTry)):
++            return ret_tokens
++
++        for fn in self.parseAction:
++            try:
++                tokens = fn(instring, tokens_start, ret_tokens)  # type: ignore [call-arg, arg-type]
++            except IndexError as parse_action_exc:
++                exc = ParseException("exception raised in parse action")
++                raise exc from parse_action_exc
++
++            if tokens is not None and tokens is not ret_tokens:
++                ret_tokens = ParseResults(
++                    tokens,
++                    self.resultsName,
++                    aslist=self.saveAsList
++                    and isinstance(tokens, (ParseResults, list)),
++                    modal=self.modalResults,
++                )
++        return ret_tokens
++
++    def _enumerate(
++        self, instring, loc, do_actions=True, callPreParse=True
++    ) -> Generator[tuple[int, int, ParseResults], None, None]:
++        """
++        Yield ``(start_loc, end_loc, tokens)`` for every parse of this element at
++        ``loc``.  Each raw parse is finalized as it is produced, so a parse action
++        or condition runs once per yielded parse; one that rejects its parse
++        removes that parse alone and enumeration continues with the next.
++        """
++        if callPreParse and self.callPreparse:
++            pre_loc = self.preParse(instring, loc)
++        else:
++            pre_loc = loc
++        tokens_start = pre_loc
++
++        raw_parses = self._enumerate_impl(instring, pre_loc, do_actions)
++        while True:
++            try:
++                end_loc, tokens = next(raw_parses)
++            except StopIteration:
++                return
++            except ParseFatalException:
++                raise
++            except (ParseException, IndexError):
++                return
++
++            try:
++                ret_tokens = self._finalize_parse(
++                    instring, tokens_start, end_loc, tokens, do_actions
++                )
++            except ParseFatalException:
++                raise
++            except (ParseException, IndexError):
++                continue
++
++            yield tokens_start, end_loc, ret_tokens
++
+     # cache for left-recursion in Forward references
+     recursion_lock = RLock()
+     recursion_memos: collections.abc.MutableMapping[
+@@ -1086,6 +1170,10 @@ class ParserElement(ABC):
+ 
+     # class-level argument cache for optimizing repeated calls when backtracking
+     # through recursive expressions
++    # locations at which a Forward is currently being enumerated, used to cut
++    # recursion cycles that would otherwise never terminate
++    _enumerations_in_progress: set[tuple[int, int]] = set()
++
+     packrat_cache: _CacheType = NullCache()
+     packrat_cache_lock = RLock()
+     packrat_cache_stats = [0, 0]
+@@ -1463,6 +1551,90 @@ class ParserElement(ABC):
+             # catch and re-raise exception from here, clears out pyparsing internal stack trace
+             raise exc.with_traceback(None)
+ 
++    def enumerate_parses(
++        self,
++        instring: str,
++        *,
++        parse_all: bool = False,
++        max_parses: typing.Optional[int] = None,
++        unique: bool = False,
++    ) -> Generator[tuple[ParseResults, int, int], None, None]:
++        """
++        Enumerate every parse of this expression at the start of ``instring``,
++        yielding ``(tokens, start, end)`` for each, most-preferred parse first.
++
++        An expression built from alternations, repetitions or optional elements can
++        match the same text in more than one way; :class:`parse_string` returns only
++        the first of those matches, while this method walks all of them.  Parses are
++        produced on demand, so parse actions run only for the parses that are
++        actually yielded.  With ``parse_all`` = True only parses that reach the end
++        of the input are yielded.  ``max_parses`` stops the enumeration after that
++        many parses.
++
++        Example:
++
++        .. testcode::
++
++            expr = Word(alphas)[1, ...]
++            for tokens, start, end in expr.enumerate_parses("spam ham eggs"):
++                print(tokens.as_list(), end)
++
++        prints:
++
++        .. testoutput::
++
++            ['spam', 'ham', 'eggs'] 13
++            ['spam', 'ham'] 8
++            ['spam'] 4
++        """
++        return _enumerate_parses(
++            self,
++            instring,
++            parse_all=parse_all,
++            max_parses=max_parses,
++            unique=unique,
++        )
++
++    def enumerate_scan(
++        self,
++        instring: str,
++        *,
++        max_parses: typing.Optional[int] = None,
++        overlap: bool = False,
++        unique: bool = False,
++    ) -> Generator[tuple[ParseResults, int, int], None, None]:
++        """
++        Scan ``instring`` for locations where this expression matches, and enumerate
++        every parse at each of them, yielding ``(tokens, start, end)`` for each.
++
++        Scanning advances as it does in :class:`scan_string`: past the end of the
++        first parse reported at a location, or one character on from the start of
++        that location when ``overlap`` = True.
++        """
++        return _enumerate_scan(
++            self,
++            instring,
++            max_parses=max_parses,
++            overlap=overlap,
++            unique=unique,
++        )
++
++    def enumerate_transforms(
++        self,
++        instring: str,
++        *,
++        max_parses: typing.Optional[int] = None,
++    ) -> Generator[str, None, None]:
++        """
++        Enumerate the strings :class:`transform_string` could produce, yielding each
++        distinct one once.
++
++        ``transform_string`` rewrites every match it finds using the first parse
++        available at that location; where an expression matches in more than one way
++        there is more than one such rewriting, and this method walks all of them.
++        """
++        return _enumerate_transforms(self, instring, max_parses=max_parses)
++
+     def transform_string(self, instring: str, *, debug: bool = False) -> str:
+         """
+         Extension to :class:`scan_string`, to modify matching text with modified tokens that may
+@@ -4651,6 +4823,34 @@ class And(ParseExpression):
+             resultlist += exprtokens
+         return loc, resultlist
+ 
++    def _enumerate_impl(self, instring, loc, do_actions=True):
++        exprs = list(self.exprs or (Empty(),))
++
++        def match_from(index, cur_loc, tokens, error_stop):
++            while index < len(exprs) and type(exprs[index]) is And._ErrorStop:
++                error_stop = True
++                index += 1
++
++            if index >= len(exprs):
++                yield cur_loc, tokens
++                return
++
++            matched = False
++            for _, next_loc, exprtokens in exprs[index]._enumerate(
++                instring, cur_loc, do_actions, callPreParse=index > 0
++            ):
++                matched = True
++                yield from match_from(
++                    index + 1, next_loc, tokens + exprtokens, error_stop
++                )
++
++            if error_stop and not matched:
++                raise ParseSyntaxException(
++                    ParseException(instring, cur_loc, self.errmsg, self)
++                )
++
++        yield from match_from(0, loc, ParseResults([]), False)
++
+     def __iadd__(self, other):
+         if isinstance(other, str_type):
+             other = self._literalStringClass(other)
+@@ -4801,6 +5001,58 @@ class Or(ParseExpression):
+ 
+         raise ParseException(instring, loc, "no defined alternatives to match", self)
+ 
++    def _enumerate_impl(self, instring, loc, do_actions=True):
++        if all(e.callPreparse for e in self.exprs):
++            loc = self.preParse(instring, loc)
++
++        # order the alternatives from a pass that runs no parse actions, the way
++        # parseImpl measures match lengths before committing to an alternative
++        planned = []
++        for alt_index, e in enumerate(self.exprs):
++            for alt_order, (_, end_loc, _) in enumerate(
++                e._enumerate(instring, loc, False)
++            ):
++                planned.append((-end_loc, alt_index, alt_order))
++        planned.sort()
++
++        if not do_actions:
++            for _, alt_index, alt_order in planned:
++                yield from self._enumerate_planned(
++                    instring, loc, alt_index, alt_order, False, {}, {}
++                )
++            return
++
++        streams: dict = {}
++        produced: dict = {}
++        for _, alt_index, alt_order in planned:
++            yield from self._enumerate_planned(
++                instring, loc, alt_index, alt_order, True, streams, produced
++            )
++
++    def _enumerate_planned(
++        self, instring, loc, alt_index, alt_order, do_actions, streams, produced
++    ):
++        """
++        Yield the ``alt_order``-th parse of alternative ``alt_index``, finalizing it
++        only now.  Parses already drawn from that alternative are kept so that each
++        one is finalized once however often the plan revisits the alternative.
++        """
++        if alt_index not in streams:
++            streams[alt_index] = self.exprs[alt_index]._enumerate(
++                instring, loc, do_actions
++            )
++            produced[alt_index] = []
++
++        parses = produced[alt_index]
++        while len(parses) <= alt_order:
++            try:
++                _, end_loc, tokens = next(streams[alt_index])
++            except StopIteration:
++                return
++            parses.append((end_loc, tokens))
++
++        yield parses[alt_order]
++
+     def __ixor__(self, other):
+         if isinstance(other, str_type):
+             other = self._literalStringClass(other)
+@@ -4913,6 +5165,11 @@ class MatchFirst(ParseExpression):
+ 
+         raise ParseException(instring, loc, "no defined alternatives to match", self)
+ 
++    def _enumerate_impl(self, instring, loc, do_actions=True):
++        for e in self.exprs:
++            for _, end_loc, tokens in e._enumerate(instring, loc, do_actions):
++                yield end_loc, tokens
++
+     def __ior__(self, other):
+         if isinstance(other, str_type):
+             other = self._literalStringClass(other)
+@@ -5128,6 +5385,27 @@ class Each(ParseExpression):
+ 
+         return loc, total_results
+ 
++    def _enumerate_impl(self, instring, loc, do_actions=True):
++        if any(
++            isinstance(e, (Opt, _MultipleMatch)) or e.mayReturnEmpty for e in self.exprs
++        ):
++            yield self.parseImpl(instring, loc, do_actions)
++            return
++
++        def match_from(cur_loc, remaining, tokens):
++            if not remaining:
++                yield cur_loc, tokens
++                return
++
++            for index in remaining:
++                rest = [i for i in remaining if i != index]
++                for _, end_loc, exprtokens in self.exprs[index]._enumerate(
++                    instring, cur_loc, do_actions
++                ):
++                    yield from match_from(end_loc, rest, tokens + exprtokens)
++
++        yield from match_from(loc, list(range(len(self.exprs))), ParseResults([]))
++
+     def _generateDefaultName(self) -> str:
+         return f"{{{' & '.join(str(e) for e in self.exprs)}}}"
+ 
+@@ -5180,6 +5458,20 @@ class ParseElementEnhance(ParserElement):
+                     pbe.msg = self.errmsg
+             raise
+ 
++    def _enumerate_contained(self, instring, loc, do_actions=True):
++        """
++        Yield one parse for every parse of the contained expression, leaving the
++        transformation of each to ``postParse``.  Used by the classes that pass
++        their contained expression through unchanged.
++        """
++        if self.expr is None:
++            raise ParseException(instring, loc, "No expression defined", self)
++
++        for _, end_loc, tokens in self.expr._enumerate(
++            instring, loc, do_actions, callPreParse=False
++        ):
++            yield end_loc, tokens
++
+     def leave_whitespace(self, recursive: bool = True) -> ParserElement:
+         """
+         Extends ``leave_whitespace`` defined in base class, and also invokes ``leave_whitespace`` on
+@@ -5400,6 +5692,11 @@ class AtStringStart(ParseElementEnhance):
+             raise ParseException(instring, loc, "not found at string start")
+         return super().parseImpl(instring, loc, do_actions)
+ 
++    def _enumerate_impl(self, instring, loc, do_actions=True):
++        if loc != 0:
++            return
++        yield from self._enumerate_contained(instring, loc, do_actions)
++
+ 
+ class AtLineStart(ParseElementEnhance):
+     r"""Matches if an expression matches at the beginning of a line within
+@@ -5436,6 +5733,11 @@ class AtLineStart(ParseElementEnhance):
+             raise ParseException(instring, loc, "not found at line start")
+         return super().parseImpl(instring, loc, do_actions)
+ 
++    def _enumerate_impl(self, instring, loc, do_actions=True):
++        if col(loc, instring) != 1:
++            return
++        yield from self._enumerate_contained(instring, loc, do_actions)
++
+ 
+ class FollowedBy(ParseElementEnhance):
+     """Lookahead matching of the given parse expression.
+@@ -5480,6 +5782,12 @@ class FollowedBy(ParseElementEnhance):
+ 
+         return loc, ret
+ 
++    def _enumerate_impl(self, instring, loc, do_actions=True):
++        for _, _, ret in self.expr._enumerate(instring, loc, do_actions):
++            del ret[:]
++            yield loc, ret
++            return
++
+ 
+ class PrecededBy(ParseElementEnhance):
+     """Lookbehind matching of the given parse expression.
+@@ -5611,6 +5919,17 @@ class Located(ParseElementEnhance):
+         else:
+             return loc, ret_tokens
+ 
++    def _enumerate_impl(self, instring, loc, do_actions=True):
++        start = self.expr.preParse(instring, loc)
++        for _, end_loc, tokens in self.expr._enumerate(
++            instring, start, do_actions, callPreParse=False
++        ):
++            ret_tokens = ParseResults([start, tokens, end_loc])
++            ret_tokens["locn_start"] = start
++            ret_tokens["value"] = tokens
++            ret_tokens["locn_end"] = end_loc
++            yield end_loc, [ret_tokens] if self.resultsName else ret_tokens
++
+ 
+ class NotAny(ParseElementEnhance):
+     """
+@@ -5653,11 +5972,18 @@ class NotAny(ParseElementEnhance):
+             raise ParseException(instring, loc, self.errmsg, self)
+         return loc, []
+ 
++    def _enumerate_impl(self, instring, loc, do_actions=True):
++        for _ in self.expr._enumerate(instring, loc, False):
++            return
++        yield loc, []
++
+     def _generateDefaultName(self) -> str:
+         return f"~{{{self.expr}}}"
+ 
+ 
+ class _MultipleMatch(ParseElementEnhance):
++    _enumerate_min_reps = 1
++
+     def __init__(
+         self,
+         expr: Union[str, ParserElement],
+@@ -5713,6 +6039,41 @@ class _MultipleMatch(ParseElementEnhance):
+ 
+         return loc, tokens
+ 
++    def _enumerate_impl(self, instring, loc, do_actions=True):
++        check_ender = self.not_ender is not None
++        has_ignore_exprs = bool(self.ignoreExprs)
++        min_reps = self._enumerate_min_reps
++
++        def match_from(cur_loc, tokens, reps):
++            if check_ender:
++                try:
++                    self.not_ender.try_parse(instring, cur_loc)
++                except (ParseException, IndexError):
++                    if reps >= min_reps:
++                        yield cur_loc, tokens
++                    return
++
++            if has_ignore_exprs and reps:
++                pre_loc = self._skipIgnorables(instring, cur_loc)
++            else:
++                pre_loc = cur_loc
++
++            for _, end_loc, exprtokens in self.expr._enumerate(
++                instring, pre_loc, do_actions
++            ):
++                if end_loc <= cur_loc:
++                    # a body match consuming nothing counts as one repetition and
++                    # then ends the repetition, wherever in the run it occurs
++                    if reps + 1 >= min_reps:
++                        yield end_loc, tokens + exprtokens
++                    continue
++                yield from match_from(end_loc, tokens + exprtokens, reps + 1)
++
++            if reps >= min_reps:
++                yield cur_loc, tokens
++
++        yield from match_from(loc, ParseResults([]), 0)
++
+     def _setResultsName(self, name, list_all_matches=False) -> ParserElement:
+         if (
+             __diag__.warn_ungrouped_named_tokens_in_collection
+@@ -5798,6 +6159,8 @@ class ZeroOrMore(_MultipleMatch):
+     Example: similar to :class:`OneOrMore`
+     """
+ 
++    _enumerate_min_reps = 0
++
+     def __init__(
+         self,
+         expr: Union[str, ParserElement],
+@@ -5845,6 +6208,8 @@ class DelimitedList(ParseElementEnhance):
+     .. versionadded:: 3.1.0
+     """
+ 
++    _enumerate_impl = ParseElementEnhance._enumerate_contained
++
+     def __init__(
+         self,
+         expr: Union[str, ParserElement],
+@@ -5975,6 +6340,24 @@ class Opt(ParseElementEnhance):
+                 tokens = []  # type: ignore[assignment]
+         return loc, tokens
+ 
++    def _enumerate_impl(self, instring, loc, do_actions=True):
++        for _, end_loc, tokens in self.expr._enumerate(
++            instring, loc, do_actions, callPreParse=False
++        ):
++            yield end_loc, tokens
++
++        default_value = self.defaultValue
++        if default_value is self.__optionalNotMatched:
++            yield loc, []
++            return
++
++        if self.expr.resultsName:
++            tokens = ParseResults([default_value])
++            tokens[self.expr.resultsName] = default_value
++        else:
++            tokens = [default_value]  # type: ignore[assignment]
++        yield loc, tokens
++
+     def _generateDefaultName(self) -> str:
+         inner = str(self.expr)
+         # strip off redundant inner {}'s
+@@ -6151,6 +6534,47 @@ class SkipTo(ParseElementEnhance):
+ 
+         return loc, skipresult
+ 
++    def _enumerate_impl(self, instring, loc, do_actions=True):
++        startloc = loc
++        instrlen = len(instring)
++        fail_on_can_parse_next = (
++            self.failOn.can_parse_next if self.failOn is not None else None
++        )
++        ignorer_try_parse = self.ignorer.try_parse if self.ignorer.ignoreExprs else None
++
++        tmploc = loc
++        while tmploc <= instrlen:
++            if fail_on_can_parse_next is not None and fail_on_can_parse_next(
++                instring, tmploc
++            ):
++                return
++
++            if ignorer_try_parse is not None:
++                prev_tmploc = tmploc
++                while 1:
++                    try:
++                        tmploc = ignorer_try_parse(instring, tmploc)
++                    except ParseBaseException:
++                        break
++                    if tmploc == prev_tmploc:
++                        break
++                    prev_tmploc = tmploc
++
++            if not self.expr.can_parse_next(instring, tmploc, do_actions=False):
++                tmploc += 1
++                continue
++
++            skipresult = ParseResults(instring[startloc:tmploc])
++            if not self.includeMatch:
++                yield tmploc, skipresult
++            else:
++                for _, end_loc, mat in self.expr._enumerate(
++                    instring, tmploc, do_actions, callPreParse=False
++                ):
++                    yield end_loc, skipresult + mat
++
++            tmploc += 1
++
+ 
+ class Forward(ParseElementEnhance):
+     """
+@@ -6184,6 +6608,18 @@ class Forward(ParseElementEnhance):
+     parser created using :class:`Forward`.
+     """
+ 
++    def _enumerate_impl(self, instring, loc, do_actions=True):
++        recursion_key = (id(self), loc)
++        active = ParserElement._enumerations_in_progress
++        if recursion_key in active:
++            return
++
++        active.add(recursion_key)
++        try:
++            yield from self._enumerate_contained(instring, loc, do_actions)
++        finally:
++            active.discard(recursion_key)
++
+     def __init__(
+         self, other: typing.Optional[Union[ParserElement, str]] = None
+     ) -> None:
+@@ -6442,6 +6878,8 @@ class TokenConverter(ParseElementEnhance):
+     Abstract subclass of :class:`ParseElementEnhance`, for converting parsed results.
+     """
+ 
++    _enumerate_impl = ParseElementEnhance._enumerate_contained
++
+     def __init__(self, expr: Union[ParserElement, str], savelist=False) -> None:
+         super().__init__(expr)  # , savelist)
+         self.saveAsList = False
+diff --git a/pyparsing/enumeration.py b/pyparsing/enumeration.py
+new file mode 100644
+index 0000000..d3942a0
+--- /dev/null
++++ b/pyparsing/enumeration.py
+@@ -0,0 +1,227 @@
++# enumeration.py
++"""
++Drivers for enumerating every parse of an expression.
++
++An expression built from alternations, repetitions and optional elements can
++often match the same text in more than one way.  Ordinary parsing commits to
++the first of those matches; the drivers here walk all of them, most-preferred
++first, using the ``_enumerate`` protocol implemented by the expression classes
++in :mod:`pyparsing.core`.
++"""
++
++from __future__ import annotations
++
++import typing
++
++from .exceptions import ParseBaseException
++from .results import ParseResults
++
++if typing.TYPE_CHECKING:
++    from .core import ParserElement
++
++EnumeratedParse = typing.Tuple[ParseResults, int, int]
++
++
++def _streamlined(expr: ParserElement, instring: str) -> str:
++    if not expr.streamlined:
++        expr.streamline()
++    for e in expr.ignoreExprs:
++        e.streamline()
++    if not expr.keepTabs:
++        instring = str(instring).expandtabs()
++    return instring
++
++
++def _signature(tokens) -> typing.Any:
++    """
++    Build a hashable structural key for one parse: its token values, nested
++    structure and named results, so that two parses producing the same tokens
++    compare equal however they were derived.
++    """
++    if not isinstance(tokens, ParseResults):
++        return repr(tokens)
++
++    values = tuple(_signature(tok) for tok in tokens)
++    named = tuple(
++        sorted((name, _signature(value)) for name, value in tokens.as_dict().items())
++    )
++    return values, named
++
++
++def _reaches_end(expr: ParserElement, instring: str, loc: int) -> bool:
++    from .core import Empty, StringEnd
++
++    end_of_text = Empty() + StringEnd().set_debug(False)
++    try:
++        end_of_text._parse(instring, expr.preParse(instring, loc))
++    except ParseBaseException:
++        return False
++    return True
++
++
++def enumerate_parses(
++    expr: ParserElement,
++    instring: str,
++    *,
++    parse_all: bool = False,
++    max_parses: typing.Optional[int] = None,
++    unique: bool = False,
++) -> typing.Generator[EnumeratedParse, None, None]:
++    """
++    Yield ``(tokens, start, end)`` for every parse of ``expr`` at the start of
++    ``instring``, most-preferred parse first.
++    """
++    from .core import ParserElement as PE, _ParseActionIndexError
++
++    if max_parses is not None and max_parses <= 0:
++        return
++
++    instring = _streamlined(expr, instring)
++    PE.reset_cache()
++    produced = 0
++    seen: set = set()
++    try:
++        for start, end, tokens in expr._enumerate(instring, 0, True):
++            if parse_all and not _reaches_end(expr, instring, end):
++                continue
++            if unique:
++                signature = (end, _signature(tokens))
++                if signature in seen:
++                    continue
++                seen.add(signature)
++            yield tokens, start, end
++            produced += 1
++            if max_parses is not None and produced >= max_parses:
++                return
++    except _ParseActionIndexError as pa_exc:
++        raise pa_exc.exc
++    except ParseBaseException as exc:
++        if PE.verbose_stacktrace:
++            raise
++        raise exc.with_traceback(None)
++
++
++def enumerate_transforms(
++    expr: ParserElement,
++    instring: str,
++    *,
++    max_parses: typing.Optional[int] = None,
++) -> typing.Generator[str, None, None]:
++    """
++    Yield every distinct string that :class:`transform_string` could produce, one
++    per combination of parses chosen at the locations where ``expr`` matches.
++    """
++    from .core import Empty, ParserElement as PE, _ParseActionIndexError
++    from .util import _flatten
++
++    if max_parses is not None and max_parses <= 0:
++        return
++
++    expr.keepTabs = True
++    instring = _streamlined(expr, instring)
++    preparser = Empty()
++    preparser.ignoreExprs = expr.ignoreExprs
++    preparser.whiteChars = expr.whiteChars
++    instrlen = len(instring)
++
++    def replacement(tokens) -> str:
++        if isinstance(tokens, ParseResults):
++            parts: list = tokens.as_list()
++        elif isinstance(tokens, str):
++            parts = [tokens]
++        else:
++            parts = list(tokens)
++        return "".join(str(part) for part in _flatten(parts))
++
++    def transforms_from(loc, parts):
++        search_loc = loc
++        while search_loc <= instrlen:
++            pre_loc = preparser.preParse(instring, search_loc)
++            matched = False
++            for _, end, tokens in expr._enumerate(
++                instring, pre_loc, True, callPreParse=False
++            ):
++                if end <= search_loc:
++                    continue
++                matched = True
++                yield from transforms_from(
++                    end, parts + [instring[loc:pre_loc], replacement(tokens)]
++                )
++            if matched:
++                return
++            search_loc = pre_loc + 1
++
++        yield "".join(part for part in parts + [instring[loc:]] if part)
++
++    produced = 0
++    seen: set = set()
++    try:
++        for transformed in transforms_from(0, []):
++            if transformed in seen:
++                continue
++            seen.add(transformed)
++            yield transformed
++            produced += 1
++            if max_parses is not None and produced >= max_parses:
++                return
++    except _ParseActionIndexError as pa_exc:
++        raise pa_exc.exc
++    except ParseBaseException as exc:
++        if PE.verbose_stacktrace:
++            raise
++        raise exc.with_traceback(None)
++
++
++def enumerate_scan(
++    expr: ParserElement,
++    instring: str,
++    *,
++    max_parses: typing.Optional[int] = None,
++    overlap: bool = False,
++    unique: bool = False,
++) -> typing.Generator[EnumeratedParse, None, None]:
++    """
++    Yield ``(tokens, start, end)`` for every parse of ``expr`` at every location
++    in ``instring`` where it matches, scanning from left to right.
++    """
++    from .core import Empty, ParserElement as PE, _ParseActionIndexError
++
++    instring = _streamlined(expr, instring)
++    preparser = Empty()
++    preparser.ignoreExprs = expr.ignoreExprs
++    preparser.whiteChars = expr.whiteChars
++    instrlen = len(instring)
++    loc = 0
++    produced = 0
++    PE.reset_cache()
++    try:
++        while loc <= instrlen and (max_parses is None or produced < max_parses):
++            pre_loc = preparser.preParse(instring, loc)
++            first_end: typing.Optional[int] = None
++            seen: set = set()
++            for start, end, tokens in expr._enumerate(
++                instring, pre_loc, True, callPreParse=False
++            ):
++                if end <= loc:
++                    continue
++                if first_end is None:
++                    first_end = end
++                if unique:
++                    signature = (end, _signature(tokens))
++                    if signature in seen:
++                        continue
++                    seen.add(signature)
++                yield tokens, start, end
++                produced += 1
++                if max_parses is not None and produced >= max_parses:
++                    return
++            if first_end is None or overlap:
++                loc = pre_loc + 1
++            else:
++                loc = first_end
++    except _ParseActionIndexError as pa_exc:
++        raise pa_exc.exc
++    except ParseBaseException as exc:
++        if PE.verbose_stacktrace:
++            raise
++        raise exc.with_traceback(None)

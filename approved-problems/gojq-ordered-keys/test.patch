@@ -1,0 +1,1612 @@
+diff --git a/cli/orderedkeys_a4b712_test.go b/cli/orderedkeys_a4b712_test.go
+new file mode 100644
+index 0000000..f30dd60
+--- /dev/null
++++ b/cli/orderedkeys_a4b712_test.go
+@@ -0,0 +1,1565 @@
++//go:build orderedkeys
++
++package cli
++
++import (
++	"os"
++	"path/filepath"
++	"regexp"
++	"runtime"
++	"slices"
++	"strings"
++	"testing"
++
++	"github.com/itchyny/gojq"
++)
++
++// orderedLibraryValue runs a query through the public library API and returns
++// its single result, so that the value can be handed to another query.
++func orderedLibraryValue(t *testing.T, query string, input any) any {
++	t.Helper()
++	q, err := gojq.Parse(query)
++	if err != nil {
++		t.Fatal(err)
++	}
++	code, err := gojq.Compile(q)
++	if err != nil {
++		t.Fatal(err)
++	}
++	iter := code.Run(input)
++	v, ok := iter.Next()
++	if !ok {
++		t.Fatalf("query %s produced nothing", query)
++	}
++	if err, ok := v.(error); ok {
++		t.Fatal(err)
++	}
++	if _, ok := iter.Next(); ok {
++		t.Fatalf("query %s produced more than one value", query)
++	}
++	return v
++}
++
++// orderedLibrary runs a query through the public library API over a value the
++// caller built in Go, so that an object with no order to keep goes in.
++func orderedLibrary(t *testing.T, query string, input any, expected string) {
++	t.Helper()
++	q, err := gojq.Parse(query)
++	if err != nil {
++		t.Fatal(err)
++	}
++	code, err := gojq.Compile(q)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var got []any
++	iter := code.Run(input)
++	for {
++		v, ok := iter.Next()
++		if !ok {
++			break
++		}
++		if err, ok := v.(error); ok {
++			t.Fatal(err)
++		}
++		got = append(got, v)
++	}
++	bs, err := gojq.Marshal(got)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(bs) != expected {
++		t.Fatalf("query %s\ngot  %s\nwant %s", query, bs, expected)
++	}
++}
++
++// orderedRunFull runs a query and returns what it wrote to standard output
++// along with the exit code, for comparing one invocation against another.
++func orderedRunFull(t *testing.T, args []string, input string) (string, int) {
++	t.Helper()
++	var outStream, errStream strings.Builder
++	c := cli{
++		inStream:  newStringReader(input),
++		outStream: &outStream,
++		errStream: &errStream,
++	}
++	code := c.run(args)
++	return outStream.String(), code
++}
++
++// orderedRejectsLikePlain checks that input the existing decoder rejects is
++// rejected the same way when the key order is kept, and that neither route
++// writes a value first.
++func orderedRejectsLikePlain(t *testing.T, args, plainArgs []string, input string) {
++	t.Helper()
++	got, code := orderedRunFull(t, args, input)
++	want, plainCode := orderedRunFull(t, plainArgs, input)
++	if plainCode == 0 {
++		t.Fatalf("input %s\nexpected the plain run to fail", input)
++	}
++	if code != plainCode {
++		t.Fatalf("input %s\nordered exited %d, plain exited %d", input, code, plainCode)
++	}
++	if got != "" || want != "" {
++		t.Fatalf("input %s\nordered wrote %q, plain wrote %q", input, got, want)
++	}
++}
++
++// orderedRunStderr runs a query which is expected to stop the program and
++// returns what it wrote to standard error along with the exit code.
++func orderedRunStderr(t *testing.T, args []string, input string) (string, int) {
++	t.Helper()
++	var outStream, errStream strings.Builder
++	c := cli{
++		inStream:  newStringReader(input),
++		outStream: &outStream,
++		errStream: &errStream,
++	}
++	code := c.run(args)
++	if s := outStream.String(); s != "" {
++		t.Fatalf("args %v\nstandard output: %s", args, s)
++	}
++	return errStream.String(), code
++}
++
++// orderedSameAsPlain checks that a run with the option produces exactly what
++// the same input produces without it, so that a rule the repository already
++// implements can be asserted as unchanged rather than restated.
++func orderedSameAsPlain(t *testing.T, args, plainArgs []string, input string) {
++	t.Helper()
++	got := orderedRun(t, args, input)
++	want := orderedRun(t, plainArgs, input)
++	if got != want {
++		t.Fatalf("args %v\ninput %s\ngot  %q\nwant %q", args, input, got, want)
++	}
++}
++
++var orderedKeyPattern = regexp.MustCompile(`"([a-z]+)":`)
++
++// orderedKeySequence returns the object keys a run printed, in the order they
++// were printed, so that one output layout can be compared against another
++// without pinning any whitespace.
++func orderedKeySequence(t *testing.T, args []string, input string) []string {
++	t.Helper()
++	var keys []string
++	for _, m := range orderedKeyPattern.FindAllStringSubmatch(orderedRun(t, args, input), -1) {
++		keys = append(keys, m[1])
++	}
++	return keys
++}
++
++var orderedANSI = regexp.MustCompile("\x1b\\[[0-9;]*m")
++
++// orderedColored checks that colored output carries the same keys in the same
++// order as the uncolored form, and that it really is colored.
++func orderedColored(t *testing.T, args []string, input, expected string) {
++	t.Helper()
++	got := orderedRun(t, args, input)
++	if !strings.Contains(got, "\x1b[") {
++		t.Fatalf("args %v\noutput carries no color escapes: %q", args, got)
++	}
++	if plain := orderedANSI.ReplaceAllString(got, ""); plain != expected {
++		t.Fatalf("args %v\ngot  %q\nwant %q", args, plain, expected)
++	}
++}
++
++// orderedExitCode runs a query which is expected to fail and returns the exit
++// code, so that a function can be compared against an established one without
++// depending on the wording of the message.
++func orderedExitCode(t *testing.T, args []string, input string) int {
++	t.Helper()
++	var outStream, errStream strings.Builder
++	c := cli{
++		inStream:  newStringReader(input),
++		outStream: &outStream,
++		errStream: &errStream,
++	}
++	code := c.run(args)
++	if code == 0 {
++		t.Fatalf("args %v\ninput %s\nexpected a non-zero exit code", args, input)
++	}
++	if s := outStream.String(); s != "" {
++		t.Fatalf("args %v\ninput %s\nstandard output: %s", args, input, s)
++	}
++	if s := errStream.String(); s == "" {
++		t.Fatalf("args %v\ninput %s\nexpected a message on standard error", args, input)
++	}
++	return code
++}
++
++// orderedErrorsLikeKeys checks that a failing input fails the same way for the
++// new function as for the established one.
++func orderedErrorsLikeKeys(t *testing.T, input string) {
++	t.Helper()
++	got := orderedExitCode(t, []string{"-c", "--ordered-keys", "keys_unsorted"}, input)
++	want := orderedExitCode(t, []string{"-c", "keys"}, input)
++	if got != want {
++		t.Fatalf("input %s\nkeys_unsorted exited %d, keys exited %d", input, got, want)
++	}
++}
++
++// orderedStderr runs a query and returns what it wrote to standard error, for
++// the paths which print there.
++func orderedStderr(t *testing.T, args []string, input string) string {
++	t.Helper()
++	var outStream, errStream strings.Builder
++	c := cli{
++		inStream:  newStringReader(input),
++		outStream: &outStream,
++		errStream: &errStream,
++	}
++	if code := c.run(args); code != 0 {
++		t.Fatalf("args %v\nexit code: %d", args, code)
++	}
++	return errStream.String()
++}
++
++func writeOrderedFile(t *testing.T, contents string) string {
++	t.Helper()
++	name := filepath.Join(t.TempDir(), "input.json")
++	if err := os.WriteFile(name, []byte(contents+"\n"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	return name
++}
++
++func orderedRun(t *testing.T, args []string, input string) string {
++	t.Helper()
++	var outStream, errStream strings.Builder
++	c := cli{
++		inStream:  newStringReader(input),
++		outStream: &outStream,
++		errStream: &errStream,
++	}
++	code := c.run(args)
++	if s := errStream.String(); s != "" {
++		t.Fatalf("args %v\nstandard error output: %s", args, s)
++	}
++	if code != 0 {
++		t.Fatalf("args %v\nexit code: %d", args, code)
++	}
++	return outStream.String()
++}
++
++func assertOrdered(t *testing.T, query, input, expected string) {
++	t.Helper()
++	got := orderedRun(t, []string{"-c", "--ordered-keys", query}, input)
++	if got != expected {
++		t.Fatalf("query %s\ninput %s\ngot  %q\nwant %q", query, input, got, expected)
++	}
++}
++
++func orderedArgs(t *testing.T, args []string, input, expected string) {
++	t.Helper()
++	got := orderedRun(t, args, input)
++	if got != expected {
++		t.Fatalf("args %v\ninput %s\ngot  %q\nwant %q", args, input, got, expected)
++	}
++}
++
++const objInput = `{"b":1,"a":2}`
++
++// wideInput has enough keys that a result built from Go map iteration order
++// almost never comes out in the order of the input.
++const wideInput = `{"e":1,"d":2,"c":3,"b":4,"a":5,"j":6}`
++
++func TestOrderedKeysIdentity(t *testing.T) {
++	assertOrdered(t, ".", objInput, "{\"b\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysThreeKeys(t *testing.T) {
++	assertOrdered(t, ".", `{"z":1,"m":2,"a":3}`, "{\"z\":1,\"m\":2,\"a\":3}\n")
++}
++
++func TestOrderedKeysNestedObject(t *testing.T) {
++	assertOrdered(t, ".", `{"b":{"d":1,"c":2},"a":3}`, "{\"b\":{\"d\":1,\"c\":2},\"a\":3}\n")
++}
++
++func TestOrderedKeysObjectInArray(t *testing.T) {
++	assertOrdered(t, ".", `[{"b":1,"a":2}]`, "[{\"b\":1,\"a\":2}]\n")
++}
++
++func TestOrderedKeysEmptyObject(t *testing.T) {
++	assertOrdered(t, ".", `{}`, "{}\n")
++}
++
++func TestOrderedKeysDuplicateKeyKeepsFirstPosition(t *testing.T) {
++	assertOrdered(t, ".", `{"a":1,"b":2,"a":3}`, "{\"a\":3,\"b\":2}\n")
++}
++
++func TestOrderedKeysDeepNesting(t *testing.T) {
++	assertOrdered(t, ".", `{"c":{"b":{"a":1,"z":2}}}`, "{\"c\":{\"b\":{\"a\":1,\"z\":2}}}\n")
++}
++
++func TestOrderedKeysManyKeys(t *testing.T) {
++	assertOrdered(t, "keys_unsorted",
++		`{"e":1,"d":2,"c":3,"b":4,"a":5,"j":6,"i":7,"h":8}`,
++		"[\"e\",\"d\",\"c\",\"b\",\"a\",\"j\",\"i\",\"h\"]\n")
++}
++
++func TestOrderedKeysUnicodeKeys(t *testing.T) {
++	assertOrdered(t, "keys_unsorted", `{"é":1,"a":2}`, "[\"é\",\"a\"]\n")
++}
++
++func TestOrderedKeysNumericLookingKeys(t *testing.T) {
++	assertOrdered(t, "keys_unsorted", `{"10":1,"9":2,"1":3}`, "[\"10\",\"9\",\"1\"]\n")
++}
++
++func TestOrderedKeysEmptyStringKey(t *testing.T) {
++	assertOrdered(t, "keys_unsorted", `{"b":1,"":2}`, "[\"b\",\"\"]\n")
++}
++
++func TestOrderedKeysOptionChangesTheOutput(t *testing.T) {
++	withOption := orderedRun(t, []string{"-c", "--ordered-keys", "."}, objInput)
++	if withOption != "{\"b\":1,\"a\":2}\n" {
++		t.Fatalf("with the option: %q", withOption)
++	}
++	if without := orderedRun(t, []string{"-c", "."}, objInput); without == withOption {
++		t.Fatalf("the option changed nothing: %q", without)
++	}
++}
++
++func TestOrderedKeysSortKeysOverrides(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "."}, objInput, "{\"a\":2,\"b\":1}\n")
++}
++
++func TestOrderedKeysSortKeysAloneIsSorted(t *testing.T) {
++	orderedArgs(t, []string{"-c", "-S", "."}, objInput, "{\"a\":2,\"b\":1}\n")
++}
++
++func TestOrderedKeysSortKeysNested(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "."},
++		`{"b":{"d":1,"c":2},"a":3}`, "{\"a\":3,\"b\":{\"c\":2,\"d\":1}}\n")
++}
++
++func TestOrderedKeysPrettyOutput(t *testing.T) {
++	orderedArgs(t, []string{"--ordered-keys", "."}, objInput, "{\n  \"b\": 1,\n  \"a\": 2\n}\n")
++}
++
++func TestOrderedKeysKeysSorts(t *testing.T) {
++	assertOrdered(t, "keys", objInput, "[\"a\",\"b\"]\n")
++}
++
++func TestOrderedKeysKeysUnsortedKeepsOrder(t *testing.T) {
++	assertOrdered(t, "keys_unsorted", objInput, "[\"b\",\"a\"]\n")
++}
++
++func TestOrderedKeysKeysUnsortedOnArray(t *testing.T) {
++	assertOrdered(t, "keys_unsorted", `["x","y"]`, "[0,1]\n")
++}
++
++func TestOrderedKeysKeysUnsortedOnNested(t *testing.T) {
++	assertOrdered(t, ".b|keys_unsorted", `{"b":{"d":1,"c":2}}`, "[\"d\",\"c\"]\n")
++}
++
++func TestOrderedKeysKeysUnsortedOnDecodedObject(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "keys_unsorted"}, `{"b":1,"a":2}`,
++		"[\"b\",\"a\"]\n")
++}
++
++func TestOrderedKeysDefaultKeysUnsortedSorts(t *testing.T) {
++	orderedArgs(t, []string{"-c", "keys_unsorted"}, objInput, "[\"a\",\"b\"]\n")
++}
++
++func TestOrderedKeysDefaultKeysUnsortedOnArray(t *testing.T) {
++	orderedArgs(t, []string{"-c", "keys_unsorted"}, `["x","y"]`, "[0,1]\n")
++}
++
++func TestOrderedKeysLength(t *testing.T) {
++	assertOrdered(t, "length", objInput, "2\n")
++}
++
++func TestOrderedKeysIterateValues(t *testing.T) {
++	assertOrdered(t, "[.[]]", objInput, "[1,2]\n")
++}
++
++func TestOrderedKeysIterateNested(t *testing.T) {
++	assertOrdered(t, "[.[]|.[]]", `{"b":{"y":1,"x":2}}`, "[1,2]\n")
++}
++
++func TestOrderedKeysPaths(t *testing.T) {
++	assertOrdered(t, "[paths]", objInput, "[[\"b\"],[\"a\"]]\n")
++}
++
++func TestOrderedKeysPathsNested(t *testing.T) {
++	assertOrdered(t, "[paths]", `{"b":{"y":1},"a":2}`, "[[\"b\"],[\"b\",\"y\"],[\"a\"]]\n")
++}
++
++func TestOrderedKeysToEntries(t *testing.T) {
++	assertOrdered(t, "to_entries", objInput,
++		"[{\"key\":\"b\",\"value\":1},{\"key\":\"a\",\"value\":2}]\n")
++}
++
++func TestOrderedKeysToEntriesKeysInOrder(t *testing.T) {
++	assertOrdered(t, "[to_entries[].key]", objInput, "[\"b\",\"a\"]\n")
++}
++
++func TestOrderedKeysFromEntriesKeepsGivenOrder(t *testing.T) {
++	assertOrdered(t, "from_entries", `[{"key":"z","value":1},{"key":"a","value":2}]`,
++		"{\"z\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysEntriesRoundTrip(t *testing.T) {
++	assertOrdered(t, "to_entries|from_entries", objInput, "{\"b\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysWithEntries(t *testing.T) {
++	assertOrdered(t, "with_entries(.value|=.+1)", objInput, "{\"b\":2,\"a\":3}\n")
++}
++
++func TestOrderedKeysMapValues(t *testing.T) {
++	assertOrdered(t, "map_values(.+1)", objInput, "{\"b\":2,\"a\":3}\n")
++}
++
++func TestOrderedKeysObjectLiteral(t *testing.T) {
++	assertOrdered(t, "{z:1,a:2}", "null", "{\"z\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysObjectLiteralComputedKeys(t *testing.T) {
++	assertOrdered(t, "{(\"z\"):1,(\"a\"):2}", "null", "{\"z\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysObjectLiteralFromInput(t *testing.T) {
++	assertOrdered(t, "{second:.a,first:.b}", objInput, "{\"second\":2,\"first\":1}\n")
++}
++
++func TestOrderedKeysEmptyObjectLiteral(t *testing.T) {
++	assertOrdered(t, "{}", "null", "{}\n")
++}
++
++func TestOrderedKeysObjectLiteralDuplicateKey(t *testing.T) {
++	assertOrdered(t, "{z:1,a:2,z:3}", "null", "{\"z\":3,\"a\":2}\n")
++}
++
++func TestOrderedKeysAssignNewKeyAppends(t *testing.T) {
++	assertOrdered(t, ".c=3", objInput, "{\"b\":1,\"a\":2,\"c\":3}\n")
++}
++
++func TestOrderedKeysAssignExistingKeyKeepsPosition(t *testing.T) {
++	assertOrdered(t, ".a=9", objInput, "{\"b\":1,\"a\":9}\n")
++}
++
++func TestOrderedKeysAssignOnNullBuildsInOrder(t *testing.T) {
++	assertOrdered(t, ".z=1|.a=2", "null", "{\"z\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysSetpathNewKeyAppends(t *testing.T) {
++	assertOrdered(t, "setpath([\"c\"];3)", objInput, "{\"b\":1,\"a\":2,\"c\":3}\n")
++}
++
++func TestOrderedKeysSetpathExistingKeyKeepsPosition(t *testing.T) {
++	assertOrdered(t, "setpath([\"b\"];9)", objInput, "{\"b\":9,\"a\":2}\n")
++}
++
++func TestOrderedKeysSetpathNested(t *testing.T) {
++	assertOrdered(t, ".b.z=5", `{"b":{"y":1},"a":2}`, "{\"b\":{\"y\":1,\"z\":5},\"a\":2}\n")
++}
++
++func TestOrderedKeysUpdateAssign(t *testing.T) {
++	assertOrdered(t, ".b|=.+10", objInput, "{\"b\":11,\"a\":2}\n")
++}
++
++func TestOrderedKeysArithmeticUpdate(t *testing.T) {
++	assertOrdered(t, ".a+=1", objInput, "{\"b\":1,\"a\":3}\n")
++}
++
++func TestOrderedKeysUpdateSeveralPaths(t *testing.T) {
++	assertOrdered(t, "(.b,.a)|=.+1", objInput, "{\"b\":2,\"a\":3}\n")
++}
++
++func TestOrderedKeysUpdateCreatingKey(t *testing.T) {
++	assertOrdered(t, ".c|=(.//7)", objInput, "{\"b\":1,\"a\":2,\"c\":7}\n")
++}
++
++func TestOrderedKeysReduceBuildsInOrder(t *testing.T) {
++	assertOrdered(t, "reduce keys_unsorted[] as $k ({}; .[$k]=1)", objInput, "{\"b\":1,\"a\":1}\n")
++}
++
++func TestOrderedKeysForeachBuildsInOrder(t *testing.T) {
++	assertOrdered(t, "[foreach keys_unsorted[] as $k ({}; .[$k]=1)]|last", objInput,
++		"{\"b\":1,\"a\":1}\n")
++}
++
++func TestOrderedKeysReduceRangeAppends(t *testing.T) {
++	assertOrdered(t, "reduce range(3) as $i (.; .[\"k\\($i)\"]=$i)", objInput,
++		"{\"b\":1,\"a\":2,\"k0\":0,\"k1\":1,\"k2\":2}\n")
++}
++
++func TestOrderedKeysMergeAppendsNewKeys(t *testing.T) {
++	assertOrdered(t, ". + {c:3}", objInput, "{\"b\":1,\"a\":2,\"c\":3}\n")
++}
++
++func TestOrderedKeysMergeKeepsPositionOfSharedKey(t *testing.T) {
++	assertOrdered(t, ". + {a:9}", objInput, "{\"b\":1,\"a\":9}\n")
++}
++
++func TestOrderedKeysMergeLeftOrderWins(t *testing.T) {
++	assertOrdered(t, "{first:0} + .", objInput, "{\"first\":0,\"b\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysMergeSeveralNewKeysInRightOrder(t *testing.T) {
++	assertOrdered(t, ". + {z:1,y:2}", objInput, "{\"b\":1,\"a\":2,\"z\":1,\"y\":2}\n")
++}
++
++func TestOrderedKeysMergeWithEmpty(t *testing.T) {
++	assertOrdered(t, ". + {}", objInput, "{\"b\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysDeepMergeAppends(t *testing.T) {
++	assertOrdered(t, ". * {b:{z:3}}", `{"b":{"y":1,"x":2}}`,
++		"{\"b\":{\"y\":1,\"x\":2,\"z\":3}}\n")
++}
++
++func TestOrderedKeysDeepMergeKeepsPosition(t *testing.T) {
++	assertOrdered(t, ". * {b:{y:9}}", `{"b":{"y":1,"x":2}}`, "{\"b\":{\"y\":9,\"x\":2}}\n")
++}
++
++func TestOrderedKeysDeepMergeNewBranch(t *testing.T) {
++	assertOrdered(t, ". * {c:{n:1}}", objInput, "{\"b\":1,\"a\":2,\"c\":{\"n\":1}}\n")
++}
++
++func TestOrderedKeysAddOfObjects(t *testing.T) {
++	assertOrdered(t, "add", `[{"b":1},{"a":2}]`, "{\"b\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysAddOfOverlappingObjects(t *testing.T) {
++	assertOrdered(t, "add", `[{"b":1,"a":2},{"a":9,"c":3}]`, "{\"b\":1,\"a\":9,\"c\":3}\n")
++}
++
++func TestOrderedKeysDeleteKeepsOrderOfRest(t *testing.T) {
++	assertOrdered(t, "del(.b)", `{"c":0,"b":1,"a":2}`, "{\"c\":0,\"a\":2}\n")
++}
++
++func TestOrderedKeysDeleteSeveral(t *testing.T) {
++	assertOrdered(t, "del(.c,.a)", `{"c":0,"b":1,"a":2}`, "{\"b\":1}\n")
++}
++
++func TestOrderedKeysDelpaths(t *testing.T) {
++	assertOrdered(t, "delpaths([[\"b\"]])", objInput, "{\"a\":2}\n")
++}
++
++func TestOrderedKeysDeleteThenAppend(t *testing.T) {
++	assertOrdered(t, "del(.b)|.c=3", objInput, "{\"a\":2,\"c\":3}\n")
++}
++
++func TestOrderedKeysDeleteMissingKey(t *testing.T) {
++	assertOrdered(t, "del(.nope)", objInput, "{\"b\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysDeleteNested(t *testing.T) {
++	assertOrdered(t, "del(.b.y)", `{"b":{"y":1,"x":2},"a":3}`, "{\"b\":{\"x\":2},\"a\":3}\n")
++}
++
++func TestOrderedKeysDeleteThenRecreateGoesToEnd(t *testing.T) {
++	assertOrdered(t, "del(.b)|.b=1", objInput, "{\"a\":2,\"b\":1}\n")
++}
++
++func TestOrderedKeysEqualityIgnoresOrder(t *testing.T) {
++	assertOrdered(t, ". == {a:2,b:1}", objInput, "true\n")
++}
++
++func TestOrderedKeysInequalityIgnoresOrder(t *testing.T) {
++	assertOrdered(t, ". != {a:2,b:1}", objInput, "false\n")
++}
++
++func TestOrderedKeysUniqueIgnoresOrder(t *testing.T) {
++	assertOrdered(t, "unique|length", `[{"b":1,"a":2},{"a":2,"b":1}]`, "1\n")
++}
++
++func TestOrderedKeysSortIgnoresOrder(t *testing.T) {
++	assertOrdered(t, "sort", `[{"b":2,"a":1},{"a":1,"b":1}]`,
++		"[{\"a\":1,\"b\":1},{\"b\":2,\"a\":1}]\n")
++}
++
++func TestOrderedKeysMaxIgnoresOrder(t *testing.T) {
++	assertOrdered(t, "max", `[{"b":2,"a":1},{"a":1,"b":1}]`, "{\"b\":2,\"a\":1}\n")
++}
++
++func TestOrderedKeysGroupByIgnoresOrder(t *testing.T) {
++	assertOrdered(t, "group_by(.)|length", `[{"b":1,"a":2},{"a":2,"b":1}]`, "1\n")
++}
++
++func TestOrderedKeysContainsIgnoresOrder(t *testing.T) {
++	assertOrdered(t, "contains({a:2,b:1})", objInput, "true\n")
++}
++
++func TestOrderedKeysIndexIgnoresOrder(t *testing.T) {
++	assertOrdered(t, "index({b:1,a:2})", `[{"a":2,"b":1}]`, "0\n")
++}
++
++func TestOrderedKeysInsideIgnoresOrder(t *testing.T) {
++	assertOrdered(t, "inside({a:2,b:1,c:3})", objInput, "true\n")
++}
++
++func TestOrderedKeysMinByIgnoresOrder(t *testing.T) {
++	assertOrdered(t, "min_by(.b)", `[{"b":2,"a":1},{"a":1,"b":1}]`, "{\"a\":1,\"b\":1}\n")
++}
++
++func TestOrderedKeysTojson(t *testing.T) {
++	assertOrdered(t, "tojson", objInput, "\"{\\\"b\\\":1,\\\"a\\\":2}\"\n")
++}
++
++func TestOrderedKeysFromjson(t *testing.T) {
++	assertOrdered(t, "fromjson|keys_unsorted", "\"{\\\"z\\\":1,\\\"a\\\":2}\"", "[\"z\",\"a\"]\n")
++}
++
++func TestOrderedKeysJsonRoundTrip(t *testing.T) {
++	assertOrdered(t, "tojson|fromjson|keys_unsorted", objInput, "[\"b\",\"a\"]\n")
++}
++
++func TestOrderedKeysJsonFormat(t *testing.T) {
++	assertOrdered(t, "@json", objInput, "\"{\\\"b\\\":1,\\\"a\\\":2}\"\n")
++}
++
++func TestOrderedKeysFromjsonNested(t *testing.T) {
++	assertOrdered(t, "fromjson", "\"{\\\"z\\\":{\\\"n\\\":1,\\\"m\\\":2}}\"",
++		"{\"z\":{\"n\":1,\"m\":2}}\n")
++}
++
++func TestOrderedKeysArgjson(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "--argjson", "v", `{"z":1,"a":2}`, "$v"},
++		"null", "{\"z\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysSlurp(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-s", "."}, objInput, "[{\"b\":1,\"a\":2}]\n")
++}
++
++func TestOrderedKeysInputs(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-n", "[inputs]"},
++		"{\"b\":1,\"a\":2}\n{\"d\":3,\"c\":4}\n",
++		"[{\"b\":1,\"a\":2},{\"d\":3,\"c\":4}]\n")
++}
++
++func TestOrderedKeysAlternativeDoesNotLeak(t *testing.T) {
++	assertOrdered(t, "[(.z=1)//., .]", objInput,
++		"[{\"b\":1,\"a\":2,\"z\":1},{\"b\":1,\"a\":2}]\n")
++}
++
++func TestOrderedKeysGeneratorDoesNotLeak(t *testing.T) {
++	assertOrdered(t, "[(.x=1), .]", objInput,
++		"[{\"b\":1,\"a\":2,\"x\":1},{\"b\":1,\"a\":2}]\n")
++}
++
++func TestOrderedKeysTwoBranchesDoNotLeak(t *testing.T) {
++	assertOrdered(t, "[(.c=1),(.d=2)]", objInput,
++		"[{\"b\":1,\"a\":2,\"c\":1},{\"b\":1,\"a\":2,\"d\":2}]\n")
++}
++
++func TestOrderedKeysChainedUpdateDoesNotLeak(t *testing.T) {
++	assertOrdered(t, "[(.x=1|.y=2), .]", objInput,
++		"[{\"b\":1,\"a\":2,\"x\":1,\"y\":2},{\"b\":1,\"a\":2}]\n")
++}
++
++func TestOrderedKeysFirstDoesNotLeak(t *testing.T) {
++	assertOrdered(t, "[first((.z=1),(.w=2)), .]", objInput,
++		"[{\"b\":1,\"a\":2,\"z\":1},{\"b\":1,\"a\":2}]\n")
++}
++
++func TestOrderedKeysLimitDoesNotLeak(t *testing.T) {
++	assertOrdered(t, "[limit(1;(.z=1),(.w=2))], .", objInput,
++		"[{\"b\":1,\"a\":2,\"z\":1}]\n{\"b\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysCatchDoesNotLeak(t *testing.T) {
++	assertOrdered(t, "[try ((.z=1)|error) catch .], .", objInput,
++		"[{\"b\":1,\"a\":2,\"z\":1}]\n{\"b\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysRepeatedReferenceIsStable(t *testing.T) {
++	assertOrdered(t, "[.,(.c=3),.]", objInput,
++		"[{\"b\":1,\"a\":2},{\"b\":1,\"a\":2,\"c\":3},{\"b\":1,\"a\":2}]\n")
++}
++
++func TestOrderedKeysIterateAssignDoesNotLeak(t *testing.T) {
++	assertOrdered(t, "[.[]=9], .", objInput, "[{\"b\":9,\"a\":9}]\n{\"b\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysGetpath(t *testing.T) {
++	assertOrdered(t, "getpath([\"a\"])", objInput, "2\n")
++}
++
++func TestOrderedKeysHas(t *testing.T) {
++	assertOrdered(t, "[has(\"a\"),has(\"nope\")]", objInput, "[true,false]\n")
++}
++
++func TestOrderedKeysWalkKeepsOrder(t *testing.T) {
++	assertOrdered(t, "walk(.)", `{"b":{"y":1,"x":2},"a":3}`,
++		"{\"b\":{\"y\":1,\"x\":2},\"a\":3}\n")
++}
++
++func TestOrderedKeysRecurse(t *testing.T) {
++	assertOrdered(t, "[recurse|type]", `{"b":{"y":1}}`, "[\"object\",\"object\",\"number\"]\n")
++}
++
++func TestOrderedKeysStreamRoundTrip(t *testing.T) {
++	assertOrdered(t, "fromstream(tostream)", objInput, "{\"b\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysTostream(t *testing.T) {
++	assertOrdered(t, "[tostream]", objInput, "[[[\"b\"],1],[[\"a\"],2],[[\"a\"]]]\n")
++}
++
++func TestOrderedKeysType(t *testing.T) {
++	assertOrdered(t, "type", objInput, "\"object\"\n")
++}
++
++func TestOrderedKeysToArrayOfPairs(t *testing.T) {
++	assertOrdered(t, "[to_entries[]|[.key,.value]]", objInput, "[[\"b\",1],[\"a\",2]]\n")
++}
++
++func TestOrderedKeysAnyAllOverKeys(t *testing.T) {
++	assertOrdered(t, "[any(keys_unsorted[];.==\"a\"),all(keys_unsorted[];.!=\"z\")]", objInput,
++		"[true,true]\n")
++}
++
++func TestOrderedKeysWideIdentity(t *testing.T) {
++	assertOrdered(t, ".", wideInput, "{\"e\":1,\"d\":2,\"c\":3,\"b\":4,\"a\":5,\"j\":6}\n")
++}
++
++func TestOrderedKeysWideIterationOrder(t *testing.T) {
++	assertOrdered(t, "[.[]]", wideInput, "[1,2,3,4,5,6]\n")
++}
++
++func TestOrderedKeysWideMergeAppends(t *testing.T) {
++	assertOrdered(t, ". + {n:7}", wideInput,
++		"{\"e\":1,\"d\":2,\"c\":3,\"b\":4,\"a\":5,\"j\":6,\"n\":7}\n")
++}
++
++func TestOrderedKeysWideMergeSharedKeysKeepPosition(t *testing.T) {
++	assertOrdered(t, ". + {c:9,a:9}", wideInput,
++		"{\"e\":1,\"d\":2,\"c\":9,\"b\":4,\"a\":9,\"j\":6}\n")
++}
++
++func TestOrderedKeysWideMergeOnLeft(t *testing.T) {
++	assertOrdered(t, "{n:0} + .", wideInput,
++		"{\"n\":0,\"e\":1,\"d\":2,\"c\":3,\"b\":4,\"a\":5,\"j\":6}\n")
++}
++
++func TestOrderedKeysWideDeepMerge(t *testing.T) {
++	assertOrdered(t, ". * {c:9}", wideInput,
++		"{\"e\":1,\"d\":2,\"c\":9,\"b\":4,\"a\":5,\"j\":6}\n")
++}
++
++func TestOrderedKeysWideDelete(t *testing.T) {
++	assertOrdered(t, "del(.c)", wideInput, "{\"e\":1,\"d\":2,\"b\":4,\"a\":5,\"j\":6}\n")
++}
++
++func TestOrderedKeysWideDeleteSeveral(t *testing.T) {
++	assertOrdered(t, "del(.e,.a)", wideInput, "{\"d\":2,\"c\":3,\"b\":4,\"j\":6}\n")
++}
++
++func TestOrderedKeysWideAssignKeepsPosition(t *testing.T) {
++	assertOrdered(t, ".c=9", wideInput,
++		"{\"e\":1,\"d\":2,\"c\":9,\"b\":4,\"a\":5,\"j\":6}\n")
++}
++
++func TestOrderedKeysWideUpdateAll(t *testing.T) {
++	assertOrdered(t, ".[]|=.+10", wideInput,
++		"{\"e\":11,\"d\":12,\"c\":13,\"b\":14,\"a\":15,\"j\":16}\n")
++}
++
++func TestOrderedKeysWideEntriesRoundTrip(t *testing.T) {
++	assertOrdered(t, "to_entries|from_entries", wideInput,
++		"{\"e\":1,\"d\":2,\"c\":3,\"b\":4,\"a\":5,\"j\":6}\n")
++}
++
++func TestOrderedKeysWideKeysUnsorted(t *testing.T) {
++	assertOrdered(t, "keys_unsorted", wideInput, "[\"e\",\"d\",\"c\",\"b\",\"a\",\"j\"]\n")
++}
++
++func TestOrderedKeysWideLiteralFromInput(t *testing.T) {
++	assertOrdered(t, "{k5:.e,k4:.d,k3:.c,k2:.b,k1:.a,k0:.j}", wideInput,
++		"{\"k5\":1,\"k4\":2,\"k3\":3,\"k2\":4,\"k1\":5,\"k0\":6}\n")
++}
++
++func TestOrderedKeysWideLiteralMixedConstants(t *testing.T) {
++	assertOrdered(t, "{z:.e,y:2,x:.d,w:4,v:.c,u:6}", wideInput,
++		"{\"z\":1,\"y\":2,\"x\":2,\"w\":4,\"v\":3,\"u\":6}\n")
++}
++
++func TestOrderedKeysWideReduceBuild(t *testing.T) {
++	assertOrdered(t, "reduce keys_unsorted[] as $k ({}; .[$k]=1)", wideInput,
++		"{\"e\":1,\"d\":1,\"c\":1,\"b\":1,\"a\":1,\"j\":1}\n")
++}
++
++func TestOrderedKeysWideDeleteThenReadd(t *testing.T) {
++	assertOrdered(t, "del(.e)|.e=0", wideInput,
++		"{\"d\":2,\"c\":3,\"b\":4,\"a\":5,\"j\":6,\"e\":0}\n")
++}
++
++func TestOrderedKeysWideBranchDoesNotLeak(t *testing.T) {
++	assertOrdered(t, "[(.n=7), .]|.[1]", wideInput,
++		"{\"e\":1,\"d\":2,\"c\":3,\"b\":4,\"a\":5,\"j\":6}\n")
++}
++
++func TestOrderedKeysWideRepeatedBranchesAreIndependent(t *testing.T) {
++	assertOrdered(t, "[(.n=7),(.m=8)]|.[1]", wideInput,
++		"{\"e\":1,\"d\":2,\"c\":3,\"b\":4,\"a\":5,\"j\":6,\"m\":8}\n")
++}
++
++func TestOrderedKeysWideNestedBranchDoesNotLeak(t *testing.T) {
++	assertOrdered(t, "{outer:.}|[(.outer.n=7), .]|.[1].outer",
++		wideInput, "{\"e\":1,\"d\":2,\"c\":3,\"b\":4,\"a\":5,\"j\":6}\n")
++}
++
++func TestOrderedKeysWideSortKeys(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "."}, wideInput,
++		"{\"a\":5,\"b\":4,\"c\":3,\"d\":2,\"e\":1,\"j\":6}\n")
++}
++
++func TestOrderedKeysWideEqualityIgnoresOrder(t *testing.T) {
++	assertOrdered(t, ". == {a:5,b:4,c:3,d:2,e:1,j:6}", wideInput, "true\n")
++}
++
++func TestOrderedKeysWideJsonRoundTrip(t *testing.T) {
++	assertOrdered(t, "tojson|fromjson|keys_unsorted", wideInput,
++		"[\"e\",\"d\",\"c\",\"b\",\"a\",\"j\"]\n")
++}
++
++func TestOrderedKeysLongSortKeysAlone(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--sort-keys", "."}, objInput, "{\"a\":2,\"b\":1}\n")
++}
++
++func TestOrderedKeysLongSortKeysWithOrdered(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "--sort-keys", "."}, wideInput,
++		"{\"a\":5,\"b\":4,\"c\":3,\"d\":2,\"e\":1,\"j\":6}\n")
++}
++
++func TestOrderedKeysSurvivesVariableBinding(t *testing.T) {
++	assertOrdered(t, ". as $x | $x", wideInput,
++		"{\"e\":1,\"d\":2,\"c\":3,\"b\":4,\"a\":5,\"j\":6}\n")
++}
++
++func TestOrderedKeysSurvivesFunctionArgument(t *testing.T) {
++	assertOrdered(t, "def f($o): $o; f(.)", wideInput,
++		"{\"e\":1,\"d\":2,\"c\":3,\"b\":4,\"a\":5,\"j\":6}\n")
++}
++
++func TestOrderedKeysSurvivesFunctionReturn(t *testing.T) {
++	assertOrdered(t, "def g: .; g|keys_unsorted", wideInput, "[\"e\",\"d\",\"c\",\"b\",\"a\",\"j\"]\n")
++}
++
++func TestOrderedKeysSurvivesArrayRoundTrip(t *testing.T) {
++	assertOrdered(t, "[.]|.[0]|keys_unsorted", wideInput, "[\"e\",\"d\",\"c\",\"b\",\"a\",\"j\"]\n")
++}
++
++func TestOrderedKeysSingularInput(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-n", "input"},
++		"{\"d\":3,\"c\":4}\n{\"b\":1,\"a\":2}\n", "{\"d\":3,\"c\":4}\n")
++}
++
++func TestOrderedKeysFileInput(t *testing.T) {
++	name := writeOrderedFile(t, `{"d":3,"c":4}`)
++	orderedArgs(t, []string{"-c", "--ordered-keys", ".", name}, "", "{\"d\":3,\"c\":4}\n")
++}
++
++func TestOrderedKeysSlurpfile(t *testing.T) {
++	name := writeOrderedFile(t, `{"d":3,"c":4}`)
++	orderedArgs(t, []string{"-c", "--ordered-keys", "--slurpfile", "v", name, "$v"},
++		"null", "[{\"d\":3,\"c\":4}]\n")
++}
++
++func TestOrderedKeysSortKeysDoesNotReachTojson(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "tojson"}, objInput,
++		"\"{\\\"b\\\":1,\\\"a\\\":2}\"\n")
++}
++
++func TestOrderedKeysSortKeysDoesNotReachJsonFormat(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "@json"}, objInput,
++		"\"{\\\"b\\\":1,\\\"a\\\":2}\"\n")
++}
++
++func TestOrderedKeysSortKeysDoesNotReachNestedTojson(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "{z:{n:.b,m:.a}}|tojson"}, objInput,
++		"\"{\\\"z\\\":{\\\"n\\\":1,\\\"m\\\":2}}\"\n")
++}
++
++func TestOrderedKeysSortKeysStillSortsPrintedObject(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "{z:{n:.b,m:.a}}"}, objInput,
++		"{\"z\":{\"m\":2,\"n\":1}}\n")
++}
++
++func TestOrderedKeysSortKeysDoesNotReachTojsonWide(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "tojson|fromjson|keys_unsorted"}, wideInput,
++		"[\"e\",\"d\",\"c\",\"b\",\"a\",\"j\"]\n")
++}
++
++func TestOrderedKeysFromjsonDuplicateKey(t *testing.T) {
++	assertOrdered(t, "fromjson", "\"{\\\"a\\\":1,\\\"b\\\":2,\\\"a\\\":3}\"", "{\"a\":3,\"b\":2}\n")
++}
++
++func TestOrderedKeysArgjsonDuplicateKey(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "--argjson", "v", `{"a":1,"b":2,"a":3}`, "$v"},
++		"null", "{\"a\":3,\"b\":2}\n")
++}
++
++func TestOrderedKeysFromEntriesDuplicateKey(t *testing.T) {
++	assertOrdered(t, "from_entries",
++		`[{"key":"z","value":1},{"key":"a","value":2},{"key":"z","value":3}]`,
++		"{\"z\":3,\"a\":2}\n")
++}
++
++func TestOrderedKeysAssignRepeatedKeyKeepsFirstPosition(t *testing.T) {
++	assertOrdered(t, "reduce (\"z\",\"a\",\"z\") as $k ({}; .[$k]=$k)", "null",
++		"{\"z\":\"z\",\"a\":\"a\"}\n")
++}
++
++func TestOrderedKeysKeysUnsortedOnNumber(t *testing.T) {
++	orderedErrorsLikeKeys(t, "1")
++}
++
++func TestOrderedKeysKeysUnsortedOnString(t *testing.T) {
++	orderedErrorsLikeKeys(t, `"s"`)
++}
++
++func TestOrderedKeysKeysUnsortedOnNull(t *testing.T) {
++	orderedErrorsLikeKeys(t, "null")
++}
++
++func TestOrderedKeysKeysUnsortedOnBoolean(t *testing.T) {
++	orderedErrorsLikeKeys(t, "true")
++}
++
++func TestOrderedKeysKeysUnsortedOnNumericString(t *testing.T) {
++	orderedErrorsLikeKeys(t, `"12"`)
++}
++
++func TestOrderedKeysHelpListsTheOptions(t *testing.T) {
++	got := orderedRun(t, []string{"--help"}, "")
++	for _, w := range []string{"--ordered-keys", "--sort-keys"} {
++		if !strings.Contains(got, w) {
++			t.Fatalf("help output does not mention %q:\n%s", w, got)
++		}
++	}
++}
++
++func TestOrderedKeysHostMapKeysUnsortedSorts(t *testing.T) {
++	orderedLibrary(t, "keys_unsorted", map[string]any{"b": 1, "a": 2}, `[["a","b"]]`)
++}
++
++func TestOrderedKeysHostMapKeysUnsortedSortsWide(t *testing.T) {
++	orderedLibrary(t, "keys_unsorted",
++		map[string]any{"e": 1, "d": 2, "c": 3, "b": 4, "a": 5, "j": 6},
++		`[["a","b","c","d","e","j"]]`)
++}
++
++func TestOrderedKeysHostMapKeysMatchesKeysUnsorted(t *testing.T) {
++	orderedLibrary(t, "[keys, keys_unsorted]", map[string]any{"b": 1, "a": 2},
++		`[[["a","b"],["a","b"]]]`)
++}
++
++func TestOrderedKeysHostMapIteratesSorted(t *testing.T) {
++	orderedLibrary(t, "[[.[]], keys_unsorted]",
++		map[string]any{"e": 1, "d": 2, "c": 3, "b": 4, "a": 5, "j": 6},
++		`[[[5,4,3,2,1,6],["a","b","c","d","e","j"]]]`)
++}
++
++func TestOrderedKeysHostMapToEntriesSorted(t *testing.T) {
++	orderedLibrary(t, "[[to_entries[].key], keys_unsorted]",
++		map[string]any{"e": 1, "d": 2, "c": 3, "b": 4, "a": 5, "j": 6},
++		`[[["a","b","c","d","e","j"],["a","b","c","d","e","j"]]]`)
++}
++
++func TestOrderedKeysHostMapNestedSorted(t *testing.T) {
++	orderedLibrary(t, ".n|keys_unsorted",
++		map[string]any{"n": map[string]any{"y": 1, "x": 2}}, `[["x","y"]]`)
++}
++
++func TestOrderedKeysHostArrayKeysUnsorted(t *testing.T) {
++	orderedLibrary(t, "keys_unsorted", []any{"x", "y"}, `[[0,1]]`)
++}
++
++func TestOrderedKeysHostMapPathsSorted(t *testing.T) {
++	orderedLibrary(t, "[[paths], keys_unsorted]", map[string]any{"b": 1, "a": 2},
++		`[[[["a"],["b"]],["a","b"]]]`)
++}
++
++func TestOrderedKeysSortKeysLeavesTheValueAlone(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "., keys_unsorted"}, objInput,
++		"{\"a\":2,\"b\":1}\n[\"b\",\"a\"]\n")
++}
++
++func TestOrderedKeysSortKeysLeavesEntriesAlone(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "[to_entries[].key], ."}, objInput,
++		"[\"b\",\"a\"]\n{\"a\":2,\"b\":1}\n")
++}
++
++func TestOrderedKeysSortKeysLeavesTextAlone(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "keys_unsorted, tojson, ."}, objInput,
++		"[\"b\",\"a\"]\n\"{\\\"b\\\":1,\\\"a\\\":2}\"\n{\"a\":2,\"b\":1}\n")
++}
++
++func TestOrderedKeysSortKeysLeavesIterationAlone(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "[.[]], ."}, wideInput,
++		"[1,2,3,4,5,6]\n{\"a\":5,\"b\":4,\"c\":3,\"d\":2,\"e\":1,\"j\":6}\n")
++}
++
++func TestOrderedKeysSortKeysSurvivesAnUpdate(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "(.c=3)|keys_unsorted"}, objInput,
++		"[\"b\",\"a\",\"c\"]\n")
++}
++
++func TestOrderedKeysSortKeysIsIdempotent(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "., ."}, objInput,
++		"{\"a\":2,\"b\":1}\n{\"a\":2,\"b\":1}\n")
++}
++
++func TestOrderedKeysStreamEventsFollowTextOrder(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "--stream", "."}, objInput,
++		"[[\"b\"],1]\n[[\"a\"],2]\n[[\"a\"]]\n")
++	orderedArgs(t, []string{"-c", "--ordered-keys", "--stream", "-n", "fromstream(inputs)"},
++		objInput, "{\"b\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysStreamNestedEventsFollowTextOrder(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "--stream", "."},
++		`{"b":{"y":1,"x":2},"a":3}`,
++		"[[\"b\",\"y\"],1]\n[[\"b\",\"x\"],2]\n[[\"b\",\"x\"]]\n[[\"a\"],3]\n[[\"a\"]]\n")
++	orderedArgs(t, []string{"-c", "--ordered-keys", "--stream", "-n", "fromstream(inputs)"},
++		`{"b":{"y":1,"x":2},"a":3}`, "{\"b\":{\"y\":1,\"x\":2},\"a\":3}\n")
++}
++
++func TestOrderedKeysStreamReconstructsInOrder(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "--stream", "-n", "fromstream(inputs)"},
++		`{"z":1,"m":2,"a":3}`, "{\"z\":1,\"m\":2,\"a\":3}\n")
++}
++
++func TestOrderedKeysStreamReconstructsKeysUnsorted(t *testing.T) {
++	orderedArgs(t,
++		[]string{"-c", "--ordered-keys", "--stream", "-n", "fromstream(inputs)|keys_unsorted"},
++		objInput, "[\"b\",\"a\"]\n")
++}
++
++func TestOrderedKeysStreamReconstructsWide(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "--stream", "-n", "fromstream(inputs)"},
++		wideInput, "{\"e\":1,\"d\":2,\"c\":3,\"b\":4,\"a\":5,\"j\":6}\n")
++}
++
++func TestOrderedKeysStreamReconstructsObjectInArray(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "--stream", "-n", "fromstream(inputs)"},
++		`[{"b":1,"a":2}]`, "[{\"b\":1,\"a\":2}]\n")
++}
++
++func TestOrderedKeysDeepMergeAppendsSeveralInnerKeys(t *testing.T) {
++	assertOrdered(t, ". * {b:{q:3,p:4,r:5}}", `{"b":{"y":1,"x":2},"a":9}`,
++		"{\"b\":{\"y\":1,\"x\":2,\"q\":3,\"p\":4,\"r\":5},\"a\":9}\n")
++}
++
++func TestOrderedKeysDeepMergeMixesExistingAndNewInnerKeys(t *testing.T) {
++	assertOrdered(t, ". * {b:{x:9,q:3,y:8,p:4}}", `{"b":{"y":1,"x":2}}`,
++		"{\"b\":{\"y\":8,\"x\":9,\"q\":3,\"p\":4}}\n")
++}
++
++func TestOrderedKeysDeepMergeSeveralBranches(t *testing.T) {
++	assertOrdered(t, ". * {e:{c:2,b:3,a:4},z:{n:1,m:2}}", `{"e":{"d":1}}`,
++		"{\"e\":{\"d\":1,\"c\":2,\"b\":3,\"a\":4},\"z\":{\"n\":1,\"m\":2}}\n")
++}
++
++func TestOrderedKeysDeepMergeAppendsManyInnerKeysInRightOrder(t *testing.T) {
++	assertOrdered(t, ". * {b:{q:3,p:4,r:5,s:6,t:7,u:8}}", `{"b":{"y":1,"x":2}}`,
++		"{\"b\":{\"y\":1,\"x\":2,\"q\":3,\"p\":4,\"r\":5,\"s\":6,\"t\":7,\"u\":8}}\n")
++}
++
++func TestOrderedKeysMergeAppendsManyNewKeysInRightOrder(t *testing.T) {
++	assertOrdered(t, ". + {q:3,p:4,r:5,s:6,t:7,u:8}", objInput,
++		"{\"b\":1,\"a\":2,\"q\":3,\"p\":4,\"r\":5,\"s\":6,\"t\":7,\"u\":8}\n")
++}
++
++func TestOrderedKeysDeepMergeInnerKeysDescending(t *testing.T) {
++	assertOrdered(t, ". * {b:{u:8,t:7,s:6,r:5,q:4}}", `{"b":{"y":1,"x":2}}`,
++		"{\"b\":{\"y\":1,\"x\":2,\"u\":8,\"t\":7,\"s\":6,\"r\":5,\"q\":4}}\n")
++}
++
++func TestOrderedKeysDeepMergeInnerKeysUnsortedShape(t *testing.T) {
++	assertOrdered(t, ". * {n:{c:1,b:2,a:3,f:4}}", `{"n":{"z":9}}`,
++		"{\"n\":{\"z\":9,\"c\":1,\"b\":2,\"a\":3,\"f\":4}}\n")
++}
++
++func TestOrderedKeysWithEntriesRenamesKeys(t *testing.T) {
++	assertOrdered(t, `with_entries(.key|="x_"+.)`, `{"z":1,"m":2,"a":3}`,
++		"{\"x_z\":1,\"x_m\":2,\"x_a\":3}\n")
++}
++
++func TestOrderedKeysWithEntriesRenamesKeysWide(t *testing.T) {
++	assertOrdered(t, "with_entries(.key|=ascii_upcase)", wideInput,
++		"{\"E\":1,\"D\":2,\"C\":3,\"B\":4,\"A\":5,\"J\":6}\n")
++}
++
++func TestOrderedKeysWithEntriesRenamesOneKeyInPlace(t *testing.T) {
++	assertOrdered(t, `with_entries(if .key=="z" then .key="m" else . end)`, `{"z":1,"a":2}`,
++		"{\"m\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysWithEntriesRenameCollides(t *testing.T) {
++	assertOrdered(t, `with_entries(if .key=="z" or .key=="b" then .key="m" else . end)`,
++		`{"z":1,"a":2,"b":3}`, "{\"m\":3,\"a\":2}\n")
++	assertOrdered(t, `with_entries(.key="k")`, objInput, "{\"k\":2}\n")
++}
++
++func TestOrderedKeysWithEntriesRenameCollidesWithLaterKey(t *testing.T) {
++	assertOrdered(t, `with_entries(if .key=="z" or .key=="b" then .key="m" else . end)`,
++		`{"z":1,"a":2,"b":3}`, "{\"m\":3,\"a\":2}\n")
++	assertOrdered(t, `with_entries(if .key=="a" then .key="b" else . end)`, `{"a":1,"b":2}`,
++		"{\"b\":2}\n")
++}
++
++func TestOrderedKeysWithEntriesRenamesAndChangesValues(t *testing.T) {
++	assertOrdered(t, `with_entries(.key|=.+"!"|.value+=10)`, objInput, "{\"b!\":11,\"a!\":12}\n")
++}
++
++func TestOrderedKeysWithEntriesDropsAKey(t *testing.T) {
++	assertOrdered(t, `with_entries(select(.key!="b"))`, `{"c":1,"b":2,"a":3}`,
++		"{\"c\":1,\"a\":3}\n")
++}
++
++func TestOrderedKeysArgjsonNestedOrder(t *testing.T) {
++	orderedArgs(t,
++		[]string{"-c", "--ordered-keys", "--argjson", "v", `{"z":{"n":1,"m":2},"a":3}`, "$v"},
++		"null", "{\"z\":{\"n\":1,\"m\":2},\"a\":3}\n")
++}
++
++func TestOrderedKeysArgjsonNestedKeysUnsorted(t *testing.T) {
++	orderedArgs(t,
++		[]string{"-c", "--ordered-keys", "--argjson", "v", `{"z":{"n":1,"m":2},"a":3}`,
++			"$v.z|keys_unsorted"},
++		"null", "[\"n\",\"m\"]\n")
++}
++
++func TestOrderedKeysJsonargsNestedOrder(t *testing.T) {
++	orderedArgs(t,
++		[]string{"-c", "--ordered-keys", "$ARGS.positional", "--jsonargs",
++			`{"z":{"n":1,"m":2},"a":3}`},
++		"null", "[{\"z\":{\"n\":1,\"m\":2},\"a\":3}]\n")
++}
++
++func TestOrderedKeysSlurpfileNestedOrder(t *testing.T) {
++	name := writeOrderedFile(t, `{"z":{"n":1,"m":2},"a":3}`)
++	orderedArgs(t, []string{"-c", "--ordered-keys", "--slurpfile", "v", name, "$v"},
++		"null", "[{\"z\":{\"n\":1,\"m\":2},\"a\":3}]\n")
++}
++
++func TestOrderedKeysFileInputNestedOrder(t *testing.T) {
++	name := writeOrderedFile(t, `{"z":{"n":1,"m":2},"a":3}`)
++	orderedArgs(t, []string{"-c", "--ordered-keys", ".", name},
++		"", "{\"z\":{\"n\":1,\"m\":2},\"a\":3}\n")
++}
++
++func TestOrderedKeysSortKeysInsideArray(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "."}, `[{"b":1,"a":2}]`,
++		"[{\"a\":2,\"b\":1}]\n")
++}
++
++func TestOrderedKeysSortKeysSeveralObjectsInArray(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "."},
++		`[{"b":1,"a":2},{"d":3,"c":4}]`, "[{\"a\":2,\"b\":1},{\"c\":4,\"d\":3}]\n")
++}
++
++func TestOrderedKeysSortKeysArrayInsideObject(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "."}, `{"n":[{"z":1,"y":2}]}`,
++		"{\"n\":[{\"y\":2,\"z\":1}]}\n")
++}
++
++func TestOrderedKeysSortKeysNestedArrays(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "-S", "."}, `[[{"b":1,"a":2}]]`,
++		"[[{\"a\":2,\"b\":1}]]\n")
++}
++
++func TestOrderedKeysKeysSortsNonASCIIUnchanged(t *testing.T) {
++	orderedSameAsPlain(t, []string{"-c", "--ordered-keys", "keys"}, []string{"-c", "keys"},
++		`{"\u00e9":1,"a":2,"z":3}`)
++}
++
++func TestOrderedKeysSortKeysNonASCIIUnchanged(t *testing.T) {
++	orderedSameAsPlain(t, []string{"-c", "--ordered-keys", "-S", "."}, []string{"-c", "."},
++		`{"\u00e9":1,"a":2,"z":3}`)
++}
++
++func TestOrderedKeysKeysSortsMixedCaseUnchanged(t *testing.T) {
++	orderedSameAsPlain(t, []string{"-c", "--ordered-keys", "keys"}, []string{"-c", "keys"},
++		`{"Z":1,"a":2}`)
++}
++
++func TestOrderedKeysKeysSortsEscapedKeyUnchanged(t *testing.T) {
++	orderedSameAsPlain(t, []string{"-c", "--ordered-keys", "keys"}, []string{"-c", "keys"},
++		`{"\u00e9":1,"a":2}`)
++}
++
++func TestOrderedKeysKeysSortsAstralPlaneUnchanged(t *testing.T) {
++	orderedSameAsPlain(t, []string{"-c", "--ordered-keys", "keys"}, []string{"-c", "keys"},
++		`{"\ud83d\ude00":1,"z":2}`)
++}
++
++func TestOrderedKeysKeysSortsControlCharacterUnchanged(t *testing.T) {
++	orderedSameAsPlain(t, []string{"-c", "--ordered-keys", "keys"}, []string{"-c", "keys"},
++		`{"b\nc":1,"ba":2}`)
++}
++
++func TestOrderedKeysCarriedAndSortedDifferForNonASCII(t *testing.T) {
++	carried := orderedRun(t, []string{"-c", "--ordered-keys", "keys_unsorted"}, `{"\u00e9":1,"e":2}`)
++	sorted := orderedRun(t, []string{"-c", "--ordered-keys", "keys"}, `{"\u00e9":1,"e":2}`)
++	if carried == sorted {
++		t.Fatalf("carried and sorted key lists are both %q", carried)
++	}
++	orderedSameAsPlain(t, []string{"-c", "--ordered-keys", "keys"}, []string{"-c", "keys"},
++		`{"\u00e9":1,"e":2}`)
++}
++
++func TestOrderedKeysColoredOutputKeepsOrder(t *testing.T) {
++	orderedColored(t, []string{"-c", "-C", "--ordered-keys", "."}, objInput, "{\"b\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysColoredOutputSortKeys(t *testing.T) {
++	orderedColored(t, []string{"-c", "-C", "--ordered-keys", "-S", "."}, wideInput,
++		"{\"a\":5,\"b\":4,\"c\":3,\"d\":2,\"e\":1,\"j\":6}\n")
++}
++
++func TestOrderedKeysColoredOutputWithoutTheOption(t *testing.T) {
++	orderedColored(t, []string{"-c", "-C", "."}, objInput, "{\"a\":2,\"b\":1}\n")
++	orderedColored(t, []string{"-c", "-C", "--ordered-keys", "."}, objInput, "{\"b\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysSortKeysMatchesDefaultOutputWide(t *testing.T) {
++	orderedSameAsPlain(t, []string{"-c", "--ordered-keys", "-S", "."}, []string{"-c", "."}, wideInput)
++}
++
++func TestOrderedKeysSortKeysMatchesDefaultOutputNested(t *testing.T) {
++	orderedSameAsPlain(t, []string{"-c", "--ordered-keys", "-S", "."}, []string{"-c", "."},
++		`{"b":{"d":1,"c":2},"a":3}`)
++}
++
++func TestOrderedKeysSortKeysMatchesDefaultOutputInArray(t *testing.T) {
++	orderedSameAsPlain(t, []string{"-c", "--ordered-keys", "-S", "."}, []string{"-c", "."},
++		`[{"b":1,"a":2},{"d":3,"c":4}]`)
++}
++
++func TestOrderedKeysKeysMatchesDefaultKeys(t *testing.T) {
++	orderedSameAsPlain(t, []string{"-c", "--ordered-keys", "keys"}, []string{"-c", "keys"}, wideInput)
++}
++
++func TestOrderedKeysEachTopLevelValueKeepsItsOwnOrder(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "."},
++		"{\"b\":1,\"a\":2}\n{\"d\":3,\"c\":4}\n",
++		"{\"b\":1,\"a\":2}\n{\"d\":3,\"c\":4}\n")
++}
++
++func TestOrderedKeysThreeTopLevelValuesKeepTheirOrders(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "."},
++		"{\"z\":1,\"a\":2}\n{\"m\":3}\n{\"e\":4,\"d\":5,\"c\":6}\n",
++		"{\"z\":1,\"a\":2}\n{\"m\":3}\n{\"e\":4,\"d\":5,\"c\":6}\n")
++}
++
++func TestOrderedKeysTopLevelValuesOnOneLineKeepTheirOrders(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "."}, `{"b":1,"a":2} {"d":3,"c":4}`,
++		"{\"b\":1,\"a\":2}\n{\"d\":3,\"c\":4}\n")
++}
++
++func TestOrderedKeysTopLevelValuesFromAFileKeepTheirOrders(t *testing.T) {
++	name := writeOrderedFile(t, "{\"b\":1,\"a\":2}\n{\"d\":3,\"c\":4}")
++	orderedArgs(t, []string{"-c", "--ordered-keys", ".", name}, "",
++		"{\"b\":1,\"a\":2}\n{\"d\":3,\"c\":4}\n")
++}
++
++func TestOrderedKeysTopLevelArrayAndObjectKeepTheirOrders(t *testing.T) {
++	orderedArgs(t, []string{"-c", "--ordered-keys", "."},
++		"[{\"b\":1,\"a\":2}]\n{\"d\":3,\"c\":4}\n",
++		"[{\"b\":1,\"a\":2}]\n{\"d\":3,\"c\":4}\n")
++}
++
++func TestOrderedKeysEscapedDuplicateKeyKeepsFirstPosition(t *testing.T) {
++	assertOrdered(t, ".", `{"a":1,"\u0061":2,"b":3}`, "{\"a\":2,\"b\":3}\n")
++}
++
++func TestOrderedKeysEscapedDuplicateKeyOutOfSortedOrder(t *testing.T) {
++	assertOrdered(t, ".", `{"z":1,"\u007a":2,"a":3}`, "{\"z\":2,\"a\":3}\n")
++}
++
++func TestOrderedKeysEscapedDuplicateKeyListsOnce(t *testing.T) {
++	assertOrdered(t, "keys_unsorted", `{"a":1,"\u0061":2,"b":3}`, "[\"a\",\"b\"]\n")
++}
++
++func TestOrderedKeysEscapedDuplicateKeyFirstIsEscaped(t *testing.T) {
++	assertOrdered(t, ".", `{"\u0061":1,"a":2}`, "{\"a\":2}\n")
++}
++
++func TestOrderedKeysEscapedDuplicateNonASCIIKey(t *testing.T) {
++	assertOrdered(t, "keys_unsorted", `{"b":1,"\u00e9":2,"\u00e9":3}`, "[\"b\",\"\u00e9\"]\n")
++}
++
++func TestOrderedKeysEscapedDuplicateKeyThroughFromjson(t *testing.T) {
++	assertOrdered(t, "fromjson", `"{\"a\":1,\"\\u0061\":2,\"b\":3}"`, "{\"a\":2,\"b\":3}\n")
++}
++
++func TestOrderedKeysLibraryResultFeedsAnotherQuery(t *testing.T) {
++	first := orderedLibraryValue(t, ".", map[string]any{"b": 1, "a": 2})
++	if got := gojq.TypeOf(first); got != "object" {
++		t.Fatalf("the result is a %s", got)
++	}
++	orderedLibrary(t, "keys_unsorted", first, `[["a","b"]]`)
++}
++
++func TestOrderedKeysLibraryNestedResultFeedsAnotherQuery(t *testing.T) {
++	first := orderedLibraryValue(t, ".n",
++		map[string]any{"n": map[string]any{"y": 1, "x": 2}, "a": 3})
++	orderedLibrary(t, "keys_unsorted", first, `[["x","y"]]`)
++}
++
++func TestOrderedKeysLibraryEntriesRoundTripAcrossRuns(t *testing.T) {
++	first := orderedLibraryValue(t, "to_entries", map[string]any{"b": 1, "a": 2})
++	orderedLibrary(t, "from_entries|keys_unsorted", first, `[["a","b"]]`)
++}
++
++func TestOrderedKeysLibraryMergedResultFeedsAnotherQuery(t *testing.T) {
++	first := orderedLibraryValue(t, ". + {z:9}", map[string]any{"b": 1, "a": 2})
++	orderedLibrary(t, "keys_unsorted", first, `[["a","b","z"]]`)
++}
++
++func TestOrderedKeysAssignCreatesNestedObjectInOrder(t *testing.T) {
++	assertOrdered(t, ".z.y=1|.a=2", "null", "{\"z\":{\"y\":1},\"a\":2}\n")
++}
++
++func TestOrderedKeysAssignFillsACreatedObject(t *testing.T) {
++	assertOrdered(t, ".z.y=1|.z.x=2|.a=3", "null", "{\"z\":{\"y\":1,\"x\":2},\"a\":3}\n")
++}
++
++func TestOrderedKeysAssignCreatesSeveralLevels(t *testing.T) {
++	assertOrdered(t, ".b.d.f=1|.b.c=2|.a=3", "null",
++		"{\"b\":{\"d\":{\"f\":1},\"c\":2},\"a\":3}\n")
++}
++
++func TestOrderedKeysAssignCreatesNestedObjectOnAnExistingOne(t *testing.T) {
++	assertOrdered(t, ".z.y=1|.a=2", `{"m":0}`, "{\"m\":0,\"z\":{\"y\":1},\"a\":2}\n")
++}
++
++func TestOrderedKeysSetpathCreatesNestedObjectInOrder(t *testing.T) {
++	assertOrdered(t, "setpath([\"z\",\"y\"];1)|setpath([\"a\"];2)", "null",
++		"{\"z\":{\"y\":1},\"a\":2}\n")
++}
++
++func TestOrderedKeysDebugPrintsInOrder(t *testing.T) {
++	got := orderedStderr(t, []string{"-c", "--ordered-keys", "debug"}, objInput)
++	if want := "[\"DEBUG:\",{\"b\":1,\"a\":2}]\n"; got != want {
++		t.Fatalf("got %q, want %q", got, want)
++	}
++}
++
++func TestOrderedKeysStderrPrintsInOrder(t *testing.T) {
++	got := orderedStderr(t, []string{"-c", "--ordered-keys", "stderr"}, objInput)
++	if want := "{\"b\":1,\"a\":2}"; got != want {
++		t.Fatalf("got %q, want %q", got, want)
++	}
++}
++
++func TestOrderedKeysRejectsTruncatedObject(t *testing.T) {
++	orderedRejectsLikePlain(t, []string{"-c", "--ordered-keys", "."}, []string{"-c", "."},
++		`{"a":1,`)
++}
++
++func TestOrderedKeysRejectsUnclosedObject(t *testing.T) {
++	orderedRejectsLikePlain(t, []string{"-c", "--ordered-keys", "."}, []string{"-c", "."}, "{")
++}
++
++func TestOrderedKeysRejectsTruncatedArray(t *testing.T) {
++	orderedRejectsLikePlain(t, []string{"-c", "--ordered-keys", "."}, []string{"-c", "."}, "[1,")
++}
++
++func TestOrderedKeysRejectsMissingValue(t *testing.T) {
++	orderedRejectsLikePlain(t, []string{"-c", "--ordered-keys", "."}, []string{"-c", "."},
++		`{"a":`)
++}
++
++func TestOrderedKeysRejectsMalformedArgjson(t *testing.T) {
++	orderedRejectsLikePlain(t,
++		[]string{"-c", "--ordered-keys", "--argjson", "v", "{", "$v"},
++		[]string{"-c", "--argjson", "v", "{", "$v"}, "null")
++}
++
++func TestOrderedKeysFromjsonRejectsTruncatedObject(t *testing.T) {
++	orderedRejectsLikePlain(t, []string{"-c", "--ordered-keys", "fromjson"},
++		[]string{"-c", "fromjson"}, `"{\"a\":1,"`)
++}
++
++func TestOrderedKeysDefaultLiteralStaysSorted(t *testing.T) {
++	orderedArgs(t, []string{"-c", "{z:1,a:2}"}, "null", "{\"a\":2,\"z\":1}\n")
++	orderedArgs(t, []string{"-c", "--ordered-keys", "{z:1,a:2}"}, "null", "{\"z\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysDefaultTojsonStaysSorted(t *testing.T) {
++	orderedArgs(t, []string{"-c", "{z:1,a:2}|tojson"}, "null", "\"{\\\"a\\\":2,\\\"z\\\":1}\"\n")
++	orderedArgs(t, []string{"-c", "--ordered-keys", "{z:1,a:2}|tojson"}, "null",
++		"\"{\\\"z\\\":1,\\\"a\\\":2}\"\n")
++}
++
++func TestOrderedKeysDefaultJsonFormatStaysSorted(t *testing.T) {
++	orderedArgs(t, []string{"-c", "{z:1,a:2}|@json"}, "null", "\"{\\\"a\\\":2,\\\"z\\\":1}\"\n")
++	orderedArgs(t, []string{"-c", "--ordered-keys", "{z:1,a:2}|@json"}, "null",
++		"\"{\\\"z\\\":1,\\\"a\\\":2}\"\n")
++}
++
++func TestOrderedKeysDefaultLiteralKeysUnsortedStaysSorted(t *testing.T) {
++	orderedArgs(t, []string{"-c", "{z:1,a:2}|keys_unsorted"}, "null", "[\"a\",\"z\"]\n")
++	orderedArgs(t, []string{"-c", "--ordered-keys", "{z:1,a:2}|keys_unsorted"}, "null",
++		"[\"z\",\"a\"]\n")
++}
++
++func TestOrderedKeysDefaultFromjsonStaysSorted(t *testing.T) {
++	orderedArgs(t, []string{"-c", "fromjson"}, `"{\"z\":1,\"a\":2}"`, "{\"a\":2,\"z\":1}\n")
++	orderedArgs(t, []string{"-c", "--ordered-keys", "fromjson"}, `"{\"z\":1,\"a\":2}"`,
++		"{\"z\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysDefaultAssignFromNullStaysSorted(t *testing.T) {
++	orderedArgs(t, []string{"-c", ".z=1|.a=2"}, "null", "{\"a\":2,\"z\":1}\n")
++	orderedArgs(t, []string{"-c", "--ordered-keys", ".z=1|.a=2"}, "null", "{\"z\":1,\"a\":2}\n")
++}
++
++func TestOrderedKeysHaltErrorPrintsInOrder(t *testing.T) {
++	got, code := orderedRunStderr(t, []string{"--ordered-keys", "halt_error"}, objInput)
++	if code == 0 {
++		t.Fatal("expected a non-zero exit code")
++	}
++	if want := "{\"b\":1,\"a\":2}\n"; got != want {
++		t.Fatalf("got %q, want %q", got, want)
++	}
++}
++
++func TestOrderedKeysHaltErrorPrintsInOrderWide(t *testing.T) {
++	got, _ := orderedRunStderr(t, []string{"--ordered-keys", "halt_error"}, wideInput)
++	if want := "{\"e\":1,\"d\":2,\"c\":3,\"b\":4,\"a\":5,\"j\":6}\n"; got != want {
++		t.Fatalf("got %q, want %q", got, want)
++	}
++}
++
++func TestOrderedKeysHaltErrorDefaultStaysSorted(t *testing.T) {
++	plain, _ := orderedRunStderr(t, []string{"halt_error"}, objInput)
++	if want := "{\"a\":2,\"b\":1}\n"; plain != want {
++		t.Fatalf("without the option: got %q, want %q", plain, want)
++	}
++	ordered, _ := orderedRunStderr(t, []string{"--ordered-keys", "halt_error"}, objInput)
++	if want := "{\"b\":1,\"a\":2}\n"; ordered != want {
++		t.Fatalf("with the option: got %q, want %q", ordered, want)
++	}
++}
++
++func TestOrderedKeysRejectsTruncationAfterAGoodValue(t *testing.T) {
++	input := "{\"b\":1,\"a\":2}\n{\"c\":3,"
++	got, code := orderedRunFull(t, []string{"-c", "--ordered-keys", "."}, input)
++	if got != "{\"b\":1,\"a\":2}\n" {
++		t.Fatalf("ordered run wrote %q", got)
++	}
++	want, plainCode := orderedRunFull(t, []string{"-c", "."}, input)
++	if want != "{\"a\":2,\"b\":1}\n" {
++		t.Fatalf("plain run wrote %q", want)
++	}
++	if code != plainCode {
++		t.Fatalf("ordered exited %d, plain exited %d", code, plainCode)
++	}
++	if code == 0 {
++		t.Fatal("expected a non-zero exit code")
++	}
++}
++
++func TestOrderedKeysRejectsTruncationAfterSeveralGoodValues(t *testing.T) {
++	input := "{\"b\":1,\"a\":2}\n{\"d\":3,\"c\":4}\n{\"e\":5,"
++	got, code := orderedRunFull(t, []string{"-c", "--ordered-keys", "."}, input)
++	if got != "{\"b\":1,\"a\":2}\n{\"d\":3,\"c\":4}\n" {
++		t.Fatalf("ordered run wrote %q", got)
++	}
++	if code == 0 {
++		t.Fatal("expected a non-zero exit code")
++	}
++}
++
++func TestOrderedKeysEveryLayoutKeepsTheSameOrder(t *testing.T) {
++	want := []string{"e", "d", "c", "b", "a", "j"}
++	for _, args := range [][]string{
++		{"-c", "--ordered-keys", "."},
++		{"--ordered-keys", "."},
++		{"--ordered-keys", "--tab", "."},
++		{"--ordered-keys", "--indent", "4", "."},
++		{"-j", "--ordered-keys", "."},
++	} {
++		if got := orderedKeySequence(t, args, wideInput); !slices.Equal(got, want) {
++			t.Fatalf("args %v\ngot  %v\nwant %v", args, got, want)
++		}
++	}
++}
++
++func TestOrderedKeysEveryLayoutSortsUnderSortKeys(t *testing.T) {
++	want := []string{"a", "b", "c", "d", "e", "j"}
++	for _, args := range [][]string{
++		{"-c", "--ordered-keys", "-S", "."},
++		{"--ordered-keys", "-S", "."},
++		{"--ordered-keys", "-S", "--tab", "."},
++		{"--ordered-keys", "-S", "--indent", "4", "."},
++		{"-j", "--ordered-keys", "-S", "."},
++	} {
++		if got := orderedKeySequence(t, args, wideInput); !slices.Equal(got, want) {
++			t.Fatalf("args %v\ngot  %v\nwant %v", args, got, want)
++		}
++	}
++}
++
++func TestOrderedKeysNestedLayoutsKeepTheSameOrder(t *testing.T) {
++	want := []string{"b", "d", "c", "a"}
++	for _, args := range [][]string{
++		{"-c", "--ordered-keys", "."},
++		{"--ordered-keys", "--tab", "."},
++		{"--ordered-keys", "--indent", "4", "."},
++	} {
++		if got := orderedKeySequence(t, args, `{"b":{"d":1,"c":2},"a":3}`); !slices.Equal(got, want) {
++			t.Fatalf("args %v\ngot  %v\nwant %v", args, got, want)
++		}
++	}
++}
++
++func TestOrderedKeysPlainMapHasNoInheritedOrder(t *testing.T) {
++	for range 256 {
++		orderedRun(t, []string{"-c", "--ordered-keys", "."}, `{"z":1,"a":2}`)
++	}
++	runtime.GC()
++	for range 64 {
++		orderedLibrary(t, "keys_unsorted", map[string]any{"z": 1, "a": 2}, `[["a","z"]]`)
++	}
++}
++
++func TestOrderedKeysPlainMapHasNoInheritedOrderAtDepth(t *testing.T) {
++	for range 256 {
++		orderedRun(t, []string{"-c", "--ordered-keys", "."}, `{"n":{"y":1,"x":2}}`)
++	}
++	runtime.GC()
++	for range 64 {
++		orderedLibrary(t, ".n|keys_unsorted",
++			map[string]any{"n": map[string]any{"y": 1, "x": 2}}, `[["x","y"]]`)
++	}
++}
++
++func TestOrderedKeysDefaultRunAfterOrderedRunStaysSorted(t *testing.T) {
++	for range 256 {
++		orderedArgs(t, []string{"-c", "--ordered-keys", "."}, `{"z":1,"a":2}`,
++			"{\"z\":1,\"a\":2}\n")
++	}
++	runtime.GC()
++	for range 64 {
++		orderedArgs(t, []string{"-c", "."}, `{"z":1,"a":2}`, "{\"a\":2,\"z\":1}\n")
++	}
++}
++
++func TestOrderedKeysOrderedAndDefaultRunsInterleave(t *testing.T) {
++	for range 128 {
++		orderedArgs(t, []string{"-c", "--ordered-keys", "."}, `{"z":1,"a":2}`,
++			"{\"z\":1,\"a\":2}\n")
++		orderedArgs(t, []string{"-c", "."}, `{"z":1,"a":2}`, "{\"a\":2,\"z\":1}\n")
++		orderedLibrary(t, "keys_unsorted", map[string]any{"z": 1, "a": 2}, `[["a","z"]]`)
++	}
++}
++
++func TestOrderedKeysBuiltinResultListsSorted(t *testing.T) {
++	orderedSameAsPlain(t, []string{"-c", "--ordered-keys", `match("b")`},
++		[]string{"-c", `match("b")`}, `"abc"`)
++}
++
++func TestOrderedKeysBuiltinResultMergesSorted(t *testing.T) {
++	assertOrdered(t, `({z:1,y:2} + match("b"))|keys_unsorted`, `"abc"`,
++		"[\"z\",\"y\",\"captures\",\"length\",\"offset\",\"string\"]\n")
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..d9abed9
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,35 @@
++#!/usr/bin/env bash
++set -uo pipefail
++export PATH="/opt/go/bin:$PATH"
++export GOFLAGS=-buildvcs=false
++
++OUTPUT_PATH=""
++MODE=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path) OUTPUT_PATH="$2"; shift 2 ;;
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    base|new) MODE="$1"; shift ;;
++    *) echo "usage: ./test.sh --output_path <path> {base|new}"; exit 1 ;;
++  esac
++done
++[ -z "$MODE" ] && { echo "usage: ./test.sh --output_path <path> {base|new}"; exit 1; }
++[ -z "$OUTPUT_PATH" ] && OUTPUT_PATH="/tmp/gojq-junit.xml"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++produce() {
++  local out ec=0
++  out=$("$@" 2>&1) || ec=$?
++  printf '%s\n' "$out"
++  printf '%s\n' "$out" | go-junit-report > "$OUTPUT_PATH"
++  return $ec
++}
++
++case "$MODE" in
++  base)
++    produce go test -v -count=1 ./...
++    ;;
++  new)
++    produce go test -v -count=1 -tags=orderedkeys -run '^TestOrderedKeys' ./cli
++    ;;
++esac

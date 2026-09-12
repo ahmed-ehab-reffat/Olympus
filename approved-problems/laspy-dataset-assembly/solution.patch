@@ -1,0 +1,817 @@
+diff --git a/laspy/__init__.py b/laspy/__init__.py
+index 7827547..da23bf8 100644
+--- a/laspy/__init__.py
++++ b/laspy/__init__.py
+@@ -3,6 +3,16 @@ __version__ = "2.7.0"
+ import logging
+ 
+ from . import errors, file, vlrs
++from .assembly import (
++    DatasetSummary,
++    Partition,
++    crop,
++    merge_datasets,
++    partition,
++    split_by,
++    summarize,
++    thin,
++)
+ from .copc import Bounds, CopcReader
+ from .errors import LaspyException
+ from .header import LasHeader
+diff --git a/laspy/assembly/__init__.py b/laspy/assembly/__init__.py
+new file mode 100644
+index 0000000..3ea08df
+--- /dev/null
++++ b/laspy/assembly/__init__.py
+@@ -0,0 +1,15 @@
++from .merge import merge_datasets
++from .partition import Partition, crop, partition
++from .reduce import split_by, thin
++from .summary import DatasetSummary, summarize
++
++__all__ = [
++    "DatasetSummary",
++    "Partition",
++    "crop",
++    "merge_datasets",
++    "partition",
++    "split_by",
++    "summarize",
++    "thin",
++]
+diff --git a/laspy/assembly/grid.py b/laspy/assembly/grid.py
+new file mode 100644
+index 0000000..88c00f3
+--- /dev/null
++++ b/laspy/assembly/grid.py
+@@ -0,0 +1,105 @@
++import numpy as np
++
++from ..copc import Bounds
++from ..errors import LaspyException
++
++INT32_MIN = -(2**31)
++INT32_MAX = 2**31 - 1
++
++COORD_NAMES = ("X", "Y", "Z")
++
++
++def to_stored(values, scale, offset):
++    """Converts world coordinates to the integers a LAS file stores"""
++    values = np.asarray(values, dtype=np.float64)
++    return np.round((values - offset) / scale)
++
++
++def to_world(stored, scale, offset):
++    """Converts stored integers back to world coordinates"""
++    return np.asarray(stored, dtype=np.float64) * scale + offset
++
++
++def stored_coords(data, num_axes=3):
++    """Returns the stored integer coordinates as a (num_axes, point count) array"""
++    return np.array(
++        [np.asarray(data[name], dtype=np.int64) for name in COORD_NAMES[:num_axes]]
++    )
++
++
++def check_representable(stored, name):
++    if len(stored) == 0:
++        return
++    if stored.min() < INT32_MIN or stored.max() > INT32_MAX:
++        raise LaspyException(
++            f"{name} coordinates do not fit in the 32 bit integer range "
++            f"with the requested scales and offsets"
++        )
++
++
++def as_axes(value, num_axes, name):
++    values = np.asarray(value, dtype=np.float64)
++    if values.ndim == 0:
++        values = np.full(num_axes, float(values))
++    if values.shape != (num_axes,):
++        raise LaspyException(f"{name} must be a scalar or {num_axes} values")
++    return values
++
++
++def stored_steps(size, scales, num_axes, name):
++    """Converts a world sized step into a whole number of stored integer units"""
++    sizes = as_axes(size, num_axes, name)
++    if np.any(sizes <= 0):
++        raise LaspyException(f"{name} must be strictly positive")
++    steps = np.round(sizes / np.asarray(scales[:num_axes])).astype(np.int64)
++    if np.any(steps < 1):
++        raise LaspyException(
++            f"{name} is smaller than the coordinate resolution of the dataset"
++        )
++    return steps
++
++
++def stored_margin(size, scales, num_axes, name):
++    margins = as_axes(size, num_axes, name)
++    if np.any(margins < 0):
++        raise LaspyException(f"{name} must not be negative")
++    return np.round(margins / np.asarray(scales[:num_axes])).astype(np.int64)
++
++
++def stored_origin(origin, scales, offsets, num_axes):
++    values = as_axes(origin, num_axes, "origin")
++    return np.array(
++        [
++            int(to_stored(values[axis], scales[axis], offsets[axis]))
++            for axis in range(num_axes)
++        ],
++        dtype=np.int64,
++    )
++
++
++def cell_indices(coords, origin, steps):
++    """Cell index of every point, lower edges belonging to the cell they open"""
++    return np.array(
++        [
++            (coords[axis] - origin[axis]) // steps[axis]
++            for axis in range(len(steps))
++        ]
++    )
++
++
++def cell_world_bounds(index, origin, steps, scales, offsets):
++    """Bounds of a cell, in world coordinates"""
++    lows = []
++    highs = []
++    for axis, cell in enumerate(index):
++        low = origin[axis] + int(cell) * int(steps[axis])
++        lows.append(to_world(low, scales[axis], offsets[axis]))
++        highs.append(to_world(low + int(steps[axis]), scales[axis], offsets[axis]))
++    return Bounds(np.array(lows, dtype=np.float64), np.array(highs, dtype=np.float64))
++
++
++def unique_keys(indices):
++    """Distinct cell indices, sorted by axis order, with the inverse mapping"""
++    keys = np.ascontiguousarray(indices.transpose())
++    unique, inverse = np.unique(keys, axis=0, return_inverse=True)
++    return unique, np.asarray(inverse).reshape(-1)
+diff --git a/laspy/assembly/merge.py b/laspy/assembly/merge.py
+new file mode 100644
+index 0000000..4313cf6
+--- /dev/null
++++ b/laspy/assembly/merge.py
+@@ -0,0 +1,237 @@
++from copy import deepcopy
++
++import numpy as np
++
++from ..errors import LaspyException
++from ..header import LasHeader, Version
++from ..lasdata import LasData
++from ..point import ExtraBytesParams, PointFormat, dims, record
++from ..vlrs.vlrlist import VLRList
++from .grid import INT32_MAX, INT32_MIN, to_stored
++
++
++def merge_datasets(
++    datasets,
++    *,
++    scales=None,
++    offsets=None,
++    point_format_id=None,
++    file_version=None,
++):
++    """Merges several datasets into a single one.
++
++    Parameters
++    ----------
++    datasets: iterable of LasData
++        The datasets to merge, kept in the order they are given.
++    scales: optional
++        Scales of the result, defaults to the finest scales of the inputs.
++    offsets: optional
++        Offsets of the result, defaults to the smallest coordinates present.
++    point_format_id: int, optional
++        Point format of the result, defaults to the largest input point format.
++    file_version: str, optional
++        Version of the result, defaults to the largest input version.
++
++    Returns
++    -------
++        laspy.LasData
++    """
++    datasets = list(datasets)
++    if not datasets:
++        raise LaspyException("merge_datasets requires at least one dataset")
++
++    point_format_id = _resolve_point_format(datasets, point_format_id)
++    version = _resolve_version(datasets, point_format_id, file_version)
++    scales = _resolve_scales(datasets, scales)
++    offsets = _resolve_offsets(datasets, offsets)
++    gps_time_type = _agreed_gps_time_type(datasets)
++
++    header = _build_header(
++        datasets, version, point_format_id, scales, offsets, gps_time_type
++    )
++    points = _build_points(datasets, header, scales, offsets)
++
++    merged = LasData(header=header, points=points)
++    merged.update_header()
++    return merged
++
++
++def _resolve_point_format(datasets, point_format_id):
++    if point_format_id is None:
++        return max(data.point_format.id for data in datasets)
++    return int(point_format_id)
++
++
++def _resolve_version(datasets, point_format_id, file_version):
++    if file_version is not None:
++        file_version = str(file_version)
++        dims.raise_if_version_not_compatible_with_fmt(point_format_id, file_version)
++        return Version.from_str(file_version)
++
++    largest = max(str(data.header.version) for data in datasets)
++    preferred = dims.preferred_file_version_for_point_format(point_format_id)
++    return Version.from_str(max(largest, preferred))
++
++
++def _resolve_scales(datasets, scales):
++    if scales is not None:
++        scales = np.asarray(scales, dtype=np.float64)
++        if scales.shape != (3,) or np.any(scales <= 0):
++            raise LaspyException("scales must be 3 strictly positive numbers")
++        return scales
++    return np.min(
++        np.array([np.asarray(data.header.scales) for data in datasets]), axis=0
++    )
++
++
++def _resolve_offsets(datasets, offsets):
++    if offsets is not None:
++        offsets = np.asarray(offsets, dtype=np.float64)
++        if offsets.shape != (3,):
++            raise LaspyException("offsets must be 3 numbers")
++        return offsets
++
++    populated = [data for data in datasets if len(data.points) > 0]
++    if not populated:
++        return np.asarray(datasets[0].header.offsets, dtype=np.float64)
++    return np.min(
++        np.array(
++            [
++                [float(np.asarray(data[name]).min()) for name in ("x", "y", "z")]
++                for data in populated
++            ]
++        ),
++        axis=0,
++    )
++
++
++def _agreed_gps_time_type(datasets):
++    seen = {
++        int(data.header.global_encoding.gps_time_type)
++        for data in datasets
++        if "gps_time" in data.point_format.dimension_names
++    }
++    if len(seen) > 1:
++        raise LaspyException(
++            "datasets mix week time and standard GPS time, they cannot be merged"
++        )
++    return seen.pop() if seen else None
++
++
++def _build_header(datasets, version, point_format_id, scales, offsets, gps_time_type):
++    first = datasets[0].header
++    header = LasHeader(version=version, point_format=PointFormat(point_format_id))
++    header.file_source_id = first.file_source_id
++    header.global_encoding.value = first.global_encoding.value
++    if gps_time_type is not None:
++        header.global_encoding.gps_time_type = gps_time_type
++    header.uuid = first.uuid
++    header.system_identifier = first.system_identifier
++    header.generating_software = first.generating_software
++    header.creation_date = first.creation_date
++    header.scales = np.asarray(scales, dtype=np.float64)
++    header.offsets = np.asarray(offsets, dtype=np.float64)
++    header.vlrs = _merge_vlrs(datasets)
++    extra_params = _merge_extra_dimensions(datasets)
++    if extra_params:
++        header.add_extra_dims(extra_params)
++    if version >= Version(1, 4):
++        header.evlrs = _merge_evlrs(datasets)
++    return header
++
++
++def _merge_vlrs(datasets):
++    merged = VLRList()
++    seen = set()
++    for data in datasets:
++        for vlr in data.header.vlrs:
++            key = (vlr.user_id, vlr.record_id)
++            if key in seen:
++                continue
++            seen.add(key)
++            merged.append(deepcopy(vlr))
++    return merged
++
++
++def _merge_evlrs(datasets):
++    merged = VLRList()
++    seen = set()
++    for data in datasets:
++        for vlr in data.evlrs or []:
++            key = (vlr.user_id, vlr.record_id)
++            if key in seen:
++                continue
++            seen.add(key)
++            merged.append(deepcopy(vlr))
++    return merged
++
++
++def _merge_extra_dimensions(datasets):
++    params = {}
++    for data in datasets:
++        for dimension in data.point_format.extra_dimensions:
++            existing = params.get(dimension.name)
++            if existing is None:
++                params[dimension.name] = ExtraBytesParams(
++                    name=dimension.name,
++                    type=dimension.dtype,
++                    description=dimension.description,
++                    offsets=dimension.offsets,
++                    scales=dimension.scales,
++                    no_data=dimension.no_data,
++                )
++            elif existing.type != dimension.dtype:
++                raise LaspyException(
++                    f"extra dimension '{dimension.name}' has type {existing.type} in one "
++                    f"dataset and {dimension.dtype} in another"
++                )
++            elif not _same_scaling(existing, dimension):
++                raise LaspyException(
++                    f"extra dimension '{dimension.name}' is scaled differently "
++                    f"in two datasets"
++                )
++    return list(params.values())
++
++
++def _same_scaling(params, dimension):
++    for ours, theirs in ((params.scales, dimension.scales), (params.offsets, dimension.offsets)):
++        if (ours is None) != (theirs is None):
++            return False
++        if ours is not None and not np.array_equal(ours, theirs):
++            return False
++    return True
++
++
++def _build_points(datasets, header, scales, offsets):
++    arrays = []
++    for data in datasets:
++        converted = record.PackedPointRecord.from_point_record(
++            data.points, header.point_format
++        )
++        _requantize(converted, data, scales, offsets)
++        arrays.append(converted.array)
++
++    if len(arrays) == 1:
++        array = arrays[0]
++    else:
++        array = np.concatenate(arrays)
++    return record.ScaleAwarePointRecord(
++        array, header.point_format, scales=header.scales, offsets=header.offsets
++    )
++
++
++def _requantize(converted, source, scales, offsets):
++    if len(converted) == 0:
++        return
++    for axis, (stored_name, world_name) in enumerate(
++        (("X", "x"), ("Y", "y"), ("Z", "z"))
++    ):
++        world = np.asarray(source[world_name], dtype=np.float64)
++        stored = to_stored(world, scales[axis], offsets[axis])
++        if stored.min() < INT32_MIN or stored.max() > INT32_MAX:
++            raise LaspyException(
++                f"the merged {stored_name} coordinates do not fit in a 32 bit integer, "
++                f"use coarser scales or different offsets"
++            )
++        converted[stored_name] = stored.astype(np.int32)
+diff --git a/laspy/assembly/partition.py b/laspy/assembly/partition.py
+new file mode 100644
+index 0000000..f83c39b
+--- /dev/null
++++ b/laspy/assembly/partition.py
+@@ -0,0 +1,202 @@
++from copy import deepcopy
++
++import numpy as np
++
++from ..errors import LaspyException
++from ..lasdata import LasData
++from .grid import (
++    cell_indices,
++    cell_world_bounds,
++    stored_coords,
++    stored_margin,
++    stored_origin,
++    stored_steps,
++    to_stored,
++    unique_keys,
++)
++
++
++class Partition:
++    """One cell of a partitioned dataset"""
++
++    def __init__(self, key, bounds, core_count, data):
++        self.key = key
++        """Subdivision level, column and row of the cell"""
++        self.bounds = bounds
++        """Extent of the cell as a laspy.Bounds"""
++        self.core_count = core_count
++        """Number of points that belong to the cell itself"""
++        self.data = data
++        """The points of the cell, buffer points last"""
++
++    def __len__(self):
++        return len(self.data.points)
++
++    def __repr__(self):
++        return "<Partition(key={}, {} points, {} core)>".format(
++            self.key, len(self), self.core_count
++        )
++
++
++def take(data, indices):
++    """Builds a new dataset out of the points at the given indices"""
++    indices = np.asarray(indices, dtype=np.intp)
++    subset = LasData(header=deepcopy(data.header), points=data.points[indices])
++    subset.update_header()
++    return subset
++
++
++def partition(
++    data, *, cell_size, origin=(0.0, 0.0), buffer=0.0, min_points=1, max_points=None
++):
++    """Splits a dataset into a grid of cells.
++
++    Parameters
++    ----------
++    data: laspy.LasData
++        The dataset to split.
++    cell_size: float or 2 floats
++        Size of a cell of the base grid along x and y.
++    origin: 2 floats
++        A corner the grid is aligned on.
++    buffer: float or 2 floats
++        The cell is grown by this distance on each axis, keeping its half open
++        shape; the points it gains are added and marked as synthetic.
++    min_points: int
++        Cells holding fewer points than this, buffer points excluded, are dropped.
++    max_points: int, optional
++        When given, a cell holding more points than this is split into quadrants
++        for as long as its size in stored units stays even.
++
++    Returns
++    -------
++        list of laspy.Partition
++    """
++    if int(min_points) < 0:
++        raise LaspyException("min_points must not be negative")
++    if max_points is not None and int(max_points) < 1:
++        raise LaspyException("max_points must be strictly positive")
++
++    scales = np.asarray(data.header.scales)
++    offsets = np.asarray(data.header.offsets)
++    steps = stored_steps(cell_size, scales, 2, "cell_size")
++    margins = stored_margin(buffer, scales, 2, "buffer")
++    grid_origin = stored_origin(origin, scales, offsets, 2)
++    coords = stored_coords(data, 2)
++
++    if coords.shape[1] == 0:
++        return []
++
++    indices = cell_indices(coords, grid_origin, steps)
++    keys, inverse = unique_keys(indices)
++
++    cells = []
++    for cell_number, key in enumerate(keys):
++        core = np.flatnonzero(inverse == cell_number)
++        cells.extend(
++            _subdivide(coords, grid_origin, steps, key, core, max_points, 0)
++        )
++    cells.sort(key=lambda cell: cell[0])
++
++    partitions = []
++    for key, cell_steps, core in cells:
++        if len(core) < int(min_points) or len(core) == 0:
++            continue
++        selected = core
++        if np.any(margins > 0):
++            selected = np.concatenate(
++                (
++                    core,
++                    _buffer_indices(
++                        coords, key[1:], grid_origin, cell_steps, margins, core
++                    ),
++                )
++            )
++        cell = take(data, selected)
++        if len(selected) > len(core):
++            _mark_buffer(cell, len(core))
++        partitions.append(
++            Partition(
++                key=key,
++                bounds=cell_world_bounds(
++                    key[1:], grid_origin, cell_steps, scales, offsets
++                ),
++                core_count=int(len(core)),
++                data=cell,
++            )
++        )
++    return partitions
++
++
++def _subdivide(coords, grid_origin, steps, key, core, max_points, level):
++    """Halves a cell into quadrants for as long as it is over budget"""
++    keeps_budget = max_points is None or len(core) <= int(max_points)
++    if keeps_budget or np.any(steps % 2 != 0):
++        return [((level, int(key[0]), int(key[1])), steps, core)]
++
++    halved = steps // 2
++    finer = cell_indices(coords[:, core], grid_origin, halved)
++    quadrants, inverse = unique_keys(finer)
++
++    cells = []
++    for quadrant_number, quadrant in enumerate(quadrants):
++        members = core[np.flatnonzero(inverse == quadrant_number)]
++        cells.extend(
++            _subdivide(
++                coords, grid_origin, halved, quadrant, members, max_points, level + 1
++            )
++        )
++    return cells
++
++
++def _buffer_indices(coords, key, grid_origin, steps, margins, core):
++    inside = np.ones(coords.shape[1], dtype=bool)
++    for axis in range(2):
++        low = grid_origin[axis] + int(key[axis]) * int(steps[axis])
++        high = low + int(steps[axis])
++        inside &= coords[axis] >= low - int(margins[axis])
++        inside &= coords[axis] < high + int(margins[axis])
++    inside[core] = False
++    return np.flatnonzero(inside)
++
++
++def _mark_buffer(cell, core_count):
++    synthetic = np.asarray(cell.synthetic).copy()
++    synthetic[core_count:] = True
++    cell.synthetic = synthetic
++
++
++def crop(data, bounds):
++    """Keeps the points inside the given bounds.
++
++    Parameters
++    ----------
++    data: laspy.LasData
++        The dataset to crop.
++    bounds: 4 or 6 floats
++        min x, min y, max x, max y or min x, min y, min z, max x, max y, max z.
++
++    Returns
++    -------
++        laspy.LasData
++    """
++    bounds = np.asarray(bounds, dtype=np.float64)
++    if bounds.shape not in ((4,), (6,)):
++        raise LaspyException("bounds must hold 4 or 6 values")
++
++    num_axes = bounds.shape[0] // 2
++    mins = bounds[:num_axes]
++    maxs = bounds[num_axes:]
++    if np.any(maxs <= mins):
++        raise LaspyException("every upper bound must be greater than its lower bound")
++
++    scales = np.asarray(data.header.scales)
++    offsets = np.asarray(data.header.offsets)
++    coords = stored_coords(data, num_axes)
++    kept = np.ones(coords.shape[1], dtype=bool)
++    for axis in range(num_axes):
++        low = to_stored(mins[axis], scales[axis], offsets[axis])
++        high = to_stored(maxs[axis], scales[axis], offsets[axis])
++        kept &= coords[axis] >= low
++        kept &= coords[axis] < high
++    return take(data, np.flatnonzero(kept))
+diff --git a/laspy/assembly/reduce.py b/laspy/assembly/reduce.py
+new file mode 100644
+index 0000000..35d3048
+--- /dev/null
++++ b/laspy/assembly/reduce.py
+@@ -0,0 +1,92 @@
++import numpy as np
++
++from ..errors import LaspyException
++from .grid import stored_coords, stored_steps, unique_keys
++from .partition import take
++
++KEEP_RULES = ("first", "last", "lowest", "highest", "centre")
++
++
++def thin(data, spacing, *, keep="first"):
++    """Keeps a single point per voxel of the given spacing.
++
++    Voxels are anchored on the stored coordinate origin of the dataset.
++
++    Parameters
++    ----------
++    data: laspy.LasData
++        The dataset to thin.
++    spacing: float or 3 floats
++        Size of a voxel along x, y and z.
++    keep: str
++        Which point of a voxel survives: 'first', 'last', 'lowest', 'highest'
++        or 'centre', the one closest to the voxel centre.
++
++    Returns
++    -------
++        laspy.LasData
++    """
++    if keep not in KEEP_RULES:
++        raise LaspyException(f"keep must be one of {KEEP_RULES}")
++
++    scales = np.asarray(data.header.scales)
++    steps = stored_steps(spacing, scales, 3, "spacing")
++    coords = stored_coords(data, 3)
++    if coords.shape[1] == 0:
++        return take(data, np.zeros(0, dtype=np.intp))
++
++    voxels = np.array([coords[axis] // steps[axis] for axis in range(3)])
++    _, inverse = unique_keys(voxels)
++
++    order = np.arange(coords.shape[1], dtype=np.int64)
++    if keep == "first":
++        primary = order
++    elif keep == "last":
++        primary = -order
++    elif keep == "lowest":
++        primary = coords[2]
++    elif keep == "highest":
++        primary = -coords[2]
++    else:
++        primary = _distance_to_centre(coords, voxels, steps)
++
++    ranked = np.lexsort((order, primary, inverse))
++    _, first = np.unique(inverse[ranked], return_index=True)
++    return take(data, np.sort(ranked[first]))
++
++
++def _distance_to_centre(coords, voxels, steps):
++    """Squared distance to the voxel centre, doubled to stay whole"""
++    squared = np.zeros(coords.shape[1], dtype=np.int64)
++    for axis in range(3):
++        low = voxels[axis] * int(steps[axis])
++        doubled = 2 * (coords[axis] - low) - int(steps[axis])
++        squared += doubled * doubled
++    return squared
++
++
++def split_by(data, dimension):
++    """Splits a dataset into one dataset per value of a dimension.
++
++    Parameters
++    ----------
++    data: laspy.LasData
++        The dataset to split.
++    dimension: str
++        Name of the dimension whose values form the groups.
++
++    Returns
++    -------
++        dict of value to laspy.LasData, keys in ascending order
++    """
++    if dimension not in data.point_format.dimension_names:
++        raise LaspyException(f"'{dimension}' is not a dimension of this dataset")
++
++    values = np.asarray(data[dimension])
++    if values.ndim != 1:
++        raise LaspyException(f"'{dimension}' does not hold one value per point")
++
++    groups = {}
++    for value in np.unique(values):
++        groups[value.item()] = take(data, np.flatnonzero(values == value))
++    return groups
+diff --git a/laspy/assembly/summary.py b/laspy/assembly/summary.py
+new file mode 100644
+index 0000000..1e3cf53
+--- /dev/null
++++ b/laspy/assembly/summary.py
+@@ -0,0 +1,109 @@
++import numpy as np
++
++from ..copc import Bounds
++from .grid import stored_coords, to_world
++
++
++class DatasetSummary:
++    """What a dataset holds, counted from the points themselves"""
++
++    def __init__(
++        self,
++        point_count,
++        bounds,
++        counts_by_classification,
++        counts_by_return,
++        gps_time_span,
++        extra_dimension_names,
++        density,
++    ):
++        self.point_count = point_count
++        self.bounds = bounds
++        self.counts_by_classification = counts_by_classification
++        self.counts_by_return = counts_by_return
++        self.gps_time_span = gps_time_span
++        self.extra_dimension_names = extra_dimension_names
++        self.density = density
++
++    def as_dict(self):
++        return {
++            "point_count": self.point_count,
++            "bounds": self.bounds,
++            "counts_by_classification": self.counts_by_classification,
++            "counts_by_return": self.counts_by_return,
++            "gps_time_span": self.gps_time_span,
++            "extra_dimension_names": self.extra_dimension_names,
++            "density": self.density,
++        }
++
++    def __repr__(self):
++        return "<DatasetSummary({} points, {} classes)>".format(
++            self.point_count, len(self.counts_by_classification)
++        )
++
++
++def _counts(values):
++    counts = {}
++    if len(values) == 0:
++        return counts
++    keys, totals = np.unique(np.asarray(values), return_counts=True)
++    for key, total in zip(keys, totals):
++        counts[key.item()] = int(total)
++    return counts
++
++
++def summarize(data):
++    """Describes the content of a dataset.
++
++    Parameters
++    ----------
++    data: laspy.LasData
++        The dataset to describe.
++
++    Returns
++    -------
++        laspy.DatasetSummary
++    """
++    scales = np.asarray(data.header.scales)
++    offsets = np.asarray(data.header.offsets)
++    coords = stored_coords(data, 3)
++    point_count = int(coords.shape[1])
++    extra_dimension_names = tuple(data.point_format.extra_dimension_names)
++
++    if point_count == 0:
++        return DatasetSummary(
++            point_count=0,
++            bounds=None,
++            counts_by_classification={},
++            counts_by_return={},
++            gps_time_span=None,
++            extra_dimension_names=extra_dimension_names,
++            density=None,
++        )
++
++    mins = [
++        float(to_world(coords[axis].min(), scales[axis], offsets[axis]))
++        for axis in range(3)
++    ]
++    maxs = [
++        float(to_world(coords[axis].max(), scales[axis], offsets[axis]))
++        for axis in range(3)
++    ]
++    area = (maxs[0] - mins[0]) * (maxs[1] - mins[1])
++    density = point_count / area if area > 0 else None
++
++    if "gps_time" in data.point_format.dimension_names:
++        gps_time = np.asarray(data["gps_time"])
++        gps_time_span = (float(gps_time.min()), float(gps_time.max()))
++    else:
++        gps_time_span = None
++
++    return DatasetSummary(
++        point_count=point_count,
++        bounds=Bounds(np.array(mins), np.array(maxs)),
++        counts_by_classification=_counts(data["classification"]),
++        counts_by_return=_counts(data["return_number"]),
++        gps_time_span=gps_time_span,
++        extra_dimension_names=extra_dimension_names,
++        density=density,
++    )

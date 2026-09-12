@@ -1,0 +1,728 @@
+diff --git a/src/sqlfluff/cli/commands.py b/src/sqlfluff/cli/commands.py
+index 0f3beb4b1..c80c15bee 100644
+--- a/src/sqlfluff/cli/commands.py
++++ b/src/sqlfluff/cli/commands.py
+@@ -1252,6 +1252,8 @@ def _paths_fix(
+             for violation in non_fixable:
+                 click.echo(formatter.format_violation(violation))
+ 
++    formatter.dispatch_fix_transaction_report(result)
++
+     if persist_timing:
+         result.persist_timing_records(persist_timing)
+ 
+diff --git a/src/sqlfluff/cli/formatters.py b/src/sqlfluff/cli/formatters.py
+index 2f6380886..476692ecc 100644
+--- a/src/sqlfluff/cli/formatters.py
++++ b/src/sqlfluff/cli/formatters.py
+@@ -3,7 +3,7 @@
+ import os
+ import sys
+ from io import StringIO
+-from typing import Callable, Optional, Union
++from typing import Callable, Optional, Union, cast
+ 
+ import click
+ from colorama import Style
+@@ -18,7 +18,12 @@ from sqlfluff.cli.helpers import (
+ )
+ from sqlfluff.cli.outputstream import OutputStream
+ from sqlfluff.core import FluffConfig, Linter, SQLBaseError, TimingSummary
+-from sqlfluff.core.linter import FormatterInterface, LintedFile, ParsedString
++from sqlfluff.core.linter import (
++    FormatterInterface,
++    LintedFile,
++    LintingResult,
++    ParsedString,
++)
+ from sqlfluff.core.types import Color
+ 
+ 
+@@ -759,6 +764,48 @@ class OutputStreamFormatter(FormatterInterface):
+ 
+         return violations_count
+ 
++    def format_fix_transaction_report(self, result: LintingResult) -> str:
++        """Format the outcomes of a fix transaction for display.
++
++        Returns an empty string unless the run staged at least one fix, which
++        only happens when the fix transaction is switched on.
++        """
++        report = result.fix_transaction_report()
++        if not report.total:
++            return ""
++        text_buffer = StringIO()
++        text_buffer.write("==== fix transaction ====\n")
++        text_buffer.write(report.summary())
++        for record in result.fix_outcome_records():
++            outcomes = cast(list[dict], record["fix_outcomes"])
++            skipped = [
++                outcome for outcome in outcomes if outcome["status"] == "skipped"
++            ]
++            if not skipped:
++                continue
++            text_buffer.write("\n")
++            text_buffer.write(
++                self.format_filename(cast(str, record["filepath"]), success=False)
++            )
++            for outcome in sorted(skipped, key=lambda o: (o["line_no"], o["line_pos"])):
++                detail = outcome["reason"]
++                if outcome["conflict_with"]:
++                    detail = f"{detail} with {outcome['conflict_with']}"
++                line = (
++                    f"L:{outcome['line_no']:4} | P:{outcome['line_pos']:4} | "
++                    f"{outcome['rule_code']}: skipped ({detail})"
++                )
++                text_buffer.write("\n" + self.colorize(line, Color.blue))
++        return text_buffer.getvalue()
++
++    def dispatch_fix_transaction_report(self, result: LintingResult) -> None:
++        """Print the fix transaction outcomes, when any were recorded."""
++        if self.verbosity < 0:
++            return
++        report = self.format_fix_transaction_report(result)
++        if report:
++            self._dispatch(report)
++
+     def completion_message(self) -> None:
+         """Prints message when SQLFluff is finished."""
+         click.echo(f"All Finished{'' if self.plain_output else ' 📜 🎉'}!")
+diff --git a/src/sqlfluff/core/default_config.cfg b/src/sqlfluff/core/default_config.cfg
+index d2106462f..4a5372f6c 100644
+--- a/src/sqlfluff/core/default_config.cfg
++++ b/src/sqlfluff/core/default_config.cfg
+@@ -22,6 +22,8 @@ exclude_rules = None
+ output_line_length = 80
+ # Number of passes to run before admitting defeat
+ runaway_limit = 10
++# Stage each fix pass as a single all-or-nothing transaction
++fix_transaction = False
+ # Maximum main-loop iterations for the Rust parser before aborting.
+ # Increase this for extremely complex SQL queries that hit the default limit.
+ # Set to 0 to use the built-in default (3000000).
+diff --git a/src/sqlfluff/core/formatter.py b/src/sqlfluff/core/formatter.py
+index cbb35064c..1a0f01261 100644
+--- a/src/sqlfluff/core/formatter.py
++++ b/src/sqlfluff/core/formatter.py
+@@ -17,7 +17,7 @@ from sqlfluff.core.types import Color
+ 
+ if TYPE_CHECKING:  # pragma: no cover
+     from sqlfluff.core.config import FluffConfig
+-    from sqlfluff.core.linter import LintedFile
++    from sqlfluff.core.linter import LintedFile, LintingResult
+ 
+ 
+ class FormatterInterface(ABC):
+@@ -78,3 +78,8 @@ class FormatterInterface(ABC):
+     def colorize(self, s: str, color: Optional[Color] = None) -> str:
+         """Optionally use ANSI colour codes to colour a string."""
+         ...
++
++    @abstractmethod
++    def dispatch_fix_transaction_report(self, result: "LintingResult") -> None:
++        """Dispatch the outcomes of a fix transaction, if any were recorded."""
++        ...
+diff --git a/src/sqlfluff/core/linter/fix_transaction.py b/src/sqlfluff/core/linter/fix_transaction.py
+new file mode 100644
+index 000000000..c5d460e4a
+--- /dev/null
++++ b/src/sqlfluff/core/linter/fix_transaction.py
+@@ -0,0 +1,293 @@
++"""Staged, all-or-nothing application of fixes proposed by several rules.
++
++The default fix loop hands each rule the tree left behind by the rule before it,
++so two rules can never propose a fix against the same tree and a conflict between
++them cannot be observed. A transaction stages every rule's fixes against a single
++snapshot instead, which makes conflicts visible, lets the batch be committed or
++rolled back as a unit, and leaves a record of what happened to each fix.
++"""
++
++from collections import Counter
++from collections.abc import Iterable, Mapping
++from dataclasses import dataclass, field
++from typing import TYPE_CHECKING, Optional
++
++from sqlfluff.core.linter.fix import apply_fixes, compute_anchor_edit_info
++
++if TYPE_CHECKING:  # pragma: no cover
++    from sqlfluff.core.dialects import Dialect
++    from sqlfluff.core.parser import BaseSegment
++    from sqlfluff.core.rules.fix import LintFix
++    from sqlfluff.core.templaters import TemplatedFile
++
++APPLIED = "applied"
++SKIPPED = "skipped"
++
++CONFLICT = "conflict"
++UNPARSABLE = "unparsable"
++OSCILLATION = "oscillation"
++
++
++@dataclass(frozen=True)
++class FixOutcome:
++    """What became of a single fix proposed during a fix transaction."""
++
++    rule_code: str
++    line_no: int
++    line_pos: int
++    status: str
++    reason: Optional[str] = None
++    conflict_with: Optional[str] = None
++
++    def to_dict(self) -> dict[str, object]:
++        """A plain mapping for serialised (e.g. JSON) output."""
++        return {
++            "rule_code": self.rule_code,
++            "line_no": self.line_no,
++            "line_pos": self.line_pos,
++            "status": self.status,
++            "reason": self.reason,
++            "conflict_with": self.conflict_with,
++        }
++
++
++@dataclass(frozen=True)
++class StagedFix:
++    """A fix held against the snapshot, remembering which rule proposed it."""
++
++    rule_code: str
++    fix: "LintFix"
++
++    @property
++    def span(self) -> tuple[int, int]:
++        """The source positions the fix anchor covers."""
++        pos = self.fix.anchor.pos_marker
++        if pos is None:
++            return (0, 0)
++        source_slice = pos.source_slice
++        return (source_slice.start, source_slice.stop)
++
++    def footprint(
++        self, templated_file: Optional["TemplatedFile"]
++    ) -> Optional[frozenset[int]]:
++        """The editable source the fix touches, as literal raw-slice offsets.
++
++        A fix can only rewrite literal source; the parts of a templated file
++        that come from a `{{ ... }}` or `{% ... %}` block are off limits, so a
++        fix landing wholly inside one of them touches nothing editable. Two
++        fixes only truly compete when the literal slices they touch actually
++        intersect, which is finer than their anchors sharing a source position.
++        Returns ``None`` when the footprint cannot be computed and the caller
++        should fall back to raw source positions alone.
++        """
++        if templated_file is None or self.fix.anchor.pos_marker is None:
++            return None
++        slices = self.fix.get_fix_slices(templated_file, within_only=True)
++        return frozenset(
++            raw_slice.source_idx
++            for raw_slice in slices
++            if raw_slice.slice_type == "literal"
++        )
++
++    def outcome(
++        self,
++        status: str,
++        reason: Optional[str] = None,
++        conflict_with: Optional[str] = None,
++    ) -> FixOutcome:
++        """Record the fate of this fix."""
++        pos = self.fix.anchor.pos_marker
++        line_no, line_pos = (pos.working_loc) if pos else (0, 0)
++        return FixOutcome(
++            rule_code=self.rule_code,
++            line_no=line_no,
++            line_pos=line_pos,
++            status=status,
++            reason=reason,
++            conflict_with=conflict_with,
++        )
++
++
++def stage_fixes(rule_code: str, fixes: list["LintFix"]) -> list[StagedFix]:
++    """Attach the proposing rule to each fix."""
++    return [StagedFix(rule_code, fix) for fix in fixes]
++
++
++def _composes(left: StagedFix, right: StagedFix) -> bool:
++    """Do these two fixes sit either side of one anchor rather than fight over it?"""
++    if left.fix.anchor.uuid != right.fix.anchor.uuid:
++        return False
++    return {left.fix.edit_type, right.fix.edit_type} == {
++        "create_before",
++        "create_after",
++    }
++
++
++def _overlaps(left: StagedFix, right: StagedFix) -> bool:
++    """Do the source positions of the two fix anchors intersect?"""
++    left_start, left_stop = left.span
++    right_start, right_stop = right.span
++    if left_start == left_stop or right_start == right_stop:
++        return left_start == right_start
++    return left_start < right_stop and right_start < left_stop
++
++
++def _competes(
++    left: StagedFix,
++    right: StagedFix,
++    footprints: Mapping[int, Optional[frozenset[int]]],
++) -> bool:
++    """Do two fixes from different rules fight over the same editable source?
++
++    They compete when their source positions overlap and the literal slices
++    they touch actually intersect. The position check discriminates fixes in a
++    single literal file (where every fix shares the one whole-file slice); the
++    slice check then drops pairs that only meet in a templated region, or that
++    edit different literal slices behind one anchor. A missing footprint means
++    the positions alone decide.
++    """
++    if _composes(left, right):
++        return False
++    if not _overlaps(left, right):
++        return False
++    left_prints = footprints[id(left)]
++    right_prints = footprints[id(right)]
++    if left_prints is None or right_prints is None:
++        return True
++    return not left_prints.isdisjoint(right_prints)
++
++
++def resolve_conflicts(
++    staged: list[StagedFix],
++    templated_file: Optional["TemplatedFile"] = None,
++) -> tuple[list[StagedFix], list[FixOutcome]]:
++    """Settle fixes from different rules that compete for the same source.
++
++    Fixes are considered in rule code order, so the rule whose code sorts first
++    is the one that keeps its fix; every later rule that wants overlapping source
++    is skipped and told which rule took it. Competition is judged on the literal
++    source each fix touches, so fixes to templated regions never spuriously block
++    one another.
++    """
++    footprints = {id(s): s.footprint(templated_file) for s in staged}
++    ordered = sorted(staged, key=lambda s: (s.rule_code, s.span, s.fix.edit_type))
++    accepted: list[StagedFix] = []
++    skipped: list[FixOutcome] = []
++
++    for candidate in ordered:
++        blocker: Optional[StagedFix] = None
++        for winner in accepted:
++            if winner.rule_code == candidate.rule_code:
++                continue
++            if _competes(winner, candidate, footprints):
++                blocker = winner
++                break
++        if blocker:
++            skipped.append(
++                candidate.outcome(SKIPPED, CONFLICT, conflict_with=blocker.rule_code)
++            )
++        else:
++            accepted.append(candidate)
++
++    return accepted, skipped
++
++
++def commit(
++    tree: "BaseSegment",
++    dialect: "Dialect",
++    accepted: list[StagedFix],
++    fix_even_unparsable: bool,
++    max_parse_depth: int,
++    max_parse_nodes: int,
++) -> tuple["BaseSegment", bool]:
++    """Apply the accepted fixes to the snapshot as a single batch.
++
++    The whole batch is applied in one pass so that no fix observes the effect of
++    another. The caller keeps the returned tree only if it is valid.
++    """
++    anchor_info = compute_anchor_edit_info([staged.fix for staged in accepted])
++    codes = ",".join(sorted({staged.rule_code for staged in accepted}))
++    new_tree, _, _, is_valid = apply_fixes(
++        tree,
++        dialect,
++        codes,
++        anchor_info,
++        fix_even_unparsable=fix_even_unparsable,
++        max_parse_depth=max_parse_depth,
++        max_parse_nodes=max_parse_nodes,
++    )
++    return new_tree, is_valid
++
++
++def roll_back(accepted: list[StagedFix], reason: str) -> list[FixOutcome]:
++    """Discard a batch, recording why every fix in it went unapplied."""
++    return [staged.outcome(SKIPPED, reason) for staged in accepted]
++
++
++def record_applied(accepted: list[StagedFix]) -> list[FixOutcome]:
++    """Record a committed batch."""
++    return [staged.outcome(APPLIED) for staged in accepted]
++
++
++def conflict_groups(
++    outcomes: Iterable[FixOutcome],
++) -> dict[str, tuple[str, ...]]:
++    """Group conflict skips by the rule that won each contested source.
++
++    The result maps a winning rule code to the codes of the rules whose fixes
++    it displaced, in the order they were skipped.
++    """
++    groups: dict[str, list[str]] = {}
++    for outcome in outcomes:
++        if outcome.reason == CONFLICT and outcome.conflict_with is not None:
++            groups.setdefault(outcome.conflict_with, []).append(outcome.rule_code)
++    return {winner: tuple(losers) for winner, losers in groups.items()}
++
++
++def oscillating_rules(outcomes: Iterable[FixOutcome]) -> frozenset[str]:
++    """The rules whose fixes were rolled back for cycling the file."""
++    return frozenset(o.rule_code for o in outcomes if o.reason == OSCILLATION)
++
++
++@dataclass(frozen=True)
++class FixTransactionReport:
++    """A tally of what a set of transactions did to the fixes they staged."""
++
++    applied: int
++    skipped: int
++    reasons: Mapping[str, int] = field(default_factory=dict)
++
++    @classmethod
++    def from_outcomes(cls, outcomes: Iterable[FixOutcome]) -> "FixTransactionReport":
++        """Summarise a run of outcomes, counting the skips by reason."""
++        applied = 0
++        reasons: "Counter[str]" = Counter()
++        for outcome in outcomes:
++            if outcome.status == APPLIED:
++                applied += 1
++            elif outcome.reason is not None:
++                reasons[outcome.reason] += 1
++        return cls(
++            applied=applied, skipped=sum(reasons.values()), reasons=dict(reasons)
++        )
++
++    @property
++    def total(self) -> int:
++        """How many fixes were staged in all."""
++        return self.applied + self.skipped
++
++    def summary(self) -> str:
++        """A one line description, ordered by reason for a stable read."""
++        if not self.total:
++            return "no staged fixes"
++        parts = [f"{self.applied} applied", f"{self.skipped} skipped"]
++        parts += [f"{self.reasons[reason]} {reason}" for reason in sorted(self.reasons)]
++        return ", ".join(parts)
++
++    def to_dict(self) -> dict[str, object]:
++        """A plain mapping for serialised (e.g. JSON) output."""
++        return {
++            "applied": self.applied,
++            "skipped": self.skipped,
++            "reasons": dict(self.reasons),
++        }
+diff --git a/src/sqlfluff/core/linter/linted_dir.py b/src/sqlfluff/core/linter/linted_dir.py
+index 52efa6e8a..d82b58dd2 100644
+--- a/src/sqlfluff/core/linter/linted_dir.py
++++ b/src/sqlfluff/core/linter/linted_dir.py
+@@ -14,6 +14,7 @@ from sqlfluff.core.errors import (
+     SQLLintError,
+ )
+ from sqlfluff.core.formatter import FormatterInterface
++from sqlfluff.core.linter.fix_transaction import FixOutcome, FixTransactionReport
+ from sqlfluff.core.linter.linted_file import TMP_PRS_ERROR_TYPES, LintedFile
+ from sqlfluff.core.parser.segments.base import BaseSegment
+ 
+@@ -59,6 +60,9 @@ class LintedDir:
+         # Timing
+         self.step_timings: list[dict[str, float]] = []
+         self.rule_timings: list[tuple[str, str, float]] = []
++        # Fix transaction provenance, retained even when files are not.
++        self.fix_outcomes: list[FixOutcome] = []
++        self._fix_outcome_records: list[SerializedObject] = []
+ 
+     def add(self, file: LintedFile) -> None:
+         """Add a file to this path.
+@@ -134,6 +138,16 @@ class LintedDir:
+             self.step_timings.append(file.timings.step_timings)
+             self.rule_timings.extend(file.timings.rule_timings)
+ 
++        # Retain fix transaction provenance, keyed by file for serialisation.
++        if file.fix_outcomes:
++            self.fix_outcomes.extend(file.fix_outcomes)
++            self._fix_outcome_records.append(
++                {
++                    "filepath": file.path,
++                    "fix_outcomes": [o.to_dict() for o in file.fix_outcomes],
++                }
++            )
++
+         # Finally, if set to persist files, do that.
+         if self.retain_files:
+             self.files.append(file)
+@@ -198,6 +212,18 @@ class LintedDir:
+         """
+         return self._records
+ 
++    def fix_outcome_records(self) -> list[SerializedObject]:
++        """Return the fix transaction outcomes as serialisable dictionaries.
++
++        Only files that staged at least one fix appear, so the result is empty
++        unless the run used the fix transaction.
++        """
++        return self._fix_outcome_records
++
++    def fix_transaction_report(self) -> FixTransactionReport:
++        """A tally of what the transactions did across this path's files."""
++        return FixTransactionReport.from_outcomes(self.fix_outcomes)
++
+     def stats(self) -> dict[str, int]:
+         """Return a dict containing linting stats about this path."""
+         return {
+diff --git a/src/sqlfluff/core/linter/linted_file.py b/src/sqlfluff/core/linter/linted_file.py
+index da33e4df5..792c686b6 100644
+--- a/src/sqlfluff/core/linter/linted_file.py
++++ b/src/sqlfluff/core/linter/linted_file.py
+@@ -23,6 +23,15 @@ from sqlfluff.core.errors import (
+     SQLTemplaterError,
+ )
+ from sqlfluff.core.formatter import FormatterInterface
++from sqlfluff.core.linter.fix_transaction import (
++    APPLIED,
++    CONFLICT,
++    SKIPPED,
++    FixOutcome,
++    FixTransactionReport,
++    conflict_groups,
++    oscillating_rules,
++)
+ from sqlfluff.core.linter.patch import FixPatch, generate_source_patches
+ 
+ # Classes needed only for type checking
+@@ -74,6 +83,7 @@ class LintedFile(NamedTuple):
+     templated_file: Optional[TemplatedFile]
+     encoding: str
+     source_patches: Optional[list[FixPatch]] = None
++    fix_outcomes: tuple[FixOutcome, ...] = ()
+ 
+     def check_tuples(
+         self, raise_on_non_linting_violations: bool = True
+@@ -92,6 +102,30 @@ class LintedFile(NamedTuple):
+                 raise v
+         return vs
+ 
++    def applied_fixes(self) -> tuple[FixOutcome, ...]:
++        """The fixes a transaction committed for this file."""
++        return tuple(o for o in self.fix_outcomes if o.status == APPLIED)
++
++    def skipped_fixes(self) -> tuple[FixOutcome, ...]:
++        """The fixes a transaction proposed but did not apply."""
++        return tuple(o for o in self.fix_outcomes if o.status == SKIPPED)
++
++    def fix_conflicts(self) -> tuple[FixOutcome, ...]:
++        """The fixes skipped because another rule took the same source."""
++        return tuple(o for o in self.fix_outcomes if o.reason == CONFLICT)
++
++    def conflict_groups(self) -> dict[str, tuple[str, ...]]:
++        """Map each winning rule to the rules its fixes displaced."""
++        return conflict_groups(self.fix_outcomes)
++
++    def oscillating_rules(self) -> frozenset[str]:
++        """The rules rolled back for cycling this file."""
++        return oscillating_rules(self.fix_outcomes)
++
++    def fix_transaction_report(self) -> FixTransactionReport:
++        """A tally of what the transactions did to this file's staged fixes."""
++        return FixTransactionReport.from_outcomes(self.fix_outcomes)
++
+     @staticmethod
+     def deduplicate_in_source_space(
+         violations: list[SQLBaseError],
+diff --git a/src/sqlfluff/core/linter/linter.py b/src/sqlfluff/core/linter/linter.py
+index 2b61bda61..ab82e925b 100644
+--- a/src/sqlfluff/core/linter/linter.py
++++ b/src/sqlfluff/core/linter/linter.py
+@@ -29,6 +29,17 @@ from sqlfluff.core.linter.common import (
+ )
+ from sqlfluff.core.linter.discovery import paths_from_path
+ from sqlfluff.core.linter.fix import apply_fixes, compute_anchor_edit_info
++from sqlfluff.core.linter.fix_transaction import (
++    OSCILLATION,
++    UNPARSABLE,
++    FixOutcome,
++    StagedFix,
++    commit,
++    record_applied,
++    resolve_conflicts,
++    roll_back,
++    stage_fixes,
++)
+ from sqlfluff.core.linter.linted_dir import LintedDir
+ from sqlfluff.core.linter.linted_file import (
+     TMP_PRS_ERROR_TYPES,
+@@ -463,6 +474,7 @@ class Linter:
+         fname: Optional[str] = None,
+         templated_file: Optional["TemplatedFile"] = None,
+         formatter: Optional[FormatterInterface] = None,
++        fix_outcomes: Optional[list[FixOutcome]] = None,
+     ) -> tuple[BaseSegment, list[SQLBaseError], Optional[IgnoreMask], RuleTimingsType]:
+         """Lint and optionally fix a tree object."""
+         # Keep track of the linting errors on the very first linter pass. The
+@@ -476,6 +488,13 @@ class Linter:
+         previous_versions: set[tuple[str, tuple["SourceFix", ...]]] = {(tree.raw, ())}
+         # Keep a buffer for recording rule timings.
+         rule_timings: RuleTimingsType = []
++        # A transaction stages every rule's fixes against one snapshot of the
++        # tree, so that competing fixes can be seen and the batch committed or
++        # rolled back as a unit. Off by default: the sequential loop below is
++        # what rules have always seen.
++        transactional = fix and bool(config.get("fix_transaction"))
++        if fix_outcomes is None:
++            fix_outcomes = []
+ 
+         # If we are fixing then we want to loop up to the runaway_limit, otherwise just
+         # once for linting.
+@@ -528,6 +547,7 @@ class Linter:
+                     f"\n\nEntering linter phase {phase}, loop {loop + 1}/{loop_limit}\n"
+                 )
+                 changed = False
++                staged: list[StagedFix] = []
+ 
+                 if is_first_linter_pass():
+                     # In order to compute initial_linting_errors correctly, need
+@@ -573,6 +593,23 @@ class Linter:
+                     if is_first_linter_pass():
+                         initial_linting_errors += linting_errors
+ 
++                    if transactional and fixes:
++                        # Apply the same intra-rule guard as the sequential path:
++                        # a rule may only touch one anchor with the composing
++                        # create_before+create_after pair, never with genuinely
++                        # conflicting fixes. Fixes that fail it are dropped, not
++                        # staged, so a rule cannot smuggle its own conflict into
++                        # the batch.
++                        anchor_info = compute_anchor_edit_info(fixes)
++                        if all(info.is_valid for info in anchor_info.values()):
++                            # Hold the fixes back; they are settled against the
++                            # snapshot once every rule has had its say.
++                            staged.extend(stage_fixes(crawler.code, fixes))
++                        rule_timings.append(
++                            (crawler.code, crawler.name, time.monotonic() - t0)
++                        )
++                        continue
++
+                     if fix and fixes:
+                         linter_logger.info(f"Applying Fixes [{crawler.code}]: {fixes}")
+                         # Do some sanity checks on the fixes before applying.
+@@ -661,6 +698,32 @@ class Linter:
+                         (crawler.code, crawler.name, time.monotonic() - t0)
+                     )
+ 
++                if transactional and staged:
++                    accepted, conflicted = resolve_conflicts(staged, templated_file)
++                    fix_outcomes.extend(conflicted)
++                    new_tree, is_valid = commit(
++                        tree,
++                        config.get("dialect_obj"),
++                        accepted,
++                        fix_even_unparsable=config.get("fix_even_unparsable"),
++                        max_parse_depth=config.get("max_parse_depth"),
++                        max_parse_nodes=config.get("max_parse_nodes"),
++                    )
++                    loop_check_tuple = (new_tree.raw, tuple(new_tree.source_fixes))
++                    if not is_valid:
++                        # The batch does not parse. Nothing from it is kept, so
++                        # a half fixed file can never reach the caller.
++                        fix_outcomes.extend(roll_back(accepted, UNPARSABLE))
++                    elif loop_check_tuple in previous_versions:
++                        # This batch returns the file to a state we have already
++                        # been in, so the rules behind it are cycling.
++                        fix_outcomes.extend(roll_back(accepted, OSCILLATION))
++                    else:
++                        tree = new_tree
++                        previous_versions.add(loop_check_tuple)
++                        fix_outcomes.extend(record_applied(accepted))
++                        changed = True
++
+                 if fix and not changed:
+                     # We did not change the file. Either the file is clean (no
+                     # fixes), or any fixes which are present will take us back
+@@ -744,6 +807,7 @@ class Linter:
+             ]
+ 
+         # If there is a root variant, handle that first.
++        fix_outcomes: list[FixOutcome] = []
+         if root_variant:
+             linter_logger.info("lint_parsed - linting root variant (%s)", parsed.fname)
+             assert root_variant.tree  # We just checked this.
+@@ -761,6 +825,7 @@ class Linter:
+                 fname=parsed.fname,
+                 templated_file=root_variant.templated_file,
+                 formatter=formatter,
++                fix_outcomes=fix_outcomes,
+             )
+ 
+             # Set legacy variables for the return payload.
+@@ -794,6 +859,7 @@ class Linter:
+                     fname=parsed.fname,
+                     templated_file=alternate_variant.templated_file,
+                     formatter=formatter,
++                    fix_outcomes=fix_outcomes,
+                 )
+                 violations += alt_linting_errors
+                 if fix:
+@@ -852,6 +918,7 @@ class Linter:
+             templated_file=templated_file,
+             encoding=encoding,
+             source_patches=merged_source_patches,
++            fix_outcomes=tuple(fix_outcomes),
+         )
+ 
+         # This is the main command line output from linting.
+diff --git a/src/sqlfluff/core/linter/linting_result.py b/src/sqlfluff/core/linter/linting_result.py
+index 36c54b872..f6c9b08ad 100644
+--- a/src/sqlfluff/core/linter/linting_result.py
++++ b/src/sqlfluff/core/linter/linting_result.py
+@@ -5,8 +5,14 @@ import time
+ from collections.abc import Iterable, Mapping
+ from typing import TYPE_CHECKING, Any, Optional, TypeVar, Union
+ 
+-from sqlfluff.core.errors import CheckTuple, SQLBaseError
++from sqlfluff.core.errors import CheckTuple, SerializedObject, SQLBaseError
+ from sqlfluff.core.formatter import FormatterInterface
++from sqlfluff.core.linter.fix_transaction import (
++    FixOutcome,
++    FixTransactionReport,
++    conflict_groups,
++    oscillating_rules,
++)
+ from sqlfluff.core.linter.linted_dir import LintedDir, LintingRecord
+ from sqlfluff.core.timing import RuleTimingSummary, TimingSummary
+ 
+@@ -89,6 +95,26 @@ class LintingResult:
+             path.num_violations(types=types, fixable=fixable) for path in self.paths
+         )
+ 
++    def get_fix_outcomes(self) -> list[FixOutcome]:
++        """Return every fix transaction outcome across all paths."""
++        return [outcome for path in self.paths for outcome in path.fix_outcomes]
++
++    def fix_transaction_report(self) -> FixTransactionReport:
++        """A tally of what the transactions did across the whole result."""
++        return FixTransactionReport.from_outcomes(self.get_fix_outcomes())
++
++    def conflict_groups(self) -> dict[str, tuple[str, ...]]:
++        """Map each winning rule to the rules its fixes displaced."""
++        return conflict_groups(self.get_fix_outcomes())
++
++    def oscillating_rules(self) -> frozenset[str]:
++        """The rules rolled back for cycling any file in the result."""
++        return oscillating_rules(self.get_fix_outcomes())
++
++    def fix_outcome_records(self) -> list[SerializedObject]:
++        """Return the per file fix transaction outcomes for serialisation."""
++        return [record for path in self.paths for record in path.fix_outcome_records()]
++
+     def get_violations(
+         self, rules: str | tuple[str, ...] | None = None
+     ) -> list[SQLBaseError]:

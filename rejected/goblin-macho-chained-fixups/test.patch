@@ -1,0 +1,665 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..798e95c
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,58 @@
++#!/usr/bin/env bash
++set -uo pipefail
++export PATH="/root/.cargo/bin:$PATH"
++export CARGO_INCREMENTAL=0
++export RUSTC_BOOTSTRAP=1
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++# `tests/archive.rs::parse_self` parses goblin's own compiled binary, so it needs a
++# prior build; harmless no-op work for every other target.
++cargo build >/dev/null 2>&1
++
++TEST_JSON="$(mktemp)"
++TEST_ERR="$(mktemp)"
++STATUS=0
++case "$MODE" in
++  base)
++    cargo test --lib \
++      --test archive --test compare_dyldinfos --test elf --test macho --test pe --test te \
++      -- -Z unstable-options --format json --report-time --test-threads=1 \
++      > "$TEST_JSON" 2> "$TEST_ERR"
++    STATUS=$?
++    ;;
++  new)
++    cargo test --test mach_chained_fixups_27e49b \
++      -- -Z unstable-options --format json --report-time --test-threads=1 \
++      > "$TEST_JSON" 2> "$TEST_ERR"
++    STATUS=$?
++    ;;
++esac
++cat "$TEST_ERR" >&2
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  cargo2junit < "$TEST_JSON" > "$OUTPUT_PATH" 2>/dev/null || true
++  if ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++    sanitized=$( { cat "$TEST_ERR"; cat "$TEST_JSON"; } | tail -c 4000 | sed -e 's/]]>/]]]]><![CDATA[>/g')
++    cat > "$OUTPUT_PATH" <<XMLEOF
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites>
++  <testsuite name="cargo-test" tests="1" failures="1" errors="0">
++    <testcase name="compilation" classname="cargo-test"><failure message="build failed"><![CDATA[${sanitized}]]></failure></testcase>
++  </testsuite>
++</testsuites>
++XMLEOF
++  fi
++fi
++exit $STATUS
+diff --git a/tests/mach_chained_fixups_27e49b.rs b/tests/mach_chained_fixups_27e49b.rs
+new file mode 100644
+index 0000000..a172b85
+--- /dev/null
++++ b/tests/mach_chained_fixups_27e49b.rs
+@@ -0,0 +1,595 @@
++use goblin::mach::imports::Import;
++use goblin::mach::{Mach, MachO};
++
++// ---------- Block 2: low-level byte builders ----------
++
++const MH_MAGIC_64: u32 = 0xfeed_facf;
++const CPU_TYPE_ARM64: u32 = 0x0100_000C;
++const MH_DYLIB: u32 = 0x6;
++const LC_SEGMENT_64: u32 = 0x19;
++const LC_LOAD_DYLIB: u32 = 0x0c;
++const LC_REQ_DYLD: u32 = 0x8000_0000;
++const LC_DYLD_INFO_ONLY: u32 = 0x22 | LC_REQ_DYLD;
++const LC_DYLD_CHAINED_FIXUPS: u32 = 0x34 | LC_REQ_DYLD;
++
++const DYLD_CHAINED_PTR_ARM64E: u16 = 1;
++const DYLD_CHAINED_PTR_64: u16 = 2;
++const DYLD_CHAINED_PTR_64_OFFSET: u16 = 6;
++const DYLD_CHAINED_IMPORT: u32 = 1;
++const DYLD_CHAINED_IMPORT_ADDEND: u32 = 2;
++const PTR_START_NONE: u16 = 0xFFFF;
++
++const BASE_VMADDR: u64 = 0x1_0000_0000;
++const TEXT_FILEOFF: u64 = 0x0;
++const TEXT_SIZE: u64 = 0x1000;
++const DATA_FILEOFF: u64 = 0x1000;
++const DATA_SIZE: u64 = 0x1000;
++const LINKEDIT_FILEOFF: u64 = 0x2000;
++const LINKEDIT_SIZE: u64 = 0x400;
++
++fn pad(mut v: Vec<u8>, n: usize) -> Vec<u8> {
++    v.resize(n, 0);
++    v
++}
++
++fn segment_cmd(name: &str, vmaddr: u64, vmsize: u64, fileoff: u64, filesize: u64) -> Vec<u8> {
++    let mut body = pad(name.as_bytes().to_vec(), 16);
++    body.extend_from_slice(&vmaddr.to_le_bytes());
++    body.extend_from_slice(&vmsize.to_le_bytes());
++    body.extend_from_slice(&fileoff.to_le_bytes());
++    body.extend_from_slice(&filesize.to_le_bytes());
++    body.extend_from_slice(&7u32.to_le_bytes()); // maxprot
++    body.extend_from_slice(&7u32.to_le_bytes()); // initprot
++    body.extend_from_slice(&0u32.to_le_bytes()); // nsects
++    body.extend_from_slice(&0u32.to_le_bytes()); // flags
++    let cmdsize = (8 + body.len()) as u32;
++    let mut cmd = LC_SEGMENT_64.to_le_bytes().to_vec();
++    cmd.extend_from_slice(&cmdsize.to_le_bytes());
++    cmd.extend_from_slice(&body);
++    cmd
++}
++
++fn dylib_cmd(name: &str) -> Vec<u8> {
++    let mut name_bytes = name.as_bytes().to_vec();
++    name_bytes.push(0);
++    let padded_len = ((name_bytes.len() + 7) / 8) * 8;
++    let name_bytes = pad(name_bytes, padded_len);
++    let mut body = 24u32.to_le_bytes().to_vec(); // name offset: 8 (cmd hdr) + 16 (Dylib struct)
++    body.extend_from_slice(&0u32.to_le_bytes()); // timestamp
++    body.extend_from_slice(&0u32.to_le_bytes()); // current_version
++    body.extend_from_slice(&0u32.to_le_bytes()); // compatibility_version
++    body.extend_from_slice(&name_bytes);
++    let cmdsize = (8 + body.len()) as u32;
++    let mut cmd = LC_LOAD_DYLIB.to_le_bytes().to_vec();
++    cmd.extend_from_slice(&cmdsize.to_le_bytes());
++    cmd.extend_from_slice(&body);
++    cmd
++}
++
++fn linkedit_data_cmd(cmd_id: u32, dataoff: u32, datasize: u32) -> Vec<u8> {
++    let mut cmd = cmd_id.to_le_bytes().to_vec();
++    cmd.extend_from_slice(&16u32.to_le_bytes());
++    cmd.extend_from_slice(&dataoff.to_le_bytes());
++    cmd.extend_from_slice(&datasize.to_le_bytes());
++    cmd
++}
++
++fn dyld_info_only_cmd(bind_off: u32, bind_size: u32) -> Vec<u8> {
++    let mut cmd = LC_DYLD_INFO_ONLY.to_le_bytes().to_vec();
++    cmd.extend_from_slice(&48u32.to_le_bytes()); // cmdsize
++    cmd.extend_from_slice(&0u32.to_le_bytes()); // rebase_off
++    cmd.extend_from_slice(&0u32.to_le_bytes()); // rebase_size
++    cmd.extend_from_slice(&bind_off.to_le_bytes());
++    cmd.extend_from_slice(&bind_size.to_le_bytes());
++    cmd.extend_from_slice(&0u32.to_le_bytes()); // weak_bind_off
++    cmd.extend_from_slice(&0u32.to_le_bytes()); // weak_bind_size
++    cmd.extend_from_slice(&0u32.to_le_bytes()); // lazy_bind_off
++    cmd.extend_from_slice(&0u32.to_le_bytes()); // lazy_bind_size
++    cmd.extend_from_slice(&0u32.to_le_bytes()); // export_off
++    cmd.extend_from_slice(&0u32.to_le_bytes()); // export_size
++    cmd
++}
++
++/// A single-symbol classic bind-opcode stream: bind `name` from dylib ordinal 1 at
++/// segment 0 (`__TEXT`), offset 0x10.
++fn classic_bind_stream(name: &str) -> Vec<u8> {
++    let mut b = Vec::new();
++    b.push(0x70); // BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | seg_index=0
++    b.push(0x10); // uleb128 seg_offset = 0x10
++    b.push(0x11); // BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | ordinal=1
++    b.push(0x40); // BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | flags=0
++    b.extend_from_slice(name.as_bytes());
++    b.push(0);
++    b.push(0x90); // BIND_OPCODE_DO_BIND
++    b.push(0x00); // BIND_OPCODE_DONE
++    b
++}
++
++/// Encode one `dyld_chained_ptr_64`/`dyld_chained_ptr_64_offset` bind entry.
++fn ptr64_bind_word(ordinal: u32, addend: u8, next: u16) -> u64 {
++    (1u64 << 63) | ((next as u64 & 0xFFF) << 51) | ((addend as u64 & 0xFF) << 24) | (ordinal as u64 & 0x00FF_FFFF)
++}
++
++/// Encode one `dyld_chained_ptr_64` rebase entry (not a bind).
++fn ptr64_rebase_word(target: u64, next: u16) -> u64 {
++    (0u64 << 63) | ((next as u64 & 0xFFF) << 51) | (target & 0xF_FFFF_FFFF)
++}
++
++/// Encode one `dyld_chained_ptr_arm64e_bind` (unauth) entry.
++fn arm64e_bind_word(ordinal: u16, addend: u32, next: u16) -> u64 {
++    (0u64 << 63) // auth = 0
++        | (1u64 << 62) // bind = 1
++        | ((next as u64 & 0x7FF) << 51)
++        | ((addend as u64 & 0x7_FFFF) << 32)
++        | (ordinal as u64)
++}
++
++/// Encode one `dyld_chained_ptr_arm64e_auth_bind` entry (no addend field).
++fn arm64e_auth_bind_word(ordinal: u16, next: u16) -> u64 {
++    (1u64 << 63) // auth = 1
++        | (1u64 << 62) // bind = 1
++        | ((next as u64 & 0x7FF) << 51)
++        | (ordinal as u64)
++}
++
++struct ImportSpec<'a> {
++    lib_ordinal: u8,
++    weak: bool,
++    name: &'a str,
++    addend: i32,
++}
++
++fn chained_import_entry(spec: &ImportSpec, imports_format: u32) -> Vec<u8> {
++    let packed = (spec.lib_ordinal as u32) | ((spec.weak as u32) << 8) | (0u32 << 9); // name_offset filled by caller layout, always 0 here (single-symbol fixtures)
++    let mut out = packed.to_le_bytes().to_vec();
++    if imports_format == DYLD_CHAINED_IMPORT_ADDEND {
++        out.extend_from_slice(&spec.addend.to_le_bytes());
++    }
++    out
++}
++
++/// Build the full `LC_DYLD_CHAINED_FIXUPS` payload for a single fixup-carrying segment
++/// (segment index 1, matching `__DATA_CONST` in every fixture below) with one page whose
++/// chain data the caller supplies pre-encoded (`page_bytes`), and a single import table entry.
++fn chained_fixups_blob(
++    pointer_format: u16,
++    imports_format: u32,
++    page_count: u16,
++    page_bytes: &[u8],
++    import: &ImportSpec,
++) -> Vec<u8> {
++    let hdr_len = 28u32;
++    let starts_in_image_len = 4 + 4 * 3; // seg_count=3 segments total
++    let starts_in_segment_len: u32 = 22 + page_bytes.len() as u32;
++    let starts_offset = hdr_len;
++    let imports_table_off = starts_offset + starts_in_image_len + starts_in_segment_len;
++    let entry_size = if imports_format == DYLD_CHAINED_IMPORT_ADDEND { 8 } else { 4 };
++    let symbols_offset = imports_table_off + entry_size;
++
++    let mut blob = Vec::new();
++    blob.extend_from_slice(&0u32.to_le_bytes()); // fixups_version
++    blob.extend_from_slice(&starts_offset.to_le_bytes());
++    blob.extend_from_slice(&imports_table_off.to_le_bytes());
++    blob.extend_from_slice(&symbols_offset.to_le_bytes());
++    blob.extend_from_slice(&1u32.to_le_bytes()); // imports_count
++    blob.extend_from_slice(&imports_format.to_le_bytes());
++    blob.extend_from_slice(&0u32.to_le_bytes()); // symbols_format (uncompressed)
++    assert_eq!(blob.len(), hdr_len as usize);
++
++    // dyld_chained_starts_in_image: seg 0 and seg 2 carry no fixups, seg 1 does
++    blob.extend_from_slice(&3u32.to_le_bytes()); // seg_count
++    blob.extend_from_slice(&0u32.to_le_bytes()); // seg_info_offset[0]
++    blob.extend_from_slice(&starts_in_image_len.to_le_bytes()); // seg_info_offset[1]
++    blob.extend_from_slice(&0u32.to_le_bytes()); // seg_info_offset[2]
++
++    // dyld_chained_starts_in_segment
++    blob.extend_from_slice(&starts_in_segment_len.to_le_bytes()); // size
++    blob.extend_from_slice(&0x1000u16.to_le_bytes()); // page_size
++    blob.extend_from_slice(&pointer_format.to_le_bytes());
++    blob.extend_from_slice(&DATA_FILEOFF.to_le_bytes()); // segment_offset
++    blob.extend_from_slice(&0u32.to_le_bytes()); // max_valid_pointer
++    blob.extend_from_slice(&page_count.to_le_bytes());
++    blob.extend_from_slice(page_bytes); // page_start[] array, one u16 per page
++
++    blob.extend_from_slice(&chained_import_entry(import, imports_format));
++    blob.extend_from_slice(import.name.as_bytes());
++    blob.push(0);
++    blob
++}
++
++/// Assemble a full Mach-O binary from: an optional legacy bind stream, and an optional
++/// chained-fixups blob (with the __DATA_CONST segment's raw file bytes to place under it).
++fn assemble(
++    legacy_bind: Option<&[u8]>,
++    chained: Option<&[u8]>,
++    data_segment_bytes: &[u8],
++) -> Vec<u8> {
++    let lc_text = segment_cmd("__TEXT", BASE_VMADDR + TEXT_FILEOFF, TEXT_SIZE, TEXT_FILEOFF, TEXT_SIZE);
++    let lc_data = segment_cmd(
++        "__DATA_CONST",
++        BASE_VMADDR + DATA_FILEOFF,
++        DATA_SIZE,
++        DATA_FILEOFF,
++        DATA_SIZE,
++    );
++    let lc_linkedit = segment_cmd(
++        "__LINKEDIT",
++        BASE_VMADDR + LINKEDIT_FILEOFF,
++        LINKEDIT_SIZE,
++        LINKEDIT_FILEOFF,
++        LINKEDIT_SIZE,
++    );
++    let lc_dylib = dylib_cmd("libFoo.dylib");
++
++    let mut load_commands = Vec::new();
++    load_commands.extend_from_slice(&lc_text);
++    load_commands.extend_from_slice(&lc_data);
++    load_commands.extend_from_slice(&lc_linkedit);
++    load_commands.extend_from_slice(&lc_dylib);
++    let mut ncmds = 4u32;
++
++    // linkedit layout: legacy bind stream (if any) first, chained-fixups blob (if any) after
++    let mut linkedit = Vec::new();
++    if let Some(bind) = legacy_bind {
++        let off = LINKEDIT_FILEOFF as u32 + linkedit.len() as u32;
++        load_commands.extend_from_slice(&dyld_info_only_cmd(off, bind.len() as u32));
++        ncmds += 1;
++        linkedit.extend_from_slice(bind);
++    }
++    if let Some(blob) = chained {
++        let off = LINKEDIT_FILEOFF as u32 + linkedit.len() as u32;
++        load_commands.extend_from_slice(&linkedit_data_cmd(LC_DYLD_CHAINED_FIXUPS, off, blob.len() as u32));
++        ncmds += 1;
++        linkedit.extend_from_slice(blob);
++    }
++    assert!(linkedit.len() as u64 <= LINKEDIT_SIZE);
++
++    let sizeofcmds = load_commands.len() as u32;
++    let mut header = MH_MAGIC_64.to_le_bytes().to_vec();
++    header.extend_from_slice(&CPU_TYPE_ARM64.to_le_bytes());
++    header.extend_from_slice(&0u32.to_le_bytes()); // cpusubtype
++    header.extend_from_slice(&MH_DYLIB.to_le_bytes());
++    header.extend_from_slice(&ncmds.to_le_bytes());
++    header.extend_from_slice(&sizeofcmds.to_le_bytes());
++    header.extend_from_slice(&0u32.to_le_bytes()); // flags
++    header.extend_from_slice(&0u32.to_le_bytes()); // reserved
++
++    let total_size = (LINKEDIT_FILEOFF + LINKEDIT_SIZE) as usize;
++    let mut buf = vec![0u8; total_size];
++    buf[0..32].copy_from_slice(&header);
++    buf[32..32 + load_commands.len()].copy_from_slice(&load_commands);
++    buf[DATA_FILEOFF as usize..DATA_FILEOFF as usize + data_segment_bytes.len()]
++        .copy_from_slice(data_segment_bytes);
++    buf[LINKEDIT_FILEOFF as usize..LINKEDIT_FILEOFF as usize + linkedit.len()]
++        .copy_from_slice(&linkedit);
++    buf
++}
++
++// ---------- Block 3: assertion helpers ----------
++
++fn with_imports<R>(bytes: &[u8], f: impl FnOnce(&[Import<'_>]) -> R) -> R {
++    let mach = Mach::parse(bytes).expect("valid mach-o");
++    let macho: MachO = match mach {
++        Mach::Binary(m) => m,
++        Mach::Fat(_) => panic!("unexpected fat binary"),
++    };
++    let imports = macho.imports().expect("imports() should not error");
++    f(&imports)
++}
++
++fn with_imports_err<R>(bytes: &[u8], f: impl FnOnce(String) -> R) -> R {
++    let mach = Mach::parse(bytes).expect("valid mach-o");
++    let macho: MachO = match mach {
++        Mach::Binary(m) => m,
++        Mach::Fat(_) => panic!("unexpected fat binary"),
++    };
++    match macho.imports() {
++        Err(e) => f(format!("{e}")),
++        Ok(v) => panic!("expected imports() to error, got {v:?}"),
++    }
++}
++
++fn assert_single_import(imports: &[Import<'_>], name: &str, dylib: &str, addend: i64, is_weak: bool) {
++    assert_eq!(imports.len(), 1, "expected exactly one import, got {imports:?}");
++    assert_eq!(imports[0].name, name);
++    assert_eq!(imports[0].dylib, dylib);
++    assert_eq!(imports[0].addend, addend);
++    assert_eq!(imports[0].is_weak, is_weak);
++}
++
++// ---------- Block 4: tests ----------
++
++#[test]
++fn chained_only_binary_resolves_import_base_returns_empty() {
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "some_imported_symbol", addend: 0 };
++    let word = ptr64_bind_word(0, 0, 0);
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    let blob = chained_fixups_blob(DYLD_CHAINED_PTR_64, DYLD_CHAINED_IMPORT, 1, &page_bytes, &import);
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports(&bin, |imports| {
++        assert_single_import(&imports, "some_imported_symbol", "libFoo.dylib", 0, false);
++        assert_eq!(imports[0].address, BASE_VMADDR + DATA_FILEOFF);
++        assert_eq!(imports[0].offset, DATA_FILEOFF);
++    });
++}
++
++#[test]
++fn cross_product_arm64e_plain_import() {
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "arm64e_plain", addend: 0 };
++    let word = arm64e_bind_word(0, 0, 0);
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    let blob = chained_fixups_blob(DYLD_CHAINED_PTR_ARM64E, DYLD_CHAINED_IMPORT, 1, &page_bytes, &import);
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports(&bin, |imports| {
++        assert_single_import(&imports, "arm64e_plain", "libFoo.dylib", 0, false);
++    });
++}
++
++#[test]
++fn cross_product_arm64e_addend_import() {
++    let import = ImportSpec { lib_ordinal: 1, weak: true, name: "arm64e_addend", addend: 7 };
++    let word = arm64e_bind_word(0, 7, 0);
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    let blob = chained_fixups_blob(DYLD_CHAINED_PTR_ARM64E, DYLD_CHAINED_IMPORT_ADDEND, 1, &page_bytes, &import);
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports(&bin, |imports| {
++        assert_single_import(&imports, "arm64e_addend", "libFoo.dylib", 7, true);
++    });
++}
++
++#[test]
++fn cross_product_ptr64_plain_import() {
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "ptr64_plain", addend: 0 };
++    let word = ptr64_bind_word(0, 0, 0);
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    let blob = chained_fixups_blob(DYLD_CHAINED_PTR_64, DYLD_CHAINED_IMPORT, 1, &page_bytes, &import);
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports(&bin, |imports| {
++        assert_single_import(&imports, "ptr64_plain", "libFoo.dylib", 0, false);
++    });
++}
++
++#[test]
++fn cross_product_ptr64_addend_import() {
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "ptr64_addend", addend: 42 };
++    let word = ptr64_bind_word(0, 42, 0);
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    let blob = chained_fixups_blob(DYLD_CHAINED_PTR_64, DYLD_CHAINED_IMPORT_ADDEND, 1, &page_bytes, &import);
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports(&bin, |imports| {
++        assert_single_import(&imports, "ptr64_addend", "libFoo.dylib", 42, false);
++    });
++}
++
++#[test]
++fn arm64e_auth_bind_resolves_same_as_unauth_with_zero_addend() {
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "auth_symbol", addend: 0 };
++    let word = arm64e_auth_bind_word(0, 0);
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    let blob = chained_fixups_blob(DYLD_CHAINED_PTR_ARM64E, DYLD_CHAINED_IMPORT, 1, &page_bytes, &import);
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports(&bin, |imports| {
++        assert_single_import(&imports, "auth_symbol", "libFoo.dylib", 0, false);
++    });
++}
++
++#[test]
++fn arm64e_auth_rebase_is_walked_not_emitted() {
++    // auth-rebase (bind=0, auth=1) at entry 0, chains to an auth-bind at entry 1
++    let target: u64 = 0x1234;
++    let rebase_word = (1u64 << 63) | (0u64 << 62) | (1u64 << 51) | (target & 0x7_FFFF_FFFF_FFF);
++    let bind_word = arm64e_auth_bind_word(0, 0);
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "after_auth_rebase", addend: 0 };
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&rebase_word.to_le_bytes());
++    data[8..16].copy_from_slice(&bind_word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    let blob = chained_fixups_blob(DYLD_CHAINED_PTR_ARM64E, DYLD_CHAINED_IMPORT, 1, &page_bytes, &import);
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports(&bin, |imports| {
++        assert_single_import(&imports, "after_auth_rebase", "libFoo.dylib", 0, false);
++    });
++}
++
++#[test]
++fn ptr64_offset_variant_decodes_through_the_same_bind_path() {
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "offset_variant", addend: 0 };
++    let word = ptr64_bind_word(0, 0, 0);
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    let blob = chained_fixups_blob(DYLD_CHAINED_PTR_64_OFFSET, DYLD_CHAINED_IMPORT, 1, &page_bytes, &import);
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports(&bin, |imports| {
++        assert_single_import(&imports, "offset_variant", "libFoo.dylib", 0, false);
++    });
++}
++
++#[test]
++fn rebase_then_bind_chain_yields_exactly_one_import() {
++    // entry 0: rebase, next=2 (2*4=8 bytes -> entry 1). entry 1: bind, next=0 (terminal).
++    let rebase_word = ptr64_rebase_word(0x2000, 2);
++    let bind_word = ptr64_bind_word(0, 0, 0);
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "reached_via_chain", addend: 0 };
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&rebase_word.to_le_bytes());
++    data[8..16].copy_from_slice(&bind_word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    let blob = chained_fixups_blob(DYLD_CHAINED_PTR_64, DYLD_CHAINED_IMPORT, 1, &page_bytes, &import);
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports(&bin, |imports| {
++        assert_single_import(&imports, "reached_via_chain", "libFoo.dylib", 0, false);
++    });
++}
++
++#[test]
++fn bind_then_rebase_chain_still_yields_exactly_one_import() {
++    // entry 0: bind, next=2 (chains to entry 1). entry 1: rebase, next=0 (terminal).
++    // Confirms the walk does not stop after the first bind, and the rebase tail is not emitted.
++    let bind_word = ptr64_bind_word(0, 0, 2);
++    let rebase_word = ptr64_rebase_word(0x3000, 0);
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "bind_first", addend: 0 };
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&bind_word.to_le_bytes());
++    data[8..16].copy_from_slice(&rebase_word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    let blob = chained_fixups_blob(DYLD_CHAINED_PTR_64, DYLD_CHAINED_IMPORT, 1, &page_bytes, &import);
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports(&bin, |imports| {
++        assert_single_import(&imports, "bind_first", "libFoo.dylib", 0, false);
++    });
++}
++
++#[test]
++fn second_page_with_no_fixups_is_skipped_not_an_error() {
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "page_zero_only", addend: 0 };
++    let word = ptr64_bind_word(0, 0, 0);
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&word.to_le_bytes());
++    // page 0 starts at byte 0; page 1 is DYLD_CHAINED_PTR_START_NONE
++    let mut page_bytes = Vec::new();
++    page_bytes.extend_from_slice(&0u16.to_le_bytes());
++    page_bytes.extend_from_slice(&PTR_START_NONE.to_le_bytes());
++    let blob = chained_fixups_blob(DYLD_CHAINED_PTR_64, DYLD_CHAINED_IMPORT, 2, &page_bytes, &import);
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports(&bin, |imports| {
++        assert_single_import(&imports, "page_zero_only", "libFoo.dylib", 0, false);
++    });
++}
++
++#[test]
++fn single_entry_chain_terminal_condition_does_not_overrun() {
++    // the N-1 fixture: next == 0 on the FIRST entry. Exactly one import, no panic, no
++    // attempt to read past the terminator.
++    let word = ptr64_bind_word(0, 0, 0);
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "terminal_first", addend: 0 };
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    let blob = chained_fixups_blob(DYLD_CHAINED_PTR_64, DYLD_CHAINED_IMPORT, 1, &page_bytes, &import);
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports(&bin, |imports| {
++        assert_single_import(&imports, "terminal_first", "libFoo.dylib", 0, false);
++    });
++}
++
++#[test]
++fn legacy_bind_opcodes_alone_still_resolve() {
++    let bind = classic_bind_stream("legacy_only_symbol");
++    let data = vec![0u8; DATA_SIZE as usize];
++    let bin = assemble(Some(&bind), None, &data);
++
++    with_imports(&bin, |imports| {
++        assert_single_import(&imports, "legacy_only_symbol", "libFoo.dylib", 0, false);
++    });
++}
++
++#[test]
++fn legacy_and_chained_fixups_together_are_both_reported() {
++    let bind = classic_bind_stream("legacy_symbol");
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "chained_symbol", addend: 0 };
++    let word = ptr64_bind_word(0, 0, 0);
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    let blob = chained_fixups_blob(DYLD_CHAINED_PTR_64, DYLD_CHAINED_IMPORT, 1, &page_bytes, &import);
++    let bin = assemble(Some(&bind), Some(&blob), &data);
++
++    with_imports(&bin, |imports| {
++        assert_eq!(imports.len(), 2, "expected both the legacy and chained imports: {imports:?}");
++        let mut names: Vec<&str> = imports.iter().map(|i| i.name).collect();
++        names.sort_unstable();
++        assert_eq!(names, vec!["chained_symbol", "legacy_symbol"]);
++    });
++}
++
++#[test]
++fn unsupported_imports_format_errors_with_format_code() {
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "whatever", addend: 0 };
++    let word = ptr64_bind_word(0, 0, 0);
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    // 3 = DYLD_CHAINED_IMPORT_ADDEND64, deliberately unsupported
++    let blob = chained_fixups_blob(DYLD_CHAINED_PTR_64, 3, 1, &page_bytes, &import);
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports_err(&bin, |msg| {
++        assert!(msg.contains('3'), "error should name the unsupported format code: {msg}");
++    });
++}
++
++#[test]
++fn compressed_symbols_format_errors_not_silently_wrong() {
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "whatever", addend: 0 };
++    let word = ptr64_bind_word(0, 0, 0);
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    let mut blob = chained_fixups_blob(DYLD_CHAINED_PTR_64, DYLD_CHAINED_IMPORT, 1, &page_bytes, &import);
++    // symbols_format lives at header byte offset 24 (7th u32 field); 9 is a distinctive
++    // non-zero (compressed) value that cannot appear incidentally elsewhere in the message.
++    blob[24..28].copy_from_slice(&9u32.to_le_bytes());
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports_err(&bin, |msg| {
++        assert!(msg.contains('9'), "error should name the unsupported value: {msg}");
++    });
++}
++
++#[test]
++fn unsupported_pointer_format_errors_with_format_code() {
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "whatever", addend: 0 };
++    let word = ptr64_bind_word(0, 0, 0);
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    // 9 = not one of DYLD_CHAINED_PTR_ARM64E/64/64_OFFSET, deliberately unsupported
++    let blob = chained_fixups_blob(9, DYLD_CHAINED_IMPORT, 1, &page_bytes, &import);
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports_err(&bin, |msg| {
++        assert!(msg.contains('9'), "error should name the unsupported format code: {msg}");
++    });
++}
++
++#[test]
++fn empty_imports_count_yields_no_imports() {
++    let import = ImportSpec { lib_ordinal: 1, weak: false, name: "unused", addend: 0 };
++    let word = ptr64_bind_word(0, 0, 0);
++    let mut data = vec![0u8; DATA_SIZE as usize];
++    data[0..8].copy_from_slice(&word.to_le_bytes());
++    let page_bytes = 0u16.to_le_bytes();
++    let mut blob = chained_fixups_blob(DYLD_CHAINED_PTR_64, DYLD_CHAINED_IMPORT, 1, &page_bytes, &import);
++    // imports_count lives at header byte offset 16 (5th u32 field)
++    blob[16..20].copy_from_slice(&0u32.to_le_bytes());
++    let bin = assemble(None, Some(&blob), &data);
++
++    with_imports(&bin, |imports| {
++        assert!(imports.is_empty(), "expected no imports, got {imports:?}");
++    });
++}

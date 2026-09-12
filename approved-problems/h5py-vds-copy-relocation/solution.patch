@@ -1,0 +1,465 @@
+diff --git a/docs/high/group.rst b/docs/high/group.rst
+index 854058dc..69909aa9 100644
+--- a/docs/high/group.rst
++++ b/docs/high/group.rst
+@@ -339,7 +339,7 @@ Reference
+         :type dest:   String
+ 
+ 
+-    .. method:: copy(source, dest, name=None, shallow=False, expand_soft=False, expand_external=False, expand_refs=False, without_attrs=False)
++    .. method:: copy(source, dest, name=None, shallow=False, expand_soft=False, expand_external=False, expand_refs=False, without_attrs=False, relocate_vds=False)
+ 
+         Copy an object or group.  The source can be a path, Group, Dataset, or
+         Datatype object.  The destination can be either a path or a Group
+@@ -361,6 +361,10 @@ Reference
+         :param expand_external: Expand external links into new objects.
+         :param expand_refs: Copy objects which are pointed to by references.
+         :param without_attrs:   Copy object(s) without copying HDF5 attributes.
++        :param relocate_vds: Reconstruct a directly selected virtual dataset
++                             so its mappings retain their source-file
++                             identities. This cannot be combined with
++                             ``expand_refs=True``.
+ 
+ 
+     .. method:: create_group(name, track_order=None)
+diff --git a/docs/vds.rst b/docs/vds.rst
+index db5084ab..cd2a21b4 100644
+--- a/docs/vds.rst
++++ b/docs/vds.rst
+@@ -99,7 +99,7 @@ found in the examples folder:
+ Reference
+ ---------
+ 
+-.. class:: VirtualLayout(shape, dtype, maxshape=None)
++.. class:: VirtualLayout(shape, dtype, maxshape=None, filename=None)
+ 
+    Object for building a virtual dataset.
+ 
+@@ -114,6 +114,25 @@ Reference
+    :param dtype: Numpy dtype or string.
+    :param tuple maxshape: The virtual dataset is resizable up to this shape.
+      Use None for axes you want to be unlimited.
++   :param filename: The target VDS filename, when it is known in advance.
++
++   .. classmethod:: from_dataset(dataset)
++
++      Reconstruct an existing virtual dataset as an independent layout. The
++      returned layout remains usable after the source file is closed and can
++      be extended through normal mapping assignment.
++
++      Whole-source mappings read their current source dataset spaces during
++      reconstruction. Explicitly selected mappings do not open their sources.
++
++   .. method:: relocated(filename, *, source_filename=None)
++
++      Return an independent layout targeted at *filename*, rebasing relative
++      mapping names to retain their source-file identities. Absolute names are
++      retained unchanged.
++
++      For a layout constructed without a target filename, *source_filename*
++      must specify the old resolution base.
+ 
+ .. class:: VirtualSource(path_or_dataset, name=None, shape=None, dtype=None, \
+                          maxshape=None)
+diff --git a/h5py/_hl/group.py b/h5py/_hl/group.py
+index f803bea2..a13850ff 100644
+--- a/h5py/_hl/group.py
++++ b/h5py/_hl/group.py
+@@ -17,12 +17,12 @@ import numpy
+ 
+ from .compat import filename_decode, filename_encode
+ 
+-from .. import h5, h5f, h5g, h5i, h5o, h5r, h5t, h5l, h5p
++from .. import h5, h5a, h5f, h5g, h5i, h5o, h5r, h5s, h5t, h5l, h5p
+ from . import base
+ from .base import HLObject, MutableMappingHDF5, phil, with_phil
+ from . import dataset
+ from . import datatype
+-from .vds import vds_support
++from .vds import VirtualLayout, vds_support
+ 
+ 
+ def set_fapl_file_locking(fapl, locking):
+@@ -73,6 +73,66 @@ def make_lapl(file, elink_mode=None, elink_swmr=None, elink_locking=None):
+     return lapl
+ 
+ 
++def _copy_dataset_attributes(source, destination):
++    """Copy attributes without publishing the destination dataset first."""
++    for name in source.attrs:
++        source_attr = h5a.open(source.id, source._e(name))
++        try:
++            source_space = source_attr.get_space()
++            source_type = source_attr.get_type()
++            try:
++                destination_attr = h5a.create(
++                    destination.id,
++                    destination._e(name),
++                    source_type,
++                    source_space,
++                )
++                try:
++                    if source_space.get_simple_extent_type() != h5s.NULL:
++                        data = numpy.empty(
++                            source_attr.shape, dtype=source_attr.dtype
++                        )
++                        source_attr.read(data)
++
++                        reference_type = h5t.check_dtype(
++                            ref=source_attr.dtype
++                        )
++                        if reference_type is not None:
++                            # Native cross-file copies leave references null
++                            # unless expand_refs is requested.
++                            data[...] = reference_type()
++
++                        destination_attr.write(data)
++                finally:
++                    destination_attr.close()
++            finally:
++                source_type.close()
++                source_space.close()
++        finally:
++            source_attr.close()
++
++
++def _copy_relocated_vds(source, destination, destination_path, without_attrs):
++    """Reconstruct and atomically publish a relocated virtual dataset."""
++    layout = VirtualLayout.from_dataset(source).relocated(
++        destination.file.filename
++    )
++    dataset_id = layout.make_dataset(destination, name=None)
++    relocated = dataset.Dataset(dataset_id)
++
++    try:
++        if not without_attrs:
++            _copy_dataset_attributes(source, relocated)
++        h5o.link(
++            relocated.id,
++            destination.id,
++            destination._e(destination_path),
++            lcpl=base.dlcpl,
++        )
++    finally:
++        relocated.id.close()
++
++
+ class Group(HLObject, MutableMappingHDF5):
+ 
+     """ Represents an HDF5 group.
+@@ -613,7 +673,7 @@ class Group(HLObject, MutableMappingHDF5):
+ 
+     def copy(self, source, dest, name=None,
+              shallow=False, expand_soft=False, expand_external=False,
+-             expand_refs=False, without_attrs=False):
++             expand_refs=False, without_attrs=False, relocate_vds=False):
+         """Copy an object or group.
+ 
+         The source can be a path, Group, Dataset, or Datatype object.  The
+@@ -639,6 +699,9 @@ class Group(HLObject, MutableMappingHDF5):
+ 
+          - without_attrs: copy object without copying attributes.
+ 
++         - relocate_vds: reconstruct a directly selected virtual dataset so
++           its mappings keep resolving to the same source files.
++
+        Example:
+ 
+         >>> f = File('myfile.hdf5', 'w')
+@@ -653,10 +716,12 @@ class Group(HLObject, MutableMappingHDF5):
+         with phil:
+             if isinstance(source, HLObject):
+                 source_path = '.'
++                source_object = source
+             else:
+                 # Interpret source as a path relative to this group
+                 source_path = source
+                 source = self
++                source_object = None
+ 
+             if isinstance(dest, Group):
+                 if name is not None:
+@@ -674,6 +739,26 @@ class Group(HLObject, MutableMappingHDF5):
+                 dest_path = dest
+                 dest = self
+ 
++            if relocate_vds:
++                if source_object is None:
++                    source_object = source[source_path]
++                if (
++                    not isinstance(source_object, dataset.Dataset)
++                    or not source_object.is_virtual
++                ):
++                    raise TypeError(
++                        "relocate_vds requires a virtual dataset source"
++                    )
++                if expand_refs:
++                    raise ValueError(
++                        "relocate_vds cannot be combined with expand_refs"
++                    )
++                if source_object.file.id != dest.file.id:
++                    _copy_relocated_vds(
++                        source_object, dest, dest_path, without_attrs
++                    )
++                    return
++
+             flags = 0
+             if shallow:
+                 flags |= h5o.COPY_SHALLOW_HIERARCHY_FLAG
+diff --git a/h5py/_hl/vds.py b/h5py/_hl/vds.py
+index fac9c3be..ca70c30b 100644
+--- a/h5py/_hl/vds.py
++++ b/h5py/_hl/vds.py
+@@ -13,13 +13,14 @@
+ 
+ from copy import deepcopy as copy
+ from collections import namedtuple
++import os
+ 
+ import numpy as np
+ 
+ from .compat import filename_encode
+ from .datatype import Datatype
+ from .selections import SimpleSelection, select
+-from .. import h5d, h5p, h5s, h5t
++from .. import h5d, h5f, h5p, h5s, h5t
+ 
+ 
+ class VDSmap(namedtuple('VDSmap', ('vspace', 'file_name',
+@@ -31,6 +32,77 @@ class VDSmap(namedtuple('VDSmap', ('vspace', 'file_name',
+ vds_support = True
+ 
+ 
++def _resolved_source_filename(filename, vds_filename):
++    """Resolve a stored VDS source name from the file containing the VDS."""
++    if os.path.isabs(filename):
++        return os.path.normpath(filename)
++
++    vds_filename = os.path.abspath(vds_filename)
++    if filename == '.':
++        return vds_filename
++    return os.path.normpath(
++        os.path.join(os.path.dirname(vds_filename), filename)
++    )
++
++
++def _relocated_source_filename(filename, source_filename, target_filename):
++    """Spell a VDS source name relative to a new containing file."""
++    if os.path.isabs(filename):
++        return filename
++
++    if os.path.realpath(source_filename) == os.path.realpath(target_filename):
++        return filename
++
++    resolved = _resolved_source_filename(filename, source_filename)
++    target_dir = os.path.dirname(os.path.abspath(target_filename))
++    return os.path.relpath(resolved, target_dir)
++
++
++def _copy_creation_properties(source, target, dtype):
++    """Copy creation properties which apply to a virtual dataset."""
++    target.set_alloc_time(source.get_alloc_time())
++    target.set_fill_time(source.get_fill_time())
++    target.set_obj_track_times(source.get_obj_track_times())
++    target.set_attr_creation_order(source.get_attr_creation_order())
++    target.set_attr_phase_change(*source.get_attr_phase_change())
++
++    if source.fill_value_defined() == h5d.FILL_VALUE_USER_DEFINED:
++        fillvalue = np.zeros((1,), dtype=dtype)
++        source.get_fill_value(fillvalue)
++        target.set_fill_value(fillvalue)
++
++
++def _mapping_source_space(dataset, mapping):
++    """Return an independent source space for a reconstructed mapping."""
++    if mapping.src_space.get_select_type() != h5s.SEL_ALL:
++        return mapping.src_space
++
++    source_filename = _resolved_source_filename(
++        mapping.file_name, dataset.file.filename
++    )
++    if os.path.realpath(source_filename) == os.path.realpath(
++            dataset.file.filename):
++        source_file_id = dataset.file.id
++        close_file = False
++    else:
++        source_file_id = h5f.open(
++            filename_encode(source_filename), h5f.ACC_RDONLY
++        )
++        close_file = True
++
++    try:
++        source_dataset_id = h5d.open(
++            source_file_id, filename_encode(mapping.dset_name)
++        )
++        try:
++            return source_dataset_id.get_space()
++        finally:
++            source_dataset_id.close()
++    finally:
++        if close_file:
++            source_file_id.close()
++
++
+ def _convert_space_for_key(space, key):
+     """
+     Converts the space with the given key. Mainly used to allow unlimited
+@@ -173,6 +245,118 @@ class VirtualLayout:
+         self.dcpl = h5p.create(h5p.DATASET_CREATE)
+         self.dcpl.set_layout(h5d.VIRTUAL)
+ 
++    @classmethod
++    def from_dataset(cls, dataset):
++        """Build an independent layout from an existing virtual dataset.
++
++        Source datasets are opened only for mappings which select the entire
++        source and therefore do not store their own extent. The returned
++        layout can be extended or relocated after the source file is closed.
++        """
++        from .dataset import Dataset
++
++        if not isinstance(dataset, Dataset) or not dataset.is_virtual:
++            raise TypeError("dataset must be a virtual Dataset")
++
++        source_filename = dataset.file.filename
++        layout = cls(
++            dataset.shape,
++            dataset.dtype,
++            maxshape=dataset.maxshape,
++            filename=source_filename,
++        )
++        source_dcpl = dataset.id.get_create_plist()
++        try:
++            try:
++                _copy_creation_properties(
++                    source_dcpl, layout.dcpl, dataset.dtype
++                )
++
++                for mapping in dataset.virtual_sources():
++                    source_space = _mapping_source_space(dataset, mapping)
++                    try:
++                        layout.dcpl.set_virtual(
++                            mapping.vspace,
++                            filename_encode(mapping.file_name),
++                            filename_encode(mapping.dset_name),
++                            source_space,
++                        )
++                    finally:
++                        source_space.close()
++                        mapping.vspace.close()
++            except Exception:
++                layout.dcpl.close()
++                raise
++        finally:
++            source_dcpl.close()
++
++        return layout
++
++    def relocated(self, filename, *, source_filename=None):
++        """Return an independent layout targeted at *filename*.
++
++        Relative mapping names are rebased from this layout's current target
++        file to the new target. Absolute names retain their original spelling.
++        For a layout created without a target filename, *source_filename* must
++        establish the file from which its relative names should be resolved.
++        """
++        if self._filename is None:
++            if source_filename is None:
++                raise ValueError(
++                    "source_filename is required for a layout without a "
++                    "target filename"
++                )
++            current_filename = os.fspath(source_filename)
++        elif source_filename is not None:
++            raise TypeError(
++                "source_filename is only valid for a layout without a "
++                "target filename"
++            )
++        else:
++            current_filename = self._filename
++
++        filename = os.fspath(filename)
++        relocated = type(self)(
++            self.shape,
++            self.dtype,
++            maxshape=self.maxshape,
++            filename=filename,
++        )
++        try:
++            _copy_creation_properties(self.dcpl, relocated.dcpl, self.dtype)
++
++            for mapping in self._virtual_sources():
++                try:
++                    relocated_filename = _relocated_source_filename(
++                        mapping.file_name, current_filename, filename
++                    )
++                    relocated.dcpl.set_virtual(
++                        mapping.vspace,
++                        filename_encode(relocated_filename),
++                        filename_encode(mapping.dset_name),
++                        mapping.src_space,
++                    )
++                finally:
++                    mapping.src_space.close()
++                    mapping.vspace.close()
++        except Exception:
++            relocated.dcpl.close()
++            raise
++
++        return relocated
++
++    def _virtual_sources(self):
++        """Return independent mapping records for this layout."""
++        return [
++            VDSmap(
++                self.dcpl.get_virtual_vspace(index),
++                self.dcpl.get_virtual_filename(index),
++                self.dcpl.get_virtual_dsetname(index),
++                self.dcpl.get_virtual_srcspace(index),
++            )
++            for index in range(self.dcpl.get_virtual_count())
++        ]
++
+     def __setitem__(self, key, source):
+         sel = select(self.shape, key, dataset=None)
+         _convert_space_for_key(sel.id, key)
+@@ -205,7 +389,7 @@ class VirtualLayout:
+             # filename was known in advance; check dst_filename matches
+             if dst_filename != filename_encode(self._filename):
+                 raise Exception(f"{dst_filename!r} != {self._filename!r}")
+-            return self.dcpl
++            return self.dcpl.copy()
+ 
+         # destination file not known in advance
+         if dst_filename in self._src_filenames:
+@@ -224,7 +408,7 @@ class VirtualLayout:
+                 )
+             return new_dcpl
+         else:
+-            return self.dcpl  # Mappings are all from other files
++            return self.dcpl.copy()  # Mappings are all from other files
+ 
+     def make_dataset(self, parent, name, fillvalue=None):
+         """ Return a new low-level dataset identifier for a virtual dataset """
+@@ -242,9 +426,18 @@ class VirtualLayout:
+         if isinstance(self.dtype, Datatype):
+             # Named types are used as-is
+             tid = self.dtype.id
++            close_tid = False
+         else:
+             dtype = np.dtype(self.dtype)
+             tid = h5t.py_create(dtype, logical=1)
+-
+-        return h5d.create(parent.id, name=name, tid=tid, space=virt_dspace,
+-                          dcpl=dcpl)
++            close_tid = True
++
++        try:
++            return h5d.create(
++                parent.id, name=name, tid=tid, space=virt_dspace, dcpl=dcpl
++            )
++        finally:
++            if close_tid:
++                tid.close()
++            virt_dspace.close()
++            dcpl.close()

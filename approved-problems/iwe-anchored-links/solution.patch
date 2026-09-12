@@ -1,0 +1,1383 @@
+diff --git a/crates/diwe/src/stats.rs b/crates/diwe/src/stats.rs
+index 2ff125f..bf268f3 100644
+--- a/crates/diwe/src/stats.rs
++++ b/crates/diwe/src/stats.rs
+@@ -44,6 +44,28 @@ fn serialize_keys<S: serde::Serializer>(keys: &[Key], serializer: S) -> Result<S
+     seq.end()
+ }
+ 
++#[derive(Debug, Clone, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct BrokenAnchor {
++    #[serde(serialize_with = "serialize_key")]
++    pub source_key: Key,
++    #[serde(serialize_with = "serialize_key")]
++    pub target_key: Key,
++    pub anchor: String,
++}
++
++pub fn broken_anchors(graph: &Graph) -> Vec<BrokenAnchor> {
++    graph
++        .dangling_anchors()
++        .into_iter()
++        .map(|dangling| BrokenAnchor {
++            source_key: dangling.source_key,
++            target_key: dangling.target_key,
++            anchor: dangling.anchor,
++        })
++        .collect()
++}
++
+ pub fn broken_links(graph: &Graph) -> Vec<BrokenLink> {
+     let existing_keys: HashSet<Key> = graph.keys().into_iter().collect();
+     let mut seen = HashSet::new();
+@@ -528,6 +550,9 @@ pub struct GraphStatistics {
+ 
+     pub broken_link_count: usize,
+     pub broken_links: Vec<BrokenLink>,
++
++    pub broken_anchor_count: usize,
++    pub broken_anchors: Vec<BrokenAnchor>,
+ }
+ 
+ impl GraphStatistics {
+@@ -568,6 +593,8 @@ impl GraphStatistics {
+             broken_links,
+         );
+         stats.orphans = orphan_keys(graph);
++        stats.broken_anchors = broken_anchors(graph);
++        stats.broken_anchor_count = stats.broken_anchors.len();
+         stats
+     }
+ 
+@@ -718,6 +745,8 @@ impl GraphStatistics {
+             most_connected,
+             broken_link_count: broken_links.len(),
+             broken_links,
++            broken_anchor_count: 0,
++            broken_anchors: Vec::new(),
+         }
+     }
+ }
+diff --git a/crates/iwe/src/export/graph_data.rs b/crates/iwe/src/export/graph_data.rs
+index 4b41192..59fc3f2 100644
+--- a/crates/iwe/src/export/graph_data.rs
++++ b/crates/iwe/src/export/graph_data.rs
+@@ -245,6 +245,7 @@ mod tests {
+                                 reference_type: ReferenceType::Regular,
+                                 url: String::new(),
+                                 display_url: None,
++                                anchor: None,
+                             }),
+                             vec![],
+                         )],
+@@ -260,6 +261,7 @@ mod tests {
+                                 reference_type: ReferenceType::Regular,
+                                 url: String::new(),
+                                 display_url: None,
++                                anchor: None,
+                             }),
+                             vec![],
+                         )],
+diff --git a/crates/iwe/templates/stats.md.jinja b/crates/iwe/templates/stats.md.jinja
+index 882208d..b5977cf 100644
+--- a/crates/iwe/templates/stats.md.jinja
++++ b/crates/iwe/templates/stats.md.jinja
+@@ -85,6 +85,15 @@
+ {% endfor %}
+ {%- endif %}
+ 
++{%- if brokenAnchors %}
++
++## Broken Anchors
++
++{% for anchor in brokenAnchors -%}
++- {{ anchor.sourceKey }} -> {{ anchor.targetKey }}#{{ anchor.anchor }}
++{% endfor %}
++{%- endif %}
++
+ {%- if orphans %}
+ 
+ ## Orphans
+diff --git a/crates/liwe/src/graph.rs b/crates/liwe/src/graph.rs
+index 998a1ae..7f4cb58 100644
+--- a/crates/liwe/src/graph.rs
++++ b/crates/liwe/src/graph.rs
+@@ -30,6 +30,7 @@ use crate::model::node::{NodeIter, NodePointer};
+ use crate::model::InlinesContext;
+ use crate::model::{Content, Key, LineId, LineNumber, LineRange, NodeId, NodesMap, State};
+ 
++pub mod anchors;
+ mod arena;
+ pub mod basic_iter;
+ pub mod builder;
+@@ -716,6 +717,9 @@ impl InlinesContext for &Graph {
+     fn get_ref_title(&self, key: &Key) -> Option<String> {
+         self.get_key_title(key)
+     }
++    fn get_anchor_title(&self, key: &Key, anchor: &str) -> Option<String> {
++        Graph::anchor_text(self, key, anchor)
++    }
+     fn wiki_display(&self, key: &Key, original_url: &str) -> String {
+         Graph::wiki_display(self, key, original_url)
+     }
+diff --git a/crates/liwe/src/graph/anchors.rs b/crates/liwe/src/graph/anchors.rs
+new file mode 100644
+index 0000000..06736b9
+--- /dev/null
++++ b/crates/liwe/src/graph/anchors.rs
+@@ -0,0 +1,176 @@
++use std::collections::HashSet;
++
++use itertools::Itertools;
++
++use super::graph_node::GraphNode;
++use super::{Graph, GraphContext};
++use crate::model::node::{NodeIter, NodePointer};
++use crate::model::{number_anchor_slugs, Key, NodeId};
++
++/// A link addressing a header no document holds.
++#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
++pub struct DanglingAnchor {
++    pub source_key: Key,
++    pub target_key: Key,
++    pub anchor: String,
++}
++
++/// A header of a document together with the anchor slug it answers to.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct AnchoredHeader {
++    pub id: NodeId,
++    pub slug: String,
++    pub text: String,
++}
++
++impl Graph {
++    /// Every header of a document in document order, with its anchor slug.
++    pub fn anchors(&self, key: &Key) -> Vec<AnchoredHeader> {
++        let Some(document) = self.maybe_key(key) else {
++            return Vec::new();
++        };
++
++        let headers = document
++            .get_all_sub_nodes()
++            .into_iter()
++            .filter(|id| {
++                GraphContext::node(&self, *id).is_header() && !self.graph_node(*id).is_empty()
++            })
++            .map(|id| (id, GraphContext::get_text(&self, id)))
++            .collect_vec();
++
++        let slugs = number_anchor_slugs(headers.iter().map(|(_, text)| text.clone()));
++
++        headers
++            .into_iter()
++            .zip(slugs)
++            .map(|((id, text), slug)| AnchoredHeader { id, slug, text })
++            .collect()
++    }
++
++    /// The header a link fragment addresses, if the document holds one.
++    pub fn resolve_anchor(&self, key: &Key, anchor: &str) -> Option<NodeId> {
++        self.anchors(key)
++            .into_iter()
++            .find(|header| header.slug == anchor)
++            .map(|header| header.id)
++    }
++
++    /// The text of the header a link fragment addresses.
++    pub fn anchor_text(&self, key: &Key, anchor: &str) -> Option<String> {
++        self.anchors(key)
++            .into_iter()
++            .find(|header| header.slug == anchor)
++            .map(|header| header.text)
++    }
++
++    /// The anchor slug of a header node, if the node is a header.
++    pub fn anchor_of(&self, id: NodeId) -> Option<String> {
++        let key = GraphContext::node(&self, id).to_document()?.document_key()?;
++        self.anchors(&key)
++            .into_iter()
++            .find(|header| header.id == id)
++            .map(|header| header.slug)
++    }
++
++    /// Every anchored link a document holds, block level and inline.
++    pub fn anchored_refs_in(&self, key: &Key) -> Vec<(Key, String)> {
++        let nodes = self
++            .maybe_key(key)
++            .map(|node| node.get_all_sub_nodes())
++            .unwrap_or_default();
++
++        let mut refs = Vec::new();
++
++        for id in nodes {
++            let graph_node = self.graph_node(id);
++            if graph_node.is_empty() {
++                continue;
++            }
++
++            if let (Some(target), Some(anchor)) = (graph_node.ref_key(), graph_node.ref_anchor()) {
++                refs.push((target, anchor));
++            }
++
++            match graph_node {
++                GraphNode::Section(section) => {
++                    refs.extend(self.get_line(section.line_id()).anchored_refs());
++                }
++                GraphNode::Leaf(leaf) => {
++                    refs.extend(self.get_line(leaf.line_id()).anchored_refs());
++                }
++                GraphNode::Table(table) => {
++                    for line_id in table.header() {
++                        refs.extend(self.get_line(*line_id).anchored_refs());
++                    }
++                    for row in table.rows() {
++                        for line_id in row {
++                            refs.extend(self.get_line(*line_id).anchored_refs());
++                        }
++                    }
++                }
++                _ => {}
++            }
++        }
++
++        refs
++    }
++
++    /// The documents holding a link addressing a given header, sorted and deduplicated.
++    pub fn anchor_backlinks(&self, key: &Key, anchor: &str) -> Vec<Key> {
++        if self.resolve_anchor(key, anchor).is_none() {
++            return Vec::new();
++        }
++
++        let mut sources = HashSet::new();
++
++        for source in self.keys() {
++            for (target, used) in self.anchored_refs_in(&source) {
++                if target == *key && used == anchor {
++                    sources.insert(source.clone());
++                }
++            }
++        }
++
++        sources.into_iter().sorted().collect()
++    }
++
++    /// The markdown of the section a link fragment addresses.
++    pub fn anchored_markdown(&self, key: &Key, anchor: &str) -> Option<String> {
++        let id = self.resolve_anchor(key, anchor)?;
++        let format = self.format_options().clone();
++
++        Some(
++            GraphContext::node(&self, id)
++                .collect_tree()
++                .iter()
++                .to_text(&key.parent(), &format),
++        )
++    }
++
++    /// Every link of the workspace whose target document holds no header for its anchor.
++    pub fn dangling_anchors(&self) -> Vec<DanglingAnchor> {
++        let mut dangling = HashSet::new();
++
++        for source in self.keys() {
++            for (target, anchor) in self.anchored_refs_in(&source) {
++                if GraphContext::get_node_id(&self, &target).is_none() {
++                    continue;
++                }
++                if self.resolve_anchor(&target, &anchor).is_none() {
++                    dangling.insert((source.clone(), target, anchor));
++                }
++            }
++        }
++
++        dangling
++            .into_iter()
++            .sorted()
++            .map(|(source_key, target_key, anchor)| DanglingAnchor {
++                source_key,
++                target_key,
++                anchor,
++            })
++            .collect()
++    }
++}
+diff --git a/crates/liwe/src/graph/basic_iter.rs b/crates/liwe/src/graph/basic_iter.rs
+index be71187..4a71c92 100644
+--- a/crates/liwe/src/graph/basic_iter.rs
++++ b/crates/liwe/src/graph/basic_iter.rs
+@@ -51,6 +51,15 @@ impl<'a> NodePointer<'a> for GraphNodePointer<'a> {
+             graph: self.graph,
+         })
+     }
++
++    fn to_anchor(&self, key: crate::model::Key, anchor: &str) -> Option<Self> {
++        self.graph
++            .resolve_anchor(&key, anchor)
++            .map(|id| GraphNodePointer {
++                id,
++                graph: self.graph,
++            })
++    }
+ }
+ 
+ impl<'a> NodeIter<'a> for GraphNodePointer<'a> {
+@@ -113,9 +122,10 @@ impl<'a> NodeIter<'a> for GraphNodePointer<'a> {
+             GraphNode::HorizontalRule(_) => Some(Node::HorizontalRule()),
+             GraphNode::Reference(reference) => {
+                 let text = match reference.reference_type() {
+-                    ReferenceType::Regular if self.graph.normalize_ref_text() => self
+-                        .graph
+-                        .get_ref_text(reference.key())
++                    ReferenceType::Regular if self.graph.normalize_ref_text() => reference
++                        .anchor()
++                        .and_then(|anchor| self.graph.anchor_text(reference.key(), &anchor))
++                        .or_else(|| self.graph.get_ref_text(reference.key()))
+                         .unwrap_or(reference.text().to_string()),
+                     ReferenceType::Regular => reference.text().to_string(),
+                     ReferenceType::WikiLink => String::default(),
+@@ -136,6 +146,7 @@ impl<'a> NodeIter<'a> for GraphNodePointer<'a> {
+                     reference_type: reference.reference_type(),
+                     url: reference.url().to_string(),
+                     display_url,
++                    anchor: reference.anchor(),
+                 }))
+             }
+             GraphNode::Table(table) => Some(Node::Table(Table {
+diff --git a/crates/liwe/src/graph/builder.rs b/crates/liwe/src/graph/builder.rs
+index 5da9da2..2feec3d 100644
+--- a/crates/liwe/src/graph/builder.rs
++++ b/crates/liwe/src/graph/builder.rs
+@@ -329,7 +329,17 @@ impl<'a> GraphBuilder<'a> {
+                 reference_type,
+                 url,
+                 display_url: _,
++                anchor,
+             }) => {
++                let url = Reference {
++                    key: key.clone(),
++                    text: title.to_string(),
++                    reference_type,
++                    url: url.clone(),
++                    display_url: None,
++                    anchor: anchor.clone(),
++                }
++                .anchored_url(url.clone());
+                 self.add_node_and2(
+                     GraphNode::new_ref(
+                         self.id,
+diff --git a/crates/liwe/src/graph/graph_line.rs b/crates/liwe/src/graph/graph_line.rs
+index c0db131..ee20544 100644
+--- a/crates/liwe/src/graph/graph_line.rs
++++ b/crates/liwe/src/graph/graph_line.rs
+@@ -30,6 +30,13 @@ impl Line {
+         self.inlines.iter().flat_map(|i| i.ref_keys()).collect()
+     }
+ 
++    pub fn anchored_refs(&self) -> Vec<(Key, String)> {
++        self.inlines
++            .iter()
++            .flat_map(|inline| inline.anchored_refs())
++            .collect()
++    }
++
+     pub fn normalize(&self, context: impl InlinesContext) -> Inlines {
+         self.inlines.iter().map(|i| i.normalize(context)).collect()
+     }
+diff --git a/crates/liwe/src/graph/graph_node.rs b/crates/liwe/src/graph/graph_node.rs
+index 1eab674..851d1b0 100644
+--- a/crates/liwe/src/graph/graph_node.rs
++++ b/crates/liwe/src/graph/graph_node.rs
+@@ -256,6 +256,10 @@ impl Reference {
+         &self.text
+     }
+ 
++    pub fn anchor(&self) -> Option<String> {
++        crate::model::anchor_from_link_url(&self.url)
++    }
++
+     pub fn url(&self) -> &str {
+         &self.url
+     }
+@@ -661,6 +665,13 @@ impl GraphNode {
+         }
+     }
+ 
++    pub fn ref_anchor(&self) -> Option<String> {
++        match self {
++            GraphNode::Reference(reference) => reference.anchor(),
++            _ => None,
++        }
++    }
++
+     pub fn ref_key(&self) -> Option<Key> {
+         match self {
+             GraphNode::Reference(reference) => Some(reference.key.clone()),
+diff --git a/crates/liwe/src/model.rs b/crates/liwe/src/model.rs
+index b48fc28..45ca54d 100644
+--- a/crates/liwe/src/model.rs
++++ b/crates/liwe/src/model.rs
+@@ -1,4 +1,10 @@
+-use std::{collections::HashMap, fmt::Display, ops::Range, path::Path, sync::Arc};
++use std::{
++    collections::{HashMap, HashSet},
++    fmt::Display,
++    ops::Range,
++    path::Path,
++    sync::Arc,
++};
+ 
+ use percent_encoding::percent_decode_str;
+ use relative_path::RelativePath;
+@@ -210,6 +216,71 @@ impl<'de> Deserialize<'de> for Key {
+     }
+ }
+ 
++/// Returns the fragment of a link url, without the leading `#`.
++pub fn anchor_from_link_url(url: &str) -> Option<String> {
++    let decoded = percent_decode_str(url).decode_utf8_lossy().into_owned();
++    decoded
++        .split_once('#')
++        .map(|(_, fragment)| fragment.to_string())
++        .filter(|fragment| !fragment.is_empty())
++}
++
++/// Whether a link url addresses only a fragment, so it names no document.
++pub fn is_fragment_only_url(url: &str) -> bool {
++    percent_decode_str(url)
++        .decode_utf8_lossy()
++        .starts_with('#')
++}
++
++/// Turns a header text into its anchor slug.
++pub fn slugify(text: &str) -> String {
++    let mut slug = String::new();
++    let mut pending_dash = false;
++
++    for character in text.chars() {
++        if character.is_alphanumeric() {
++            if pending_dash && !slug.is_empty() {
++                slug.push('-');
++            }
++            pending_dash = false;
++            slug.extend(character.to_lowercase());
++        } else {
++            pending_dash = true;
++        }
++    }
++
++    slug
++}
++
++/// Numbers repeated slugs in document order, the first occurrence keeps the bare slug.
++pub fn number_anchor_slugs(headers: impl IntoIterator<Item = String>) -> Vec<String> {
++    let mut seen: HashMap<String, usize> = HashMap::new();
++    let mut taken: HashSet<String> = HashSet::new();
++    let mut slugs = Vec::new();
++
++    for header in headers {
++        let base = match slugify(&header) {
++            slug if slug.is_empty() => "section".to_string(),
++            slug => slug,
++        };
++        let count = seen.entry(base.clone()).or_insert(0);
++
++        loop {
++            *count += 1;
++            let slug = match *count {
++                1 => base.clone(),
++                taken_count => format!("{}-{}", base, taken_count),
++            };
++            if taken.insert(slug.clone()) {
++                slugs.push(slug);
++                break;
++            }
++        }
++    }
++
++    slugs
++}
++
+ pub fn strip_doc_extension(name: &str) -> &str {
+     name.strip_suffix(".md")
+         .or_else(|| name.strip_suffix(".dj"))
+@@ -256,6 +327,7 @@ pub type Title = String;
+ 
+ pub trait InlinesContext: Copy {
+     fn get_ref_title(&self, key: &Key) -> Option<String>;
++    fn get_anchor_title(&self, key: &Key, anchor: &str) -> Option<String>;
+     fn wiki_display(&self, key: &Key, original_url: &str) -> String;
+     fn normalize_ref_text(&self) -> bool;
+ }
+diff --git a/crates/liwe/src/model/document.rs b/crates/liwe/src/model/document.rs
+index 517f7ac..2e72bd0 100644
+--- a/crates/liwe/src/model/document.rs
++++ b/crates/liwe/src/model/document.rs
+@@ -585,7 +585,7 @@ impl DocumentInline {
+             DocumentInline::LineBreak(_) => Inline::LineBreak,
+             DocumentInline::Link(link) => {
+                 let inlines = to_graph_inlines(&link.inlines, relative_to, key_index);
+-                if model::is_ref_url(&link.target.url) && !link.target.url.starts_with('#') {
++                if model::is_ref_url(&link.target.url) && !model::is_fragment_only_url(&link.target.url) {
+                     Inline::Reference(Reference {
+                         key: key_index.resolve_link_key(
+                             &link.target.url,
+@@ -596,6 +596,7 @@ impl DocumentInline {
+                         reference_type: link.link_type.to_ref_type(),
+                         url: link.target.url.clone(),
+                         display_url: None,
++                        anchor: model::anchor_from_link_url(&link.target.url),
+                     })
+                 } else {
+                     Inline::Link(
+@@ -652,7 +653,10 @@ impl DocumentInline {
+ 
+     fn is_ref(&self) -> bool {
+         match self {
+-            DocumentInline::Link(link) => model::is_ref_url(&link.target.url),
++            DocumentInline::Link(link) => {
++                model::is_ref_url(&link.target.url)
++                    && !model::is_fragment_only_url(&link.target.url)
++            }
+             _ => false,
+         }
+     }
+diff --git a/crates/liwe/src/model/inline.rs b/crates/liwe/src/model/inline.rs
+index 72fc77c..438b4b0 100644
+--- a/crates/liwe/src/model/inline.rs
++++ b/crates/liwe/src/model/inline.rs
+@@ -8,6 +8,13 @@ use crate::model::{InlinesContext, Key, Lang, LibraryUrl, Title};
+ 
+ pub type Inlines = Vec<Inline>;
+ 
++pub fn map_inlines(inlines: &Inlines, map: &dyn Fn(&Reference) -> Option<Reference>) -> Inlines {
++    inlines
++        .iter()
++        .map(|inline| inline.map_references(map))
++        .collect()
++}
++
+ #[derive(Debug, Clone, PartialEq, Default)]
+ pub struct Attributes {
+     pub id: String,
+@@ -102,6 +109,39 @@ impl Inline {
+         }
+     }
+ 
++    /// Every anchored reference the inline holds, at any nesting depth.
++    pub fn anchored_refs(&self) -> Vec<(Key, String)> {
++        let mut refs = Vec::new();
++        self.collect_anchored_refs(&mut refs);
++        refs
++    }
++
++    fn collect_anchored_refs(&self, refs: &mut Vec<(Key, String)>) {
++        match self {
++            Inline::Emph(inner)
++            | Inline::Underline(inner)
++            | Inline::Strong(inner)
++            | Inline::Strikeout(inner)
++            | Inline::Superscript(inner)
++            | Inline::Subscript(inner)
++            | Inline::SmallCaps(inner)
++            | Inline::Mark(inner)
++            | Inline::Insert(inner)
++            | Inline::Delete(inner)
++            | Inline::Span(_, inner) => {
++                for inline in inner {
++                    inline.collect_anchored_refs(refs);
++                }
++            }
++            Inline::Reference(reference) => {
++                if let Some(anchor) = &reference.anchor {
++                    refs.push((reference.key.clone(), anchor.clone()));
++                }
++            }
++            _ => {}
++        }
++    }
++
+     pub fn ref_keys(&self) -> Vec<Key> {
+         match self {
+             Inline::Emph(emph) => emph.iter().flat_map(|inline| inline.ref_keys()).collect(),
+@@ -197,8 +237,11 @@ impl Inline {
+             ),
+             Inline::Reference(reference) => {
+                 let new_text = match reference.reference_type {
+-                    ReferenceType::Regular if context.normalize_ref_text() => context
+-                        .get_ref_title(&reference.key)
++                    ReferenceType::Regular if context.normalize_ref_text() => reference
++                        .anchor
++                        .as_ref()
++                        .map(|anchor| context.get_anchor_title(&reference.key, anchor))
++                        .unwrap_or_else(|| context.get_ref_title(&reference.key))
+                         .unwrap_or_else(|| reference.text.clone()),
+                     ReferenceType::Regular => reference.text.clone(),
+                     ReferenceType::WikiLink => String::new(),
+@@ -218,12 +261,34 @@ impl Inline {
+                     reference_type: reference.reference_type,
+                     url: reference.url.clone(),
+                     display_url,
++                    anchor: reference.anchor.clone(),
+                 })
+             }
+             _ => self.clone(),
+         }
+     }
+ 
++    pub fn map_references(&self, map: &dyn Fn(&Reference) -> Option<Reference>) -> Inline {
++        match self {
++            Inline::Emph(inner) => Inline::Emph(map_inlines(inner, map)),
++            Inline::Strong(inner) => Inline::Strong(map_inlines(inner, map)),
++            Inline::Underline(inner) => Inline::Underline(map_inlines(inner, map)),
++            Inline::Strikeout(inner) => Inline::Strikeout(map_inlines(inner, map)),
++            Inline::Superscript(inner) => Inline::Superscript(map_inlines(inner, map)),
++            Inline::Subscript(inner) => Inline::Subscript(map_inlines(inner, map)),
++            Inline::SmallCaps(inner) => Inline::SmallCaps(map_inlines(inner, map)),
++            Inline::Mark(inner) => Inline::Mark(map_inlines(inner, map)),
++            Inline::Insert(inner) => Inline::Insert(map_inlines(inner, map)),
++            Inline::Delete(inner) => Inline::Delete(map_inlines(inner, map)),
++            Inline::Span(attr, inner) => Inline::Span(attr.clone(), map_inlines(inner, map)),
++            Inline::Reference(reference) => match map(reference) {
++                Some(updated) => Inline::Reference(updated),
++                None => self.clone(),
++            },
++            _ => self.clone(),
++        }
++    }
++
+     pub fn change_key(&self, target_key: &Key, updated_key: &Key) -> Inline {
+         match self {
+             Inline::Emph(emph) => Inline::Emph(
+@@ -294,8 +359,9 @@ impl Inline {
+                         key: updated_key.clone(),
+                         text: reference.text.clone(),
+                         reference_type: reference.reference_type,
+-                        url: updated_key.to_library_url(),
++                        url: reference.anchored_url(updated_key.to_library_url()),
+                         display_url: None,
++                        anchor: reference.anchor.clone(),
+                     });
+                 }
+                 self.clone()
+diff --git a/crates/liwe/src/model/key_index.rs b/crates/liwe/src/model/key_index.rs
+index 75ad3cd..246059d 100644
+--- a/crates/liwe/src/model/key_index.rs
++++ b/crates/liwe/src/model/key_index.rs
+@@ -55,7 +55,11 @@ impl KeyIndex {
+ 
+     pub fn resolve_wiki(&self, url: &str) -> Key {
+         let decoded = percent_decode_str(url).decode_utf8_lossy().into_owned();
+-        let target = strip_doc_extension(&decoded).to_string();
++        let without_fragment = match decoded.split_once('#') {
++            Some((path, _)) => path,
++            None => decoded.as_str(),
++        };
++        let target = strip_doc_extension(without_fragment).to_string();
+         let segs = segments(&target);
+ 
+         let Some(basename) = segs.last() else {
+diff --git a/crates/liwe/src/model/node_pointer.rs b/crates/liwe/src/model/node_pointer.rs
+index 05565e4..08f79ba 100644
+--- a/crates/liwe/src/model/node_pointer.rs
++++ b/crates/liwe/src/model/node_pointer.rs
+@@ -11,6 +11,7 @@ pub trait NodePointer<'a>: NodeIter<'a> {
+     fn prev_id(&self) -> Option<NodeId>;
+     fn to_node(&self, id: NodeId) -> Self;
+     fn to_key(&self, key: Key) -> Option<Self>;
++    fn to_anchor(&self, key: Key, anchor: &str) -> Option<Self>;
+ 
+     fn at(&self, id: NodeId) -> bool {
+         self.id() == Some(id)
+@@ -60,6 +61,16 @@ pub trait NodePointer<'a>: NodeIter<'a> {
+         sections
+     }
+ 
++    fn ref_anchor(&self) -> Option<String> {
++        self.node().and_then(|node| {
++            if let Node::Reference(reference) = node {
++                reference.anchor.clone()
++            } else {
++                None
++            }
++        })
++    }
++
+     fn ref_key(&self) -> Option<Key> {
+         self.node().and_then(|node| {
+             if let Node::Reference(reference) = node {
+diff --git a/crates/liwe/src/model/projector.rs b/crates/liwe/src/model/projector.rs
+index cb94e67..e18056c 100644
+--- a/crates/liwe/src/model/projector.rs
++++ b/crates/liwe/src/model/projector.rs
+@@ -58,9 +58,12 @@ impl Projector {
+                 let url = match reference.reference_type {
+                     ReferenceType::Regular => self.regular_url(&reference.key, &reference.url),
+                     ReferenceType::WikiLink | ReferenceType::WikiLinkPiped => reference
+-                        .display_url
+-                        .clone()
+-                        .unwrap_or_else(|| reference.key.to_library_url()),
++                        .anchored_url(
++                            reference
++                                .display_url
++                                .clone()
++                                .unwrap_or_else(|| reference.key.to_library_url()),
++                        ),
+                 };
+                 let inlines = match reference.reference_type {
+                     ReferenceType::WikiLink => vec![],
+@@ -162,9 +165,12 @@ impl Projector {
+                 let url = match reference_type {
+                     ReferenceType::Regular => self.regular_url(&reference.key, &reference.url),
+                     ReferenceType::WikiLink | ReferenceType::WikiLinkPiped => reference
+-                        .display_url
+-                        .clone()
+-                        .unwrap_or_else(|| reference.key.to_library_url()),
++                        .anchored_url(
++                            reference
++                                .display_url
++                                .clone()
++                                .unwrap_or_else(|| reference.key.to_library_url()),
++                        ),
+                 };
+ 
+                 let link = Inline::Link(
+diff --git a/crates/liwe/src/model/reference.rs b/crates/liwe/src/model/reference.rs
+index aec9284..8ce3ec1 100644
+--- a/crates/liwe/src/model/reference.rs
++++ b/crates/liwe/src/model/reference.rs
+@@ -25,4 +25,14 @@ pub struct Reference {
+     pub reference_type: ReferenceType,
+     pub url: String,
+     pub display_url: Option<String>,
++    pub anchor: Option<String>,
++}
++
++impl Reference {
++    pub fn anchored_url(&self, base: String) -> String {
++        match &self.anchor {
++            Some(anchor) if !base.contains('#') => format!("{}#{}", base, anchor),
++            _ => base,
++        }
++    }
+ }
+diff --git a/crates/liwe/src/model/tree.rs b/crates/liwe/src/model/tree.rs
+index 874e3e7..b711d1d 100644
+--- a/crates/liwe/src/model/tree.rs
++++ b/crates/liwe/src/model/tree.rs
+@@ -4,8 +4,8 @@ use itertools::Itertools;
+ 
+ use super::{
+     ids::alloc_node_id,
+-    inline::{prepend_checkbox, Inline},
+-    node::{Node, NodePointer, Reference, ReferenceType},
++    inline::{map_inlines, prepend_checkbox, Inline},
++    node::{Node, NodePointer, Reference, ReferenceType, Table},
+     Key, LineRange, NodeId,
+ };
+ 
+@@ -92,6 +92,7 @@ impl Tree {
+                     reference_type: ReferenceType::Regular,
+                     url: String::new(),
+                     display_url: None,
++                    anchor: None,
+                 }),
+                 children: vec![],
+             }
+@@ -108,6 +109,20 @@ impl Tree {
+         }
+     }
+ 
++    /// Replaces the text of a header, keeping its node identity and its children.
++    pub fn set_header_text(&self, node_id: NodeId, text: &str) -> Tree {
++        if self.id_eq(node_id) {
++            return Tree {
++                id: self.id,
++                line_range: self.line_range.clone(),
++                node: Node::Section(vec![Inline::Str(text.to_string())]),
++                children: self.children.clone(),
++            };
++        }
++
++        self.map_children(|child| child.set_header_text(node_id, text))
++    }
++
+     pub fn change_list_type(&self, node_id: NodeId) -> Tree {
+         if self.id_eq(node_id) {
+             Tree {
+@@ -376,6 +391,59 @@ impl Tree {
+         }
+     }
+ 
++    /// Rewrites every reference of the tree, block level and inline, through `map`.
++    pub fn map_references(&self, map: &dyn Fn(&Reference) -> Option<Reference>) -> Tree {
++        Tree {
++            id: self.id,
++            line_range: self.line_range.clone(),
++            node: match &self.node {
++                Node::Section(inlines) => Node::Section(map_inlines(inlines, map)),
++                Node::Leaf(inlines) => Node::Leaf(map_inlines(inlines, map)),
++                Node::Item(checked, inlines) => Node::Item(*checked, map_inlines(inlines, map)),
++                Node::Reference(reference) => match map(reference) {
++                    Some(updated) => Node::Reference(updated),
++                    None => self.node.clone(),
++                },
++                Node::Table(table) => Node::Table(Table {
++                    header: table
++                        .header
++                        .iter()
++                        .map(|cell| map_inlines(cell, map))
++                        .collect_vec(),
++                    alignment: table.alignment.clone(),
++                    rows: table
++                        .rows
++                        .iter()
++                        .map(|row| row.iter().map(|cell| map_inlines(cell, map)).collect_vec())
++                        .collect_vec(),
++                }),
++                _ => self.node.clone(),
++            },
++            children: self
++                .map_children(|child| child.map_references(map))
++                .children,
++        }
++    }
++
++    /// Every header of the tree in document order, paired with its node id.
++    pub fn headers(&self) -> Vec<(NodeId, String)> {
++        let mut headers = Vec::new();
++        self.collect_headers(false, &mut headers);
++        headers
++    }
++
++    fn collect_headers(&self, in_list: bool, headers: &mut Vec<(NodeId, String)>) {
++        if let Node::Section(_) = self.node {
++            if !in_list {
++                headers.push((self.id, self.node.plain_text()));
++            }
++        }
++        let nested = in_list || self.is_list();
++        for child in &self.children {
++            child.collect_headers(nested, headers);
++        }
++    }
++
+     pub fn change_key(&self, target_key: &Key, updated_key: &Key) -> Tree {
+         Tree {
+             id: self.id,
+@@ -409,11 +477,12 @@ impl Tree {
+                     text: reference.text.clone(),
+                     reference_type: reference.reference_type,
+                     url: if reference.key.eq(target_key) {
+-                        updated_key.to_library_url()
++                        reference.anchored_url(updated_key.to_library_url())
+                     } else {
+                         reference.url.clone()
+                     },
+                     display_url: None,
++                    anchor: reference.anchor.clone(),
+                 }),
+                 _ => self.node.clone(),
+             },
+@@ -514,13 +583,21 @@ impl Tree {
+                 .into_iter()
+                 .flat_map(|child| {
+                     if child.is_reference() {
+-                        child
+-                            .ref_key()
+-                            .filter(|_| depth > 0)
+-                            .and_then(|key| child.to_key(key))
+-                            .map(|pointer| Tree::squash_from_pointer(pointer, depth - 1))
+-                            .map(|r| r.first().unwrap().children.clone())
+-                            .unwrap_or(Tree::squash_from_pointer(child, 0))
++                        match child.ref_anchor() {
++                            Some(anchor) => child
++                                .ref_key()
++                                .filter(|_| depth > 0)
++                                .and_then(|key| child.to_anchor(key, &anchor))
++                                .map(|pointer| Tree::squash_from_pointer(pointer, depth - 1))
++                                .unwrap_or(Tree::squash_from_pointer(child, 0)),
++                            None => child
++                                .ref_key()
++                                .filter(|_| depth > 0)
++                                .and_then(|key| child.to_key(key))
++                                .map(|pointer| Tree::squash_from_pointer(pointer, depth - 1))
++                                .map(|r| r.first().unwrap().children.clone())
++                                .unwrap_or(Tree::squash_from_pointer(child, 0)),
++                        }
+                     } else {
+                         Tree::squash_from_pointer(child, depth)
+                     }
+@@ -760,6 +837,7 @@ impl Tree {
+                         reference_type: reference.reference_type,
+                         url: reference.url.clone(),
+                         display_url: reference.display_url.clone(),
++                        anchor: reference.anchor.clone(),
+                     }));
+                     inlines.push(Inline::Space);
+                     inlines.push(Inline::Str("<-".to_string()));
+@@ -775,6 +853,7 @@ impl Tree {
+                             reference_type: ReferenceType::Regular,
+                             url: String::new(),
+                             display_url: None,
++                            anchor: None,
+                         }));
+                     }
+ 
+diff --git a/crates/liwe/src/operations.rs b/crates/liwe/src/operations.rs
+index 2f2f2f0..9fbbc11 100644
+--- a/crates/liwe/src/operations.rs
++++ b/crates/liwe/src/operations.rs
+@@ -1,3 +1,4 @@
++mod anchors;
+ mod attach;
+ mod changes;
+ mod config;
+@@ -8,13 +9,14 @@ mod rename;
+ mod select;
+ mod util;
+ 
++pub use anchors::{AnchorRelocation, RelocatedDocument};
+ pub use attach::{attach_reference, AttachTarget};
+ pub use changes::{Changes, OperationError};
+ pub use config::{ExtractConfig, InlineConfig};
+ pub use delete::delete;
+ pub use extract::{extract, extract_all};
+ pub use inline::inline;
+-pub use rename::rename;
++pub use rename::{rename, rename_header};
+ pub use select::{
+     references, sections, select_reference, select_section, InclusionRef, SectionRef, SelectError,
+ };
+diff --git a/crates/liwe/src/operations/anchors.rs b/crates/liwe/src/operations/anchors.rs
+new file mode 100644
+index 0000000..1b35700
+--- /dev/null
++++ b/crates/liwe/src/operations/anchors.rs
+@@ -0,0 +1,139 @@
++use std::collections::{HashMap, HashSet};
++
++use itertools::Itertools;
++
++use crate::graph::{Graph, GraphContext};
++use crate::model::node::Reference;
++use crate::model::node::NodeIter;
++use crate::model::tree::Tree;
++
++use super::changes::Changes;
++use crate::model::{number_anchor_slugs, Key, NodeId};
++
++/// A document produced by an operation, paired with the tree it was built from.
++pub struct RelocatedDocument<'a> {
++    pub key: Key,
++    pub tree: &'a Tree,
++    pub created: bool,
++}
++
++/// Follows headers across an operation so links anchored at them keep pointing at the same header.
++#[derive(Default)]
++pub struct AnchorRelocation {
++    before: HashMap<(Key, String), NodeId>,
++    after: HashMap<NodeId, (Key, Option<String>)>,
++}
++
++impl AnchorRelocation {
++    pub fn build(graph: &Graph, sources: &[Key], results: &[RelocatedDocument]) -> AnchorRelocation {
++        let mut before = HashMap::new();
++
++        for key in sources {
++            for header in graph.anchors(key) {
++                before.insert((key.clone(), header.slug), header.id);
++            }
++        }
++
++        let mut after = HashMap::new();
++
++        for result in results {
++            let headers = result.tree.headers();
++            let slugs = number_anchor_slugs(headers.iter().map(|(_, text)| text.clone()));
++
++            for (position, ((id, _), slug)) in headers.iter().zip(slugs).enumerate() {
++                let anchor = if result.created && position == 0 {
++                    None
++                } else {
++                    Some(slug)
++                };
++                after.insert(*id, (result.key.clone(), anchor));
++            }
++        }
++
++        AnchorRelocation { before, after }
++    }
++
++    fn target(&self, reference: &Reference) -> Option<(Key, Option<String>)> {
++        let anchor = reference.anchor.clone()?;
++        let id = self.before.get(&(reference.key.clone(), anchor))?;
++        let (key, anchor) = self.after.get(id)?;
++
++        if *key == reference.key && anchor.as_deref() == reference.anchor.as_deref() {
++            return None;
++        }
++
++        Some((key.clone(), anchor.clone()))
++    }
++
++    /// Rewrites every anchored reference of a tree that addresses a header this operation moved.
++    pub fn apply(&self, tree: &Tree) -> Tree {
++        tree.map_references(&|reference| {
++            let (key, anchor) = self.target(reference)?;
++            let url = match &anchor {
++                Some(anchor) => format!("{}#{}", key.to_library_url(), anchor),
++                None => key.to_library_url(),
++            };
++
++            Some(Reference {
++                key,
++                text: reference.text.clone(),
++                reference_type: reference.reference_type,
++                url,
++                display_url: None,
++                anchor,
++            })
++        })
++    }
++
++    /// The documents holding a link into one of the operation's source documents.
++    pub fn linking_documents(&self, graph: &Graph, sources: &[Key]) -> Vec<Key> {
++        let mut keys: HashSet<Key> = HashSet::new();
++
++        for source in sources {
++            let inbound = graph
++                .get_inclusion_edges_to(source)
++                .into_iter()
++                .chain(graph.get_reference_edges_to(source));
++
++            for node_id in inbound {
++                keys.insert(graph.key_of(node_id));
++            }
++        }
++
++        keys.into_iter().sorted().collect()
++    }
++
++    /// Adds an update for every other document whose anchored links this operation moved.
++    pub fn retarget_linking_documents(
++        &self,
++        graph: &Graph,
++        sources: &[Key],
++        already_written: &[Key],
++        changes: &mut Changes,
++    ) {
++        if self.is_empty() {
++            return;
++        }
++
++        let format = graph.format_options().clone();
++
++        for key in self.linking_documents(graph, sources) {
++            if already_written.contains(&key) {
++                continue;
++            }
++
++            let tree = graph.collect(&key);
++            let updated = self.apply(&tree);
++
++            if updated == tree {
++                continue;
++            }
++
++            changes.add_update(key.clone(), updated.iter().to_text(&key.parent(), &format));
++        }
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.before.is_empty() || self.after.is_empty()
++    }
++}
+diff --git a/crates/liwe/src/operations/attach.rs b/crates/liwe/src/operations/attach.rs
+index c926734..d6e4a97 100644
+--- a/crates/liwe/src/operations/attach.rs
++++ b/crates/liwe/src/operations/attach.rs
+@@ -26,6 +26,7 @@ pub fn attach_reference(
+             reference_type: ReferenceType::Regular,
+             url: String::new(),
+             display_url: None,
++            anchor: None,
+         }),
+         children: vec![],
+     };
+diff --git a/crates/liwe/src/operations/extract.rs b/crates/liwe/src/operations/extract.rs
+index 6b2041c..711188f 100644
+--- a/crates/liwe/src/operations/extract.rs
++++ b/crates/liwe/src/operations/extract.rs
+@@ -9,6 +9,7 @@ use crate::model::node::{Node, NodeIter, Reference, ReferenceType};
+ use crate::model::tree::Tree;
+ use crate::model::{Key, NodeId};
+ 
++use super::anchors::{AnchorRelocation, RelocatedDocument};
+ use super::changes::{Changes, OperationError};
+ use super::config::ExtractConfig;
+ use super::util::{format_target_key, KeyFormatContext};
+@@ -73,7 +74,6 @@ pub fn extract(
+     let format = graph.format_options().clone();
+ 
+     let extracted = tree.get(target_id);
+-    let new_markdown = extracted.iter().to_text(&new_key.parent(), &format);
+ 
+     let reference_type = match &config.link_type {
+         Some(LinkType::WikiLink) => ReferenceType::WikiLink,
+@@ -89,12 +89,41 @@ pub fn extract(
+         reference_type,
+     );
+ 
++    let sources = vec![source_key.clone()];
++    let relocation = AnchorRelocation::build(
++        graph,
++        &sources,
++        &[
++            RelocatedDocument {
++                key: new_key.clone(),
++                tree: &extracted,
++                created: true,
++            },
++            RelocatedDocument {
++                key: source_key.clone(),
++                tree: &updated_tree,
++                created: false,
++            },
++        ],
++    );
++
++    let extracted = relocation.apply(&extracted);
++    let updated_tree = relocation.apply(&updated_tree);
++
++    let new_markdown = extracted.iter().to_text(&new_key.parent(), &format);
+     let source_markdown = updated_tree.iter().to_text(&source_key.parent(), &format);
+ 
+     let mut result = Changes::default();
+     result.add_create(new_key.clone(), new_markdown);
+     result.add_update(source_key.clone(), source_markdown);
+ 
++    relocation.retarget_linking_documents(
++        graph,
++        &sources,
++        &[source_key.clone(), new_key.clone()],
++        &mut result,
++    );
++
+     Ok(result)
+ }
+ 
+@@ -139,6 +168,7 @@ fn extract_section_rec(
+                     reference_type,
+                     url: new_key.to_library_url(),
+                     display_url: None,
++                    anchor: None,
+                 }),
+                 children: vec![],
+             },
+@@ -211,6 +241,7 @@ pub fn extract_all(
+     let mut result = Changes::default();
+     let mut current_tree = tree.clone();
+     let mut generated_keys: Vec<Key> = Vec::new();
++    let mut created_trees: Vec<(Key, Tree)> = Vec::new();
+ 
+     for (idx, section_id) in subsection_ids.iter().enumerate() {
+         let section_title = current_tree
+@@ -242,7 +273,7 @@ pub fn extract_all(
+         generated_keys.push(new_key.clone());
+ 
+         let extracted = current_tree.get(*section_id);
+-        let new_markdown = extracted.iter().to_text(&new_key.parent(), &format);
++        created_trees.push((new_key.clone(), extracted));
+ 
+         let reference_type = match &config.link_type {
+             Some(LinkType::WikiLink) => ReferenceType::WikiLink,
+@@ -258,12 +289,40 @@ pub fn extract_all(
+             reference_type,
+         );
+ 
+-        result.add_create(new_key, new_markdown);
+     }
+ 
+-    let source_markdown = current_tree.iter().to_text(&source_key.parent(), &format);
++    let sources = vec![source_key.clone()];
++    let mut documents: Vec<RelocatedDocument> = created_trees
++        .iter()
++        .map(|(key, tree)| RelocatedDocument {
++            key: key.clone(),
++            tree,
++            created: true,
++        })
++        .collect();
++    documents.push(RelocatedDocument {
++        key: source_key.clone(),
++        tree: &current_tree,
++        created: false,
++    });
++
++    let relocation = AnchorRelocation::build(graph, &sources, &documents);
++
++    let mut written = vec![source_key.clone()];
++    for (key, tree) in &created_trees {
++        let markdown = relocation.apply(tree).iter().to_text(&key.parent(), &format);
++        result.add_create(key.clone(), markdown);
++        written.push(key.clone());
++    }
++
++    let source_markdown = relocation
++        .apply(&current_tree)
++        .iter()
++        .to_text(&source_key.parent(), &format);
+     result.add_update(source_key.clone(), source_markdown);
+ 
++    relocation.retarget_linking_documents(graph, &sources, &written, &mut result);
++
+     Ok(result)
+ }
+ 
+diff --git a/crates/liwe/src/operations/inline.rs b/crates/liwe/src/operations/inline.rs
+index 2c0829a..742e895 100644
+--- a/crates/liwe/src/operations/inline.rs
++++ b/crates/liwe/src/operations/inline.rs
+@@ -9,6 +9,7 @@ use crate::model::node::{Node, NodeIter};
+ use crate::model::tree::Tree;
+ use crate::model::{Key, NodeId};
+ 
++use super::anchors::{AnchorRelocation, RelocatedDocument};
+ use super::changes::{Changes, OperationError};
+ use super::config::InlineConfig;
+ 
+@@ -62,7 +63,25 @@ pub fn inline(
+         }
+     };
+ 
+-    let source_markdown = updated_tree.iter().to_text(&source_key.parent(), &format);
++    let mut sources = vec![source_key.clone()];
++    if !config.keep_target {
++        sources.push(inline_key.clone());
++    }
++
++    let relocation = AnchorRelocation::build(
++        graph,
++        &sources,
++        &[RelocatedDocument {
++            key: source_key.clone(),
++            tree: &updated_tree,
++            created: false,
++        }],
++    );
++
++    let source_markdown = relocation
++        .apply(&updated_tree)
++        .iter()
++        .to_text(&source_key.parent(), &format);
+     result.add_update(source_key.clone(), source_markdown);
+ 
+     if !config.keep_target {
+@@ -80,12 +99,15 @@ pub fn inline(
+ 
+         for ref_key in additional_refs.iter().sorted() {
+             let tree = graph.collect(ref_key);
+-            let updated = tree
++            let retargeted = relocation.apply(&tree);
++            let updated = retargeted
+                 .remove_inclusion_edges_to(&inline_key)
+                 .remove_inline_links_to(&inline_key);
+             let markdown = updated.iter().to_text(&ref_key.parent(), &format);
+             result.add_update(ref_key.clone(), markdown);
+         }
++    } else {
++        relocation.retarget_linking_documents(graph, &sources, &[source_key.clone()], &mut result);
+     }
+ 
+     Ok(result)
+diff --git a/crates/liwe/src/operations/rename.rs b/crates/liwe/src/operations/rename.rs
+index 71b6664..841d513 100644
+--- a/crates/liwe/src/operations/rename.rs
++++ b/crates/liwe/src/operations/rename.rs
+@@ -4,10 +4,62 @@ use itertools::Itertools;
+ 
+ use crate::graph::{Graph, GraphContext};
+ use crate::model::node::NodeIter;
+-use crate::model::Key;
++use crate::model::{Key, NodeId};
+ 
++use super::anchors::{AnchorRelocation, RelocatedDocument};
+ use super::changes::{Changes, OperationError};
+ 
++/// Renames a header and keeps every link anchored at it pointing at the same header.
++pub fn rename_header(
++    graph: &Graph,
++    key: &Key,
++    header_id: NodeId,
++    text: &str,
++) -> Result<Changes, OperationError> {
++    if graph.get_node_id(key).is_none() {
++        return Err(OperationError::NotFound(key.clone()));
++    }
++
++    let tree = graph.collect(key);
++
++    if !tree.is_header(header_id) {
++        return Err(OperationError::InvalidTarget(
++            "Target must be a section header".to_string(),
++        ));
++    }
++
++    if text.trim().is_empty() {
++        return Err(OperationError::InvalidTarget(
++            "Header text cannot be empty".to_string(),
++        ));
++    }
++
++    let format = graph.format_options().clone();
++    let renamed = tree.set_header_text(header_id, text);
++
++    let sources = vec![key.clone()];
++    let relocation = AnchorRelocation::build(
++        graph,
++        &sources,
++        &[RelocatedDocument {
++            key: key.clone(),
++            tree: &renamed,
++            created: false,
++        }],
++    );
++
++    let mut result = Changes::default();
++    let markdown = relocation
++        .apply(&renamed)
++        .iter()
++        .to_text(&key.parent(), &format);
++    result.add_update(key.clone(), markdown);
++
++    relocation.retarget_linking_documents(graph, &sources, &[key.clone()], &mut result);
++
++    Ok(result)
++}
++
+ pub fn rename(graph: &Graph, old_key: &Key, new_key: &Key) -> Result<Changes, OperationError> {
+     if new_key.as_str().is_empty() {
+         return Err(OperationError::InvalidTarget(
+diff --git a/crates/liwe/src/operations/util.rs b/crates/liwe/src/operations/util.rs
+index 003eebe..ba70ea0 100644
+--- a/crates/liwe/src/operations/util.rs
++++ b/crates/liwe/src/operations/util.rs
+@@ -8,14 +8,7 @@ use crate::graph::GraphContext;
+ use crate::model::Key;
+ 
+ pub fn string_to_slug(s: &str) -> String {
+-    s.to_lowercase()
+-        .chars()
+-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+-        .collect::<String>()
+-        .split('-')
+-        .filter(|s| !s.is_empty())
+-        .collect::<Vec<_>>()
+-        .join("-")
++    crate::model::slugify(s)
+ }
+ 
+ pub struct KeyFormatContext<'a> {

@@ -1,0 +1,1019 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..91d72d1
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,37 @@
++#!/usr/bin/env bash
++# Run deterministic offline regression or OME pyramid validation tests.
++set -uo pipefail
++
++cd /app
++
++output_path="results.xml"
++if [ "${1:-}" = "--output_path" ]; then
++    output_path="$2"
++    shift 2
++fi
++mode="${1:-new}"
++
++mkdir -p "$(dirname "$output_path")"
++
++export SKIP_LARGE=1
++export SKIP_SLOW=1
++export SKIP_EXTENDED=1
++export SKIP_FILE=1
++export SKIP_VALIDATE=1
++export SKIP_HTTP=1
++
++case "$mode" in
++    base)
++        python -m pytest tests -q \
++            --ignore=tests/test_ome_pyramid_validation_a0d7bb.py \
++            --junitxml="$output_path"
++        ;;
++    new)
++        python -m pytest tests/test_ome_pyramid_validation_a0d7bb.py -q \
++            --junitxml="$output_path"
++        ;;
++    *)
++        echo "unknown mode: $mode (expected base or new)" >&2
++        exit 2
++        ;;
++esac
+diff --git a/tests/test_ome_pyramid_validation_a0d7bb.py b/tests/test_ome_pyramid_validation_a0d7bb.py
+new file mode 100644
+index 0000000..e68eeca
+--- /dev/null
++++ b/tests/test_ome_pyramid_validation_a0d7bb.py
+@@ -0,0 +1,970 @@
++"""Tests for OME-TIFF pyramid storage validation."""
++
++from __future__ import annotations
++
++import inspect
++from pathlib import Path
++
++import numpy
++import pytest
++
++from tifffile import OmeXml, TiffFile, TiffPage, TiffWriter
++
++
++def write_pyramid(
++    path: Path,
++    shapes: list[tuple[int, int]],
++    *,
++    planes: int = 2,
++    flags: list[int] | None = None,
++    ome: bool = True,
++) -> None:
++    """Write a small deterministic OME pyramid."""
++    if flags is None:
++        flags = [1] * (len(shapes) - 1)
++    with TiffWriter(path, ome=ome) as tif:
++        base = numpy.zeros((planes, *shapes[0]), numpy.uint8)
++        tif.write(
++            base,
++            subifds=len(shapes) - 1,
++            metadata={'axes': 'CYX'},
++        )
++        for index, shape in enumerate(shapes[1:]):
++            tif.write(
++                numpy.zeros((planes, *shape), numpy.uint8),
++                subfiletype=flags[index],
++            )
++
++
++def multifile_ome_xml(
++    root: Path, companion: Path, active_uuid: str
++) -> str:
++    """Return OME-XML mapping one plane from each of two TIFF files."""
++    root_uuid = 'urn:uuid:11111111-1111-1111-1111-111111111111'
++    companion_uuid = 'urn:uuid:22222222-2222-2222-2222-222222222222'
++    return (
++        '<?xml version="1.0" encoding="UTF-8"?>'
++        '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06" '
++        f'UUID="{active_uuid}">'
++        '<Image ID="Image:0"><Pixels ID="Pixels:0" '
++        'DimensionOrder="XYCZT" Type="uint8" SizeX="64" SizeY="64" '
++        'SizeC="2" SizeZ="1" SizeT="1">'
++        '<Channel ID="Channel:0:0" SamplesPerPixel="1"/>'
++        '<Channel ID="Channel:0:1" SamplesPerPixel="1"/>'
++        '<TiffData IFD="0" FirstC="0" PlaneCount="1">'
++        f'<UUID FileName="{root.name}">{root_uuid}</UUID></TiffData>'
++        '<TiffData IFD="0" FirstC="1" PlaneCount="1">'
++        f'<UUID FileName="{companion.name}">{companion_uuid}</UUID>'
++        '</TiffData></Pixels></Image></OME>'
++    )
++
++
++def write_multifile_pyramid(tmp_path: Path, stem: str) -> tuple[Path, Path]:
++    """Write one two-plane OME pyramid across companion TIFF files."""
++    root = tmp_path / f'{stem}-root.ome.tif'
++    companion = tmp_path / f'{stem}-companion.ome.tif'
++    uuids = (
++        'urn:uuid:11111111-1111-1111-1111-111111111111',
++        'urn:uuid:22222222-2222-2222-2222-222222222222',
++    )
++    for path, active_uuid in zip((root, companion), uuids, strict=True):
++        with TiffWriter(path) as tif:
++            tif.write(
++                numpy.zeros((64, 64), numpy.uint8),
++                description=multifile_ome_xml(root, companion, active_uuid),
++                metadata=None,
++                subifds=2,
++            )
++            tif.write(numpy.zeros((32, 32), numpy.uint8), subfiletype=1)
++            tif.write(numpy.zeros((16, 16), numpy.uint8), subfiletype=1)
++    return root, companion
++
++
++def overwrite_subifd(
++    path: Path, page_index: int, level: int, offset: int
++) -> None:
++    """Overwrite one SubIFD offset."""
++    with TiffFile(path, mode='r+') as tif:
++        page = tif.pages[page_index].aspage()
++        offsets = list(page.subifds or ())
++        offsets[level] = offset
++        page.tags[330].overwrite(tuple(offsets))
++
++
++def test_validate_ome_pyramid_signature() -> None:
++    """Expose the documented keyword-only validation API."""
++    signature = inspect.signature(TiffFile.validate_ome_pyramid)
++    assert list(signature.parameters) == ['self', 'strict', 'assert_']
++    assert (
++        signature.parameters['strict'].kind is inspect.Parameter.KEYWORD_ONLY
++    )
++    assert signature.parameters['strict'].default is False
++    assert (
++        signature.parameters['assert_'].kind is inspect.Parameter.KEYWORD_ONLY
++    )
++    assert signature.parameters['assert_'].default is True
++
++
++def test_valid_pyramid_and_assertion_mode(tmp_path: Path) -> None:
++    """Return booleans or raise AssertionError according to assert_."""
++    valid = tmp_path / 'valid.ome.tif'
++    invalid = tmp_path / 'invalid.ome.tif'
++    write_pyramid(valid, [(64, 64), (32, 32), (16, 16)])
++    write_pyramid(invalid, [(64, 64), (16, 16), (32, 32)])
++
++    with TiffFile(valid) as tif:
++        assert tif.validate_ome_pyramid() is True
++        assert tif.validate_ome_pyramid(strict=True) is True
++    with TiffFile(invalid) as tif:
++        assert tif.validate_ome_pyramid(assert_=False) is False
++        with pytest.raises(AssertionError):
++            tif.validate_ome_pyramid()
++
++
++def test_non_ome_fails_and_flat_ome_succeeds(tmp_path: Path) -> None:
++    """Distinguish non-OME data from a valid OME image without a pyramid."""
++    non_ome = tmp_path / 'plain.tif'
++    flat_ome = tmp_path / 'flat.ome.tif'
++    with TiffWriter(non_ome) as tif:
++        tif.write(numpy.zeros((8, 8), numpy.uint8))
++    with TiffWriter(flat_ome, ome=True) as tif:
++        tif.write(numpy.zeros((8, 8), numpy.uint8))
++
++    with TiffFile(non_ome) as tif:
++        assert tif.validate_ome_pyramid(assert_=False) is False
++        with pytest.raises(AssertionError):
++            tif.validate_ome_pyramid()
++    with TiffFile(flat_ome) as tif:
++        assert tif.validate_ome_pyramid() is True
++        assert tif.validate_ome_pyramid(strict=True) is True
++
++
++@pytest.mark.parametrize('owner', ['root', 'companion'])
++def test_mapped_ome_plane_missing_from_primary_chain(
++    tmp_path: Path, owner: str
++) -> None:
++    """Require every OME plane mapping to resolve to a primary IFD."""
++    if owner == 'root':
++        path = tmp_path / 'missing-root-ifd.ome.tif'
++        with TiffWriter(path, ome=True) as tif:
++            tif.write(
++                numpy.zeros((2, 8, 8), numpy.uint8),
++                metadata={'axes': 'CYX'},
++            )
++        old = 'IFD="0" PlaneCount="2"'
++        new = 'IFD="1" PlaneCount="2"'
++    else:
++        path, companion = write_multifile_pyramid(
++            tmp_path, 'missing-companion-ifd'
++        )
++        with TiffFile(companion) as tif:
++            assert len(tif.pages) == 1
++        old = '<TiffData IFD="0" FirstC="1" PlaneCount="1">'
++        new = '<TiffData IFD="1" FirstC="1" PlaneCount="1">'
++
++    with TiffFile(path, mode='r+') as tif:
++        tag = tif.pages.first.tags[270]
++        assert old in tag.value
++        tag.overwrite(tag.value.replace(old, new))
++
++    with TiffFile(path) as tif:
++        assert [page is None for page in tif.series[0]] == [False, True]
++        assert tif.validate_ome_pyramid(assert_=False) is False
++        with pytest.raises(AssertionError):
++            tif.validate_ome_pyramid()
++
++
++def test_subifd_cannot_alias_primary_chain(tmp_path: Path) -> None:
++    """Reject a tag-330 child that is also a primary-chain IFD."""
++    path = tmp_path / 'primary-alias.ome.tif'
++    write_pyramid(path, [(64, 64), (32, 32), (16, 16)])
++    with TiffFile(path) as tif:
++        primary_offset = tif.pages[1].offset
++    overwrite_subifd(path, 0, 0, primary_offset)
++
++    with TiffFile(path) as tif:
++        assert tif.validate_ome_pyramid(assert_=False) is False
++
++
++def test_subifd_has_one_full_resolution_owner(tmp_path: Path) -> None:
++    """Reject one child offset referenced by two base planes."""
++    path = tmp_path / 'duplicate-owner.ome.tif'
++    write_pyramid(path, [(64, 64), (32, 32), (16, 16)])
++    with TiffFile(path) as tif:
++        child_offset = tif.pages[0].subifds[0]
++    overwrite_subifd(path, 1, 0, child_offset)
++
++    with TiffFile(path) as tif:
++        assert tif.validate_ome_pyramid(assert_=False) is False
++
++
++def test_every_subresolution_is_listed_in_tag_330(tmp_path: Path) -> None:
++    """Reject a reduced IFD reachable only through a child NextIFD link."""
++    path = tmp_path / 'subifd-chain.ome.tif'
++    with TiffWriter(path, ome=True) as tif:
++        tif.write(numpy.zeros((64, 64), numpy.uint8), subifds=-2)
++        tif.write(numpy.zeros((32, 32), numpy.uint8), subfiletype=1)
++        tif.write(numpy.zeros((16, 16), numpy.uint8), subfiletype=1)
++
++    with TiffFile(path) as tif:
++        assert len(tif.pages.first.subifds) == 1
++        assert tif.validate_ome_pyramid(assert_=False) is False
++
++
++def test_all_base_planes_have_corresponding_levels(tmp_path: Path) -> None:
++    """Reject base or child shape disagreements across OME planes."""
++    missing = tmp_path / 'missing-level.ome.tif'
++    mismatch = tmp_path / 'mismatched-level.ome.tif'
++    base_mismatch = tmp_path / 'mismatched-base.ome.tif'
++    write_pyramid(missing, [(64, 64), (32, 32), (16, 16)])
++    write_pyramid(mismatch, [(64, 64), (32, 32), (16, 16)])
++    with TiffWriter(base_mismatch, ome=True) as tif:
++        tif.write(
++            numpy.zeros((2, 8, 8), numpy.uint8),
++            metadata={'axes': 'CYX'},
++        )
++    overwrite_subifd(missing, 1, 0, 0)
++
++    with TiffFile(mismatch, mode='r+') as tif:
++        offset = tif.pages[1].subifds[0]
++        tif.filehandle.seek(offset)
++        child = TiffPage(tif, (1, 1))
++        child.tags[257].overwrite(31)
++
++    with TiffFile(base_mismatch, mode='r+') as tif:
++        tif.pages[1].tags[256].overwrite(7)
++
++    for path in (missing, mismatch, base_mismatch):
++        with TiffFile(path) as tif:
++            assert tif.validate_ome_pyramid(assert_=False) is False
++
++
++def test_each_plane_has_same_number_of_subresolution_levels(
++    tmp_path: Path,
++) -> None:
++    """Do not ignore extra tag-330 levels on a later base plane."""
++    path = tmp_path / 'unequal-level-count.ome.tif'
++    write_pyramid(path, [(64, 64), (32, 32), (16, 16)])
++    with TiffFile(path, mode='r+') as tif:
++        page = tif.pages[0].aspage()
++        assert page.subifds is not None
++        page.tags[330].overwrite((page.subifds[0],))
++
++    with TiffFile(path) as tif:
++        assert [len(page.subifds or ()) for page in tif.pages] == [1, 2]
++        assert tif.validate_ome_pyramid(assert_=False) is False
++
++
++def test_unreadable_subifd_uses_validation_result(tmp_path: Path) -> None:
++    """Normalize parser errors from a nonzero child offset beyond EOF."""
++    path = tmp_path / 'unreadable-subifd.ome.tif'
++    write_pyramid(path, [(64, 64), (32, 32), (16, 16)])
++    overwrite_subifd(path, 0, 0, path.stat().st_size + 1024)
++
++    with TiffFile(path) as tif:
++        assert tif.validate_ome_pyramid(assert_=False) is False
++        with pytest.raises(AssertionError):
++            tif.validate_ome_pyramid()
++
++
++@pytest.mark.parametrize(
++    'initially_closed', [True, False], ids=['closed', 'open']
++)
++def test_multifile_pyramid_uses_each_owning_file(
++    tmp_path: Path, initially_closed: bool
++) -> None:
++    """Validate topology and preserve each companion's handle state."""
++    root, companion_path = write_multifile_pyramid(
++        tmp_path, 'valid-multifile'
++    )
++    before = {path: path.read_bytes() for path in (root, companion_path)}
++
++    with TiffFile(root) as tif:
++        series = tif.series[0]
++        assert series.is_multifile
++        parents = {page.parent for page in series if page is not None}
++        assert len(parents) == 2
++        companion_tif = next(
++            parent for parent in parents if parent is not tif
++        )
++        offsets = {
++            page.parent.pages.first.subifds[0]
++            for page in series
++            if page is not None
++        }
++        assert len(offsets) == 1
++        assert companion_tif.filehandle.closed
++        if not initially_closed:
++            companion_tif.filehandle.open()
++        assert companion_tif.filehandle.closed is initially_closed
++        assert tif.validate_ome_pyramid(strict=True) is True
++        assert companion_tif.filehandle.closed is initially_closed
++    assert {path: path.read_bytes() for path in before} == before
++
++
++@pytest.mark.parametrize('failure', ['missing-child', 'shape-mismatch'])
++def test_multifile_secondary_topology_is_validated(
++    tmp_path: Path, failure: str
++) -> None:
++    """Reject topology errors found only in a companion TIFF."""
++    root, companion = write_multifile_pyramid(tmp_path, failure)
++    if failure == 'missing-child':
++        overwrite_subifd(companion, 0, 0, 0)
++    else:
++        with TiffFile(companion, mode='r+') as tif:
++            offset = tif.pages.first.subifds[0]
++            tif.filehandle.seek(offset)
++            child = TiffPage(tif, (0, 1))
++            child.tags[257].overwrite(31)
++
++    with TiffFile(root) as tif:
++        assert tif.series[0].is_multifile
++        assert tif.validate_ome_pyramid(assert_=False) is False
++        with pytest.raises(AssertionError):
++            tif.validate_ome_pyramid()
++
++
++@pytest.mark.parametrize(
++    'initially_closed', [True, False], ids=['closed', 'open']
++)
++@pytest.mark.parametrize(
++    'assert_mode', [False, True], ids=['return', 'raise']
++)
++def test_failed_multifile_validation_restores_companion_state(
++    tmp_path: Path, initially_closed: bool, assert_mode: bool
++) -> None:
++    """Restore companion state when validation returns or raises."""
++    root, companion = write_multifile_pyramid(
++        tmp_path, f'failed-{initially_closed}-{assert_mode}'
++    )
++    overwrite_subifd(companion, 0, 0, 0)
++
++    with TiffFile(root) as tif:
++        series = tif.series[0]
++        companion_tif = next(
++            page.parent
++            for page in series
++            if page is not None and page.parent is not tif
++        )
++        assert companion_tif.filehandle.closed
++        if not initially_closed:
++            companion_tif.filehandle.open()
++        assert companion_tif.filehandle.closed is initially_closed
++        if assert_mode:
++            with pytest.raises(AssertionError):
++                tif.validate_ome_pyramid()
++        else:
++            assert tif.validate_ome_pyramid(assert_=False) is False
++        assert companion_tif.filehandle.closed is initially_closed
++
++
++@pytest.mark.parametrize('assert_mode', [False, True], ids=['return', 'raise'])
++def test_unreopenable_companion_uses_validation_result(
++    tmp_path: Path, assert_mode: bool
++) -> None:
++    """Normalize I/O errors while reopening a mapped companion."""
++    root, companion = write_multifile_pyramid(
++        tmp_path, f'unreopenable-{assert_mode}'
++    )
++
++    with TiffFile(root) as tif:
++        series = tif.series[0]
++        companion_tif = next(
++            page.parent
++            for page in series
++            if page is not None and page.parent is not tif
++        )
++        assert companion_tif.filehandle.closed
++        hidden = companion.with_suffix('.unavailable')
++        companion.rename(hidden)
++
++        if assert_mode:
++            with pytest.raises(AssertionError):
++                tif.validate_ome_pyramid()
++        else:
++            assert tif.validate_ome_pyramid(assert_=False) is False
++        assert companion_tif.filehandle.closed
++
++
++@pytest.mark.parametrize(
++    'shapes',
++    [
++        [(64, 64), (16, 16), (32, 32)],
++        [(64, 64), (64, 32), (16, 16)],
++        [(64, 64), (32, 64), (16, 16)],
++        [(100, 100), (20, 80), (40, 40)],
++    ],
++    ids=[
++        'reverse-size-order',
++        'not-reduced-in-y',
++        'not-reduced-in-x',
++        'equal-plane-area',
++    ],
++)
++def test_required_order_and_xy_reduction(
++    tmp_path: Path, shapes: list[tuple[int, int]]
++) -> None:
++    """Require descending plane size and reduction in both spatial axes."""
++    path = tmp_path / 'required-topology.ome.tif'
++    write_pyramid(path, shapes)
++    with TiffFile(path) as tif:
++        assert tif.validate_ome_pyramid(assert_=False) is False
++
++
++def test_default_order_is_by_area_not_each_consecutive_axis(
++    tmp_path: Path,
++) -> None:
++    """Allow one child axis to grow while plane area decreases."""
++    path = tmp_path / 'area-ordered.ome.tif'
++    write_pyramid(path, [(100, 100), (20, 80), (30, 40)])
++
++    with TiffFile(path) as tif:
++        assert tif.validate_ome_pyramid() is True
++
++
++def test_reduced_image_flag_is_strict_only(tmp_path: Path) -> None:
++    """Apply reduced-image bitmask semantics only in strict mode."""
++    path = tmp_path / 'missing-reduced.ome.tif'
++    combined = tmp_path / 'combined-subfiletype.ome.tif'
++    write_pyramid(
++        path,
++        [(64, 64), (32, 32), (16, 16)],
++        flags=[0, 1],
++    )
++    write_pyramid(
++        combined,
++        [(64, 64), (32, 32), (16, 16)],
++        flags=[3, 3],
++    )
++    with TiffFile(path) as tif:
++        assert tif.validate_ome_pyramid() is True
++        assert tif.validate_ome_pyramid(strict=True, assert_=False) is False
++    with TiffFile(combined) as tif:
++        assert tif.validate_ome_pyramid(strict=True) is True
++
++
++def test_strict_accepts_reduced_mask_subfiletype(tmp_path: Path) -> None:
++    """Accept reduced-image children that also set the mask bit."""
++    path = tmp_path / 'reduced-mask.ome.tif'
++    with TiffWriter(path, ome=True) as tif:
++        tif.write(numpy.zeros((64, 64), bool), subifds=2)
++        tif.write(numpy.zeros((32, 32), bool), subfiletype=5)
++        tif.write(numpy.zeros((16, 16), bool), subfiletype=5)
++
++    with TiffFile(path) as tif:
++        children = list(tif.pages.first.pages)
++        assert [child.subfiletype for child in children] == [5, 5]
++        assert tif.validate_ome_pyramid(strict=True) is True
++
++
++@pytest.mark.parametrize(
++    'shapes',
++    [
++        [(64, 64), (32, 16), (16, 8)],
++        [(64, 64), (32, 32), (8, 8)],
++    ],
++    ids=['anisotropic', 'changing-factor'],
++)
++def test_strict_rejects_nonuniform_factors(
++    tmp_path: Path, shapes: list[tuple[int, int]]
++) -> None:
++    """Require one integer XY factor between consecutive levels."""
++    path = tmp_path / 'factor.ome.tif'
++    write_pyramid(path, shapes)
++    with TiffFile(path) as tif:
++        assert tif.validate_ome_pyramid() is True
++        assert tif.validate_ome_pyramid(strict=True, assert_=False) is False
++
++
++@pytest.mark.parametrize(
++    'shapes',
++    [
++        [(65, 63), (33, 32), (17, 16)],
++        [(65, 63), (32, 32), (16, 16)],
++        [(81, 75), (27, 25), (9, 9)],
++    ],
++    ids=['odd-factor-two', 'mixed-rounding', 'factor-three'],
++)
++def test_strict_accepts_odd_rounding_and_other_integer_factors(
++    tmp_path: Path, shapes: list[tuple[int, int]]
++) -> None:
++    """Accept floor-or-ceiling odd reductions and factors other than two."""
++    path = tmp_path / 'valid-factor.ome.tif'
++    write_pyramid(path, shapes)
++    with TiffFile(path) as tif:
++        assert tif.validate_ome_pyramid(strict=True) is True
++
++
++@pytest.mark.parametrize('difference', ['axes', 'size'])
++def test_nonspatial_page_shape_is_strict_only(
++    tmp_path: Path, difference: str
++) -> None:
++    """Check page axes and nonspatial sizes independently in strict mode."""
++    path = tmp_path / f'samples-{difference}.ome.tif'
++    if difference == 'axes':
++        child = numpy.zeros((3, 32, 32), numpy.uint8)
++        child_options = {'photometric': 'rgb', 'planarconfig': 'separate'}
++    else:
++        child = numpy.zeros((32, 32, 4), numpy.uint8)
++        child_options = {'photometric': 'rgb'}
++
++    with TiffWriter(path, ome=True) as tif:
++        tif.write(
++            numpy.zeros((64, 64, 3), numpy.uint8),
++            photometric='rgb',
++            subifds=1,
++        )
++        tif.write(
++            child,
++            subfiletype=1,
++            **child_options,
++        )
++
++    with TiffFile(path) as tif:
++        base = tif.pages[0]
++        assert base.subifds is not None
++        tif.filehandle.seek(base.subifds[0])
++        level = TiffPage(tif, (0, 1))
++        base_shape = dict(zip(base.axes, base.shape))
++        level_shape = dict(zip(level.axes, level.shape))
++        if difference == 'axes':
++            assert (base.axes, level.axes) == ('YXS', 'SYX')
++            assert base_shape['S'] == level_shape['S'] == 3
++        else:
++            assert base.axes == level.axes == 'YXS'
++            assert (base_shape['S'], level_shape['S']) == (3, 4)
++        assert tif.validate_ome_pyramid() is True
++        assert tif.validate_ome_pyramid(strict=True, assert_=False) is False
++
++
++def test_legal_encodings_and_multiple_series_are_accepted(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Do not decode pixels, fetch schemas, or require every series to pyramid."""
++    path = tmp_path / 'encoded-and-flat.ome.tif'
++    with TiffWriter(path, ome=True) as tif:
++        tif.write(
++            numpy.zeros((2, 64, 64), numpy.uint8),
++            subifds=2,
++            metadata={'axes': 'CYX'},
++            tile=(16, 16),
++        )
++        tif.write(
++            numpy.zeros((2, 32, 32), numpy.uint8),
++            subfiletype=1,
++            tile=(16, 16),
++            compression='deflate',
++        )
++        tif.write(
++            numpy.zeros((2, 16, 16), numpy.uint8),
++            subfiletype=1,
++            tile=(16, 16),
++        )
++        tif.write(
++            numpy.zeros((3, 12, 10), numpy.uint16),
++            metadata={'axes': 'ZYX'},
++        )
++
++    def unexpected(*args: object, **kwargs: object) -> None:
++        raise AssertionError('structural validation used pixel or schema data')
++
++    monkeypatch.setattr(TiffPage, 'asarray', unexpected)
++    monkeypatch.setattr(TiffPage, 'segments', unexpected)
++    monkeypatch.setattr(OmeXml, 'validate', unexpected)
++    with TiffFile(path) as tif:
++        assert len(tif.series) == 2
++        assert tif.validate_ome_pyramid(strict=True) is True
++
++
++@pytest.mark.parametrize(
++    'base_tiled, child_tiled',
++    [
++        (True, (False, False)),
++        (False, (True, True)),
++        (True, (True, False)),
++    ],
++    ids=['tiled-base', 'tiled-children', 'mixed-children'],
++)
++def test_mixed_tile_and_strip_storage_is_accepted(
++    tmp_path: Path,
++    base_tiled: bool,
++    child_tiled: tuple[bool, bool],
++) -> None:
++    """Allow base and child IFDs to use different storage layouts."""
++    path = tmp_path / f'mixed-tile-strip-{base_tiled}-{child_tiled}.ome.tif'
++    base_tile = (16, 16) if base_tiled else None
++    child_tile = [
++        (16, 16) if tiled else None for tiled in child_tiled
++    ]
++    with TiffWriter(path, ome=True) as tif:
++        tif.write(
++            numpy.zeros((64, 64), numpy.uint8),
++            subifds=2,
++            tile=base_tile,
++        )
++        tif.write(
++            numpy.zeros((32, 32), numpy.uint8),
++            subfiletype=1,
++            tile=child_tile[0],
++        )
++        tif.write(
++            numpy.zeros((16, 16), numpy.uint8),
++            subfiletype=1,
++            tile=child_tile[1],
++        )
++
++    with TiffFile(path) as tif:
++        base = tif.pages.first
++        assert base.is_tiled is base_tiled
++        children = list(base.pages)
++        assert len(children) == 2
++        assert tuple(child.is_tiled for child in children) == child_tiled
++        assert tif.validate_ome_pyramid() is True
++        assert tif.validate_ome_pyramid(strict=True) is True
++
++
++def test_every_ome_series_is_validated(tmp_path: Path) -> None:
++    """Do not stop after validating the first OME image series."""
++    path = tmp_path / 'invalid-second-series.ome.tif'
++    with TiffWriter(path, ome=True) as tif:
++        tif.write(
++            numpy.zeros((2, 64, 64), numpy.uint8),
++            subifds=1,
++            metadata={'axes': 'CYX'},
++        )
++        tif.write(
++            numpy.zeros((2, 32, 32), numpy.uint8),
++            subfiletype=1,
++        )
++        tif.write(
++            numpy.zeros((3, 81, 75), numpy.uint16),
++            subifds=2,
++            metadata={'axes': 'ZYX'},
++        )
++        tif.write(
++            numpy.zeros((3, 9, 9), numpy.uint16),
++            subfiletype=1,
++        )
++        tif.write(
++            numpy.zeros((3, 27, 25), numpy.uint16),
++            subfiletype=1,
++        )
++
++    with TiffFile(path) as tif:
++        assert len(tif.series) == 2
++        assert tif.validate_ome_pyramid(assert_=False) is False
++
++
++def test_strict_factor_is_scoped_per_ome_series(tmp_path: Path) -> None:
++    """Allow different OME image series to use different integer factors."""
++    path = tmp_path / 'different-series-factors.ome.tif'
++    with TiffWriter(path, ome=True) as tif:
++        tif.write(
++            numpy.zeros((2, 64, 64), numpy.uint8),
++            subifds=2,
++            metadata={'axes': 'CYX'},
++        )
++        tif.write(
++            numpy.zeros((2, 32, 32), numpy.uint8),
++            subfiletype=1,
++        )
++        tif.write(
++            numpy.zeros((2, 16, 16), numpy.uint8),
++            subfiletype=1,
++        )
++        tif.write(
++            numpy.zeros((3, 81, 75), numpy.uint16),
++            subifds=2,
++            metadata={'axes': 'ZYX'},
++        )
++        tif.write(
++            numpy.zeros((3, 27, 25), numpy.uint16),
++            subfiletype=1,
++        )
++        tif.write(
++            numpy.zeros((3, 9, 9), numpy.uint16),
++            subfiletype=1,
++        )
++
++    with TiffFile(path) as tif:
++        assert len(tif.series) == 2
++        assert tif.validate_ome_pyramid(strict=True) is True
++
++
++def test_validation_never_changes_file_bytes(tmp_path: Path) -> None:
++    """Keep successful and failed validation read-only."""
++    valid = tmp_path / 'readonly-valid.ome.tif'
++    invalid = tmp_path / 'readonly-invalid.ome.tif'
++    write_pyramid(valid, [(64, 64), (32, 32), (16, 16)])
++    write_pyramid(invalid, [(64, 64), (32, 32), (16, 16)])
++    overwrite_subifd(invalid, 1, 0, 0)
++
++    for path, expected in ((valid, True), (invalid, False)):
++        before = path.read_bytes()
++        with TiffFile(path) as tif:
++            assert tif.validate_ome_pyramid(assert_=False) is expected
++        assert path.read_bytes() == before
++
++
++def test_strict_failure_honors_assertion_mode(tmp_path: Path) -> None:
++    """Raise for strict-only failures when assert_ retains its default."""
++    path = tmp_path / 'strict-invalid.ome.tif'
++    write_pyramid(path, [(64, 64), (32, 32)], flags=[0])
++
++    with TiffFile(path) as tif:
++        assert tif.validate_ome_pyramid(strict=True, assert_=False) is False
++        with pytest.raises(AssertionError):
++            tif.validate_ome_pyramid(strict=True)
++
++
++def test_subifd_owner_is_unique_across_ome_series(tmp_path: Path) -> None:
++    """Do not reset child ownership tracking between OME image series."""
++    path = tmp_path / 'cross-series-owner.ome.tif'
++    with TiffWriter(path, ome=True) as tif:
++        tif.write(
++            numpy.zeros((2, 64, 64), numpy.uint8),
++            subifds=1,
++            metadata={'axes': 'CYX'},
++        )
++        tif.write(
++            numpy.zeros((2, 32, 32), numpy.uint8),
++            subfiletype=1,
++        )
++        tif.write(
++            numpy.zeros((3, 64, 64), numpy.uint16),
++            subifds=1,
++            metadata={'axes': 'ZYX'},
++        )
++        tif.write(
++            numpy.zeros((3, 32, 32), numpy.uint16),
++            subfiletype=1,
++        )
++
++    with TiffFile(path) as tif:
++        assert len(tif.series) == 2
++        assert tif.pages[0].subifds is not None
++        shared_offset = tif.pages[0].subifds[0]
++    overwrite_subifd(path, 2, 0, shared_offset)
++
++    with TiffFile(path) as tif:
++        assert tif.validate_ome_pyramid(assert_=False) is False
++
++
++def test_strict_allows_unit_axis_to_remain_unchanged(
++    tmp_path: Path,
++) -> None:
++    """Allow ceiling division of a unit axis at a later level."""
++    path = tmp_path / 'unit-axis.ome.tif'
++    with TiffWriter(path, ome=True) as tif:
++        tif.write(numpy.zeros((3, 8), numpy.uint8), subifds=2)
++        tif.write(numpy.zeros((1, 4), numpy.uint8), subfiletype=1)
++        tif.write(numpy.zeros((1, 2), numpy.uint8), subfiletype=1)
++
++    with TiffFile(path) as tif:
++        assert [page.shape for page in tif.pages.first.pages] == [
++            (1, 4),
++            (1, 2),
++        ]
++        assert tif.validate_ome_pyramid(strict=True) is True
++
++
++def test_tiled_levels_may_use_independent_tile_sizes(tmp_path: Path) -> None:
++    """Do not require tiled full-resolution and child IFDs to match."""
++    path = tmp_path / 'independent-tile-sizes.ome.tif'
++    with TiffWriter(path, ome=True) as tif:
++        tif.write(
++            numpy.zeros((64, 64), numpy.uint8),
++            subifds=2,
++            tile=(32, 32),
++        )
++        tif.write(
++            numpy.zeros((32, 32), numpy.uint8),
++            subfiletype=1,
++            tile=(16, 16),
++        )
++        tif.write(
++            numpy.zeros((16, 16), numpy.uint8),
++            subfiletype=1,
++            tile=(16, 16),
++        )
++
++    with TiffFile(path) as tif:
++        pages = [tif.pages.first, *tif.pages.first.pages]
++        assert [(page.tilelength, page.tilewidth) for page in pages] == [
++            (32, 32),
++            (16, 16),
++            (16, 16),
++        ]
++        assert tif.validate_ome_pyramid() is True
++        assert tif.validate_ome_pyramid(strict=True) is True
++
++
++def test_valid_compression_strip_and_rectangular_tile_choices(
++    tmp_path: Path,
++) -> None:
++    """Accept independent valid tile, strip, and compression choices."""
++    imagecodecs = pytest.importorskip('imagecodecs')
++    required = ('PACKBITS', 'LZW', 'ZSTD')
++    if not all(
++        getattr(getattr(imagecodecs, name, None), 'available', False)
++        for name in required
++    ):
++        pytest.skip('requires PackBits, LZW, and ZSTD encoders')
++    path = tmp_path / 'storage-choices.ome.tif'
++    with TiffWriter(path, ome=True) as tif:
++        tif.write(
++            numpy.zeros((64, 64), numpy.uint8),
++            subifds=2,
++            tile=(16, 32),
++            compression='packbits',
++        )
++        tif.write(
++            numpy.zeros((32, 32), numpy.uint8),
++            subfiletype=1,
++            rowsperstrip=7,
++            compression='lzw',
++        )
++        tif.write(
++            numpy.zeros((16, 16), numpy.uint8),
++            subfiletype=1,
++            tile=(16, 32),
++            compression='zstd',
++        )
++
++    with TiffFile(path) as tif:
++        pages = [tif.pages.first, *tif.pages.first.pages]
++        assert pages[0].tilelength != pages[0].tilewidth
++        assert pages[1].rowsperstrip == 7
++        assert pages[1].rowsperstrip != pages[1].imagelength
++        assert pages[2].tilelength != pages[2].tilewidth
++        assert len({page.compression for page in pages}) == 3
++        assert tif.validate_ome_pyramid(strict=True) is True
++
++
++def test_every_child_requires_reduced_image_bit(tmp_path: Path) -> None:
++    """Do not infer a later child's reduced-image bit from level one."""
++    path = tmp_path / 'late-flag.ome.tif'
++    write_pyramid(
++        path,
++        [(64, 64), (32, 32), (16, 16)],
++        planes=1,
++        flags=[1, 0],
++    )
++
++    with TiffFile(path) as tif:
++        assert tif.validate_ome_pyramid() is True
++        assert tif.validate_ome_pyramid(strict=True, assert_=False) is False
++
++
++def test_every_child_is_smaller_than_base_in_both_axes(
++    tmp_path: Path,
++) -> None:
++    """Apply both-axis full-resolution reduction to later children too."""
++    path = tmp_path / 'late-axis.ome.tif'
++    write_pyramid(
++        path,
++        [(100, 100), (50, 50), (20, 100)],
++        planes=1,
++    )
++
++    with TiffFile(path) as tif:
++        assert tif.validate_ome_pyramid(assert_=False) is False
++
++
++@pytest.mark.parametrize('difference', ['axes', 'size'])
++def test_every_child_preserves_strict_page_shape(
++    tmp_path: Path, difference: str
++) -> None:
++    """Apply strict axes and nonspatial-size checks to later children."""
++    path = tmp_path / f'late-page-shape-{difference}.ome.tif'
++    if difference == 'axes':
++        late_child = numpy.zeros((3, 16, 16), numpy.uint8)
++        late_options = {'photometric': 'rgb', 'planarconfig': 'separate'}
++    else:
++        late_child = numpy.zeros((16, 16, 4), numpy.uint8)
++        late_options = {'photometric': 'rgb'}
++
++    with TiffWriter(path, ome=True) as tif:
++        tif.write(
++            numpy.zeros((64, 64, 3), numpy.uint8),
++            photometric='rgb',
++            subifds=2,
++        )
++        tif.write(
++            numpy.zeros((32, 32, 3), numpy.uint8),
++            photometric='rgb',
++            subfiletype=1,
++        )
++        tif.write(late_child, subfiletype=1, **late_options)
++
++    with TiffFile(path) as tif:
++        base = tif.pages.first
++        children = list(base.pages)
++        base_shape = dict(zip(base.axes, base.shape))
++        first_shape = dict(zip(children[0].axes, children[0].shape))
++        assert children[0].axes == base.axes == 'YXS'
++        assert first_shape['S'] == base_shape['S'] == 3
++        if difference == 'axes':
++            late_shape = dict(zip(children[1].axes, children[1].shape))
++            assert children[1].axes == 'SYX'
++            assert late_shape['S'] == 3
++        else:
++            late_shape = dict(zip(children[1].axes, children[1].shape))
++            assert children[1].axes == 'YXS'
++            assert late_shape['S'] == 4
++        assert tif.validate_ome_pyramid() is True
++        assert tif.validate_ome_pyramid(strict=True, assert_=False) is False
++
++
++def test_full_resolution_y_shapes_must_match(tmp_path: Path) -> None:
++    """Compare both X and Y across full-resolution OME planes."""
++    path = tmp_path / 'mismatched-base-y.ome.tif'
++    write_pyramid(path, [(64, 64), (32, 32)], planes=2)
++    with TiffFile(path, mode='r+') as tif:
++        tif.pages[1].tags[257].overwrite(63)
++
++    with TiffFile(path) as tif:
++        assert tif.validate_ome_pyramid(assert_=False) is False
++
++
++def test_strict_accepts_ambiguous_odd_factor_sequence(
++    tmp_path: Path,
++) -> None:
++    """Keep all viable factors until a series-wide factor is established."""
++    path = tmp_path / 'ambiguous-odd-factor.ome.tif'
++    with TiffWriter(path, ome=True) as tif:
++        tif.write(numpy.zeros((3, 11), numpy.uint8), subifds=2)
++        tif.write(numpy.zeros((1, 4), numpy.uint8), subfiletype=1)
++        tif.write(numpy.zeros((1, 2), numpy.uint8), subfiletype=1)
++
++    with TiffFile(path) as tif:
++        assert [page.shape for page in tif.pages.first.pages] == [
++            (1, 4),
++            (1, 2),
++        ]
++        assert tif.validate_ome_pyramid(strict=True) is True
++
++
++def test_malformed_ome_relationship_uses_validation_result(
++    tmp_path: Path,
++) -> None:
++    """Normalize metadata parser errors as validation failures."""
++    path = tmp_path / 'malformed-relationship.ome.tif'
++    with TiffWriter(path, ome=True) as tif:
++        tif.write(numpy.zeros((8, 8), numpy.uint8))
++
++    with TiffFile(path, mode='r+') as tif:
++        tag = tif.pages.first.tags[270]
++        tag.overwrite(
++            tag.value.replace(
++                'DimensionOrder="XYCZT"',
++                'BadDimensionXX="XYCZT"',
++            )
++        )
++
++    with TiffFile(path) as tif:
++        assert tif.is_ome
++        assert tif.validate_ome_pyramid(assert_=False) is False
++        with pytest.raises(AssertionError):
++            tif.validate_ome_pyramid()

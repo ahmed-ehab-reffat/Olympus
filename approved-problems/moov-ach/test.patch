@@ -1,0 +1,2156 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..91aded84
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,87 @@
++#!/usr/bin/env bash
++# Test runner.
++#
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++#   base  existing tests covering files, batches and entries
++#   new   tests for applying Notifications of Change
++set -uo pipefail
++
++cd /app
++
++OUTPUT_PATH=""
++MODE=""
++
++while [ "$#" -gt 0 ]; do
++  case "$1" in
++    --output_path)
++      OUTPUT_PATH="${2:-}"
++      shift 2
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      shift
++      ;;
++    base|new)
++      MODE="$1"
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      exit 2
++      ;;
++  esac
++done
++
++if [ -z "$MODE" ]; then
++  echo "missing mode (expected base or new)" >&2
++  exit 2
++fi
++
++# Never let a previous run's report stand in for this one.
++if [ -n "$OUTPUT_PATH" ]; then
++  rm -f "$OUTPUT_PATH"
++fi
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  go test -count=1 -v "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++case "$MODE" in
++  base)
++    run_tests ./ ./cmd/... ./server/... ./internal/... ./examples/... ./test/issues/...
++    ;;
++  new)
++    run_tests ./test/corrections/...
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH"
++
++  # A build failure can leave nothing for the reporter to work with. Record that as a
++  # failure rather than leaving the caller without a report.
++  if [ ! -s "$OUTPUT_PATH" ]; then
++    cat > "$OUTPUT_PATH" <<'XML'
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites tests="1" failures="1">
++  <testsuite name="test.sh" tests="1" failures="1" errors="0">
++    <testcase name="run" classname="test.sh">
++      <failure message="no test results produced">the test run produced no results</failure>
++    </testcase>
++  </testsuite>
++</testsuites>
++XML
++    STATUS=1
++  fi
++fi
++
++exit "$STATUS"
+diff --git a/test/corrections/corrections_eda8cb_test.go b/test/corrections/corrections_eda8cb_test.go
+new file mode 100644
+index 00000000..7faf1341
+--- /dev/null
++++ b/test/corrections/corrections_eda8cb_test.go
+@@ -0,0 +1,2057 @@
++// Licensed to The Moov Authors under one or more contributor
++// license agreements. See the NOTICE file distributed with
++// this work for additional information regarding copyright
++// ownership. The Moov Authors licenses this file to you under
++// the Apache License, Version 2.0 (the "License"); you may
++// not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++package corrections
++
++import (
++	"bytes"
++	"reflect"
++	"testing"
++
++	"github.com/moov-io/ach"
++
++	"github.com/stretchr/testify/require"
++)
++
++const (
++	originatingODFI = "12104288"
++	receivingODFI   = "23138010"
++)
++
++type correctionResult struct {
++	Refused *ach.File
++	Undo    *ach.File
++}
++
++// correctionResultFor calls ApplyCorrections and projects its public Refused and Undo fields
++// into the local test view.
++func correctionResultFor(t testing.TB, file *ach.File, corrections ...*ach.File) (*correctionResult, error) {
++	t.Helper()
++
++	method := reflect.ValueOf(file).MethodByName("ApplyCorrections")
++	require.True(t, method.IsValid(), "ach.File is missing ApplyCorrections")
++	if !method.IsValid() {
++		return nil, nil
++	}
++
++	args := make([]reflect.Value, len(corrections))
++	for i := range corrections {
++		args[i] = reflect.ValueOf(corrections[i])
++	}
++	out := method.Call(args)
++	require.Len(t, out, 2)
++
++	var err error
++	if !out[1].IsNil() {
++		err = out[1].Interface().(error)
++	}
++	if out[0].IsNil() {
++		return nil, err
++	}
++
++	value := out[0].Elem()
++	refused := value.FieldByName("Refused")
++	undo := value.FieldByName("Undo")
++	require.True(t, refused.IsValid(), "correction result has no Refused field")
++	require.True(t, undo.IsValid(), "correction result has no Undo field")
++
++	result := &correctionResult{}
++	if !refused.IsNil() {
++		result.Refused = refused.Interface().(*ach.File)
++	}
++	if !undo.IsNil() {
++		result.Undo = undo.Interface().(*ach.File)
++	}
++	return result, err
++}
++
++// applyCorrections preserves the L3 helper surface for tests concerned only with refusals.
++func applyCorrections(t testing.TB, file *ach.File, corrections ...*ach.File) (*ach.File, error) {
++	t.Helper()
++
++	result, err := correctionResultFor(t, file, corrections...)
++	if result == nil {
++		return nil, err
++	}
++	return result.Refused, err
++}
++
++// applied runs ApplyCorrections and requires that nothing was refused.
++func applied(t testing.TB, file *ach.File, corrections ...*ach.File) {
++	t.Helper()
++
++	refused, err := applyCorrections(t, file, corrections...)
++	require.NoError(t, err)
++	require.Nil(t, refused, "expected no refusals")
++	require.NoError(t, file.Validate())
++}
++
++// appliedResult requires a non-empty result with no refusals and a usable undo file.
++func appliedResult(t testing.TB, file *ach.File, corrections ...*ach.File) *correctionResult {
++	t.Helper()
++
++	result, err := correctionResultFor(t, file, corrections...)
++	require.NoError(t, err)
++	require.NotNil(t, result)
++	require.Nil(t, result.Refused, "expected no refusals")
++	require.NotNil(t, result.Undo, "expected an undo file")
++	require.NoError(t, result.Undo.Validate())
++	require.NoError(t, file.Validate())
++	return result
++}
++
++// refusedCodes returns the refused change code of every entry of a refused file, in order.
++func refusedCodes(t testing.TB, refused *ach.File) []string {
++	t.Helper()
++
++	require.NotNil(t, refused)
++	var out []string
++	for _, batch := range refused.Batches {
++		for _, entry := range batch.GetEntries() {
++			require.NotNil(t, entry.Addenda98Refused, "refused entry without a refused addenda98")
++			out = append(out, entry.Addenda98Refused.RefusedChangeCode)
++		}
++	}
++	return out
++}
++
++// refuses runs ApplyCorrections and requires exactly the given refusal codes, in order.
++func refuses(t testing.TB, file *ach.File, corrections *ach.File, codes ...string) *ach.File {
++	t.Helper()
++
++	refused, err := applyCorrections(t, file, corrections)
++	require.NoError(t, err)
++	require.Equal(t, codes, refusedCodes(t, refused))
++	require.NoError(t, file.Validate())
++	return refused
++}
++
++// fileBytes renders a file as NACHA text, so a file can be compared against itself
++// across a call which has to leave it untouched.
++func fileBytes(t testing.TB, file *ach.File) []byte {
++	t.Helper()
++
++	var buf bytes.Buffer
++	writer := ach.NewWriter(&buf)
++	require.NoError(t, writer.Write(file))
++	writer.Flush()
++	return buf.Bytes()
++}
++
++// roundTrip writes a file and reads it back through the library's own writer and reader.
++func roundTrip(t testing.TB, file *ach.File) *ach.File {
++	t.Helper()
++
++	read, err := ach.NewReader(bytes.NewReader(fileBytes(t, file))).Read()
++	require.NoError(t, err)
++	require.NoError(t, read.Validate())
++	return &read
++}
++
++// notice describes a Notification of Change to place into a correction file.
++type notice struct {
++	changeCode    string
++	originalTrace string
++	originalDFI   string
++	correctedData string
++}
++
++func fileHeader() ach.FileHeader {
++	fh := ach.NewFileHeader()
++	fh.ImmediateDestination = "231380104"
++	fh.ImmediateOrigin = "121042882"
++	fh.FileCreationDate = "230421"
++	fh.FileCreationTime = "1201"
++	fh.ImmediateDestinationName = "Federal Reserve Bank"
++	fh.ImmediateOriginName = "My Bank Name"
++	return fh
++}
++
++func batchHeader(serviceClassCode int, secCode string, odfi string) *ach.BatchHeader {
++	bh := ach.NewBatchHeader()
++	bh.ServiceClassCode = serviceClassCode
++	bh.StandardEntryClassCode = secCode
++	bh.CompanyName = "ACME Corporation"
++	bh.CompanyIdentification = "121042882"
++	bh.CompanyEntryDescription = "PAYROLL"
++	bh.EffectiveEntryDate = "230424"
++	bh.ODFIIdentification = odfi
++	return bh
++}
++
++func forwardEntry(transactionCode int, routingNumber, accountNumber, name string, amount, sequence int) *ach.EntryDetail {
++	entry := ach.NewEntryDetail()
++	entry.TransactionCode = transactionCode
++	entry.SetRDFI(routingNumber)
++	entry.DFIAccountNumber = accountNumber
++	entry.Amount = amount
++	entry.IndividualName = name
++	entry.IdentificationNumber = "location #23"
++	entry.SetTraceNumber(originatingODFI, sequence)
++	entry.Category = ach.CategoryForward
++	return entry
++}
++
++func offsetEntry(transactionCode int, routingNumber string, amount, sequence int) *ach.EntryDetail {
++	return forwardEntry(transactionCode, routingNumber, "999999999", "OFFSET", amount, sequence)
++}
++
++func forwardBatch(t testing.TB, serviceClassCode int, entries ...*ach.EntryDetail) ach.Batcher {
++	t.Helper()
++
++	batch := ach.NewBatchPPD(batchHeader(serviceClassCode, ach.PPD, originatingODFI))
++	for _, entry := range entries {
++		batch.AddEntry(entry)
++	}
++	require.NoError(t, batch.Create())
++	return batch
++}
++
++func forwardFile(t testing.TB, batches ...ach.Batcher) *ach.File {
++	t.Helper()
++
++	file := ach.NewFile()
++	file.SetHeader(fileHeader())
++	for _, batch := range batches {
++		file.AddBatch(batch)
++	}
++	require.NoError(t, file.Create())
++	require.NoError(t, file.Validate())
++	return file
++}
++
++func iatEntry(sequence, transactionCode int) *ach.IATEntryDetail {
++	entry := ach.NewIATEntryDetail()
++	entry.TransactionCode = transactionCode
++	entry.SetRDFI("121042882")
++	entry.AddendaRecords = 7
++	entry.DFIAccountNumber = "123456789"
++	entry.Amount = 100000
++	entry.SetTraceNumber(originatingODFI, sequence)
++	entry.Category = ach.CategoryForward
++
++	entry.Addenda10 = ach.NewAddenda10()
++	entry.Addenda10.TransactionTypeCode = "ANN"
++	entry.Addenda10.ForeignPaymentAmount = 100000
++	entry.Addenda10.ForeignTraceNumber = "928383-23938"
++	entry.Addenda10.Name = "BEK Enterprises"
++
++	entry.Addenda11 = ach.NewAddenda11()
++	entry.Addenda11.OriginatorName = "BEK Solutions"
++	entry.Addenda11.OriginatorStreetAddress = "15 West Place Street"
++
++	entry.Addenda12 = ach.NewAddenda12()
++	entry.Addenda12.OriginatorCityStateProvince = "JacobsTown*PA\\"
++	entry.Addenda12.OriginatorCountryPostalCode = "US*19305\\"
++
++	entry.Addenda13 = ach.NewAddenda13()
++	entry.Addenda13.ODFIName = "Wells Fargo"
++	entry.Addenda13.ODFIIDNumberQualifier = "01"
++	entry.Addenda13.ODFIIdentification = "231380104"
++	entry.Addenda13.ODFIBranchCountryCode = "US"
++
++	entry.Addenda14 = ach.NewAddenda14()
++	entry.Addenda14.RDFIName = "Citadel Bank"
++	entry.Addenda14.RDFIIDNumberQualifier = "01"
++	entry.Addenda14.RDFIIdentification = "121042882"
++	entry.Addenda14.RDFIBranchCountryCode = "CA"
++
++	entry.Addenda15 = ach.NewAddenda15()
++	entry.Addenda15.ReceiverIDNumber = "987465493213987"
++	entry.Addenda15.ReceiverStreetAddress = "2121 Front Street"
++
++	entry.Addenda16 = ach.NewAddenda16()
++	entry.Addenda16.ReceiverCityStateProvince = "LetterTown*AB\\"
++	entry.Addenda16.ReceiverCountryPostalCode = "CA*80014\\"
++	return entry
++}
++
++func iatForwardFile(t testing.TB, entries ...*ach.IATEntryDetail) *ach.File {
++	t.Helper()
++
++	header := ach.NewIATBatchHeader()
++	header.ServiceClassCode = ach.CreditsOnly
++	header.ForeignExchangeIndicator = "FF"
++	header.ForeignExchangeReferenceIndicator = 3
++	header.ISODestinationCountryCode = "US"
++	header.OriginatorIdentification = "123456789"
++	header.StandardEntryClassCode = ach.IAT
++	header.CompanyEntryDescription = "TRADEPAYMT"
++	header.ISOOriginatingCurrencyCode = "CAD"
++	header.ISODestinationCurrencyCode = "USD"
++	header.ODFIIdentification = originatingODFI
++	header.EffectiveEntryDate = "230424"
++
++	batch := ach.NewIATBatch(header)
++	for _, entry := range entries {
++		batch.AddEntry(entry)
++	}
++	require.NoError(t, batch.Create())
++
++	file := ach.NewFile()
++	file.SetHeader(fileHeader())
++	file.AddIATBatch(batch)
++	require.NoError(t, file.Create())
++	require.NoError(t, file.Validate())
++	return file
++}
++
++func specializedForwardFile(t testing.TB, sec string, transactionCode int) *ach.File {
++	t.Helper()
++
++	header := batchHeader(ach.CreditsOnly, sec, originatingODFI)
++	entry := forwardEntry(transactionCode, "031300012", "744-5678-99", "Best. #1", 0, 1)
++	entry.SetOriginalTraceNumber("031300010000001")
++
++	var batch ach.Batcher
++	switch sec {
++	case ach.ACK:
++		batch = ach.NewBatchACK(header)
++	case ach.ATX:
++		entry.SetCATXAddendaRecords(1)
++		entry.SetCATXReceivingCompany("Receiver Company")
++		entry.DiscretionaryData = "01"
++		entry.AddendaRecordIndicator = 1
++		addenda := ach.NewAddenda05()
++		addenda.PaymentRelatedInformation = "Credit account for service"
++		entry.AddAddenda05(addenda)
++		batch = ach.NewBatchATX(header)
++	case ach.DNE:
++		header.CompanyEntryDescription = "Death"
++		header.OriginatorStatusCode = 2
++		entry.AddendaRecordIndicator = 1
++		addenda := ach.NewAddenda05()
++		addenda.PaymentRelatedInformation = `DATE OF DEATH*010218*CUSTOMERSSN*#########*AMOUNT*$$$$.cc\`
++		entry.AddAddenda05(addenda)
++		batch = ach.NewBatchDNE(header)
++	case ach.ENR:
++		header.CompanyEntryDescription = "AUTOENROLL"
++		entry.AddendaRecordIndicator = 1
++		addenda := ach.NewAddenda05()
++		addenda.PaymentRelatedInformation = `22*12200004*3*123987654321*777777777*DOE*JOHN*1\`
++		entry.AddAddenda05(addenda)
++		batch = ach.NewBatchENR(header)
++	default:
++		t.Fatalf("unsupported specialized SEC %q", sec)
++	}
++	batch.AddEntry(entry)
++	require.NoError(t, batch.Create())
++	return forwardFile(t, batch)
++}
++
++func onlyUndoEntry(t testing.TB, result *correctionResult) *ach.EntryDetail {
++	t.Helper()
++
++	require.NotNil(t, result)
++	require.NotNil(t, result.Undo)
++	require.Len(t, result.Undo.Batches, 1)
++	entries := result.Undo.Batches[0].GetEntries()
++	require.Len(t, entries, 1)
++	return entries[0]
++}
++
++func undoEntries(result *correctionResult) []*ach.EntryDetail {
++	if result == nil || result.Undo == nil {
++		return nil
++	}
++	var entries []*ach.EntryDetail
++	for _, batch := range result.Undo.Batches {
++		entries = append(entries, batch.GetEntries()...)
++	}
++	return entries
++}
++
++func assertOrdinaryInverse(t testing.TB, code string, corrected *ach.CorrectedData) *ach.EntryDetail {
++	t.Helper()
++
++	file := threeEntryFile(t)
++	before := *entryOf(t, file, 0, 0)
++	beforeControl := file.Control
++	result := appliedResult(t, file, correctionFile(t, notice{
++		changeCode:    code,
++		originalTrace: traceOf(t, file, 0, 0),
++		originalDFI:   "23138010",
++		correctedData: ach.WriteCorrectionData(code, corrected),
++	}))
++	undo := onlyUndoEntry(t, result)
++	require.Equal(t, code, undo.Addenda98.ChangeCode)
++
++	undoResult := appliedResult(t, file, result.Undo)
++	after := entryOf(t, file, 0, 0)
++	require.Equal(t, before.RDFIIdentification, after.RDFIIdentification)
++	require.Equal(t, before.CheckDigit, after.CheckDigit)
++	require.Equal(t, before.DFIAccountNumber, after.DFIAccountNumber)
++	require.Equal(t, before.IndividualName, after.IndividualName)
++	require.Equal(t, before.TransactionCode, after.TransactionCode)
++	require.Equal(t, before.IdentificationNumber, after.IdentificationNumber)
++	require.Equal(t, beforeControl.EntryAddendaCount, file.Control.EntryAddendaCount)
++	require.Equal(t, beforeControl.EntryHash, file.Control.EntryHash)
++	require.Equal(t, beforeControl.TotalDebitEntryDollarAmountInFile, file.Control.TotalDebitEntryDollarAmountInFile)
++	require.Equal(t, beforeControl.TotalCreditEntryDollarAmountInFile, file.Control.TotalCreditEntryDollarAmountInFile)
++	require.NotNil(t, undoResult.Undo)
++	return undo
++}
++
++// threeEntryFile is a single credit batch holding entries at three different institutions.
++// Its entry hash is 23138010 + 12104288 + 23138010 and it moves 400000 in credits.
++func threeEntryFile(t testing.TB) *ach.File {
++	t.Helper()
++
++	return forwardFile(t, forwardBatch(t, ach.CreditsOnly,
++		forwardEntry(ach.CheckingCredit, "231380104", "123456789", "WADE ARNOLD", 100000, 1),
++		forwardEntry(ach.CheckingCredit, "121042882", "744-5678-99", "JANE DOE", 250000, 2),
++		forwardEntry(ach.CheckingCredit, "231380104", "987654321", "JOHN SMITH", 50000, 3),
++	))
++}
++
++func creditOffsetFile(t testing.TB) *ach.File {
++	t.Helper()
++
++	return forwardFile(t, forwardBatch(t, ach.MixedDebitsAndCredits,
++		forwardEntry(ach.CheckingDebit, "231380104", "123456789", "WADE ARNOLD", 100000, 1),
++		forwardEntry(ach.CheckingDebit, "121042882", "744-5678-99", "JANE DOE", 250000, 2),
++		offsetEntry(ach.CheckingCredit, "091000019", 350000, 3),
++	))
++}
++
++func debitOffsetFile(t testing.TB) *ach.File {
++	t.Helper()
++
++	return forwardFile(t, forwardBatch(t, ach.MixedDebitsAndCredits,
++		forwardEntry(ach.CheckingCredit, "231380104", "123456789", "WADE ARNOLD", 100000, 1),
++		forwardEntry(ach.CheckingCredit, "121042882", "744-5678-99", "JANE DOE", 250000, 2),
++		offsetEntry(ach.CheckingDebit, "091000019", 350000, 3),
++	))
++}
++
++func bothOffsetsFile(t testing.TB) *ach.File {
++	t.Helper()
++
++	return forwardFile(t, forwardBatch(t, ach.MixedDebitsAndCredits,
++		forwardEntry(ach.CheckingCredit, "231380104", "123456789", "WADE ARNOLD", 100000, 1),
++		forwardEntry(ach.CheckingCredit, "121042882", "744-5678-99", "JANE DOE", 50000, 2),
++		forwardEntry(ach.CheckingDebit, "231380104", "987654321", "JOHN SMITH", 200000, 3),
++		forwardEntry(ach.CheckingDebit, "121042882", "222333444", "MARY JONES", 70000, 4),
++		offsetEntry(ach.CheckingDebit, "091000019", 150000, 5),
++		offsetEntry(ach.CheckingCredit, "071000055", 270000, 6),
++	))
++}
++
++func orderedOffsetFile(t testing.TB) *ach.File {
++	t.Helper()
++
++	return forwardFile(t, forwardBatch(t, ach.MixedDebitsAndCredits,
++		forwardEntry(ach.CheckingCredit, "231380104", "123456789", "ALPHA", 100000, 1),
++		forwardEntry(ach.CheckingCredit, "121042882", "744-5678-99", "BRAVO", 200000, 2),
++		forwardEntry(ach.CheckingDebit, "231380104", "987654321", "PERMANENT DEBIT", 50000, 3),
++		offsetEntry(ach.CheckingDebit, "091000019", 300000, 4),
++	))
++}
++
++func correctionFile(t testing.TB, notices ...notice) *ach.File {
++	t.Helper()
++
++	batch := ach.NewBatchCOR(batchHeader(ach.CreditsOnly, ach.COR, receivingODFI))
++	for i, n := range notices {
++		entry := ach.NewEntryDetail()
++		entry.TransactionCode = ach.CheckingReturnNOCCredit
++		entry.SetRDFI("121042882")
++		entry.DFIAccountNumber = "744-5678-99"
++		entry.Amount = 0
++		entry.IndividualName = "WADE ARNOLD"
++		entry.SetTraceNumber(receivingODFI, i+1)
++		entry.AddendaRecordIndicator = 1
++
++		addenda98 := ach.NewAddenda98()
++		addenda98.ChangeCode = n.changeCode
++		addenda98.OriginalTrace = n.originalTrace
++		addenda98.OriginalDFI = n.originalDFI
++		addenda98.CorrectedData = n.correctedData
++		addenda98.TraceNumber = entry.TraceNumber
++
++		entry.Addenda98 = addenda98
++		entry.Category = ach.CategoryNOC
++
++		batch.AddEntry(entry)
++	}
++	require.NoError(t, batch.Create())
++
++	file := ach.NewFile()
++	file.SetHeader(fileHeader())
++	file.AddBatch(batch)
++	require.NoError(t, file.Create())
++	return file
++}
++
++func debitCorrectionFile(t testing.TB, n notice) *ach.File {
++	t.Helper()
++
++	file := correctionFile(t, n)
++	batch := file.Batches[0]
++	batch.GetHeader().ServiceClassCode = ach.DebitsOnly
++	batch.GetEntries()[0].TransactionCode = ach.CheckingReturnNOCDebit
++	require.NoError(t, batch.Create())
++	require.NoError(t, file.Create())
++	return file
++}
++
++// traceOf returns the trace number of an entry of the file, by batch and entry position.
++func traceOf(t testing.TB, file *ach.File, batchIndex, entryIndex int) string {
++	t.Helper()
++
++	require.Greater(t, len(file.Batches), batchIndex)
++	entries := file.Batches[batchIndex].GetEntries()
++	require.Greater(t, len(entries), entryIndex)
++	return entries[entryIndex].TraceNumber
++}
++
++func entryOf(t testing.TB, file *ach.File, batchIndex, entryIndex int) *ach.EntryDetail {
++	t.Helper()
++
++	require.Greater(t, len(file.Batches), batchIndex)
++	entries := file.Batches[batchIndex].GetEntries()
++	require.Greater(t, len(entries), entryIndex)
++	return entries[entryIndex]
++}
++
++// correctionFileNamed is correctionFile with a company name on the batch header, so the
++// provenance of a refused batch's header is observable.
++func correctionFileNamed(t testing.TB, company string, notices ...notice) *ach.File {
++	t.Helper()
++
++	file := correctionFile(t, notices...)
++	header := file.Batches[0].GetHeader()
++	header.CompanyName = company
++	file.Batches[0].SetHeader(header)
++	require.NoError(t, file.Batches[0].Create())
++	require.NoError(t, file.Create())
++	return file
++}
++
++// Applying corrections.
++
++func TestApplyCorrections_AccountNumber(t *testing.T) {
++	file := threeEntryFile(t)
++	applied(t, file, correctionFile(t, notice{"C01", traceOf(t, file, 0, 0), "23138010", "1918171614"}))
++
++	entry := entryOf(t, file, 0, 0)
++	require.Equal(t, "1918171614", entry.DFIAccountNumber)
++	require.Equal(t, "23138010", entry.RDFIIdentification)
++	require.Equal(t, "4", entry.CheckDigit)
++	require.Equal(t, ach.CheckingCredit, entry.TransactionCode)
++	require.Equal(t, 100000, entry.Amount)
++	require.Equal(t, "WADE ARNOLD", entry.IndividualName)
++}
++
++func TestApplyCorrections_RoutingNumber(t *testing.T) {
++	file := threeEntryFile(t)
++	applied(t, file, correctionFile(t, notice{"C02", traceOf(t, file, 0, 0), "23138010", "071000055"}))
++
++	entry := entryOf(t, file, 0, 0)
++	require.Equal(t, "07100005", entry.RDFIIdentification)
++	require.Equal(t, "5", entry.CheckDigit)
++	require.Equal(t, 7100005+12104288+23138010, file.Control.EntryHash)
++}
++
++func TestApplyCorrections_RoutingAndAccountNumber(t *testing.T) {
++	file := threeEntryFile(t)
++	applied(t, file, correctionFile(t, notice{"C03", traceOf(t, file, 0, 0), "23138010", "071000055 1918171614"}))
++
++	entry := entryOf(t, file, 0, 0)
++	require.Equal(t, "07100005", entry.RDFIIdentification)
++	require.Equal(t, "5", entry.CheckDigit)
++	require.Equal(t, "1918171614", entry.DFIAccountNumber)
++}
++
++func TestApplyCorrections_AccountNumberAndTransactionCode(t *testing.T) {
++	file := threeEntryFile(t)
++	applied(t, file, correctionFile(t,
++		notice{"C06", traceOf(t, file, 0, 0), "23138010", "1918171614                 32"}))
++
++	entry := entryOf(t, file, 0, 0)
++	require.Equal(t, "1918171614", entry.DFIAccountNumber)
++	require.Equal(t, ach.SavingsCredit, entry.TransactionCode)
++}
++
++func TestApplyCorrections_IndividualName(t *testing.T) {
++	file := threeEntryFile(t)
++	applied(t, file, correctionFile(t, notice{"C04", traceOf(t, file, 0, 1), "12104288", "JANE R DOE"}))
++	require.Equal(t, "JANE R DOE", entryOf(t, file, 0, 1).IndividualName)
++}
++
++func TestApplyCorrections_TransactionCode(t *testing.T) {
++	file := threeEntryFile(t)
++	applied(t, file, correctionFile(t, notice{"C05", traceOf(t, file, 0, 1), "12104288", "32"}))
++
++	require.Equal(t, ach.SavingsCredit, entryOf(t, file, 0, 1).TransactionCode)
++	require.Equal(t, ach.CreditsOnly, file.Batches[0].GetHeader().ServiceClassCode)
++	require.Equal(t, 400000, file.Batches[0].GetControl().TotalCreditEntryDollarAmount)
++}
++
++func TestApplyCorrections_IdentificationNumber(t *testing.T) {
++	file := threeEntryFile(t)
++	applied(t, file, correctionFile(t, notice{"C09", traceOf(t, file, 0, 1), "12104288", "location #99"}))
++	require.Equal(t, "location #99", entryOf(t, file, 0, 1).IdentificationNumber)
++}
++
++func TestApplyCorrections_EveryCorrectedField(t *testing.T) {
++	file := threeEntryFile(t)
++	trace := traceOf(t, file, 0, 0)
++
++	applied(t, file, correctionFile(t,
++		notice{"C07", trace, "23138010", "091000019 77788899 27"},
++		notice{"C04", trace, "23138010", "WADE R ARNOLD"},
++		notice{"C09", trace, "23138010", "location #7"},
++	))
++
++	entry := entryOf(t, file, 0, 0)
++	require.Equal(t, "09100001", entry.RDFIIdentification)
++	require.Equal(t, "9", entry.CheckDigit)
++	require.Equal(t, "77788899", entry.DFIAccountNumber)
++	require.Equal(t, ach.CheckingDebit, entry.TransactionCode)
++	require.Equal(t, "WADE R ARNOLD", entry.IndividualName)
++	require.Equal(t, "location #7", entry.IdentificationNumber)
++}
++
++func TestApplyCorrections_AcrossBatches(t *testing.T) {
++	file := forwardFile(t,
++		forwardBatch(t, ach.CreditsOnly,
++			forwardEntry(ach.CheckingCredit, "231380104", "123456789", "WADE ARNOLD", 100000, 1)),
++		forwardBatch(t, ach.CreditsOnly,
++			forwardEntry(ach.CheckingCredit, "121042882", "744-5678-99", "JANE DOE", 250000, 2)),
++	)
++
++	applied(t, file, correctionFile(t,
++		notice{"C01", traceOf(t, file, 0, 0), "23138010", "1111111111"},
++		notice{"C01", traceOf(t, file, 1, 0), "12104288", "2222222222"},
++	))
++
++	require.Equal(t, "1111111111", entryOf(t, file, 0, 0).DFIAccountNumber)
++	require.Equal(t, "2222222222", entryOf(t, file, 1, 0).DFIAccountNumber)
++	require.Equal(t, 23138010+12104288, file.Control.EntryHash)
++}
++
++func TestApplyCorrections_SameEntryTwice(t *testing.T) {
++	file := threeEntryFile(t)
++	trace := traceOf(t, file, 0, 0)
++
++	applied(t, file, correctionFile(t,
++		notice{"C01", trace, "23138010", "1918171614"},
++		notice{"C04", trace, "23138010", "WADE R ARNOLD"},
++	))
++
++	require.Equal(t, "1918171614", entryOf(t, file, 0, 0).DFIAccountNumber)
++	require.Equal(t, "WADE R ARNOLD", entryOf(t, file, 0, 0).IndividualName)
++}
++
++func TestApplyCorrections_ServiceClassCodeWidens(t *testing.T) {
++	file := threeEntryFile(t)
++	applied(t, file, correctionFile(t, notice{"C05", traceOf(t, file, 0, 0), "23138010", "27"}))
++
++	require.Equal(t, ach.MixedDebitsAndCredits, file.Batches[0].GetHeader().ServiceClassCode)
++	require.Equal(t, ach.MixedDebitsAndCredits, file.Batches[0].GetControl().ServiceClassCode)
++	require.Equal(t, 100000, file.Control.TotalDebitEntryDollarAmountInFile)
++	require.Equal(t, 300000, file.Control.TotalCreditEntryDollarAmountInFile)
++}
++
++func TestApplyCorrections_ServiceClassCodeNotNarrowed(t *testing.T) {
++	file := forwardFile(t, forwardBatch(t, ach.MixedDebitsAndCredits,
++		forwardEntry(ach.CheckingCredit, "231380104", "123456789", "WADE ARNOLD", 100000, 1),
++		forwardEntry(ach.CheckingDebit, "121042882", "744-5678-99", "JANE DOE", 250000, 2),
++	))
++
++	applied(t, file, correctionFile(t, notice{"C05", traceOf(t, file, 0, 1), "12104288", "22"}))
++
++	require.Equal(t, ach.MixedDebitsAndCredits, file.Batches[0].GetHeader().ServiceClassCode)
++	require.Equal(t, ach.MixedDebitsAndCredits, file.Batches[0].GetControl().ServiceClassCode)
++}
++
++func TestApplyCorrections_CorrectionEntriesAreNotAdded(t *testing.T) {
++	file := threeEntryFile(t)
++	applied(t, file, correctionFile(t, notice{"C01", traceOf(t, file, 0, 0), "23138010", "1918171614"}))
++
++	require.Len(t, file.Batches, 1)
++	require.Len(t, file.Batches[0].GetEntries(), 3)
++	require.Equal(t, 1, file.Control.BatchCount)
++	require.Equal(t, 3, file.Control.EntryAddendaCount)
++}
++
++func TestApplyCorrections_CorrectedFileRoundTrips(t *testing.T) {
++	file := threeEntryFile(t)
++	applied(t, file, correctionFile(t, notice{"C07", traceOf(t, file, 0, 0), "23138010", "091000019 77788899 27"}))
++
++	read := roundTrip(t, file)
++	require.Equal(t, ach.MixedDebitsAndCredits, read.Batches[0].GetHeader().ServiceClassCode)
++	require.Equal(t, 9100001+12104288+23138010, read.Control.EntryHash)
++	require.Equal(t, "09100001", read.Batches[0].GetEntries()[0].RDFIIdentification)
++}
++
++// Matching: trace number and the receiving DFI identification, as sent.
++
++func TestApplyCorrections_AsSentRoutingStillMatchesAfterCorrection(t *testing.T) {
++	file := threeEntryFile(t)
++	trace := traceOf(t, file, 0, 0)
++
++	applied(t, file, correctionFile(t,
++		notice{"C02", trace, "23138010", "071000055"},
++		notice{"C01", trace, "23138010", "1918171614"},
++	))
++
++	entry := entryOf(t, file, 0, 0)
++	require.Equal(t, "07100005", entry.RDFIIdentification)
++	require.Equal(t, "1918171614", entry.DFIAccountNumber)
++}
++
++func TestApplyCorrections_CorrectedRoutingMatchesNothing(t *testing.T) {
++	file := threeEntryFile(t)
++	trace := traceOf(t, file, 0, 0)
++
++	// The second names the routing number the first installs, which no entry was sent
++	// with. It is refused; the first still applies.
++	refuses(t, file, correctionFile(t,
++		notice{"C02", trace, "23138010", "071000055"},
++		notice{"C01", trace, "07100005", "1918171614"},
++	), "C61")
++
++	entry := entryOf(t, file, 0, 0)
++	require.Equal(t, "07100005", entry.RDFIIdentification)
++	require.Equal(t, "123456789", entry.DFIAccountNumber)
++}
++
++func TestApplyCorrections_AsSentChainAcrossFiles(t *testing.T) {
++	file := threeEntryFile(t)
++	trace := traceOf(t, file, 0, 0)
++
++	first := correctionFile(t, notice{"C02", trace, "23138010", "071000055"})
++	second := correctionFile(t, notice{"C01", trace, "23138010", "1918171614"})
++
++	applied(t, file, first, second)
++
++	require.Equal(t, "07100005", entryOf(t, file, 0, 0).RDFIIdentification)
++	require.Equal(t, "1918171614", entryOf(t, file, 0, 0).DFIAccountNumber)
++}
++
++func TestApplyCorrections_LaterFileWinsOnTheSameEntry(t *testing.T) {
++	file := threeEntryFile(t)
++	trace := traceOf(t, file, 0, 0)
++
++	applied(t, file,
++		correctionFile(t, notice{"C01", trace, "23138010", "1111111111"}),
++		correctionFile(t, notice{"C01", trace, "23138010", "2222222222"}),
++	)
++	require.Equal(t, "2222222222", entryOf(t, file, 0, 0).DFIAccountNumber)
++}
++
++func TestApplyCorrections_NoFilesIsANoOp(t *testing.T) {
++	file := threeEntryFile(t)
++	before := fileBytes(t, file)
++
++	refused, err := applyCorrections(t, file)
++	require.NoError(t, err)
++	require.Nil(t, refused)
++	require.Equal(t, before, fileBytes(t, file))
++}
++
++func TestApplyCorrections_WithoutNotifications(t *testing.T) {
++	file := threeEntryFile(t)
++	before := fileBytes(t, file)
++
++	other := forwardFile(t, forwardBatch(t, ach.CreditsOnly,
++		forwardEntry(ach.CheckingCredit, "231380104", "123456789", "WADE ARNOLD", 100000, 9)))
++
++	refused, err := applyCorrections(t, file, other)
++	require.NoError(t, err)
++	require.Nil(t, refused)
++	require.Equal(t, before, fileBytes(t, file))
++}
++
++// Refusal classification. The checks run in a fixed order and the first to fail names
++// the refusal.
++
++func TestApplyCorrections_UnreadableCorrectedDataIsC65(t *testing.T) {
++	file := threeEntryFile(t)
++	refuses(t, file, correctionFile(t, notice{"C05", traceOf(t, file, 0, 0), "23138010", "not a code"}), "C65")
++	require.Equal(t, ach.CheckingCredit, entryOf(t, file, 0, 0).TransactionCode)
++}
++
++func TestApplyCorrections_IncompleteRoutingAndAccountDataIsC65(t *testing.T) {
++	file := threeEntryFile(t)
++	before := append([]byte(nil), fileBytes(t, file)...)
++
++	result, err := correctionResultFor(t, file, correctionFile(t,
++		notice{"C03", traceOf(t, file, 0, 0), "23138010", "071000055"}))
++	require.NoError(t, err)
++	require.Equal(t, []string{"C65"}, refusedCodes(t, result.Refused))
++	require.Nil(t, result.Undo)
++	require.Equal(t, before, fileBytes(t, file))
++}
++
++func TestApplyCorrections_IncompleteCompositeDataIsC65(t *testing.T) {
++	file := threeEntryFile(t)
++	before := append([]byte(nil), fileBytes(t, file)...)
++
++	result, err := correctionResultFor(t, file, correctionFile(t,
++		notice{"C06", traceOf(t, file, 0, 0), "23138010", "NEWACCOUNT22"},
++		notice{"C07", traceOf(t, file, 0, 1), "12104288", "091000019ACCOUNT22"},
++	))
++	require.NoError(t, err)
++	require.Equal(t, []string{"C65", "C65"}, refusedCodes(t, result.Refused))
++	require.Nil(t, result.Undo)
++	require.Equal(t, before, fileBytes(t, file))
++}
++
++func TestApplyCorrections_ChangeCodeWithoutCorrectionIsC65(t *testing.T) {
++	file := threeEntryFile(t)
++	for _, code := range []string{"C08", "C13", "C14"} {
++		refuses(t, file, correctionFile(t, notice{code, traceOf(t, file, 0, 0), "23138010", "1918171614"}), "C65")
++	}
++}
++
++func TestApplyCorrections_RefusedChangeCodeIsC65(t *testing.T) {
++	file := threeEntryFile(t)
++	for _, code := range []string{"C61", "C62", "C67", "C69"} {
++		refuses(t, file, correctionFile(t, notice{code, traceOf(t, file, 0, 0), "23138010", "1918171614"}), "C65")
++	}
++}
++
++func TestApplyCorrections_UnknownInstitutionIsC61(t *testing.T) {
++	file := threeEntryFile(t)
++	refuses(t, file, correctionFile(t, notice{"C01", traceOf(t, file, 0, 0), "99999999", "1918171614"}), "C61")
++	require.Equal(t, "123456789", entryOf(t, file, 0, 0).DFIAccountNumber)
++}
++
++func TestApplyCorrections_KnownInstitutionUnknownTraceIsC62(t *testing.T) {
++	file := threeEntryFile(t)
++	refuses(t, file, correctionFile(t, notice{"C01", "121042880000099", "23138010", "1918171614"}), "C62")
++}
++
++func TestApplyCorrections_TraceAtTheWrongInstitutionIsC62(t *testing.T) {
++	file := threeEntryFile(t)
++	// 12104288 is a real institution in the file, but it does not hold entry 0's trace.
++	refuses(t, file, correctionFile(t, notice{"C01", traceOf(t, file, 0, 0), "12104288", "1918171614"}), "C62")
++	require.Equal(t, "123456789", entryOf(t, file, 0, 0).DFIAccountNumber)
++	require.Equal(t, "744-5678-99", entryOf(t, file, 0, 1).DFIAccountNumber)
++}
++
++func TestApplyCorrections_UnusableRoutingNumberIsC67(t *testing.T) {
++	file := threeEntryFile(t)
++	refuses(t, file, correctionFile(t, notice{"C02", traceOf(t, file, 0, 0), "23138010", "071000051"}), "C67")
++	require.Equal(t, "23138010", entryOf(t, file, 0, 0).RDFIIdentification)
++}
++
++func TestApplyCorrections_UnusableTransactionCodeIsC69(t *testing.T) {
++	file := threeEntryFile(t)
++	refuses(t, file, correctionFile(t, notice{"C05", traceOf(t, file, 0, 0), "23138010", "17"}), "C69")
++	require.Equal(t, ach.CheckingCredit, entryOf(t, file, 0, 0).TransactionCode)
++}
++
++func TestApplyCorrections_PrenoteCodeOntoLiveEntryIsC69(t *testing.T) {
++	file := threeEntryFile(t)
++	refuses(t, file, correctionFile(t, notice{"C05", traceOf(t, file, 0, 0), "23138010", "23"}), "C69")
++	require.Equal(t, ach.CheckingCredit, entryOf(t, file, 0, 0).TransactionCode)
++}
++
++func TestApplyCorrections_PrenoteCodeOntoZeroAmountEntryApplies(t *testing.T) {
++	file := forwardFile(t, forwardBatch(t, ach.CreditsOnly,
++		forwardEntry(ach.CheckingPrenoteCredit, "231380104", "123456789", "WADE ARNOLD", 0, 1)))
++
++	applied(t, file, correctionFile(t, notice{"C05", traceOf(t, file, 0, 0), "23138010", "33"}))
++	require.Equal(t, ach.SavingsPrenoteCredit, entryOf(t, file, 0, 0).TransactionCode)
++}
++
++// Precedence: a notification wrong in more than one way takes the earlier code.
++
++func TestApplyCorrections_UnreadableDataBeatsBadInstitution(t *testing.T) {
++	file := threeEntryFile(t)
++	refuses(t, file, correctionFile(t, notice{"C05", traceOf(t, file, 0, 0), "99999999", "not a code"}), "C65")
++}
++
++func TestApplyCorrections_BadInstitutionBeatsBadTransactionCode(t *testing.T) {
++	file := threeEntryFile(t)
++	refuses(t, file, correctionFile(t, notice{"C05", traceOf(t, file, 0, 0), "99999999", "17"}), "C61")
++}
++
++func TestApplyCorrections_UnknownTraceBeatsBadRoutingNumber(t *testing.T) {
++	file := threeEntryFile(t)
++	refuses(t, file, correctionFile(t, notice{"C02", "121042880000099", "23138010", "071000051"}), "C62")
++}
++
++func TestApplyCorrections_BadRoutingNumberBeatsBadTransactionCode(t *testing.T) {
++	file := threeEntryFile(t)
++	// C07 carries a routing number, an account number and a transaction code; the routing
++	// number is checked first.
++	refuses(t, file, correctionFile(t, notice{"C07", traceOf(t, file, 0, 0), "23138010", "071000051 77788899 17"}), "C67")
++	require.Equal(t, "23138010", entryOf(t, file, 0, 0).RDFIIdentification)
++	require.Equal(t, "123456789", entryOf(t, file, 0, 0).DFIAccountNumber)
++}
++
++// Partition: a refusal stops nothing else.
++
++func TestApplyCorrections_RefusalDoesNotStopOtherNotifications(t *testing.T) {
++	file := threeEntryFile(t)
++
++	refuses(t, file, correctionFile(t,
++		notice{"C01", traceOf(t, file, 0, 0), "23138010", "1111111111"},
++		notice{"C01", "121042880000099", "23138010", "2222222222"},
++		notice{"C01", traceOf(t, file, 0, 2), "23138010", "3333333333"},
++	), "C62")
++
++	require.Equal(t, "1111111111", entryOf(t, file, 0, 0).DFIAccountNumber)
++	require.Equal(t, "3333333333", entryOf(t, file, 0, 2).DFIAccountNumber)
++}
++
++func TestApplyCorrections_RefusalDoesNotStopALaterOneOnTheSameEntry(t *testing.T) {
++	file := threeEntryFile(t)
++	trace := traceOf(t, file, 0, 0)
++
++	refuses(t, file, correctionFile(t,
++		notice{"C01", trace, "23138010", "1111111111"},
++		notice{"C02", trace, "23138010", "071000051"},
++		notice{"C04", trace, "23138010", "WADE R ARNOLD"},
++	), "C67")
++
++	entry := entryOf(t, file, 0, 0)
++	require.Equal(t, "1111111111", entry.DFIAccountNumber)
++	require.Equal(t, "WADE R ARNOLD", entry.IndividualName)
++	require.Equal(t, "23138010", entry.RDFIIdentification)
++}
++
++func TestApplyCorrections_RefusalsAcrossFilesDoNotStopEachOther(t *testing.T) {
++	file := threeEntryFile(t)
++
++	refused, err := applyCorrections(t, file,
++		correctionFile(t, notice{"C01", traceOf(t, file, 0, 0), "23138010", "1111111111"}),
++		correctionFile(t, notice{"C01", "121042880000099", "23138010", "2222222222"}),
++		correctionFile(t, notice{"C01", traceOf(t, file, 0, 2), "23138010", "3333333333"}),
++	)
++	require.NoError(t, err)
++	require.Equal(t, []string{"C62"}, refusedCodes(t, refused))
++	require.NoError(t, file.Validate())
++
++	require.Equal(t, "1111111111", entryOf(t, file, 0, 0).DFIAccountNumber)
++	require.Equal(t, "3333333333", entryOf(t, file, 0, 2).DFIAccountNumber)
++}
++
++func TestApplyCorrections_AllRefusedLeavesTheFileUntouched(t *testing.T) {
++	file := threeEntryFile(t)
++	before := fileBytes(t, file)
++
++	refuses(t, file, correctionFile(t,
++		notice{"C01", "121042880000099", "23138010", "1111111111"},
++		notice{"C01", traceOf(t, file, 0, 0), "99999999", "2222222222"},
++	), "C62", "C61")
++
++	require.Equal(t, before, fileBytes(t, file))
++}
++
++// The returned file of refused notifications.
++
++func TestApplyCorrections_NilWhenNothingRefused(t *testing.T) {
++	file := threeEntryFile(t)
++	refused, err := applyCorrections(t, file, correctionFile(t,
++		notice{"C01", traceOf(t, file, 0, 0), "23138010", "1918171614"}))
++	require.NoError(t, err)
++	require.Nil(t, refused)
++}
++
++func TestApplyCorrections_RefusedFileIsValidAndRoundTrips(t *testing.T) {
++	file := threeEntryFile(t)
++	refused := refuses(t, file, correctionFile(t,
++		notice{"C01", "121042880000099", "23138010", "1111111111"}), "C62")
++
++	require.NoError(t, refused.Validate())
++	read := roundTrip(t, refused)
++	require.Len(t, read.Batches, 1)
++	require.Equal(t, ach.COR, read.Batches[0].GetHeader().StandardEntryClassCode)
++	require.Equal(t, "C62", read.Batches[0].GetEntries()[0].Addenda98Refused.RefusedChangeCode)
++}
++
++func TestApplyCorrections_RefusedFileControlsAreBuilt(t *testing.T) {
++	file := threeEntryFile(t)
++	refused := refuses(t, file, correctionFile(t,
++		notice{"C01", "121042880000099", "23138010", "1111111111"},
++		notice{"C04", "121042880000098", "23138010", "SOMEBODY ELSE"},
++	), "C62", "C62")
++
++	require.Equal(t, 1, refused.Control.BatchCount)
++	// Two entries, each carrying one addenda record.
++	require.Equal(t, 4, refused.Control.EntryAddendaCount)
++	require.Equal(t, 0, refused.Control.TotalDebitEntryDollarAmountInFile)
++	require.Equal(t, 0, refused.Control.TotalCreditEntryDollarAmountInFile)
++	require.Equal(t, 2, refused.Batches[0].GetControl().EntryAddendaCount/2)
++}
++
++func TestApplyCorrections_RefusedBatchUsesCoveringServiceClass(t *testing.T) {
++	file := threeEntryFile(t)
++	credit := correctionFile(t,
++		notice{"C01", "121042880000091", "23138010", "1111111111"})
++	debit := debitCorrectionFile(t,
++		notice{"C01", "121042880000092", "23138010", "2222222222"})
++	debit.Batches[0].GetEntries()[0].SetTraceNumber(receivingODFI, 2)
++	require.NoError(t, debit.Batches[0].Create())
++	require.NoError(t, debit.Create())
++
++	source := ach.NewFile()
++	source.SetHeader(fileHeader())
++	source.AddBatch(credit.Batches[0])
++	source.AddBatch(debit.Batches[0])
++	require.NoError(t, source.Create())
++
++	result, err := correctionResultFor(t, file, source)
++	require.NoError(t, err)
++	require.NotNil(t, result)
++	require.Nil(t, result.Undo)
++	require.Equal(t, []string{"C62", "C62"}, refusedCodes(t, result.Refused))
++	require.Len(t, result.Refused.Batches, 1)
++	require.Equal(t, ach.MixedDebitsAndCredits, result.Refused.Batches[0].GetHeader().ServiceClassCode)
++	require.Equal(t, ach.MixedDebitsAndCredits, result.Refused.Batches[0].GetControl().ServiceClassCode)
++	require.NoError(t, result.Refused.Validate())
++}
++
++func TestApplyCorrections_RefusedFileTakesTheReceivingFileHeader(t *testing.T) {
++	file := threeEntryFile(t)
++	refused := refuses(t, file, correctionFile(t,
++		notice{"C01", "121042880000099", "23138010", "1111111111"}), "C62")
++
++	require.Equal(t, file.Header.ImmediateDestination, refused.Header.ImmediateDestination)
++	require.Equal(t, file.Header.ImmediateOrigin, refused.Header.ImmediateOrigin)
++}
++
++func TestApplyCorrections_RefusedBatchTakesItsSourceBatchHeader(t *testing.T) {
++	file := threeEntryFile(t)
++	corrections := correctionFileNamed(t, "RECEIVING BANK", notice{"C01", "121042880000099", "23138010", "1111111111"})
++
++	refused := refuses(t, file, corrections, "C62")
++	require.Equal(t, "RECEIVING BANK", refused.Batches[0].GetHeader().CompanyName)
++	require.Equal(t, ach.COR, refused.Batches[0].GetHeader().StandardEntryClassCode)
++}
++
++func TestApplyCorrections_RefusedBatchUsesTheBatchContainingTheFirstRefusal(t *testing.T) {
++	file := threeEntryFile(t)
++	clean := correctionFileNamed(t, "CLEAN BATCH",
++		notice{"C01", traceOf(t, file, 0, 0), "23138010", "1111111111"})
++	dirty := correctionFileNamed(t, "FIRST REFUSAL BATCH",
++		notice{"C01", "121042880000099", "23138010", "2222222222"})
++
++	source := ach.NewFile()
++	source.SetHeader(fileHeader())
++	source.AddBatch(clean.Batches[0])
++	source.AddBatch(dirty.Batches[0])
++	require.NoError(t, source.Create())
++
++	refused := refuses(t, file, source, "C62")
++	require.Len(t, refused.Batches, 1)
++	require.Equal(t, "FIRST REFUSAL BATCH", refused.Batches[0].GetHeader().CompanyName)
++}
++
++func TestApplyCorrections_OneBatchPerSourceFileInArgumentOrder(t *testing.T) {
++	file := threeEntryFile(t)
++
++	first := correctionFileNamed(t, "FIRST BANK", notice{"C01", "121042880000091", "23138010", "1111111111"})
++	second := correctionFileNamed(t, "SECOND BANK", notice{"C01", "121042880000092", "23138010", "2222222222"})
++
++	refusedFile, err := applyCorrections(t, file, first, second)
++	require.NoError(t, err)
++	require.Len(t, refusedFile.Batches, 2)
++	require.Equal(t, "FIRST BANK", refusedFile.Batches[0].GetHeader().CompanyName)
++	require.Equal(t, "SECOND BANK", refusedFile.Batches[1].GetHeader().CompanyName)
++	require.NoError(t, refusedFile.Validate())
++}
++
++func TestApplyCorrections_FilesWithoutRefusalsContributeNoBatch(t *testing.T) {
++	file := threeEntryFile(t)
++
++	clean := correctionFileNamed(t, "CLEAN BANK", notice{"C01", traceOf(t, file, 0, 0), "23138010", "1111111111"})
++	dirty := correctionFileNamed(t, "DIRTY BANK", notice{"C01", "121042880000099", "23138010", "2222222222"})
++
++	refusedFile, err := applyCorrections(t, file, clean, dirty)
++	require.NoError(t, err)
++	require.Len(t, refusedFile.Batches, 1)
++	require.Equal(t, "DIRTY BANK", refusedFile.Batches[0].GetHeader().CompanyName)
++}
++
++func TestApplyCorrections_RefusalsKeepTheirOrderWithinABatch(t *testing.T) {
++	file := threeEntryFile(t)
++	refused := refuses(t, file, correctionFile(t,
++		notice{"C01", traceOf(t, file, 0, 0), "99999999", "1111111111"},
++		notice{"C05", traceOf(t, file, 0, 0), "23138010", "not a code"},
++		notice{"C02", traceOf(t, file, 0, 0), "23138010", "071000051"},
++	), "C61", "C65", "C67")
++
++	require.Len(t, refused.Batches, 1)
++	require.Len(t, refused.Batches[0].GetEntries(), 3)
++}
++
++func TestApplyCorrections_RefusedAddendaCarriesTheOriginalNotification(t *testing.T) {
++	file := threeEntryFile(t)
++	refused := refuses(t, file, correctionFile(t,
++		notice{"C01", "121042880000099", "23138010", "1918171614"}), "C62")
++
++	addenda := refused.Batches[0].GetEntries()[0].Addenda98Refused
++	require.Equal(t, "C62", addenda.RefusedChangeCode)
++	require.Equal(t, "C01", addenda.ChangeCode)
++	require.Equal(t, "121042880000099", addenda.OriginalTrace)
++	require.Equal(t, "23138010", addenda.OriginalDFI)
++	require.Contains(t, addenda.CorrectedData, "1918171614")
++	require.True(t, ach.IsRefusedChangeCode(addenda.RefusedChangeCode))
++}
++
++func TestApplyCorrections_TraceSequenceNumberIsTheLastSevenOfTheNotificationTrace(t *testing.T) {
++	file := threeEntryFile(t)
++	corrections := correctionFile(t, notice{"C01", "121042880000099", "23138010", "1918171614"})
++	noticeTrace := corrections.Batches[0].GetEntries()[0].TraceNumberField()
++
++	refused := refuses(t, file, corrections, "C62")
++
++	addenda := refused.Batches[0].GetEntries()[0].Addenda98Refused
++	require.Len(t, addenda.TraceSequenceNumber, 7)
++	require.Equal(t, noticeTrace[len(noticeTrace)-7:], addenda.TraceSequenceNumber)
++}
++
++func TestApplyCorrections_RefusedEntryCopiesTheNotificationEntry(t *testing.T) {
++	file := threeEntryFile(t)
++	corrections := correctionFile(t, notice{"C01", "121042880000099", "23138010", "1918171614"})
++	source := corrections.Batches[0].GetEntries()[0]
++
++	refused := refuses(t, file, corrections, "C62")
++	copied := refused.Batches[0].GetEntries()[0]
++
++	require.Equal(t, source.TransactionCode, copied.TransactionCode)
++	require.Equal(t, source.RDFIIdentification, copied.RDFIIdentification)
++	require.Equal(t, source.CheckDigit, copied.CheckDigit)
++	require.Equal(t, source.DFIAccountNumber, copied.DFIAccountNumber)
++	require.Equal(t, source.Amount, copied.Amount)
++	require.Equal(t, source.IdentificationNumber, copied.IdentificationNumber)
++	require.Equal(t, source.IndividualName, copied.IndividualName)
++	require.Equal(t, source.DiscretionaryData, copied.DiscretionaryData)
++	require.Equal(t, source.TraceNumber, copied.TraceNumber)
++	require.Equal(t, source.AddendaRecordIndicator, copied.AddendaRecordIndicator)
++	require.Equal(t, source.Category, copied.Category)
++	require.Nil(t, copied.Addenda98)
++}
++
++func TestApplyCorrections_ReceivingFileCountsNeverMove(t *testing.T) {
++	file := threeEntryFile(t)
++	refuses(t, file, correctionFile(t,
++		notice{"C01", traceOf(t, file, 0, 0), "23138010", "1111111111"},
++		notice{"C01", "121042880000099", "23138010", "2222222222"},
++	), "C62")
++
++	require.Len(t, file.Batches, 1)
++	require.Equal(t, 1, file.Control.BatchCount)
++	require.Equal(t, 3, file.Control.EntryAddendaCount)
++}
++
++func TestApplyCorrections_EveryRefusalCodeIsInTheDictionary(t *testing.T) {
++	file := threeEntryFile(t)
++	refused := refuses(t, file, correctionFile(t,
++		notice{"C05", traceOf(t, file, 0, 0), "23138010", "bad"},
++		notice{"C01", traceOf(t, file, 0, 0), "99999999", "1111111111"},
++		notice{"C01", "121042880000099", "23138010", "2222222222"},
++		notice{"C02", traceOf(t, file, 0, 0), "23138010", "071000051"},
++		notice{"C05", traceOf(t, file, 0, 0), "23138010", "17"},
++	), "C65", "C61", "C62", "C67", "C69")
++
++	for _, code := range refusedCodes(t, refused) {
++		require.True(t, ach.IsRefusedChangeCode(code), "%s is not a refused change code", code)
++	}
++}
++
++// The same inputs must give the same answer every time.
++
++func TestApplyCorrections_IsDeterministic(t *testing.T) {
++	build := func() (*ach.File, *ach.File) {
++		file := threeEntryFile(t)
++		corrections := correctionFile(t,
++			notice{"C01", traceOf(t, file, 0, 0), "23138010", "1111111111"},
++			notice{"C01", "121042880000099", "23138010", "2222222222"},
++			notice{"C02", traceOf(t, file, 0, 2), "23138010", "071000051"},
++			notice{"C04", traceOf(t, file, 0, 1), "12104288", "JANE R DOE"},
++		)
++		refused, err := applyCorrections(t, file, corrections)
++		require.NoError(t, err)
++		return file, refused
++	}
++
++	firstFile, firstRefused := build()
++	secondFile, secondRefused := build()
++
++	require.Equal(t, fileBytes(t, firstFile), fileBytes(t, secondFile))
++	require.Equal(t, fileBytes(t, firstRefused), fileBytes(t, secondRefused))
++	require.Equal(t, refusedCodes(t, firstRefused), refusedCodes(t, secondRefused))
++}
++
++func TestApplyCorrections_RefusedFileIsDeterministicAcrossFiles(t *testing.T) {
++	build := func() *ach.File {
++		file := threeEntryFile(t)
++		refused, err := applyCorrections(t, file,
++			correctionFileNamed(t, "BANK ONE", notice{"C01", "121042880000091", "23138010", "1111111111"}),
++			correctionFileNamed(t, "BANK TWO", notice{"C01", "121042880000092", "23138010", "2222222222"}),
++		)
++		require.NoError(t, err)
++		return refused
++	}
++	require.Equal(t, fileBytes(t, build()), fileBytes(t, build()))
++}
++
++func TestApplyCorrections_ServiceClassCodeNotNarrowedToDebits(t *testing.T) {
++	file := forwardFile(t, forwardBatch(t, ach.MixedDebitsAndCredits,
++		forwardEntry(ach.CheckingDebit, "231380104", "123456789", "WADE ARNOLD", 100000, 1),
++		forwardEntry(ach.CheckingCredit, "121042882", "744-5678-99", "JANE DOE", 250000, 2),
++	))
++
++	applied(t, file, correctionFile(t, notice{"C05", traceOf(t, file, 0, 1), "12104288", "27"}))
++
++	require.Equal(t, ach.MixedDebitsAndCredits, file.Batches[0].GetHeader().ServiceClassCode)
++	require.Equal(t, ach.MixedDebitsAndCredits, file.Batches[0].GetControl().ServiceClassCode)
++}
++
++func TestApplyCorrections_ClassifiesAgainstEntriesInEveryBatch(t *testing.T) {
++	file := forwardFile(t,
++		forwardBatch(t, ach.CreditsOnly,
++			forwardEntry(ach.CheckingCredit, "231380104", "123456789", "WADE ARNOLD", 100000, 1)),
++		forwardBatch(t, ach.CreditsOnly,
++			forwardEntry(ach.CheckingCredit, "121042882", "744-5678-99", "JANE DOE", 250000, 2)),
++	)
++
++	// The entry named sits in the second batch, so a matcher which only indexes the first
++	// would refuse this rather than apply it.
++	applied(t, file, correctionFile(t, notice{"C04", traceOf(t, file, 1, 0), "12104288", "JANE R DOE"}))
++	require.Equal(t, "JANE R DOE", entryOf(t, file, 1, 0).IndividualName)
++	require.Equal(t, 23138010+12104288, file.Control.EntryHash)
++}
++
++func TestApplyCorrections_PrenoteDebitCodeOntoLiveEntryIsC69(t *testing.T) {
++	file := threeEntryFile(t)
++	refuses(t, file, correctionFile(t, notice{"C05", traceOf(t, file, 0, 1), "12104288", "28"}), "C69")
++	require.Equal(t, ach.CheckingCredit, entryOf(t, file, 0, 1).TransactionCode)
++}
++
++func TestApplyCorrections_PrenoteCodeRefusedAlongsideUsableFields(t *testing.T) {
++	file := threeEntryFile(t)
++	// The routing number and account number are both usable; the prenotification
++	// transaction code is not, and none of the three lands.
++	refuses(t, file, correctionFile(t,
++		notice{"C07", traceOf(t, file, 0, 0), "23138010", "091000019 77788899 33"}), "C69")
++
++	entry := entryOf(t, file, 0, 0)
++	require.Equal(t, "23138010", entry.RDFIIdentification)
++	require.Equal(t, "123456789", entry.DFIAccountNumber)
++	require.Equal(t, ach.CheckingCredit, entry.TransactionCode)
++}
++
++func TestApplyCorrections_BadRoutingNumberBeatsAPrenoteCode(t *testing.T) {
++	file := threeEntryFile(t)
++	// Both the routing number and the transaction code are unusable; the routing number
++	// is checked first.
++	refuses(t, file, correctionFile(t,
++		notice{"C07", traceOf(t, file, 0, 0), "23138010", "071000051 77788899 23"}), "C67")
++}
++
++func TestApplyCorrections_RoutingIsCheckedBeforeTheTransactionCode(t *testing.T) {
++	file := threeEntryFile(t)
++	// Both parts are unusable, so whichever check runs first names the refusal. The
++	// routing number is specified to run first.
++	refuses(t, file, correctionFile(t,
++		notice{"C07", traceOf(t, file, 0, 1), "12104288", "071000051 77788899 99"}), "C67")
++	require.Equal(t, "12104288", entryOf(t, file, 0, 1).RDFIIdentification)
++}
++
++// Offset entries are preserved and rebalanced incrementally in notification order.
++
++func TestApplyCorrections_CreditOffsetRebalancesAfterDirectionFlip(t *testing.T) {
++	file := creditOffsetFile(t)
++	offsetCode := entryOf(t, file, 0, 2).TransactionCode
++
++	applied(t, file, correctionFile(t,
++		notice{"C05", traceOf(t, file, 0, 0), "23138010", "22"}))
++
++	require.Equal(t, 250000, entryOf(t, file, 0, 2).Amount)
++	require.Equal(t, offsetCode, entryOf(t, file, 0, 2).TransactionCode)
++}
++
++func TestApplyCorrections_DebitOffsetRebalancesAfterDirectionFlip(t *testing.T) {
++	file := debitOffsetFile(t)
++	offsetCode := entryOf(t, file, 0, 2).TransactionCode
++
++	applied(t, file, correctionFile(t,
++		notice{"C05", traceOf(t, file, 0, 0), "23138010", "27"}))
++
++	require.Equal(t, 250000, entryOf(t, file, 0, 2).Amount)
++	require.Equal(t, offsetCode, entryOf(t, file, 0, 2).TransactionCode)
++}
++
++func TestApplyCorrections_BothOffsetsRebalance(t *testing.T) {
++	file := bothOffsetsFile(t)
++	debitOffsetCode := entryOf(t, file, 0, 4).TransactionCode
++	creditOffsetCode := entryOf(t, file, 0, 5).TransactionCode
++
++	applied(t, file, correctionFile(t,
++		notice{"C05", traceOf(t, file, 0, 0), "23138010", "27"}))
++
++	require.Len(t, file.Batches[0].GetEntries(), 6)
++	require.Equal(t, 50000, entryOf(t, file, 0, 4).Amount)
++	require.Equal(t, 370000, entryOf(t, file, 0, 5).Amount)
++	require.Equal(t, debitOffsetCode, entryOf(t, file, 0, 4).TransactionCode)
++	require.Equal(t, creditOffsetCode, entryOf(t, file, 0, 5).TransactionCode)
++}
++
++func TestApplyCorrections_OffsetEntryCannotBeCorrectedIsC62(t *testing.T) {
++	file := debitOffsetFile(t)
++	offset := entryOf(t, file, 0, 2)
++
++	refuses(t, file, correctionFile(t,
++		notice{"C01", offset.TraceNumber, offset.RDFIIdentification, "1111111111"}), "C62")
++
++	require.Equal(t, "999999999", offset.DFIAccountNumber)
++	require.Equal(t, 350000, offset.Amount)
++}
++
++func TestApplyCorrections_UnreadableDataBeatsOffsetTarget(t *testing.T) {
++	file := debitOffsetFile(t)
++	offset := entryOf(t, file, 0, 2)
++
++	refuses(t, file, correctionFile(t,
++		notice{"C05", offset.TraceNumber, offset.RDFIIdentification, "not a code"}), "C65")
++}
++
++func TestApplyCorrections_OffsetTargetBeatsBadRoutingNumber(t *testing.T) {
++	file := debitOffsetFile(t)
++	offset := entryOf(t, file, 0, 2)
++
++	refuses(t, file, correctionFile(t,
++		notice{"C02", offset.TraceNumber, offset.RDFIIdentification, "071000051"}), "C62")
++}
++
++func TestApplyCorrections_OffsetTargetRefusalDoesNotBlockLaterNotification(t *testing.T) {
++	file := debitOffsetFile(t)
++	offset := entryOf(t, file, 0, 2)
++
++	refuses(t, file, correctionFile(t,
++		notice{"C01", offset.TraceNumber, offset.RDFIIdentification, "1111111111"},
++		notice{"C01", traceOf(t, file, 0, 0), "23138010", "2222222222"},
++	), "C62")
++
++	require.Equal(t, "999999999", offset.DFIAccountNumber)
++	require.Equal(t, "2222222222", entryOf(t, file, 0, 0).DFIAccountNumber)
++}
++
++func TestApplyCorrections_OffsetFeasibilityDependsOnForwardOrder(t *testing.T) {
++	file := orderedOffsetFile(t)
++	firstTrace := traceOf(t, file, 0, 0)
++	secondTrace := traceOf(t, file, 0, 1)
++
++	refused := refuses(t, file, correctionFile(t,
++		notice{"C05", firstTrace, "23138010", "27"},
++		notice{"C05", secondTrace, "12104288", "27"},
++	), "C69")
++
++	require.Equal(t, ach.CheckingDebit, entryOf(t, file, 0, 0).TransactionCode)
++	require.Equal(t, ach.CheckingCredit, entryOf(t, file, 0, 1).TransactionCode)
++	require.Equal(t, 200000, entryOf(t, file, 0, 3).Amount)
++	require.Equal(t, secondTrace, refused.Batches[0].GetEntries()[0].Addenda98Refused.OriginalTraceField())
++}
++
++func TestApplyCorrections_OffsetFeasibilityDependsOnReverseOrder(t *testing.T) {
++	file := orderedOffsetFile(t)
++	firstTrace := traceOf(t, file, 0, 0)
++	secondTrace := traceOf(t, file, 0, 1)
++
++	refused := refuses(t, file, correctionFile(t,
++		notice{"C05", secondTrace, "12104288", "27"},
++		notice{"C05", firstTrace, "23138010", "27"},
++	), "C69")
++
++	require.Equal(t, ach.CheckingCredit, entryOf(t, file, 0, 0).TransactionCode)
++	require.Equal(t, ach.CheckingDebit, entryOf(t, file, 0, 1).TransactionCode)
++	require.Equal(t, 100000, entryOf(t, file, 0, 3).Amount)
++	require.Equal(t, firstTrace, refused.Batches[0].GetEntries()[0].Addenda98Refused.OriginalTraceField())
++}
++
++func TestApplyCorrections_ZeroOffsetRefusalCarriesC69(t *testing.T) {
++	file := orderedOffsetFile(t)
++	firstTrace := traceOf(t, file, 0, 0)
++	secondTrace := traceOf(t, file, 0, 1)
++
++	refused := refuses(t, file, correctionFile(t,
++		notice{"C05", firstTrace, "23138010", "27"},
++		notice{"C05", secondTrace, "12104288", "27"},
++	), "C69")
++
++	addenda := refused.Batches[0].GetEntries()[0].Addenda98Refused
++	require.Equal(t, "C69", addenda.RefusedChangeCode)
++	require.Equal(t, "C05", addenda.ChangeCode)
++	require.Equal(t, secondTrace, addenda.OriginalTraceField())
++}
++
++func TestApplyCorrections_BatchWithoutOffsetDoesNotUseOffsetFeasibility(t *testing.T) {
++	file := forwardFile(t, forwardBatch(t, ach.CreditsOnly,
++		forwardEntry(ach.CheckingCredit, "231380104", "123456789", "ALPHA", 100000, 1),
++		forwardEntry(ach.CheckingCredit, "121042882", "744-5678-99", "BRAVO", 200000, 2),
++	))
++
++	applied(t, file, correctionFile(t,
++		notice{"C05", traceOf(t, file, 0, 0), "23138010", "27"},
++		notice{"C05", traceOf(t, file, 0, 1), "12104288", "27"},
++	))
++
++	require.Equal(t, ach.CheckingDebit, entryOf(t, file, 0, 0).TransactionCode)
++	require.Equal(t, ach.CheckingDebit, entryOf(t, file, 0, 1).TransactionCode)
++}
++
++func TestApplyCorrections_OffsetEntryCountDoesNotMove(t *testing.T) {
++	file := bothOffsetsFile(t)
++	beforeBatchCount := len(file.Batches[0].GetEntries())
++	beforeFileCount := file.Control.EntryAddendaCount
++
++	applied(t, file, correctionFile(t,
++		notice{"C05", traceOf(t, file, 0, 0), "23138010", "27"}))
++
++	require.Len(t, file.Batches[0].GetEntries(), beforeBatchCount)
++	require.Equal(t, beforeFileCount, file.Control.EntryAddendaCount)
++}
++
++func TestApplyCorrections_OffsetControlsIncludeRebalancedAmounts(t *testing.T) {
++	file := bothOffsetsFile(t)
++
++	applied(t, file, correctionFile(t,
++		notice{"C05", traceOf(t, file, 0, 0), "23138010", "27"}))
++
++	control := file.Batches[0].GetControl()
++	require.Equal(t, 420000, control.TotalCreditEntryDollarAmount)
++	require.Equal(t, 420000, control.TotalDebitEntryDollarAmount)
++	require.Equal(t, 420000, file.Control.TotalCreditEntryDollarAmountInFile)
++	require.Equal(t, 420000, file.Control.TotalDebitEntryDollarAmountInFile)
++	require.Equal(t, 23138010+12104288+23138010+12104288+9100001+7100005, control.EntryHash)
++	require.Equal(t, control.EntryHash, file.Control.EntryHash)
++	require.Equal(t, ach.MixedDebitsAndCredits, file.Batches[0].GetHeader().ServiceClassCode)
++	require.Equal(t, ach.MixedDebitsAndCredits, control.ServiceClassCode)
++}
++
++func TestApplyCorrections_OffsetRebalanceAcrossBatches(t *testing.T) {
++	file := forwardFile(t,
++		forwardBatch(t, ach.MixedDebitsAndCredits,
++			forwardEntry(ach.CheckingCredit, "231380104", "123456789", "ALPHA", 100000, 1),
++			forwardEntry(ach.CheckingCredit, "121042882", "744-5678-99", "BRAVO", 250000, 2),
++			offsetEntry(ach.CheckingDebit, "091000019", 350000, 3)),
++		forwardBatch(t, ach.MixedDebitsAndCredits,
++			forwardEntry(ach.CheckingDebit, "231380104", "987654321", "CHARLIE", 40000, 4),
++			offsetEntry(ach.CheckingCredit, "071000055", 40000, 5)),
++	)
++
++	applied(t, file, correctionFile(t,
++		notice{"C05", traceOf(t, file, 0, 0), "23138010", "27"}))
++
++	require.Equal(t, 250000, entryOf(t, file, 0, 2).Amount)
++	require.Equal(t, 40000, entryOf(t, file, 1, 1).Amount)
++	require.Equal(t, 290000, file.Control.TotalCreditEntryDollarAmountInFile)
++	require.Equal(t, 390000, file.Control.TotalDebitEntryDollarAmountInFile)
++}
++
++func TestApplyCorrections_OffsetRebalanceRoundTrips(t *testing.T) {
++	file := bothOffsetsFile(t)
++
++	applied(t, file, correctionFile(t,
++		notice{"C05", traceOf(t, file, 0, 0), "23138010", "27"}))
++
++	read := roundTrip(t, file)
++	require.Len(t, read.Batches[0].GetEntries(), 6)
++	require.Equal(t, 50000, entryOf(t, read, 0, 4).Amount)
++	require.Equal(t, 370000, entryOf(t, read, 0, 5).Amount)
++	require.Equal(t, 420000, read.Control.TotalCreditEntryDollarAmountInFile)
++	require.Equal(t, 420000, read.Control.TotalDebitEntryDollarAmountInFile)
++}
++
++// Result and undo journal behavior.
++
++func TestApplyCorrections_ResultIsNilWhenThereAreNoNotifications(t *testing.T) {
++	file := threeEntryFile(t)
++	result, err := correctionResultFor(t, file, threeEntryFile(t))
++	require.NoError(t, err)
++	require.Nil(t, result)
++}
++
++func TestApplyCorrections_AllRefusedResultHasNoUndo(t *testing.T) {
++	file := threeEntryFile(t)
++	result, err := correctionResultFor(t, file, correctionFile(t,
++		notice{"C01", "121042880099999", "12104288", "1918171614"},
++	))
++	require.NoError(t, err)
++	require.NotNil(t, result)
++	require.NotNil(t, result.Refused)
++	require.Nil(t, result.Undo)
++}
++
++func TestApplyCorrections_MixedResultHasRefusedAndUndo(t *testing.T) {
++	file := threeEntryFile(t)
++	result, err := correctionResultFor(t, file, correctionFile(t,
++		notice{"C01", traceOf(t, file, 0, 0), "23138010", "1918171614"},
++		notice{"C01", "121042880099999", "12104288", "1918171614"},
++	))
++	require.NoError(t, err)
++	require.NotNil(t, result)
++	require.Equal(t, []string{"C62"}, refusedCodes(t, result.Refused))
++	require.Len(t, undoEntries(result), 1)
++}
++
++func TestApplyCorrections_AcceptedNoOpHasUndoEntry(t *testing.T) {
++	file := threeEntryFile(t)
++	result := appliedResult(t, file, correctionFile(t,
++		notice{"C01", traceOf(t, file, 0, 0), "23138010", "123456789"},
++	))
++	require.Len(t, undoEntries(result), 1)
++	require.Equal(t, "123456789", onlyUndoEntry(t, result).Addenda98.ParseCorrectedData().AccountNumber)
++}
++
++func TestApplyCorrections_RefusalIsExcludedFromUndo(t *testing.T) {
++	file := threeEntryFile(t)
++	result, err := correctionResultFor(t, file, correctionFile(t,
++		notice{"C01", traceOf(t, file, 0, 0), "23138010", "1918171614"},
++		notice{"C05", traceOf(t, file, 0, 1), "12104288", "99"},
++		notice{"C04", traceOf(t, file, 0, 2), "23138010", "JOHN Q SMITH"},
++	))
++	require.NoError(t, err)
++	require.Equal(t, []string{"C69"}, refusedCodes(t, result.Refused))
++	require.Len(t, undoEntries(result), 2)
++	require.Equal(t, "C04", undoEntries(result)[0].Addenda98.ChangeCode)
++	require.Equal(t, "C01", undoEntries(result)[1].Addenda98.ChangeCode)
++}
++
++func TestApplyCorrections_UndoReversesAcrossFiles(t *testing.T) {
++	file := threeEntryFile(t)
++	first := correctionFile(t, notice{"C01", traceOf(t, file, 0, 0), "23138010", "1918171614"})
++	second := correctionFile(t,
++		notice{"C04", traceOf(t, file, 0, 1), "12104288", "JANE R DOE"},
++		notice{"C09", traceOf(t, file, 0, 2), "23138010", "location #77"},
++	)
++	entries := undoEntries(appliedResult(t, file, first, second))
++	require.Len(t, entries, 3)
++	require.Equal(t, []string{"C09", "C04", "C01"}, []string{
++		entries[0].Addenda98.ChangeCode,
++		entries[1].Addenda98.ChangeCode,
++		entries[2].Addenda98.ChangeCode,
++	})
++}
++
++func TestApplyCorrections_UndoHeaderComesFromLastAcceptance(t *testing.T) {
++	file := threeEntryFile(t)
++	first := correctionFileNamed(t, "FIRST SOURCE", notice{"C01", traceOf(t, file, 0, 0), "23138010", "1918171614"})
++	last := correctionFileNamed(t, "LAST SOURCE", notice{"C04", traceOf(t, file, 0, 1), "12104288", "JANE R DOE"})
++	result := appliedResult(t, file, first, last)
++
++	require.Equal(t, file.Header, result.Undo.Header)
++	require.Equal(t, "LAST SOURCE", result.Undo.Batches[0].GetHeader().CompanyName)
++	require.Equal(t, ach.COR, result.Undo.Batches[0].GetHeader().StandardEntryClassCode)
++	require.Equal(t, 1, result.Undo.Batches[0].GetHeader().BatchNumber)
++}
++
++func TestApplyCorrections_UndoUsesFreshSynchronizedTraces(t *testing.T) {
++	file := threeEntryFile(t)
++	result := appliedResult(t, file, correctionFile(t,
++		notice{"C01", traceOf(t, file, 0, 0), "23138010", "1918171614"},
++		notice{"C04", traceOf(t, file, 0, 1), "12104288", "JANE R DOE"},
++		notice{"C09", traceOf(t, file, 0, 2), "23138010", "location #77"},
++	))
++	for i, entry := range undoEntries(result) {
++		require.Equal(t, receivingODFI, entry.TraceNumber[:8])
++		require.Equal(t, []string{"0000001", "0000002", "0000003"}[i], entry.TraceNumberField()[8:])
++		require.Equal(t, entry.TraceNumber, entry.Addenda98.TraceNumber)
++		require.Zero(t, entry.Amount)
++		require.Equal(t, ach.CategoryNOC, entry.Category)
++		require.Equal(t, 1, entry.AddendaRecordIndicator)
++	}
++}
++
++func TestApplyCorrections_UndoC01EncodesPriorAccount(t *testing.T) {
++	undo := assertOrdinaryInverse(t, "C01", &ach.CorrectedData{AccountNumber: "1918171614"})
++	require.Equal(t, "123456789", undo.Addenda98.ParseCorrectedData().AccountNumber)
++}
++
++func TestApplyCorrections_UndoC02EncodesPriorRouting(t *testing.T) {
++	undo := assertOrdinaryInverse(t, "C02", &ach.CorrectedData{RoutingNumber: "071000055"})
++	require.Equal(t, "231380104", undo.Addenda98.ParseCorrectedData().RoutingNumber)
++}
++
++func TestApplyCorrections_UndoC03EncodesPriorRoutingAndAccount(t *testing.T) {
++	undo := assertOrdinaryInverse(t, "C03", &ach.CorrectedData{RoutingNumber: "071000055", AccountNumber: "1918171614"})
++	data := undo.Addenda98.ParseCorrectedData()
++	require.Equal(t, "231380104", data.RoutingNumber)
++	require.Equal(t, "123456789", data.AccountNumber)
++}
++
++func TestApplyCorrections_UndoC04EncodesPriorName(t *testing.T) {
++	undo := assertOrdinaryInverse(t, "C04", &ach.CorrectedData{Name: "WADE R ARNOLD"})
++	require.Equal(t, "WADE ARNOLD", undo.Addenda98.ParseCorrectedData().Name)
++}
++
++func TestApplyCorrections_UndoC05EncodesPriorTransactionCode(t *testing.T) {
++	undo := assertOrdinaryInverse(t, "C05", &ach.CorrectedData{TransactionCode: ach.SavingsCredit})
++	require.Equal(t, ach.CheckingCredit, undo.Addenda98.ParseCorrectedData().TransactionCode)
++}
++
++func TestApplyCorrections_UndoC06EncodesPriorAccountAndTransactionCode(t *testing.T) {
++	file := threeEntryFile(t)
++	result := appliedResult(t, file, correctionFile(t, notice{
++		"C06", traceOf(t, file, 0, 0), "23138010",
++		ach.WriteCorrectionData("C06", &ach.CorrectedData{AccountNumber: "1918171614", TransactionCode: ach.SavingsCredit}),
++	}))
++	require.Equal(t, "1918171614", entryOf(t, file, 0, 0).DFIAccountNumber)
++	require.Equal(t, ach.SavingsCredit, entryOf(t, file, 0, 0).TransactionCode)
++
++	undo := onlyUndoEntry(t, result)
++	data := undo.Addenda98.ParseCorrectedData()
++	require.Equal(t, "123456789", data.AccountNumber)
++	require.Equal(t, ach.CheckingCredit, data.TransactionCode)
++}
++
++func TestApplyCorrections_UndoBatchUsesCoveringServiceClass(t *testing.T) {
++	file := threeEntryFile(t)
++	credit := correctionFile(t,
++		notice{"C01", traceOf(t, file, 0, 0), "23138010", "1111111111"})
++	debit := debitCorrectionFile(t,
++		notice{"C01", traceOf(t, file, 0, 1), "12104288", "2222222222"})
++
++	result, err := correctionResultFor(t, file, credit, debit)
++	require.NoError(t, err)
++	require.NotNil(t, result)
++	require.Nil(t, result.Refused)
++	require.NotNil(t, result.Undo)
++	require.Equal(t, ach.MixedDebitsAndCredits, result.Undo.Batches[0].GetHeader().ServiceClassCode)
++	require.Equal(t, ach.MixedDebitsAndCredits, result.Undo.Batches[0].GetControl().ServiceClassCode)
++	require.NoError(t, result.Undo.Validate())
++}
++
++func TestApplyCorrections_UndoC07EncodesAllPriorFields(t *testing.T) {
++	undo := assertOrdinaryInverse(t, "C07", &ach.CorrectedData{
++		RoutingNumber:   "071000055",
++		AccountNumber:   "1918171614",
++		TransactionCode: ach.CheckingDebit,
++	})
++	data := undo.Addenda98.ParseCorrectedData()
++	require.Equal(t, "231380104", data.RoutingNumber)
++	require.Equal(t, "123456789", data.AccountNumber)
++	require.Equal(t, ach.CheckingCredit, data.TransactionCode)
++}
++
++func TestApplyCorrections_UndoC09EncodesPriorIdentification(t *testing.T) {
++	undo := assertOrdinaryInverse(t, "C09", &ach.CorrectedData{Identification: "location #99"})
++	require.Equal(t, "location #23", undo.Addenda98.ParseCorrectedData().Identification)
++}
++
++func TestApplyCorrections_RoutingChainUndoUsesFinalDFI(t *testing.T) {
++	file := threeEntryFile(t)
++	trace := traceOf(t, file, 0, 0)
++	result := appliedResult(t, file, correctionFile(t,
++		notice{"C02", trace, "23138010", "071000055"},
++		notice{"C02", trace, "23138010", "091000019"},
++		notice{"C02", trace, "23138010", "031300012"},
++	))
++	require.Equal(t, "03130001", entryOf(t, file, 0, 0).RDFIIdentification)
++	for _, entry := range undoEntries(result) {
++		require.Equal(t, trace, entry.Addenda98.OriginalTrace)
++		require.Equal(t, "03130001", entry.Addenda98.OriginalDFI)
++	}
++}
++
++func TestApplyCorrections_UndoRestoresOffsetsAndControls(t *testing.T) {
++	file := creditOffsetFile(t)
++	before := append([]byte(nil), fileBytes(t, file)...)
++	result := appliedResult(t, file, correctionFile(t,
++		notice{"C05", traceOf(t, file, 0, 0), "23138010", "22"},
++	))
++	require.Equal(t, 250000, entryOf(t, file, 0, 2).Amount)
++	appliedResult(t, file, result.Undo)
++	require.Equal(t, before, fileBytes(t, file))
++}
++
++func TestApplyCorrections_UndoOfUndoReproducesPostForwardState(t *testing.T) {
++	file := threeEntryFile(t)
++	before := append([]byte(nil), fileBytes(t, file)...)
++	source := correctionFile(t,
++		notice{"C03", traceOf(t, file, 0, 0), "23138010", "071000055 1918171614"},
++		notice{"C06", traceOf(t, file, 0, 1), "12104288", "222333444                 32"},
++		notice{"C07", traceOf(t, file, 0, 2), "23138010", "091000019 555666777     32"},
++	)
++	forward := appliedResult(t, file, source)
++	postForward := append([]byte(nil), fileBytes(t, file)...)
++
++	redo := appliedResult(t, file, forward.Undo)
++	require.Equal(t, before, fileBytes(t, file))
++	appliedResult(t, file, redo.Undo)
++	require.Equal(t, postForward, fileBytes(t, file))
++}
++
++func TestApplyCorrections_UndoDoesNotMutateCorrectionSources(t *testing.T) {
++	file := threeEntryFile(t)
++	source := correctionFile(t,
++		notice{"C01", traceOf(t, file, 0, 0), "23138010", "1918171614"},
++		notice{"C04", traceOf(t, file, 0, 1), "12104288", "JANE R DOE"},
++	)
++	before := append([]byte(nil), fileBytes(t, source)...)
++	result := appliedResult(t, file, source)
++	require.Equal(t, before, fileBytes(t, source))
++	appliedResult(t, file, result.Undo)
++	require.Equal(t, before, fileBytes(t, source))
++}
++
++// IAT targets and representation boundaries.
++
++func TestApplyCorrections_IATC02ChangesRouting(t *testing.T) {
++	file := iatForwardFile(t, iatEntry(1, ach.CheckingCredit))
++	entry := file.IATBatches[0].Entries[0]
++	result := appliedResult(t, file, correctionFile(t,
++		notice{"C02", entry.TraceNumber, "12104288", "071000055"},
++	))
++
++	require.Nil(t, result.Refused)
++	require.Equal(t, "07100005", entry.RDFIIdentification)
++	require.Equal(t, "5", entry.CheckDigit)
++	require.Equal(t, 7100005, file.IATBatches[0].Control.EntryHash)
++}
++
++func TestApplyCorrections_IATC08ChangesRouting(t *testing.T) {
++	file := iatForwardFile(t, iatEntry(1, ach.CheckingCredit))
++	entry := file.IATBatches[0].Entries[0]
++	appliedResult(t, file, correctionFile(t,
++		notice{"C08", entry.TraceNumber, "12104288", "091000019"},
++	))
++
++	require.Equal(t, "09100001", entry.RDFIIdentification)
++	require.Equal(t, "9", entry.CheckDigit)
++}
++
++func TestApplyCorrections_IATC05ChangesTransactionCode(t *testing.T) {
++	file := iatForwardFile(t, iatEntry(1, ach.CheckingCredit))
++	entry := file.IATBatches[0].Entries[0]
++	appliedResult(t, file, correctionFile(t,
++		notice{"C05", entry.TraceNumber, "12104288", "27"},
++	))
++
++	require.Equal(t, ach.CheckingDebit, entry.TransactionCode)
++	require.Zero(t, file.IATBatches[0].Control.TotalCreditEntryDollarAmount)
++	require.Equal(t, 100000, file.IATBatches[0].Control.TotalDebitEntryDollarAmount)
++	require.Equal(t, ach.DebitsOnly, file.IATBatches[0].Header.ServiceClassCode)
++	require.Equal(t, ach.DebitsOnly, file.IATBatches[0].Control.ServiceClassCode)
++}
++
++func TestApplyCorrections_IATC09ChangesReceiverIDNumber(t *testing.T) {
++	file := iatForwardFile(t, iatEntry(1, ach.CheckingCredit))
++	entry := file.IATBatches[0].Entries[0]
++	appliedResult(t, file, correctionFile(t,
++		notice{"C09", entry.TraceNumber, "12104288", "123456789012345"},
++	))
++
++	require.Equal(t, "123456789012345", entry.Addenda15.ReceiverIDNumber)
++	require.Equal(t, "2121 Front Street", entry.Addenda15.ReceiverStreetAddress)
++}
++
++func TestApplyCorrections_C08OnOrdinaryTargetIsC65(t *testing.T) {
++	file := threeEntryFile(t)
++	refuses(t, file, correctionFile(t,
++		notice{"C08", traceOf(t, file, 0, 0), "23138010", "071000055"},
++	), "C65")
++}
++
++func TestApplyCorrections_IATC01IsC65(t *testing.T) {
++	file := iatForwardFile(t, iatEntry(1, ach.CheckingCredit))
++	entry := file.IATBatches[0].Entries[0]
++	refuses(t, file, correctionFile(t,
++		notice{"C01", entry.TraceNumber, "12104288", "1918171614"},
++	), "C65")
++}
++
++func TestApplyCorrections_IATUnsupportedCodeBeatsBadRouting(t *testing.T) {
++	file := iatForwardFile(t, iatEntry(1, ach.CheckingCredit))
++	entry := file.IATBatches[0].Entries[0]
++	refuses(t, file, correctionFile(t,
++		notice{"C03", entry.TraceNumber, "12104288", "071000051 1918171614"},
++	), "C65")
++}
++
++func TestApplyCorrections_IATMatchesAsSentRoutingAcrossChain(t *testing.T) {
++	file := iatForwardFile(t, iatEntry(1, ach.CheckingCredit))
++	entry := file.IATBatches[0].Entries[0]
++	trace := entry.TraceNumber
++	result := appliedResult(t, file, correctionFile(t,
++		notice{"C02", trace, "12104288", "071000055"},
++		notice{"C08", trace, "12104288", "091000019"},
++		notice{"C02", trace, "12104288", "031300012"},
++	))
++
++	require.Equal(t, "03130001", entry.RDFIIdentification)
++	require.Len(t, undoEntries(result), 3)
++	for _, undo := range undoEntries(result) {
++		require.Equal(t, "03130001", undo.Addenda98.OriginalDFI)
++	}
++}
++
++func TestApplyCorrections_IATCorrectionPreservesUnselectedAddenda(t *testing.T) {
++	file := iatForwardFile(t, iatEntry(1, ach.CheckingCredit))
++	entry := file.IATBatches[0].Entries[0]
++	before10 := entry.Addenda10.String()
++	before14 := entry.Addenda14.String()
++	before16 := entry.Addenda16.String()
++	appliedResult(t, file, correctionFile(t,
++		notice{"C09", entry.TraceNumber, "12104288", "123456789012345"},
++	))
++
++	require.Equal(t, before10, entry.Addenda10.String())
++	require.Equal(t, before14, entry.Addenda14.String())
++	require.Equal(t, before16, entry.Addenda16.String())
++}
++
++func TestApplyCorrections_IATControlsAndRoundTripObserveRouting(t *testing.T) {
++	file := iatForwardFile(t,
++		iatEntry(1, ach.CheckingCredit),
++		iatEntry(2, ach.CheckingCredit),
++	)
++	entry := file.IATBatches[0].Entries[0]
++	appliedResult(t, file, correctionFile(t,
++		notice{"C02", entry.TraceNumber, "12104288", "071000055"},
++	))
++
++	require.Equal(t, 7100005+12104288, file.IATBatches[0].Control.EntryHash)
++	require.Equal(t, 7100005+12104288, file.Control.EntryHash)
++	read := roundTrip(t, file)
++	require.Len(t, read.IATBatches, 1)
++	require.Equal(t, "07100005", read.IATBatches[0].Entries[0].RDFIIdentification)
++	require.Equal(t, file.Control, read.Control)
++}
++
++func TestApplyCorrections_IATUndoRestoresAllSupportedFields(t *testing.T) {
++	file := iatForwardFile(t, iatEntry(1, ach.CheckingCredit))
++	entry := file.IATBatches[0].Entries[0]
++	before := append([]byte(nil), fileBytes(t, file)...)
++	trace := entry.TraceNumber
++	forward := appliedResult(t, file, correctionFile(t,
++		notice{"C02", trace, "12104288", "071000055"},
++		notice{"C05", trace, "12104288", "27"},
++		notice{"C09", trace, "12104288", "123456789012345"},
++	))
++
++	appliedResult(t, file, forward.Undo)
++	require.Equal(t, before, fileBytes(t, file))
++}
++
++func TestApplyCorrections_IATUndoOfUndoReproducesForwardState(t *testing.T) {
++	file := iatForwardFile(t, iatEntry(1, ach.CheckingCredit))
++	entry := file.IATBatches[0].Entries[0]
++	trace := entry.TraceNumber
++	forward := appliedResult(t, file, correctionFile(t,
++		notice{"C08", trace, "12104288", "071000055"},
++		notice{"C05", trace, "12104288", "32"},
++		notice{"C09", trace, "12104288", "123456789012345"},
++	))
++	postForward := append([]byte(nil), fileBytes(t, file)...)
++
++	redo := appliedResult(t, file, forward.Undo)
++	appliedResult(t, file, redo.Undo)
++	require.Equal(t, postForward, fileBytes(t, file))
++}
++
++func TestApplyCorrections_NotificationsInsideIATSourceAreIgnored(t *testing.T) {
++	file := threeEntryFile(t)
++	source := iatForwardFile(t, iatEntry(1, ach.CheckingCredit))
++	source.IATBatches[0].Entries[0].Addenda98 = ach.NewAddenda98()
++	source.IATBatches[0].Entries[0].Addenda98.ChangeCode = "C01"
++	source.IATBatches[0].Entries[0].Addenda98.OriginalTrace = traceOf(t, file, 0, 0)
++	source.IATBatches[0].Entries[0].Addenda98.OriginalDFI = "23138010"
++	source.IATBatches[0].Entries[0].Addenda98.CorrectedData = "1918171614"
++
++	result, err := correctionResultFor(t, file, source)
++	require.NoError(t, err)
++	require.Nil(t, result)
++	require.Equal(t, "123456789", entryOf(t, file, 0, 0).DFIAccountNumber)
++}
++
++// Concrete target-batch validation and three-axis interactions.
++
++func TestApplyCorrections_ACKRejectsGloballyKnownC05Code(t *testing.T) {
++	file := specializedForwardFile(t, ach.ACK, ach.CheckingZeroDollarRemittanceCredit)
++	entry := entryOf(t, file, 0, 0)
++	before := append([]byte(nil), fileBytes(t, file)...)
++	result, err := correctionResultFor(t, file, correctionFile(t,
++		notice{"C05", entry.TraceNumber, "03130001", "22"},
++	))
++	require.NoError(t, err)
++	require.Equal(t, []string{"C69"}, refusedCodes(t, result.Refused))
++	require.Nil(t, result.Undo)
++	require.Equal(t, before, fileBytes(t, file))
++}
++
++func TestApplyCorrections_ACKAcceptsConcreteSavingsAlternative(t *testing.T) {
++	file := specializedForwardFile(t, ach.ACK, ach.CheckingZeroDollarRemittanceCredit)
++	entry := entryOf(t, file, 0, 0)
++	result := appliedResult(t, file, correctionFile(t,
++		notice{"C05", entry.TraceNumber, "03130001", "34"},
++	))
++	require.Equal(t, ach.SavingsZeroDollarRemittanceCredit, entry.TransactionCode)
++	require.Equal(t, ach.CheckingZeroDollarRemittanceCredit, onlyUndoEntry(t, result).Addenda98.ParseCorrectedData().TransactionCode)
++}
++
++func TestApplyCorrections_ATXRejectsGloballyKnownC05Code(t *testing.T) {
++	file := specializedForwardFile(t, ach.ATX, ach.CheckingZeroDollarRemittanceCredit)
++	entry := entryOf(t, file, 0, 0)
++	refuses(t, file, correctionFile(t,
++		notice{"C05", entry.TraceNumber, "03130001", "22"},
++	), "C69")
++	require.Equal(t, ach.CheckingZeroDollarRemittanceCredit, entry.TransactionCode)
++}
++
++func TestApplyCorrections_ATXAcceptsConcreteSavingsAlternative(t *testing.T) {
++	file := specializedForwardFile(t, ach.ATX, ach.CheckingZeroDollarRemittanceCredit)
++	entry := entryOf(t, file, 0, 0)
++	appliedResult(t, file, correctionFile(t,
++		notice{"C05", entry.TraceNumber, "03130001", "34"},
++	))
++	require.Equal(t, ach.SavingsZeroDollarRemittanceCredit, entry.TransactionCode)
++	require.Len(t, entry.Addenda05, 1)
++}
++
++func TestApplyCorrections_DNERejectsGloballyKnownC05Code(t *testing.T) {
++	file := specializedForwardFile(t, ach.DNE, ach.CheckingPrenoteCredit)
++	entry := entryOf(t, file, 0, 0)
++	refuses(t, file, correctionFile(t,
++		notice{"C05", entry.TraceNumber, "03130001", "22"},
++	), "C69")
++	require.Equal(t, ach.CheckingPrenoteCredit, entry.TransactionCode)
++}
++
++func TestApplyCorrections_DNEAcceptsConcreteSavingsAlternative(t *testing.T) {
++	file := specializedForwardFile(t, ach.DNE, ach.CheckingPrenoteCredit)
++	entry := entryOf(t, file, 0, 0)
++	appliedResult(t, file, correctionFile(t,
++		notice{"C05", entry.TraceNumber, "03130001", "33"},
++	))
++	require.Equal(t, ach.SavingsPrenoteCredit, entry.TransactionCode)
++	require.Len(t, entry.Addenda05, 1)
++}
++
++func TestApplyCorrections_ENRRejectsGloballyKnownC05Code(t *testing.T) {
++	file := specializedForwardFile(t, ach.ENR, ach.CheckingPrenoteCredit)
++	entry := entryOf(t, file, 0, 0)
++	refuses(t, file, correctionFile(t,
++		notice{"C05", entry.TraceNumber, "03130001", "22"},
++	), "C69")
++	require.Equal(t, ach.CheckingPrenoteCredit, entry.TransactionCode)
++}
++
++func TestApplyCorrections_ENRRefusalRollsBackBeforeLaterAcceptance(t *testing.T) {
++	file := specializedForwardFile(t, ach.ENR, ach.CheckingPrenoteCredit)
++	entry := entryOf(t, file, 0, 0)
++	result, err := correctionResultFor(t, file, correctionFile(t,
++		notice{"C05", entry.TraceNumber, "03130001", "22"},
++		notice{"C05", entry.TraceNumber, "03130001", "33"},
++	))
++	require.NoError(t, err)
++	require.Equal(t, []string{"C69"}, refusedCodes(t, result.Refused))
++	require.Equal(t, ach.SavingsPrenoteCredit, entry.TransactionCode)
++	require.Len(t, undoEntries(result), 1)
++	require.Equal(t, ach.CheckingPrenoteCredit, onlyUndoEntry(t, result).Addenda98.ParseCorrectedData().TransactionCode)
++}
++
++func TestApplyCorrections_OrdinaryVRefusalBetweenOrdinaryAndIATAcceptances(t *testing.T) {
++	file := specializedForwardFile(t, ach.ACK, ach.CheckingZeroDollarRemittanceCredit)
++	iat := iatForwardFile(t, iatEntry(1, ach.CheckingCredit))
++	file.AddIATBatch(iat.IATBatches[0])
++	require.NoError(t, file.Create())
++	ordinary := entryOf(t, file, 0, 0)
++	international := file.IATBatches[0].Entries[0]
++
++	result, err := correctionResultFor(t, file, correctionFile(t,
++		notice{"C01", ordinary.TraceNumber, "03130001", "1918171614"},
++		notice{"C05", ordinary.TraceNumber, "03130001", "22"},
++		notice{"C09", international.TraceNumber, "12104288", "123456789012345"},
++	))
++	require.NoError(t, err)
++	require.Equal(t, []string{"C69"}, refusedCodes(t, result.Refused))
++	require.Equal(t, "1918171614", ordinary.DFIAccountNumber)
++	require.Equal(t, ach.CheckingZeroDollarRemittanceCredit, ordinary.TransactionCode)
++	require.Equal(t, "123456789012345", international.Addenda15.ReceiverIDNumber)
++	require.Equal(t, []string{"C09", "C01"}, []string{
++		undoEntries(result)[0].Addenda98.ChangeCode,
++		undoEntries(result)[1].Addenda98.ChangeCode,
++	})
++}
++
++func TestApplyCorrections_OffsetAcceptanceVRefusalAndIATRedo(t *testing.T) {
++	file := creditOffsetFile(t)
++	iat := iatForwardFile(t, iatEntry(1, ach.CheckingCredit))
++	file.AddIATBatch(iat.IATBatches[0])
++	require.NoError(t, file.Create())
++	before := append([]byte(nil), fileBytes(t, file)...)
++	first := entryOf(t, file, 0, 0)
++	second := entryOf(t, file, 0, 1)
++	international := file.IATBatches[0].Entries[0]
++
++	forward, err := correctionResultFor(t, file, correctionFile(t,
++		notice{"C05", first.TraceNumber, "23138010", "22"},
++		notice{"C05", second.TraceNumber, "12104288", "23"},
++		notice{"C09", international.TraceNumber, "12104288", "123456789012345"},
++	))
++	require.NoError(t, err)
++	require.Equal(t, []string{"C69"}, refusedCodes(t, forward.Refused))
++	require.Equal(t, 250000, entryOf(t, file, 0, 2).Amount)
++	require.Equal(t, ach.CheckingDebit, second.TransactionCode)
++	postForward := append([]byte(nil), fileBytes(t, file)...)
++
++	redo := appliedResult(t, file, forward.Undo)
++	require.Equal(t, before, fileBytes(t, file))
++	appliedResult(t, file, redo.Undo)
++	require.Equal(t, postForward, fileBytes(t, file))
++}
++
++func TestApplyCorrections_IATAcceptedNoOpHasUndoEntry(t *testing.T) {
++	file := iatForwardFile(t, iatEntry(1, ach.CheckingCredit))
++	entry := file.IATBatches[0].Entries[0]
++	result := appliedResult(t, file, correctionFile(t,
++		notice{"C09", entry.TraceNumber, "12104288", entry.Addenda15.ReceiverIDNumber},
++	))
++	require.Len(t, undoEntries(result), 1)
++	require.Equal(t, "987465493213987", onlyUndoEntry(t, result).Addenda98.ParseCorrectedData().Identification)
++}
++
++func TestApplyCorrections_CorrectionSourceAddendaTracesStayUnchanged(t *testing.T) {
++	file := threeEntryFile(t)
++	source := correctionFile(t,
++		notice{"C01", traceOf(t, file, 0, 0), "23138010", "1918171614"},
++		notice{"C04", traceOf(t, file, 0, 1), "12104288", "JANE R DOE"},
++		notice{"C09", traceOf(t, file, 0, 2), "23138010", "location #77"},
++	)
++	var before []string
++	for _, entry := range source.Batches[0].GetEntries() {
++		before = append(before, entry.Addenda98.TraceNumber)
++	}
++	appliedResult(t, file, source)
++	for i, entry := range source.Batches[0].GetEntries() {
++		require.Equal(t, before[i], entry.Addenda98.TraceNumber)
++		require.Equal(t, entry.TraceNumber, entry.Addenda98.TraceNumber)
++	}
++}
++
++func TestApplyCorrections_OrdinaryC08RefusalLeavesRoutingUnchanged(t *testing.T) {
++	file := threeEntryFile(t)
++	entry := entryOf(t, file, 0, 0)
++	result, err := correctionResultFor(t, file, correctionFile(t,
++		notice{"C08", entry.TraceNumber, "23138010", "071000055"},
++	))
++	require.NoError(t, err)
++	require.Equal(t, []string{"C65"}, refusedCodes(t, result.Refused))
++	require.Nil(t, result.Undo)
++	require.Equal(t, "23138010", entry.RDFIIdentification)
++	require.Equal(t, "4", entry.CheckDigit)
++}

@@ -1,0 +1,866 @@
+diff --git a/numbat/modules/core/quantities.nbt b/numbat/modules/core/quantities.nbt
+index 08d8543c..2a6d65a0 100644
+--- a/numbat/modules/core/quantities.nbt
++++ b/numbat/modules/core/quantities.nbt
+@@ -25,12 +25,25 @@ fn has_unit<T: Dim>(quantity: T, unit_query: T) -> Bool
+ @example("is_dimensionless(10 km/h)")
+ fn is_dimensionless<T: Dim>(quantity: T) -> Bool
+ 
++@name("Parse a string as a unit")
++@description("Parses a string as a unit, returning that unit with a value of one. The expected return type (dimension) must be inferable from the surrounding context. This is the inverse of `unit_name`.")
++@example("let u: Velocity = unit_from(\"km/h\")")
++@example("let u: Acceleration = unit_from(\"m/s^2\")")
++fn unit_from<T: Dim>(input: String) -> T
++
+ @description("Returns a string representation of the unit of `quantity`. Returns an empty string if `quantity` is dimensionless.")
+ @example("unit_name(20)")
+ @example("unit_name(20 m^2)")
+ @example("unit_name(20 km/h)")
+ fn unit_name<T: Dim>(quantity: T) -> String
+ 
++@name("Express a quantity in a given unit")
++@description("Returns the numerical value of `quantity` expressed in the unit named by `target`. The target is a unit expression, or the degree sign syntax for an offset temperature scale. This is the inverse of `parse`.")
++@example("value_in(100 km/h, \"m/s\")")
++@example("value_in(1 km^2, \"m^2\")")
++@example("value_in(300 K, \"°C\")")
++fn value_in<T: Dim>(quantity: T, target: String) -> Scalar
++
+ # TODO: Once we support explicitly passing arguments to type parameters, we can remove the second argument and
+ # replace this with `fn quantity_cast<To: Dim, From: Dim>(f: From) -> To` and call it with `quantity_cast::<Length>(…)`.
+ @description("Unsafe function that returns the quantity `from` unmodified with the target dimension `To`. This can be useful in generic code, but should generally be avoided otherwise.")
+diff --git a/numbat/src/ffi/functions.rs b/numbat/src/ffi/functions.rs
+index f295b752..a81c7d57 100644
+--- a/numbat/src/ffi/functions.rs
++++ b/numbat/src/ffi/functions.rs
+@@ -2,7 +2,7 @@ use std::collections::HashMap;
+ use std::sync::OnceLock;
+ 
+ use super::{Args, FfiContext, macros::*};
+-use crate::parse_quantity::parse_quantity_literal;
++use crate::parse_quantity::{parse_quantity_literal, parse_unit_literal, value_in_unit};
+ use crate::typechecker::type_scheme::TypeScheme;
+ use crate::{interpreter::RuntimeErrorKind, quantity::Quantity, value::Value};
+ 
+@@ -47,6 +47,8 @@ pub(crate) fn functions() -> &'static HashMap<&'static str, ForeignFunction> {
+         insert_function!(unit_name, 1..=1);
+         insert_function!(quantity_cast, 2..=2);
+         insert_function!("parse", parse, 1..=1);
++        insert_function!(unit_from, 1..=1);
++        insert_function!(value_in, 2..=2);
+         insert_function!("args", args_, 0..=0);
+ 
+         // Math
+@@ -206,6 +208,31 @@ fn is_dimensionless(
+     return_boolean!(quantity.as_scalar().is_ok())
+ }
+ 
++fn value_in(
++    ctx: &mut FfiContext,
++    mut args: Args,
++    _return_type: &TypeScheme,
++) -> Result<Value, Box<RuntimeErrorKind>> {
++    let quantity = quantity_arg!(args);
++    let target = string_arg!(args);
++
++    let unit_lookup = |name: &str| ctx.lookup_unit(name);
++
++    match value_in_unit(
++        &quantity,
++        &target,
++        ctx.ctx.prefix_transformer,
++        ctx.ctx.typechecker,
++        unit_lookup,
++    ) {
++        Ok(value) => return_scalar!(value),
++        Err(e) => Err(Box::new(RuntimeErrorKind::UserError(format!(
++            "Could not express quantity in '{}': {}",
++            target, e
++        )))),
++    }
++}
++
+ fn unit_name(
+     _ctx: &mut FfiContext,
+     mut args: Args,
+@@ -268,6 +295,45 @@ fn parse(
+     }
+ }
+ 
++fn unit_from(
++    ctx: &mut FfiContext,
++    mut args: Args,
++    return_type: &TypeScheme,
++) -> Result<Value, Box<RuntimeErrorKind>> {
++    let input = string_arg!(args);
++
++    if return_type.is_polymorphic() {
++        return Err(Box::new(RuntimeErrorKind::UserError(
++            "unit_from() requires a type annotation for the return type, e.g. `let u: Velocity = unit_from(\"km/h\")`".into(),
++        )));
++    }
++
++    let unit_lookup = |name: &str| ctx.lookup_unit(name);
++
++    match parse_unit_literal(
++        &input,
++        ctx.ctx.prefix_transformer,
++        ctx.ctx.typechecker,
++        unit_lookup,
++    ) {
++        Ok((unit, input_type)) => {
++            if input_type.to_concrete_type() == return_type.to_concrete_type() {
++                return_quantity!(1.0, unit)
++            } else {
++                Err(Box::new(RuntimeErrorKind::UserError(format!(
++                    "Type mismatch: expected `{}`, got `{}`",
++                    return_type.to_concrete_type(),
++                    input_type.to_concrete_type()
++                ))))
++            }
++        }
++        Err(e) => Err(Box::new(RuntimeErrorKind::UserError(format!(
++            "Could not parse unit '{}': {}",
++            input, e
++        )))),
++    }
++}
++
+ fn args_(
+     _ctx: &mut FfiContext,
+     _args: Args,
+diff --git a/numbat/src/parse_quantity.rs b/numbat/src/parse_quantity.rs
+index b616b9b0..61c8ee29 100644
+--- a/numbat/src/parse_quantity.rs
++++ b/numbat/src/parse_quantity.rs
+@@ -1,9 +1,13 @@
+-//! Parser for simple quantity literals.
++//! Parser for quantity literals.
+ //!
+-//! This module provides a restricted parser that only accepts simple quantity literals
+-//! of the form `<number>` or `<number> <unit>`, not arbitrary expressions.
++//! This module provides a restricted parser that accepts quantity literals of the form
++//! `<number>` or `<number> <unit expression>`, not arbitrary expressions. A unit expression
++//! is built from unit names, products, quotients, parentheses and exact rational powers.
++
++use num_traits::{ToPrimitive, Zero};
+ 
+ use crate::Type;
++use crate::arithmetic::{Exponent, Power, Rational};
+ use crate::ast::{BinaryOperator, Expression, Statement, UnaryOperator};
+ use crate::number::Number;
+ use crate::parser::{ParseError, parse};
+@@ -11,8 +15,14 @@ use crate::prefix_transformer::Transformer;
+ use crate::quantity::Quantity;
+ use crate::typechecker::TypeChecker;
+ use crate::typechecker::type_scheme::TypeScheme;
++use crate::typed_ast::DType;
+ use crate::unit::Unit;
+ 
++const OFFSET_CELSIUS: f64 = 273.15;
++const OFFSET_FAHRENHEIT: f64 = 459.67;
++const SCALE_FAHRENHEIT: f64 = 5.0 / 9.0;
++const KELVIN: &str = "kelvin";
++
+ /// Error type for parsing quantity literals
+ #[derive(Debug, Clone, PartialEq)]
+ pub enum QuantityLiteralError {
+@@ -43,14 +53,18 @@ impl std::fmt::Display for QuantityLiteralError {
+ /// - `-3.14`
+ /// - `1.5 km`
+ /// - `1.5 * km`
+-/// - `100 m`
++/// - `100 km/h`
++/// - `9.81 m/s^2`
++/// - `5 /s`
++/// - `20 °C`
+ pub fn parse_quantity_literal(
+     input: &str,
+     transformer: &Transformer,
+     typechecker: &TypeChecker,
+     unit_lookup: impl Fn(&str) -> Option<Unit>,
+ ) -> Result<(Quantity, TypeScheme), QuantityLiteralError> {
+-    let mut expr = parse_quantity_ast(input)?;
++    let normalized = normalize_superscripts(input);
++    let mut expr = collapse_leading_signs(parse_quantity_ast(&normalized)?);
+     transformer.transform_expression(&mut expr);
+     let type_scheme = get_expression_type(&expr, typechecker)?;
+     let quantity = evaluate_quantity_expression(&expr, &unit_lookup)?;
+@@ -58,10 +72,211 @@ pub fn parse_quantity_literal(
+     Ok((quantity, type_scheme))
+ }
+ 
++/// Rewrite Unicode superscript exponents into the ASCII `^(...)` spelling.
++///
++/// `unit_name` prints exponents as superscripts, and the tokenizer only accepts single digits
++/// one through nine, so a printed unit like `m\u{b9}\u{2070}` cannot be read back without this step.
++fn normalize_superscripts(input: &str) -> String {
++    let mut out = String::with_capacity(input.len());
++    let mut run = String::new();
++
++    for c in input.chars() {
++        let digit = match c {
++            '\u{2070}' => Some('0'),
++            '\u{b9}' => Some('1'),
++            '\u{b2}' => Some('2'),
++            '\u{b3}' => Some('3'),
++            '\u{2074}'..='\u{2079}' => char::from_u32(c as u32 - 0x2074 + '4' as u32),
++            '\u{207b}' => Some('-'),
++            _ => None,
++        };
++
++        match digit {
++            Some(d) => run.push(d),
++            None => {
++                flush_superscript_run(&mut run, &mut out);
++                out.push(c);
++            }
++        }
++    }
++
++    flush_superscript_run(&mut run, &mut out);
++    out
++}
++
++fn flush_superscript_run(run: &mut String, out: &mut String) {
++    if !run.is_empty() {
++        out.push_str("^(");
++        out.push_str(run);
++        out.push(')');
++        run.clear();
++    }
++}
++
++/// Parse the input as numbat source and return its single expression.
++fn single_expression(input: &str) -> Result<Expression<'_>, QuantityLiteralError> {
++    let input = input.trim();
++    if input.is_empty() {
++        return Err(QuantityLiteralError::ParseError("Empty input".to_string()));
++    }
++
++    let mut statements = parse(input, 0).map_err(|(_stmts, errs): (_, Vec<ParseError>)| {
++        let msg = errs
++            .iter()
++            .map(|e| format!("{:?}", e.kind))
++            .collect::<Vec<_>>()
++            .join(", ");
++        QuantityLiteralError::ParseError(msg)
++    })?;
++
++    if statements.len() != 1 {
++        return Err(QuantityLiteralError::InvalidPattern(format!(
++            "Expected a single expression, got {} statements",
++            statements.len()
++        )));
++    }
++
++    match statements.remove(0) {
++        Statement::Expression(expr) => Ok(expr),
++        _ => Err(QuantityLiteralError::InvalidPattern(
++            "Expected an expression, not a declaration".to_string(),
++        )),
++    }
++}
++
++/// Parse a unit literal, returning the unit it denotes and its corresponding type.
++///
++/// The input is a unit expression on its own, carrying no number. This is the inverse of
++/// `unit_name`.
++///
++/// Valid examples:
++/// - `m`
++/// - `km/h`
++/// - `m/s^2`
++/// - `kg m / s^2`
++pub fn parse_unit_literal(
++    input: &str,
++    transformer: &Transformer,
++    typechecker: &TypeChecker,
++    unit_lookup: impl Fn(&str) -> Option<Unit>,
++) -> Result<(Unit, TypeScheme), QuantityLiteralError> {
++    if input.trim().starts_with('/') {
++        let carried = format!("1 {}", input.trim());
++        let (quantity, type_scheme) =
++            parse_quantity_literal(&carried, transformer, typechecker, unit_lookup)?;
++
++        return Ok((quantity.unit().clone(), type_scheme));
++    }
++
++    let normalized = normalize_superscripts(input);
++    let mut expr = parse_unit_ast(&normalized)?;
++    transformer.transform_expression(&mut expr);
++    let type_scheme =
++        TypeScheme::concrete(Type::Dimension(unit_expression_dtype(&expr, typechecker)?));
++    let (_, unit) = unit_expression_value(&expr, &unit_lookup)?;
++
++    Ok((unit, type_scheme))
++}
++
++/// Express `quantity` in the unit the target string names, returning the bare number.
++///
++/// The target is a unit expression in the same grammar a quantity literal may carry, or the
++/// degree-sign syntax for an offset temperature scale. This is the inverse of `parse`.
++pub fn value_in_unit(
++    quantity: &Quantity,
++    target: &str,
++    transformer: &Transformer,
++    typechecker: &TypeChecker,
++    unit_lookup: impl Fn(&str) -> Option<Unit>,
++) -> Result<f64, QuantityLiteralError> {
++    let target = target.trim();
++    if target.is_empty() {
++        return Err(QuantityLiteralError::ParseError("Empty input".to_string()));
++    }
++
++    if let Some(scale) = offset_scale(target) {
++        let kelvin = unit_lookup(KELVIN).ok_or_else(|| {
++            QuantityLiteralError::NameResolutionError(format!("Unknown unit: {KELVIN}"))
++        })?;
++        let in_kelvin = convert_checked(quantity, &kelvin, target)?;
++
++        return Ok(scale.from_kelvin(in_kelvin));
++    }
++
++    let (unit, _) = parse_unit_literal(target, transformer, typechecker, unit_lookup)?;
++
++    convert_checked(quantity, &unit, target)
++}
++
++/// Convert `quantity` into `unit`, rejecting a dimension mismatch whatever the magnitude is.
++///
++/// `Quantity::convert_to` lets a zero through to any unit, which is not the contract here.
++fn convert_checked(
++    quantity: &Quantity,
++    unit: &Unit,
++    target: &str,
++) -> Result<f64, QuantityLiteralError> {
++    if quantity.unit().to_base_unit_representation().0 != unit.to_base_unit_representation().0 {
++        return Err(dimension_mismatch(quantity, target));
++    }
++
++    Ok(quantity
++        .convert_to(unit)
++        .map_err(|_| dimension_mismatch(quantity, target))?
++        .unsafe_value()
++        .to_f64())
++}
++
++/// The offset temperature scales the degree-sign syntax names.
++enum OffsetScale {
++    Celsius,
++    Fahrenheit,
++}
++
++impl OffsetScale {
++    fn from_kelvin(&self, kelvin: f64) -> f64 {
++        match self {
++            OffsetScale::Celsius => kelvin - OFFSET_CELSIUS,
++            OffsetScale::Fahrenheit => kelvin / SCALE_FAHRENHEIT - OFFSET_FAHRENHEIT,
++        }
++    }
++}
++
++fn offset_scale(target: &str) -> Option<OffsetScale> {
++    match target {
++        "°C" | "celsius" | "degree_celsius" => Some(OffsetScale::Celsius),
++        "°F" | "fahrenheit" | "degree_fahrenheit" => Some(OffsetScale::Fahrenheit),
++        _ => None,
++    }
++}
++
++fn dimension_mismatch(quantity: &Quantity, target: &str) -> QuantityLiteralError {
++    QuantityLiteralError::InvalidPattern(format!(
++        "Cannot express {} in '{}'",
++        quantity.unit(),
++        target
++    ))
++}
++
++/// Parse a unit literal and return the expression AST.
++///
++/// This accepts the same unit expressions a quantity literal may carry, but rejects any that
++/// carry a number.
++pub fn parse_unit_ast(input: &str) -> Result<Expression<'_>, QuantityLiteralError> {
++    let expr = single_expression(input)?;
++
++    match validate_unit_expression(&expr, false) {
++        Some(false) => Ok(expr),
++        _ => Err(QuantityLiteralError::InvalidPattern(
++            "Expected a unit expression without a number".to_string(),
++        )),
++    }
++}
++
+ /// Infer the type of a quantity literal expression.
+ ///
+-/// For scalars, returns the scalar (dimensionless) type.
+-/// For scalar × unit, returns the unit's type scheme.
++/// For scalars, returns the scalar (dimensionless) type. For a number followed by a unit
++/// expression, returns the dimension the unit expression denotes.
+ fn get_expression_type(
+     expr: &Expression,
+     typechecker: &TypeChecker,
+@@ -69,34 +284,143 @@ fn get_expression_type(
+     match expr {
+         Expression::Scalar(_, _) => Ok(TypeScheme::concrete(Type::scalar())),
+ 
++        Expression::BinaryOperator { .. } => Ok(TypeScheme::concrete(Type::Dimension(
++            unit_expression_dtype(expr, typechecker)?,
++        ))),
++
++        Expression::UnaryOperator {
++            op: UnaryOperator::Negate,
++            expr: inner,
++            ..
++        } => get_expression_type(inner, typechecker),
++
++        Expression::FunctionCall { callable, .. } if temperature_conversion(callable).is_some() => {
++            lookup_dtype(KELVIN, typechecker).map(|d| TypeScheme::concrete(Type::Dimension(d)))
++        }
++
++        _ => Err(QuantityLiteralError::InvalidPattern(
++            "Unexpected expression type".to_string(),
++        )),
++    }
++}
++
++/// Infer the dimension denoted by a unit expression. The leading number contributes no
++/// dimension of its own.
++fn unit_expression_dtype(
++    expr: &Expression,
++    typechecker: &TypeChecker,
++) -> Result<DType, QuantityLiteralError> {
++    match expr {
++        Expression::Scalar(_, _) => Ok(DType::scalar()),
++
++        Expression::UnitIdentifier { name, .. } => lookup_dtype(name, typechecker),
++
++        Expression::Identifier(_, _) => Err(QuantityLiteralError::InvalidPattern(
++            "Expected unit identifier".to_string(),
++        )),
++
+         Expression::BinaryOperator {
+             op: BinaryOperator::Mul,
++            lhs,
+             rhs,
+             ..
+-        } => {
+-            if let Expression::UnitIdentifier { name, .. } = rhs.as_ref() {
+-                typechecker.lookup_identifier_type(name).ok_or_else(|| {
+-                    QuantityLiteralError::NameResolutionError(format!("Unknown unit: {name}"))
+-                })
+-            } else {
+-                Err(QuantityLiteralError::InvalidPattern(
+-                    "Expected unit identifier".to_string(),
+-                ))
+-            }
+-        }
++        } => Ok(unit_expression_dtype(lhs, typechecker)?
++            .multiply(&unit_expression_dtype(rhs, typechecker)?)),
++
++        Expression::BinaryOperator {
++            op: BinaryOperator::Div,
++            lhs,
++            rhs,
++            ..
++        } => Ok(unit_expression_dtype(lhs, typechecker)?
++            .divide(&unit_expression_dtype(rhs, typechecker)?)),
++
++        Expression::BinaryOperator {
++            op: BinaryOperator::Power,
++            lhs,
++            rhs,
++            ..
++        } => Ok(unit_expression_dtype(lhs, typechecker)?.power(exponent_value(rhs)?)),
+ 
+         Expression::UnaryOperator {
+             op: UnaryOperator::Negate,
+             expr: inner,
+             ..
+-        } => get_expression_type(inner, typechecker),
++        } => unit_expression_dtype(inner, typechecker),
+ 
+         _ => Err(QuantityLiteralError::InvalidPattern(
+-            "Unexpected expression type".to_string(),
++            "Expected unit identifier".to_string(),
++        )),
++    }
++}
++
++/// Look up the dimension a unit name was declared with.
++fn lookup_dtype(name: &str, typechecker: &TypeChecker) -> Result<DType, QuantityLiteralError> {
++    match typechecker.lookup_identifier_type(name) {
++        Some(scheme) => match scheme.to_concrete_type() {
++            Type::Dimension(dtype) => Ok(dtype),
++            _ => Err(QuantityLiteralError::InvalidPattern(format!(
++                "Not a unit: {name}"
++            ))),
++        },
++        None => Err(QuantityLiteralError::NameResolutionError(format!(
++            "Unknown unit: {name}"
++        ))),
++    }
++}
++
++/// Returns the conversion the given callable stands for, if it is one of the temperature
++/// conversions the language's degree-sign syntax expands to.
++fn temperature_conversion(callable: &Expression) -> Option<&'static str> {
++    match callable {
++        Expression::Identifier(_, name) if *name == "from_celsius" => Some("from_celsius"),
++        Expression::Identifier(_, name) if *name == "from_fahrenheit" => Some("from_fahrenheit"),
++        _ => None,
++    }
++}
++
++/// Evaluate an exponent, which must be an exact integer or rational.
++fn exponent_value(expr: &Expression) -> Result<Exponent, QuantityLiteralError> {
++    match expr {
++        Expression::Scalar(_, n) => rational_from_f64(n.to_f64()),
++
++        Expression::UnaryOperator {
++            op: UnaryOperator::Negate,
++            expr: inner,
++            ..
++        } => Ok(-exponent_value(inner)?),
++
++        Expression::BinaryOperator {
++            op: BinaryOperator::Div,
++            lhs,
++            rhs,
++            ..
++        } if is_integer_exponent(lhs) && is_integer_exponent(rhs) => {
++            let denominator = exponent_value(rhs)?;
++            if denominator.is_zero() {
++                return Err(QuantityLiteralError::InvalidPattern(
++                    "Exponent divides by zero".to_string(),
++                ));
++            }
++            Ok(exponent_value(lhs)? / denominator)
++        }
++
++        _ => Err(QuantityLiteralError::InvalidPattern(
++            "Expected a numeric exponent".to_string(),
+         )),
+     }
+ }
+ 
++/// Convert a literal number to an exact rational, rejecting non-integers.
++fn rational_from_f64(value: f64) -> Result<Exponent, QuantityLiteralError> {
++    if value.fract() != 0.0 || !value.is_finite() {
++        return Err(QuantityLiteralError::InvalidPattern(
++            "Exponent must be an integer or a ratio of integers".to_string(),
++        ));
++    }
++    Ok(Rational::from_integer(value as i128))
++}
++
+ /// Evaluate a quantity literal expression to produce a Quantity.
+ fn evaluate_quantity_expression(
+     expr: &Expression,
+@@ -106,16 +430,10 @@ fn evaluate_quantity_expression(
+         // Plain scalar
+         Expression::Scalar(_, n) => Ok(Quantity::from_scalar(n.to_f64())),
+ 
+-        // Scalar × Unit
+-        Expression::BinaryOperator {
+-            op: BinaryOperator::Mul,
+-            lhs,
+-            rhs,
+-            ..
+-        } => {
+-            let scalar = extract_scalar(lhs)?;
+-            let unit = extract_unit(rhs, unit_lookup)?;
+-            Ok(Quantity::new(Number::from_f64(scalar), unit))
++        // A unit expression carrying the leading number in its leftmost position
++        Expression::BinaryOperator { .. } => {
++            let (value, unit) = unit_expression_value(expr, unit_lookup)?;
++            Ok(Quantity::new(Number::from_f64(value), unit))
+         }
+ 
+         // Negation
+@@ -128,18 +446,104 @@ fn evaluate_quantity_expression(
+             Ok(-quantity)
+         }
+ 
++        // Degree-sign temperatures, which the prefix transformer expands into a call
++        Expression::FunctionCall { callable, args, .. }
++            if temperature_conversion(callable).is_some() =>
++        {
++            let conversion = temperature_conversion(callable).unwrap();
++            let [argument] = args.as_slice() else {
++                return Err(QuantityLiteralError::InvalidPattern(
++                    "Expected a single temperature value".to_string(),
++                ));
++            };
++            let value = evaluate_quantity_expression(argument, unit_lookup)?;
++            if !value.unit().is_scalar() {
++                return Err(QuantityLiteralError::InvalidPattern(
++                    "Expected a dimensionless temperature value".to_string(),
++                ));
++            }
++            let degrees = value.unsafe_value().to_f64();
++            let kelvin = match conversion {
++                "from_celsius" => degrees + OFFSET_CELSIUS,
++                _ => (degrees + OFFSET_FAHRENHEIT) * SCALE_FAHRENHEIT,
++            };
++            let unit = unit_lookup(KELVIN).ok_or_else(|| {
++                QuantityLiteralError::NameResolutionError(format!("Unknown unit: {KELVIN}"))
++            })?;
++            Ok(Quantity::new(Number::from_f64(kelvin), unit))
++        }
++
+         _ => Err(QuantityLiteralError::InvalidPattern(
+             "Unexpected expression type".to_string(),
+         )),
+     }
+ }
+ 
+-/// Extract the scalar value from a Scalar expression.
+-fn extract_scalar(expr: &Expression) -> Result<f64, QuantityLiteralError> {
++/// Evaluate a unit expression to the number and Unit it denotes. The leading number appears
++/// as the leftmost leaf; every other leaf contributes a factor of one.
++fn unit_expression_value(
++    expr: &Expression,
++    unit_lookup: &impl Fn(&str) -> Option<Unit>,
++) -> Result<(f64, Unit), QuantityLiteralError> {
+     match expr {
+-        Expression::Scalar(_, n) => Ok(n.to_f64()),
++        Expression::Scalar(_, n) => Ok((n.to_f64(), Unit::scalar())),
++
++        Expression::UnitIdentifier { .. } | Expression::Identifier(_, _) => {
++            Ok((1.0, extract_unit(expr, unit_lookup)?))
++        }
++
++        Expression::BinaryOperator {
++            op: BinaryOperator::Mul,
++            lhs,
++            rhs,
++            ..
++        } => {
++            let (left_value, left_unit) = unit_expression_value(lhs, unit_lookup)?;
++            let (right_value, right_unit) = unit_expression_value(rhs, unit_lookup)?;
++            Ok((left_value * right_value, left_unit * right_unit))
++        }
++
++        Expression::BinaryOperator {
++            op: BinaryOperator::Div,
++            lhs,
++            rhs,
++            ..
++        } => {
++            let (left_value, left_unit) = unit_expression_value(lhs, unit_lookup)?;
++            let (right_value, right_unit) = unit_expression_value(rhs, unit_lookup)?;
++            if right_value == 0.0 {
++                return Err(QuantityLiteralError::InvalidPattern(
++                    "Division by zero".to_string(),
++                ));
++            }
++            Ok((left_value / right_value, left_unit / right_unit))
++        }
++
++        Expression::BinaryOperator {
++            op: BinaryOperator::Power,
++            lhs,
++            rhs,
++            ..
++        } => {
++            let exponent = exponent_value(rhs)?;
++            let (base_value, base_unit) = unit_expression_value(lhs, unit_lookup)?;
++            let exponent_f64 = exponent.to_f64().ok_or_else(|| {
++                QuantityLiteralError::InvalidPattern("Exponent is out of range".to_string())
++            })?;
++            Ok((base_value.powf(exponent_f64), base_unit.power(exponent)))
++        }
++
++        Expression::UnaryOperator {
++            op: UnaryOperator::Negate,
++            expr: inner,
++            ..
++        } => {
++            let (value, unit) = unit_expression_value(inner, unit_lookup)?;
++            Ok((-value, unit))
++        }
++
+         _ => Err(QuantityLiteralError::InvalidPattern(
+-            "Expected scalar".to_string(),
++            "Expected unit identifier".to_string(),
+         )),
+     }
+ }
+@@ -172,45 +576,49 @@ fn extract_unit(
+ /// - `-3.14`
+ /// - `1.5 km`
+ /// - `1.5 * km`
+-/// - `100 m`
++/// - `100 km/h`
++/// - `9.81 m/s^2`
++/// - `1 km^2`
++/// - `5 /s`
+ ///
+ /// Invalid examples (will return an error):
+ /// - `1 + 2`
+ /// - `1 km + 500 m`
+-/// - `100 km/h` (compound units not supported)
++/// - `2 * 3 m` (only one number is allowed)
+ /// - `x` (variables not supported)
+-pub fn parse_quantity_ast(input: &str) -> Result<Expression<'_>, QuantityLiteralError> {
+-    let input = input.trim();
+-    if input.is_empty() {
+-        return Err(QuantityLiteralError::ParseError("Empty input".to_string()));
++/// Fold repeated leading signs into at most one negation.
++///
++/// A quantity literal may carry a repeated sign, and the degree-sign temperature rewrite only
++/// recognises a single negation directly around the unit. Folding first keeps the sign attached
++/// to the number the affine conversion consumes.
++fn collapse_leading_signs(expr: Expression<'_>) -> Expression<'_> {
++    let mut negations = 0usize;
++    let mut span = None;
++    let mut current = expr;
++
++    while let Expression::UnaryOperator {
++        op: UnaryOperator::Negate,
++        expr: inner,
++        span_op,
++    } = current
++    {
++        negations += 1;
++        span = Some(span_op);
++        current = *inner;
+     }
+ 
+-    let mut statements = parse(input, 0).map_err(|(_stmts, errs): (_, Vec<ParseError>)| {
+-        let msg = errs
+-            .iter()
+-            .map(|e| format!("{:?}", e.kind))
+-            .collect::<Vec<_>>()
+-            .join(", ");
+-        QuantityLiteralError::ParseError(msg)
+-    })?;
+-
+-    if statements.len() != 1 {
+-        return Err(QuantityLiteralError::InvalidPattern(format!(
+-            "Expected a single expression, got {} statements",
+-            statements.len()
+-        )));
++    match span {
++        Some(span_op) if negations % 2 == 1 => Expression::UnaryOperator {
++            op: UnaryOperator::Negate,
++            expr: Box::new(current),
++            span_op,
++        },
++        _ => current,
+     }
++}
+ 
+-    let statement = statements.remove(0);
+-
+-    let expr = match statement {
+-        Statement::Expression(expr) => expr,
+-        _ => {
+-            return Err(QuantityLiteralError::InvalidPattern(
+-                "Expected an expression, not a declaration".to_string(),
+-            ));
+-        }
+-    };
++pub fn parse_quantity_ast(input: &str) -> Result<Expression<'_>, QuantityLiteralError> {
++    let expr = single_expression(input)?;
+ 
+     if !is_valid_quantity_literal(&expr) {
+         return Err(QuantityLiteralError::InvalidPattern(
+@@ -225,25 +633,92 @@ fn is_valid_quantity_literal(expr: &Expression) -> bool {
+     match expr {
+         Expression::Scalar(_, _) => true,
+ 
+-        // Scalar times unit (implicit or explicit multiplication)
++        // Negation of a valid quantity literal
++        Expression::UnaryOperator {
++            op: UnaryOperator::Negate,
++            expr: inner,
++            ..
++        } => is_valid_quantity_literal(inner),
++
++        // A unit expression whose leftmost leaf is the one number the literal may carry
++        _ => validate_unit_expression(expr, true) == Some(true),
++    }
++}
++
++/// Check the shape of a unit expression, returning whether it carries a number, or `None`
++/// if the shape is not a unit expression at all. A number is only allowed in the leftmost
++/// leaf, which `number_allowed` tracks. This runs before the prefix transformer, so unit
++/// names are still plain identifiers.
++fn validate_unit_expression(expr: &Expression, number_allowed: bool) -> Option<bool> {
++    match expr {
++        Expression::Scalar(_, _) if number_allowed => Some(true),
++
++        Expression::Identifier(_, _) | Expression::UnitIdentifier { .. } => Some(false),
++
+         Expression::BinaryOperator {
+-            op: BinaryOperator::Mul,
++            op: BinaryOperator::Mul | BinaryOperator::Div,
+             lhs,
+             rhs,
+             ..
+-        } if lhs.is_scalar() && rhs.is_identifier() => true,
++        } => {
++            let left = validate_unit_expression(lhs, number_allowed)?;
++            let right = validate_unit_expression(rhs, false)?;
++            Some(left || right)
++        }
++
++        Expression::BinaryOperator {
++            op: BinaryOperator::Power,
++            lhs,
++            rhs,
++            ..
++        } if is_exponent_expression(rhs) => validate_unit_expression(lhs, false),
+ 
+-        // Negation of a valid quantity literal
+         Expression::UnaryOperator {
+             op: UnaryOperator::Negate,
+             expr: inner,
+             ..
+-        } => is_valid_quantity_literal(inner),
++        } if number_allowed => validate_unit_expression(inner, true),
++
++        _ => None,
++    }
++}
++
++/// Returns whether the expression is a signed integer, with no arithmetic of its own.
++fn is_integer_exponent(expr: &Expression) -> bool {
++    match expr {
++        Expression::Scalar(_, _) => true,
++
++        Expression::UnaryOperator {
++            op: UnaryOperator::Negate,
++            expr: inner,
++            ..
++        } => is_integer_exponent(inner),
+ 
+         _ => false,
+     }
+ }
+ 
++/// Returns whether the expression is an integer or a single ratio of integers. A ratio whose
++/// own operands are computed is not one of those forms.
++fn is_exponent_expression(expr: &Expression) -> bool {
++    match expr {
++        Expression::UnaryOperator {
++            op: UnaryOperator::Negate,
++            expr: inner,
++            ..
++        } => is_exponent_expression(inner),
++
++        Expression::BinaryOperator {
++            op: BinaryOperator::Div,
++            lhs,
++            rhs,
++            ..
++        } => is_integer_exponent(lhs) && is_integer_exponent(rhs),
++
++        _ => is_integer_exponent(expr),
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;

@@ -1,0 +1,1051 @@
+diff --git a/ast/parameterlist.go b/ast/parameterlist.go
+index 635a812..d361c11 100644
+--- a/ast/parameterlist.go
++++ b/ast/parameterlist.go
+@@ -44,6 +44,18 @@ func NewParameterList(
+ 	}
+ }
+ 
++// RequiredArgumentCount returns the number of arguments a call has to provide:
++// the parameters up to the first one which declares a default argument
++func (l *ParameterList) RequiredArgumentCount() int {
++	for index, parameter := range l.Parameters {
++		if parameter.HasDefaultArgument() {
++			return index
++		}
++	}
++
++	return len(l.Parameters)
++}
++
+ // EffectiveArgumentLabels returns the effective argument labels that
+ // the arguments of a call must use:
+ // If no argument label is declared for parameter,
+diff --git a/interpreter/interpreter.go b/interpreter/interpreter.go
+index 18b751a..04a4b9a 100644
+--- a/interpreter/interpreter.go
++++ b/interpreter/interpreter.go
+@@ -3068,12 +3068,9 @@ func (interpreter *Interpreter) functionConditionsWrapper(
+ 					interpreter.activations.PushNewWithParent(lexicalScope)
+ 					defer interpreter.activations.Pop()
+ 
+-					if declaration.ParameterList != nil {
+-						interpreter.bindParameterArguments(
+-							declaration.ParameterList,
+-							invocation.Arguments,
+-						)
+-					}
++					// `self` and `base` are made available
++					// before the parameters are bound,
++					// so that a default argument may refer to them
+ 
+ 					if invocation.Self != nil {
+ 						interpreter.declareSelfVariable(*invocation.Self)
+@@ -3082,6 +3079,14 @@ func (interpreter *Interpreter) functionConditionsWrapper(
+ 						interpreter.declareVariable(sema.BaseIdentifier, invocation.Base)
+ 					}
+ 
++					if declaration.ParameterList != nil {
++						interpreter.bindParameterArguments(
++							functionType,
++							declaration.ParameterList,
++							invocation.Arguments,
++						)
++					}
++
+ 					// NOTE: It is important to wrap the invocation in a function,
+ 					//  so the inner function isn't invoked here
+ 
+diff --git a/interpreter/interpreter_expression.go b/interpreter/interpreter_expression.go
+index 8781922..62c8b0b 100644
+--- a/interpreter/interpreter_expression.go
++++ b/interpreter/interpreter_expression.go
+@@ -1301,6 +1301,7 @@ func (interpreter *Interpreter) visitInvocationExpressionWithImplicitArgument(
+ 		implicitArg,
+ 		argumentTypes,
+ 		parameterTypes,
++		invocationExpressionTypes.ParameterIndexes,
+ 		returnType,
+ 		typeArguments,
+ 	)
+diff --git a/interpreter/interpreter_invocation.go b/interpreter/interpreter_invocation.go
+index c090019..bfc3b2b 100644
+--- a/interpreter/interpreter_invocation.go
++++ b/interpreter/interpreter_invocation.go
+@@ -22,6 +22,7 @@ import (
+ 	"github.com/onflow/atree"
+ 
+ 	"github.com/onflow/cadence/ast"
++	"github.com/onflow/cadence/errors"
+ 	"github.com/onflow/cadence/sema"
+ )
+ 
+@@ -72,6 +73,7 @@ func invokeFunctionValue(
+ 		nil, // no implicit argument
+ 		argumentTypes,
+ 		parameterTypes,
++		nil, // each argument is for the parameter at the same position
+ 		returnType,
+ 		typeArguments,
+ 	)
+@@ -85,6 +87,7 @@ func invokeFunctionValueWithEval[T any](
+ 	implicitArgumentValue Value,
+ 	argumentTypes []sema.Type,
+ 	parameterTypes []sema.Type,
++	parameterIndexes []int,
+ 	returnType sema.Type,
+ 	typeArguments *sema.TypeParameterTypeOrderedMap,
+ ) Value {
+@@ -120,9 +123,20 @@ func invokeFunctionValueWithEval[T any](
+ 		actualFunctionType,
+ 		parameterTypes,
+ 		argumentTypes,
++		parameterIndexes,
+ 		typeArguments,
+ 	)
+ 
++	// Place the arguments at the position of the parameter they are for,
++	// leaving a hole for every parameter the call left off
++
++	if parameterIndexes != nil {
++		transferredArguments = spreadArguments(
++			transferredArguments,
++			parameterIndexes,
++		)
++	}
++
+ 	// add the implicit argument to the end of the argument list, if it exists
+ 	if implicitArgumentValue != nil {
+ 		transferredImplicitArgument := implicitArgumentValue.Transfer(
+@@ -181,6 +195,25 @@ func invokeFunctionValueWithEval[T any](
+ 	)
+ }
+ 
++// spreadArguments returns the given arguments,
++// each moved to the position of the parameter it is the argument for
++func spreadArguments(arguments []Value, parameterIndexes []int) []Value {
++	var lastParameterIndex int
++	for _, index := range parameterIndexes {
++		lastParameterIndex = max(lastParameterIndex, index)
++	}
++
++	spreadArguments := make([]Value, lastParameterIndex+1)
++	for argumentIndex, parameterIndex := range parameterIndexes {
++		if argumentIndex >= len(arguments) {
++			break
++		}
++		spreadArguments[parameterIndex] = arguments[argumentIndex]
++	}
++
++	return spreadArguments
++}
++
+ func transferArguments[T any](
+ 	context InvocationContext,
+ 	arguments []T,
+@@ -188,6 +221,7 @@ func transferArguments[T any](
+ 	actualFunctionType *sema.FunctionType,
+ 	parameterTypes []sema.Type,
+ 	argumentTypes []sema.Type,
++	parameterIndexes []int,
+ 	typeArguments *sema.TypeParameterTypeOrderedMap,
+ ) []Value {
+ 
+@@ -232,8 +266,13 @@ func transferArguments[T any](
+ 				//   let f: fun(Int): UInt8? = funcWithOptionalParam
+ 				//   f(4)  // call-site param type is Int, actual param type is Int?
+ 				var parameterType sema.Type
+-				if i < actualParamsCount {
+-					parameterType = actualParameters[i].TypeAnnotation.Type.Resolve(typeArguments)
++				actualParameterIndex := i
++				if parameterIndexes != nil {
++					actualParameterIndex = parameterIndexes[i]
++				}
++				if actualParameterIndex < actualParamsCount {
++					parameterType = actualParameters[actualParameterIndex].
++						TypeAnnotation.Type.Resolve(typeArguments)
+ 				}
+ 
+ 				// It is possible that resolving the type-parameter may not always be successful,
+@@ -306,7 +345,11 @@ func (interpreter *Interpreter) invokeInterpretedFunctionActivated(
+ 	defer interpreter.activations.Pop()
+ 
+ 	if function.ParameterList != nil {
+-		interpreter.bindParameterArguments(function.ParameterList, arguments)
++		interpreter.bindParameterArguments(
++			function.Type,
++			function.ParameterList,
++			arguments,
++		)
+ 	}
+ 
+ 	return interpreter.visitFunctionBody(
+@@ -321,13 +364,86 @@ func (interpreter *Interpreter) invokeInterpretedFunctionActivated(
+ 	)
+ }
+ 
+-// bindParameterArguments binds the argument values to the given parameters
++// bindParameterArguments binds the argument values to the given parameters.
++// Every parameter the call left off is bound to its default argument
+ func (interpreter *Interpreter) bindParameterArguments(
++	functionType *sema.FunctionType,
+ 	parameterList *ast.ParameterList,
+ 	arguments []Value,
+ ) {
+-	for parameterIndex, parameter := range parameterList.Parameters {
+-		argument := arguments[parameterIndex]
+-		interpreter.declareVariable(parameter.Identifier.Identifier, argument)
++	parameters := parameterList.Parameters
++	argumentCount := len(arguments)
++
++	argument := func(parameterIndex int) Value {
++		if parameterIndex >= argumentCount {
++			return nil
++		}
++		return arguments[parameterIndex]
++	}
++
++	// The default arguments are evaluated before any parameter is declared,
++	// so that a default argument is evaluated in the scope which encloses
++	// the parameters, and does not see the parameters of this very call
++
++	var defaultArguments []Value
++
++	for parameterIndex, parameter := range parameters {
++		if argument(parameterIndex) != nil {
++			continue
++		}
++
++		if defaultArguments == nil {
++			defaultArguments = make([]Value, len(parameters))
++		}
++
++		defaultArguments[parameterIndex] = interpreter.evalDefaultArgument(
++			functionType,
++			parameter,
++			parameterIndex,
++		)
+ 	}
++
++	for parameterIndex, parameter := range parameters {
++		value := argument(parameterIndex)
++		if value == nil {
++			value = defaultArguments[parameterIndex]
++		}
++
++		interpreter.declareVariable(parameter.Identifier.Identifier, value)
++	}
++}
++
++// evalDefaultArgument evaluates the default argument of the given parameter
++func (interpreter *Interpreter) evalDefaultArgument(
++	functionType *sema.FunctionType,
++	parameter *ast.Parameter,
++	parameterIndex int,
++) Value {
++	defaultArgument := parameter.DefaultArgument
++	if defaultArgument == nil {
++		panic(errors.NewUnexpectedError(
++			"missing argument for parameter %s",
++			parameter.Identifier.Identifier,
++		))
++	}
++
++	value := interpreter.evalExpression(defaultArgument)
++
++	// Convert and box the value like an argument of a call,
++	// e.g. an `Int` default argument of an `Int?` parameter
++
++	if functionType != nil &&
++		parameterIndex < len(functionType.Parameters) {
++
++		semaParameter := functionType.Parameters[parameterIndex]
++
++		value = TransferIfNotResourceAndConvert(
++			interpreter,
++			value,
++			semaParameter.DefaultArgument,
++			semaParameter.TypeAnnotation.Type,
++		)
++	}
++
++	return value
+ }
+diff --git a/interpreter/interpreter_transaction.go b/interpreter/interpreter_transaction.go
+index 4096412..7fafb1f 100644
+--- a/interpreter/interpreter_transaction.go
++++ b/interpreter/interpreter_transaction.go
+@@ -93,7 +93,11 @@ func (interpreter *Interpreter) declareTransactionEntryPoint(declaration *ast.Tr
+ 				transactionArguments := invocation.Arguments[:transactionParameterCount]
+ 				prepareArguments := invocation.Arguments[transactionParameterCount:]
+ 
+-				interpreter.bindParameterArguments(declaration.ParameterList, transactionArguments)
++				interpreter.bindParameterArguments(
++					nil,
++					declaration.ParameterList,
++					transactionArguments,
++				)
+ 				invocation.Arguments = prepareArguments
+ 			}
+ 
+diff --git a/parser/function.go b/parser/function.go
+index cc8d8b3..3d0480e 100644
+--- a/parser/function.go
++++ b/parser/function.go
+@@ -35,7 +35,31 @@ func parsePurityAnnotation(p *parser) ast.FunctionPurity {
+ 	return ast.FunctionPurityUnspecified
+ }
+ 
++// defaultArgumentsMode determines how a parameter list treats default arguments.
++type defaultArgumentsMode uint8
++
++const (
++	// defaultArgumentsDisallowed rejects a default argument on any parameter
++	defaultArgumentsDisallowed defaultArgumentsMode = iota
++	// defaultArgumentsAllowed accepts a default argument on any parameter
++	defaultArgumentsAllowed
++	// defaultArgumentsRequired requires a default argument on every parameter
++	defaultArgumentsRequired
++)
++
+ func parseParameterList(p *parser, expectDefaultArguments bool) (*ast.ParameterList, error) {
++	defaultArguments := defaultArgumentsDisallowed
++	if expectDefaultArguments {
++		defaultArguments = defaultArgumentsRequired
++	}
++
++	return parseParameterListWithDefaultArguments(p, defaultArguments)
++}
++
++func parseParameterListWithDefaultArguments(
++	p *parser,
++	defaultArguments defaultArgumentsMode,
++) (*ast.ParameterList, error) {
+ 	var parameters []*ast.Parameter
+ 
+ 	p.skipSpaceAndComments()
+@@ -68,7 +92,7 @@ func parseParameterList(p *parser, expectDefaultArguments bool) (*ast.ParameterL
+ 					Pos: p.current.StartPos,
+ 				})
+ 			}
+-			parameter, err := parseParameter(p, expectDefaultArguments)
++			parameter, err := parseParameter(p, defaultArguments)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+@@ -121,7 +145,7 @@ func parseParameterList(p *parser, expectDefaultArguments bool) (*ast.ParameterL
+ 	), nil
+ }
+ 
+-func parseParameter(p *parser, expectDefaultArgument bool) (*ast.Parameter, error) {
++func parseParameter(p *parser, defaultArguments defaultArgumentsMode) (*ast.Parameter, error) {
+ 	p.skipSpaceAndComments()
+ 
+ 	startPos := p.current.StartPos
+@@ -170,13 +194,18 @@ func parseParameter(p *parser, expectDefaultArgument bool) (*ast.Parameter, erro
+ 
+ 	var defaultArgument ast.Expression
+ 
+-	if expectDefaultArgument {
+-		if !p.current.Is(lexer.TokenEqual) {
+-			return nil, &MissingDefaultArgumentError{
+-				GotToken: p.current,
+-			}
++	switch {
++	case defaultArguments == defaultArgumentsRequired && !p.current.Is(lexer.TokenEqual):
++		return nil, &MissingDefaultArgumentError{
++			GotToken: p.current,
+ 		}
+ 
++	case defaultArguments == defaultArgumentsDisallowed && p.current.Is(lexer.TokenEqual):
++		return nil, &UnexpectedDefaultArgumentError{
++			Pos: p.current.StartPos,
++		}
++
++	case p.current.Is(lexer.TokenEqual):
+ 		// Skip the =
+ 		p.nextSemanticToken()
+ 
+@@ -184,11 +213,6 @@ func parseParameter(p *parser, expectDefaultArgument bool) (*ast.Parameter, erro
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-
+-	} else if p.current.Is(lexer.TokenEqual) {
+-		return nil, &UnexpectedDefaultArgumentError{
+-			Pos: p.current.StartPos,
+-		}
+ 	}
+ 
+ 	return ast.NewParameter(
+@@ -385,7 +409,7 @@ func parseFunctionParameterListAndRest(
+ ) {
+ 	// Parameter list
+ 
+-	parameterList, err = parseParameterList(p, false)
++	parameterList, err = parseParameterListWithDefaultArguments(p, defaultArgumentsAllowed)
+ 	if err != nil {
+ 		return
+ 	}
+diff --git a/sema/check_composite_declaration.go b/sema/check_composite_declaration.go
+index 32871c1..91cb26f 100644
+--- a/sema/check_composite_declaration.go
++++ b/sema/check_composite_declaration.go
+@@ -2568,6 +2568,10 @@ func (checker *Checker) checkSpecialFunction(
+ 		true,
+ 		initializationInfo,
+ 		checkResourceLoss,
++		// The parameters of an event declaration are the event's fields,
++		// and the default arguments of a default destruction event
++		// are checked separately, with the container in scope
++		compositeKind != common.CompositeKindEvent,
+ 	)
+ 
+ 	if containerKind == ContainerKindComposite {
+diff --git a/sema/check_function.go b/sema/check_function.go
+index dfc4477..9c5e616 100644
+--- a/sema/check_function.go
++++ b/sema/check_function.go
+@@ -134,6 +134,7 @@ func (checker *Checker) visitFunctionDeclaration(
+ 		options.mustExit,
+ 		nil,
+ 		options.checkResourceLoss,
++		true,
+ 	)
+ }
+ 
+@@ -170,6 +171,7 @@ func (checker *Checker) checkFunction(
+ 	mustExit bool,
+ 	initializationInfo *InitializationInfo,
+ 	checkResourceLoss bool,
++	checkDefaultArguments bool,
+ ) {
+ 	// check argument labels
+ 	checker.checkArgumentLabels(parameterList)
+@@ -204,6 +206,18 @@ func (checker *Checker) checkFunction(
+ 				checker.leaveValueScope(endPosGetter, checkResourceLoss)
+ 			}()
+ 
++			// The default arguments are checked before the parameters are declared:
++			// a default argument is evaluated before any parameter is bound,
++			// so the parameters are not in scope for it
++
++			if checkDefaultArguments {
++				checker.checkDefaultArguments(
++					parameterList,
++					functionType,
++					functionBlock != nil,
++				)
++			}
++
+ 			checker.declareParameters(parameterList, functionType.Parameters)
+ 
+ 			functionActivation.InitializationInfo = initializationInfo
+@@ -243,6 +257,89 @@ func (checker *Checker) checkFunction(
+ // checkFunctionExits checks that the given function block exits
+ // with a return-type appropriate return statement.
+ // The return is not needed if the function has a `Void` return type.
++// checkDefaultArguments checks the default arguments of the given parameters.
++//
++// A default argument is evaluated once per call which leaves the argument off,
++// so it must be pure, and it must not produce a resource,
++// which would be lost for every call that provides the argument.
++//
++// A parameter which follows one that has a default argument
++// must have one as well.
++func (checker *Checker) checkDefaultArguments(
++	parameterList *ast.ParameterList,
++	functionType *FunctionType,
++	hasImplementation bool,
++) {
++	var previousParameterHasDefaultArgument bool
++
++	for index, parameter := range parameterList.Parameters {
++
++		defaultArgument := parameter.DefaultArgument
++		if defaultArgument == nil {
++			if previousParameterHasDefaultArgument {
++				checker.report(&MissingDefaultArgumentError{
++					Parameter: parameter,
++					Range: ast.NewRangeFromPositioned(
++						checker.memoryGauge,
++						parameter,
++					),
++				})
++			}
++			continue
++		}
++
++		previousParameterHasDefaultArgument = true
++
++		// A function which has no implementation, like an interface requirement,
++		// has no scope to evaluate a default argument in
++
++		if !hasImplementation {
++			checker.report(&DefaultArgumentWithoutImplementationError{
++				Range: ast.NewRangeFromPositioned(
++					checker.memoryGauge,
++					defaultArgument,
++				),
++			})
++			continue
++		}
++
++		if index >= len(functionType.Parameters) {
++			continue
++		}
++
++		typeAnnotation := functionType.Parameters[index].TypeAnnotation
++
++		if typeAnnotation.IsResource {
++			checker.report(&InvalidResourceDefaultArgumentError{
++				Range: ast.NewRangeFromPositioned(
++					checker.memoryGauge,
++					defaultArgument,
++				),
++			})
++			continue
++		}
++
++		parameterType := typeAnnotation.Type
++
++		var defaultArgumentType Type
++		checker.InNewPurityScope(true, func() {
++			defaultArgumentType = checker.VisitExpression(
++				defaultArgument,
++				nil,
++				parameterType,
++			)
++		})
++
++		// Record the type the default argument produces on the parameter itself,
++		// so it is available wherever the function type is,
++		// also when the function is declared in another location
++
++		if !defaultArgumentType.IsInvalidType() {
++			functionType.Parameters[index].DefaultArgument = defaultArgumentType
++		}
++	}
++}
++
+ func (checker *Checker) checkFunctionExits(functionBlock *ast.FunctionBlock, returnType Type) {
+ 
+ 	if returnType == VoidType {
+@@ -553,6 +650,7 @@ func (checker *Checker) VisitFunctionExpression(expression *ast.FunctionExpressi
+ 		true,
+ 		nil,
+ 		true,
++		true,
+ 	)
+ 
+ 	// function expressions are not allowed in conditions
+diff --git a/sema/check_invocation_expression.go b/sema/check_invocation_expression.go
+index c9fbbb3..c695d6d 100644
+--- a/sema/check_invocation_expression.go
++++ b/sema/check_invocation_expression.go
+@@ -158,9 +158,23 @@ func (checker *Checker) checkInvocationExpression(invocationExpression *ast.Invo
+ 
+ 	var returnType Type
+ 
++	// Match the arguments to the parameters:
++	// a call may leave off any argument whose parameter has a default argument,
++	// so an argument is not necessarily the argument for the parameter
++	// at the same position
++
++	parameterIndexes := matchArgumentsToParameters(
++		invocationExpression.Arguments,
++		functionType,
++	)
++
+ 	checkInvocation := func() {
+ 		argumentTypes, returnType =
+-			checker.checkInvocation(invocationExpression, functionType)
++			checker.checkInvocation(
++				invocationExpression,
++				functionType,
++				parameterIndexes,
++			)
+ 	}
+ 
+ 	if isOptionalChainingResult {
+@@ -191,12 +205,14 @@ func (checker *Checker) checkInvocationExpression(invocationExpression *ast.Invo
+ 		checker.checkIdentifierInvocationArgumentLabels(
+ 			invocationExpression,
+ 			typedInvokedExpression,
++			parameterIndexes,
+ 		)
+ 
+ 	case *ast.MemberExpression:
+ 		checker.checkMemberInvocationArgumentLabels(
+ 			invocationExpression,
+ 			typedInvokedExpression,
++			parameterIndexes,
+ 		)
+ 	}
+ 
+@@ -313,9 +329,158 @@ func (checker *Checker) checkConstructorInvocationWithResourceResult(
+ 	)
+ }
+ 
++// matchArgumentsToParameters returns the index of the parameter
++// each argument of a call provides the value for.
++//
++// The arguments keep the order the parameters are declared in,
++// but a parameter which has a default argument may be left off,
++// so an argument is matched to the next parameter which either
++// has the argument's label, or has no default argument.
++//
++// The result is nil when every argument matches the parameter
++// at the same position, which is the common case.
++func matchArgumentsToParameters(
++	arguments []*ast.Argument,
++	functionType *FunctionType,
++) []int {
++
++	parameters := functionType.Parameters
++	parameterCount := len(parameters)
++
++	var parameterIndexes []int
++
++	parameterIndex := 0
++
++	for argumentIndex, argument := range arguments {
++
++		// Skip over the parameters which have a default argument
++		// and which this argument is not for
++
++		for parameterIndex < parameterCount {
++			parameter := parameters[parameterIndex]
++
++			if parameter.DefaultArgument == nil ||
++				expectedArgumentLabel(parameter) == argument.Label {
++
++				break
++			}
++
++			if parameterIndexes == nil {
++				parameterIndexes = identityParameterIndexes(len(arguments))
++			}
++
++			parameterIndex++
++		}
++
++		if parameterIndexes != nil {
++			// An argument which is left without a parameter, although the call
++			// provides no more arguments than there are parameters,
++			// is reported by checkUnmatchedArguments
++			parameterIndexes[argumentIndex] = parameterIndex
++		}
++
++		if parameterIndex >= parameterCount {
++			continue
++		}
++
++		parameterIndex++
++	}
++
++	return parameterIndexes
++}
++
++// checkUnmatchedArguments reports an argument which no parameter accepts,
++// which happens when the call provides an argument for a parameter
++// an earlier argument was already matched to.
++// A call which simply provides too many arguments
++// is reported by checkInvocationArgumentCount instead
++func (checker *Checker) checkUnmatchedArguments(
++	invocationExpression *ast.InvocationExpression,
++	functionType *FunctionType,
++	parameterIndexes []int,
++) {
++	parameters := functionType.Parameters
++	parameterCount := len(parameters)
++
++	if parameterIndexes == nil ||
++		len(invocationExpression.Arguments) > parameterCount {
++
++		return
++	}
++
++	matched := make([]bool, parameterCount)
++	for _, index := range parameterIndexes {
++		if index < parameterCount {
++			matched[index] = true
++		}
++	}
++
++	expectedLabel := ""
++	for index, parameter := range parameters {
++		if !matched[index] {
++			expectedLabel = expectedArgumentLabel(parameter)
++			break
++		}
++	}
++
++	for argumentIndex, index := range parameterIndexes {
++		if index < parameterCount {
++			continue
++		}
++
++		argument := invocationExpression.Arguments[argumentIndex]
++
++		errorRange := ast.NewRangeFromPositioned(checker.memoryGauge, argument.Expression)
++		if argument.Label != "" {
++			errorRange = ast.NewRange(
++				checker.memoryGauge,
++				*argument.LabelStartPos,
++				*argument.LabelEndPos,
++			)
++		}
++
++		checker.report(&IncorrectArgumentLabelError{
++			ActualArgumentLabel:   argument.Label,
++			ExpectedArgumentLabel: expectedLabel,
++			Range:                 errorRange,
++		})
++	}
++}
++
++// expectedArgumentLabel returns the label an argument for the given parameter
++// has to use, which is empty when the parameter requires no label
++func expectedArgumentLabel(parameter Parameter) string {
++	label := parameter.EffectiveArgumentLabel()
++	if label == ArgumentLabelNotRequired {
++		return ""
++	}
++
++	return label
++}
++
++func identityParameterIndexes(count int) []int {
++	parameterIndexes := make([]int, count)
++	for index := range parameterIndexes {
++		parameterIndexes[index] = index
++	}
++
++	return parameterIndexes
++}
++
++// parameterIndex returns the index of the parameter
++// the argument at the given index provides the value for
++func parameterIndex(parameterIndexes []int, argumentIndex int) int {
++	if parameterIndexes == nil {
++		return argumentIndex
++	}
++
++	return parameterIndexes[argumentIndex]
++}
++
+ func (checker *Checker) checkIdentifierInvocationArgumentLabels(
+ 	invocationExpression *ast.InvocationExpression,
+ 	identifierExpression *ast.IdentifierExpression,
++	parameterIndexes []int,
+ ) {
+ 	variable := checker.findAndCheckValueVariable(identifierExpression, false)
+ 
+@@ -326,12 +491,14 @@ func (checker *Checker) checkIdentifierInvocationArgumentLabels(
+ 	checker.checkInvocationArgumentLabels(
+ 		invocationExpression.Arguments,
+ 		variable.ArgumentLabels,
++		parameterIndexes,
+ 	)
+ }
+ 
+ func (checker *Checker) checkMemberInvocationArgumentLabels(
+ 	invocationExpression *ast.InvocationExpression,
+ 	memberExpression *ast.MemberExpression,
++	parameterIndexes []int,
+ ) {
+ 	_, _, member, _ := checker.visitMember(memberExpression, false)
+ 
+@@ -342,21 +509,26 @@ func (checker *Checker) checkMemberInvocationArgumentLabels(
+ 	checker.checkInvocationArgumentLabels(
+ 		invocationExpression.Arguments,
+ 		member.ArgumentLabels,
++		parameterIndexes,
+ 	)
+ }
+ 
+ func (checker *Checker) checkInvocationArgumentLabels(
+ 	arguments []*ast.Argument,
+ 	argumentLabels []string,
++	parameterIndexes []int,
+ ) {
+ 	argumentCount := len(arguments)
+ 
+-	for i, argumentLabel := range argumentLabels {
+-		if i >= argumentCount {
+-			break
++	for argumentIndex := range argumentCount {
++		labelIndex := parameterIndex(parameterIndexes, argumentIndex)
++		if labelIndex >= len(argumentLabels) {
++			continue
+ 		}
+ 
+-		argument := arguments[i]
++		argumentLabel := argumentLabels[labelIndex]
++
++		argument := arguments[argumentIndex]
+ 		providedLabel := argument.Label
+ 		if argumentLabel == ArgumentLabelNotRequired {
+ 			// argument label is not required,
+@@ -405,12 +577,12 @@ func (checker *Checker) checkInvocationArgumentLabels(
+ func (checker *Checker) checkInvocation(
+ 	invocationExpression *ast.InvocationExpression,
+ 	functionType *FunctionType,
++	parameterIndexes []int,
+ ) (
+ 	argumentTypes []Type,
+ 	returnType Type,
+ ) {
+ 	parameterCount := len(functionType.Parameters)
+-	arity := functionType.Arity
+ 	typeParameterCount := len(functionType.TypeParameters)
+ 
+ 	// Check the type arguments and bind them to type parameters
+@@ -456,11 +628,16 @@ func (checker *Checker) checkInvocation(
+ 	// TODO: only pass position of arguments, not whole invocation
+ 	checker.checkInvocationArgumentCount(
+ 		argumentCount,
+-		parameterCount,
+-		arity,
++		functionType,
+ 		invocationExpression,
+ 	)
+ 
++	checker.checkUnmatchedArguments(
++		invocationExpression,
++		functionType,
++		parameterIndexes,
++	)
++
+ 	minCount := min(parameterCount, argumentCount)
+ 
+ 	var parameterTypes []Type
+@@ -473,10 +650,19 @@ func (checker *Checker) checkInvocation(
+ 
+ 		for argumentIndex := range minCount {
+ 
++			matchedParameterIndex := parameterIndex(parameterIndexes, argumentIndex)
++			if matchedParameterIndex >= parameterCount {
++				argument := invocationExpression.Arguments[argumentIndex]
++				argumentTypes[argumentIndex] =
++					checker.VisitExpression(argument.Expression, invocationExpression, nil)
++				continue
++			}
++
+ 			parameterTypes[argumentIndex] =
+ 				checker.checkInvocationRequiredArgument(
+ 					invocationExpression,
+ 					argumentIndex,
++					matchedParameterIndex,
+ 					functionType,
+ 					argumentTypes,
+ 					typeArguments,
+@@ -551,6 +737,7 @@ func (checker *Checker) checkInvocation(
+ 			TypeArguments:     typeArguments,
+ 			TypeParameters:    functionType.TypeParameters,
+ 			ParameterTypes:    parameterTypes,
++			ParameterIndexes:  parameterIndexes,
+ 			ReturnType:        returnType,
+ 			ArgumentTypes:     argumentTypes,
+ 			PassArgumentTypes: functionType.Arity.IsVariadic(),
+@@ -591,6 +778,7 @@ func (checker *Checker) checkTypeParameterInference(
+ func (checker *Checker) checkInvocationRequiredArgument(
+ 	invocationExpression *ast.InvocationExpression,
+ 	argumentIndex int,
++	parameterIndex int,
+ 	functionType *FunctionType,
+ 	argumentTypes []Type,
+ 	typeArguments *TypeParameterTypeOrderedMap,
+@@ -599,7 +787,7 @@ func (checker *Checker) checkInvocationRequiredArgument(
+ ) {
+ 	argument := invocationExpression.Arguments[argumentIndex]
+ 
+-	parameter := functionType.Parameters[argumentIndex]
++	parameter := functionType.Parameters[parameterIndex]
+ 	parameterType = parameter.TypeAnnotation.Type
+ 
+ 	var argumentType Type
+@@ -726,11 +914,13 @@ func (checker *Checker) checkInvocationRequiredArgument(
+ 
+ func (checker *Checker) checkInvocationArgumentCount(
+ 	argumentCount int,
+-	parameterCount int,
+-	arity *Arity,
++	functionType *FunctionType,
+ 	pos ast.HasPosition,
+ ) {
+-	minCount := arity.MinCount(parameterCount)
++	parameterCount := len(functionType.Parameters)
++	arity := functionType.Arity
++
++	minCount := functionType.MinimumArgumentCount()
+ 	if argumentCount < minCount {
+ 		checker.report(
+ 			&InsufficientArgumentsError{
+diff --git a/sema/check_transaction_declaration.go b/sema/check_transaction_declaration.go
+index 8c793ac..aa0a774 100644
+--- a/sema/check_transaction_declaration.go
++++ b/sema/check_transaction_declaration.go
+@@ -196,6 +196,7 @@ func (checker *Checker) visitTransactionPrepareFunction(
+ 		true,
+ 		initializationInfo,
+ 		true,
++		true,
+ 	)
+ 
+ 	checker.checkTransactionPrepareFunctionParameters(
+@@ -248,6 +249,7 @@ func (checker *Checker) visitTransactionExecuteFunction(
+ 		true,
+ 		nil,
+ 		true,
++		true,
+ 	)
+ }
+ 
+diff --git a/sema/checker.go b/sema/checker.go
+index 8d77520..5137afd 100644
+--- a/sema/checker.go
++++ b/sema/checker.go
+@@ -1413,6 +1413,14 @@ func (checker *Checker) parameters(parameterList *ast.ParameterList) []Parameter
+ 					Type:       convertedParameterType,
+ 				},
+ 			}
++
++			// A parameter with a default argument may be left off in a call.
++			// The default argument expression itself is checked
++			// when the declaration's function is checked
++
++			if parameter.HasDefaultArgument() {
++				parameters[i].DefaultArgument = convertedParameterType
++			}
+ 		}
+ 	}
+ 
+diff --git a/sema/elaboration.go b/sema/elaboration.go
+index 2d47187..ef72588 100644
+--- a/sema/elaboration.go
++++ b/sema/elaboration.go
+@@ -72,6 +72,9 @@ type AssignmentStatementTypes struct {
+ }
+ 
+ type InvocationExpressionTypes struct {
++	// ParameterIndexes is the index of the parameter each argument provides the value for.
++	// It is nil when each argument is for the parameter at the same position
++	ParameterIndexes []int
+ 	ReturnType     Type
+ 	TypeArguments  *TypeParameterTypeOrderedMap
+ 	TypeParameters []*TypeParameter
+diff --git a/sema/errors.go b/sema/errors.go
+index b01f619..ccbb5d6 100644
+--- a/sema/errors.go
++++ b/sema/errors.go
+@@ -1139,6 +1139,78 @@ func (*InvalidNativeModifierError) SecondaryError() string {
+ 		"remove the modifier or use a function declaration"
+ }
+ 
++// MissingDefaultArgumentError
++
++type MissingDefaultArgumentError struct {
++	Parameter *ast.Parameter
++	ast.Range
++}
++
++var _ SemanticError = &MissingDefaultArgumentError{}
++var _ errors.UserError = &MissingDefaultArgumentError{}
++var _ errors.SecondaryError = &MissingDefaultArgumentError{}
++
++func (*MissingDefaultArgumentError) isSemanticError() {}
++
++func (*MissingDefaultArgumentError) IsUserError() {}
++
++func (e *MissingDefaultArgumentError) Error() string {
++	return fmt.Sprintf(
++		"parameter %#q has no default argument, but a preceding parameter has one",
++		e.Parameter.Identifier.Identifier,
++	)
++}
++
++func (*MissingDefaultArgumentError) SecondaryError() string {
++	return "give this parameter a default argument, " +
++		"or declare it before all parameters which have one"
++}
++
++// DefaultArgumentWithoutImplementationError
++
++type DefaultArgumentWithoutImplementationError struct {
++	ast.Range
++}
++
++var _ SemanticError = &DefaultArgumentWithoutImplementationError{}
++var _ errors.UserError = &DefaultArgumentWithoutImplementationError{}
++var _ errors.SecondaryError = &DefaultArgumentWithoutImplementationError{}
++
++func (*DefaultArgumentWithoutImplementationError) isSemanticError() {}
++
++func (*DefaultArgumentWithoutImplementationError) IsUserError() {}
++
++func (*DefaultArgumentWithoutImplementationError) Error() string {
++	return "invalid default argument for a function without an implementation"
++}
++
++func (*DefaultArgumentWithoutImplementationError) SecondaryError() string {
++	return "a default argument is evaluated in the scope of the function which declares it; " +
++		"declare it in the implementation instead"
++}
++
++// InvalidResourceDefaultArgumentError
++
++type InvalidResourceDefaultArgumentError struct {
++	ast.Range
++}
++
++var _ SemanticError = &InvalidResourceDefaultArgumentError{}
++var _ errors.UserError = &InvalidResourceDefaultArgumentError{}
++var _ errors.SecondaryError = &InvalidResourceDefaultArgumentError{}
++
++func (*InvalidResourceDefaultArgumentError) isSemanticError() {}
++
++func (*InvalidResourceDefaultArgumentError) IsUserError() {}
++
++func (*InvalidResourceDefaultArgumentError) Error() string {
++	return "invalid default argument for parameter of resource type"
++}
++
++func (*InvalidResourceDefaultArgumentError) SecondaryError() string {
++	return "remove the default argument and pass the resource in every call"
++}
++
+ // InvalidDictionaryIndexBindingError
+ 
+ type InvalidDictionaryIndexBindingError struct {
+diff --git a/sema/type.go b/sema/type.go
+index f0b0015..0b32fcf 100644
+--- a/sema/type.go
++++ b/sema/type.go
+@@ -5009,6 +5009,25 @@ func (t *FunctionType) ParameterTypes() []Type {
+ 	return types
+ }
+ 
++// MinimumArgumentCount returns the number of arguments
++// which a call of a function of this type has to provide.
++// Parameters which declare a default argument may be left off,
++// so the minimum is the number of parameters
++// up to the first one with a default argument.
++// Default arguments are deliberately not part of the type's identity:
++// they belong to the declaration, not to the type.
++func (t *FunctionType) MinimumArgumentCount() int {
++	parameterCount := len(t.Parameters)
++
++	for index, parameter := range t.Parameters {
++		if parameter.DefaultArgument != nil {
++			return min(index, t.Arity.MinCount(parameterCount))
++		}
++	}
++
++	return t.Arity.MinCount(parameterCount)
++}
++
+ func (t *FunctionType) ArityEqual(other *Arity) bool {
+ 	if t.Arity == nil {
+ 		return other == nil

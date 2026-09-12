@@ -1,0 +1,3255 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..c64723f
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,109 @@
++#!/bin/sh
++set -u
++
++MODE=""
++OUTPUT_PATH=""
++
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++
++MODE="${MODE:-base}"
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++fi
++
++NEW_TEST=icmp_errors_7be31c
++LOG=$(mktemp)
++XML=$(mktemp)
++
++emit_case() {
++  name=$1
++  status=$2
++  if [ "$status" = ok ]; then
++    printf '<testcase name="%s" classname="smoltcp"/>\n' "$name" >> "$XML"
++  else
++    printf '<testcase name="%s" classname="smoltcp"><failure message="test failed"/></testcase>\n' "$name" >> "$XML"
++  fi
++}
++
++# Turn the lines cargo test prints for each test into JUnit test cases. Doc test names
++# carry spaces and angle brackets, so the name is escaped before it goes into the XML.
++collect_results() {
++  awk '
++    /^test .* \.\.\. / {
++      line = $0
++      sub(/^test /, "", line)
++      idx = index(line, " ... ")
++      name = substr(line, 1, idx - 1)
++      status = substr(line, idx + 5)
++      sub(/ .*$/, "", status)
++      gsub(/&/, "\\&amp;", name)
++      gsub(/</, "\\&lt;", name)
++      gsub(/>/, "\\&gt;", name)
++      gsub(/"/, "\\&quot;", name)
++      if (status == "ok" || status == "ignored")
++        printf "<testcase name=\"%s\" classname=\"smoltcp\"/>\n", name
++      else
++        printf "<testcase name=\"%s\" classname=\"smoltcp\"><failure message=\"test failed\"/></testcase>\n", name
++    }
++  ' "$LOG" >> "$XML"
++}
++
++# A compilation failure produces no per-test lines at all, so write one failing case
++# per test function instead, otherwise the run looks like it had no tests.
++synthesize_failures() {
++  for name in $(awk '/^#\[test\]/ { want = 1; next } want && /^fn / { sub(/^fn /, ""); sub(/\(.*$/, ""); print; want = 0 }' "tests/$NEW_TEST.rs"); do
++    emit_case "$name" failed
++  done
++}
++
++: > "$XML"
++
++if [ "$MODE" = new ]; then
++  cargo test --offline --test "$NEW_TEST" > "$LOG" 2>&1
++  EXIT_CODE=$?
++  collect_results
++  if ! grep -q '<testcase' "$XML"; then
++    synthesize_failures
++    EXIT_CODE=1
++  fi
++else
++  # The library's own unit tests. Two suites are deliberately left out:
++  #
++  # - Doc tests. Rustdoc names them after the line the example starts on, so inserting
++  #   a single line anywhere above one renames it. Any solution to this task edits
++  #   src/socket/tcp.rs, which moves the `connect` example, and a regression check keyed
++  #   on test names would read that rename as a failure no matter what the code does.
++  # - tests/netsim.rs, the one integration test the repo ships, which is behind the
++  #   `_netsim` feature and is not built by default.
++  cargo test --offline --lib > "$LOG" 2>&1
++  EXIT_CODE=$?
++  collect_results
++  if ! grep -q '<testcase' "$XML"; then
++    emit_case "build" failed
++    EXIT_CODE=1
++  fi
++fi
++
++cat "$LOG"
++
++if [ -n "$OUTPUT_PATH" ]; then
++  TOTAL=$(grep -c '<testcase' "$XML")
++  FAILURES=$(grep -c '<failure' "$XML")
++  {
++    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
++    printf '<testsuites name="smoltcp" tests="%s" failures="%s" errors="0" time="0">\n' "$TOTAL" "$FAILURES"
++    printf '<testsuite name="smoltcp" tests="%s" failures="%s" errors="0" time="0">\n' "$TOTAL" "$FAILURES"
++    sort "$XML"
++    printf '</testsuite>\n</testsuites>\n'
++  } > "$OUTPUT_PATH"
++fi
++
++rm -f "$LOG" "$XML"
++exit "$EXIT_CODE"
+diff --git a/tests/icmp_errors_7be31c.rs b/tests/icmp_errors_7be31c.rs
+new file mode 100644
+index 0000000..7163581
+--- /dev/null
++++ b/tests/icmp_errors_7be31c.rs
+@@ -0,0 +1,3134 @@
++use std::collections::VecDeque;
++
++use smoltcp::iface::{Config, Interface, SocketSet};
++use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
++use smoltcp::socket::{tcp, udp, IcmpError};
++use smoltcp::time::{Duration, Instant};
++use smoltcp::wire::{
++    HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address,
++    Ipv6Cidr, Ipv6Packet, Ipv6Repr, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
++};
++
++const LOCAL_V4: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
++const REMOTE_V4: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
++const OTHER_V4: Ipv4Address = Ipv4Address::new(192, 168, 1, 3);
++const ROUTER_V4: Ipv4Address = Ipv4Address::new(192, 168, 1, 254);
++
++const LOCAL_PORT: u16 = 49500;
++const REMOTE_PORT: u16 = 80;
++
++const IFACE_MTU: usize = 1500;
++
++struct TestDevice {
++    rx: VecDeque<Vec<u8>>,
++    tx: VecDeque<Vec<u8>>,
++}
++
++impl TestDevice {
++    fn new() -> Self {
++        Self {
++            rx: VecDeque::new(),
++            tx: VecDeque::new(),
++        }
++    }
++}
++
++impl Device for TestDevice {
++    type RxToken<'a> = RxToken;
++    type TxToken<'a> = TxToken<'a>;
++
++    fn capabilities(&self) -> DeviceCapabilities {
++        let mut caps = DeviceCapabilities::default();
++        caps.max_transmission_unit = IFACE_MTU;
++        caps.medium = Medium::Ip;
++        caps.checksum = ChecksumCapabilities::default();
++        caps
++    }
++
++    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
++        let buffer = self.rx.pop_front()?;
++        Some((RxToken { buffer }, TxToken { queue: &mut self.tx }))
++    }
++
++    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
++        Some(TxToken { queue: &mut self.tx })
++    }
++}
++
++struct RxToken {
++    buffer: Vec<u8>,
++}
++
++impl phy::RxToken for RxToken {
++    fn consume<R, F>(self, f: F) -> R
++    where
++        F: FnOnce(&[u8]) -> R,
++    {
++        f(&self.buffer)
++    }
++}
++
++struct TxToken<'a> {
++    queue: &'a mut VecDeque<Vec<u8>>,
++}
++
++impl phy::TxToken for TxToken<'_> {
++    fn consume<R, F>(self, len: usize, f: F) -> R
++    where
++        F: FnOnce(&mut [u8]) -> R,
++    {
++        let mut buffer = vec![0; len];
++        let result = f(&mut buffer);
++        self.queue.push_back(buffer);
++        result
++    }
++}
++
++fn setup() -> (Interface, TestDevice) {
++    let mut device = TestDevice::new();
++    let config = Config::new(HardwareAddress::Ip);
++    let mut iface = Interface::new(config, &mut device, Instant::ZERO);
++    iface.update_ip_addrs(|addrs| {
++        addrs.push(IpCidr::new(LOCAL_V4.into(), 24)).unwrap();
++        addrs
++            .push(IpCidr::Ipv6(Ipv6Cidr::new(
++                Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
++                64,
++            )))
++            .unwrap();
++    });
++    (iface, device)
++}
++
++/// A TCP socket that has completed its handshake with `REMOTE_V4`, plus the sequence
++/// number the local side will use for its first data byte.
++fn connected(
++    iface: &mut Interface,
++    device: &mut TestDevice,
++    sockets: &mut SocketSet,
++    now: Instant,
++) -> (smoltcp::iface::SocketHandle, TcpSeqNumber) {
++    let socket = tcp::Socket::new(
++        tcp::SocketBuffer::new(vec![0; 4096]),
++        tcp::SocketBuffer::new(vec![0; 65535]),
++    );
++    let handle = sockets.add(socket);
++
++    sockets
++        .get_mut::<tcp::Socket>(handle)
++        .connect(iface.context(), (REMOTE_V4, REMOTE_PORT), LOCAL_PORT)
++        .unwrap();
++
++    iface.poll(now, device, sockets);
++    let syn = device.tx.pop_front().expect("no SYN was sent");
++    let local_isn = tcp_of(&syn).seq_number;
++
++    let reply = tcp_packet(
++        REMOTE_V4,
++        LOCAL_V4,
++        TcpRepr {
++            src_port: REMOTE_PORT,
++            dst_port: LOCAL_PORT,
++            control: smoltcp::wire::TcpControl::Syn,
++            seq_number: TcpSeqNumber(0x4000),
++            ack_number: Some(local_isn + 1),
++            window_len: 65535,
++            window_scale: None,
++            max_seg_size: Some(1460),
++            sack_permitted: false,
++            sack_ranges: [None, None, None],
++            timestamp: None,
++            payload: &[],
++        },
++    );
++    device.rx.push_back(reply);
++    iface.poll(now, device, sockets);
++    device.tx.clear();
++
++    assert_eq!(
++        sockets.get::<tcp::Socket>(handle).state(),
++        tcp::State::Established
++    );
++    (handle, local_isn + 1)
++}
++
++
++/// An established connection that has sent `bytes` it has not had acknowledged, plus the
++/// sequence number of the first of them.
++fn connected_with_data_in_flight(
++    iface: &mut Interface,
++    device: &mut TestDevice,
++    sockets: &mut SocketSet,
++    bytes: usize,
++) -> (smoltcp::iface::SocketHandle, TcpSeqNumber) {
++    let (handle, base) = connected(iface, device, sockets, Instant::ZERO);
++    sockets
++        .get_mut::<tcp::Socket>(handle)
++        .send_slice(&vec![0x33; bytes])
++        .unwrap();
++    iface.poll(Instant::ZERO, device, sockets);
++    device.tx.clear();
++    (handle, base)
++}
++
++fn tcp_of(frame: &[u8]) -> TcpRepr<'_> {
++    let ip = Ipv4Packet::new_checked(frame).expect("not an IPv4 packet");
++    assert_eq!(ip.next_header(), IpProtocol::Tcp);
++    let payload_len = ip.total_len() as usize - ip.header_len() as usize;
++    let tcp = TcpPacket::new_checked(&frame[ip.header_len() as usize..][..payload_len])
++        .expect("not a TCP packet");
++    TcpRepr::parse(
++        &tcp,
++        &ip.src_addr().into(),
++        &ip.dst_addr().into(),
++        &ChecksumCapabilities::default(),
++    )
++    .expect("malformed TCP packet")
++}
++
++fn tcp_packet(src: Ipv4Address, dst: Ipv4Address, repr: TcpRepr<'_>) -> Vec<u8> {
++    let ip_repr = Ipv4Repr {
++        src_addr: src,
++        dst_addr: dst,
++        next_header: IpProtocol::Tcp,
++        payload_len: repr.buffer_len(),
++        hop_limit: 64,
++    };
++    let mut frame = vec![0; ip_repr.buffer_len() + repr.buffer_len()];
++    ip_repr.emit(
++        &mut Ipv4Packet::new_unchecked(&mut frame),
++        &ChecksumCapabilities::default(),
++    );
++    repr.emit(
++        &mut TcpPacket::new_unchecked(&mut frame[ip_repr.buffer_len()..]),
++        &src.into(),
++        &dst.into(),
++        &ChecksumCapabilities::default(),
++    );
++    frame
++}
++
++/// The IPv4 header plus the first eight bytes of the transport header of a TCP segment
++/// this stack would have sent, which is all an ICMP error is required to quote.
++fn quoted_tcp(src: Ipv4Address, dst: Ipv4Address, src_port: u16, dst_port: u16, seq: TcpSeqNumber) -> Vec<u8> {
++    let repr = TcpRepr {
++        src_port,
++        dst_port,
++        control: smoltcp::wire::TcpControl::None,
++        seq_number: seq,
++        ack_number: None,
++        window_len: 1024,
++        window_scale: None,
++        max_seg_size: None,
++        sack_permitted: false,
++        sack_ranges: [None, None, None],
++        timestamp: None,
++        payload: &[],
++    };
++    let mut frame = tcp_packet(src, dst, repr);
++    frame.truncate(20 + 8);
++    frame
++}
++
++fn quoted_udp(src: Ipv4Address, dst: Ipv4Address, src_port: u16, dst_port: u16) -> Vec<u8> {
++    let repr = UdpRepr {
++        src_port,
++        dst_port,
++    };
++    let ip_repr = Ipv4Repr {
++        src_addr: src,
++        dst_addr: dst,
++        next_header: IpProtocol::Udp,
++        payload_len: repr.header_len(),
++        hop_limit: 64,
++    };
++    let mut frame = vec![0; ip_repr.buffer_len() + repr.header_len()];
++    ip_repr.emit(
++        &mut Ipv4Packet::new_unchecked(&mut frame),
++        &ChecksumCapabilities::default(),
++    );
++    repr.emit(
++        &mut UdpPacket::new_unchecked(&mut frame[ip_repr.buffer_len()..]),
++        &src.into(),
++        &dst.into(),
++        0,
++        |_| {},
++        &ChecksumCapabilities::default(),
++    );
++    frame.truncate(20 + 8);
++    frame
++}
++
++/// The IPv6 header plus the first eight bytes of a UDP datagram this stack would have
++/// sent, which is all an ICMPv6 error is required to quote.
++fn quoted_udp_v6(src: Ipv6Address, dst: Ipv6Address, src_port: u16, dst_port: u16) -> Vec<u8> {
++    let ip_repr = Ipv6Repr {
++        src_addr: src,
++        dst_addr: dst,
++        next_header: IpProtocol::Udp,
++        payload_len: 8,
++        hop_limit: 64,
++    };
++    let mut frame = vec![0; ip_repr.buffer_len() + 8];
++    ip_repr.emit(&mut Ipv6Packet::new_unchecked(&mut frame));
++    let header_len = ip_repr.buffer_len();
++    frame[header_len..header_len + 2].copy_from_slice(&src_port.to_be_bytes());
++    frame[header_len + 2..header_len + 4].copy_from_slice(&dst_port.to_be_bytes());
++    frame
++}
++
++/// An ICMPv4 error message carrying `quote`, with the raw type, code and next-hop MTU
++/// fields written by hand so that messages routers really send can be reproduced.
++fn icmpv4_error(from: Ipv4Address, msg_type: u8, code: u8, next_hop_mtu: u16, quote: &[u8]) -> Vec<u8> {
++    let icmp_len = 8 + quote.len();
++    let ip_repr = Ipv4Repr {
++        src_addr: from,
++        dst_addr: LOCAL_V4,
++        next_header: IpProtocol::Icmp,
++        payload_len: icmp_len,
++        hop_limit: 64,
++    };
++    let mut frame = vec![0; ip_repr.buffer_len() + icmp_len];
++    ip_repr.emit(
++        &mut Ipv4Packet::new_unchecked(&mut frame),
++        &ChecksumCapabilities::default(),
++    );
++
++    let icmp = &mut frame[ip_repr.buffer_len()..];
++    icmp[0] = msg_type;
++    icmp[1] = code;
++    icmp[6..8].copy_from_slice(&next_hop_mtu.to_be_bytes());
++    icmp[8..].copy_from_slice(quote);
++
++    let checksum = checksum(icmp);
++    icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
++    frame
++}
++
++fn icmpv6_packet_too_big(from: Ipv6Address, to: Ipv6Address, mtu: u32, quote: &[u8]) -> Vec<u8> {
++    icmpv6_error(from, to, 2, 0, mtu, quote)
++}
++
++/// An ICMPv6 error message carrying `quote`. `word` is the four bytes that follow the
++/// checksum, which hold the MTU of a "packet too big" and the pointer of a
++/// "parameter problem".
++fn icmpv6_error(
++    from: Ipv6Address,
++    to: Ipv6Address,
++    msg_type: u8,
++    code: u8,
++    word: u32,
++    quote: &[u8],
++) -> Vec<u8> {
++    let icmp_len = 8 + quote.len();
++    let ip_repr = Ipv6Repr {
++        src_addr: from,
++        dst_addr: to,
++        next_header: IpProtocol::Icmpv6,
++        payload_len: icmp_len,
++        hop_limit: 64,
++    };
++    let mut frame = vec![0; ip_repr.buffer_len() + icmp_len];
++    ip_repr.emit(&mut Ipv6Packet::new_unchecked(&mut frame));
++
++    let icmp = &mut frame[ip_repr.buffer_len()..];
++    icmp[0] = msg_type;
++    icmp[1] = code;
++    icmp[4..8].copy_from_slice(&word.to_be_bytes());
++    icmp[8..].copy_from_slice(quote);
++
++    let checksum = icmpv6_checksum(&from, &to, icmp);
++    icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
++    frame
++}
++
++fn checksum(data: &[u8]) -> u16 {
++    let mut sum = 0u32;
++    let mut chunks = data.chunks_exact(2);
++    for chunk in &mut chunks {
++        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
++    }
++    if let Some(&last) = chunks.remainder().first() {
++        sum += (last as u32) << 8;
++    }
++    while sum >> 16 != 0 {
++        sum = (sum & 0xffff) + (sum >> 16);
++    }
++    !(sum as u16)
++}
++
++fn icmpv6_checksum(src: &Ipv6Address, dst: &Ipv6Address, icmp: &[u8]) -> u16 {
++    let mut pseudo = Vec::new();
++    pseudo.extend_from_slice(&src.octets());
++    pseudo.extend_from_slice(&dst.octets());
++    pseudo.extend_from_slice(&(icmp.len() as u32).to_be_bytes());
++    pseudo.extend_from_slice(&[0, 0, 0, 58]);
++    pseudo.extend_from_slice(icmp);
++    checksum(&pseudo)
++}
++
++const DST_UNREACHABLE: u8 = 3;
++const TIME_EXCEEDED: u8 = 11;
++
++const NET_UNREACHABLE: u8 = 0;
++const HOST_UNREACHABLE: u8 = 1;
++const PROTO_UNREACHABLE: u8 = 2;
++const PORT_UNREACHABLE: u8 = 3;
++const FRAG_REQUIRED: u8 = 4;
++
++fn connecting(
++    iface: &mut Interface,
++    device: &mut TestDevice,
++    sockets: &mut SocketSet,
++) -> (smoltcp::iface::SocketHandle, TcpSeqNumber) {
++    let socket = tcp::Socket::new(
++        tcp::SocketBuffer::new(vec![0; 4096]),
++        tcp::SocketBuffer::new(vec![0; 4096]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<tcp::Socket>(handle)
++        .connect(iface.context(), (REMOTE_V4, REMOTE_PORT), LOCAL_PORT)
++        .unwrap();
++    iface.poll(Instant::ZERO, device, sockets);
++    let syn = device.tx.pop_front().expect("no SYN was sent");
++    let seq = tcp_of(&syn).seq_number;
++    assert_eq!(
++        sockets.get::<tcp::Socket>(handle).state(),
++        tcp::State::SynSent
++    );
++    (handle, seq)
++}
++
++#[test]
++fn host_unreachable_aborts_a_connection_attempt() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, seq) = connecting(&mut iface, &mut device, &mut sockets);
++
++    let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, seq);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        HOST_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.state(), tcp::State::Closed);
++    assert_eq!(socket.take_error(), Some(IcmpError::HostUnreachable));
++    assert_eq!(socket.take_error(), None);
++}
++
++#[test]
++fn every_unreachable_reason_aborts_a_connection_attempt() {
++    for (code, expected) in [
++        (NET_UNREACHABLE, IcmpError::NetUnreachable),
++        (HOST_UNREACHABLE, IcmpError::HostUnreachable),
++        (PROTO_UNREACHABLE, IcmpError::ProtoUnreachable),
++        (PORT_UNREACHABLE, IcmpError::PortUnreachable),
++    ] {
++        let (mut iface, mut device) = setup();
++        let mut sockets = SocketSet::new(vec![]);
++        let (handle, seq) = connecting(&mut iface, &mut device, &mut sockets);
++
++        let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, seq);
++        device
++            .rx
++            .push_back(icmpv4_error(ROUTER_V4, DST_UNREACHABLE, code, 0, &quote));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++        let socket = sockets.get_mut::<tcp::Socket>(handle);
++        assert_eq!(socket.state(), tcp::State::Closed);
++        assert_eq!(socket.take_error(), Some(expected));
++    }
++}
++
++#[test]
++fn time_exceeded_does_not_abort_a_connection_attempt() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, seq) = connecting(&mut iface, &mut device, &mut sockets);
++
++    let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, seq);
++    device
++        .rx
++        .push_back(icmpv4_error(ROUTER_V4, TIME_EXCEEDED, 0, 0, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.state(), tcp::State::SynSent);
++    assert_eq!(socket.take_error(), Some(IcmpError::TimeExceeded));
++}
++
++#[test]
++fn an_open_connection_survives_a_hard_error() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, seq) = connected_with_data_in_flight(&mut iface, &mut device, &mut sockets, 100);
++
++    let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, seq);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        HOST_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.state(), tcp::State::Established);
++    assert_eq!(socket.take_error(), Some(IcmpError::HostUnreachable));
++}
++
++#[test]
++fn an_error_quoting_a_sequence_number_we_never_sent_is_ignored() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, seq) = connecting(&mut iface, &mut device, &mut sockets);
++
++    let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, seq + 5000);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        HOST_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.state(), tcp::State::SynSent);
++    assert_eq!(socket.take_error(), None);
++}
++
++#[test]
++fn an_error_quoting_another_connection_is_ignored() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, seq) = connecting(&mut iface, &mut device, &mut sockets);
++
++    let quote = quoted_tcp(LOCAL_V4, OTHER_V4, LOCAL_PORT, REMOTE_PORT, seq);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        HOST_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.state(), tcp::State::SynSent);
++    assert_eq!(socket.take_error(), None);
++}
++
++#[test]
++fn an_error_quoting_a_packet_we_did_not_send_is_ignored() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, seq) = connecting(&mut iface, &mut device, &mut sockets);
++
++    let quote = quoted_tcp(OTHER_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, seq);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        HOST_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.state(), tcp::State::SynSent);
++    assert_eq!(socket.take_error(), None);
++}
++
++#[test]
++fn a_udp_socket_is_told_its_datagram_bounced() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = udp::Socket::new(
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .bind(LOCAL_PORT)
++        .unwrap();
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        PORT_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<udp::Socket>(handle);
++    assert_eq!(socket.take_error(), Some(IcmpError::PortUnreachable));
++    assert_eq!(socket.take_error(), None);
++}
++
++#[test]
++fn a_destination_starts_out_at_the_interface_mtu() {
++    let (iface, _device) = setup();
++    assert_eq!(iface.pmtu(REMOTE_V4), IFACE_MTU);
++}
++
++#[test]
++fn fragmentation_required_lowers_the_path_mtu() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    // The quoted datagram has a sender on this interface, so the report is one
++    // this stack is meant to act on however the socket-matching rule is read.
++    let _sender = bound_udp(&mut sockets);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(iface.pmtu(REMOTE_V4), 900);
++    assert_eq!(iface.pmtu(OTHER_V4), IFACE_MTU);
++}
++
++#[test]
++fn a_reported_mtu_below_the_floor_is_raised_to_it() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    // The quoted datagram has a sender on this interface, so the report is one
++    // this stack is meant to act on however the socket-matching rule is read.
++    let _sender = bound_udp(&mut sockets);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        68,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(iface.pmtu(REMOTE_V4), 576);
++}
++
++#[test]
++fn a_router_that_reports_no_mtu_falls_to_the_next_size_down() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    // The quoted datagram has a sender on this interface, so the report is one
++    // this stack is meant to act on however the socket-matching rule is read.
++    let _sender = bound_udp(&mut sockets);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(iface.pmtu(REMOTE_V4), 1492);
++}
++
++#[test]
++fn repeated_reports_with_no_mtu_walk_down_the_table() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    // The quoted datagram has a sender on this interface, so the report is one
++    // this stack is meant to act on however the socket-matching rule is read.
++    let _sender = bound_udp(&mut sockets);
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++
++    for expected in [1492usize, 1006, 576, 576] {
++        device.rx.push_back(icmpv4_error(
++            ROUTER_V4,
++            DST_UNREACHABLE,
++            FRAG_REQUIRED,
++            0,
++            &quote,
++        ));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++        assert_eq!(iface.pmtu(REMOTE_V4), expected);
++    }
++}
++
++#[test]
++fn a_reported_mtu_above_the_interface_mtu_is_capped() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    // The quoted datagram has a sender on this interface, so the report is one
++    // this stack is meant to act on however the socket-matching rule is read.
++    let _sender = bound_udp(&mut sockets);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        9000,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(iface.pmtu(REMOTE_V4), IFACE_MTU);
++}
++
++#[test]
++fn a_later_report_may_only_lower_the_path_mtu() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    // The quoted datagram has a sender on this interface, so the report is one
++    // this stack is meant to act on however the socket-matching rule is read.
++    let _sender = bound_udp(&mut sockets);
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++
++    for (mtu, expected) in [(1200u16, 1200usize), (800, 800), (1400, 800)] {
++        device.rx.push_back(icmpv4_error(
++            ROUTER_V4,
++            DST_UNREACHABLE,
++            FRAG_REQUIRED,
++            mtu,
++            &quote,
++        ));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++        assert_eq!(iface.pmtu(REMOTE_V4), expected);
++    }
++}
++
++#[test]
++fn a_learned_path_mtu_is_probed_back_upward() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    // The quoted datagram has a sender on this interface, so the report is one
++    // this stack is meant to act on however the socket-matching rule is read.
++    let _sender = bound_udp(&mut sockets);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    for (after, expected) in [
++        (0u64, 900usize),
++        (599, 900),
++        // Exactly ten minutes old, so the hold is over and the next size is tried.
++        (600, 1006),
++        (601, 1006),
++        (1200, 1492),
++        (1201, 1492),
++        (1800, IFACE_MTU),
++        (100_000, IFACE_MTU),
++    ] {
++        let now = Instant::ZERO + Duration::from_secs(after);
++        iface.poll(now, &mut device, &mut sockets);
++        assert_eq!(
++            iface.pmtu(REMOTE_V4),
++            expected,
++            "path mtu {after} seconds after the report"
++        );
++    }
++}
++
++#[test]
++fn a_report_before_the_probe_interval_still_lowers_the_path_mtu() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    // The quoted datagram has a sender on this interface, so the report is one
++    // this stack is meant to act on however the socket-matching rule is read.
++    let _sender = bound_udp(&mut sockets);
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    assert_eq!(iface.pmtu(REMOTE_V4), 900);
++
++    // Well inside the ten minutes the first report holds for, so nothing has been
++    // probed upward yet.
++    let later = Instant::ZERO + Duration::from_secs(300);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        700,
++        &quote,
++    ));
++    iface.poll(later, &mut device, &mut sockets);
++
++    assert_eq!(iface.pmtu(REMOTE_V4), 700);
++}
++
++#[test]
++fn flushing_forgets_every_learned_path_mtu() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    // The quoted datagram has a sender on this interface, so the report is one
++    // this stack is meant to act on however the socket-matching rule is read.
++    let _sender = bound_udp(&mut sockets);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    assert_eq!(iface.pmtu(REMOTE_V4), 900);
++
++    iface.flush_pmtu();
++    assert_eq!(iface.pmtu(REMOTE_V4), IFACE_MTU);
++}
++
++#[test]
++fn packet_too_big_lowers_an_ipv6_path_mtu_to_its_own_floor() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    // The quoted datagram has a sender on this interface, so the report is one
++    // this stack is meant to act on however the socket-matching rule is read.
++    let _sender = bound_udp(&mut sockets);
++
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++
++    let ip_repr = Ipv6Repr {
++        src_addr: local,
++        dst_addr: remote,
++        next_header: IpProtocol::Udp,
++        payload_len: 8,
++        hop_limit: 64,
++    };
++    let mut quote = vec![0; ip_repr.buffer_len() + 8];
++    ip_repr.emit(&mut Ipv6Packet::new_unchecked(&mut quote));
++    quote[40..42].copy_from_slice(&LOCAL_PORT.to_be_bytes());
++    quote[42..44].copy_from_slice(&REMOTE_PORT.to_be_bytes());
++
++    device
++        .rx
++        .push_back(icmpv6_packet_too_big(remote, local, 900, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    assert_eq!(iface.pmtu(remote), 1280);
++}
++
++#[test]
++fn segments_shrink_to_the_learned_path_mtu() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, _seq) = connected(&mut iface, &mut device, &mut sockets, Instant::ZERO);
++
++    sockets
++        .get_mut::<tcp::Socket>(handle)
++        .send_slice(&[0x42; 16384])
++        .unwrap();
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let first = device.tx.pop_front().expect("no data segment was sent");
++    let first_len = Ipv4Packet::new_checked(&first).unwrap().total_len() as usize;
++    assert!(
++        first_len <= IFACE_MTU,
++        "a segment of {first_len} bytes was sent over a link with an MTU of {IFACE_MTU}"
++    );
++    assert!(
++        first_len > 900,
++        "this segment is already within the path MTU the error is about, so shrinking it \
++         would prove nothing"
++    );
++    device.tx.clear();
++
++    let quote = quoted_tcp(
++        LOCAL_V4,
++        REMOTE_V4,
++        LOCAL_PORT,
++        REMOTE_PORT,
++        tcp_of(&first).seq_number,
++    );
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    assert_eq!(iface.pmtu(REMOTE_V4), 900);
++
++    // The socket that sent the segment is told about it, like any other sender.
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.take_error(), Some(IcmpError::PacketTooBig { mtu: 900 }));
++    assert_eq!(socket.take_error(), None);
++    device.tx.clear();
++
++    // The whole window is retransmitted after the retransmission timer expires, and
++    // every segment of it has to fit the path the error came from.
++    let mut now = Instant::ZERO;
++    for _ in 0..40 {
++        now += Duration::from_millis(250);
++        iface.poll(now, &mut device, &mut sockets);
++        if !device.tx.is_empty() {
++            break;
++        }
++    }
++
++    let resent = device.tx.pop_front().expect("nothing was retransmitted");
++    assert!(
++        Ipv4Packet::new_checked(&resent).unwrap().total_len() as usize <= 900,
++        "a segment of {} bytes was sent to a path with an MTU of 900",
++        Ipv4Packet::new_checked(&resent).unwrap().total_len()
++    );
++    for frame in device.tx.iter() {
++        assert!(Ipv4Packet::new_checked(frame).unwrap().total_len() as usize <= 900);
++    }
++}
++
++#[test]
++fn the_advertised_mss_still_comes_from_the_interface_mtu() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    // The quoted datagram has a sender on this interface, so the report is one
++    // this stack is meant to act on however the socket-matching rule is read.
++    let _sender = bound_udp(&mut sockets);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    device.tx.clear();
++
++    let (_handle, _seq) = connecting(&mut iface, &mut device, &mut sockets);
++    // `connecting` already took the SYN off the queue, so send it again from a fresh socket.
++    let socket = tcp::Socket::new(
++        tcp::SocketBuffer::new(vec![0; 512]),
++        tcp::SocketBuffer::new(vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<tcp::Socket>(handle)
++        .connect(iface.context(), (REMOTE_V4, REMOTE_PORT), LOCAL_PORT + 1)
++        .unwrap();
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let syn = device
++        .tx
++        .iter()
++        .find(|frame| tcp_of(frame).max_seg_size.is_some())
++        .expect("no SYN was sent");
++    assert_eq!(tcp_of(syn).max_seg_size, Some(1460));
++}
++
++#[test]
++fn a_datagram_is_fragmented_to_the_learned_path_mtu() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = udp::Socket::new(
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .bind(LOCAL_PORT)
++        .unwrap();
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    device.tx.clear();
++
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .send_slice(&[0x37; 1200], (REMOTE_V4, REMOTE_PORT))
++        .unwrap();
++
++    let mut now = Instant::ZERO;
++    for _ in 0..8 {
++        iface.poll(now, &mut device, &mut sockets);
++        now += Duration::from_millis(1);
++    }
++
++    assert!(device.tx.len() >= 2, "the datagram was not fragmented");
++    let mut total_payload = 0;
++    for frame in device.tx.iter() {
++        let packet = Ipv4Packet::new_checked(frame).unwrap();
++        assert!(
++            packet.total_len() as usize <= 900,
++            "a fragment of {} bytes was sent to a path with an MTU of 900",
++            packet.total_len()
++        );
++        total_payload += packet.total_len() as usize - packet.header_len() as usize;
++    }
++    assert_eq!(total_payload, 1208);
++}
++
++#[test]
++fn an_error_reaches_both_the_icmp_socket_and_the_sender() {
++    use smoltcp::socket::icmp;
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let icmp_socket = icmp::Socket::new(
++        icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let icmp_handle = sockets.add(icmp_socket);
++    sockets
++        .get_mut::<icmp::Socket>(icmp_handle)
++        .bind(icmp::Endpoint::Udp(smoltcp::wire::IpListenEndpoint {
++            addr: None,
++            port: LOCAL_PORT,
++        }))
++        .unwrap();
++
++    let udp_socket = udp::Socket::new(
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let udp_handle = sockets.add(udp_socket);
++    sockets
++        .get_mut::<udp::Socket>(udp_handle)
++        .bind(LOCAL_PORT)
++        .unwrap();
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        PORT_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    // Handing the error to the sender must not consume the message on its way there.
++    let icmp_socket = sockets.get_mut::<icmp::Socket>(icmp_handle);
++    assert!(icmp_socket.can_recv(), "the icmp socket received nothing");
++    let (_payload, addr) = icmp_socket.recv().unwrap();
++    assert_eq!(addr, IpAddress::from(ROUTER_V4));
++
++    assert_eq!(
++        sockets.get_mut::<udp::Socket>(udp_handle).take_error(),
++        Some(IcmpError::PortUnreachable)
++    );
++}
++
++#[test]
++fn a_raw_socket_is_told_about_errors_for_its_protocol() {
++    use smoltcp::socket::raw;
++    use smoltcp::wire::IpVersion;
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = raw::Socket::new(
++        Some(IpVersion::Ipv4),
++        Some(IpProtocol::Udp),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        PORT_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<raw::Socket>(handle);
++    assert_eq!(socket.take_error(), Some(IcmpError::PortUnreachable));
++    assert_eq!(socket.take_error(), None);
++}
++
++#[test]
++fn a_raw_socket_bound_to_another_protocol_is_not_told() {
++    use smoltcp::socket::raw;
++    use smoltcp::wire::IpVersion;
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = raw::Socket::new(
++        Some(IpVersion::Ipv4),
++        Some(IpProtocol::Tcp),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        PORT_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<raw::Socket>(handle).take_error(), None);
++}
++
++#[test]
++fn errors_are_split_into_hard_and_soft() {
++    for hard in [
++        IcmpError::NetUnreachable,
++        IcmpError::HostUnreachable,
++        IcmpError::ProtoUnreachable,
++        IcmpError::PortUnreachable,
++        IcmpError::SrcRouteFailed,
++        IcmpError::Prohibited,
++    ] {
++        assert!(hard.is_hard(), "{hard:?} should be hard");
++    }
++
++    for soft in [
++        IcmpError::TimeExceeded,
++        IcmpError::ParamProblem,
++        IcmpError::PacketTooBig { mtu: 900 },
++    ] {
++        assert!(!soft.is_hard(), "{soft:?} should be soft");
++    }
++}
++
++#[test]
++fn a_failed_source_route_aborts_a_connection_attempt() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, seq) = connecting(&mut iface, &mut device, &mut sockets);
++
++    let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, seq);
++    device
++        .rx
++        .push_back(icmpv4_error(ROUTER_V4, DST_UNREACHABLE, 5, 0, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.state(), tcp::State::Closed);
++    assert_eq!(socket.take_error(), Some(IcmpError::SrcRouteFailed));
++}
++
++#[test]
++fn a_prohibited_route_aborts_a_connection_attempt() {
++    for code in [9u8, 10, 13] {
++        let (mut iface, mut device) = setup();
++        let mut sockets = SocketSet::new(vec![]);
++        let (handle, seq) = connecting(&mut iface, &mut device, &mut sockets);
++
++        let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, seq);
++        device
++            .rx
++            .push_back(icmpv4_error(ROUTER_V4, DST_UNREACHABLE, code, 0, &quote));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++        let socket = sockets.get_mut::<tcp::Socket>(handle);
++        assert_eq!(socket.state(), tcp::State::Closed);
++        assert_eq!(socket.take_error(), Some(IcmpError::Prohibited));
++    }
++}
++
++#[test]
++fn a_socket_is_told_its_packet_was_too_big() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = udp::Socket::new(
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .bind(LOCAL_PORT)
++        .unwrap();
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(
++        sockets.get_mut::<udp::Socket>(handle).take_error(),
++        Some(IcmpError::PacketTooBig { mtu: 900 })
++    );
++    assert_eq!(iface.pmtu(REMOTE_V4), 900);
++}
++
++#[test]
++fn a_parameter_problem_reaches_the_socket_that_sent_the_packet() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = udp::Socket::new(
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .bind(LOCAL_PORT)
++        .unwrap();
++
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++    let quote = quoted_udp_v6(local, remote, LOCAL_PORT, REMOTE_PORT);
++
++    device
++        .rx
++        .push_back(icmpv6_error(remote, local, 4, 0, 40, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(
++        sockets.get_mut::<udp::Socket>(handle).take_error(),
++        Some(IcmpError::ParamProblem)
++    );
++}
++
++fn ack_from_remote(ack_number: TcpSeqNumber) -> Vec<u8> {
++    tcp_packet(
++        REMOTE_V4,
++        LOCAL_V4,
++        TcpRepr {
++            src_port: REMOTE_PORT,
++            dst_port: LOCAL_PORT,
++            control: smoltcp::wire::TcpControl::None,
++            seq_number: TcpSeqNumber(0x4001),
++            ack_number: Some(ack_number),
++            window_len: 65535,
++            window_scale: None,
++            max_seg_size: None,
++            sack_permitted: false,
++            sack_ranges: [None, None, None],
++            timestamp: None,
++            payload: &[],
++        },
++    )
++}
++
++#[test]
++fn the_last_error_reported_is_the_one_handed_over() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = udp::Socket::new(
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .bind(LOCAL_PORT)
++        .unwrap();
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    for code in [HOST_UNREACHABLE, PORT_UNREACHABLE] {
++        device
++            .rx
++            .push_back(icmpv4_error(ROUTER_V4, DST_UNREACHABLE, code, 0, &quote));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    }
++
++    let socket = sockets.get_mut::<udp::Socket>(handle);
++    assert_eq!(socket.take_error(), Some(IcmpError::PortUnreachable));
++    assert_eq!(socket.take_error(), None);
++}
++
++#[test]
++fn only_a_sequence_still_outstanding_is_acted_on() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, base) = connected(&mut iface, &mut device, &mut sockets, Instant::ZERO);
++
++    sockets
++        .get_mut::<tcp::Socket>(handle)
++        .send_slice(&[0x11; 100])
++        .unwrap();
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    device.tx.clear();
++
++    // Nothing has been acknowledged, so the outstanding window is [base, base + 100].
++    for (seq, expected) in [
++        (base, Some(IcmpError::HostUnreachable)),
++        (base + 99, Some(IcmpError::HostUnreachable)),
++        // One past the last byte sent: the next sequence number, not an outstanding one.
++        (base + 100, None),
++        (base + 500, None),
++    ] {
++        let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, seq);
++        device.rx.push_back(icmpv4_error(
++            ROUTER_V4,
++            DST_UNREACHABLE,
++            HOST_UNREACHABLE,
++            0,
++            &quote,
++        ));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++        assert_eq!(
++            sockets.get_mut::<tcp::Socket>(handle).take_error(),
++            expected,
++            "error quoting sequence {seq}"
++        );
++    }
++
++    device.rx.push_back(ack_from_remote(base + 100));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    device.tx.clear();
++
++    // That data has been acknowledged now, so an error about it is stale.
++    let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, base);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        HOST_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    assert_eq!(sockets.get_mut::<tcp::Socket>(handle).take_error(), None);
++}
++
++#[test]
++fn no_path_mtu_is_learned_from_a_packet_we_did_not_send() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let quote = quoted_udp(OTHER_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(iface.pmtu(REMOTE_V4), IFACE_MTU);
++}
++
++#[test]
++fn nothing_is_learned_from_a_quote_shorter_than_an_ip_header() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let handle = bound_udp(&mut sockets);
++
++    // Not even a whole IPv4 header, so the quote names neither a sender nor a
++    // destination and there is nothing in it to act on.
++    let mut quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    quote.truncate(12);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<udp::Socket>(handle).take_error(), None);
++    assert_eq!(iface.pmtu(REMOTE_V4), IFACE_MTU);
++}
++
++#[test]
++fn flushing_forgets_the_path_mtu_of_every_destination() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    // The quoted datagram has a sender on this interface, so the report is one
++    // this stack is meant to act on however the socket-matching rule is read.
++    let _sender = bound_udp(&mut sockets);
++
++    for (dst, mtu) in [(REMOTE_V4, 900u16), (OTHER_V4, 1200)] {
++        let quote = quoted_udp(LOCAL_V4, dst, LOCAL_PORT, REMOTE_PORT);
++        device.rx.push_back(icmpv4_error(
++            ROUTER_V4,
++            DST_UNREACHABLE,
++            FRAG_REQUIRED,
++            mtu,
++            &quote,
++        ));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    }
++    assert_eq!(iface.pmtu(REMOTE_V4), 900);
++    assert_eq!(iface.pmtu(OTHER_V4), 1200);
++
++    iface.flush_pmtu();
++    assert_eq!(iface.pmtu(REMOTE_V4), IFACE_MTU);
++    assert_eq!(iface.pmtu(OTHER_V4), IFACE_MTU);
++}
++
++#[test]
++fn an_ipv6_socket_is_told_its_packet_was_too_big() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = udp::Socket::new(
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .bind(LOCAL_PORT)
++        .unwrap();
++
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++    let quote = quoted_udp_v6(local, remote, LOCAL_PORT, REMOTE_PORT);
++
++    // 1300 sits between the IPv6 minimum and the interface MTU, so nothing clamps it.
++    device
++        .rx
++        .push_back(icmpv6_packet_too_big(remote, local, 1300, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(
++        sockets.get_mut::<udp::Socket>(handle).take_error(),
++        Some(IcmpError::PacketTooBig { mtu: 1300 })
++    );
++    assert_eq!(iface.pmtu(remote), 1300);
++}
++
++#[test]
++fn a_raw_socket_bound_to_another_ip_version_is_not_told() {
++    use smoltcp::socket::raw;
++    use smoltcp::wire::IpVersion;
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = raw::Socket::new(
++        Some(IpVersion::Ipv6),
++        Some(IpProtocol::Udp),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        PORT_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<raw::Socket>(handle).take_error(), None);
++}
++
++#[test]
++fn the_error_type_carries_the_derives_the_api_promises() {
++    fn assert_derives<T: std::fmt::Debug + Clone + Copy + PartialEq + Eq>(_: T) {}
++    assert_derives(IcmpError::HostUnreachable);
++    assert_derives(IcmpError::PacketTooBig { mtu: 900 });
++
++    let error = IcmpError::PacketTooBig { mtu: 900 };
++    let copied = error;
++    assert_eq!(error, copied);
++    assert_eq!(error.clone(), copied);
++    assert_ne!(error, IcmpError::PacketTooBig { mtu: 1200 });
++    assert!(!format!("{error:?}").is_empty());
++}
++
++#[test]
++fn a_hard_error_aborts_a_connection_being_accepted() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = tcp::Socket::new(
++        tcp::SocketBuffer::new(vec![0; 4096]),
++        tcp::SocketBuffer::new(vec![0; 4096]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<tcp::Socket>(handle)
++        .listen(REMOTE_PORT)
++        .unwrap();
++
++    let syn = tcp_packet(
++        REMOTE_V4,
++        LOCAL_V4,
++        TcpRepr {
++            src_port: LOCAL_PORT,
++            dst_port: REMOTE_PORT,
++            control: smoltcp::wire::TcpControl::Syn,
++            seq_number: TcpSeqNumber(0x4000),
++            ack_number: None,
++            window_len: 65535,
++            window_scale: None,
++            max_seg_size: Some(1460),
++            sack_permitted: false,
++            sack_ranges: [None, None, None],
++            timestamp: None,
++            payload: &[],
++        },
++    );
++    device.rx.push_back(syn);
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let synack = device.tx.pop_front().expect("no SYN|ACK was sent");
++    let seq = tcp_of(&synack).seq_number;
++    assert_eq!(
++        sockets.get::<tcp::Socket>(handle).state(),
++        tcp::State::SynReceived
++    );
++
++    let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, REMOTE_PORT, LOCAL_PORT, seq);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        HOST_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.state(), tcp::State::Closed);
++    assert_eq!(socket.take_error(), Some(IcmpError::HostUnreachable));
++}
++
++#[test]
++fn an_error_quoting_the_wrong_port_on_either_side_is_ignored() {
++    for (src_port, dst_port) in [(LOCAL_PORT + 1, REMOTE_PORT), (LOCAL_PORT, REMOTE_PORT + 1)] {
++        let (mut iface, mut device) = setup();
++        let mut sockets = SocketSet::new(vec![]);
++        let (handle, seq) = connecting(&mut iface, &mut device, &mut sockets);
++
++        let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, src_port, dst_port, seq);
++        device.rx.push_back(icmpv4_error(
++            ROUTER_V4,
++            DST_UNREACHABLE,
++            HOST_UNREACHABLE,
++            0,
++            &quote,
++        ));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++        let socket = sockets.get_mut::<tcp::Socket>(handle);
++        assert_eq!(socket.state(), tcp::State::SynSent, "ports {src_port} {dst_port}");
++        assert_eq!(socket.take_error(), None, "ports {src_port} {dst_port}");
++    }
++}
++
++#[test]
++fn a_udp_socket_ignores_an_error_quoting_another_port() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = udp::Socket::new(
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .bind(LOCAL_PORT)
++        .unwrap();
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT + 1, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        PORT_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<udp::Socket>(handle).take_error(), None);
++}
++
++#[test]
++fn icmpv6_reasons_map_onto_the_same_errors() {
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++
++    for (msg_type, code, expected) in [
++        (1u8, 1u8, IcmpError::Prohibited),
++        (1, 4, IcmpError::PortUnreachable),
++        (3, 0, IcmpError::TimeExceeded),
++    ] {
++        let (mut iface, mut device) = setup();
++        let mut sockets = SocketSet::new(vec![]);
++
++        let socket = udp::Socket::new(
++            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        );
++        let handle = sockets.add(socket);
++        sockets
++            .get_mut::<udp::Socket>(handle)
++            .bind(LOCAL_PORT)
++            .unwrap();
++
++        let quote = quoted_udp_v6(local, remote, LOCAL_PORT, REMOTE_PORT);
++        device
++            .rx
++            .push_back(icmpv6_error(remote, local, msg_type, code, 0, &quote));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++        assert_eq!(
++            sockets.get_mut::<udp::Socket>(handle).take_error(),
++            Some(expected),
++            "icmpv6 type {msg_type} code {code}"
++        );
++    }
++}
++
++#[test]
++fn a_learned_ipv6_path_mtu_constrains_what_is_sent() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++
++    let socket = udp::Socket::new(
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .bind(LOCAL_PORT)
++        .unwrap();
++
++    let quote = quoted_udp_v6(local, remote, LOCAL_PORT, REMOTE_PORT);
++    device
++        .rx
++        .push_back(icmpv6_packet_too_big(remote, local, 1300, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    assert_eq!(iface.pmtu(remote), 1300);
++    device.tx.clear();
++
++    let mut now = Instant::ZERO;
++    let mut run = |iface: &mut Interface, device: &mut TestDevice, sockets: &mut SocketSet| {
++        for _ in 0..8 {
++            iface.poll(now, device, sockets);
++            now += Duration::from_millis(1);
++        }
++    };
++
++    // A datagram that fits the learned size still goes out.
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .send_slice(&[0x21; 1000], (remote, REMOTE_PORT))
++        .unwrap();
++    run(&mut iface, &mut device, &mut sockets);
++    assert!(!device.tx.is_empty(), "a datagram within the path MTU was not sent");
++    for frame in device.tx.iter() {
++        assert!(frame.len() <= 1300);
++    }
++    device.tx.clear();
++
++    // One that does not fit must not go out over that path at its full size.
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .send_slice(&[0x22; 1400], (remote, REMOTE_PORT))
++        .unwrap();
++    run(&mut iface, &mut device, &mut sockets);
++    for frame in device.tx.iter() {
++        assert!(
++            frame.len() <= 1300,
++            "a frame of {} bytes was sent to a path with an MTU of 1300",
++            frame.len()
++        );
++    }
++
++    // Whether that datagram is dropped or held back until the path grows again is not
++    // something this task decides, so nothing is asserted about it beyond its size.
++}
++
++#[test]
++fn a_soft_error_leaves_an_open_connection_alone() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, seq) = connected_with_data_in_flight(&mut iface, &mut device, &mut sockets, 100);
++
++    let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, seq);
++    device
++        .rx
++        .push_back(icmpv4_error(ROUTER_V4, TIME_EXCEEDED, 0, 0, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.state(), tcp::State::Established);
++    assert_eq!(socket.take_error(), Some(IcmpError::TimeExceeded));
++}
++
++#[test]
++fn an_ipv6_raw_socket_is_told_about_errors_for_its_protocol() {
++    use smoltcp::socket::raw;
++    use smoltcp::wire::IpVersion;
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = raw::Socket::new(
++        Some(IpVersion::Ipv6),
++        Some(IpProtocol::Udp),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++    let quote = quoted_udp_v6(local, remote, LOCAL_PORT, REMOTE_PORT);
++
++    device
++        .rx
++        .push_back(icmpv6_error(remote, local, 1, 4, 0, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<raw::Socket>(handle);
++    assert_eq!(socket.take_error(), Some(IcmpError::PortUnreachable));
++    assert_eq!(socket.take_error(), None);
++}
++
++/// A UDP socket bound to `LOCAL_PORT`, for the cases that only need somewhere for an
++/// error to land.
++fn bound_udp(sockets: &mut SocketSet) -> smoltcp::iface::SocketHandle {
++    let socket = udp::Socket::new(
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .bind(LOCAL_PORT)
++        .unwrap();
++    handle
++}
++
++#[test]
++fn every_icmpv6_reason_that_cannot_reach_the_destination_is_hard() {
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++
++    // No route, beyond scope, address unreachable, failed policy and reject route all
++    // say the packet cannot get there. Which of the named variants each becomes is not
++    // pinned here, only that it is a hard one.
++    for code in [0u8, 2, 3, 5, 6] {
++        let (mut iface, mut device) = setup();
++        let mut sockets = SocketSet::new(vec![]);
++        let handle = bound_udp(&mut sockets);
++
++        let quote = quoted_udp_v6(local, remote, LOCAL_PORT, REMOTE_PORT);
++        device
++            .rx
++            .push_back(icmpv6_error(remote, local, 1, code, 0, &quote));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++        let error = sockets
++            .get_mut::<udp::Socket>(handle)
++            .take_error()
++            .unwrap_or_else(|| panic!("icmpv6 unreachable code {code} reported nothing"));
++        assert!(error.is_hard(), "icmpv6 unreachable code {code} became {error:?}");
++    }
++}
++
++#[test]
++fn an_icmpv4_parameter_problem_reaches_the_socket_that_sent_the_packet() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let handle = bound_udp(&mut sockets);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device
++        .rx
++        .push_back(icmpv4_error(ROUTER_V4, 12, 0, 0, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(
++        sockets.get_mut::<udp::Socket>(handle).take_error(),
++        Some(IcmpError::ParamProblem)
++    );
++    // A parameter problem says nothing about how large a packet may be.
++    assert_eq!(iface.pmtu(REMOTE_V4), IFACE_MTU);
++}
++
++#[test]
++fn a_raw_socket_bound_to_no_particular_protocol_is_told() {
++    use smoltcp::socket::raw;
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = raw::Socket::new(
++        None,
++        None,
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        PORT_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(
++        sockets.get_mut::<raw::Socket>(handle).take_error(),
++        Some(IcmpError::PortUnreachable)
++    );
++}
++
++#[test]
++fn an_error_whose_checksum_is_wrong_is_ignored() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let handle = bound_udp(&mut sockets);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    let mut frame = icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    );
++    let checksum = &mut frame[20 + 2..20 + 4];
++    checksum[0] ^= 0xff;
++    device.rx.push_back(frame);
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<udp::Socket>(handle).take_error(), None);
++    assert_eq!(iface.pmtu(REMOTE_V4), IFACE_MTU);
++}
++
++#[test]
++fn an_icmpv6_error_quoting_less_than_a_header_is_ignored() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let handle = bound_udp(&mut sockets);
++
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++    let mut quote = quoted_udp_v6(local, remote, LOCAL_PORT, REMOTE_PORT);
++    quote.truncate(20);
++
++    device
++        .rx
++        .push_back(icmpv6_packet_too_big(remote, local, 1300, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<udp::Socket>(handle).take_error(), None);
++    assert_eq!(iface.pmtu(remote), IFACE_MTU);
++}
++
++#[test]
++fn the_fragments_of_a_datagram_reassemble_to_the_original() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = udp::Socket::new(
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .bind(LOCAL_PORT)
++        .unwrap();
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    device.tx.clear();
++
++    let payload: Vec<u8> = (0..1200u32).map(|i| (i % 251) as u8).collect();
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .send_slice(&payload, (REMOTE_V4, REMOTE_PORT))
++        .unwrap();
++
++    let mut now = Instant::ZERO;
++    for _ in 0..8 {
++        iface.poll(now, &mut device, &mut sockets);
++        now += Duration::from_millis(1);
++    }
++
++    let mut reassembled = vec![0u8; 0];
++    let frames: Vec<_> = device.tx.iter().cloned().collect();
++    assert!(frames.len() >= 2, "the datagram was not fragmented");
++
++    for (index, frame) in frames.iter().enumerate() {
++        let packet = Ipv4Packet::new_checked(frame).unwrap();
++        let last = index + 1 == frames.len();
++
++        assert_eq!(
++            packet.more_frags(),
++            !last,
++            "fragment {index} has the wrong more-fragments flag"
++        );
++        assert_eq!(
++            packet.frag_offset() as usize,
++            reassembled.len(),
++            "fragment {index} starts at the wrong offset"
++        );
++        if !last {
++            assert_eq!(
++                packet.frag_offset() as usize % 8,
++                0,
++                "fragment {index} is not aligned to an eight byte boundary"
++            );
++        }
++        reassembled.extend_from_slice(packet.payload());
++    }
++
++    let datagram = UdpPacket::new_checked(&reassembled[..]).expect("not a UDP datagram");
++    assert_eq!(datagram.src_port(), LOCAL_PORT);
++    assert_eq!(datagram.dst_port(), REMOTE_PORT);
++    assert_eq!(datagram.payload(), &payload[..]);
++}
++
++#[test]
++fn a_fresh_report_holds_at_its_new_size() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    // The quoted datagram has a sender on this interface, so the report is one
++    // this stack is meant to act on however the socket-matching rule is read.
++    let _sender = bound_udp(&mut sockets);
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        700,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO + Duration::from_secs(300), &mut device, &mut sockets);
++
++    // Each report holds for ten minutes of its own, so at 700 seconds the first report's
++    // ten minutes have passed but the second one's have not, and nothing is probed yet.
++    for after in [300u64, 400, 550, 700, 899] {
++        iface.poll(
++            Instant::ZERO + Duration::from_secs(after),
++            &mut device,
++            &mut sockets,
++        );
++        assert_eq!(iface.pmtu(REMOTE_V4), 700, "path mtu at {after} seconds");
++    }
++
++    // Ten minutes after the second report, and not before, the next size up is tried.
++    iface.poll(
++        Instant::ZERO + Duration::from_secs(901),
++        &mut device,
++        &mut sockets,
++    );
++    assert_eq!(iface.pmtu(REMOTE_V4), 1006);
++}
++
++#[test]
++fn a_hard_error_leaves_a_closing_connection_alone() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, base) = connected(&mut iface, &mut device, &mut sockets, Instant::ZERO);
++
++    sockets.get_mut::<tcp::Socket>(handle).close();
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    device.tx.clear();
++    assert_eq!(
++        sockets.get::<tcp::Socket>(handle).state(),
++        tcp::State::FinWait1
++    );
++
++    let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, base);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        HOST_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    // The connection is past opening, so a hard error is recorded and nothing else.
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.state(), tcp::State::FinWait1);
++    assert_eq!(socket.take_error(), Some(IcmpError::HostUnreachable));
++}
++
++#[test]
++fn a_socket_bound_elsewhere_is_not_told_its_packet_was_too_big() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = udp::Socket::new(
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let bystander = sockets.add(socket);
++    sockets
++        .get_mut::<udp::Socket>(bystander)
++        .bind(LOCAL_PORT + 7)
++        .unwrap();
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<udp::Socket>(bystander).take_error(), None);
++}
++
++#[test]
++fn an_icmpv6_error_quoting_a_packet_we_did_not_send_is_ignored() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let handle = bound_udp(&mut sockets);
++
++    let foreign = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 9);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let quote = quoted_udp_v6(foreign, remote, LOCAL_PORT, REMOTE_PORT);
++
++    device
++        .rx
++        .push_back(icmpv6_packet_too_big(remote, local, 1300, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<udp::Socket>(handle).take_error(), None);
++    assert_eq!(iface.pmtu(remote), IFACE_MTU);
++}
++
++#[test]
++fn an_icmpv6_error_quoting_another_port_is_ignored() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let handle = bound_udp(&mut sockets);
++
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++    let quote = quoted_udp_v6(local, remote, LOCAL_PORT + 1, REMOTE_PORT);
++
++    device
++        .rx
++        .push_back(icmpv6_error(remote, local, 1, 4, 0, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<udp::Socket>(handle).take_error(), None);
++}
++
++#[test]
++fn a_tcp_socket_also_keeps_only_the_latest_error() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, seq) = connected_with_data_in_flight(&mut iface, &mut device, &mut sockets, 100);
++
++    let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, seq);
++    for code in [HOST_UNREACHABLE, PROTO_UNREACHABLE] {
++        device
++            .rx
++            .push_back(icmpv4_error(ROUTER_V4, DST_UNREACHABLE, code, 0, &quote));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    }
++
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.take_error(), Some(IcmpError::ProtoUnreachable));
++    assert_eq!(socket.take_error(), None);
++}
++
++#[test]
++fn a_raw_socket_also_keeps_only_the_latest_error() {
++    use smoltcp::socket::raw;
++    use smoltcp::wire::IpVersion;
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = raw::Socket::new(
++        Some(IpVersion::Ipv4),
++        Some(IpProtocol::Udp),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    for code in [HOST_UNREACHABLE, PORT_UNREACHABLE] {
++        device
++            .rx
++            .push_back(icmpv4_error(ROUTER_V4, DST_UNREACHABLE, code, 0, &quote));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    }
++
++    let socket = sockets.get_mut::<raw::Socket>(handle);
++    assert_eq!(socket.take_error(), Some(IcmpError::PortUnreachable));
++    assert_eq!(socket.take_error(), None);
++}
++
++/// An established connection whose outstanding data runs past the largest sequence number
++/// and wraps around, plus the sequence number of the first outstanding byte.
++///
++/// The initial sequence number is random, so this looks for one that starts close enough
++/// below the top of the space. Every `connect` draws a fresh one from the interface, so a
++/// single interface yields many candidates without rebuilding anything.
++#[allow(clippy::type_complexity)]
++fn connected_across_the_wrap(
++    queued: usize,
++    sent: usize,
++) -> (
++    Interface,
++    TestDevice,
++    SocketSet<'static>,
++    smoltcp::iface::SocketHandle,
++    TcpSeqNumber,
++) {
++    for seed in 0..64u64 {
++        let mut device = TestDevice::new();
++        let mut config = Config::new(HardwareAddress::Ip);
++        config.random_seed = seed;
++        let mut iface = Interface::new(config, &mut device, Instant::ZERO);
++        iface.update_ip_addrs(|addrs| {
++            addrs.push(IpCidr::new(LOCAL_V4.into(), 24)).unwrap();
++        });
++
++        let mut sockets = SocketSet::new(vec![]);
++        let socket = tcp::Socket::new(
++            tcp::SocketBuffer::new(vec![0; 4096]),
++            tcp::SocketBuffer::new(vec![0; queued]),
++        );
++        let handle = sockets.add(socket);
++
++        for _ in 0..8192 {
++            sockets.get_mut::<tcp::Socket>(handle).abort();
++            iface.poll(Instant::ZERO, &mut device, &mut sockets);
++            device.tx.clear();
++
++            sockets
++                .get_mut::<tcp::Socket>(handle)
++                .connect(iface.context(), (REMOTE_V4, REMOTE_PORT), LOCAL_PORT)
++                .unwrap();
++            iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++            let Some(syn) = device.tx.pop_front() else {
++                continue;
++            };
++            device.tx.clear();
++            let isn = tcp_of(&syn).seq_number;
++            let base = isn + 1;
++
++            // Read as plain numbers, the window starts high and ends low: it went round.
++            if !(base.0 > 0 && (base + sent).0 < 0) {
++                continue;
++            }
++
++            let reply = tcp_packet(
++                REMOTE_V4,
++                LOCAL_V4,
++                TcpRepr {
++                    src_port: REMOTE_PORT,
++                    dst_port: LOCAL_PORT,
++                    control: smoltcp::wire::TcpControl::Syn,
++                    seq_number: TcpSeqNumber(0x4000),
++                    ack_number: Some(isn + 1),
++                    window_len: 65535,
++                    window_scale: None,
++                    max_seg_size: Some(1460),
++                    sack_permitted: false,
++                    sack_ranges: [None, None, None],
++                    timestamp: None,
++                    payload: &[],
++                },
++            );
++            device.rx.push_back(reply);
++            iface.poll(Instant::ZERO, &mut device, &mut sockets);
++            device.tx.clear();
++            assert_eq!(
++                sockets.get::<tcp::Socket>(handle).state(),
++                tcp::State::Established
++            );
++            return (iface, device, sockets, handle, base);
++        }
++    }
++    panic!("no initial sequence number put the outstanding window across the wrap");
++}
++
++#[test]
++fn a_send_window_that_crosses_the_wrap_is_still_matched_correctly() {
++    const QUEUED: usize = 1 << 20;
++    // One full window of data goes out on the first poll; the outstanding range has to
++    // cross the wrap, so ask for a little less than that to leave room.
++    const SENT: usize = 60_000;
++
++    let (mut iface, mut device, mut sockets, handle, base) =
++        connected_across_the_wrap(QUEUED, SENT);
++
++    sockets
++        .get_mut::<tcp::Socket>(handle)
++        .send_slice(&vec![0x5a; QUEUED])
++        .unwrap();
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    device.tx.clear();
++
++    // Both of these are outstanding, but the far one has gone past the largest sequence
++    // number and reads as a smaller number than the near one.
++    for offset in [0usize, SENT - 1] {
++        let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, base + offset);
++        device.rx.push_back(icmpv4_error(
++            ROUTER_V4,
++            DST_UNREACHABLE,
++            HOST_UNREACHABLE,
++            0,
++            &quote,
++        ));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++        assert_eq!(
++            sockets.get_mut::<tcp::Socket>(handle).take_error(),
++            Some(IcmpError::HostUnreachable),
++            "sequence {offset} bytes into a window that crosses the wrap"
++        );
++    }
++
++    // Just below the window, which has also wrapped, and so is still not outstanding.
++    let quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, base - 1);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        HOST_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    assert_eq!(sockets.get_mut::<tcp::Socket>(handle).take_error(), None);
++}
++
++#[test]
++fn a_path_mtu_is_learned_even_with_no_socket_to_tell() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    // A complete, valid report about a packet this interface sent, but nothing is bound
++    // to the port it quotes.
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(iface.pmtu(REMOTE_V4), 900);
++}
++
++#[test]
++fn the_path_mtu_of_a_destination_can_be_asked_for_as_an_ip_address() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let handle = bound_udp(&mut sockets);
++    let _ = handle;
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let dst: IpAddress = REMOTE_V4.into();
++    assert_eq!(iface.pmtu(dst), 900);
++    assert_eq!(iface.pmtu(IpAddress::from(OTHER_V4)), IFACE_MTU);
++
++    let v6: IpAddress = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2).into();
++    assert_eq!(iface.pmtu(v6), IFACE_MTU);
++}
++
++fn tcp_of_v6(frame: &[u8]) -> TcpRepr<'_> {
++    let ip = Ipv6Packet::new_checked(frame).expect("not an IPv6 packet");
++    assert_eq!(ip.next_header(), IpProtocol::Tcp);
++    let tcp = TcpPacket::new_checked(&frame[40..][..ip.payload_len() as usize])
++        .expect("not a TCP packet");
++    TcpRepr::parse(
++        &tcp,
++        &ip.src_addr().into(),
++        &ip.dst_addr().into(),
++        &ChecksumCapabilities::default(),
++    )
++    .expect("malformed TCP packet")
++}
++
++/// The IPv6 header plus the first eight bytes of a TCP segment this stack would have sent.
++fn quoted_tcp_v6(
++    src: Ipv6Address,
++    dst: Ipv6Address,
++    src_port: u16,
++    dst_port: u16,
++    seq: TcpSeqNumber,
++) -> Vec<u8> {
++    let ip_repr = Ipv6Repr {
++        src_addr: src,
++        dst_addr: dst,
++        next_header: IpProtocol::Tcp,
++        payload_len: 8,
++        hop_limit: 64,
++    };
++    let mut frame = vec![0; ip_repr.buffer_len() + 8];
++    ip_repr.emit(&mut Ipv6Packet::new_unchecked(&mut frame));
++    frame[40..42].copy_from_slice(&src_port.to_be_bytes());
++    frame[42..44].copy_from_slice(&dst_port.to_be_bytes());
++    frame[44..48].copy_from_slice(&(seq.0 as u32).to_be_bytes());
++    frame
++}
++
++#[test]
++fn an_icmpv6_hard_error_aborts_a_connection_attempt() {
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let socket = tcp::Socket::new(
++        tcp::SocketBuffer::new(vec![0; 4096]),
++        tcp::SocketBuffer::new(vec![0; 4096]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<tcp::Socket>(handle)
++        .connect(iface.context(), (remote, REMOTE_PORT), LOCAL_PORT)
++        .unwrap();
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let syn = device.tx.pop_front().expect("no SYN was sent");
++    let seq = tcp_of_v6(&syn).seq_number;
++    assert_eq!(
++        sockets.get::<tcp::Socket>(handle).state(),
++        tcp::State::SynSent
++    );
++
++    let quote = quoted_tcp_v6(local, remote, LOCAL_PORT, REMOTE_PORT, seq);
++    device
++        .rx
++        .push_back(icmpv6_error(remote, local, 1, 4, 0, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.state(), tcp::State::Closed);
++    assert_eq!(socket.take_error(), Some(IcmpError::PortUnreachable));
++}
++
++#[test]
++fn an_icmpv6_error_quoting_a_sequence_we_never_sent_is_ignored() {
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let socket = tcp::Socket::new(
++        tcp::SocketBuffer::new(vec![0; 4096]),
++        tcp::SocketBuffer::new(vec![0; 4096]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<tcp::Socket>(handle)
++        .connect(iface.context(), (remote, REMOTE_PORT), LOCAL_PORT)
++        .unwrap();
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let syn = device.tx.pop_front().expect("no SYN was sent");
++    let seq = tcp_of_v6(&syn).seq_number;
++
++    let quote = quoted_tcp_v6(local, remote, LOCAL_PORT, REMOTE_PORT, seq + 5000);
++    device
++        .rx
++        .push_back(icmpv6_error(remote, local, 1, 4, 0, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.state(), tcp::State::SynSent);
++    assert_eq!(socket.take_error(), None);
++}
++
++#[test]
++fn a_udp_socket_bound_to_one_address_ignores_an_error_for_another() {
++    const SECOND_V4: Ipv4Address = Ipv4Address::new(192, 168, 1, 9);
++
++    let mut device = TestDevice::new();
++    let config = Config::new(HardwareAddress::Ip);
++    let mut iface = Interface::new(config, &mut device, Instant::ZERO);
++    iface.update_ip_addrs(|addrs| {
++        addrs.push(IpCidr::new(LOCAL_V4.into(), 24)).unwrap();
++        addrs.push(IpCidr::new(SECOND_V4.into(), 24)).unwrap();
++    });
++
++    let mut sockets = SocketSet::new(vec![]);
++    let socket = udp::Socket::new(
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<udp::Socket>(handle)
++        .bind((SECOND_V4, LOCAL_PORT))
++        .unwrap();
++
++    // Both are addresses of this interface, but the datagram went out from the other one.
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        PORT_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<udp::Socket>(handle).take_error(), None);
++}
++
++#[test]
++fn a_raw_socket_is_not_told_about_a_packet_we_did_not_send() {
++    use smoltcp::socket::raw;
++    use smoltcp::wire::IpVersion;
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let socket = raw::Socket::new(
++        Some(IpVersion::Ipv4),
++        Some(IpProtocol::Udp),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++
++    // The version and protocol are the ones this socket is bound to, so only the
++    // ownership check can turn it away.
++    let quote = quoted_udp(OTHER_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<raw::Socket>(handle).take_error(), None);
++    assert_eq!(iface.pmtu(REMOTE_V4), IFACE_MTU);
++}
++
++#[test]
++fn one_report_reaches_both_a_raw_socket_and_the_sender() {
++    use smoltcp::socket::raw;
++    use smoltcp::wire::IpVersion;
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++
++    let raw_socket = raw::Socket::new(
++        Some(IpVersion::Ipv4),
++        Some(IpProtocol::Udp),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++    );
++    let raw_handle = sockets.add(raw_socket);
++    let udp_handle = bound_udp(&mut sockets);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        PORT_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    // The sender is told, and the raw socket bound to that traffic is told as well.
++    assert_eq!(
++        sockets.get_mut::<udp::Socket>(udp_handle).take_error(),
++        Some(IcmpError::PortUnreachable)
++    );
++    assert_eq!(
++        sockets.get_mut::<raw::Socket>(raw_handle).take_error(),
++        Some(IcmpError::PortUnreachable)
++    );
++}
++
++#[test]
++fn an_ipv6_path_mtu_is_probed_back_upward_and_can_be_flushed() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let handle = bound_udp(&mut sockets);
++    let _ = handle;
++
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++    let quote = quoted_udp_v6(local, remote, LOCAL_PORT, REMOTE_PORT);
++
++    device
++        .rx
++        .push_back(icmpv6_packet_too_big(remote, local, 1300, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    for (after, expected) in [
++        (0u64, 1300usize),
++        (599, 1300),
++        (600, 1492),
++        (1200, IFACE_MTU),
++        (100_000, IFACE_MTU),
++    ] {
++        iface.poll(
++            Instant::ZERO + Duration::from_secs(after),
++            &mut device,
++            &mut sockets,
++        );
++        assert_eq!(iface.pmtu(remote), expected, "ipv6 path mtu at {after} seconds");
++    }
++
++    device
++        .rx
++        .push_back(icmpv6_packet_too_big(remote, local, 1300, &quote));
++    iface.poll(
++        Instant::ZERO + Duration::from_secs(100_000),
++        &mut device,
++        &mut sockets,
++    );
++    assert_eq!(iface.pmtu(remote), 1300);
++
++    iface.flush_pmtu();
++    assert_eq!(iface.pmtu(remote), IFACE_MTU);
++}
++
++fn tcp_packet_v6(src: Ipv6Address, dst: Ipv6Address, repr: TcpRepr<'_>) -> Vec<u8> {
++    let ip_repr = Ipv6Repr {
++        src_addr: src,
++        dst_addr: dst,
++        next_header: IpProtocol::Tcp,
++        payload_len: repr.buffer_len(),
++        hop_limit: 64,
++    };
++    let mut frame = vec![0; ip_repr.buffer_len() + repr.buffer_len()];
++    ip_repr.emit(&mut Ipv6Packet::new_unchecked(&mut frame));
++    repr.emit(
++        &mut TcpPacket::new_unchecked(&mut frame[ip_repr.buffer_len()..]),
++        &src.into(),
++        &dst.into(),
++        &ChecksumCapabilities::default(),
++    );
++    frame
++}
++
++/// An established IPv6 connection, plus the sequence number of its first data byte.
++fn connected_v6(
++    iface: &mut Interface,
++    device: &mut TestDevice,
++    sockets: &mut SocketSet,
++    local: Ipv6Address,
++    remote: Ipv6Address,
++) -> (smoltcp::iface::SocketHandle, TcpSeqNumber) {
++    let socket = tcp::Socket::new(
++        tcp::SocketBuffer::new(vec![0; 4096]),
++        tcp::SocketBuffer::new(vec![0; 65535]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<tcp::Socket>(handle)
++        .connect(iface.context(), (remote, REMOTE_PORT), LOCAL_PORT)
++        .unwrap();
++    iface.poll(Instant::ZERO, device, sockets);
++
++    let syn = device.tx.pop_front().expect("no SYN was sent");
++    let isn = tcp_of_v6(&syn).seq_number;
++
++    let reply = tcp_packet_v6(
++        remote,
++        local,
++        TcpRepr {
++            src_port: REMOTE_PORT,
++            dst_port: LOCAL_PORT,
++            control: smoltcp::wire::TcpControl::Syn,
++            seq_number: TcpSeqNumber(0x4000),
++            ack_number: Some(isn + 1),
++            window_len: 65535,
++            window_scale: None,
++            max_seg_size: Some(1440),
++            sack_permitted: false,
++            sack_ranges: [None, None, None],
++            timestamp: None,
++            payload: &[],
++        },
++    );
++    device.rx.push_back(reply);
++    iface.poll(Instant::ZERO, device, sockets);
++    device.tx.clear();
++
++    assert_eq!(
++        sockets.get::<tcp::Socket>(handle).state(),
++        tcp::State::Established
++    );
++    (handle, isn + 1)
++}
++
++#[test]
++fn ipv6_segments_shrink_to_the_learned_path_mtu() {
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, _base) = connected_v6(&mut iface, &mut device, &mut sockets, local, remote);
++
++    sockets
++        .get_mut::<tcp::Socket>(handle)
++        .send_slice(&[0x61; 16384])
++        .unwrap();
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let first = device.tx.pop_front().expect("no data segment was sent");
++    let first_len = first.len();
++    assert!(
++        first_len > 1300,
++        "the first segment already fitted the path MTU the error is about"
++    );
++    let seq = tcp_of_v6(&first).seq_number;
++    device.tx.clear();
++
++    let quote = quoted_tcp_v6(local, remote, LOCAL_PORT, REMOTE_PORT, seq);
++    device
++        .rx
++        .push_back(icmpv6_packet_too_big(remote, local, 1300, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    assert_eq!(iface.pmtu(remote), 1300);
++    device.tx.clear();
++
++    let mut now = Instant::ZERO;
++    for _ in 0..40 {
++        now += Duration::from_millis(250);
++        iface.poll(now, &mut device, &mut sockets);
++        if !device.tx.is_empty() {
++            break;
++        }
++    }
++
++    assert!(!device.tx.is_empty(), "nothing was retransmitted");
++    for frame in device.tx.iter() {
++        assert!(
++            frame.len() <= 1300,
++            "a segment of {} bytes was sent to a path with an MTU of 1300",
++            frame.len()
++        );
++    }
++}
++
++#[test]
++fn the_advertised_mss_on_an_ipv6_syn_still_comes_from_the_interface_mtu() {
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let _sender = bound_udp(&mut sockets);
++
++    let quote = quoted_udp_v6(local, remote, LOCAL_PORT, REMOTE_PORT);
++    device
++        .rx
++        .push_back(icmpv6_packet_too_big(remote, local, 1300, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    assert_eq!(iface.pmtu(remote), 1300);
++    device.tx.clear();
++
++    let socket = tcp::Socket::new(
++        tcp::SocketBuffer::new(vec![0; 512]),
++        tcp::SocketBuffer::new(vec![0; 512]),
++    );
++    let handle = sockets.add(socket);
++    sockets
++        .get_mut::<tcp::Socket>(handle)
++        .connect(iface.context(), (remote, REMOTE_PORT), LOCAL_PORT + 1)
++        .unwrap();
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    // 1500 less the IPv6 and TCP headers, not the 1300 just learned.
++    let syn = device.tx.pop_front().expect("no SYN was sent");
++    assert_eq!(tcp_of_v6(&syn).max_seg_size, Some(1440));
++}
++
++#[test]
++fn a_tcp_socket_is_not_told_about_a_quote_with_no_sequence_number_in_it() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, seq) =
++        connected_with_data_in_flight(&mut iface, &mut device, &mut sockets, 100);
++
++    // A whole IPv4 header and both ports, but the sequence number is cut off, so there is
++    // no way to tell whether this quotes something the socket still has outstanding.
++    let mut quote = quoted_tcp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT, seq);
++    quote.truncate(20 + 4);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        HOST_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.state(), tcp::State::Established);
++    assert_eq!(socket.take_error(), None);
++}
++
++#[test]
++fn each_raw_binding_dimension_is_matched_on_its_own() {
++    use smoltcp::socket::raw;
++    use smoltcp::wire::IpVersion;
++
++    // Version fixed, protocol wild: the version still has to match.
++    for (version, protocol, expected) in [
++        (Some(IpVersion::Ipv4), None, Some(IcmpError::PortUnreachable)),
++        (Some(IpVersion::Ipv6), None, None),
++        (None, Some(IpProtocol::Udp), Some(IcmpError::PortUnreachable)),
++        (None, Some(IpProtocol::Tcp), None),
++    ] {
++        let (mut iface, mut device) = setup();
++        let mut sockets = SocketSet::new(vec![]);
++
++        let socket = raw::Socket::new(
++            version,
++            protocol,
++            raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++            raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 512]),
++        );
++        let handle = sockets.add(socket);
++
++        let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++        device.rx.push_back(icmpv4_error(
++            ROUTER_V4,
++            DST_UNREACHABLE,
++            PORT_UNREACHABLE,
++            0,
++            &quote,
++        ));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++        assert_eq!(
++            sockets.get_mut::<raw::Socket>(handle).take_error(),
++            expected,
++            "raw socket bound to {version:?} / {protocol:?}"
++        );
++    }
++}
++
++#[test]
++fn an_icmpv6_error_whose_checksum_is_wrong_is_ignored() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let handle = bound_udp(&mut sockets);
++
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++    let quote = quoted_udp_v6(local, remote, LOCAL_PORT, REMOTE_PORT);
++
++    let mut frame = icmpv6_packet_too_big(remote, local, 1300, &quote);
++    // The ICMPv6 message starts after the fixed forty byte IPv6 header.
++    frame[40 + 2] ^= 0xff;
++    device.rx.push_back(frame);
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<udp::Socket>(handle).take_error(), None);
++    assert_eq!(iface.pmtu(remote), IFACE_MTU);
++}
++
++#[test]
++fn a_message_of_an_unknown_type_is_ignored() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let handle = bound_udp(&mut sockets);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device
++        .rx
++        .push_back(icmpv4_error(ROUTER_V4, 200, 0, 900, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<udp::Socket>(handle).take_error(), None);
++    assert_eq!(iface.pmtu(REMOTE_V4), IFACE_MTU);
++
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++    let quote = quoted_udp_v6(local, remote, LOCAL_PORT, REMOTE_PORT);
++    device
++        .rx
++        .push_back(icmpv6_error(remote, local, 200, 0, 1300, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<udp::Socket>(handle).take_error(), None);
++    assert_eq!(iface.pmtu(remote), IFACE_MTU);
++}
++
++#[test]
++fn an_unreachable_reason_that_carries_no_mtu_leaves_the_path_mtu_alone() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let _sender = bound_udp(&mut sockets);
++
++    // A destination unreachable with a code this stack has no name for. Whether such a
++    // report is reported to the socket at all is left open here; what it certainly is
++    // not is a report of how large a packet may be, so the path MTU must not move. The
++    // MTU field is filled in to catch an implementation that reads it regardless.
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        200,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    assert_eq!(iface.pmtu(REMOTE_V4), IFACE_MTU);
++
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++    let quote = quoted_udp_v6(local, remote, LOCAL_PORT, REMOTE_PORT);
++    device
++        .rx
++        .push_back(icmpv6_error(remote, local, 1, 200, 1300, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    assert_eq!(iface.pmtu(remote), IFACE_MTU);
++}
++
++#[test]
++fn a_udp_socket_is_not_told_about_a_quote_with_no_ports_in_it() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let handle = bound_udp(&mut sockets);
++
++    // A whole IPv4 header, but not enough of the datagram to read both ports, so there is
++    // no way to tell which socket sent it.
++    let mut quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    quote.truncate(20 + 2);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        PORT_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(sockets.get_mut::<udp::Socket>(handle).take_error(), None);
++}
++
++#[test]
++fn an_ipv6_tcp_socket_is_not_told_about_a_quote_with_no_sequence_number_in_it() {
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let (handle, base) = connected_v6(&mut iface, &mut device, &mut sockets, local, remote);
++
++    sockets
++        .get_mut::<tcp::Socket>(handle)
++        .send_slice(&[0x44; 100])
++        .unwrap();
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    device.tx.clear();
++
++    // Both ports survive the truncation but the sequence number does not, so there is no
++    // way to tell whether this quotes something the socket still has outstanding.
++    let mut quote = quoted_tcp_v6(local, remote, LOCAL_PORT, REMOTE_PORT, base);
++    quote.truncate(40 + 4);
++    device
++        .rx
++        .push_back(icmpv6_error(remote, local, 1, 4, 0, &quote));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    let socket = sockets.get_mut::<tcp::Socket>(handle);
++    assert_eq!(socket.state(), tcp::State::Established);
++    assert_eq!(socket.take_error(), None);
++}
++
++#[test]
++fn a_report_outside_the_bounds_is_still_reported_and_recorded_at_the_bound() {
++    // Below the IPv4 floor, and above the interface MTU: the recorded path MTU moves to
++    // the bound in both cases. Whether the socket hears the size the router quoted or the
++    // one that ended up recorded is not something this task decides, so only the shape of
++    // the error is asserted here.
++    for (reported, recorded) in [(68u16, 576usize), (9000, IFACE_MTU)] {
++        let (mut iface, mut device) = setup();
++        let mut sockets = SocketSet::new(vec![]);
++        let handle = bound_udp(&mut sockets);
++
++        let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++        device.rx.push_back(icmpv4_error(
++            ROUTER_V4,
++            DST_UNREACHABLE,
++            FRAG_REQUIRED,
++            reported,
++            &quote,
++        ));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++        assert!(
++            matches!(
++                sockets.get_mut::<udp::Socket>(handle).take_error(),
++                Some(IcmpError::PacketTooBig { .. })
++            ),
++            "a report of {reported} did not reach the socket"
++        );
++        assert_eq!(iface.pmtu(REMOTE_V4), recorded, "a report of {reported}");
++    }
++}
++
++#[test]
++fn a_raw_socket_send_is_also_sized_by_the_learned_path_mtu() {
++    use smoltcp::socket::raw;
++    use smoltcp::wire::IpVersion;
++
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let _sender = bound_udp(&mut sockets);
++
++    let quote = quoted_udp(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++    assert_eq!(iface.pmtu(REMOTE_V4), 900);
++    device.tx.clear();
++
++    let socket = raw::Socket::new(
++        Some(IpVersion::Ipv4),
++        Some(IpProtocol::Udp),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 4096]),
++        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 4096]),
++    );
++    let handle = sockets.add(socket);
++
++    // A complete IPv4 packet of 1200 bytes, which is under the interface MTU but over the
++    // size this destination now accepts.
++    let payload_len = 1200 - 20 - 8;
++    let repr = UdpRepr {
++        src_port: LOCAL_PORT,
++        dst_port: REMOTE_PORT,
++    };
++    let ip_repr = Ipv4Repr {
++        src_addr: LOCAL_V4,
++        dst_addr: REMOTE_V4,
++        next_header: IpProtocol::Udp,
++        payload_len: repr.header_len() + payload_len,
++        hop_limit: 64,
++    };
++    let mut packet = vec![0; ip_repr.buffer_len() + repr.header_len() + payload_len];
++    ip_repr.emit(
++        &mut Ipv4Packet::new_unchecked(&mut packet),
++        &ChecksumCapabilities::default(),
++    );
++    repr.emit(
++        &mut UdpPacket::new_unchecked(&mut packet[ip_repr.buffer_len()..]),
++        &LOCAL_V4.into(),
++        &REMOTE_V4.into(),
++        payload_len,
++        |buf| buf.fill(0x77),
++        &ChecksumCapabilities::default(),
++    );
++    sockets
++        .get_mut::<raw::Socket>(handle)
++        .send_slice(&packet)
++        .unwrap();
++
++    let mut now = Instant::ZERO;
++    for _ in 0..8 {
++        iface.poll(now, &mut device, &mut sockets);
++        now += Duration::from_millis(1);
++    }
++
++    assert!(device.tx.len() >= 2, "the raw packet was not fragmented");
++    for frame in device.tx.iter() {
++        let ip = Ipv4Packet::new_checked(frame).unwrap();
++        assert!(
++            ip.total_len() as usize <= 900,
++            "a frame of {} bytes was sent to a path with an MTU of 900",
++            ip.total_len()
++        );
++    }
++}
++
++#[test]
++fn a_udp_socket_is_told_whatever_the_quoted_destination_was() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let handle = bound_udp(&mut sockets);
++
++    // The socket is bound to a local port and has no remote of its own, so a quoted
++    // destination it never sent to is still its traffic as far as matching can tell.
++    let quote = quoted_udp(LOCAL_V4, OTHER_V4, LOCAL_PORT, REMOTE_PORT + 5);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        PORT_UNREACHABLE,
++        0,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(
++        sockets.get_mut::<udp::Socket>(handle).take_error(),
++        Some(IcmpError::PortUnreachable)
++    );
++}
++
++/// A quoted UDP datagram whose IPv4 header carries four bytes of options, so the transport
++/// header starts at offset 24 rather than the usual 20.
++fn quoted_udp_with_ip_options(
++    src: Ipv4Address,
++    dst: Ipv4Address,
++    src_port: u16,
++    dst_port: u16,
++) -> Vec<u8> {
++    const HEADER_LEN: usize = 24;
++    let mut frame = vec![0u8; HEADER_LEN + 8];
++    {
++        let mut packet = Ipv4Packet::new_unchecked(&mut frame);
++        packet.set_version(4);
++        packet.set_header_len(HEADER_LEN as u8);
++        packet.set_dscp(0);
++        packet.set_ecn(0);
++        packet.set_total_len((HEADER_LEN + 8) as u16);
++        packet.set_ident(0);
++        packet.set_dont_frag(false);
++        packet.set_more_frags(false);
++        packet.set_frag_offset(0);
++        packet.set_hop_limit(64);
++        packet.set_next_header(IpProtocol::Udp);
++        packet.set_src_addr(src);
++        packet.set_dst_addr(dst);
++    }
++    // Four no-operation options. An implementation reading the ports at a fixed offset of
++    // twenty would find these bytes instead.
++    frame[20..24].copy_from_slice(&[1, 1, 1, 1]);
++    frame[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&src_port.to_be_bytes());
++    frame[HEADER_LEN + 2..HEADER_LEN + 4].copy_from_slice(&dst_port.to_be_bytes());
++    Ipv4Packet::new_unchecked(&mut frame).fill_checksum();
++    frame
++}
++
++#[test]
++fn a_quote_whose_ip_header_carries_options_is_still_read_correctly() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let handle = bound_udp(&mut sockets);
++
++    let quote = quoted_udp_with_ip_options(LOCAL_V4, REMOTE_V4, LOCAL_PORT, REMOTE_PORT);
++    device.rx.push_back(icmpv4_error(
++        ROUTER_V4,
++        DST_UNREACHABLE,
++        FRAG_REQUIRED,
++        900,
++        &quote,
++    ));
++    iface.poll(Instant::ZERO, &mut device, &mut sockets);
++
++    assert_eq!(
++        sockets.get_mut::<udp::Socket>(handle).take_error(),
++        Some(IcmpError::PacketTooBig { mtu: 900 })
++    );
++    assert_eq!(iface.pmtu(REMOTE_V4), 900);
++}
++
++#[test]
++fn an_ipv6_router_that_reports_no_mtu_walks_down_to_the_ipv6_floor() {
++    let (mut iface, mut device) = setup();
++    let mut sockets = SocketSet::new(vec![]);
++    let _sender = bound_udp(&mut sockets);
++
++    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
++    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
++    let quote = quoted_udp_v6(local, remote, LOCAL_PORT, REMOTE_PORT);
++
++    // The zero rule is the same for both families; only the floor it stops at differs.
++    for expected in [1492usize, 1280, 1280] {
++        device
++            .rx
++            .push_back(icmpv6_packet_too_big(remote, local, 0, &quote));
++        iface.poll(Instant::ZERO, &mut device, &mut sockets);
++        assert_eq!(iface.pmtu(remote), expected);
++    }
++}

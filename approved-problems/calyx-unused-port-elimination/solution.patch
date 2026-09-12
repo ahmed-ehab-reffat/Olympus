@@ -1,0 +1,1565 @@
+diff --git a/calyx/frontend/src/attribute.rs b/calyx/frontend/src/attribute.rs
+index 0ee5af49..53563003 100644
+--- a/calyx/frontend/src/attribute.rs
++++ b/calyx/frontend/src/attribute.rs
+@@ -31,6 +31,10 @@ pub enum BoolAttr {
+     #[strum(serialize = "nointerface")]
+     /// The component doesn't have a standard interface
+     NoInterface,
++    #[strum(serialize = "fixed_signature")]
++    /// The signature of this component is observed outside the program and
++    /// must not be changed
++    FixedSignature,
+     #[strum(serialize = "reset")]
+     /// Reset signal for the component
+     Reset,
+diff --git a/calyx/ir/src/structure.rs b/calyx/ir/src/structure.rs
+index af28b9c0..4a0cbeec 100644
+--- a/calyx/ir/src/structure.rs
++++ b/calyx/ir/src/structure.rs
+@@ -10,7 +10,7 @@ use calyx_frontend::{Attribute, BoolAttr};
+ use calyx_utils::{CalyxResult, Error, GetName};
+ use itertools::Itertools;
+ use smallvec::{SmallVec, smallvec};
+-use std::collections::HashMap;
++use std::collections::{HashMap, HashSet};
+ use std::hash::Hash;
+ use std::rc::Rc;
+ 
+@@ -476,6 +476,15 @@ impl Cell {
+         &self.ports
+     }
+ 
++    /// Drop every port whose name appears in `names` and return the number of
++    /// ports that were dropped.
++    pub fn remove_ports(&mut self, names: &HashSet<Id>) -> usize {
++        let before = self.ports.len();
++        self.ports
++            .retain(|port| !names.contains(&port.borrow().name));
++        before - self.ports.len()
++    }
++
+     // Get the signature of this cell as a vector. Each element corresponds to a port in the Cell.
+     pub fn get_signature(&self) -> Vec<PortDef<u64>> {
+         self.ports
+diff --git a/calyx/opt/src/analysis/mod.rs b/calyx/opt/src/analysis/mod.rs
+index d6147bc9..2ba7b055 100644
+--- a/calyx/opt/src/analysis/mod.rs
++++ b/calyx/opt/src/analysis/mod.rs
+@@ -16,6 +16,7 @@ mod graph_coloring;
+ mod inference_analysis;
+ mod live_range_analysis;
+ mod port_interface;
++mod port_liveness;
+ mod promotion_analysis;
+ pub mod reaching_defns;
+ mod read_write_set;
+@@ -41,6 +42,9 @@ pub use inference_analysis::GoDone;
+ pub use inference_analysis::InferenceAnalysis;
+ pub use live_range_analysis::LiveRangeAnalysis;
+ pub use port_interface::PortInterface;
++pub use port_liveness::{
++    PortLiveness, constant_input_ports, constant_output_ports,
++};
+ pub use promotion_analysis::PromotionAnalysis;
+ pub use read_write_set::{AssignmentAnalysis, ReadWriteSet};
+ pub use schedule_conflicts::ScheduleConflicts;
+diff --git a/calyx/opt/src/analysis/port_liveness.rs b/calyx/opt/src/analysis/port_liveness.rs
+new file mode 100644
+index 00000000..eabe35d4
+--- /dev/null
++++ b/calyx/opt/src/analysis/port_liveness.rs
+@@ -0,0 +1,935 @@
++use calyx_ir::{self as ir, RRC};
++use std::collections::{HashMap, HashSet};
++
++/// A port on a component signature, identified by the name of the component and
++/// the name of the port.
++pub type SignaturePort = (ir::Id, ir::Id);
++
++/// A `ref` cell in a component's signature, identified by the name of the
++/// component and the name of the cell.
++pub type SignatureRef = (ir::Id, ir::Id);
++
++/// Whole-program liveness information for component signatures.
++///
++/// A signature port is live when removing it could change the behavior of the
++/// program. Because the analysis is whole-program, an output port is live only
++/// when some instantiation of the component has that port read, and an input
++/// port is live only when the body of the component reads it.
++///
++/// The two facts depend on each other: dropping a read of an instance port can
++/// make a port of the instantiated component dead, which in turn drops more
++/// reads. [PortLiveness] therefore computes the least set of live ports that is
++/// closed under both rules.
++pub struct PortLiveness {
++    live_ports: HashSet<SignaturePort>,
++    live_refs: HashSet<SignatureRef>,
++    live_comb: HashSet<(ir::Id, ir::Id)>,
++}
++
++/// Ports that the compiler uses to implement the go-done protocol. They are
++/// never removed because the surrounding machinery assumes they exist.
++fn is_interface_port(port: &ir::Port) -> bool {
++    port.attributes.has(ir::NumAttr::Go)
++        || port.attributes.has(ir::NumAttr::Done)
++        || port.attributes.has(ir::BoolAttr::Clk)
++        || port.attributes.has(ir::BoolAttr::Reset)
++}
++
++/// The component instantiated by `cell`, if the cell is an instance of a
++/// component defined in this program.
++fn instance_of(cell: &ir::Cell) -> Option<ir::Id> {
++    match &cell.prototype {
++        ir::CellType::Component { name } => Some(*name),
++        _ => None,
++    }
++}
++
++/// The `(value, width)` of a constant if `port` belongs to a constant cell.
++fn const_of(port: &ir::Port) -> Option<(u64, u64)> {
++    let ir::PortParent::Cell(cell_wref) = &port.parent else {
++        return None;
++    };
++    let cell = cell_wref.upgrade();
++    let cell = cell.borrow();
++    match &cell.prototype {
++        ir::CellType::Constant { val, width } => Some((*val, *width)),
++        _ => None,
++    }
++}
++
++/// Whether `a`'s destination is `inst.<port>`.
++fn writes_port<T>(a: &ir::Assignment<T>, inst: ir::Id, port: ir::Id) -> bool {
++    let d = a.dst.borrow();
++    d.get_parent_name() == inst && d.name == port
++}
++
++/// Whether `a` reads `inst.<port>` on its source or in its guard.
++fn reads_port<T>(a: &ir::Assignment<T>, inst: ir::Id, port: ir::Id) -> bool {
++    {
++        let s = a.src.borrow();
++        if s.get_parent_name() == inst && s.name == port {
++            return true;
++        }
++    }
++    a.guard.all_ports().iter().any(|p| {
++        let p = p.borrow();
++        p.get_parent_name() == inst && p.name == port
++    })
++}
++
++/// Whether anything in `comp` other than an `invoke` of `inst` drives the `@go`
++/// port of `inst`, which starts the instance outside the bindings those invokes
++/// carry. Structural wiring and the destination of another `invoke`'s output
++/// binding both count.
++fn go_driven_structurally(comp: &ir::Component, inst: ir::Id) -> bool {
++    let drives_go = |d: &ir::Port| {
++        d.get_parent_name() == inst && d.attributes.has(ir::NumAttr::Go)
++    };
++    let mut bound_by_invoke = false;
++    visit_invokes(&comp.control.borrow(), &mut |_, _, outputs| {
++        if outputs.iter().any(|(_, p)| drives_go(&p.borrow())) {
++            bound_by_invoke = true;
++        }
++    });
++    if bound_by_invoke {
++        return true;
++    }
++    if comp
++        .continuous_assignments
++        .iter()
++        .any(|a| drives_go(&a.dst.borrow()))
++    {
++        return true;
++    }
++    for group in comp.get_groups().iter() {
++        if group
++            .borrow()
++            .assignments
++            .iter()
++            .any(|a| drives_go(&a.dst.borrow()))
++        {
++            return true;
++        }
++    }
++    for group in comp.comb_groups.iter() {
++        if group
++            .borrow()
++            .assignments
++            .iter()
++            .any(|a| drives_go(&a.dst.borrow()))
++        {
++            return true;
++        }
++    }
++    for group in comp.get_static_groups().iter() {
++        if group
++            .borrow()
++            .assignments
++            .iter()
++            .any(|a| drives_go(&a.dst.borrow()))
++        {
++            return true;
++        }
++    }
++    for fsm in comp.fsms.iter() {
++        for state in &fsm.borrow().assignments {
++            if state.iter().any(|a| drives_go(&a.dst.borrow())) {
++                return true;
++            }
++        }
++    }
++    false
++}
++
++/// The single constant that every unconditional driver of `inst.<port>` writes,
++/// or `None` when it is read from, left undriven, driven conditionally (in a
++/// group), or driven with a guard / non-constant / two disagreeing constants.
++fn value_driven_to(
++    comp: &ir::Component,
++    inst: ir::Id,
++    port: ir::Id,
++) -> Option<(u64, u64)> {
++    // Only an unconditional driver (a continuous assignment or an `invoke`
++    // binding) proves the port always carries a constant. A group / comb-group /
++    // static-group write is active only while its group runs, so it is
++    // conditional and disqualifies the port. Any read disqualifies it too.
++    let mut writes: Vec<Option<(u64, u64)>> = Vec::new();
++    let mut read = false;
++    let mut conditional_write = false;
++    let mut continuous_write = false;
++
++    for a in &comp.continuous_assignments {
++        if writes_port(a, inst, port) {
++            continuous_write = true;
++            writes.push(if a.guard.is_true() {
++                const_of(&a.src.borrow())
++            } else {
++                None
++            });
++        }
++        if reads_port(a, inst, port) {
++            read = true;
++        }
++    }
++    for group in comp.get_groups().iter() {
++        for a in &group.borrow().assignments {
++            if writes_port(a, inst, port) {
++                conditional_write = true;
++            }
++            if reads_port(a, inst, port) {
++                read = true;
++            }
++        }
++    }
++    for group in comp.comb_groups.iter() {
++        for a in &group.borrow().assignments {
++            if writes_port(a, inst, port) {
++                conditional_write = true;
++            }
++            if reads_port(a, inst, port) {
++                read = true;
++            }
++        }
++    }
++    for group in comp.get_static_groups().iter() {
++        for a in &group.borrow().assignments {
++            if writes_port(a, inst, port) {
++                conditional_write = true;
++            }
++            if reads_port(a, inst, port) {
++                read = true;
++            }
++        }
++    }
++    for fsm in comp.fsms.iter() {
++        let fsm = fsm.borrow();
++        for state in &fsm.assignments {
++            for a in state {
++                if writes_port(a, inst, port) {
++                    conditional_write = true;
++                }
++                if reads_port(a, inst, port) {
++                    read = true;
++                }
++            }
++        }
++        for transition in &fsm.transitions {
++            if let ir::Transition::Conditional(arms) = transition {
++                for (guard, _) in arms {
++                    if guard.all_ports().iter().any(|p| {
++                        let p = p.borrow();
++                        p.get_parent_name() == inst && p.name == port
++                    }) {
++                        read = true;
++                    }
++                }
++            }
++        }
++    }
++
++    // An `invoke` of the instance that omits the port leaves it undriven for
++    // that activation, unless a continuous assignment drives it at all times.
++    let mut invocations = 0usize;
++    let mut bound = 0usize;
++    visit_invokes(&comp.control.borrow(), &mut |target, inputs, outputs| {
++        if target != inst {
++            return;
++        }
++        invocations += 1;
++        for (name, src) in inputs {
++            if *name == port {
++                bound += 1;
++                writes.push(const_of(&src.borrow()));
++            }
++        }
++        for (name, _) in outputs {
++            if *name == port {
++                read = true;
++            }
++        }
++    });
++
++    if read || conditional_write || writes.is_empty() {
++        return None;
++    }
++    if !continuous_write && bound < invocations {
++        return None;
++    }
++    if !continuous_write && go_driven_structurally(comp, inst) {
++        return None;
++    }
++    let mut value = None;
++    for w in writes {
++        match (w, value) {
++            (Some(k), None) => value = Some(k),
++            (Some(k), Some(v)) if k == v => {}
++            _ => return None,
++        }
++    }
++    value
++}
++
++/// Apply `f(invoked_cell, inputs, outputs)` to every dynamic and static
++/// `invoke` in a control program.
++fn visit_invokes(
++    con: &ir::Control,
++    f: &mut impl FnMut(
++        ir::Id,
++        &[(ir::Id, RRC<ir::Port>)],
++        &[(ir::Id, RRC<ir::Port>)],
++    ),
++) {
++    match con {
++        ir::Control::Invoke(i) => {
++            f(i.comp.borrow().name(), &i.inputs, &i.outputs)
++        }
++        ir::Control::Seq(seq) => {
++            seq.stmts.iter().for_each(|s| visit_invokes(s, f))
++        }
++        ir::Control::Par(par) => {
++            par.stmts.iter().for_each(|s| visit_invokes(s, f))
++        }
++        ir::Control::If(if_) => {
++            visit_invokes(&if_.tbranch, f);
++            visit_invokes(&if_.fbranch, f);
++        }
++        ir::Control::While(wh) => visit_invokes(&wh.body, f),
++        ir::Control::Repeat(rep) => visit_invokes(&rep.body, f),
++        ir::Control::Static(sc) => visit_static_invokes(sc, f),
++        ir::Control::Empty(_)
++        | ir::Control::Enable(_)
++        | ir::Control::FSMEnable(_) => {}
++    }
++}
++
++/// Apply `f(invoked_cell, inputs, outputs)` to every `static invoke` in a
++/// static control program.
++fn visit_static_invokes(
++    con: &ir::StaticControl,
++    f: &mut impl FnMut(
++        ir::Id,
++        &[(ir::Id, RRC<ir::Port>)],
++        &[(ir::Id, RRC<ir::Port>)],
++    ),
++) {
++    match con {
++        ir::StaticControl::Invoke(i) => {
++            f(i.comp.borrow().name(), &i.inputs, &i.outputs)
++        }
++        ir::StaticControl::Seq(seq) => {
++            seq.stmts.iter().for_each(|s| visit_static_invokes(s, f))
++        }
++        ir::StaticControl::Par(par) => {
++            par.stmts.iter().for_each(|s| visit_static_invokes(s, f))
++        }
++        ir::StaticControl::If(if_) => {
++            visit_static_invokes(&if_.tbranch, f);
++            visit_static_invokes(&if_.fbranch, f);
++        }
++        ir::StaticControl::Repeat(rep) => visit_static_invokes(&rep.body, f),
++        ir::StaticControl::Empty(_) | ir::StaticControl::Enable(_) => {}
++    }
++}
++
++/// Input ports that every instantiation drives with the same constant, mapped to
++/// that constant. The entrypoint and `@fixed_signature` components are excluded
++/// because their signatures are fixed.
++pub fn constant_input_ports(
++    ctx: &ir::Context,
++) -> HashMap<(ir::Id, ir::Id), (u64, u64)> {
++    let mut instances: HashMap<ir::Id, Vec<(ir::Id, ir::Id)>> = HashMap::new();
++    for d in &ctx.components {
++        for cell in d.cells.iter() {
++            if let Some(target) = instance_of(&cell.borrow()) {
++                instances
++                    .entry(target)
++                    .or_default()
++                    .push((d.name, cell.borrow().name()));
++            }
++        }
++    }
++
++    let by_name: HashMap<ir::Id, &ir::Component> =
++        ctx.components.iter().map(|c| (c.name, c)).collect();
++
++    let mut result = HashMap::new();
++    for comp in &ctx.components {
++        if comp.name == ctx.entrypoint
++            || comp.attributes.has(ir::BoolAttr::FixedSignature)
++        {
++            continue;
++        }
++        let sites = match instances.get(&comp.name) {
++            Some(s) if !s.is_empty() => s,
++            _ => continue,
++        };
++        for port in comp.signature.borrow().ports.iter() {
++            let name = port.borrow().name;
++            if is_interface_port(&port.borrow()) {
++                continue;
++            }
++            let mut common: Option<(u64, u64)> = None;
++            let mut uniform = true;
++            for (d_name, inst) in sites {
++                let d = by_name[d_name];
++                match value_driven_to(d, *inst, name) {
++                    Some(k) if common.is_none_or(|c| c == k) => {
++                        common = Some(k)
++                    }
++                    _ => {
++                        uniform = false;
++                        break;
++                    }
++                }
++            }
++            if let (true, Some(k)) = (uniform, common) {
++                result.insert((comp.name, name), k);
++            }
++        }
++    }
++    result
++}
++
++/// Whether `port` is the signature port named `name` of `comp` (as opposed to a
++/// same-named port on some cell inside `comp`).
++fn is_signature_port(
++    comp: &ir::Component,
++    name: ir::Id,
++    port: &ir::Port,
++) -> bool {
++    port.name == name
++        && port.get_parent_name() == comp.signature.borrow().name()
++}
++
++/// Output ports that the component always drives with one constant, mapped to
++/// that constant. Such an output can be dropped once every reader is given the
++/// constant directly, wherever it is read.
++pub fn constant_output_ports(
++    ctx: &ir::Context,
++) -> HashMap<(ir::Id, ir::Id), (u64, u64)> {
++    let mut instances: HashMap<ir::Id, Vec<(ir::Id, ir::Id)>> = HashMap::new();
++    for d in &ctx.components {
++        for cell in d.cells.iter() {
++            if let Some(target) = instance_of(&cell.borrow()) {
++                instances
++                    .entry(target)
++                    .or_default()
++                    .push((d.name, cell.borrow().name()));
++            }
++        }
++    }
++    let by_name: HashMap<ir::Id, &ir::Component> =
++        ctx.components.iter().map(|c| (c.name, c)).collect();
++
++    let mut result = HashMap::new();
++    for comp in &ctx.components {
++        if comp.name == ctx.entrypoint
++            || comp.attributes.has(ir::BoolAttr::FixedSignature)
++        {
++            continue;
++        }
++        if !instances.get(&comp.name).is_some_and(|s| !s.is_empty()) {
++            continue;
++        }
++        for port in comp.signature.borrow().ports.iter() {
++            let name = port.borrow().name;
++            if is_interface_port(&port.borrow()) {
++                continue;
++            }
++            let mut value: Option<(u64, u64)> = None;
++            let mut cont_writes = 0usize;
++            let mut other_writer = false;
++            for a in &comp.continuous_assignments {
++                if is_signature_port(comp, name, &a.dst.borrow()) {
++                    cont_writes += 1;
++                    if a.guard.is_true() {
++                        value = const_of(&a.src.borrow());
++                    } else {
++                        value = None;
++                    }
++                }
++            }
++            // A group, comb-group, or static-group write drives the port only
++            // while that group is active, so it is not unconditionally constant.
++            let mut group_writer = |group: &RRC<ir::Group>| {
++                for a in &group.borrow().assignments {
++                    if is_signature_port(comp, name, &a.dst.borrow()) {
++                        other_writer = true;
++                    }
++                }
++            };
++            comp.get_groups().iter().for_each(&mut group_writer);
++            for group in comp.comb_groups.iter() {
++                for a in &group.borrow().assignments {
++                    if is_signature_port(comp, name, &a.dst.borrow()) {
++                        other_writer = true;
++                    }
++                }
++            }
++            for group in comp.get_static_groups().iter() {
++                for a in &group.borrow().assignments {
++                    if is_signature_port(comp, name, &a.dst.borrow()) {
++                        other_writer = true;
++                    }
++                }
++            }
++            for fsm in comp.fsms.iter() {
++                for state in &fsm.borrow().assignments {
++                    for a in state {
++                        if is_signature_port(comp, name, &a.dst.borrow()) {
++                            other_writer = true;
++                        }
++                    }
++                }
++            }
++
++            let k = match value {
++                Some(k) if cont_writes == 1 && !other_writer => k,
++                _ => continue,
++            };
++            // An `invoke` output binding writes the port's value into a
++            // destination in the caller. Removing the port would drop that
++            // write instead of replacing it, so the port stays.
++            let bound_at_invoke =
++                instances[&comp.name].iter().any(|(d, inst)| {
++                    let mut found = false;
++                    visit_invokes(
++                        &by_name[d].control.borrow(),
++                        &mut |target, _, outputs| {
++                            if target == *inst
++                                && outputs.iter().any(|(n, _)| *n == name)
++                            {
++                                found = true;
++                            }
++                        },
++                    );
++                    found
++                });
++            if bound_at_invoke {
++                continue;
++            }
++            result.insert((comp.name, name), k);
++        }
++    }
++    result
++}
++
++/// Where a port lives, from the point of view of the component being analyzed.
++enum PortOwner {
++    /// A port of the component's own signature.
++    Signature(ir::Id),
++    /// A port of an instance of another component.
++    Instance(ir::Id, ir::Id),
++    /// A port of a primitive, a constant, or a group hole.
++    Opaque,
++}
++
++impl PortLiveness {
++    /// Compute liveness for every component in `ctx`.
++    pub fn new(ctx: &ir::Context) -> Self {
++        let mut analysis = PortLiveness {
++            live_ports: HashSet::new(),
++            live_refs: HashSet::new(),
++            live_comb: HashSet::new(),
++        };
++        analysis.seed(ctx);
++        while analysis.round(ctx) {}
++        analysis
++    }
++
++    /// Whether `port` on `comp`'s signature must be retained.
++    pub fn is_live_port(&self, comp: ir::Id, port: ir::Id) -> bool {
++        self.live_ports.contains(&(comp, port))
++    }
++
++    /// Whether the `ref` cell `cell` in `comp` must be retained.
++    pub fn is_live_ref(&self, comp: ir::Id, cell: ir::Id) -> bool {
++        self.live_refs.contains(&(comp, cell))
++    }
++
++    /// Mark the ports that are live regardless of how the program uses them:
++    /// the entire signature of the entrypoint, which the outside world drives,
++    /// and the go-done protocol ports of every component.
++    fn seed(&mut self, ctx: &ir::Context) {
++        for comp in &ctx.components {
++            let fixed = comp.name == ctx.entrypoint
++                || comp.attributes.has(ir::BoolAttr::FixedSignature);
++            for port in comp.signature.borrow().ports.iter() {
++                let port = port.borrow();
++                if fixed || is_interface_port(&port) {
++                    self.live_ports.insert((comp.name, port.name));
++                }
++            }
++            if fixed {
++                for cell in comp.cells.iter() {
++                    let cell = cell.borrow();
++                    if cell.is_reference() {
++                        self.live_refs.insert((comp.name, cell.name()));
++                    }
++                }
++            }
++        }
++    }
++
++    /// Classify the owner of `port` relative to the component being analyzed.
++    fn owner(&self, port: &ir::Port) -> PortOwner {
++        let ir::PortParent::Cell(cell_wref) = &port.parent else {
++            return PortOwner::Opaque;
++        };
++        let cell_ref = cell_wref.upgrade();
++        let cell = cell_ref.borrow();
++        match &cell.prototype {
++            ir::CellType::ThisComponent => PortOwner::Signature(port.name),
++            ir::CellType::Component { name } => {
++                PortOwner::Instance(*name, port.name)
++            }
++            _ => PortOwner::Opaque,
++        }
++    }
++
++    /// Whether the value written into `port` can still reach an observable sink.
++    /// A read on the source side of an assignment only keeps the source alive
++    /// when the destination it feeds is itself live: the assignment is otherwise
++    /// removed along with the destination and carries the source with it.
++    ///
++    /// A destination is a sink when it drives a group hole, a `ref` cell, an
++    /// `@external` cell, or a stateful cell, because those observe the value
++    /// regardless of what reads it back. A destination on a combinational cell
++    /// is live only when that cell's own output is live, which is what turns the
++    /// analysis into a transitive dataflow closure rather than a syntactic
++    /// use-count.
++    fn write_survives(&self, comp: &ir::Component, port: &ir::Port) -> bool {
++        match self.owner(port) {
++            PortOwner::Signature(name) => self.is_live_port(comp.name, name),
++            PortOwner::Instance(target, name) => {
++                self.is_live_port(target, name)
++            }
++            PortOwner::Opaque => {
++                if port.is_hole() {
++                    return true;
++                }
++                let ir::PortParent::Cell(cell_wref) = &port.parent else {
++                    return true;
++                };
++                let cell = cell_wref.upgrade();
++                let cell = cell.borrow();
++                if cell.is_reference()
++                    || cell.attributes.has(ir::BoolAttr::External)
++                {
++                    return true;
++                }
++                if cell.is_comb_cell() {
++                    return self.live_comb.contains(&(comp.name, cell.name()));
++                }
++                true
++            }
++        }
++    }
++
++    /// Record that the combinational cell owning `port` computes a value that is
++    /// used, which keeps its inputs reachable in the next round.
++    fn mark_comb_use(&mut self, comp: &ir::Component, port: &ir::Port) -> bool {
++        let ir::PortParent::Cell(cell_wref) = &port.parent else {
++            return false;
++        };
++        let cell = cell_wref.upgrade();
++        let cell = cell.borrow();
++        if cell.is_comb_cell() {
++            self.live_comb.insert((comp.name, cell.name()))
++        } else {
++            false
++        }
++    }
++
++    /// Record that `port` is read from inside `comp`.
++    fn record_read(&mut self, comp: &ir::Component, port: &ir::Port) -> bool {
++        let entry = match self.owner(port) {
++            PortOwner::Signature(name) => (comp.name, name),
++            PortOwner::Instance(target, name) => (target, name),
++            PortOwner::Opaque => return false,
++        };
++        self.live_ports.insert(entry)
++    }
++
++    /// Record that the `ref` cell `cell` is used inside `comp`.
++    fn record_ref_use(
++        &mut self,
++        comp: &ir::Component,
++        cell: &ir::Cell,
++    ) -> bool {
++        if !cell.is_reference() {
++            return false;
++        }
++        self.live_refs.insert((comp.name, cell.name()))
++    }
++
++    /// Record every port a surviving assignment reads: its source and every
++    /// port its guard inspects.
++    fn read_assignment<T>(
++        &mut self,
++        comp: &ir::Component,
++        assign: &ir::Assignment<T>,
++    ) -> bool {
++        if !self.write_survives(comp, &assign.dst.borrow()) {
++            return false;
++        }
++        let mut changed = self.record_read(comp, &assign.src.borrow());
++        changed |= self.mark_comb_use(comp, &assign.src.borrow());
++        changed |= self.record_ref_cell_of(comp, &assign.src);
++        changed |= self.record_ref_cell_of(comp, &assign.dst);
++        for port in assign.guard.all_ports() {
++            changed |= self.record_read(comp, &port.borrow());
++            changed |= self.mark_comb_use(comp, &port.borrow());
++            changed |= self.record_ref_cell_of(comp, &port);
++        }
++        changed
++    }
++
++    /// Record a use of the `ref` cell that owns `port`, if there is one.
++    fn record_ref_cell_of(
++        &mut self,
++        comp: &ir::Component,
++        port: &RRC<ir::Port>,
++    ) -> bool {
++        let port = port.borrow();
++        let ir::PortParent::Cell(cell_wref) = &port.parent else {
++            return false;
++        };
++        let cell = cell_wref.upgrade();
++        let cell = cell.borrow();
++        self.record_ref_use(comp, &cell)
++    }
++
++    /// Walk the control program of `comp`, recording the ports it reads.
++    fn read_control(
++        &mut self,
++        comp: &ir::Component,
++        con: &ir::Control,
++    ) -> bool {
++        let mut changed = false;
++        match con {
++            ir::Control::Empty(_) | ir::Control::FSMEnable(_) => {}
++            ir::Control::Enable(_) => {}
++            ir::Control::Seq(seq) => {
++                for stmt in &seq.stmts {
++                    changed |= self.read_control(comp, stmt);
++                }
++            }
++            ir::Control::Par(par) => {
++                for stmt in &par.stmts {
++                    changed |= self.read_control(comp, stmt);
++                }
++            }
++            ir::Control::If(if_) => {
++                changed |= self.record_read(comp, &if_.port.borrow());
++                changed |= self.mark_comb_use(comp, &if_.port.borrow());
++                changed |= self.record_ref_cell_of(comp, &if_.port);
++                changed |= self.read_control(comp, &if_.tbranch);
++                changed |= self.read_control(comp, &if_.fbranch);
++            }
++            ir::Control::While(wh) => {
++                changed |= self.record_read(comp, &wh.port.borrow());
++                changed |= self.mark_comb_use(comp, &wh.port.borrow());
++                changed |= self.record_ref_cell_of(comp, &wh.port);
++                changed |= self.read_control(comp, &wh.body);
++            }
++            ir::Control::Repeat(rep) => {
++                changed |= self.read_control(comp, &rep.body);
++            }
++            ir::Control::Invoke(invoke) => {
++                changed |= self.read_invoke(
++                    comp,
++                    &invoke.comp,
++                    &invoke.inputs,
++                    &invoke.outputs,
++                    &invoke.ref_cells,
++                );
++            }
++            ir::Control::Static(sc) => {
++                changed |= self.read_static_control(comp, sc);
++            }
++        }
++        changed
++    }
++
++    /// Walk a static control program, recording the ports it reads.
++    fn read_static_control(
++        &mut self,
++        comp: &ir::Component,
++        con: &ir::StaticControl,
++    ) -> bool {
++        let mut changed = false;
++        match con {
++            ir::StaticControl::Empty(_) | ir::StaticControl::Enable(_) => {}
++            ir::StaticControl::Seq(seq) => {
++                for stmt in &seq.stmts {
++                    changed |= self.read_static_control(comp, stmt);
++                }
++            }
++            ir::StaticControl::Par(par) => {
++                for stmt in &par.stmts {
++                    changed |= self.read_static_control(comp, stmt);
++                }
++            }
++            ir::StaticControl::If(if_) => {
++                changed |= self.record_read(comp, &if_.port.borrow());
++                changed |= self.mark_comb_use(comp, &if_.port.borrow());
++                changed |= self.record_ref_cell_of(comp, &if_.port);
++                changed |= self.read_static_control(comp, &if_.tbranch);
++                changed |= self.read_static_control(comp, &if_.fbranch);
++            }
++            ir::StaticControl::Repeat(rep) => {
++                changed |= self.read_static_control(comp, &rep.body);
++            }
++            ir::StaticControl::Invoke(invoke) => {
++                changed |= self.read_invoke(
++                    comp,
++                    &invoke.comp,
++                    &invoke.inputs,
++                    &invoke.outputs,
++                    &invoke.ref_cells,
++                );
++            }
++        }
++        changed
++    }
++
++    /// An invocation reads the ports bound to the invoked cell's inputs and
++    /// reads the invoked cell's outputs that it binds. A binding whose port on
++    /// the invoked cell is removed disappears with it.
++    fn read_invoke(
++        &mut self,
++        comp: &ir::Component,
++        target: &RRC<ir::Cell>,
++        inputs: &[(ir::Id, RRC<ir::Port>)],
++        outputs: &[(ir::Id, RRC<ir::Port>)],
++        ref_cells: &[(ir::Id, RRC<ir::Cell>)],
++    ) -> bool {
++        let mut changed = false;
++        let invoked = instance_of(&target.borrow());
++        changed |= self.record_ref_use(comp, &target.borrow());
++        for (name, port) in inputs {
++            if let Some(invoked) = invoked {
++                if !self.is_live_port(invoked, *name) {
++                    continue;
++                }
++            }
++            changed |= self.record_read(comp, &port.borrow());
++            changed |= self.mark_comb_use(comp, &port.borrow());
++            changed |= self.record_ref_cell_of(comp, port);
++        }
++        for (name, port) in outputs {
++            if !self.write_survives(comp, &port.borrow()) {
++                continue;
++            }
++            if let Some(invoked) = invoked {
++                changed |= self.live_ports.insert((invoked, *name));
++            }
++            changed |= self.record_ref_cell_of(comp, port);
++        }
++        for (name, cell) in ref_cells {
++            if let Some(invoked) = invoked {
++                if !self.is_live_ref(invoked, *name) {
++                    continue;
++                }
++            }
++            changed |= self.record_ref_use(comp, &cell.borrow());
++        }
++        changed
++    }
++
++    /// A `ref` cell of `comp` is used when the body of `comp` mentions it. The
++    /// enclosing program cannot observe it otherwise, so an unmentioned `ref`
++    /// cell is dropped from the signature.
++    fn round(&mut self, ctx: &ir::Context) -> bool {
++        let mut changed = false;
++        for comp in &ctx.components {
++            comp.iter_assignments(|assign| {
++                changed |= self.read_assignment(comp, assign);
++            });
++            comp.iter_static_assignments(|assign| {
++                changed |= self.read_assignment(comp, assign);
++            });
++            for fsm in comp.fsms.iter() {
++                let fsm = fsm.borrow();
++                for state in &fsm.assignments {
++                    for assign in state {
++                        changed |= self.read_assignment(comp, assign);
++                    }
++                }
++                for transition in &fsm.transitions {
++                    if let ir::Transition::Conditional(arms) = transition {
++                        for (guard, _) in arms {
++                            for port in guard.all_ports() {
++                                changed |=
++                                    self.record_read(comp, &port.borrow());
++                                changed |=
++                                    self.mark_comb_use(comp, &port.borrow());
++                                changed |= self.record_ref_cell_of(comp, &port);
++                            }
++                        }
++                    }
++                }
++            }
++            changed |= self.read_control(comp, &comp.control.borrow());
++            for cell in comp.cells.iter() {
++                let cell = cell.borrow();
++                if let Some(target) = instance_of(&cell) {
++                    for port in cell.ports.iter() {
++                        let port = port.borrow();
++                        if is_interface_port(&port) {
++                            changed |=
++                                self.live_ports.insert((target, port.name));
++                        }
++                    }
++                }
++            }
++        }
++        changed
++    }
++
++    /// The signature ports of `comp` that the rewrite removes.
++    pub fn dead_ports(&self, comp: &ir::Component) -> HashSet<ir::Id> {
++        comp.signature
++            .borrow()
++            .ports
++            .iter()
++            .filter_map(|port| {
++                let port = port.borrow();
++                if self.is_live_port(comp.name, port.name) {
++                    None
++                } else {
++                    Some(port.name)
++                }
++            })
++            .collect()
++    }
++
++    /// The `ref` cells of `comp` that the rewrite removes.
++    pub fn dead_refs(&self, comp: &ir::Component) -> HashSet<ir::Id> {
++        comp.cells
++            .iter()
++            .filter_map(|cell| {
++                let cell = cell.borrow();
++                if cell.is_reference()
++                    && !self.is_live_ref(comp.name, cell.name())
++                {
++                    Some(cell.name())
++                } else {
++                    None
++                }
++            })
++            .collect()
++    }
++
++    /// A map from each component to the ports the rewrite removes from it.
++    pub fn removal_plan(
++        &self,
++        ctx: &ir::Context,
++    ) -> HashMap<ir::Id, HashSet<ir::Id>> {
++        ctx.components
++            .iter()
++            .map(|comp| (comp.name, self.dead_ports(comp)))
++            .collect()
++    }
++}
+diff --git a/calyx/opt/src/default_passes.rs b/calyx/opt/src/default_passes.rs
+index 7acfcdd7..11470b58 100644
+--- a/calyx/opt/src/default_passes.rs
++++ b/calyx/opt/src/default_passes.rs
+@@ -4,13 +4,14 @@ use crate::passes::{
+     AddGuard, Canonicalize, CellShare, ClkInsertion, CollapseControl, CombProp,
+     CompileInvoke, CompileRepeat, CompileStatic, ComponentInliner,
+     ConstantPortProp, DataPathInfer, DeadAssignmentRemoval, DeadCellRemoval,
+-    DeadGroupRemoval, DefaultAssigns, Externalize, GoInsertion, GroupToInvoke,
+-    GroupToSeq, InferShare, LowerGuards, MergeAssign, Papercut,
+-    ProfilerInstrumentation, PropagateProtected, RemoveIds, ResetInsertion,
+-    SimplifyStaticGuards, SimplifyWithControl, StaticFSMAllocation,
+-    StaticFSMOpts, StaticInference, StaticInliner, StaticPromotion,
+-    StaticRepeatFSMAllocation, SynthesisPapercut, TopDownCompileControl,
+-    UniquefyEnables, UnrollBounded, WellFormed, WireInliner, WrapMain,
++    DeadGroupRemoval, DeadPortElimination, DefaultAssigns, Externalize,
++    GoInsertion, GroupToInvoke, GroupToSeq, InferShare, LowerGuards,
++    MergeAssign, Papercut, ProfilerInstrumentation, PropagateProtected,
++    RemoveIds, ResetInsertion, SimplifyStaticGuards, SimplifyWithControl,
++    StaticFSMAllocation, StaticFSMOpts, StaticInference, StaticInliner,
++    StaticPromotion, StaticRepeatFSMAllocation, SynthesisPapercut,
++    TopDownCompileControl, UniquefyEnables, UnrollBounded, WellFormed,
++    WireInliner, WrapMain,
+ };
+ use crate::passes_experimental::{
+     CompileSync, CompileSyncWithoutSyncReg, DiscoverExternal, ExternalToRef,
+@@ -77,6 +78,7 @@ impl PassManager {
+         pm.register_pass::<Externalize>()?;
+ 
+         // Disabled by default
++        pm.register_pass::<DeadPortElimination>()?;
+         pm.register_pass::<DiscoverExternal>()?;
+         pm.register_pass::<UnrollBounded>()?;
+         pm.register_pass::<RegisterUnsharing>()?;
+diff --git a/calyx/opt/src/passes/dead_port_elimination.rs b/calyx/opt/src/passes/dead_port_elimination.rs
+new file mode 100644
+index 00000000..2edd3f48
+--- /dev/null
++++ b/calyx/opt/src/passes/dead_port_elimination.rs
+@@ -0,0 +1,498 @@
++use crate::analysis::{
++    PortLiveness, constant_input_ports, constant_output_ports,
++};
++use crate::traversal::{
++    Action, ConstructVisitor, Named, ParseVal, PassOpt, VisResult, Visitor,
++};
++use calyx_ir::{self as ir, RRC, rewriter};
++use calyx_utils::{CalyxResult, OutputFile};
++use itertools::Itertools;
++use serde::Serialize;
++use std::collections::{HashMap, HashSet};
++use std::io::Write;
++use std::rc::Rc;
++
++/// Removes ports that no instantiation of a component can observe.
++///
++/// The pass is whole-program: an output port survives only when some instance
++/// of the component has it read, and an input port survives only when the body
++/// of the component reads it. Every assignment and every `invoke` binding that
++/// mentions a removed port is removed with it, which lets the dead cell and
++/// dead assignment passes make more progress.
++///
++/// The signature of the entrypoint is left alone because the program cannot see
++/// how the outside world drives it, and the go-done protocol ports are left
++/// alone because the rest of the compiler assumes they exist. A component
++/// marked `@fixed_signature` is left alone for the same reason.
++///
++/// Passing `-x dead-port-elimination:dump=file-name` writes a json summary of
++/// everything the pass removed.
++pub struct DeadPortElimination {
++    /// Ports removed from each component's signature.
++    dead_ports: HashMap<ir::Id, HashSet<ir::Id>>,
++    /// `ref` cells removed from each component's signature.
++    dead_refs: HashMap<ir::Id, HashSet<ir::Id>>,
++    /// Ports removed across all rounds, for the summary report.
++    report_ports: HashMap<ir::Id, HashSet<ir::Id>>,
++    /// `ref` cells removed across all rounds, for the summary report.
++    report_refs: HashMap<ir::Id, HashSet<ir::Id>>,
++    /// Stream that receives the summary of what was removed.
++    dump: Option<OutputFile>,
++}
++
++/// Summary of the removals performed on a single component.
++#[derive(Serialize)]
++struct Removals {
++    component: String,
++    ports: Vec<String>,
++    ref_cells: Vec<String>,
++}
++
++impl Named for DeadPortElimination {
++    fn name() -> &'static str {
++        "dead-port-elimination"
++    }
++
++    fn description() -> &'static str {
++        "removes component ports that no instantiation observes"
++    }
++
++    fn opts() -> Vec<PassOpt> {
++        vec![PassOpt::new(
++            "dump",
++            "write a json summary of the removed ports and ref cells",
++            ParseVal::OutStream(OutputFile::Null),
++            PassOpt::parse_outstream,
++        )]
++    }
++}
++
++impl ConstructVisitor for DeadPortElimination {
++    fn from(ctx: &ir::Context) -> CalyxResult<Self>
++    where
++        Self: Sized,
++    {
++        let opts = Self::get_opts(ctx);
++        Ok(DeadPortElimination {
++            dead_ports: HashMap::default(),
++            dead_refs: HashMap::default(),
++            report_ports: HashMap::default(),
++            report_refs: HashMap::default(),
++            dump: opts[&"dump"].not_null_outstream(),
++        })
++    }
++
++    fn clear_data(&mut self) {
++        self.dead_ports = HashMap::default();
++        self.dead_refs = HashMap::default();
++        self.report_ports = HashMap::default();
++        self.report_refs = HashMap::default();
++    }
++}
++
++impl DeadPortElimination {
++    /// Whether `port` has been removed, resolving the port through the
++    /// component that owns it.
++    fn is_removed(&self, comp: ir::Id, port: &ir::Port) -> bool {
++        let ir::PortParent::Cell(cell_wref) = &port.parent else {
++            return false;
++        };
++        let cell_ref = cell_wref.upgrade();
++        let cell = cell_ref.borrow();
++        let owner = match &cell.prototype {
++            ir::CellType::ThisComponent => comp,
++            ir::CellType::Component { name } => *name,
++            _ => return false,
++        };
++        self.dead_ports
++            .get(&owner)
++            .is_some_and(|ports| ports.contains(&port.name))
++    }
++
++    /// An assignment survives when none of the ports it mentions was removed.
++    fn survives<T>(&self, comp: ir::Id, assign: &ir::Assignment<T>) -> bool {
++        let mentioned = [&assign.dst, &assign.src]
++            .into_iter()
++            .cloned()
++            .chain(assign.guard.all_ports());
++        !mentioned
++            .into_iter()
++            .any(|port| self.is_removed(comp, &port.borrow()))
++    }
++
++    /// Drop the removed ports from a cell that instantiates a component.
++    fn prune_cell(&self, cell: &RRC<ir::Cell>) {
++        let mut cell = cell.borrow_mut();
++        let ir::CellType::Component { name } = cell.prototype else {
++            return;
++        };
++        let Some(dead) = self.dead_ports.get(&name) else {
++            return;
++        };
++        cell.remove_ports(dead);
++    }
++
++    /// Drop the bindings of an `invoke` that mention a removed port or a
++    /// removed `ref` cell, on either side of the binding.
++    fn prune_invoke(
++        &self,
++        comp: ir::Id,
++        target: &RRC<ir::Cell>,
++        inputs: &mut Vec<(ir::Id, RRC<ir::Port>)>,
++        outputs: &mut Vec<(ir::Id, RRC<ir::Port>)>,
++        ref_cells: &mut Vec<(ir::Id, RRC<ir::Cell>)>,
++    ) {
++        outputs.retain(|(_, port)| !self.is_removed(comp, &port.borrow()));
++        let ir::CellType::Component { name: invoked } =
++            target.borrow().prototype
++        else {
++            return;
++        };
++        if let Some(dead) = self.dead_ports.get(&invoked) {
++            inputs.retain(|(name, _)| !dead.contains(name));
++            outputs.retain(|(name, _)| !dead.contains(name));
++        }
++        if let Some(dead) = self.dead_refs.get(&invoked) {
++            ref_cells.retain(|(name, _)| !dead.contains(name));
++        }
++    }
++
++    /// Walk the control program, pruning every `invoke` it contains.
++    fn prune_control(&self, comp: ir::Id, con: &mut ir::Control) {
++        match con {
++            ir::Control::Empty(_)
++            | ir::Control::Enable(_)
++            | ir::Control::FSMEnable(_) => {}
++            ir::Control::Seq(seq) => {
++                for stmt in &mut seq.stmts {
++                    self.prune_control(comp, stmt);
++                }
++            }
++            ir::Control::Par(par) => {
++                for stmt in &mut par.stmts {
++                    self.prune_control(comp, stmt);
++                }
++            }
++            ir::Control::If(if_) => {
++                self.prune_control(comp, &mut if_.tbranch);
++                self.prune_control(comp, &mut if_.fbranch);
++            }
++            ir::Control::While(wh) => {
++                self.prune_control(comp, &mut wh.body);
++            }
++            ir::Control::Repeat(rep) => {
++                self.prune_control(comp, &mut rep.body);
++            }
++            ir::Control::Invoke(invoke) => {
++                self.prune_invoke(
++                    comp,
++                    &invoke.comp,
++                    &mut invoke.inputs,
++                    &mut invoke.outputs,
++                    &mut invoke.ref_cells,
++                );
++            }
++            ir::Control::Static(sc) => self.prune_static_control(comp, sc),
++        }
++    }
++
++    /// Walk a static control program, pruning every `invoke` it contains.
++    fn prune_static_control(&self, comp: ir::Id, con: &mut ir::StaticControl) {
++        match con {
++            ir::StaticControl::Empty(_) | ir::StaticControl::Enable(_) => {}
++            ir::StaticControl::Seq(seq) => {
++                for stmt in &mut seq.stmts {
++                    self.prune_static_control(comp, stmt);
++                }
++            }
++            ir::StaticControl::Par(par) => {
++                for stmt in &mut par.stmts {
++                    self.prune_static_control(comp, stmt);
++                }
++            }
++            ir::StaticControl::If(if_) => {
++                self.prune_static_control(comp, &mut if_.tbranch);
++                self.prune_static_control(comp, &mut if_.fbranch);
++            }
++            ir::StaticControl::Repeat(rep) => {
++                self.prune_static_control(comp, &mut rep.body);
++            }
++            ir::StaticControl::Invoke(invoke) => {
++                self.prune_invoke(
++                    comp,
++                    &invoke.comp,
++                    &mut invoke.inputs,
++                    &mut invoke.outputs,
++                    &mut invoke.ref_cells,
++                );
++            }
++        }
++    }
++
++    /// Write the summary of removals, ordered by component and by name so that
++    /// the same program always produces the same report.
++    fn emit_report(&mut self) -> CalyxResult<()> {
++        let Some(dump) = &mut self.dump else {
++            return Ok(());
++        };
++        let summary = self
++            .dead_ports
++            .keys()
++            .chain(self.dead_refs.keys())
++            .copied()
++            .collect::<HashSet<_>>()
++            .into_iter()
++            .map(|comp| {
++                let names = |set: Option<&HashSet<ir::Id>>| {
++                    set.into_iter()
++                        .flatten()
++                        .map(|id| id.to_string())
++                        .sorted()
++                        .collect_vec()
++                };
++                Removals {
++                    component: comp.to_string(),
++                    ports: names(self.dead_ports.get(&comp)),
++                    ref_cells: names(self.dead_refs.get(&comp)),
++                }
++            })
++            .filter(|r| !r.ports.is_empty() || !r.ref_cells.is_empty())
++            .sorted_by(|a, b| Ord::cmp(&a.component, &b.component))
++            .collect_vec();
++        write!(
++            dump.get_write(),
++            "{}",
++            serde_json::to_string_pretty(&summary)?
++        )?;
++        Ok(())
++    }
++
++    /// Apply the removals to a single component.
++    fn rewrite(&self, comp: &mut ir::Component) {
++        let name = comp.name;
++        if let Some(dead) = self.dead_ports.get(&name) {
++            comp.signature.borrow_mut().remove_ports(dead);
++        }
++        for cell in comp.cells.iter() {
++            self.prune_cell(cell);
++        }
++
++        for group in comp.get_groups().iter() {
++            group
++                .borrow_mut()
++                .assignments
++                .retain(|assign| self.survives(name, assign));
++        }
++        for group in comp.get_static_groups().iter() {
++            group
++                .borrow_mut()
++                .assignments
++                .retain(|assign| self.survives(name, assign));
++        }
++        for group in comp.comb_groups.iter() {
++            group
++                .borrow_mut()
++                .assignments
++                .retain(|assign| self.survives(name, assign));
++        }
++        for fsm in comp.fsms.iter() {
++            for state in &mut fsm.borrow_mut().assignments {
++                state.retain(|assign| self.survives(name, assign));
++            }
++        }
++        comp.continuous_assignments
++            .retain(|assign| self.survives(name, assign));
++
++        let control = std::rc::Rc::clone(&comp.control);
++        self.prune_control(name, &mut control.borrow_mut());
++
++        if let Some(dead) = self.dead_refs.get(&name) {
++            let cells = comp.cells.drain().collect::<Vec<_>>();
++            comp.cells.append(
++                cells
++                    .into_iter()
++                    .filter(|cell| !dead.contains(&cell.borrow().name())),
++            );
++        }
++    }
++}
++
++/// Apply `rewriter` to the assignments and transition guards of every `fsm`,
++/// which the shared component rewriter does not visit.
++fn rewrite_fsms(rewriter: &rewriter::Rewriter, comp: &mut ir::Component) {
++    for fsm in comp.fsms.iter() {
++        let mut fsm = fsm.borrow_mut();
++        for state in &mut fsm.assignments {
++            for assign in state.iter_mut() {
++                rewriter.rewrite_assign(assign);
++            }
++        }
++        for transition in &mut fsm.transitions {
++            if let ir::Transition::Conditional(arms) = transition {
++                for (guard, _) in arms.iter_mut() {
++                    rewriter.rewrite_guard(guard);
++                }
++            }
++        }
++    }
++}
++
++impl DeadPortElimination {
++    /// Replace every read of a constant-valued input port with that constant so
++    /// that the port itself can then be removed. Because every instance drives
++    /// the port with the same constant, the substitution preserves behavior.
++    fn inline_constant_inputs(
++        &mut self,
++        ctx: &mut ir::Context,
++        constants: &HashMap<(ir::Id, ir::Id), (u64, u64)>,
++    ) {
++        for comp in &mut ctx.components {
++            let ports: Vec<(ir::Id, (u64, u64))> = comp
++                .signature
++                .borrow()
++                .ports
++                .iter()
++                .filter_map(|p| {
++                    let p = p.borrow();
++                    constants.get(&(comp.name, p.name)).map(|k| (p.name, *k))
++                })
++                .collect();
++            if ports.is_empty() {
++                continue;
++            }
++            let mut port_map = rewriter::PortRewriteMap::default();
++            {
++                let mut builder = ir::Builder::new(comp, &ctx.lib);
++                for (name, (val, width)) in &ports {
++                    let cst = builder.add_constant(*val, *width);
++                    let out = Rc::clone(&cst.borrow().get("out"));
++                    let sig = builder.component.signature.borrow();
++                    let canon =
++                        sig.ports.iter().find(|p| p.borrow().name == *name);
++                    if let Some(p) = canon {
++                        port_map.insert(p.borrow().canonical(), out);
++                    }
++                }
++            }
++            let rewriter = rewriter::Rewriter {
++                port_map,
++                ..Default::default()
++            };
++            rewriter.rewrite(comp);
++            rewrite_fsms(&rewriter, comp);
++            let dead = self.dead_ports.entry(comp.name).or_default();
++            for (name, _) in ports {
++                dead.insert(name);
++            }
++        }
++    }
++
++    /// Give every reader of a constant-valued output port the constant directly,
++    /// so the output becomes unread and is removed. Propagating a constant output
++    /// can make a reader's own output constant, which is why the pass iterates.
++    fn propagate_constant_outputs(
++        &mut self,
++        ctx: &mut ir::Context,
++        constants: &HashMap<(ir::Id, ir::Id), (u64, u64)>,
++    ) {
++        for comp in &mut ctx.components {
++            let reads: Vec<(ir::Canonical, (u64, u64))> = comp
++                .cells
++                .iter()
++                .filter_map(|cell| {
++                    let cell = cell.borrow();
++                    let ir::CellType::Component { name } = cell.prototype
++                    else {
++                        return None;
++                    };
++                    Some((cell.name(), name))
++                })
++                .flat_map(|(inst, target)| {
++                    constants.iter().filter_map(move |((c, o), k)| {
++                        (*c == target)
++                            .then(|| (ir::Canonical::new(inst, *o), *k))
++                    })
++                })
++                .collect();
++            if reads.is_empty() {
++                continue;
++            }
++            let mut port_map = rewriter::PortRewriteMap::default();
++            {
++                let mut builder = ir::Builder::new(comp, &ctx.lib);
++                for (canon, (val, width)) in &reads {
++                    let cst = builder.add_constant(*val, *width);
++                    let out = Rc::clone(&cst.borrow().get("out"));
++                    port_map.insert(canon.clone(), out);
++                }
++            }
++            let rewriter = rewriter::Rewriter {
++                port_map,
++                ..Default::default()
++            };
++            rewriter.rewrite(comp);
++            rewrite_fsms(&rewriter, comp);
++        }
++        for ((c, o), _) in constants {
++            self.dead_ports.entry(*c).or_default().insert(*o);
++        }
++    }
++
++    /// Accumulate this round's removals into the cumulative report.
++    fn record_round(&mut self) {
++        for (comp, ports) in &self.dead_ports {
++            self.report_ports
++                .entry(*comp)
++                .or_default()
++                .extend(ports.iter().copied());
++        }
++        for (comp, refs) in &self.dead_refs {
++            self.report_refs
++                .entry(*comp)
++                .or_default()
++                .extend(refs.iter().copied());
++        }
++    }
++}
++
++impl Visitor for DeadPortElimination {
++    fn start_context(&mut self, ctx: &mut ir::Context) -> VisResult {
++        // Liveness, constant-input inlining, and constant-output propagation feed
++        // each other: propagating a constant output leaves a further port unread,
++        // and removing ports can leave a further output constant. Iterate the
++        // whole analysis until a round removes nothing.
++        loop {
++            let liveness = PortLiveness::new(ctx);
++            self.dead_ports = liveness.removal_plan(ctx);
++            self.dead_refs = ctx
++                .components
++                .iter()
++                .map(|comp| (comp.name, liveness.dead_refs(comp)))
++                .collect();
++
++            let inputs = constant_input_ports(ctx);
++            self.inline_constant_inputs(ctx, &inputs);
++            let outputs = constant_output_ports(ctx);
++            self.propagate_constant_outputs(ctx, &outputs);
++
++            let progress = self
++                .dead_ports
++                .values()
++                .chain(self.dead_refs.values())
++                .any(|s| !s.is_empty());
++            if !progress {
++                break;
++            }
++            self.record_round();
++            for comp in &mut ctx.components {
++                self.rewrite(comp);
++            }
++        }
++
++        self.dead_ports = std::mem::take(&mut self.report_ports);
++        self.dead_refs = std::mem::take(&mut self.report_refs);
++        self.emit_report()?;
++
++        Ok(Action::Stop)
++    }
++}
+diff --git a/calyx/opt/src/passes/mod.rs b/calyx/opt/src/passes/mod.rs
+index b26bc0b4..8aaf7d45 100644
+--- a/calyx/opt/src/passes/mod.rs
++++ b/calyx/opt/src/passes/mod.rs
+@@ -12,6 +12,7 @@ mod constant_port_prop;
+ mod dead_assignment_removal;
+ mod dead_cell_removal;
+ mod dead_group_removal;
++mod dead_port_elimination;
+ mod externalize;
+ mod go_insertion;
+ mod group_to_invoke;
+@@ -60,6 +61,7 @@ pub use data_path_infer::DataPathInfer;
+ pub use dead_assignment_removal::DeadAssignmentRemoval;
+ pub use dead_cell_removal::DeadCellRemoval;
+ pub use dead_group_removal::DeadGroupRemoval;
++pub use dead_port_elimination::DeadPortElimination;
+ pub use dump_ports::DumpResults;
+ pub use externalize::Externalize;
+ pub use go_insertion::GoInsertion;

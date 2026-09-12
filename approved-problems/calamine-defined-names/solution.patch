@@ -1,0 +1,539 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index e869c49..5cf7fa2 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -226,6 +226,48 @@ pub struct Metadata {
+     sheets: Vec<Sheet>,
+     /// Map of sheet names/sheet path within zip archive
+     names: Vec<(String, String)>,
++    defined_names: Vec<DefinedName>,
++}
++
++/// A workbook defined name and its source-format metadata.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct DefinedName {
++    /// The defined name.
++    pub name: String,
++    /// The formula, range, or expression represented by the name.
++    pub formula: String,
++    /// The namespace in which the name is visible.
++    pub scope: DefinedNameScope,
++    /// Whether the source format marks the name as hidden.
++    ///
++    /// This is `None` when the source format has no equivalent property.
++    pub hidden: Option<bool>,
++    /// Whether the source format marks or identifies the name as built in.
++    ///
++    /// This is `None` when the source format has no equivalent property.
++    pub built_in: Option<bool>,
++    /// The source comment associated with the name.
++    ///
++    /// `Some("")` represents an explicitly present empty comment. This is
++    /// `None` when no comment is present or the format has no equivalent.
++    pub comment: Option<String>,
++    /// Whether the source format marks the name for publication.
++    ///
++    /// This is `None` when the source format has no equivalent property.
++    pub published: Option<bool>,
++    /// Whether the source format marks the name as a workbook parameter.
++    ///
++    /// This is `None` when the source format has no equivalent property.
++    pub workbook_parameter: Option<bool>,
++}
++
++/// The namespace in which a defined name is visible.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum DefinedNameScope {
++    /// The name is visible throughout the workbook.
++    Workbook,
++    /// The name is local to the worksheet at this zero-based workbook index.
++    Worksheet(usize),
+ }
+ 
+ /// Type of sheet.
+@@ -365,6 +407,11 @@ where
+         &self.metadata().names
+     }
+ 
++    /// Get structured metadata for all defined names, in workbook order.
++    fn defined_names_metadata(&self) -> &[DefinedName] {
++        &self.metadata().defined_names
++    }
++
+     /// Get the nth worksheet. Shortcut for getting the nth
+     /// worksheet name, then the corresponding worksheet.
+     fn worksheet_range_at(&mut self, n: usize) -> Option<Result<Range<Data>, Self::Error>> {
+diff --git a/src/ods.rs b/src/ods.rs
+index 05a2304..4fd17fc 100644
+--- a/src/ods.rs
++++ b/src/ods.rs
+@@ -23,7 +23,10 @@ use zip::result::ZipError;
+ use crate::attrs::{decode_attr, RawAttributes};
+ use crate::utils::unescape_entity_to_buffer;
+ use crate::vba::VbaProject;
+-use crate::{Data, DataType, HeaderRow, Metadata, Range, Reader, Sheet, SheetType, SheetVisible};
++use crate::{
++    Data, DataType, DefinedName, DefinedNameScope, HeaderRow, Metadata, Range, Reader, Sheet,
++    SheetType, SheetVisible,
++};
+ use std::marker::PhantomData;
+ 
+ const MIMETYPE: &[u8] = b"application/vnd.oasis.opendocument.spreadsheet";
+@@ -205,7 +208,12 @@ where
+         } = parse_content(zip)?;
+         let metadata = Metadata {
+             sheets: sheets_metadata,
+-            names: defined_names,
++            names: defined_names
++                .iter()
++                .filter(|defined_name| matches!(defined_name.scope, DefinedNameScope::Workbook))
++                .map(|defined_name| (defined_name.name.clone(), defined_name.formula.clone()))
++                .collect(),
++            defined_names,
+         };
+ 
+         Ok(Ods {
+@@ -279,7 +287,7 @@ where
+ struct Content {
+     sheets: BTreeMap<String, (Range<Data>, Range<String>)>,
+     sheets_metadata: Vec<Sheet>,
+-    defined_names: Vec<(String, String)>,
++    defined_names: Vec<DefinedName>,
+ }
+ 
+ /// Check password protection
+@@ -380,7 +388,9 @@ fn parse_content<RS: Read + Seek>(mut zip: ZipArchive<RS>) -> Result<Content, Od
+                     .unwrap_or(SheetVisible::Visible);
+                 if let Some(v) = e.raw_attr(b"table:name")? {
+                     let name = decode_attr(&reader.decoder(), v)?;
+-                    let (range, formulas) = read_table(&mut reader)?;
++                    let sheet_index = sheets_metadata.len();
++                    let (range, formulas, local_names) = read_table(&mut reader, sheet_index)?;
++                    defined_names.extend(local_names);
+                     sheets_metadata.push(Sheet {
+                         name: name.clone(),
+                         typ: SheetType::WorkSheet,
+@@ -390,7 +400,10 @@ fn parse_content<RS: Read + Seek>(mut zip: ZipArchive<RS>) -> Result<Content, Od
+                 }
+             }
+             Ok(Event::Start(e)) if e.name() == QName(b"table:named-expressions") => {
+-                defined_names = read_named_expressions(&mut reader)?;
++                defined_names.extend(read_named_expressions(
++                    &mut reader,
++                    DefinedNameScope::Workbook,
++                )?);
+             }
+             Ok(Event::Eof) => break,
+             Err(e) => return Err(OdsError::Xml(e)),
+@@ -405,7 +418,11 @@ fn parse_content<RS: Read + Seek>(mut zip: ZipArchive<RS>) -> Result<Content, Od
+     })
+ }
+ 
+-fn read_table<RS>(reader: &mut OdsReader<'_, RS>) -> Result<(Range<Data>, Range<String>), OdsError>
++#[allow(clippy::type_complexity)]
++fn read_table<RS>(
++    reader: &mut OdsReader<'_, RS>,
++    sheet_index: usize,
++) -> Result<(Range<Data>, Range<String>, Vec<DefinedName>), OdsError>
+ where
+     RS: Read + Seek,
+ {
+@@ -417,6 +434,7 @@ where
+     let mut row_buf = Vec::with_capacity(1024);
+     let mut cell_buf = Vec::with_capacity(1024);
+     let mut total_rows = 0;
++    let mut defined_names = Vec::new();
+     cols.push(0);
+     loop {
+         match reader.read_event_into(&mut buf) {
+@@ -446,6 +464,12 @@ where
+                 cols.push(cells.len());
+                 rows_repeats.push(capped_repeats);
+             }
++            Ok(Event::Start(e)) if e.name() == QName(b"table:named-expressions") => {
++                defined_names.extend(read_named_expressions(
++                    reader,
++                    DefinedNameScope::Worksheet(sheet_index),
++                )?);
++            }
+             Ok(Event::End(e)) if e.name() == QName(b"table:table") => break,
+             Err(e) => return Err(OdsError::Xml(e)),
+             Ok(_) => (),
+@@ -455,6 +479,7 @@ where
+     Ok((
+         get_range(cells, &cols, &rows_repeats)?,
+         get_range(formulas, &cols, &rows_repeats)?,
++        defined_names,
+     ))
+ }
+ 
+@@ -760,7 +785,8 @@ where
+ 
+ fn read_named_expressions<RS>(
+     reader: &mut OdsReader<'_, RS>,
+-) -> Result<Vec<(String, String)>, OdsError>
++    scope: DefinedNameScope,
++) -> Result<Vec<DefinedName>, OdsError>
+ where
+     RS: Read + Seek,
+ {
+@@ -787,7 +813,16 @@ where
+                         _ => (),
+                     }
+                 }
+-                defined_names.push((name, formula));
++                defined_names.push(DefinedName {
++                    name,
++                    formula,
++                    scope,
++                    hidden: None,
++                    built_in: None,
++                    comment: None,
++                    published: None,
++                    workbook_parameter: None,
++                });
+             }
+             Ok(Event::End(e))
+                 if e.name() == QName(b"table:named-range")
+diff --git a/src/xls.rs b/src/xls.rs
+index 2bc5ca4..303deec 100644
+--- a/src/xls.rs
++++ b/src/xls.rs
+@@ -19,8 +19,8 @@ use crate::utils::read_usize;
+ use crate::utils::{push_column, read_f64, read_i16, read_i32, read_u16, read_u32};
+ use crate::vba::VbaProject;
+ use crate::{
+-    Cell, CellErrorType, Data, Dimensions, HeaderRow, Metadata, Range, Reader, Sheet, SheetType,
+-    SheetVisible,
++    Cell, CellErrorType, Data, DefinedName, DefinedNameScope, Dimensions, HeaderRow, Metadata,
++    Range, Reader, Sheet, SheetType, SheetVisible,
+ };
+ 
+ #[derive(Debug)]
+@@ -486,6 +486,7 @@ impl<RS: Read + Seek> Xls<RS> {
+         let mut sheet_names = Vec::new();
+         let mut strings = Vec::new();
+         let mut defined_names = Vec::new();
++        let mut last_defined_name = None;
+         let mut xtis = Vec::new();
+         let mut formats = BTreeMap::new();
+         let mut xfs = Vec::new();
+@@ -541,7 +542,17 @@ impl<RS: Read + Seek> Xls<RS> {
+                         biff = bof.biff;
+                     }
+                     // Lbl (MS-XLS 2.4.150)
+-                    0x0018 => defined_names.push(parse_lbl(&r, &encoding, biff)?),
++                    0x0018 => {
++                        defined_names.push(parse_lbl(&r, &encoding, biff)?);
++                        last_defined_name = Some(defined_names.len() - 1);
++                    }
++                    // NameCmt (MS-XLS 2.4.176)
++                    0x0894 => {
++                        if let Some(index) = last_defined_name {
++                            defined_names[index].0.comment =
++                                Some(parse_name_comment(&r, &encoding)?);
++                        }
++                    }
+                     // ExternSheet (MS-XLS 2.4.106)
+                     0x0017 => xtis.extend(parse_extern_sheet(&r, biff)),
+                     // SST (MS-XLS 2.4.265)
+@@ -583,7 +594,7 @@ impl<RS: Read + Seek> Xls<RS> {
+ 
+         let defined_names = defined_names
+             .into_iter()
+-            .map(|(name, (i, mut f))| {
++            .map(|(mut name, (i, mut f))| {
+                 if let Some(i) = i {
+                     let sh = xtis
+                         .get(i)
+@@ -591,9 +602,14 @@ impl<RS: Read + Seek> Xls<RS> {
+                         .map_or("#REF", |sh| &sh.1);
+                     f = format!("{sh}!{f}");
+                 }
+-                (name, f)
++                name.formula = f;
++                name
+             })
+             .collect::<Vec<_>>();
++        let legacy_defined_names = defined_names
++            .iter()
++            .map(|name| (name.name.clone(), name.formula.clone()))
++            .collect::<Vec<_>>();
+ 
+         debug!("defined_names: {defined_names:?}");
+ 
+@@ -657,7 +673,7 @@ impl<RS: Read + Seek> Xls<RS> {
+                         let fmla = parse_formula(
+                             &r.data[20..],
+                             &fmla_sheet_names,
+-                            &defined_names,
++                            &legacy_defined_names,
+                             &xtis,
+                             &encoding,
+                             biff,
+@@ -687,7 +703,8 @@ impl<RS: Read + Seek> Xls<RS> {
+         }
+ 
+         self.sheets = sheets;
+-        self.metadata.names = defined_names;
++        self.metadata.names = legacy_defined_names;
++        self.metadata.defined_names = defined_names;
+ 
+         #[cfg(feature = "picture")]
+         if !draw_group.is_empty() {
+@@ -787,9 +804,11 @@ fn parse_lbl(
+     r: &Record<'_>,
+     encoding: &XlsEncoding,
+     biff: Biff,
+-) -> Result<(String, (Option<usize>, String)), XlsError> {
++) -> Result<(DefinedName, (Option<usize>, String)), XlsError> {
++    let flags = read_u16(r.data);
+     let cch = r.data[3] as usize;
+     let cce = read_u16(&r.data[4..]) as usize;
++    let sheet_index = read_u16(&r.data[8..]) as usize;
+     let mut name = String::with_capacity(cch);
+     match biff {
+         Biff::Biff2 | Biff::Biff3 | Biff::Biff4 | Biff::Biff5 => {
+@@ -800,7 +819,75 @@ fn parse_lbl(
+     }
+     let rgce = &r.data[r.data.len() - cce..];
+     let formula = parse_defined_names(rgce, biff)?;
+-    Ok((name, formula))
++    Ok((
++        DefinedName {
++            name,
++            formula: String::new(),
++            scope: if sheet_index == 0 {
++                DefinedNameScope::Workbook
++            } else {
++                DefinedNameScope::Worksheet(sheet_index - 1)
++            },
++            hidden: Some(flags & 0x0001 != 0),
++            built_in: Some(flags & 0x0020 != 0),
++            comment: None,
++            published: Some(flags & 0x2000 != 0),
++            workbook_parameter: Some(flags & 0x4000 != 0),
++        },
++        formula,
++    ))
++}
++
++fn parse_name_comment(r: &Record<'_>, encoding: &XlsEncoding) -> Result<String, XlsError> {
++    if r.data.len() < 18 {
++        return Err(XlsError::Len {
++            expected: 18,
++            found: r.data.len(),
++            typ: "NameCmt",
++        });
++    }
++
++    let name_len = read_u16(&r.data[12..]) as usize;
++    let comment_len = read_u16(&r.data[14..]) as usize;
++    let (_, name_size) =
++        parse_unicode_string_no_cch(&r.data[16..], name_len, encoding, "NameCmt:name")?;
++    let (comment, _) = parse_unicode_string_no_cch(
++        &r.data[16 + name_size..],
++        comment_len,
++        encoding,
++        "NameCmt:comment",
++    )?;
++    Ok(comment)
++}
++
++fn parse_unicode_string_no_cch(
++    data: &[u8],
++    character_count: usize,
++    encoding: &XlsEncoding,
++    typ: &'static str,
++) -> Result<(String, usize), XlsError> {
++    let Some(options) = data.first() else {
++        return Err(XlsError::Len {
++            expected: 1,
++            found: 0,
++            typ,
++        });
++    };
++    let mut value = String::with_capacity(character_count);
++    let (decoded, bytes) = encoding.decode_to(
++        &data[1..],
++        character_count,
++        &mut value,
++        Some(options & 0x01 != 0),
++    );
++    if decoded != character_count {
++        return Err(XlsError::Len {
++            expected: 1 + character_count * if options & 0x01 == 0 { 1 } else { 2 },
++            found: data.len(),
++            typ,
++        });
++    }
++    Ok((value, 1 + bytes))
+ }
+ 
+ fn parse_extern_sheet(r: &Record<'_>, biff: Biff) -> Vec<Xti> {
+diff --git a/src/xlsb/mod.rs b/src/xlsb/mod.rs
+index cab7ab5..ee106d7 100644
+--- a/src/xlsb/mod.rs
++++ b/src/xlsb/mod.rs
+@@ -28,7 +28,8 @@ use crate::utils::{
+ };
+ use crate::vba::VbaProject;
+ use crate::{
+-    Cell, Data, HeaderRow, Metadata, Range, Reader, ReaderRef, Sheet, SheetType, SheetVisible,
++    Cell, Data, DefinedName, DefinedNameScope, HeaderRow, Metadata, Range, Reader, ReaderRef,
++    Sheet, SheetType, SheetVisible,
+ };
+ 
+ /// A Xlsb specific error
+@@ -351,6 +352,7 @@ impl<RS: Read + Seek> Xlsb<RS> {
+ 
+         // BrtName
+         let mut defined_names = Vec::new();
++        let mut structured_defined_names = Vec::new();
+         loop {
+             let typ = iter.read_type()?;
+             match typ {
+@@ -380,16 +382,37 @@ impl<RS: Read + Seek> Xlsb<RS> {
+                 0x0027 => {
+                     // BrtName
+                     let len = iter.fill_buffer(&mut buf)?;
++                    let flags = read_u32(&buf);
++                    let sheet_index = read_u32(&buf[5..9]);
+                     let mut str_len = 0;
+                     let name = wide_str(&buf[9..len], &mut str_len)?.into_owned();
+                     let rgce_len = read_u32(&buf[9 + str_len..]) as usize;
+                     let rgce = &buf[13 + str_len..13 + str_len + rgce_len];
+                     let formula = parse_formula(rgce, &self.extern_sheets, &defined_names)?;
+-                    defined_names.push((name, formula));
++                    let extra_len_offset = 13 + str_len + rgce_len;
++                    let extra_len = read_u32(&buf[extra_len_offset..]) as usize;
++                    let comment_offset = extra_len_offset + 4 + extra_len;
++                    let comment = nullable_wide_str(&buf[comment_offset..])?.map(Cow::into_owned);
++                    defined_names.push((name.clone(), formula.clone()));
++                    structured_defined_names.push(DefinedName {
++                        name,
++                        formula,
++                        scope: if sheet_index == u32::MAX {
++                            DefinedNameScope::Workbook
++                        } else {
++                            DefinedNameScope::Worksheet(sheet_index as usize)
++                        },
++                        hidden: Some(flags & 0x0000_0001 != 0),
++                        built_in: Some(flags & 0x0000_0020 != 0),
++                        comment,
++                        published: Some(flags & 0x0000_8000 != 0),
++                        workbook_parameter: Some(flags & 0x0001_0000 != 0),
++                    });
+                 }
+                 0x009D | 0x0225 | 0x018D | 0x0180 | 0x009A | 0x0252 | 0x0229 | 0x009B | 0x0084 => {
+                     // record supposed to happen AFTER BrtNames
+                     self.metadata.names = defined_names;
++                    self.metadata.defined_names = structured_defined_names;
+                     return Ok(());
+                 }
+                 _ => debug!("Unsupported type {typ:X}"),
+@@ -724,6 +747,21 @@ fn wide_str<'a>(buf: &'a [u8], str_len: &mut usize) -> Result<Cow<'a, str>, Xlsb
+     Ok(UTF_16LE.decode(s).0)
+ }
+ 
++fn nullable_wide_str(buf: &[u8]) -> Result<Option<Cow<'_, str>>, XlsbError> {
++    let len = read_u32(buf);
++    if len == u32::MAX {
++        return Ok(None);
++    }
++    let byte_len = len as usize * 2;
++    if buf.len() < 4 + byte_len {
++        return Err(XlsbError::WideStr {
++            ws_len: 4 + byte_len,
++            buf_len: buf.len(),
++        });
++    }
++    Ok(Some(UTF_16LE.decode(&buf[4..4 + byte_len]).0))
++}
++
+ /// Formula parsing
+ ///
+ /// [MS-XLSB 2.2.2]
+diff --git a/src/xlsx/mod.rs b/src/xlsx/mod.rs
+index bd3854e..2668ac1 100644
+--- a/src/xlsx/mod.rs
++++ b/src/xlsx/mod.rs
+@@ -31,8 +31,8 @@ use crate::vba::VbaProject;
+ #[cfg(feature = "picture")]
+ use crate::Picture;
+ use crate::{
+-    Cell, CellErrorType, Data, Dimensions, HeaderRow, Metadata, Range, Reader, ReaderRef, Sheet,
+-    SheetType, SheetVisible, Table,
++    Cell, CellErrorType, Data, DefinedName, DefinedNameScope, Dimensions, HeaderRow, Metadata,
++    Range, Reader, ReaderRef, Sheet, SheetType, SheetVisible, Table,
+ };
+ pub use cells_reader::{
+     XlsxCellFormula, XlsxCellFormulaMetadataRecord, XlsxCellReader, XlsxFormulaMetadata,
+@@ -523,6 +523,36 @@ impl<RS: Read + Seek> Xlsx<RS> {
+                 Ok(Event::Start(e)) if e.local_name().as_ref() == b"definedName" => {
+                     if let Some(val) = e.raw_attr(b"name")? {
+                         let name = decode_attr(&xml.decoder(), val)?;
++                        let scope = match e.raw_attr(b"localSheetId")? {
++                            Some(value) => DefinedNameScope::Worksheet(
++                                decode_attr(&xml.decoder(), value)?.parse()?,
++                            ),
++                            None => DefinedNameScope::Workbook,
++                        };
++                        let hidden = e
++                            .raw_attr(b"hidden")?
++                            .is_some_and(|value| value == b"1" || value == b"true");
++                        let built_in = matches!(
++                            name.as_str(),
++                            "_xlnm.Print_Area"
++                                | "_xlnm.Print_Titles"
++                                | "_xlnm.Criteria"
++                                | "_xlnm._FilterDatabase"
++                                | "_xlnm.Extract"
++                                | "_xlnm.Consolidate_Area"
++                                | "_xlnm.Database"
++                                | "_xlnm.Sheet_Title"
++                        );
++                        let comment = match e.raw_attr(b"comment")? {
++                            Some(value) => Some(decode_attr(&xml.decoder(), value)?),
++                            None => None,
++                        };
++                        let published = e
++                            .raw_attr(b"publishToServer")?
++                            .is_some_and(|value| value == b"1" || value == b"true");
++                        let workbook_parameter = e
++                            .raw_attr(b"workbookParameter")?
++                            .is_some_and(|value| value == b"1" || value == b"true");
+                         val_buf.clear();
+                         let mut value = String::new();
+                         loop {
+@@ -534,7 +564,16 @@ impl<RS: Read + Seek> Xlsx<RS> {
+                                 _ => (),
+                             }
+                         }
+-                        defined_names.push((name, value));
++                        defined_names.push(DefinedName {
++                            name,
++                            formula: value,
++                            scope,
++                            hidden: Some(hidden),
++                            built_in: Some(built_in),
++                            comment,
++                            published: Some(published),
++                            workbook_parameter: Some(workbook_parameter),
++                        });
+                     }
+                 }
+                 Ok(Event::End(e)) if e.local_name().as_ref() == b"workbook" => break,
+@@ -543,7 +582,11 @@ impl<RS: Read + Seek> Xlsx<RS> {
+                 _ => (),
+             }
+         }
+-        self.metadata.names = defined_names;
++        self.metadata.names = defined_names
++            .iter()
++            .map(|name| (name.name.clone(), name.formula.clone()))
++            .collect();
++        self.metadata.defined_names = defined_names;
+         Ok(())
+     }
+ 

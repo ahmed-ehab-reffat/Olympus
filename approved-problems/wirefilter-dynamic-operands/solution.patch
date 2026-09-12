@@ -1,0 +1,987 @@
+diff --git a/engine/src/ast/field_expr.rs b/engine/src/ast/field_expr.rs
+index f42e804..a3208ce 100644
+--- a/engine/src/ast/field_expr.rs
++++ b/engine/src/ast/field_expr.rs
+@@ -3,6 +3,11 @@ use super::function_expr::FunctionCallExpr;
+ use super::parse::FilterParser;
+ use super::visitor::{Visitor, VisitorMut};
+ use crate::ast::index_expr::{Compare, IndexExpr};
++use crate::ast::operand::{
++    ContainsElement, OperandOp, compile_contains_set, compile_operand_comparison, lex_ordering_operand,
++    lex_contains_set, lex_operand, membership_operand_type, walk_contains_set,
++    walk_contains_set_mut,
++};
+ use crate::compiler::Compiler;
+ use crate::filter::CompiledExpr;
+ use crate::lex::{Lex, LexErrorKind, LexResult, LexWith, expect, skip_space, span};
+@@ -174,6 +179,60 @@ pub enum ComparisonOpExpr {
+         /// List name
+         name: ListName,
+     },
++
++    /// Ordering comparison against an operand expression
++    OrderingExpr {
++        /// Ordering comparison operator
++        op: OrderingOp,
++        /// Right-hand side operand expression
++        rhs: IndexExpr,
++    },
++
++    /// Integer comparison against an operand expression
++    IntExpr {
++        /// Integer comparison operator
++        op: IntOp,
++        /// Right-hand side operand expression
++        rhs: IndexExpr,
++    },
++
++    /// "contains" comparison against an operand expression
++    #[serde(serialize_with = "serialize_contains_expr")]
++    ContainsExpr(IndexExpr),
++
++    /// "in" comparison against an operand expression
++    #[serde(serialize_with = "serialize_in_expr")]
++    InExpr(IndexExpr),
++
++    /// "contains {...}" comparison against a set of literals and expressions
++    #[serde(serialize_with = "serialize_contains_set")]
++    ContainsSet(Vec<ContainsElement>),
++}
++
++impl ComparisonOpExpr {
++    fn operand(&self) -> Option<&IndexExpr> {
++        match self {
++            Self::OrderingExpr { rhs, .. }
++            | Self::IntExpr { rhs, .. }
++            | Self::ContainsExpr(rhs)
++            | Self::InExpr(rhs) => Some(rhs),
++            _ => None,
++        }
++    }
++
++    fn operand_mut(&mut self) -> Option<&mut IndexExpr> {
++        match self {
++            Self::OrderingExpr { rhs, .. }
++            | Self::IntExpr { rhs, .. }
++            | Self::ContainsExpr(rhs)
++            | Self::InExpr(rhs) => Some(rhs),
++            _ => None,
++        }
++    }
++
++    fn operand_map_each_count(&self) -> usize {
++        self.operand().map_or(0, IndexExpr::map_each_count)
++    }
+ }
+ 
+ fn serialize_op_rhs<T, S>(op: &'static str, rhs: &T, ser: S) -> Result<S::Ok, S::Error>
+@@ -228,6 +287,21 @@ fn serialize_list<S: Serializer>(_: &List, name: &ListName, ser: S) -> Result<S:
+     serialize_op_rhs("InList", name, ser)
+ }
+ 
++fn serialize_contains_expr<S: Serializer>(rhs: &IndexExpr, ser: S) -> Result<S::Ok, S::Error> {
++    serialize_op_rhs("Contains", rhs, ser)
++}
++
++fn serialize_in_expr<S: Serializer>(rhs: &IndexExpr, ser: S) -> Result<S::Ok, S::Error> {
++    serialize_op_rhs("In", rhs, ser)
++}
++
++fn serialize_contains_set<S: Serializer>(
++    rhs: &[ContainsElement],
++    ser: S,
++) -> Result<S::Ok, S::Error> {
++    serialize_op_rhs("ContainsOneOf", rhs, ser)
++}
++
+ /// Represents either the access to a field's value or
+ /// a function call.
+ #[derive(Debug, PartialEq, Eq, Clone, Hash, Serialize)]
+@@ -285,7 +359,7 @@ pub struct ComparisonExpr {
+ 
+ impl GetType for ComparisonExpr {
+     fn get_type(&self) -> Type {
+-        if self.lhs.map_each_count() > 0 {
++        if self.lhs.map_each_count() > 0 || self.op.operand_map_each_count() > 0 {
+             Type::Array(Type::Bool.into())
+         } else if self.op == ComparisonOpExpr::IsTrue {
+             // Bool or Array(Bool)
+@@ -312,7 +386,18 @@ impl ComparisonExpr {
+     ) -> LexResult<'i, Self> {
+         let lhs_type = lhs.get_type();
+ 
+-        let (op, input) = if lhs_type == Type::Bool {
++        // Types without a literal form read an operand expression here; types
++        // with one try an operand and then fall back to the literal below.
++        let operand = if matches!(lhs_type, Type::Bool | Type::Array(_) | Type::Map(_)) {
++            lex_ordering_operand(input, parser, lhs_type)
++        } else {
++            None
++        };
++
++        let (op, input) = if let Some(result) = operand {
++            let ((op, rhs), input) = result?;
++            (ComparisonOpExpr::OrderingExpr { op, rhs }, input)
++        } else if lhs_type == Type::Bool {
+             (ComparisonOpExpr::IsTrue, input)
+         } else if lhs_type.next() == Some(Type::Bool) {
+             // Invalid because this would produce an Array(Array(Bool))
+@@ -339,7 +424,14 @@ impl ComparisonExpr {
+                 (Type::Ip, ComparisonOp::In)
+                 | (Type::Bytes, ComparisonOp::In)
+                 | (Type::Int, ComparisonOp::In) => {
+-                    if expect(input, "$").is_ok() {
++                    if expect(input, "$").is_err()
++                        && expect(input, "{").is_err()
++                        && let Some(result) =
++                            lex_operand(input, parser, membership_operand_type(lhs_type))
++                    {
++                        let (rhs, input) = result?;
++                        (ComparisonOpExpr::InExpr(rhs), input)
++                    } else if expect(input, "$").is_ok() {
+                         let (name, input) = ListName::lex(input)?;
+                         let list = parser.scheme.get_list(&lhs_type).ok_or((
+                             LexErrorKind::UnsupportedOp { lhs_type },
+@@ -360,17 +452,35 @@ impl ComparisonExpr {
+                 (Type::Ip, ComparisonOp::Ordering(op))
+                 | (Type::Bytes, ComparisonOp::Ordering(op))
+                 | (Type::Int, ComparisonOp::Ordering(op)) => {
+-                    let (rhs, input) = RhsValue::lex_with(input, lhs_type)?;
+-                    (ComparisonOpExpr::Ordering { op, rhs }, input)
++                    if let Some(result) = lex_operand(input, parser, lhs_type) {
++                        let (rhs, input) = result?;
++                        (ComparisonOpExpr::OrderingExpr { op, rhs }, input)
++                    } else {
++                        let (rhs, input) = RhsValue::lex_with(input, lhs_type)?;
++                        (ComparisonOpExpr::Ordering { op, rhs }, input)
++                    }
+                 }
+                 (Type::Int, ComparisonOp::Int(op)) => {
+-                    let (rhs, input) = i64::lex(input)?;
+-                    (ComparisonOpExpr::Int { op, rhs }, input)
++                    if let Some(result) = lex_operand(input, parser, lhs_type) {
++                        let (rhs, input) = result?;
++                        (ComparisonOpExpr::IntExpr { op, rhs }, input)
++                    } else {
++                        let (rhs, input) = i64::lex(input)?;
++                        (ComparisonOpExpr::Int { op, rhs }, input)
++                    }
+                 }
+                 (Type::Bytes, ComparisonOp::Bytes(op)) => match op {
+                     BytesOp::Contains => {
+-                        let (bytes, input) = BytesExpr::lex(input)?;
+-                        (ComparisonOpExpr::Contains(bytes), input)
++                        if let Some(result) = lex_contains_set(input, parser) {
++                            let (set, input) = result?;
++                            (ComparisonOpExpr::ContainsSet(set), input)
++                        } else if let Some(result) = lex_operand(input, parser, lhs_type) {
++                            let (rhs, input) = result?;
++                            (ComparisonOpExpr::ContainsExpr(rhs), input)
++                        } else {
++                            let (bytes, input) = BytesExpr::lex(input)?;
++                            (ComparisonOpExpr::Contains(bytes), input)
++                        }
+                     }
+                     BytesOp::Matches => {
+                         let (regex, input) = Regex::lex_with(input, parser)?;
+@@ -427,12 +537,26 @@ impl<const STRICT: bool, U> Compare<U> for Wildcard<STRICT> {
+ impl Expr for ComparisonExpr {
+     #[inline]
+     fn walk<'a, V: Visitor<'a>>(&'a self, visitor: &mut V) {
+-        visitor.visit_index_expr(&self.lhs)
++        visitor.visit_index_expr(&self.lhs);
++        if let Some(rhs) = self.op.operand() {
++            visitor.visit_index_expr(rhs);
++        }
++        if let ComparisonOpExpr::ContainsSet(set) = &self.op {
++            walk_contains_set(set, visitor);
++        }
+     }
+ 
+     #[inline]
+     fn walk_mut<'a, V: VisitorMut<'a>>(&'a mut self, visitor: &mut V) {
+-        visitor.visit_index_expr(&mut self.lhs)
++        visitor.visit_index_expr(&mut self.lhs);
++        match &mut self.op {
++            ComparisonOpExpr::ContainsSet(set) => walk_contains_set_mut(set, visitor),
++            op => {
++                if let Some(rhs) = op.operand_mut() {
++                    visitor.visit_index_expr(rhs);
++                }
++            }
++        }
+     }
+ 
+     fn compile_with_compiler<C: Compiler>(self, compiler: &mut C) -> CompiledExpr<C::U> {
+@@ -787,6 +911,26 @@ impl Expr for ComparisonExpr {
+ 
+                 lhs.compile_with(compiler, false, InList { name, list })
+             }
++            ComparisonOpExpr::OrderingExpr { op, rhs } => {
++                let default = op == OrderingOp::NotEqual && nil_not_equal_behavior;
++                compile_operand_comparison(
++                    compiler,
++                    lhs,
++                    rhs,
++                    OperandOp::Ordering(op),
++                    default,
++                )
++            }
++            ComparisonOpExpr::IntExpr { op, rhs } => {
++                compile_operand_comparison(compiler, lhs, rhs, OperandOp::Int(op), false)
++            }
++            ComparisonOpExpr::ContainsExpr(rhs) => {
++                compile_operand_comparison(compiler, lhs, rhs, OperandOp::Contains, false)
++            }
++            ComparisonOpExpr::InExpr(rhs) => {
++                compile_operand_comparison(compiler, lhs, rhs, OperandOp::In, false)
++            }
++            ComparisonOpExpr::ContainsSet(set) => compile_contains_set(compiler, lhs, set),
+         }
+     }
+ }
+diff --git a/engine/src/ast/index_expr.rs b/engine/src/ast/index_expr.rs
+index f1f8443..2768ae3 100644
+--- a/engine/src/ast/index_expr.rs
++++ b/engine/src/ast/index_expr.rs
+@@ -8,7 +8,7 @@ use crate::filter::{CompiledExpr, CompiledOneExpr, CompiledValueExpr, CompiledVe
+ use crate::lex::{Lex, LexErrorKind, LexResult, LexWith, expect, skip_space, span};
+ use crate::lhs_types::{Array, Map, TypedArray};
+ use crate::scheme::{FieldIndex, IndexAccessError};
+-use crate::types::{GetType, IntoIter, LhsValue, Type};
++use crate::types::{GetType, IntoIter, LhsValue, Type, TypeMismatchError};
+ use serde::ser::SerializeSeq;
+ use serde::{Serialize, Serializer};
+ 
+@@ -44,6 +44,11 @@ impl ValueExpr for IndexExpr {
+             IdentifierExpr::Field(ref field) => visitor.visit_field(field),
+             IdentifierExpr::FunctionCallExpr(ref call) => visitor.visit_function_call_expr(call),
+         }
++        for index in &self.indexes {
++            if let FieldIndex::Dynamic(expr) = index {
++                visitor.visit_index_expr(expr);
++            }
++        }
+     }
+ 
+     #[inline]
+@@ -54,6 +59,11 @@ impl ValueExpr for IndexExpr {
+                 visitor.visit_function_call_expr(call)
+             }
+         }
++        for index in &mut self.indexes {
++            if let FieldIndex::Dynamic(expr) = index {
++                visitor.visit_index_expr(expr);
++            }
++        }
+     }
+ 
+     fn compile_with_compiler<C: Compiler>(self, compiler: &mut C) -> CompiledValueExpr<C::U> {
+@@ -64,6 +74,27 @@ impl ValueExpr for IndexExpr {
+             indexes,
+         } = self;
+ 
++        if has_dynamic_index(&indexes) {
++            let steps = compile_index_steps(compiler, indexes);
++            return match identifier {
++                IdentifierExpr::Field(f) => CompiledValueExpr::new(move |ctx| {
++                    ctx.get_field_value_unchecked(&f)
++                        .and_then(|value| resolve_steps(value, &steps, ctx))
++                        .map(LhsValue::as_ref)
++                        .ok_or(ty)
++                }),
++                IdentifierExpr::FunctionCallExpr(call) => {
++                    let call = compiler.compile_function_call_expr(call);
++                    CompiledValueExpr::new(move |ctx| {
++                        call.execute(ctx)
++                            .ok()
++                            .and_then(|value| extract_steps(value, &steps, ctx))
++                            .ok_or(ty)
++                    })
++                }
++            };
++        }
++
+         let last = match map_each_count {
+             0 => Some(indexes.len()),
+             1 if indexes.last() == Some(&FieldIndex::MapEach) => {
+@@ -127,6 +158,132 @@ impl ValueExpr for IndexExpr {
+     }
+ }
+ 
++pub(crate) fn has_dynamic_index(indexes: &[FieldIndex]) -> bool {
++    indexes
++        .iter()
++        .any(|index| matches!(index, FieldIndex::Dynamic(_)))
++}
++
++fn has_map_each(indexes: &[FieldIndex]) -> bool {
++    indexes.contains(&FieldIndex::MapEach)
++}
++
++/// Lexes an index that is computed by an expression, checking it against the
++/// key type the indexed value expects.
++fn lex_dynamic_index<'i>(
++    input: &'i str,
++    parser: &FilterParser<'_>,
++    indexed_type: Type,
++) -> Option<LexResult<'i, FieldIndex>> {
++    let expected = match indexed_type {
++        Type::Array(_) => Type::Int,
++        Type::Map(_) => Type::Bytes,
++        _ => return None,
++    };
++    let (expr, rest) = IndexExpr::lex_with(input, parser).ok()?;
++    let actual = expr.get_type();
++    if actual != expected || expr.map_each_count() > 0 {
++        return Some(Err((
++            LexErrorKind::TypeMismatch(TypeMismatchError {
++                expected: expected.into(),
++                actual,
++            }),
++            span(input, rest),
++        )));
++    }
++    Some(Ok((FieldIndex::Dynamic(expr.into()), rest)))
++}
++
++enum IndexStep<U> {
++    Static(FieldIndex),
++    Dynamic(CompiledValueExpr<U>),
++}
++
++fn compile_index_steps<C: Compiler>(
++    compiler: &mut C,
++    indexes: Vec<FieldIndex>,
++) -> Box<[IndexStep<C::U>]> {
++    indexes
++        .into_iter()
++        .map(|index| match index {
++            FieldIndex::Dynamic(expr) => {
++                IndexStep::Dynamic((*expr).compile_with_compiler(compiler))
++            }
++            index => IndexStep::Static(index),
++        })
++        .collect()
++}
++
++fn index_static<'v, 'e>(
++    value: &'v LhsValue<'e>,
++    index: &FieldIndex,
++) -> Option<&'v LhsValue<'e>> {
++    match (value, index) {
++        (LhsValue::Array(array), FieldIndex::ArrayIndex(index)) => array.get(*index as usize),
++        (LhsValue::Map(map), FieldIndex::MapKey(key)) => map.get(key.as_bytes()),
++        _ => None,
++    }
++}
++
++fn index_by_value<'v, 'e>(
++    value: &'v LhsValue<'e>,
++    key: &LhsValue<'_>,
++) -> Option<&'v LhsValue<'e>> {
++    match (value, key) {
++        (LhsValue::Map(map), LhsValue::Bytes(key)) => map.get(key.as_ref()),
++        (LhsValue::Array(array), LhsValue::Int(index)) => {
++            usize::try_from(*index).ok().and_then(|index| array.get(index))
++        }
++        _ => None,
++    }
++}
++
++fn extract_by_value<'e>(value: LhsValue<'e>, key: &LhsValue<'_>) -> Option<LhsValue<'e>> {
++    match (value, key) {
++        (LhsValue::Map(map), LhsValue::Bytes(key)) => map.extract(key.as_ref()),
++        (LhsValue::Array(array), LhsValue::Int(index)) => usize::try_from(*index)
++            .ok()
++            .and_then(|index| array.extract(index)),
++        _ => None,
++    }
++}
++
++fn resolve_steps<'v, 'e, U>(
++    value: &'v LhsValue<'e>,
++    steps: &[IndexStep<U>],
++    ctx: &'e ExecutionContext<'e, U>,
++) -> Option<&'v LhsValue<'e>> {
++    let mut current = value;
++    for step in steps {
++        current = match step {
++            IndexStep::Static(index) => index_static(current, index)?,
++            IndexStep::Dynamic(expr) => {
++                let key = expr.execute(ctx).ok()?;
++                index_by_value(current, &key)?
++            }
++        };
++    }
++    Some(current)
++}
++
++fn extract_steps<'e, U>(
++    value: LhsValue<'e>,
++    steps: &[IndexStep<U>],
++    ctx: &'e ExecutionContext<'e, U>,
++) -> Option<LhsValue<'e>> {
++    let mut current = value;
++    for step in steps {
++        current = match step {
++            IndexStep::Static(index) => current.extract(index).ok().flatten()?,
++            IndexStep::Dynamic(expr) => {
++                let key = expr.execute(ctx).ok()?;
++                extract_by_value(current, &key)?
++            }
++        };
++    }
++    Some(current)
++}
++
+ fn simplify_indexes(mut indexes: Vec<FieldIndex>) -> Box<[FieldIndex]> {
+     if Some(&FieldIndex::MapEach) == indexes.last() {
+         indexes.pop();
+@@ -151,6 +308,24 @@ impl IndexExpr {
+             identifier,
+             indexes,
+         } = self;
++        if has_dynamic_index(&indexes) {
++            let steps = compile_index_steps(compiler, indexes);
++            return match identifier {
++                IdentifierExpr::FunctionCallExpr(call) => {
++                    let call = compiler.compile_function_call_expr(call);
++                    CompiledOneExpr::new(move |ctx| {
++                        ok_ref(&call.execute(ctx))
++                            .and_then(|value| resolve_steps(value, &steps, ctx))
++                            .map_or(default, |value| comp.compare(value, ctx))
++                    })
++                }
++                IdentifierExpr::Field(f) => CompiledOneExpr::new(move |ctx| {
++                    ctx.get_field_value_unchecked(&f)
++                        .and_then(|value| resolve_steps(value, &steps, ctx))
++                        .map_or(default, |value| comp.compare(value, ctx))
++                }),
++            };
++        }
+         let indexes = simplify_indexes(indexes);
+         match identifier {
+             IdentifierExpr::FunctionCallExpr(call) => {
+@@ -327,12 +502,30 @@ impl<'i, 's> LexWith<'i, &FilterParser<'s>> for IndexExpr {
+         while let Ok(rest) = expect(input, "[") {
+             let rest = skip_space(rest);
+ 
+-            let (idx, rest) = FieldIndex::lex(rest)?;
++            let (idx, rest) = match FieldIndex::lex(rest) {
++                Ok(parsed) => parsed,
++                Err(err) => match lex_dynamic_index(rest, parser, current_type) {
++                    Some(parsed) => parsed?,
++                    None => return Err(err),
++                },
++            };
+ 
+             let mut rest = skip_space(rest);
+ 
+             rest = expect(rest, "]")?;
+ 
++            if matches!(idx, FieldIndex::Dynamic(_)) && has_map_each(&indexes)
++                || idx == FieldIndex::MapEach && has_dynamic_index(&indexes)
++            {
++                return Err((
++                    LexErrorKind::InvalidIndexAccess(IndexAccessError {
++                        index: idx,
++                        actual: current_type,
++                    }),
++                    span(input, rest),
++                ));
++            }
++
+             match &idx {
+                 FieldIndex::ArrayIndex(_) => match current_type {
+                     Type::Array(array_type) => {
+@@ -379,6 +572,15 @@ impl<'i, 's> LexWith<'i, &FilterParser<'s>> for IndexExpr {
+                         ));
+                     }
+                 },
++                FieldIndex::Dynamic(_) => match current_type {
++                    Type::Array(array_type) => {
++                        current_type = array_type.into();
++                    }
++                    Type::Map(map_type) => {
++                        current_type = map_type.into();
++                    }
++                    _ => unreachable!(),
++                },
+             };
+ 
+             input = rest;
+@@ -405,6 +607,8 @@ impl GetType for IndexExpr {
+                 (Type::Array(sub_ty), FieldIndex::MapEach) => sub_ty.into(),
+                 (Type::Map(sub_ty), FieldIndex::MapKey(_)) => sub_ty.into(),
+                 (Type::Map(sub_ty), FieldIndex::MapEach) => sub_ty.into(),
++                (Type::Array(sub_ty), FieldIndex::Dynamic(_)) => sub_ty.into(),
++                (Type::Map(sub_ty), FieldIndex::Dynamic(_)) => sub_ty.into(),
+                 (_, _) => unreachable!(),
+             }
+         }
+@@ -460,6 +664,10 @@ impl<'a, 'b> FieldIndexIterator<'a, 'b> {
+                     actual: val.get_type(),
+                 }),
+             },
++            FieldIndex::Dynamic(_) => Err(IndexAccessError {
++                index: idx.clone(),
++                actual: val.get_type(),
++            }),
+         }
+     }
+ }
+diff --git a/engine/src/ast/mod.rs b/engine/src/ast/mod.rs
+index b158ea9..1c1a334 100644
+--- a/engine/src/ast/mod.rs
++++ b/engine/src/ast/mod.rs
+@@ -2,6 +2,7 @@ pub mod field_expr;
+ pub mod function_expr;
+ pub mod index_expr;
+ pub mod logical_expr;
++pub(crate) mod operand;
+ pub mod parse;
+ pub mod visitor;
+ 
+diff --git a/engine/src/ast/operand.rs b/engine/src/ast/operand.rs
+new file mode 100644
+index 0000000..b16c69e
+--- /dev/null
++++ b/engine/src/ast/operand.rs
+@@ -0,0 +1,385 @@
++use crate::ast::ValueExpr;
++use crate::ast::field_expr::{ComparisonOp, IntOp, OrderingOp};
++use crate::ast::index_expr::{Compare, IndexExpr};
++use crate::compiler::Compiler;
++use crate::execution_context::ExecutionContext;
++use crate::filter::{CompiledExpr, CompiledValueExpr, CompiledVecExpr};
++use crate::ast::parse::FilterParser;
++use crate::ast::visitor::{Visitor, VisitorMut};
++use crate::lex::{Lex, LexErrorKind, LexResult, LexWith, expect, skip_space, span};
++use crate::lhs_types::{ArrayIter, MapIter, TypedArray};
++use crate::strict_partial_ord::StrictPartialOrd;
++use crate::rhs_types::BytesExpr;
++use crate::types::{GetType, LhsValue, Type, TypeMismatchError};
++use serde::Serialize;
++use memchr::memmem;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum OperandOp {
++    Ordering(OrderingOp),
++    Int(IntOp),
++    Contains,
++    In,
++}
++
++pub(crate) enum OperandItems<'v, 'e> {
++    Array(ArrayIter<'e, 'v>),
++    Map(MapIter<'e, 'v>),
++}
++
++impl<'v, 'e> Iterator for OperandItems<'v, 'e> {
++    type Item = &'v LhsValue<'e>;
++
++    #[inline]
++    fn next(&mut self) -> Option<Self::Item> {
++        match self {
++            Self::Array(iter) => iter.next(),
++            Self::Map(iter) => iter.next().map(|(_, value)| value),
++        }
++    }
++
++    #[inline]
++    fn size_hint(&self) -> (usize, Option<usize>) {
++        let len = match self {
++            Self::Array(iter) => iter.len(),
++            Self::Map(iter) => iter.len(),
++        };
++        (len, Some(len))
++    }
++}
++
++#[inline]
++pub(crate) fn operand_items<'v, 'e>(value: &'v LhsValue<'e>) -> Option<OperandItems<'v, 'e>> {
++    match value {
++        LhsValue::Array(array) => Some(OperandItems::Array(array.iter())),
++        LhsValue::Map(map) => Some(OperandItems::Map(map.iter())),
++        _ => None,
++    }
++}
++
++fn values_equal(lhs: &LhsValue<'_>, rhs: &LhsValue<'_>) -> bool {
++    match (lhs, rhs) {
++        (LhsValue::Array(lhs), LhsValue::Array(rhs)) => {
++            lhs.len() == rhs.len()
++                && lhs
++                    .iter()
++                    .zip(rhs.iter())
++                    .all(|(lhs, rhs)| values_equal(lhs, rhs))
++        }
++        (LhsValue::Map(lhs), LhsValue::Map(rhs)) => {
++            lhs.len() == rhs.len()
++                && lhs.iter().zip(rhs.iter()).all(
++                    |((lhs_key, lhs_value), (rhs_key, rhs_value))| {
++                        lhs_key == rhs_key && values_equal(lhs_value, rhs_value)
++                    },
++                )
++        }
++        (lhs, rhs) => scalars_match(OrderingOp::Equal, lhs, rhs),
++    }
++}
++
++#[inline]
++fn scalars_match(op: OrderingOp, lhs: &LhsValue<'_>, rhs: &LhsValue<'_>) -> bool {
++    match (lhs, rhs) {
++        (LhsValue::Int(lhs), LhsValue::Int(rhs)) => op.matches(lhs.cmp(rhs)),
++        (LhsValue::Bytes(lhs), LhsValue::Bytes(rhs)) => op.matches(lhs.as_ref().cmp(rhs.as_ref())),
++        (LhsValue::Ip(lhs), LhsValue::Ip(rhs)) => op.matches_opt(lhs.strict_partial_cmp(rhs)),
++        (LhsValue::Bool(lhs), LhsValue::Bool(rhs)) => op.matches(lhs.cmp(rhs)),
++        _ => op == OrderingOp::NotEqual,
++    }
++}
++
++#[inline]
++fn ordering_matches(op: OrderingOp, lhs: &LhsValue<'_>, rhs: &LhsValue<'_>) -> bool {
++    match (lhs, rhs) {
++        (LhsValue::Array(_) | LhsValue::Map(_), _) | (_, LhsValue::Array(_) | LhsValue::Map(_)) => {
++            match op {
++                OrderingOp::Equal => values_equal(lhs, rhs),
++                OrderingOp::NotEqual => !values_equal(lhs, rhs),
++                _ => false,
++            }
++        }
++        (lhs, rhs) => scalars_match(op, lhs, rhs),
++    }
++}
++
++/// Whether an operand of this type supports the given ordering operator.
++#[inline]
++pub(crate) fn supports_ordering(ty: &Type, op: OrderingOp) -> bool {
++    match ty {
++        Type::Array(_) | Type::Map(_) => {
++            matches!(op, OrderingOp::Equal | OrderingOp::NotEqual)
++        }
++        _ => true,
++    }
++}
++
++/// Reads an ordering operator followed by an operand expression of the given
++/// type. Yields nothing when the input does not continue with an ordering
++/// operator the type supports, which leaves the caller's other readings intact.
++pub(crate) fn lex_ordering_operand<'i>(
++    input: &'i str,
++    parser: &FilterParser<'_>,
++    expected: Type,
++) -> Option<LexResult<'i, (OrderingOp, IndexExpr)>> {
++    let (op, rest) = ComparisonOp::lex(skip_space(input)).ok()?;
++    let ComparisonOp::Ordering(op) = op else {
++        return None;
++    };
++    if !supports_ordering(&expected, op) {
++        return None;
++    }
++    let result = lex_operand(skip_space(rest), parser, expected)?;
++    Some(result.map(|(rhs, rest)| ((op, rhs), rest)))
++}
++
++#[inline]
++fn contains_bytes(lhs: &LhsValue<'_>, rhs: &LhsValue<'_>) -> bool {
++    match (lhs, rhs) {
++        (LhsValue::Bytes(lhs), LhsValue::Bytes(rhs)) => {
++            memmem::find(lhs.as_ref(), rhs.as_ref()).is_some()
++        }
++        _ => false,
++    }
++}
++
++#[inline]
++fn is_member(lhs: &LhsValue<'_>, rhs: &LhsValue<'_>) -> bool {
++    match rhs {
++        LhsValue::Array(array) => array
++            .iter()
++            .any(|item| ordering_matches(OrderingOp::Equal, lhs, item)),
++        _ => false,
++    }
++}
++
++#[inline]
++pub(crate) fn compare_operands(op: OperandOp, lhs: &LhsValue<'_>, rhs: &LhsValue<'_>) -> bool {
++    match op {
++        OperandOp::Ordering(op) => ordering_matches(op, lhs, rhs),
++        OperandOp::Int(IntOp::BitwiseAnd) => match (lhs, rhs) {
++            (LhsValue::Int(lhs), LhsValue::Int(rhs)) => lhs & rhs != 0,
++            _ => false,
++        },
++        OperandOp::Contains => contains_bytes(lhs, rhs),
++        OperandOp::In => is_member(lhs, rhs),
++    }
++}
++
++struct OperandCompare<U> {
++    op: OperandOp,
++    rhs: CompiledValueExpr<U>,
++    default: bool,
++}
++
++impl<U: 'static> Compare<U> for OperandCompare<U> {
++    #[inline]
++    fn compare<'e>(&self, value: &LhsValue<'e>, ctx: &'e ExecutionContext<'e, U>) -> bool {
++        match self.rhs.execute(ctx) {
++            Ok(rhs) => compare_operands(self.op, value, &rhs),
++            Err(_) => self.default,
++        }
++    }
++}
++
++/// Lexes an operand expression when the input starts one, checking it against
++/// the type the operator expects.
++pub(crate) fn lex_operand<'i>(
++    input: &'i str,
++    parser: &FilterParser<'_>,
++    expected: Type,
++) -> Option<LexResult<'i, IndexExpr>> {
++    let (rhs, rest) = IndexExpr::lex_with(input, parser).ok()?;
++    let actual = rhs.get_type();
++    if actual != expected {
++        return Some(Err((
++            LexErrorKind::TypeMismatch(TypeMismatchError {
++                expected: expected.into(),
++                actual,
++            }),
++            span(input, rest),
++        )));
++    }
++    Some(Ok((rhs, rest)))
++}
++
++fn empty() -> TypedArray<'static, bool> {
++    TypedArray::default()
++}
++
++/// Compiles a comparison whose right operand is an expression evaluated
++/// against the execution context.
++pub(crate) fn compile_operand_comparison<C: Compiler>(
++    compiler: &mut C,
++    lhs: IndexExpr,
++    rhs: IndexExpr,
++    op: OperandOp,
++    default: bool,
++) -> CompiledExpr<C::U> {
++    if rhs.map_each_count() == 0 {
++        let rhs = rhs.compile_with_compiler(compiler);
++        return lhs.compile_with(compiler, default, OperandCompare { op, rhs, default });
++    }
++
++    let paired = lhs.map_each_count() > 0;
++    let lhs = lhs.compile_with_compiler(compiler);
++    let rhs = rhs.compile_with_compiler(compiler);
++
++    CompiledExpr::Vec(CompiledVecExpr::new(move |ctx| {
++        let rhs_value = match rhs.execute(ctx) {
++            Ok(value) => value,
++            Err(_) => return empty(),
++        };
++        let Some(rhs_items) = operand_items(&rhs_value) else {
++            return empty();
++        };
++        match lhs.execute(ctx) {
++            Ok(lhs_value) => {
++                if !paired {
++                    return TypedArray::from_iter(
++                        rhs_items.map(|rhs_item| compare_operands(op, &lhs_value, rhs_item)),
++                    );
++                }
++                match operand_items(&lhs_value) {
++                    Some(lhs_items) => TypedArray::from_iter(
++                        lhs_items
++                            .zip(rhs_items)
++                            .map(|(lhs_item, rhs_item)| compare_operands(op, lhs_item, rhs_item)),
++                    ),
++                    None => empty(),
++                }
++            }
++            Err(_) => {
++                if paired {
++                    empty()
++                } else {
++                    TypedArray::from_iter(rhs_items.map(|_| default))
++                }
++            }
++        }
++    }))
++}
++
++/// Type an `in` operand must have for a left operand of type `ty`.
++#[inline]
++pub(crate) fn membership_operand_type(ty: Type) -> Type {
++    Type::Array(ty.into())
++}
++
++/// One element of a `contains {...}` set: either a literal or an expression.
++#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
++#[serde(untagged)]
++pub enum ContainsElement {
++    /// A literal byte string.
++    Literal(BytesExpr),
++    /// An expression evaluated against the execution context.
++    Operand(IndexExpr),
++}
++
++impl ContainsElement {
++    fn walk<'a, V: Visitor<'a>>(&'a self, visitor: &mut V) {
++        if let Self::Operand(expr) = self {
++            visitor.visit_index_expr(expr);
++        }
++    }
++
++    fn walk_mut<'a, V: VisitorMut<'a>>(&'a mut self, visitor: &mut V) {
++        if let Self::Operand(expr) = self {
++            visitor.visit_index_expr(expr);
++        }
++    }
++}
++
++pub(crate) fn walk_contains_set<'a, V: Visitor<'a>>(set: &'a [ContainsElement], visitor: &mut V) {
++    for element in set {
++        element.walk(visitor);
++    }
++}
++
++pub(crate) fn walk_contains_set_mut<'a, V: VisitorMut<'a>>(
++    set: &'a mut [ContainsElement],
++    visitor: &mut V,
++) {
++    for element in set {
++        element.walk_mut(visitor);
++    }
++}
++
++/// Lexes a braced `contains {...}` set of literals and expressions.
++pub(crate) fn lex_contains_set<'i>(
++    input: &'i str,
++    parser: &FilterParser<'_>,
++) -> Option<LexResult<'i, Vec<ContainsElement>>> {
++    let mut rest = skip_space(expect(input, "{").ok()?);
++    let mut elements = Vec::new();
++    loop {
++        if let Ok(after) = expect(rest, "}") {
++            return Some(Ok((elements, after)));
++        }
++        let element = match lex_operand(rest, parser, Type::Bytes) {
++            Some(Ok((expr, after))) => {
++                if expr.map_each_count() > 0 {
++                    return Some(Err((
++                        LexErrorKind::TypeMismatch(TypeMismatchError {
++                            expected: Type::Bytes.into(),
++                            actual: Type::Array(Type::Bytes.into()),
++                        }),
++                        span(rest, after),
++                    )));
++                }
++                rest = after;
++                ContainsElement::Operand(expr)
++            }
++            Some(Err(err)) => return Some(Err(err)),
++            None => match BytesExpr::lex(rest) {
++                Ok((bytes, after)) => {
++                    rest = after;
++                    ContainsElement::Literal(bytes)
++                }
++                Err(err) => return Some(Err(err)),
++            },
++        };
++        elements.push(element);
++        rest = skip_space(rest);
++    }
++}
++
++enum Needle<U> {
++    Static(Box<[u8]>),
++    Dynamic(CompiledValueExpr<U>),
++}
++
++struct ContainsOneOfOperands<U>(Box<[Needle<U>]>);
++
++impl<U: 'static> Compare<U> for ContainsOneOfOperands<U> {
++    fn compare<'e>(&self, value: &LhsValue<'e>, ctx: &'e ExecutionContext<'e, U>) -> bool {
++        let LhsValue::Bytes(haystack) = value else {
++            return false;
++        };
++        self.0.iter().any(|needle| match needle {
++            Needle::Static(needle) => memmem::find(haystack.as_ref(), needle).is_some(),
++            Needle::Dynamic(expr) => match expr.execute(ctx) {
++                Ok(LhsValue::Bytes(needle)) => {
++                    memmem::find(haystack.as_ref(), needle.as_ref()).is_some()
++                }
++                _ => false,
++            },
++        })
++    }
++}
++
++/// Compiles a `contains {...}` set comparison.
++pub(crate) fn compile_contains_set<C: Compiler>(
++    compiler: &mut C,
++    lhs: IndexExpr,
++    set: Vec<ContainsElement>,
++) -> CompiledExpr<C::U> {
++    let needles: Box<[Needle<C::U>]> = set
++        .into_iter()
++        .map(|element| match element {
++            ContainsElement::Literal(bytes) => Needle::Static(bytes.into()),
++            ContainsElement::Operand(expr) => Needle::Dynamic(expr.compile_with_compiler(compiler)),
++        })
++        .collect();
++    lhs.compile_with(compiler, false, ContainsOneOfOperands(needles))
++}
+diff --git a/engine/src/lib.rs b/engine/src/lib.rs
+index 3944713..66b1a48 100644
+--- a/engine/src/lib.rs
++++ b/engine/src/lib.rs
+@@ -83,6 +83,7 @@ pub use self::ast::field_expr::{
+     ComparisonExpr, ComparisonOpExpr, IdentifierExpr, IntOp, OrderingOp,
+ };
+ pub use self::ast::function_expr::{FunctionCallArgExpr, FunctionCallExpr};
++pub use self::ast::operand::ContainsElement;
+ pub use self::ast::index_expr::{Compare, IndexExpr};
+ pub use self::ast::logical_expr::{
+     LogicalExpr, LogicalOp, ParenthesizedExpr, QuantifierArgExpr, QuantifierOp, UnaryOp,
+diff --git a/engine/src/scheme.rs b/engine/src/scheme.rs
+index db21743..06ba833 100644
+--- a/engine/src/scheme.rs
++++ b/engine/src/scheme.rs
+@@ -1,3 +1,4 @@
++use crate::ast::index_expr::IndexExpr;
+ use crate::ast::parse::{FilterParser, ParseError, ParserSettings};
+ use crate::ast::{FilterAst, FilterValueAst};
+ use crate::functions::FunctionDefinition;
+@@ -45,6 +46,9 @@ pub enum FieldIndex {
+ 
+     /// Map each element by applying a function or a comparison
+     MapEach,
++
++    /// Index or key computed by an expression at execution time
++    Dynamic(Box<IndexExpr>),
+ }
+ 
+ impl<'i> Lex<'i> for FieldIndex {
+diff --git a/engine/src/types.rs b/engine/src/types.rs
+index d646648..ee694f3 100644
+--- a/engine/src/types.rs
++++ b/engine/src/types.rs
+@@ -724,6 +724,7 @@ impl<'a> LhsValue<'a> {
+                 index: item.clone(),
+                 actual: self.get_type(),
+             }),
++            (_, FieldIndex::Dynamic(_)) => Ok(None),
+         }
+     }
+ 
+@@ -757,6 +758,7 @@ impl<'a> LhsValue<'a> {
+                 index: item.clone(),
+                 actual: self.get_type(),
+             }),
++            FieldIndex::Dynamic(_) => Ok(None),
+         }
+     }
+ 

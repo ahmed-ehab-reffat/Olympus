@@ -1,0 +1,882 @@
+diff --git a/mp4/progressive.go b/mp4/progressive.go
+new file mode 100644
+index 0000000..16eb96f
+--- /dev/null
++++ b/mp4/progressive.go
+@@ -0,0 +1,629 @@
++package mp4
++
++import (
++	"bytes"
++	"encoding/binary"
++	"fmt"
++	"math"
++	"sort"
++)
++
++// ProgressiveConfig steers how a fragmented file is turned into a progressive file.
++type ProgressiveConfig struct {
++	// ChunkDurationMS is the maximal media duration of a chunk in milliseconds.
++	// Zero results in one chunk per source fragment.
++	ChunkDurationMS uint32
++	// LargeOffsets results in a co64 box instead of stco and a 64-bit mdat header.
++	LargeOffsets bool
++}
++
++// progressiveChunk is a run of consecutive samples of one track stored contiguously in mdat.
++type progressiveChunk struct {
++	trackID      uint32
++	firstIdx     int
++	nrSamples    uint32
++	sampleDescID uint32
++	startTime    uint64
++	size         uint64
++	auxSize      uint64
++	offset       uint64
++	auxOffset    uint64
++}
++
++// progressiveTrack gathers everything needed to write one track of a progressive file.
++type progressiveTrack struct {
++	trackID       uint32
++	trak          *TrakBox
++	timescale     uint32
++	samples       []FullSample
++	auxInfo       [][]byte
++	sampleDescIDs []uint32
++	fragEnds      []int
++	chunks        []*progressiveChunk
++	stco          *StcoBox
++	co64          *Co64Box
++	saio          *SaioBox
++	mediaDur      uint64
++	firstDTime    uint64
++}
++
++// hasAuxInfo tells whether the track carries sample auxiliary information for encryption.
++func (tr *progressiveTrack) hasAuxInfo() bool {
++	return len(tr.auxInfo) > 0
++}
++
++// ToProgressive builds a new progressive (non-fragmented) file from a fragmented file.
++// The returned file has ftyp, moov and a single mdat box as children.
++func (f *File) ToProgressive(cfg ProgressiveConfig) (*File, error) {
++	if !f.isFragmented {
++		return nil, fmt.Errorf("file is not fragmented")
++	}
++	if f.Init == nil || f.Init.Moov == nil || f.Init.Ftyp == nil {
++		return nil, fmt.Errorf("no init segment with ftyp and moov")
++	}
++	moov, err := cloneMoovWithoutMvex(f.Init.Moov)
++	if err != nil {
++		return nil, err
++	}
++	if moov.Mvhd == nil || moov.Mvhd.Timescale == 0 {
++		return nil, fmt.Errorf("movie timescale is zero")
++	}
++	movieTimescale := moov.Mvhd.Timescale
++	if err := checkFragmentTracks(f, moov); err != nil {
++		return nil, err
++	}
++	tracks, err := collectProgressiveTracks(f, moov)
++	if err != nil {
++		return nil, err
++	}
++	for _, tr := range tracks {
++		tr.chunks = chunkTrackSamples(tr, cfg)
++		if err := fillTrackTables(tr, cfg); err != nil {
++			return nil, err
++		}
++		setTrackDuration(tr, movieTimescale)
++		setTrackEditList(tr, movieTimescale)
++	}
++	setMovieDuration(moov, tracks, movieTimescale)
++	ftyp, err := cloneFtyp(f.Init.Ftyp)
++	if err != nil {
++		return nil, err
++	}
++	mdatHdrSize := uint64(boxHeaderSize)
++	if cfg.LargeOffsets {
++		mdatHdrSize += 8
++	}
++	dataStart := ftyp.Size() + moov.Size() + mdatHdrSize
++	order := orderProgressiveChunks(tracks, movieTimescale)
++	data := layoutProgressiveChunks(order, tracks, dataStart)
++	if err := writeChunkOffsets(tracks); err != nil {
++		return nil, err
++	}
++	mdat := &MdatBox{LargeSize: cfg.LargeOffsets}
++	mdat.SetData(data)
++	out := NewFile()
++	out.Ftyp = ftyp
++	out.Moov = moov
++	out.Mdat = mdat
++	out.Children = []Box{ftyp, moov, mdat}
++	return out, nil
++}
++
++// cloneMoovWithoutMvex makes a deep copy of moov where the mvex box is dropped.
++func cloneMoovWithoutMvex(moov *MoovBox) (*MoovBox, error) {
++	box, err := cloneBox(moov)
++	if err != nil {
++		return nil, err
++	}
++	newMoov, ok := box.(*MoovBox)
++	if !ok {
++		return nil, fmt.Errorf("cloned box is not a moov box")
++	}
++	children := make([]Box, 0, len(newMoov.Children))
++	for _, ch := range newMoov.Children {
++		if ch.Type() == "mvex" {
++			continue
++		}
++		children = append(children, ch)
++	}
++	newMoov.Children = children
++	newMoov.Mvex = nil
++	return newMoov, nil
++}
++
++// cloneFtyp makes a deep copy of an ftyp box.
++func cloneFtyp(ftyp *FtypBox) (*FtypBox, error) {
++	box, err := cloneBox(ftyp)
++	if err != nil {
++		return nil, err
++	}
++	newFtyp, ok := box.(*FtypBox)
++	if !ok {
++		return nil, fmt.Errorf("cloned box is not an ftyp box")
++	}
++	return newFtyp, nil
++}
++
++// cloneBox copies a box by encoding and decoding it.
++func cloneBox(b Box) (Box, error) {
++	var buf bytes.Buffer
++	if err := b.Encode(&buf); err != nil {
++		return nil, fmt.Errorf("could not encode %s box: %w", b.Type(), err)
++	}
++	return DecodeBox(0, &buf)
++}
++
++// collectProgressiveTracks gathers the samples of every track in moov order.
++func collectProgressiveTracks(f *File, moov *MoovBox) ([]*progressiveTrack, error) {
++	tracks := make([]*progressiveTrack, 0, len(moov.Traks))
++	for _, trak := range moov.Traks {
++		if trak.Tkhd == nil || trak.Mdia == nil || trak.Mdia.Mdhd == nil {
++			return nil, fmt.Errorf("track is missing tkhd or mdhd box")
++		}
++		trackID := trak.Tkhd.TrackID
++		if f.Init.Moov.Mvex == nil {
++			return nil, fmt.Errorf("no mvex box in the init segment")
++		}
++		trex, ok := f.Init.Moov.Mvex.GetTrex(trackID)
++		if !ok {
++			return nil, fmt.Errorf("no trex for trackID %d", trackID)
++		}
++		tr := &progressiveTrack{
++			trackID:   trackID,
++			trak:      trak,
++			timescale: trak.Mdia.Mdhd.Timescale,
++		}
++		if tr.timescale == 0 {
++			return nil, fmt.Errorf("media timescale is zero for trackID %d", trackID)
++		}
++		if err := gatherTrackSamples(f, tr, trex); err != nil {
++			return nil, err
++		}
++		tracks = append(tracks, tr)
++	}
++	return tracks, nil
++}
++
++// gatherTrackSamples appends the samples of all fragments of one track and records fragment ends.
++func gatherTrackSamples(f *File, tr *progressiveTrack, trex *TrexBox) error {
++	for _, seg := range f.Segments {
++		for _, frag := range seg.Fragments {
++			if frag.Moof == nil || frag.Mdat == nil {
++				return fmt.Errorf("trackID %d: fragment without moof or mdat box", tr.trackID)
++			}
++			saved := snapshotTrunSamples(frag, tr.trackID)
++			samples, err := readFragmentSamples(frag, tr.trackID, trex)
++			restoreTrunSamples(saved)
++			if err != nil {
++				return fmt.Errorf("trackID %d: %w", tr.trackID, err)
++			}
++			if len(samples) == 0 {
++				continue
++			}
++			if len(tr.samples) == 0 {
++				tr.firstDTime = samples[0].DecodeTime
++			}
++			descID, err := fragmentSampleDescID(frag, tr.trackID, trex, tr.trak)
++			if err != nil {
++				return fmt.Errorf("trackID %d: %w", tr.trackID, err)
++			}
++			tr.samples = append(tr.samples, samples...)
++			for range samples {
++				tr.sampleDescIDs = append(tr.sampleDescIDs, descID)
++			}
++			tr.fragEnds = append(tr.fragEnds, len(tr.samples))
++			aux, err := fragmentAuxInfo(frag, tr.trackID, len(samples), needsPerSampleIV(tr.trak, descID))
++			if err != nil {
++				return fmt.Errorf("trackID %d: %w", tr.trackID, err)
++			}
++			if aux != nil {
++				tr.auxInfo = append(tr.auxInfo, aux...)
++			}
++		}
++	}
++	if tr.hasAuxInfo() && len(tr.auxInfo) != len(tr.samples) {
++		return fmt.Errorf("trackID %d has auxiliary information for %d of %d samples",
++			tr.trackID, len(tr.auxInfo), len(tr.samples))
++	}
++	for i := range tr.samples {
++		tr.mediaDur += uint64(tr.samples[i].Dur)
++	}
++	return nil
++}
++
++// fragmentSampleDescID resolves which sample description the samples of one track in a fragment use.
++func fragmentSampleDescID(frag *Fragment, trackID uint32, trex *TrexBox, trak *TrakBox) (uint32, error) {
++	descID := trex.DefaultSampleDescriptionIndex
++	for _, traf := range frag.Moof.Trafs {
++		if traf.Tfhd == nil || traf.Tfhd.TrackID != trackID {
++			continue
++		}
++		if traf.Tfhd.HasSampleDescriptionIndex() {
++			descID = traf.Tfhd.SampleDescriptionIndex
++		}
++		break
++	}
++	if descID == 0 {
++		descID = 1
++	}
++	stsd := trak.Mdia.Minf.Stbl.Stsd
++	if int(descID) > len(stsd.Children) {
++		return 0, fmt.Errorf("sample description %d is not among the %d in stsd", descID, len(stsd.Children))
++	}
++	return descID, nil
++}
++
++// checkFragmentTracks reports an error if a fragment carries a track the init segment does not describe.
++func checkFragmentTracks(f *File, moov *MoovBox) error {
++	known := make(map[uint32]bool, len(moov.Traks))
++	for _, trak := range moov.Traks {
++		if trak.Tkhd != nil {
++			known[trak.Tkhd.TrackID] = true
++		}
++	}
++	for _, seg := range f.Segments {
++		for _, frag := range seg.Fragments {
++			if frag.Moof == nil {
++				return fmt.Errorf("fragment without moof box")
++			}
++			for _, traf := range frag.Moof.Trafs {
++				if traf.Tfhd == nil {
++					return fmt.Errorf("track fragment without tfhd box")
++				}
++				if !known[traf.Tfhd.TrackID] {
++					return fmt.Errorf("no track in the init segment for trackID %d", traf.Tfhd.TrackID)
++				}
++			}
++		}
++	}
++	return nil
++}
++
++// readFragmentSamples reads the samples of one track after checking that they fit the mdat box.
++func readFragmentSamples(frag *Fragment, trackID uint32, trex *TrexBox) ([]FullSample, error) {
++	if err := checkFragmentData(frag, trackID, trex); err != nil {
++		return nil, err
++	}
++	return frag.GetFullSamples(trex)
++}
++
++// snapshotTrunSamples copies the sample values of one track, which reading fills in from the defaults.
++func snapshotTrunSamples(frag *Fragment, trackID uint32) map[*TrunBox][]Sample {
++	saved := make(map[*TrunBox][]Sample)
++	for _, traf := range frag.Moof.Trafs {
++		if traf.Tfhd == nil || traf.Tfhd.TrackID != trackID {
++			continue
++		}
++		for _, trun := range traf.Truns {
++			samples := make([]Sample, len(trun.Samples))
++			copy(samples, trun.Samples)
++			saved[trun] = samples
++		}
++	}
++	return saved
++}
++
++// restoreTrunSamples puts the saved sample values back so that the input file is left untouched.
++func restoreTrunSamples(saved map[*TrunBox][]Sample) {
++	for trun, samples := range saved {
++		copy(trun.Samples, samples)
++	}
++}
++
++// checkFragmentData reports an error if the data of one track does not lie inside the fragment's mdat box.
++// Every trun is checked at the position it actually addresses, not only by its total sample size.
++func checkFragmentData(frag *Fragment, trackID uint32, trex *TrexBox) error {
++	available := uint64(len(frag.Mdat.Data))
++	payloadStart := frag.Mdat.PayloadAbsoluteOffset()
++	for _, traf := range frag.Moof.Trafs {
++		if traf.Tfhd == nil || traf.Tfhd.TrackID != trackID {
++			continue
++		}
++		for _, trun := range traf.Truns {
++			trun.AddSampleDefaultValues(traf.Tfhd, trex)
++			start, err := trunDataStart(frag, traf.Tfhd, trun, payloadStart)
++			if err != nil {
++				return err
++			}
++			end := start + trun.SizeOfData()
++			if end > available {
++				return fmt.Errorf("samples reach byte %d but the fragment holds %d", end, available)
++			}
++		}
++	}
++	return nil
++}
++
++// trunDataStart resolves where the samples of a trun begin inside the mdat payload.
++func trunDataStart(frag *Fragment, tfhd *TfhdBox, trun *TrunBox, payloadStart uint64) (uint64, error) {
++	baseOffset := frag.Moof.StartPos
++	if tfhd.HasBaseDataOffset() {
++		baseOffset = tfhd.BaseDataOffset
++	}
++	if trun.HasDataOffset() {
++		moved := int64(baseOffset) + int64(trun.DataOffset)
++		if moved < 0 {
++			return 0, fmt.Errorf("trun data offset %d points before the file", trun.DataOffset)
++		}
++		baseOffset = uint64(moved)
++	}
++	if baseOffset == 0 {
++		return 0, nil
++	}
++	if baseOffset < payloadStart {
++		return 0, fmt.Errorf("trun data starts at %d, before the mdat payload at %d", baseOffset, payloadStart)
++	}
++	return baseOffset - payloadStart, nil
++}
++
++// needsPerSampleIV tells whether the samples of a sample description carry their own initialization vectors.
++// A protected track with a constant initialization vector has none.
++func needsPerSampleIV(trak *TrakBox, descID uint32) bool {
++	stsd := trak.Mdia.Minf.Stbl.Stsd
++	if int(descID) > len(stsd.Children) {
++		return false
++	}
++	var sinf *SinfBox
++	switch entry := stsd.Children[descID-1].(type) {
++	case *VisualSampleEntryBox:
++		sinf = entry.Sinf
++	case *AudioSampleEntryBox:
++		sinf = entry.Sinf
++	}
++	if sinf == nil || sinf.Schi == nil || sinf.Schi.Tenc == nil {
++		return false
++	}
++	tenc := sinf.Schi.Tenc
++	return tenc.DefaultIsProtected == 1 && tenc.DefaultPerSampleIVSize > 0
++}
++
++// fragmentAuxInfo returns the serialized sample auxiliary information of one track in one fragment.
++func fragmentAuxInfo(frag *Fragment, trackID uint32, nrSamples int, needIV bool) ([][]byte, error) {
++	var senc *SencBox
++	for _, traf := range frag.Moof.Trafs {
++		if traf.Tfhd != nil && traf.Tfhd.TrackID == trackID {
++			senc = traf.Senc
++			break
++		}
++	}
++	if senc == nil {
++		if needIV {
++			return nil, fmt.Errorf("no senc box for samples with their own initialization vectors")
++		}
++		return nil, nil
++	}
++	if senc.ReadButNotParsed() {
++		return nil, fmt.Errorf("senc box is not parsed")
++	}
++	if int(senc.SampleCount) != nrSamples {
++		return nil, fmt.Errorf("senc holds %d samples but the fragment has %d", senc.SampleCount, nrSamples)
++	}
++	aux := make([][]byte, 0, nrSamples)
++	withSubSamples := senc.Flags&0x2 != 0
++	for i := 0; i < nrSamples; i++ {
++		var info []byte
++		if i < len(senc.IVs) {
++			info = append(info, senc.IVs[i]...)
++		}
++		if withSubSamples {
++			var subSamples []SubSamplePattern
++			if i < len(senc.SubSamples) {
++				subSamples = senc.SubSamples[i]
++			}
++			info = binary.BigEndian.AppendUint16(info, uint16(len(subSamples)))
++			for _, ss := range subSamples {
++				info = binary.BigEndian.AppendUint16(info, ss.BytesOfClearData)
++				info = binary.BigEndian.AppendUint32(info, ss.BytesOfProtectedData)
++			}
++		}
++		aux = append(aux, info)
++	}
++	return aux, nil
++}
++
++// chunkTrackSamples splits the samples of a track into chunks that never span a source fragment.
++func chunkTrackSamples(tr *progressiveTrack, cfg ProgressiveConfig) []*progressiveChunk {
++	var chunks []*progressiveChunk
++	maxDur := rescaleTime(uint64(cfg.ChunkDurationMS), 1000, tr.timescale)
++	start := 0
++	for _, end := range tr.fragEnds {
++		idx := start
++		for idx < end {
++			chunk := &progressiveChunk{
++				trackID:      tr.trackID,
++				firstIdx:     idx,
++				startTime:    tr.samples[idx].DecodeTime,
++				sampleDescID: tr.sampleDescIDs[idx],
++			}
++			var accDur uint64
++			for idx < end {
++				dur := uint64(tr.samples[idx].Dur)
++				if maxDur > 0 && chunk.nrSamples > 0 && accDur+dur > maxDur {
++					break
++				}
++				accDur += dur
++				chunk.size += uint64(tr.samples[idx].Size)
++				if tr.hasAuxInfo() {
++					chunk.auxSize += uint64(len(tr.auxInfo[idx]))
++				}
++				chunk.nrSamples++
++				idx++
++			}
++			chunks = append(chunks, chunk)
++		}
++		start = end
++	}
++	return chunks
++}
++
++// orderProgressiveChunks returns all chunks in the order they are stored in mdat.
++func orderProgressiveChunks(tracks []*progressiveTrack, movieTimescale uint32) []*progressiveChunk {
++	var all []*progressiveChunk
++	movieTimes := make(map[*progressiveChunk]uint64)
++	for _, tr := range tracks {
++		for _, chunk := range tr.chunks {
++			movieTimes[chunk] = rescaleTime(chunk.startTime, tr.timescale, movieTimescale)
++			all = append(all, chunk)
++		}
++	}
++	sort.SliceStable(all, func(i, j int) bool {
++		if movieTimes[all[i]] != movieTimes[all[j]] {
++			return movieTimes[all[i]] < movieTimes[all[j]]
++		}
++		return all[i].trackID < all[j].trackID
++	})
++	return all
++}
++
++// layoutProgressiveChunks concatenates the sample data of the ordered chunks and sets their offsets.
++func layoutProgressiveChunks(order []*progressiveChunk, tracks []*progressiveTrack, dataStart uint64) []byte {
++	byTrackID := make(map[uint32]*progressiveTrack, len(tracks))
++	var totalSize uint64
++	for _, tr := range tracks {
++		byTrackID[tr.trackID] = tr
++		for _, chunk := range tr.chunks {
++			totalSize += chunk.size + chunk.auxSize
++		}
++	}
++	data := make([]byte, 0, totalSize)
++	offset := dataStart
++	for _, chunk := range order {
++		tr := byTrackID[chunk.trackID]
++		lastIdx := chunk.firstIdx + int(chunk.nrSamples)
++		chunk.auxOffset = offset
++		if tr.hasAuxInfo() {
++			for i := chunk.firstIdx; i < lastIdx; i++ {
++				data = append(data, tr.auxInfo[i]...)
++			}
++			offset += chunk.auxSize
++		}
++		chunk.offset = offset
++		for i := chunk.firstIdx; i < lastIdx; i++ {
++			data = append(data, tr.samples[i].Data...)
++		}
++		offset += chunk.size
++	}
++	return data
++}
++
++// writeChunkOffsets copies the chunk offsets into the stco, co64 and saio boxes of every track.
++func writeChunkOffsets(tracks []*progressiveTrack) error {
++	for _, tr := range tracks {
++		for i, chunk := range tr.chunks {
++			switch {
++			case tr.co64 != nil:
++				tr.co64.ChunkOffset[i] = chunk.offset
++			case tr.stco != nil:
++				if chunk.offset > math.MaxUint32 {
++					return fmt.Errorf("chunk offset %d needs 64-bit offsets", chunk.offset)
++				}
++				tr.stco.ChunkOffset[i] = uint32(chunk.offset)
++			}
++			if tr.saio != nil {
++				tr.saio.Offset[i] = int64(chunk.auxOffset)
++			}
++		}
++	}
++	return nil
++}
++
++// setTrackDuration sets the media and track durations from the accumulated sample durations.
++func setTrackDuration(tr *progressiveTrack, movieTimescale uint32) {
++	mdhd := tr.trak.Mdia.Mdhd
++	mdhd.Duration = tr.mediaDur
++	if mdhd.Duration > math.MaxUint32 {
++		mdhd.Version = 1
++	}
++	total := tr.mediaDur
++	if tr.firstDTime > 0 {
++		total += tr.firstDTime
++	}
++	tr.trak.Tkhd.Duration = rescaleTime(total, tr.timescale, movieTimescale)
++	if tr.trak.Tkhd.Duration > math.MaxUint32 {
++		tr.trak.Tkhd.Version = 1
++	}
++}
++
++// setMovieDuration sets the movie duration to the longest track duration.
++func setMovieDuration(moov *MoovBox, tracks []*progressiveTrack, movieTimescale uint32) {
++	var longest uint64
++	for _, tr := range tracks {
++		if tr.trak.Tkhd.Duration > longest {
++			longest = tr.trak.Tkhd.Duration
++		}
++	}
++	moov.Mvhd.Duration = longest
++	if longest > math.MaxUint32 {
++		moov.Mvhd.Version = 1
++	}
++}
++
++// setTrackEditList adds an edit list with a leading empty edit for a track that starts late.
++func setTrackEditList(tr *progressiveTrack, movieTimescale uint32) {
++	if tr.firstDTime == 0 {
++		removeTrakEdts(tr.trak)
++		return
++	}
++	elst := &ElstBox{}
++	elst.Entries = append(elst.Entries, ElstEntry{
++		SegmentDuration:  rescaleTime(tr.firstDTime, tr.timescale, movieTimescale),
++		MediaTime:        -1,
++		MediaRateInteger: 1,
++	})
++	elst.Entries = append(elst.Entries, ElstEntry{
++		SegmentDuration:  rescaleTime(tr.mediaDur, tr.timescale, movieTimescale),
++		MediaTime:        0,
++		MediaRateInteger: 1,
++	})
++	for _, entry := range elst.Entries {
++		if entry.SegmentDuration > math.MaxUint32 {
++			elst.Version = 1
++		}
++	}
++	edts := &EdtsBox{}
++	edts.AddChild(elst)
++	edts.Elst = append(edts.Elst, elst)
++	setTrakEdts(tr.trak, edts)
++}
++
++// removeTrakEdts drops an edit list the init segment carried, since the track starts at time zero.
++func removeTrakEdts(trak *TrakBox) {
++	if trak.Edts == nil {
++		return
++	}
++	children := make([]Box, 0, len(trak.Children))
++	for _, ch := range trak.Children {
++		if ch.Type() == "edts" {
++			continue
++		}
++		children = append(children, ch)
++	}
++	trak.Children = children
++	trak.Edts = nil
++}
++
++// setTrakEdts inserts an edts box directly after the tkhd box, replacing any present one.
++func setTrakEdts(trak *TrakBox, edts *EdtsBox) {
++	children := make([]Box, 0, len(trak.Children)+1)
++	for _, ch := range trak.Children {
++		if ch.Type() == "edts" {
++			continue
++		}
++		children = append(children, ch)
++		if ch.Type() == "tkhd" {
++			children = append(children, edts)
++		}
++	}
++	trak.Children = children
++	trak.Edts = edts
++}
++
++// rescaleTime converts a time from one timescale to another, rounding down.
++// The whole part is converted before the remainder so that large times do not overflow.
++func rescaleTime(t uint64, from, to uint32) uint64 {
++	if from == to || from == 0 {
++		return t
++	}
++	whole, rest := t/uint64(from), t%uint64(from)
++	return whole*uint64(to) + rest*uint64(to)/uint64(from)
++}
+diff --git a/mp4/progressive_tables.go b/mp4/progressive_tables.go
+new file mode 100644
+index 0000000..e2010c9
+--- /dev/null
++++ b/mp4/progressive_tables.go
+@@ -0,0 +1,228 @@
++package mp4
++
++import "fmt"
++
++// fillTrackTables replaces the sample tables of a track with tables describing all its samples.
++func fillTrackTables(tr *progressiveTrack, cfg ProgressiveConfig) error {
++	minf := tr.trak.Mdia.Minf
++	if minf == nil || minf.Stbl == nil || minf.Stbl.Stsd == nil {
++		return fmt.Errorf("trackID %d has no sample description", tr.trackID)
++	}
++	stbl := NewStblBox()
++	stbl.AddChild(minf.Stbl.Stsd)
++	stbl.AddChild(buildStts(tr.samples))
++	if ctts := buildCtts(tr.samples); ctts != nil {
++		stbl.AddChild(ctts)
++	}
++	stsc, err := buildStsc(tr.chunks)
++	if err != nil {
++		return fmt.Errorf("trackID %d: %w", tr.trackID, err)
++	}
++	stbl.AddChild(stsc)
++	stbl.AddChild(buildStsz(tr.samples))
++	if stss := buildStss(tr.samples); stss != nil {
++		stbl.AddChild(stss)
++	}
++	if cfg.LargeOffsets {
++		tr.co64 = &Co64Box{ChunkOffset: make([]uint64, len(tr.chunks))}
++		stbl.AddChild(tr.co64)
++	} else {
++		tr.stco = &StcoBox{ChunkOffset: make([]uint32, len(tr.chunks))}
++		stbl.AddChild(tr.stco)
++	}
++	if sdtp := buildSdtp(tr.samples); sdtp != nil {
++		stbl.AddChild(sdtp)
++	}
++	if tr.hasAuxInfo() {
++		saiz, err := buildSaiz(tr.auxInfo)
++		if err != nil {
++			return fmt.Errorf("trackID %d: %w", tr.trackID, err)
++		}
++		stbl.AddChild(saiz)
++		tr.saio = buildSaio(len(tr.chunks), cfg.LargeOffsets)
++		stbl.AddChild(tr.saio)
++	}
++	replaceStbl(minf, stbl)
++	return nil
++}
++
++// buildSaiz creates a sample auxiliary information sizes box for the collected per-sample information.
++func buildSaiz(auxInfo [][]byte) (*SaizBox, error) {
++	saiz := &SaizBox{
++		Version:     0,
++		Flags:       1,
++		AuxInfoType: "cenc",
++		SampleCount: uint32(len(auxInfo)),
++	}
++	uniform := true
++	for i := range auxInfo {
++		if len(auxInfo[i]) > 255 {
++			return nil, fmt.Errorf("auxiliary information of sample %d is %d bytes", i+1, len(auxInfo[i]))
++		}
++		if len(auxInfo[i]) != len(auxInfo[0]) {
++			uniform = false
++		}
++	}
++	if uniform {
++		saiz.DefaultSampleInfoSize = byte(len(auxInfo[0]))
++		return saiz, nil
++	}
++	saiz.SampleInfo = make([]byte, 0, len(auxInfo))
++	for i := range auxInfo {
++		saiz.SampleInfo = append(saiz.SampleInfo, byte(len(auxInfo[i])))
++	}
++	return saiz, nil
++}
++
++// buildSaio creates a sample auxiliary information offsets box with one offset per chunk.
++func buildSaio(nrChunks int, largeOffsets bool) *SaioBox {
++	saio := &SaioBox{
++		Flags:       1,
++		AuxInfoType: "cenc",
++		Offset:      make([]int64, nrChunks),
++	}
++	if largeOffsets {
++		saio.Version = 1
++	}
++	return saio
++}
++
++// replaceStbl swaps the sample table box of a minf box, keeping the position of the old box.
++func replaceStbl(minf *MinfBox, stbl *StblBox) {
++	children := make([]Box, 0, len(minf.Children))
++	for _, ch := range minf.Children {
++		if ch.Type() == "stbl" {
++			children = append(children, stbl)
++			continue
++		}
++		children = append(children, ch)
++	}
++	minf.Children = children
++	minf.Stbl = stbl
++}
++
++// buildStts creates a time-to-sample box with the minimal number of entries.
++func buildStts(samples []FullSample) *SttsBox {
++	stts := &SttsBox{}
++	for i := range samples {
++		dur := samples[i].Dur
++		last := len(stts.SampleCount) - 1
++		if last >= 0 && stts.SampleTimeDelta[last] == dur {
++			stts.SampleCount[last]++
++			continue
++		}
++		stts.SampleCount = append(stts.SampleCount, 1)
++		stts.SampleTimeDelta = append(stts.SampleTimeDelta, dur)
++	}
++	return stts
++}
++
++// buildStsz creates a sample size box that uses the uniform size when all samples are equally big.
++func buildStsz(samples []FullSample) *StszBox {
++	stsz := &StszBox{SampleNumber: uint32(len(samples))}
++	if len(samples) == 0 {
++		return stsz
++	}
++	uniform := true
++	first := samples[0].Size
++	for i := range samples {
++		if samples[i].Size != first {
++			uniform = false
++			break
++		}
++	}
++	if uniform {
++		stsz.SampleUniformSize = first
++		return stsz
++	}
++	stsz.SampleSize = make([]uint32, 0, len(samples))
++	for i := range samples {
++		stsz.SampleSize = append(stsz.SampleSize, samples[i].Size)
++	}
++	return stsz
++}
++
++// buildStsc creates a sample-to-chunk box where consecutive chunks with equal sample counts share an entry.
++func buildStsc(chunks []*progressiveChunk) (*StscBox, error) {
++	stsc := &StscBox{}
++	var prevNrSamples, prevDescID uint32
++	for i, chunk := range chunks {
++		if i > 0 && chunk.nrSamples == prevNrSamples && chunk.sampleDescID == prevDescID {
++			continue
++		}
++		err := stsc.AddEntry(uint32(i+1), chunk.nrSamples, chunk.sampleDescID)
++		if err != nil {
++			return nil, err
++		}
++		prevNrSamples, prevDescID = chunk.nrSamples, chunk.sampleDescID
++	}
++	return stsc, nil
++}
++
++// buildStss creates a sync sample box, or nil when every sample is a sync sample.
++func buildStss(samples []FullSample) *StssBox {
++	stss := &StssBox{}
++	for i := range samples {
++		if samples[i].IsSync() {
++			stss.SampleNumber = append(stss.SampleNumber, uint32(i+1))
++		}
++	}
++	if len(stss.SampleNumber) == len(samples) {
++		return nil
++	}
++	return stss
++}
++
++// buildCtts creates a composition time offset box, or nil when no sample has an offset.
++func buildCtts(samples []FullSample) *CttsBox {
++	var counts []uint32
++	var offsets []int32
++	negative := false
++	nonZero := false
++	for i := range samples {
++		offset := samples[i].CompositionTimeOffset
++		if offset != 0 {
++			nonZero = true
++		}
++		if offset < 0 {
++			negative = true
++		}
++		last := len(offsets) - 1
++		if last >= 0 && offsets[last] == offset {
++			counts[last]++
++			continue
++		}
++		counts = append(counts, 1)
++		offsets = append(offsets, offset)
++	}
++	if !nonZero {
++		return nil
++	}
++	ctts := &CttsBox{}
++	if negative {
++		ctts.Version = 1
++	}
++	if err := ctts.AddSampleCountsAndOffset(counts, offsets); err != nil {
++		return nil
++	}
++	return ctts
++}
++
++// buildSdtp creates a sample dependency box, or nil when no sample carries dependency information.
++func buildSdtp(samples []FullSample) *SdtpBox {
++	entries := make([]SdtpEntry, 0, len(samples))
++	carriesInfo := false
++	for i := range samples {
++		flags := DecodeSampleFlags(samples[i].Flags)
++		if flags.IsLeading != 0 || flags.SampleDependsOn != 0 ||
++			flags.SampleIsDependedOn != 0 || flags.SampleHasRedundancy != 0 {
++			carriesInfo = true
++		}
++		entries = append(entries, NewSdtpEntry(flags.IsLeading, flags.SampleDependsOn,
++			flags.SampleIsDependedOn, flags.SampleHasRedundancy))
++	}
++	if !carriesInfo {
++		return nil
++	}
++	return CreateSdtpBox(entries)
++}
+diff --git a/mp4/sdtp.go b/mp4/sdtp.go
+index 940edda..56b0ba0 100644
+--- a/mp4/sdtp.go
++++ b/mp4/sdtp.go
+@@ -26,7 +26,7 @@ type SdtpEntry uint8
+ 
+ // NewSdtpEntry - make new SdtpEntry from 2-bit parameters
+ func NewSdtpEntry(isLeading, sampleDependsOn, sampleDependedOn, hasRedundancy uint8) SdtpEntry {
+-	return SdtpEntry(isLeading<<6 | sampleDependedOn<<4 | sampleDependedOn<<2 | hasRedundancy)
++	return SdtpEntry(isLeading<<6 | sampleDependsOn<<4 | sampleDependedOn<<2 | hasRedundancy)
+ }
+ 
+ // IsLeading (bits 0-1)

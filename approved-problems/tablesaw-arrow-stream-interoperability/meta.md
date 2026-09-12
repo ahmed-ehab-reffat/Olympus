@@ -1,0 +1,11 @@
+Title: Integrate Arrow streams with Tablesaw I/O
+
+Finish the Arrow module so ordinary Arrow IPC streams work through Tablesaw's normal I/O API, not only its direct file helpers. Add `ArrowReadOptions` and `ArrowWriteOptions` builders for binary files and streams, and make both available through the usual `Table.read()` and `Table.write()` option flow. Register both option classes and the `arrow` and `arrows` extensions. Keep the existing `ArrowReader(File/Path).read()` and `ArrowWriter.write(Table, File)` entry points working. A caller-provided output stream remains open after a write.
+
+`ArrowWriteOptions.batchSize(int)` sets the maximum rows in each nonempty record batch and rejects nonpositive values. Batch boundaries must not change row order, values, or missingness. The writer's default batch size is an implementation choice.
+
+Preserve the Arrow module's scalar surface: UTF-8 strings; signed 64-, 32-, and 16-bit integers; dates; local times; timezone-free local date-times; timezone-bearing instants; booleans; and 32- and 64-bit floating point. The reader consumes every record batch, retains the schema of zero-row batches, and accepts direct or dictionary-encoded UTF-8 in any schema order. Dictionary indices may use any standard signed or unsigned Arrow integer type. Null indices and null dictionary values become missing strings.
+
+Arrow validity controls Tablesaw missingness in both directions. Reject a valid empty string, signed minimum integer, or NaN instead of silently turning it into missing; infinities remain valid. Accept Arrow day and millisecond dates plus second, millisecond, microsecond, and nanosecond times and timestamps when the value is exactly representable at Tablesaw's millisecond precision. A timezone-free timestamp is a local date-time under the module's existing UTC-epoch interpretation; a timestamp with any timezone is an instant. Unsupported, lossy, out-of-day, or out-of-range input throws `IllegalArgumentException` naming the field, and a failed read does not poison that `ArrowReader` for a later retry.
+
+Write nullable fields that a standard Arrow Java consumer can read with the same logical values and validity. The concrete temporal units and instant timezone label are not part of the contract.

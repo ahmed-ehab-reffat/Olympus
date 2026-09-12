@@ -1,0 +1,4357 @@
+diff --git a/crates/turmoil/tests/capacity_e557d7.rs b/crates/turmoil/tests/capacity_e557d7.rs
+new file mode 100644
+index 0000000..aa3e36c
+--- /dev/null
++++ b/crates/turmoil/tests/capacity_e557d7.rs
+@@ -0,0 +1,4244 @@
++use std::net::{IpAddr, Ipv4Addr, SocketAddr};
++use std::rc::Rc;
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++#[cfg(feature = "regex")]
++use regex::Regex;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use turmoil::net::{TcpListener, TcpStream, UdpSocket};
++use turmoil::{Builder, Duplex, Result, Sim};
++
++const PORT: u16 = 1738;
++
++type Log = Arc<Mutex<Vec<(u64, usize)>>>;
++
++fn now_ms() -> u64 {
++    turmoil::sim_elapsed().unwrap().as_millis() as u64
++}
++
++fn sim(latency: u64) -> Sim<'static> {
++    Builder::new()
++        .min_message_latency(Duration::from_millis(latency))
++        .max_message_latency(Duration::from_millis(latency))
++        .tick_duration(Duration::from_millis(1))
++        .simulation_duration(Duration::from_secs(120))
++        .build()
++}
++
++fn log() -> Log {
++    Arc::new(Mutex::new(Vec::new()))
++}
++
++fn arrivals(log: &Log) -> Vec<u64> {
++    log.lock().unwrap().iter().map(|(at, _)| *at).collect()
++}
++
++fn sizes(log: &Log) -> Vec<usize> {
++    log.lock().unwrap().iter().map(|(_, size)| *size).collect()
++}
++
++fn udp_sink(sim: &mut Sim<'_>, name: &'static str, log: &Log) {
++    let log = log.clone();
++
++    sim.host(name, move || {
++        let log = log.clone();
++
++        async move {
++            let sock = UdpSocket::bind((IpAddr::from(Ipv4Addr::UNSPECIFIED), PORT)).await?;
++
++            loop {
++                let mut buf = vec![0; 65536];
++                let (size, _) = sock.recv_from(&mut buf).await?;
++                log.lock().unwrap().push((now_ms(), size));
++            }
++        }
++    });
++}
++
++fn tcp_sink(sim: &mut Sim<'_>, name: &'static str, log: &Log) {
++    let log = log.clone();
++
++    sim.host(name, move || {
++        let log = log.clone();
++
++        async move {
++            let listener =
++                TcpListener::bind((IpAddr::from(Ipv4Addr::UNSPECIFIED), PORT)).await?;
++            let (mut stream, _) = listener.accept().await?;
++
++            loop {
++                let mut buf = vec![0; 65536];
++                match stream.read(&mut buf).await? {
++                    0 => break,
++                    size => log.lock().unwrap().push((now_ms(), size)),
++                }
++            }
++
++            Ok(())
++        }
++    });
++}
++
++fn tcp_byte_sink(sim: &mut Sim<'_>, name: &'static str, log: &Log, bytes: &Arc<Mutex<Vec<u8>>>) {
++    let log = log.clone();
++    let bytes = bytes.clone();
++
++    sim.host(name, move || {
++        let log = log.clone();
++        let bytes = bytes.clone();
++
++        async move {
++            let listener =
++                TcpListener::bind((IpAddr::from(Ipv4Addr::UNSPECIFIED), PORT)).await?;
++            let (mut stream, _) = listener.accept().await?;
++
++            loop {
++                let mut buf = vec![0; 65536];
++                match stream.read(&mut buf).await? {
++                    0 => break,
++                    size => {
++                        log.lock().unwrap().push((now_ms(), size));
++                        bytes.lock().unwrap().extend_from_slice(&buf[..size]);
++                    }
++                }
++            }
++
++            Ok(())
++        }
++    });
++}
++
++async fn bind() -> std::result::Result<UdpSocket, std::io::Error> {
++    UdpSocket::bind((IpAddr::from(Ipv4Addr::UNSPECIFIED), PORT)).await
++}
++
++fn target(name: &str) -> SocketAddr {
++    SocketAddr::from((turmoil::lookup(name), PORT))
++}
++
++fn watch(sock: Rc<UdpSocket>, log: Log) {
++    tokio::task::spawn_local(async move {
++        loop {
++            let mut buf = vec![0; 65536];
++            let (size, _) = sock.recv_from(&mut buf).await.unwrap();
++            log.lock().unwrap().push((now_ms(), size));
++        }
++    });
++}
++
++async fn settle(millis: u64) {
++    tokio::time::sleep(Duration::from_millis(millis)).await;
++}
++
++#[test]
++fn unlimited_bandwidth_delivers_every_datagram_together() -> Result {
++    let mut sim = sim(5);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..3 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(100).await;
++        Ok(())
++    });
++
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![5, 5, 5]);
++    Ok(())
++}
++
++#[test]
++fn a_datagram_takes_its_size_over_the_bandwidth() -> Result {
++    let mut sim = sim(5);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(100).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![15]);
++    Ok(())
++}
++
++#[test]
++fn queued_datagrams_wait_their_turn() -> Result {
++    let mut sim = sim(5);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..3 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(100).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![15, 25, 35]);
++    Ok(())
++}
++
++#[test]
++fn a_bigger_datagram_holds_the_wire_longer() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 2_000], target("server")).await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![40, 50]);
++    assert_eq!(sizes(&log), vec![2_000, 500]);
++    Ok(())
++}
++
++#[test]
++fn an_empty_datagram_is_carried_at_once() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&[], target("server")).await?;
++        settle(50).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![1]);
++    Ok(())
++}
++
++#[test]
++fn a_partial_millisecond_of_transmission_rounds_up_to_the_next_tick() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 1_000], target("server")).await?;
++        settle(2_000).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 3_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![334]);
++    Ok(())
++}
++
++#[test]
++fn zero_bandwidth_is_unlimited() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..3 {
++            sock.send_to(&vec![0; 5_000], target("server")).await?;
++        }
++        settle(100).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 0);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![1, 1, 1]);
++    Ok(())
++}
++
++#[test]
++fn the_builder_sets_the_bandwidth_of_every_link() -> Result {
++    let mut sim = Builder::new()
++        .min_message_latency(Duration::from_millis(0))
++        .max_message_latency(Duration::from_millis(0))
++        .tick_duration(Duration::from_millis(1))
++        .bandwidth(50_000)
++        .build();
++
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..2 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(100).await;
++        Ok(())
++    });
++
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20]);
++    Ok(())
++}
++
++#[test]
++fn set_bandwidth_replaces_the_default_for_every_link() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(100).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10]);
++    Ok(())
++}
++
++#[test]
++fn a_link_setting_wins_over_the_default() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(100).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++    sim.set_link_bandwidth("client", "server", 25_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![20]);
++    Ok(())
++}
++
++#[test]
++fn the_two_directions_of_a_link_are_carried_separately() -> Result {
++    let mut sim = sim(0);
++    let to_server = log();
++    let to_client = log();
++
++    let sink = to_server.clone();
++    sim.host("server", move || {
++        let sink = sink.clone();
++
++        async move {
++            let sock = bind().await?;
++            loop {
++                let mut buf = vec![0; 65536];
++                let (size, origin) = sock.recv_from(&mut buf).await?;
++                sink.lock().unwrap().push((now_ms(), size));
++                sock.send_to(&vec![0; 500], origin).await?;
++            }
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 2_000], target("server")).await?;
++
++        let mut buf = vec![0; 65536];
++        let (size, _) = sock.recv_from(&mut buf).await?;
++        sink.lock().unwrap().push((now_ms(), size));
++
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&to_server), vec![40]);
++    assert_eq!(arrivals(&to_client), vec![50]);
++    Ok(())
++}
++
++#[test]
++fn a_oneway_bandwidth_leaves_the_other_direction_alone() -> Result {
++    let mut sim = sim(0);
++    let to_client = log();
++
++    sim.host("server", move || async move {
++        let sock = bind().await?;
++        loop {
++            let mut buf = vec![0; 65536];
++            let (_, origin) = sock.recv_from(&mut buf).await?;
++            sock.send_to(&vec![0; 500], origin).await?;
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&[0], target("server")).await?;
++
++        let mut buf = vec![0; 65536];
++        let (size, _) = sock.recv_from(&mut buf).await?;
++        sink.lock().unwrap().push((now_ms(), size));
++
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth_oneway("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&to_client), vec![1]);
++    Ok(())
++}
++
++#[test]
++fn a_oneway_bandwidth_applies_to_its_own_direction() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(100).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth_oneway("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10]);
++    Ok(())
++}
++
++#[test]
++fn every_link_out_of_a_host_shares_its_interface() -> Result {
++    let mut sim = sim(0);
++    let first = log();
++    let second = log();
++    udp_sink(&mut sim, "one", &first);
++    udp_sink(&mut sim, "two", &second);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("one")).await?;
++        sock.send_to(&vec![0; 500], target("two")).await?;
++        settle(100).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&first), vec![10]);
++    assert_eq!(arrivals(&second), vec![20]);
++    Ok(())
++}
++
++#[test]
++fn links_out_of_different_hosts_do_not_share_an_interface() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.host("other", move || async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(1_000).await;
++        Ok(())
++    });
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        settle(5).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("other", 50_000);
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.run()?;
++
++    assert!(arrivals(&log).contains(&15));
++    Ok(())
++}
++
++#[test]
++fn the_slower_of_the_link_and_the_interface_wins() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.set_link_bandwidth("client", "server", 25_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![20]);
++    Ok(())
++}
++
++#[test]
++fn an_unlimited_interface_leaves_the_link_in_charge() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("client", 0);
++    sim.set_link_bandwidth("client", "server", 25_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![20]);
++    Ok(())
++}
++
++#[test]
++fn an_interface_holds_up_a_second_link_with_its_own_bandwidth() -> Result {
++    let mut sim = sim(0);
++    let first = log();
++    let second = log();
++    udp_sink(&mut sim, "one", &first);
++    udp_sink(&mut sim, "two", &second);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("one")).await?;
++        sock.send_to(&vec![0; 500], target("two")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.set_link_bandwidth("client", "one", 25_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&first), vec![20]);
++    assert_eq!(arrivals(&second), vec![20]);
++    Ok(())
++}
++
++#[test]
++fn queued_bytes_counts_what_has_not_arrived() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..3 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.step()?;
++    sim.step()?;
++
++    assert_eq!(sim.queued_bytes("client", "server"), 1_500);
++    assert_eq!(sim.queued_bytes("server", "client"), 0);
++
++    sim.run()?;
++
++    assert_eq!(sim.queued_bytes("client", "server"), 0);
++    assert_eq!(arrivals(&log), vec![10, 20, 30]);
++    Ok(())
++}
++
++#[test]
++fn queued_bytes_drops_as_each_datagram_arrives() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..2 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++
++    while sim.elapsed() < Duration::from_millis(15) {
++        sim.step()?;
++    }
++
++    assert_eq!(sim.queued_bytes("client", "server"), 500);
++
++    sim.run()?;
++    Ok(())
++}
++
++#[test]
++fn a_full_queue_drops_the_datagram() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 2);
++    Ok(())
++}
++
++#[test]
++fn a_datagram_bigger_than_the_queue_never_gets_on() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 2_000], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert!(arrivals(&log).is_empty());
++    assert_eq!(sim.link_stats("client", "server").dropped, 1);
++    Ok(())
++}
++
++#[test]
++fn a_datagram_that_exactly_fills_the_queue_is_kept() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..2 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 0);
++    Ok(())
++}
++
++#[test]
++fn the_queue_takes_datagrams_again_once_it_drains() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..2 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(50).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20, 60]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 0);
++    Ok(())
++}
++
++#[test]
++fn a_zero_queue_capacity_never_drops() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 0);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20, 30, 40]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 0);
++    Ok(())
++}
++
++#[test]
++fn the_builder_sets_the_queue_capacity_of_every_link() -> Result {
++    let mut sim = Builder::new()
++        .min_message_latency(Duration::from_millis(0))
++        .max_message_latency(Duration::from_millis(0))
++        .tick_duration(Duration::from_millis(1))
++        .bandwidth(50_000)
++        .queue_capacity(1_000)
++        .build();
++
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..3 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 1);
++    Ok(())
++}
++
++#[test]
++fn set_queue_capacity_replaces_the_default_for_every_link() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..3 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++    sim.set_queue_capacity(1_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 1);
++    Ok(())
++}
++
++#[test]
++fn drops_are_counted_for_the_direction_they_happened_on() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert_eq!(sim.link_stats("client", "server").dropped, 2);
++    assert_eq!(sim.link_stats("server", "client").dropped, 0);
++    Ok(())
++}
++
++#[test]
++fn nothing_is_dropped_when_the_wire_keeps_up() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 500);
++    sim.run()?;
++
++    assert_eq!(sim.link_stats("client", "server").dropped, 0);
++    assert_eq!(arrivals(&log), vec![10]);
++    Ok(())
++}
++
++#[test]
++fn a_connection_is_never_dropped_by_a_full_queue() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    tcp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let mut stream = TcpStream::connect(target("server")).await?;
++        for _ in 0..4 {
++            stream.write_all(&vec![0; 500]).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert_eq!(sizes(&log).iter().sum::<usize>(), 2_000);
++    assert_eq!(sim.link_stats("client", "server").dropped, 0);
++    Ok(())
++}
++
++#[test]
++fn a_connections_bytes_are_carried_at_the_links_bandwidth() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    tcp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let mut stream = TcpStream::connect(target("server")).await?;
++        stream.write_all(&vec![0; 500]).await?;
++        stream.write_all(&vec![0; 500]).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![11, 21]);
++    Ok(())
++}
++
++#[test]
++fn opening_a_connection_costs_no_wire_time() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    tcp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let mut stream = TcpStream::connect(target("server")).await?;
++        stream.write_all(&vec![0; 500]).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![11]);
++    Ok(())
++}
++
++#[test]
++fn partitioning_a_link_frees_the_wire() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..10 {
++            sock.send_to(&vec![0; 5_000], target("server")).await?;
++        }
++        settle(5).await;
++        turmoil::partition("client", "server");
++        turmoil::repair("client", "server");
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(1_000).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![15]);
++    Ok(())
++}
++
++#[test]
++fn partitioning_one_way_frees_only_that_wire() -> Result {
++    let mut sim = sim(0);
++    let to_client = log();
++
++    sim.host("server", move || async move {
++        let sock = bind().await?;
++        loop {
++            let mut buf = vec![0; 65536];
++            let (_, origin) = sock.recv_from(&mut buf).await?;
++            sock.send_to(&vec![0; 500], origin).await?;
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(5).await;
++        turmoil::partition_oneway("client", "server");
++
++        let mut buf = vec![0; 65536];
++        let (size, _) = sock.recv_from(&mut buf).await?;
++        sink.lock().unwrap().push((now_ms(), size));
++
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 0);
++    sim.set_link_bandwidth_oneway("server", "client", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&to_client), vec![11]);
++    Ok(())
++}
++
++
++#[test]
++fn released_datagrams_go_on_the_wire_one_after_another() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        turmoil::hold("client", "server");
++        for _ in 0..3 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(20).await;
++        turmoil::release("client", "server");
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![30, 40, 50]);
++    Ok(())
++}
++
++#[test]
++fn datagrams_arrive_in_the_order_they_were_sent() -> Result {
++    let mut sim = Builder::new()
++        .min_message_latency(Duration::from_millis(0))
++        .max_message_latency(Duration::from_millis(50))
++        .tick_duration(Duration::from_millis(1))
++        .rng_seed(20260804)
++        .build();
++
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for size in [900_usize, 800, 700, 600, 500, 400, 300, 200] {
++            sock.send_to(&vec![0; size], target("server")).await?;
++        }
++        settle(2_000).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(sizes(&log), vec![900, 800, 700, 600, 500, 400, 300, 200]);
++    let arrivals = arrivals(&log);
++    assert!(arrivals.windows(2).all(|pair| pair[0] <= pair[1]));
++    Ok(())
++}
++
++#[test]
++fn a_slow_wire_holds_arrivals_back_past_the_latency() -> Result {
++    let mut sim = sim(5);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..2 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![15, 25]);
++    Ok(())
++}
++
++#[test]
++fn a_wire_that_has_drained_starts_the_next_datagram_at_once() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(50).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 60]);
++    Ok(())
++}
++
++#[test]
++fn a_bandwidth_set_later_leaves_what_is_already_on_the_wire_alone() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.step()?;
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![1]);
++    Ok(())
++}
++
++#[test]
++fn queued_bytes_is_zero_before_anything_is_sent() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        settle(5).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++
++    assert_eq!(sim.queued_bytes("client", "server"), 0);
++    assert_eq!(sim.link_stats("client", "server").dropped, 0);
++
++    sim.run()
++}
++
++#[test]
++fn a_connections_bytes_are_counted_as_queued() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    tcp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let mut stream = TcpStream::connect(target("server")).await?;
++        stream.write_all(&vec![0; 500]).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 5_000);
++
++    while sim.elapsed() < Duration::from_millis(10) {
++        sim.step()?;
++    }
++
++    assert_eq!(sim.queued_bytes("client", "server"), 500);
++
++    sim.run()?;
++
++    assert_eq!(sim.queued_bytes("client", "server"), 0);
++    Ok(())
++}
++
++#[test]
++fn a_datagram_starts_while_the_one_before_it_is_still_flying() -> Result {
++    let mut sim = sim(100);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..2 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![110, 120]);
++    Ok(())
++}
++
++#[test]
++fn a_slow_bandwidth_takes_a_whole_second() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 8], target("server")).await?;
++        settle(2_000).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 8);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![1_000]);
++    Ok(())
++}
++
++#[test]
++fn the_receiving_side_is_never_charged_for_what_it_takes_in() -> Result {
++    let mut sim = sim(0);
++    let to_client = log();
++
++    sim.host("server", move || async move {
++        let sock = bind().await?;
++        loop {
++            let mut buf = vec![0; 65536];
++            let (_, origin) = sock.recv_from(&mut buf).await?;
++            sock.send_to(&vec![0; 500], origin).await?;
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++
++        let mut buf = vec![0; 65536];
++        let (size, _) = sock.recv_from(&mut buf).await?;
++        sink.lock().unwrap().push((now_ms(), size));
++
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&to_client), vec![100]);
++    Ok(())
++}
++
++#[test]
++fn a_full_queue_keeps_dropping_until_the_wire_drains() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..6 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(15).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20, 30]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 4);
++    Ok(())
++}
++
++#[test]
++fn each_direction_keeps_its_own_queue() -> Result {
++    let mut sim = sim(0);
++    let to_client = log();
++
++    sim.host("server", move || async move {
++        let sock = bind().await?;
++        loop {
++            let mut buf = vec![0; 65536];
++            let (_, origin) = sock.recv_from(&mut buf).await?;
++            sock.send_to(&vec![0; 500], origin).await?;
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++
++        for _ in 0..2 {
++            let mut buf = vec![0; 65536];
++            let (size, _) = sock.recv_from(&mut buf).await?;
++            sink.lock().unwrap().push((now_ms(), size));
++        }
++
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++    sim.set_queue_capacity(1_000);
++    sim.run()?;
++
++    assert_eq!(sizes(&to_client), vec![500, 500]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 2);
++    assert_eq!(sim.link_stats("server", "client").dropped, 0);
++    Ok(())
++}
++
++#[test]
++fn released_datagrams_keep_the_order_they_were_sent_in() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        turmoil::hold("client", "server");
++        for size in [900_usize, 800, 700] {
++            sock.send_to(&vec![0; size], target("server")).await?;
++        }
++        settle(10).await;
++        turmoil::release("client", "server");
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(sizes(&log), vec![900, 800, 700]);
++    assert_eq!(arrivals(&log), vec![28, 44, 58]);
++    Ok(())
++}
++
++
++#[test]
++fn broadcast_datagrams_share_the_senders_interface() -> Result {
++    let mut sim = sim(0);
++    let first = log();
++    let second = log();
++    udp_sink(&mut sim, "one", &first);
++    udp_sink(&mut sim, "two", &second);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.set_broadcast(true)?;
++        sock.send_to(&vec![0; 500], (IpAddr::from(Ipv4Addr::BROADCAST), PORT))
++            .await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&first), vec![10]);
++    assert_eq!(arrivals(&second), vec![20]);
++    Ok(())
++}
++
++#[test]
++fn a_bandwidth_change_applies_to_what_is_sent_after_it() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(50).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++
++    while sim.elapsed() < Duration::from_millis(30) {
++        sim.step()?;
++    }
++
++    sim.set_link_bandwidth("client", "server", 25_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 70]);
++    Ok(())
++}
++
++#[test]
++fn every_host_keeps_its_own_interface() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.host("other", move || async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(1_000).await;
++        Ok(())
++    });
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("other", 50_000);
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.run()?;
++
++    let arrivals = arrivals(&log);
++    assert!(arrivals.contains(&10));
++    assert!(arrivals.contains(&100));
++    Ok(())
++}
++
++#[test]
++fn a_host_takes_messages_in_at_its_own_rate() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..2 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_receive_bandwidth("server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20]);
++    Ok(())
++}
++
++#[test]
++fn two_senders_share_the_receiving_host() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.host("one", move || async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_receive_bandwidth("server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20]);
++    Ok(())
++}
++
++#[test]
++fn an_unlimited_receiver_holds_nothing_back() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..2 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_receive_bandwidth("server", 0);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![1, 1]);
++    Ok(())
++}
++
++#[test]
++fn the_slowest_of_the_three_hops_decides_when_a_datagram_lands() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.set_link_bandwidth("client", "server", 25_000);
++    sim.set_host_receive_bandwidth("server", 12_500);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![60]);
++    Ok(())
++}
++
++#[test]
++fn the_receiving_side_of_the_sender_is_left_alone() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_host_receive_bandwidth("client", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![1]);
++    Ok(())
++}
++
++#[test]
++fn a_receiving_host_that_has_caught_up_takes_the_next_datagram_at_once() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(50).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_receive_bandwidth("server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 60]);
++    Ok(())
++}
++
++#[test]
++fn latency_comes_before_the_receiving_host_takes_a_datagram_in() -> Result {
++    let mut sim = sim(5);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..2 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_receive_bandwidth("server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![15, 25]);
++    Ok(())
++}
++
++#[test]
++fn a_reply_is_charged_to_the_replying_hosts_sending_side() -> Result {
++    let mut sim = sim(0);
++    let to_client = log();
++
++    sim.host("server", move || async move {
++        let sock = bind().await?;
++        loop {
++            let mut buf = vec![0; 65536];
++            let (_, origin) = sock.recv_from(&mut buf).await?;
++            sock.send_to(&vec![0; 500], origin).await?;
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&[0], target("server")).await?;
++
++        let mut buf = vec![0; 65536];
++        let (size, _) = sock.recv_from(&mut buf).await?;
++        sink.lock().unwrap().push((now_ms(), size));
++
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("server", 50_000);
++    sim.set_host_receive_bandwidth("server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&to_client), vec![11]);
++    Ok(())
++}
++
++#[test]
++fn a_datagram_waiting_on_the_receiver_is_still_queued() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..2 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_receive_bandwidth("server", 50_000);
++
++    while sim.elapsed() < Duration::from_millis(12) {
++        sim.step()?;
++    }
++
++    assert_eq!(sim.queued_bytes("client", "server"), 500);
++
++    sim.run()?;
++
++    assert_eq!(sim.queued_bytes("client", "server"), 0);
++    Ok(())
++}
++
++#[test]
++fn a_receiving_host_serves_every_link_into_it() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.host("one", move || async move {
++        let sock = bind().await?;
++        for _ in 0..2 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_receive_bandwidth("server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20, 30]);
++    Ok(())
++}
++
++#[test]
++fn a_half_duplex_link_carries_one_direction_at_a_time() -> Result {
++    let mut sim = sim(0);
++    let to_server = log();
++    let to_client = log();
++
++    let sink = to_server.clone();
++    sim.host("server", move || {
++        let sink = sink.clone();
++
++        async move {
++            let sock = bind().await?;
++            loop {
++                let mut buf = vec![0; 65536];
++                let (size, origin) = sock.recv_from(&mut buf).await?;
++                sink.lock().unwrap().push((now_ms(), size));
++                sock.send_to(&vec![0; 500], origin).await?;
++            }
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++
++        let mut buf = vec![0; 65536];
++        let (size, _) = sock.recv_from(&mut buf).await?;
++        sink.lock().unwrap().push((now_ms(), size));
++
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_duplex("client", "server", Duplex::Half);
++    sim.run()?;
++
++    assert_eq!(arrivals(&to_server), vec![10]);
++    assert_eq!(arrivals(&to_client), vec![20]);
++    Ok(())
++}
++
++#[test]
++fn a_full_duplex_link_carries_both_directions_at_once() -> Result {
++    let mut sim = sim(0);
++    let to_server = log();
++    let to_client = log();
++
++    let sink = to_server.clone();
++    sim.host("server", move || {
++        let sink = sink.clone();
++
++        async move {
++            let sock = Rc::new(bind().await?);
++            watch(sock.clone(), sink.clone());
++
++            sock.send_to(&vec![0; 500], target("client")).await?;
++            settle(500).await;
++            Ok(())
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = Rc::new(bind().await?);
++        watch(sock.clone(), sink.clone());
++
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_duplex("client", "server", Duplex::Full);
++    sim.run()?;
++
++    assert_eq!(arrivals(&to_server), vec![10]);
++    assert_eq!(arrivals(&to_client), vec![10]);
++    Ok(())
++}
++
++#[test]
++fn a_link_is_full_duplex_to_begin_with() -> Result {
++    let mut sim = sim(0);
++    let to_server = log();
++    let to_client = log();
++
++    let sink = to_server.clone();
++    sim.host("server", move || {
++        let sink = sink.clone();
++
++        async move {
++            let sock = Rc::new(bind().await?);
++            watch(sock.clone(), sink.clone());
++
++            sock.send_to(&vec![0; 5_000], target("client")).await?;
++            settle(500).await;
++            Ok(())
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = Rc::new(bind().await?);
++        watch(sock.clone(), sink.clone());
++
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&to_server), vec![100]);
++    assert_eq!(arrivals(&to_client), vec![100]);
++    Ok(())
++}
++
++#[test]
++fn an_unlimited_half_duplex_link_holds_nothing_back() -> Result {
++    let mut sim = sim(0);
++    let to_client = log();
++
++    sim.host("server", move || async move {
++        let sock = bind().await?;
++        loop {
++            let mut buf = vec![0; 65536];
++            let (_, origin) = sock.recv_from(&mut buf).await?;
++            sock.send_to(&vec![0; 5_000], origin).await?;
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++
++        let mut buf = vec![0; 65536];
++        let (size, _) = sock.recv_from(&mut buf).await?;
++        sink.lock().unwrap().push((now_ms(), size));
++
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_duplex("client", "server", Duplex::Half);
++    sim.run()?;
++
++    assert_eq!(arrivals(&to_client), vec![1]);
++    Ok(())
++}
++
++#[test]
++fn link_stats_count_what_a_direction_carried() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..3 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    let stats = sim.link_stats("client", "server");
++    assert_eq!(stats.sent, 3);
++    assert_eq!(stats.delivered, 3);
++    assert_eq!(stats.bytes_sent, 1_500);
++    assert_eq!(stats.bytes_delivered, 1_500);
++    assert_eq!(stats.dropped, 0);
++    assert_eq!(stats.busy, Duration::from_millis(30));
++    Ok(())
++}
++
++#[test]
++fn link_stats_start_empty() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        settle(5).await;
++        Ok(())
++    });
++
++    let stats = sim.link_stats("client", "server");
++    assert_eq!(stats.sent, 0);
++    assert_eq!(stats.delivered, 0);
++    assert_eq!(stats.bytes_sent, 0);
++    assert_eq!(stats.bytes_delivered, 0);
++    assert_eq!(stats.dropped, 0);
++    assert_eq!(stats.busy, Duration::ZERO);
++
++    sim.run()
++}
++
++#[test]
++fn a_dropped_datagram_is_counted_but_never_carried() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    let stats = sim.link_stats("client", "server");
++    assert_eq!(stats.sent, 2);
++    assert_eq!(stats.delivered, 2);
++    assert_eq!(stats.bytes_sent, 1_000);
++    assert_eq!(stats.dropped, 2);
++    Ok(())
++}
++
++#[test]
++fn a_partitioned_datagram_is_counted_as_sent_but_not_delivered() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(5).await;
++        turmoil::partition("client", "server");
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    let stats = sim.link_stats("client", "server");
++    assert_eq!(stats.sent, 1);
++    assert_eq!(stats.delivered, 0);
++    assert_eq!(stats.bytes_delivered, 0);
++    assert!(arrivals(&log).is_empty());
++    Ok(())
++}
++
++#[test]
++fn an_unlimited_wire_is_never_busy() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.run()?;
++
++    let stats = sim.link_stats("client", "server");
++    assert_eq!(stats.sent, 1);
++    assert_eq!(stats.busy, Duration::ZERO);
++    Ok(())
++}
++
++#[test]
++fn each_direction_keeps_its_own_stats() -> Result {
++    let mut sim = sim(0);
++    let to_client = log();
++
++    sim.host("server", move || async move {
++        let sock = bind().await?;
++        loop {
++            let mut buf = vec![0; 65536];
++            let (_, origin) = sock.recv_from(&mut buf).await?;
++            sock.send_to(&vec![0; 200], origin).await?;
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++
++        let mut buf = vec![0; 65536];
++        let (size, _) = sock.recv_from(&mut buf).await?;
++        sink.lock().unwrap().push((now_ms(), size));
++
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++    sim.run()?;
++
++    assert_eq!(sim.link_stats("client", "server").bytes_delivered, 500);
++    assert_eq!(sim.link_stats("server", "client").bytes_delivered, 200);
++    Ok(())
++}
++
++#[test]
++fn every_message_carries_the_overhead_on_the_wire() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_message_overhead(500);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![20]);
++    Ok(())
++}
++
++#[test]
++fn an_empty_datagram_still_carries_the_overhead() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&[], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_message_overhead(500);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10]);
++    Ok(())
++}
++
++#[test]
++fn the_overhead_counts_against_the_queue() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..3 {
++            sock.send_to(&vec![0; 250], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.set_message_overhead(250);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 1);
++    Ok(())
++}
++
++#[test]
++fn the_overhead_shows_up_in_the_bytes_a_direction_carried() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_message_overhead(100);
++    sim.run()?;
++
++    let stats = sim.link_stats("client", "server");
++    assert_eq!(stats.bytes_sent, 600);
++    assert_eq!(stats.bytes_delivered, 600);
++    Ok(())
++}
++
++#[test]
++fn the_builder_sets_the_overhead_of_every_message() -> Result {
++    let mut sim = Builder::new()
++        .min_message_latency(Duration::from_millis(0))
++        .max_message_latency(Duration::from_millis(0))
++        .tick_duration(Duration::from_millis(1))
++        .bandwidth(50_000)
++        .message_overhead(500)
++        .build();
++
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![20]);
++    Ok(())
++}
++
++#[test]
++fn no_overhead_is_carried_by_default() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10]);
++    assert_eq!(sim.link_stats("client", "server").bytes_sent, 500);
++    Ok(())
++}
++
++#[test]
++fn a_segment_waits_for_room_in_the_queue() -> Result {
++    let mut sim = sim(100);
++    let log = log();
++    tcp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let mut stream = TcpStream::connect(target("server")).await?;
++        for _ in 0..4 {
++            stream.write_all(&vec![0; 500]).await?;
++        }
++        settle(1_000).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![210, 220, 320, 330]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 0);
++    Ok(())
++}
++
++#[test]
++fn a_datagram_is_dropped_where_a_segment_would_wait() -> Result {
++    let mut sim = sim(100);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(1_000).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![110, 120]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 2);
++    Ok(())
++}
++
++#[test]
++fn a_stream_that_waited_for_room_still_arrives_in_order() -> Result {
++    let mut sim = sim(50);
++    let log = log();
++    let received = Arc::new(Mutex::new(Vec::new()));
++    tcp_byte_sink(&mut sim, "server", &log, &received);
++
++    sim.client("client", async move {
++        let mut stream = TcpStream::connect(target("server")).await?;
++        for byte in 0..6u8 {
++            stream.write_all(&vec![byte; 500]).await?;
++        }
++        settle(2_000).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    let arrivals = arrivals(&log);
++    assert_eq!(arrivals.len(), 6);
++    assert!(arrivals.windows(2).all(|pair| pair[0] < pair[1]));
++
++    let expected: Vec<u8> = (0..6u8).flat_map(|byte| vec![byte; 500]).collect();
++    assert_eq!(*received.lock().unwrap(), expected);
++    Ok(())
++}
++
++#[test]
++fn host_stats_count_what_an_interface_carried() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..2 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.set_host_receive_bandwidth("server", 25_000);
++    sim.run()?;
++
++    let client = sim.host_stats("client");
++    assert_eq!(client.sent, 2);
++    assert_eq!(client.bytes_sent, 1_000);
++    assert_eq!(client.send_busy, Duration::from_millis(20));
++    assert_eq!(client.received, 0);
++
++    let server = sim.host_stats("server");
++    assert_eq!(server.received, 2);
++    assert_eq!(server.bytes_received, 1_000);
++    assert_eq!(server.receive_busy, Duration::from_millis(40));
++    assert_eq!(server.sent, 0);
++    Ok(())
++}
++
++#[test]
++fn host_stats_start_empty() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        settle(5).await;
++        Ok(())
++    });
++
++    let stats = sim.host_stats("client");
++    assert_eq!(stats.sent, 0);
++    assert_eq!(stats.received, 0);
++    assert_eq!(stats.bytes_sent, 0);
++    assert_eq!(stats.bytes_received, 0);
++    assert_eq!(stats.dropped, 0);
++    assert_eq!(stats.send_busy, Duration::ZERO);
++    assert_eq!(stats.receive_busy, Duration::ZERO);
++
++    sim.run()
++}
++
++#[test]
++fn an_unlimited_interface_is_never_busy() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.run()?;
++
++    let stats = sim.host_stats("client");
++    assert_eq!(stats.sent, 1);
++    assert_eq!(stats.bytes_sent, 5_000);
++    assert_eq!(stats.send_busy, Duration::ZERO);
++    Ok(())
++}
++
++#[test]
++fn a_hosts_interface_carries_what_every_link_of_it_does() -> Result {
++    let mut sim = sim(0);
++    let first = log();
++    let second = log();
++    udp_sink(&mut sim, "one", &first);
++    udp_sink(&mut sim, "two", &second);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("one")).await?;
++        sock.send_to(&vec![0; 300], target("two")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.run()?;
++
++    let stats = sim.host_stats("client");
++    assert_eq!(stats.sent, 2);
++    assert_eq!(stats.bytes_sent, 800);
++    Ok(())
++}
++
++#[test]
++fn the_overhead_is_counted_by_the_interface_too() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.set_message_overhead(100);
++    sim.run()?;
++
++    assert_eq!(sim.host_stats("client").bytes_sent, 600);
++    Ok(())
++}
++
++#[test]
++fn a_half_duplex_link_makes_one_side_wait_for_the_other() -> Result {
++    let mut sim = sim(0);
++    let to_server = log();
++    let to_client = log();
++
++    let sink = to_server.clone();
++    sim.host("server", move || {
++        let sink = sink.clone();
++
++        async move {
++            let sock = bind().await?;
++            sock.send_to(&vec![0; 500], target("client")).await?;
++
++            loop {
++                let mut buf = vec![0; 65536];
++                let (size, _) = sock.recv_from(&mut buf).await?;
++                sink.lock().unwrap().push((now_ms(), size));
++            }
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++
++        let mut buf = vec![0; 65536];
++        let (size, _) = sock.recv_from(&mut buf).await?;
++        sink.lock().unwrap().push((now_ms(), size));
++
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_duplex("client", "server", Duplex::Half);
++    sim.run()?;
++
++    let mut both = [arrivals(&to_client), arrivals(&to_server)].concat();
++    both.sort();
++    assert_eq!(both, vec![10, 20]);
++    Ok(())
++}
++
++#[test]
++fn a_full_duplex_link_lets_both_sides_send_at_once() -> Result {
++    let mut sim = sim(0);
++    let to_server = log();
++    let to_client = log();
++
++    let sink = to_server.clone();
++    sim.host("server", move || {
++        let sink = sink.clone();
++
++        async move {
++            let sock = bind().await?;
++            sock.send_to(&vec![0; 500], target("client")).await?;
++
++            loop {
++                let mut buf = vec![0; 65536];
++                let (size, _) = sock.recv_from(&mut buf).await?;
++                sink.lock().unwrap().push((now_ms(), size));
++            }
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++
++        let mut buf = vec![0; 65536];
++        let (size, _) = sock.recv_from(&mut buf).await?;
++        sink.lock().unwrap().push((now_ms(), size));
++
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&to_client), vec![10]);
++    assert_eq!(arrivals(&to_server), vec![10]);
++    Ok(())
++}
++
++#[test]
++fn a_partition_leaves_an_interface_with_the_time_it_committed() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(5).await;
++        turmoil::partition("client", "server");
++        turmoil::repair("client", "server");
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(1_000).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![110]);
++    Ok(())
++}
++
++#[test]
++fn a_discarded_datagram_still_counts_for_the_host_that_sent_it() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(5).await;
++        turmoil::partition("client", "server");
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.run()?;
++
++    let stats = sim.host_stats("client");
++    assert_eq!(stats.sent, 1);
++    assert_eq!(stats.bytes_sent, 5_000);
++    assert!(arrivals(&log).is_empty());
++    Ok(())
++}
++
++#[test]
++fn released_datagrams_carry_no_further_latency() -> Result {
++    let mut sim = sim(50);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        turmoil::hold("client", "server");
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(100).await;
++        turmoil::release("client", "server");
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![110]);
++    Ok(())
++}
++
++#[test]
++fn an_overhead_set_later_applies_to_what_follows() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(50).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++
++    while sim.elapsed() < Duration::from_millis(30) {
++        sim.step()?;
++    }
++
++    sim.set_message_overhead(500);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 70]);
++    Ok(())
++}
++
++#[test]
++fn a_connection_segment_carries_the_overhead_and_nothing_else() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    tcp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let mut stream = TcpStream::connect(target("server")).await?;
++        stream.write_all(&vec![0; 500]).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_message_overhead(500);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![30]);
++    assert_eq!(sim.link_stats("client", "server").bytes_sent, 2_000);
++    Ok(())
++}
++
++#[test]
++fn a_host_counts_the_datagrams_a_full_queue_took_from_it() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert_eq!(sim.host_stats("client").dropped, 2);
++    assert_eq!(sim.host_stats("client").sent, 2);
++    assert_eq!(sim.host_stats("client").bytes_sent, 1_000);
++    assert_eq!(sim.host_stats("server").dropped, 0);
++    Ok(())
++}
++
++#[test]
++fn a_link_queue_capacity_wins_over_the_default() -> Result {
++    let mut sim = sim(0);
++    let first = log();
++    let second = log();
++    udp_sink(&mut sim, "one", &first);
++    udp_sink(&mut sim, "two", &second);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("one")).await?;
++        }
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("two")).await?;
++        }
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++    sim.set_queue_capacity(1_000);
++    sim.set_link_queue_capacity("client", "one", 2_000);
++    sim.run()?;
++
++    assert_eq!(sizes(&first).len(), 4);
++    assert_eq!(sim.link_stats("client", "one").dropped, 0);
++
++    assert_eq!(sizes(&second).len(), 2);
++    assert_eq!(sim.link_stats("client", "two").dropped, 2);
++    Ok(())
++}
++
++#[cfg(feature = "regex")]
++#[test]
++fn every_host_a_selector_matches_gets_the_bandwidth() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    for name in ["node-1", "node-2"] {
++        sim.host(name, move || async move {
++            let sock = bind().await?;
++            for _ in 0..2 {
++                sock.send_to(&vec![0; 500], target("server")).await?;
++            }
++            settle(500).await;
++            Ok(())
++        });
++    }
++
++    sim.client("client", async move {
++        settle(300).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth(Regex::new("^node-").unwrap(), 50_000);
++    sim.run()?;
++
++    let mut arrivals = arrivals(&log);
++    arrivals.sort_unstable();
++    assert_eq!(arrivals, vec![10, 10, 20, 20]);
++    assert_eq!(sim.host_stats("node-1").send_busy, Duration::from_millis(20));
++    assert_eq!(sim.host_stats("node-2").send_busy, Duration::from_millis(20));
++    Ok(())
++}
++
++#[cfg(feature = "regex")]
++#[test]
++fn every_host_a_selector_matches_takes_messages_in_at_that_rate() -> Result {
++    let mut sim = sim(0);
++    let first = log();
++    let second = log();
++    udp_sink(&mut sim, "node-1", &first);
++    udp_sink(&mut sim, "node-2", &second);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for name in ["node-1", "node-2"] {
++            for _ in 0..2 {
++                sock.send_to(&vec![0; 500], target(name)).await?;
++            }
++        }
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_host_receive_bandwidth(Regex::new("^node-").unwrap(), 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&first), vec![10, 20]);
++    assert_eq!(arrivals(&second), vec![10, 20]);
++    Ok(())
++}
++
++#[test]
++fn a_segment_bigger_than_the_queue_still_goes_on_the_wire() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    tcp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let mut stream = TcpStream::connect(target("server")).await?;
++        stream.write_all(&vec![0; 2_000]).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert_eq!(sizes(&log).iter().sum::<usize>(), 2_000);
++    assert_eq!(arrivals(&log), vec![41]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 0);
++    Ok(())
++}
++
++#[test]
++fn a_duplex_change_applies_to_what_is_sent_after_it() -> Result {
++    let mut sim = sim(0);
++    let to_server = log();
++    let to_client = log();
++
++    let sink = to_server.clone();
++    sim.host("server", move || {
++        let sink = sink.clone();
++
++        async move {
++            let sock = Rc::new(bind().await?);
++            watch(sock.clone(), sink.clone());
++
++            sock.send_to(&vec![0; 500], target("client")).await?;
++            settle(50).await;
++            sock.send_to(&vec![0; 500], target("client")).await?;
++            settle(500).await;
++            Ok(())
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = Rc::new(bind().await?);
++        watch(sock.clone(), sink.clone());
++
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(50).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++
++    while sim.elapsed() < Duration::from_millis(30) {
++        sim.step()?;
++    }
++
++    sim.set_link_duplex("client", "server", Duplex::Half);
++    sim.run()?;
++
++    assert_eq!(arrivals(&to_client), vec![10, 60]);
++    assert_eq!(arrivals(&to_server), vec![10, 70]);
++    Ok(())
++}
++
++#[test]
++fn a_host_bandwidth_set_later_applies_to_what_follows() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(50).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    while sim.elapsed() < Duration::from_millis(30) {
++        sim.step()?;
++    }
++
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![1, 60]);
++    assert_eq!(sim.host_stats("client").send_busy, Duration::from_millis(10));
++    Ok(())
++}
++
++#[test]
++fn a_receive_bandwidth_set_later_applies_to_what_follows() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(50).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    while sim.elapsed() < Duration::from_millis(30) {
++        sim.step()?;
++    }
++
++    sim.set_host_receive_bandwidth("server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![1, 60]);
++    assert_eq!(
++        sim.host_stats("server").receive_busy,
++        Duration::from_millis(10)
++    );
++    Ok(())
++}
++
++#[test]
++fn a_queue_capacity_set_later_applies_to_what_follows() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(100).await;
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++
++    while sim.elapsed() < Duration::from_millis(60) {
++        sim.step()?;
++    }
++
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert_eq!(sizes(&log).len(), 6);
++    assert_eq!(sim.link_stats("client", "server").dropped, 2);
++    Ok(())
++}
++
++#[test]
++fn a_reset_segment_carries_the_overhead_and_no_payload() -> Result {
++    let mut sim = sim(0);
++
++    sim.host("server", move || async move {
++        let listener = TcpListener::bind((IpAddr::from(Ipv4Addr::UNSPECIFIED), PORT)).await?;
++        let (mut stream, _) = listener.accept().await?;
++        stream.write_all(&vec![0; 500]).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.client("client", async move {
++        let stream = TcpStream::connect(target("server")).await?;
++        settle(50).await;
++        drop(stream);
++        settle(100).await;
++        Ok(())
++    });
++
++    sim.set_message_overhead(100);
++    sim.run()?;
++
++    let to_server = sim.link_stats("client", "server");
++    assert_eq!(to_server.sent, 2);
++    assert_eq!(to_server.bytes_sent, 200);
++    assert_eq!(sim.host_stats("client").bytes_sent, 200);
++
++    let to_client = sim.link_stats("server", "client");
++    assert_eq!(to_client.bytes_sent, 600);
++    Ok(())
++}
++
++
++#[test]
++fn a_bandwidth_change_leaves_a_waiting_message_alone() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++
++    while sim.elapsed() < Duration::from_millis(30) {
++        sim.step()?;
++    }
++
++    sim.set_link_bandwidth("client", "server", 25_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![100, 110]);
++    Ok(())
++}
++
++#[test]
++fn an_overhead_change_leaves_a_waiting_message_alone() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++
++    while sim.elapsed() < Duration::from_millis(30) {
++        sim.step()?;
++    }
++
++    sim.set_message_overhead(500);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![100, 110]);
++    assert_eq!(sim.link_stats("client", "server").bytes_sent, 5_500);
++    Ok(())
++}
++
++#[test]
++fn a_smaller_queue_keeps_what_it_already_took_on() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(5).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(60).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++
++    while sim.elapsed() < Duration::from_millis(3) {
++        sim.step()?;
++    }
++
++    assert_eq!(sim.queued_bytes("client", "server"), 2_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20, 30, 40, 75]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 1);
++    Ok(())
++}
++
++
++#[test]
++fn a_partition_leaves_a_receiving_interface_with_the_time_it_committed() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(5).await;
++        turmoil::partition("client", "server");
++        turmoil::repair("client", "server");
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(1_000).await;
++        Ok(())
++    });
++
++    sim.set_host_receive_bandwidth("server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![110]);
++    Ok(())
++}
++
++#[test]
++fn a_discarded_message_still_counts_the_time_it_held_a_hop() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(5).await;
++        turmoil::partition("client", "server");
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.set_host_receive_bandwidth("server", 100_000);
++    sim.run()?;
++
++    let link = sim.link_stats("client", "server");
++    assert_eq!(link.sent, 1);
++    assert_eq!(link.delivered, 0);
++    assert_eq!(link.busy, Duration::from_millis(100));
++
++    let client = sim.host_stats("client");
++    assert_eq!(client.sent, 1);
++    assert_eq!(client.send_busy, Duration::from_millis(100));
++
++    let server = sim.host_stats("server");
++    assert_eq!(server.received, 0);
++    assert_eq!(server.bytes_received, 0);
++    assert_eq!(server.receive_busy, Duration::from_millis(50));
++
++    assert!(arrivals(&log).is_empty());
++    Ok(())
++}
++
++#[cfg(feature = "regex")]
++#[test]
++fn a_selector_sets_the_bandwidth_of_every_link_it_matches() -> Result {
++    let mut sim = sim(0);
++    let first = log();
++    let second = log();
++    udp_sink(&mut sim, "node-1", &first);
++    udp_sink(&mut sim, "node-2", &second);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for name in ["node-1", "node-2"] {
++            for _ in 0..2 {
++                sock.send_to(&vec![0; 500], target(name)).await?;
++            }
++        }
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth(
++        Regex::new("^client$").unwrap(),
++        Regex::new("^node-").unwrap(),
++        50_000,
++    );
++    sim.run()?;
++
++    assert_eq!(arrivals(&first), vec![10, 20]);
++    assert_eq!(arrivals(&second), vec![10, 20]);
++    Ok(())
++}
++
++#[cfg(feature = "regex")]
++#[test]
++fn a_selector_sets_the_queue_capacity_of_every_link_it_matches() -> Result {
++    let mut sim = sim(0);
++    let first = log();
++    let second = log();
++    udp_sink(&mut sim, "node-1", &first);
++    udp_sink(&mut sim, "node-2", &second);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for name in ["node-1", "node-2"] {
++            for _ in 0..4 {
++                sock.send_to(&vec![0; 500], target(name)).await?;
++            }
++        }
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++    sim.set_link_queue_capacity(
++        Regex::new("^client$").unwrap(),
++        Regex::new("^node-").unwrap(),
++        1_000,
++    );
++    sim.run()?;
++
++    assert_eq!(arrivals(&first).len(), 2);
++    assert_eq!(arrivals(&second).len(), 2);
++    assert_eq!(sim.link_stats("client", "node-1").dropped, 2);
++    assert_eq!(sim.link_stats("client", "node-2").dropped, 2);
++    Ok(())
++}
++
++#[cfg(feature = "regex")]
++#[test]
++fn a_selector_that_matches_nothing_leaves_every_link_alone() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "node-1", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("node-1")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth(
++        Regex::new("^client$").unwrap(),
++        Regex::new("^nothing-").unwrap(),
++        50_000,
++    );
++    sim.set_host_send_bandwidth(Regex::new("^nothing-").unwrap(), 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![1]);
++    assert_eq!(sim.link_stats("client", "node-1").busy, Duration::ZERO);
++    Ok(())
++}
++
++#[test]
++fn each_direction_of_a_half_duplex_link_keeps_its_own_queue() -> Result {
++    let mut sim = sim(0);
++    let to_server = log();
++    let to_client = log();
++
++    let sink = to_server.clone();
++    sim.host("server", move || {
++        let sink = sink.clone();
++
++        async move {
++            let sock = Rc::new(bind().await?);
++            watch(sock.clone(), sink.clone());
++
++            for _ in 0..4 {
++                sock.send_to(&vec![0; 500], target("client")).await?;
++            }
++            settle(500).await;
++            Ok(())
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = Rc::new(bind().await?);
++        watch(sock.clone(), sink.clone());
++
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++    sim.set_queue_capacity(1_000);
++    sim.set_link_duplex("client", "server", Duplex::Half);
++    sim.run()?;
++
++    assert_eq!(sim.link_stats("client", "server").dropped, 2);
++    assert_eq!(sim.link_stats("server", "client").dropped, 2);
++    assert_eq!(arrivals(&to_server).len(), 2);
++    assert_eq!(arrivals(&to_client).len(), 2);
++
++    let mut both = [arrivals(&to_client), arrivals(&to_server)].concat();
++    both.sort();
++    assert_eq!(both, vec![10, 20, 30, 40]);
++    Ok(())
++}
++
++#[test]
++fn the_overhead_of_a_released_message_is_counted_too() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        turmoil::hold("client", "server");
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(20).await;
++        turmoil::release("client", "server");
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_message_overhead(500);
++    sim.run()?;
++
++    let stats = sim.link_stats("client", "server");
++    assert_eq!(stats.bytes_sent, 1_000);
++    assert_eq!(stats.bytes_delivered, 1_000);
++    assert_eq!(stats.busy, Duration::from_millis(20));
++    assert_eq!(arrivals(&log), vec![40]);
++    Ok(())
++}
++
++#[test]
++fn the_overhead_of_a_discarded_message_is_counted_too() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(5).await;
++        turmoil::partition("client", "server");
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_message_overhead(500);
++    sim.run()?;
++
++    let stats = sim.link_stats("client", "server");
++    assert_eq!(stats.bytes_sent, 5_500);
++    assert_eq!(stats.bytes_delivered, 0);
++    assert_eq!(stats.busy, Duration::from_millis(110));
++    assert!(arrivals(&log).is_empty());
++    Ok(())
++}
++
++#[test]
++fn the_overhead_shows_up_in_the_bytes_a_direction_still_carries() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_message_overhead(500);
++
++    while sim.elapsed() < Duration::from_millis(5) {
++        sim.step()?;
++    }
++
++    assert_eq!(sim.queued_bytes("client", "server"), 1_000);
++
++    sim.run()?;
++
++    assert_eq!(sim.queued_bytes("client", "server"), 0);
++    Ok(())
++}
++
++#[test]
++fn a_global_bandwidth_sets_links_and_leaves_interfaces_unlimited() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10]);
++    assert_eq!(
++        sim.link_stats("client", "server").busy,
++        Duration::from_millis(10)
++    );
++    assert_eq!(sim.host_stats("client").send_busy, Duration::ZERO);
++    assert_eq!(sim.host_stats("server").receive_busy, Duration::ZERO);
++    Ok(())
++}
++
++#[test]
++fn a_builder_bandwidth_sets_links_and_leaves_interfaces_unlimited() -> Result {
++    let mut sim = Builder::new()
++        .min_message_latency(Duration::from_millis(0))
++        .max_message_latency(Duration::from_millis(0))
++        .tick_duration(Duration::from_millis(1))
++        .bandwidth(50_000)
++        .build();
++
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.run()?;
++
++    assert_eq!(
++        sim.link_stats("client", "server").busy,
++        Duration::from_millis(10)
++    );
++    assert_eq!(sim.host_stats("client").send_busy, Duration::ZERO);
++    assert_eq!(sim.host_stats("server").receive_busy, Duration::ZERO);
++    Ok(())
++}
++
++#[test]
++fn closing_a_connection_carries_the_overhead_and_no_payload() -> Result {
++    let mut sim = sim(0);
++
++    sim.host("server", move || async move {
++        let listener = TcpListener::bind((IpAddr::from(Ipv4Addr::UNSPECIFIED), PORT)).await?;
++        let (mut stream, _) = listener.accept().await?;
++
++        let mut buf = vec![0; 65536];
++        let read = stream.read(&mut buf).await?;
++        assert_eq!(read, 500);
++
++        drop(stream);
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.client("client", async move {
++        let mut stream = TcpStream::connect(target("server")).await?;
++        stream.write_all(&vec![0; 500]).await?;
++
++        let mut buf = vec![0; 65536];
++        assert_eq!(stream.read(&mut buf).await?, 0);
++
++        settle(100).await;
++        Ok(())
++    });
++
++    sim.set_message_overhead(100);
++    sim.run()?;
++
++    let closing = sim.link_stats("server", "client");
++    assert_eq!(closing.sent, 1);
++    assert_eq!(closing.bytes_sent, 100);
++    assert_eq!(closing.bytes_delivered, 100);
++    assert_eq!(sim.host_stats("server").bytes_sent, 100);
++
++    let opening = sim.link_stats("client", "server");
++    assert_eq!(opening.sent, 3);
++    assert_eq!(opening.bytes_sent, 800);
++    Ok(())
++}
++
++#[test]
++fn the_overhead_counts_on_the_receiving_side_too() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_host_receive_bandwidth("server", 50_000);
++    sim.set_message_overhead(100);
++    sim.run()?;
++
++    let server = sim.host_stats("server");
++    assert_eq!(server.received, 1);
++    assert_eq!(server.bytes_received, 600);
++    assert_eq!(server.receive_busy, Duration::from_millis(12));
++    assert_eq!(arrivals(&log), vec![12]);
++    Ok(())
++}
++
++#[test]
++fn a_half_duplex_wire_charges_each_direction_only_for_its_own_traffic() -> Result {
++    let mut sim = sim(0);
++    let to_server = log();
++    let to_client = log();
++
++    let sink = to_server.clone();
++    sim.host("server", move || {
++        let sink = sink.clone();
++
++        async move {
++            let sock = Rc::new(bind().await?);
++            watch(sock.clone(), sink.clone());
++
++            sock.send_to(&vec![0; 500], target("client")).await?;
++            settle(500).await;
++            Ok(())
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = Rc::new(bind().await?);
++        watch(sock.clone(), sink.clone());
++
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_duplex("client", "server", Duplex::Half);
++    sim.run()?;
++
++    let mut both = [arrivals(&to_client), arrivals(&to_server)].concat();
++    both.sort();
++    assert_eq!(both, vec![10, 20]);
++
++    assert_eq!(
++        sim.link_stats("server", "client").busy,
++        Duration::from_millis(10)
++    );
++    assert_eq!(
++        sim.link_stats("client", "server").busy,
++        Duration::from_millis(10)
++    );
++    Ok(())
++}
++
++
++#[test]
++fn a_link_queue_capacity_bounds_both_directions() -> Result {
++    let mut sim = sim(0);
++    let to_server = log();
++    let to_client = log();
++
++    let sink = to_server.clone();
++    sim.host("server", move || {
++        let sink = sink.clone();
++
++        async move {
++            let sock = Rc::new(bind().await?);
++            watch(sock.clone(), sink.clone());
++
++            for _ in 0..4 {
++                sock.send_to(&vec![0; 500], target("client")).await?;
++            }
++            settle(500).await;
++            Ok(())
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = Rc::new(bind().await?);
++        watch(sock.clone(), sink.clone());
++
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert_eq!(sim.link_stats("client", "server").dropped, 2);
++    assert_eq!(sim.link_stats("server", "client").dropped, 2);
++    assert_eq!(arrivals(&to_server), vec![10, 20]);
++    assert_eq!(arrivals(&to_client), vec![10, 20]);
++    Ok(())
++}
++
++#[test]
++#[should_panic]
++fn setting_the_bandwidth_of_a_link_that_does_not_exist_is_an_error() {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.set_link_bandwidth("server", "ghost", 50_000);
++}
++
++#[test]
++fn a_host_that_has_never_sent_has_empty_stats() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.host("quiet", move || async move {
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(100).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("quiet", 50_000);
++    sim.set_host_receive_bandwidth("quiet", 50_000);
++    sim.run()?;
++
++    let stats = sim.host_stats("quiet");
++    assert_eq!(stats.sent, 0);
++    assert_eq!(stats.received, 0);
++    assert_eq!(stats.bytes_sent, 0);
++    assert_eq!(stats.bytes_received, 0);
++    assert_eq!(stats.dropped, 0);
++    assert_eq!(stats.send_busy, Duration::ZERO);
++    assert_eq!(stats.receive_busy, Duration::ZERO);
++
++    assert_eq!(sim.queued_bytes("client", "quiet"), 0);
++    assert_eq!(sim.link_stats("client", "quiet").sent, 0);
++    Ok(())
++}
++
++#[test]
++fn a_later_datagram_never_overtakes_an_earlier_one() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(5).await;
++        sock.send_to(&vec![0; 300], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_latency("client", "server", Duration::from_millis(100));
++
++    while sim.elapsed() < Duration::from_millis(3) {
++        sim.step()?;
++    }
++
++    sim.set_link_latency("client", "server", Duration::from_millis(0));
++    sim.run()?;
++
++    assert_eq!(sizes(&log), vec![500, 300]);
++    assert_eq!(arrivals(&log), vec![110, 110]);
++    Ok(())
++}
++
++#[test]
++fn a_link_set_back_to_unlimited_frees_only_what_follows() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(50).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++
++    while sim.elapsed() < Duration::from_millis(30) {
++        sim.step()?;
++    }
++
++    sim.set_link_bandwidth("client", "server", 0);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![100, 110, 110]);
++    assert_eq!(
++        sim.link_stats("client", "server").busy,
++        Duration::from_millis(110)
++    );
++    Ok(())
++}
++
++#[test]
++fn an_interface_set_back_to_unlimited_frees_only_what_follows() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(150).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("client", 50_000);
++
++    while sim.elapsed() < Duration::from_millis(30) {
++        sim.step()?;
++    }
++
++    sim.set_host_send_bandwidth("client", 0);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![100, 151]);
++    assert_eq!(
++        sim.host_stats("client").send_busy,
++        Duration::from_millis(100)
++    );
++    Ok(())
++}
++
++#[test]
++fn an_overhead_set_back_to_zero_leaves_what_it_already_charged() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(50).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_message_overhead(500);
++
++    while sim.elapsed() < Duration::from_millis(30) {
++        sim.step()?;
++    }
++
++    sim.set_message_overhead(0);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![20, 60]);
++    assert_eq!(sim.link_stats("client", "server").bytes_sent, 1_500);
++    Ok(())
++}
++
++#[cfg(feature = "regex")]
++#[test]
++fn a_selector_sets_one_direction_and_leaves_the_other_alone() -> Result {
++    let mut sim = sim(0);
++    let to_node = log();
++    let to_client = log();
++
++    let sink = to_node.clone();
++    sim.host("node-1", move || {
++        let sink = sink.clone();
++
++        async move {
++            let sock = Rc::new(bind().await?);
++            watch(sock.clone(), sink.clone());
++
++            settle(100).await;
++            sock.send_to(&vec![0; 5_000], target("client")).await?;
++            settle(500).await;
++            Ok(())
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = Rc::new(bind().await?);
++        watch(sock.clone(), sink.clone());
++
++        sock.send_to(&vec![0; 500], target("node-1")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth_oneway(
++        Regex::new("^client$").unwrap(),
++        Regex::new("^node-").unwrap(),
++        50_000,
++    );
++    sim.run()?;
++
++    assert_eq!(arrivals(&to_node), vec![10]);
++    assert_eq!(arrivals(&to_client), vec![100]);
++    assert_eq!(
++        sim.link_stats("client", "node-1").busy,
++        Duration::from_millis(10)
++    );
++    assert_eq!(sim.link_stats("node-1", "client").busy, Duration::ZERO);
++    Ok(())
++}
++
++#[test]
++fn an_arrival_between_ticks_lands_on_the_next_one() -> Result {
++    let mut sim = Builder::new()
++        .min_message_latency(Duration::from_millis(5))
++        .max_message_latency(Duration::from_millis(5))
++        .tick_duration(Duration::from_millis(10))
++        .simulation_duration(Duration::from_secs(30))
++        .build();
++
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![20]);
++    Ok(())
++}
++
++#[test]
++fn an_oversized_segment_waits_for_the_queue_ahead_of_it() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    tcp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let mut stream = TcpStream::connect(target("server")).await?;
++        stream.write_all(&vec![0; 500]).await?;
++        stream.write_all(&vec![0; 500]).await?;
++        stream.write_all(&vec![0; 2_000]).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    assert_eq!(sizes(&log).iter().sum::<usize>(), 3_000);
++    assert_eq!(arrivals(&log), vec![11, 21, 61]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 0);
++    Ok(())
++}
++
++#[test]
++fn going_back_to_full_duplex_frees_only_what_follows() -> Result {
++    let mut sim = sim(0);
++    let to_server = log();
++    let to_client = log();
++
++    let sink = to_server.clone();
++    sim.host("server", move || {
++        let sink = sink.clone();
++
++        async move {
++            let sock = Rc::new(bind().await?);
++            watch(sock.clone(), sink.clone());
++
++            sock.send_to(&vec![0; 500], target("client")).await?;
++            settle(150).await;
++            sock.send_to(&vec![0; 500], target("client")).await?;
++            settle(500).await;
++            Ok(())
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = Rc::new(bind().await?);
++        watch(sock.clone(), sink.clone());
++
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(150).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_link_duplex("client", "server", Duplex::Half);
++
++    while sim.elapsed() < Duration::from_millis(30) {
++        sim.step()?;
++    }
++
++    sim.set_link_duplex("client", "server", Duplex::Full);
++    sim.run()?;
++
++    assert_eq!(arrivals(&to_client).len(), 2);
++    assert_eq!(arrivals(&to_server).len(), 2);
++    assert_eq!(arrivals(&to_client)[1], 160);
++    assert_eq!(arrivals(&to_server)[1], 160);
++
++    let mut first = vec![arrivals(&to_client)[0], arrivals(&to_server)[0]];
++    first.sort();
++    assert_eq!(first, vec![10, 20]);
++    Ok(())
++}
++
++#[test]
++fn a_queue_override_does_not_freeze_a_later_global_bandwidth() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_queue_capacity("client", "server", 4_000);
++    sim.set_bandwidth(50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10]);
++    assert_eq!(
++        sim.link_stats("client", "server").busy,
++        Duration::from_millis(10)
++    );
++    Ok(())
++}
++
++#[test]
++fn a_bandwidth_override_does_not_freeze_a_later_global_queue_capacity() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_queue_capacity(1_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 2);
++    Ok(())
++}
++
++#[test]
++fn a_link_override_does_not_freeze_a_later_global_overhead() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_message_overhead(500);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![20]);
++    assert_eq!(sim.link_stats("client", "server").bytes_sent, 1_000);
++    Ok(())
++}
++
++#[test]
++fn an_interface_takes_messages_on_in_send_order_across_links() -> Result {
++    let mut sim = sim(0);
++    let slow = log();
++    let fast = log();
++    udp_sink(&mut sim, "slow", &slow);
++    udp_sink(&mut sim, "fast", &fast);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("slow")).await?;
++        sock.send_to(&vec![0; 500], target("slow")).await?;
++        sock.send_to(&vec![0; 500], target("fast")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.set_link_bandwidth("client", "slow", 25_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&slow), vec![20, 40]);
++    assert_eq!(arrivals(&fast), vec![40]);
++    Ok(())
++}
++
++#[test]
++fn an_enormous_rate_carries_a_message_at_once() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", u64::MAX);
++    sim.set_host_send_bandwidth("client", u64::MAX);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![1]);
++    Ok(())
++}
++
++#[test]
++fn busy_time_keeps_the_part_of_a_millisecond_it_used() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 1_000], target("server")).await?;
++        settle(2_000).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 3_000);
++    sim.run()?;
++
++    let busy = sim.link_stats("client", "server").busy;
++    assert!(busy > Duration::from_millis(333));
++    assert!(busy < Duration::from_millis(334));
++    assert_eq!(arrivals(&log), vec![334]);
++    Ok(())
++}
++
++#[test]
++#[should_panic]
++fn setting_the_queue_of_a_link_that_does_not_exist_is_an_error() {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.set_link_queue_capacity("server", "ghost", 1_000);
++}
++
++#[test]
++#[should_panic]
++fn setting_the_duplex_of_a_link_that_does_not_exist_is_an_error() {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.set_link_duplex("server", "ghost", Duplex::Half);
++}
++
++#[test]
++fn a_half_duplex_wire_is_held_for_each_directions_own_time() -> Result {
++    let mut sim = sim(0);
++    let to_server = log();
++    let to_client = log();
++
++    let sink = to_server.clone();
++    sim.host("server", move || {
++        let sink = sink.clone();
++
++        async move {
++            let sock = bind().await?;
++            loop {
++                let mut buf = vec![0; 65536];
++                let (size, origin) = sock.recv_from(&mut buf).await?;
++                sink.lock().unwrap().push((now_ms(), size));
++                sock.send_to(&vec![0; 1_000], origin).await?;
++            }
++        }
++    });
++
++    let sink = to_client.clone();
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 1_000], target("server")).await?;
++
++        let mut buf = vec![0; 65536];
++        let (size, _) = sock.recv_from(&mut buf).await?;
++        sink.lock().unwrap().push((now_ms(), size));
++
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth_oneway("client", "server", 50_000);
++    sim.set_link_bandwidth_oneway("server", "client", 25_000);
++    sim.set_link_duplex("client", "server", Duplex::Half);
++    sim.run()?;
++
++    assert_eq!(arrivals(&to_server), vec![20]);
++    assert_eq!(arrivals(&to_client), vec![60]);
++    assert_eq!(
++        sim.link_stats("client", "server").busy,
++        Duration::from_millis(20)
++    );
++    assert_eq!(
++        sim.link_stats("server", "client").busy,
++        Duration::from_millis(40)
++    );
++    Ok(())
++}
++
++#[test]
++fn a_receiving_interface_serves_two_senders_in_the_order_they_reach_it() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("near", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.client("far", async move {
++        let sock = bind().await?;
++        settle(5).await;
++        sock.send_to(&vec![0; 400], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_latency("near", "server", Duration::from_millis(10));
++    sim.set_link_latency("far", "server", Duration::from_millis(50));
++    sim.set_host_receive_bandwidth("server", 50_000);
++    sim.run()?;
++
++    assert_eq!(sizes(&log), vec![500, 400]);
++    assert_eq!(arrivals(&log), vec![20, 63]);
++    Ok(())
++}
++
++#[cfg(feature = "regex")]
++#[test]
++fn a_selector_makes_every_link_it_matches_half_duplex() -> Result {
++    let mut sim = sim(0);
++    let at_matched = log();
++    let at_untouched = log();
++    let from_matched = log();
++    let from_untouched = log();
++
++    for (name, sink) in [("node-1", &at_matched), ("other", &at_untouched)] {
++        let sink = sink.clone();
++
++        sim.host(name, move || {
++            let sink = sink.clone();
++
++            async move {
++                let sock = bind().await?;
++                sock.send_to(&vec![0; 500], target("client")).await?;
++
++                loop {
++                    let mut buf = vec![0; 65536];
++                    let (size, _) = sock.recv_from(&mut buf).await?;
++                    sink.lock().unwrap().push((now_ms(), size));
++                }
++            }
++        });
++    }
++
++    let matched = from_matched.clone();
++    let untouched = from_untouched.clone();
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("node-1")).await?;
++        sock.send_to(&vec![0; 500], target("other")).await?;
++
++        for _ in 0..2 {
++            let mut buf = vec![0; 65536];
++            let (size, origin) = sock.recv_from(&mut buf).await?;
++            let sink = if origin == target("node-1") {
++                &matched
++            } else {
++                &untouched
++            };
++            sink.lock().unwrap().push((now_ms(), size));
++        }
++
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++    sim.set_link_duplex(
++        Regex::new("^client$").unwrap(),
++        Regex::new("^node-").unwrap(),
++        Duplex::Half,
++    );
++    sim.run()?;
++
++    let mut matched = [arrivals(&at_matched), arrivals(&from_matched)].concat();
++    matched.sort();
++    assert_eq!(matched, vec![10, 20]);
++
++    let mut untouched = [arrivals(&at_untouched), arrivals(&from_untouched)].concat();
++    untouched.sort();
++    assert_eq!(untouched, vec![10, 10]);
++    Ok(())
++}
++
++#[test]
++fn a_global_bandwidth_set_later_applies_to_what_follows() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(50).await;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++
++    while sim.elapsed() < Duration::from_millis(30) {
++        sim.step()?;
++    }
++
++    sim.set_bandwidth(25_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 70]);
++    Ok(())
++}
++
++#[test]
++fn a_global_queue_capacity_set_later_applies_to_what_follows() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..2 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(100).await;
++        for _ in 0..2 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++
++    while sim.elapsed() < Duration::from_millis(50) {
++        sim.step()?;
++    }
++
++    sim.set_queue_capacity(500);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![10, 20, 110]);
++    assert_eq!(sim.link_stats("client", "server").dropped, 1);
++    Ok(())
++}
++
++#[test]
++fn a_turned_away_datagram_holds_no_hop_at_all() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        for _ in 0..4 {
++            sock.send_to(&vec![0; 500], target("server")).await?;
++        }
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_link_bandwidth("client", "server", 50_000);
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.set_link_queue_capacity("client", "server", 1_000);
++    sim.run()?;
++
++    let link = sim.link_stats("client", "server");
++    assert_eq!(link.dropped, 2);
++    assert_eq!(link.sent, 2);
++    assert_eq!(link.busy, Duration::from_millis(20));
++
++    let client = sim.host_stats("client");
++    assert_eq!(client.dropped, 2);
++    assert_eq!(client.sent, 2);
++    assert_eq!(client.bytes_sent, 1_000);
++    assert_eq!(client.send_busy, Duration::from_millis(20));
++    Ok(())
++}
++
++#[test]
++fn an_exchange_is_counted_on_the_right_side_of_each_host() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++
++    sim.host("server", move || async move {
++        let sock = bind().await?;
++        loop {
++            let mut buf = vec![0; 65536];
++            let (_, origin) = sock.recv_from(&mut buf).await?;
++            sock.send_to(&vec![0; 300], origin).await?;
++        }
++    });
++
++    let sink = log.clone();
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 500], target("server")).await?;
++
++        let mut buf = vec![0; 65536];
++        let (size, _) = sock.recv_from(&mut buf).await?;
++        sink.lock().unwrap().push((now_ms(), size));
++
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![16]);
++
++    let client = sim.host_stats("client");
++    assert_eq!((client.sent, client.bytes_sent), (1, 500));
++    assert_eq!((client.received, client.bytes_received), (1, 300));
++
++    let server = sim.host_stats("server");
++    assert_eq!((server.sent, server.bytes_sent), (1, 300));
++    assert_eq!((server.received, server.bytes_received), (1, 500));
++    Ok(())
++}
++
++#[cfg(feature = "regex")]
++#[test]
++fn a_host_selector_that_matches_nothing_leaves_every_interface_alone() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    udp_sink(&mut sim, "server", &log);
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], target("server")).await?;
++        settle(500).await;
++        Ok(())
++    });
++
++    sim.set_host_send_bandwidth(Regex::new("^ghost").unwrap(), 1_000);
++    sim.set_host_receive_bandwidth(Regex::new("^ghost").unwrap(), 1_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![1]);
++    assert_eq!(sim.host_stats("client").send_busy, Duration::ZERO);
++    assert_eq!(sim.host_stats("server").receive_busy, Duration::ZERO);
++    Ok(())
++}
++
++#[test]
++fn a_message_a_host_sends_to_itself_takes_no_hop() -> Result {
++    let mut sim = sim(0);
++    let log = log();
++    let sink = log.clone();
++
++    sim.client("client", async move {
++        let sock = bind().await?;
++        sock.send_to(&vec![0; 5_000], (Ipv4Addr::LOCALHOST, PORT))
++            .await?;
++
++        let mut buf = vec![0; 65536];
++        let (size, _) = sock.recv_from(&mut buf).await?;
++        sink.lock().unwrap().push((now_ms(), size));
++
++        settle(200).await;
++        Ok(())
++    });
++
++    sim.set_bandwidth(50_000);
++    sim.set_message_overhead(500);
++    sim.set_host_send_bandwidth("client", 50_000);
++    sim.set_host_receive_bandwidth("client", 50_000);
++    sim.run()?;
++
++    assert_eq!(arrivals(&log), vec![1]);
++    assert_eq!(sizes(&log), vec![5_000]);
++
++    let client = sim.host_stats("client");
++    assert_eq!((client.sent, client.received), (0, 0));
++    assert_eq!(client.send_busy, Duration::ZERO);
++    assert_eq!(client.receive_busy, Duration::ZERO);
++    Ok(())
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..5a34c5b
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,101 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++export PATH="/opt/cargo/bin:/root/.cargo/bin:${PATH}"
++export CARGO_HOME="${CARGO_HOME:-/opt/cargo}"
++export CARGO_NET_OFFLINE=true
++
++cd "$(dirname "$0")"
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path) OUTPUT_PATH="$2"; shift 2 ;;
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    base|new) MODE="$1"; shift ;;
++    *) echo "Usage: ./test.sh [--output_path <path>] {base|new}"; exit 1 ;;
++  esac
++done
++[ -z "$MODE" ] && { echo "Usage: ./test.sh [--output_path <path>] {base|new}"; exit 1; }
++[ -z "$OUTPUT_PATH" ] && OUTPUT_PATH="/tmp/report.xml"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++CLASSNAME="cargo-test"
++
++TESTCASES=""
++PASSED=0
++FAILED=0
++STATUS=0
++
++write_junit() {
++  cat > "$OUTPUT_PATH" <<XMLEOF
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites>
++  <testsuite name="turmoil" tests="$((PASSED + FAILED))" failures="${FAILED}" errors="0">
++${TESTCASES}  </testsuite>
++</testsuites>
++XMLEOF
++}
++
++collect() {
++  local line
++  while IFS= read -r line; do
++    if [[ "$line" =~ ^[[:space:]]*test\ ([^[:space:]]+)\ (-\ should\ panic\ )?\.\.\.\ ok ]]; then
++      TESTCASES+="    <testcase name=\"${BASH_REMATCH[1]}\" classname=\"${CLASSNAME}\" />"$'\n'
++      PASSED=$((PASSED + 1))
++    elif [[ "$line" =~ ^[[:space:]]*test\ ([^[:space:]]+)\ (-\ should\ panic\ )?\.\.\.\ FAILED ]]; then
++      TESTCASES+="    <testcase name=\"${BASH_REMATCH[1]}\" classname=\"${CLASSNAME}\"><failure message=\"test failed\"/></testcase>"$'\n'
++      FAILED=$((FAILED + 1))
++    fi
++  done <<< "$1"
++}
++
++synthesize_failures() {
++  local file="$1" sanitized fn
++  STATUS=1
++  sanitized=$(printf '%s' "$2" | tail -c 3000 | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/]]>/]] >/g')
++  while IFS= read -r fn; do
++    [ -z "$fn" ] && continue
++    TESTCASES+="    <testcase name=\"${fn}\" classname=\"${CLASSNAME}\"><failure message=\"build failed\"><![CDATA[${sanitized}]]></failure></testcase>"$'\n'
++    FAILED=$((FAILED + 1))
++  done < <(awk '/^#\[test\]/{t=1;next} t&&/^fn /{s=$0;sub(/^fn /,"",s);sub(/\(.*/,"",s);print s;t=0}' "$file")
++}
++
++run_suite() {
++  local out
++  out=$(eval "$1" 2>&1)
++  [ $? -ne 0 ] && STATUS=1
++  echo "$out"
++  collect "$out"
++}
++
++run_new_suite() {
++  local before=$((PASSED + FAILED)) out
++  out=$(eval "$1" 2>&1)
++  [ $? -ne 0 ] && STATUS=1
++  echo "$out"
++  collect "$out"
++  if [ $((PASSED + FAILED)) -eq "$before" ]; then
++    synthesize_failures "$2" "$out"
++  fi
++}
++
++case "$MODE" in
++  base)
++    run_suite "cargo test --workspace --exclude turmoil"
++    run_suite "cargo test -p turmoil --lib --test async_send_sync --test barriers --test dns --test fs --test io_uring_conformance --test io_uring_parity --test net --test tokio_io"
++    if [ "$((PASSED + FAILED))" -eq 0 ]; then
++      echo "no tests were discovered"
++      STATUS=1
++    fi
++    write_junit
++    exit $STATUS
++    ;;
++  new)
++    run_new_suite "cargo test -p turmoil --features regex --test capacity_e557d7" \
++      "crates/turmoil/tests/capacity_e557d7.rs"
++    write_junit
++    exit $STATUS
++    ;;
++esac

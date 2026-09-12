@@ -1,0 +1,570 @@
+diff --git a/crates/gitql-core/src/signature.rs b/crates/gitql-core/src/signature.rs
+index 297483c..79edb6f 100644
+--- a/crates/gitql-core/src/signature.rs
++++ b/crates/gitql-core/src/signature.rs
+@@ -81,3 +81,28 @@ impl Signature {
+         self
+     }
+ }
++
++/// Window functions that compute their result from the window definition's ordering key
++/// instead of user-supplied arguments, and therefore require an `ORDER BY` clause inside
++/// their `OVER(...)` window definition.
++pub fn order_key_required_window_functions() -> &'static [&'static str] {
++    &["rank", "dense_rank", "percent_rank", "cume_dist"]
++}
++
++/// Returns true if `function_name` is a window function whose frame is built from the
++/// window definition's ordering key rather than from its own call arguments.
++pub fn is_order_key_required_window_function(function_name: &str) -> bool {
++    order_key_required_window_functions().contains(&function_name)
++}
++
++/// Window functions that need the ordering key values for every row in the partition,
++/// not just the rows up to and including the current one, to compute their result.
++pub fn whole_partition_order_key_window_functions() -> &'static [&'static str] {
++    &["percent_rank", "cume_dist"]
++}
++
++/// Returns true if `function_name` is an order-key-required window function that must be
++/// evaluated against the entire ordered partition rather than a per-row cumulative sub-frame.
++pub fn is_whole_partition_order_key_window_function(function_name: &str) -> bool {
++    whole_partition_order_key_window_functions().contains(&function_name)
++}
+diff --git a/crates/gitql-engine/src/engine_window_functions.rs b/crates/gitql-engine/src/engine_window_functions.rs
+index 5caa492..04d6f7a 100644
+--- a/crates/gitql-engine/src/engine_window_functions.rs
++++ b/crates/gitql-engine/src/engine_window_functions.rs
+@@ -2,11 +2,15 @@ use std::collections::HashMap;
+ 
+ use gitql_ast::statement::GroupByStatement;
+ use gitql_ast::statement::WindowDefinition;
++use gitql_ast::statement::WindowFunction;
+ use gitql_ast::statement::WindowFunctionKind;
+ use gitql_ast::statement::WindowFunctionsStatement;
+ use gitql_ast::statement::WindowValue;
+ use gitql_core::environment::Environment;
+ use gitql_core::object::GitQLObject;
++use gitql_core::signature::is_order_key_required_window_function;
++use gitql_core::signature::is_whole_partition_order_key_window_function;
++use gitql_core::values::Value;
+ 
+ use crate::engine_evaluator::evaluate_expression;
+ use crate::engine_executor::resolve_actual_column_name;
+@@ -27,9 +31,6 @@ pub(crate) fn execute_window_functions_statement(
+         gitql_object.flat()
+     }
+ 
+-    let main_group = &mut gitql_object.groups[0];
+-    let rows_len = main_group.rows.len();
+-
+     // Evaluate Window functions
+     for (result_column_name, window_value) in statement.window_values.iter() {
+         if let WindowValue::Function(function) = window_value {
+@@ -40,51 +41,54 @@ pub(crate) fn execute_window_functions_statement(
+                 .position(|r| r.eq(&column_name))
+                 .unwrap();
+ 
+-            // Apply window definition to end up with frames
++            // Apply partitioning and ordering to end up with ordered partitions
+             apply_window_definition_on_gitql_object(
+                 env,
+                 gitql_object,
+                 &function.window_definition,
+             )?;
+ 
+-            // Run window function on each group
+-            let args_len = function.arguments.len();
+-            for frame_index in 0..gitql_object.len() {
+-                let mut frame_values = Vec::with_capacity(rows_len);
+-                let frame = &mut gitql_object.groups[frame_index];
+-                for row in frame.rows.iter_mut() {
+-                    let mut row_selected_values = Vec::with_capacity(args_len);
+-                    for argument in function.arguments.iter() {
+-                        let argument =
+-                            evaluate_expression(env, argument, &gitql_object.titles, &row.values)?;
+-                        row_selected_values.push(argument);
+-                    }
+-
+-                    frame_values.push(row_selected_values);
+-                }
++            let is_order_key_function =
++                is_order_key_required_window_function(&function.function_name);
++            let has_ordering = function.window_definition.ordering_clause.is_some();
++
++            if is_order_key_function && !has_ordering {
++                return Err(format!(
++                    "Window function `{}` requires an ordering clause to build its cumulative frame",
++                    function.function_name
++                ));
++            }
+ 
+-                if frame_values.is_empty() {
++            let use_cumulative_frame = has_ordering
++                && !is_whole_partition_order_key_window_function(&function.function_name);
++
++            for frame_index in 0..gitql_object.len() {
++                let partition_len = gitql_object.groups[frame_index].rows.len();
++                if partition_len == 0 {
+                     continue;
+                 }
+ 
+-                // Evaluate function for this frame
+-                match function.kind {
+-                    WindowFunctionKind::AggregatedWindowFunction => {
+-                        let aggregation_function =
+-                            env.aggregation_function(&function.function_name).unwrap();
+-                        let aggregated_value = aggregation_function(&frame_values);
+-                        for row in frame.rows.iter_mut() {
+-                            row.values[column_index] = aggregated_value.clone();
+-                        }
+-                    }
+-                    WindowFunctionKind::PureWindowFunction => {
+-                        let window_function = env.window_function(&function.function_name).unwrap();
+-                        let window_values = window_function(&frame_values);
+-                        for (index, value) in window_values.iter().enumerate() {
+-                            frame.rows[index].values[column_index] = value.clone();
+-                        }
+-                    }
+-                };
++                if use_cumulative_frame {
++                    apply_cumulative_window_function(
++                        env,
++                        gitql_object,
++                        frame_index,
++                        partition_len,
++                        column_index,
++                        function,
++                        is_order_key_function,
++                    )?;
++                } else {
++                    apply_whole_partition_window_function(
++                        env,
++                        gitql_object,
++                        frame_index,
++                        partition_len,
++                        column_index,
++                        function,
++                        is_order_key_function,
++                    )?;
++                }
+             }
+         }
+         gitql_object.flat();
+@@ -115,6 +119,144 @@ pub(crate) fn execute_window_functions_statement(
+     Ok(())
+ }
+ 
++// Row at position `row_index` is evaluated against rows `0..=row_index` of the ordered partition
++#[allow(clippy::too_many_arguments)]
++fn apply_cumulative_window_function(
++    env: &mut Environment,
++    gitql_object: &mut GitQLObject,
++    frame_index: usize,
++    partition_len: usize,
++    column_index: usize,
++    function: &WindowFunction,
++    is_order_key_function: bool,
++) -> Result<(), String> {
++    for row_index in 0..partition_len {
++        let frame_values = build_frame_values(
++            env,
++            gitql_object,
++            frame_index,
++            0,
++            row_index + 1,
++            function,
++            is_order_key_function,
++        )?;
++
++        if frame_values.is_empty() {
++            continue;
++        }
++
++        let result_value = evaluate_window_frame(env, function, &frame_values);
++        let target_row = &mut gitql_object.groups[frame_index].rows[row_index];
++        target_row.values[column_index] = result_value;
++    }
++
++    Ok(())
++}
++
++// Evaluated once against the whole partition and broadcast to every row. Used both for the
++// pre-cumulative broadcast behavior (no ORDER BY) and for order-key functions whose result
++// depends on the full partition size, not just the rows up to the current one
++#[allow(clippy::too_many_arguments)]
++fn apply_whole_partition_window_function(
++    env: &mut Environment,
++    gitql_object: &mut GitQLObject,
++    frame_index: usize,
++    partition_len: usize,
++    column_index: usize,
++    function: &WindowFunction,
++    is_order_key_function: bool,
++) -> Result<(), String> {
++    let frame_values = build_frame_values(
++        env,
++        gitql_object,
++        frame_index,
++        0,
++        partition_len,
++        function,
++        is_order_key_function,
++    )?;
++
++    if frame_values.is_empty() {
++        return Ok(());
++    }
++
++    match function.kind {
++        WindowFunctionKind::AggregatedWindowFunction => {
++            let aggregation_function = env.aggregation_function(&function.function_name).unwrap();
++            let aggregated_value = aggregation_function(&frame_values);
++            for row in gitql_object.groups[frame_index].rows.iter_mut() {
++                row.values[column_index] = aggregated_value.clone();
++            }
++        }
++        WindowFunctionKind::PureWindowFunction => {
++            let window_function = env.window_function(&function.function_name).unwrap();
++            let window_values = window_function(&frame_values);
++            for (index, value) in window_values.into_iter().enumerate() {
++                gitql_object.groups[frame_index].rows[index].values[column_index] = value;
++            }
++        }
++    };
++
++    Ok(())
++}
++
++// Order-key functions take no user-supplied arguments, so their frame is built from the
++// window definition's ordering key expressions instead of `function.arguments`
++fn build_frame_values(
++    env: &mut Environment,
++    gitql_object: &GitQLObject,
++    frame_index: usize,
++    start: usize,
++    end: usize,
++    function: &WindowFunction,
++    is_order_key_function: bool,
++) -> Result<Vec<Vec<Box<dyn Value>>>, String> {
++    let rows = &gitql_object.groups[frame_index].rows[start..end];
++
++    let key_expressions: Vec<_> = if is_order_key_function {
++        function
++            .window_definition
++            .ordering_clause
++            .as_ref()
++            .map(|ordering| ordering.order_by.arguments.iter().collect())
++            .unwrap_or_default()
++    } else {
++        function.arguments.iter().collect()
++    };
++
++    let mut frame_values = Vec::with_capacity(rows.len());
++    for row in rows {
++        let mut row_selected_values = Vec::with_capacity(key_expressions.len());
++        for expression in key_expressions.iter() {
++            let value = evaluate_expression(env, expression, &gitql_object.titles, &row.values)?;
++            row_selected_values.push(value);
++        }
++        frame_values.push(row_selected_values);
++    }
++
++    Ok(frame_values)
++}
++
++// Under cumulative framing every earlier row already has its own (smaller) frame's
++// result assigned from a prior iteration, so only the last element is needed here
++fn evaluate_window_frame(
++    env: &mut Environment,
++    function: &WindowFunction,
++    frame_values: &[Vec<Box<dyn Value>>],
++) -> Box<dyn Value> {
++    match function.kind {
++        WindowFunctionKind::AggregatedWindowFunction => {
++            let aggregation_function = env.aggregation_function(&function.function_name).unwrap();
++            aggregation_function(frame_values)
++        }
++        WindowFunctionKind::PureWindowFunction => {
++            let window_function = env.window_function(&function.function_name).unwrap();
++            let mut values = window_function(frame_values);
++            values.pop().unwrap()
++        }
++    }
++}
++
+ fn apply_window_definition_on_gitql_object(
+     env: &mut Environment,
+     gitql_object: &mut GitQLObject,
+diff --git a/crates/gitql-parser/src/parse_function_call.rs b/crates/gitql-parser/src/parse_function_call.rs
+index 6ef9d10..460b612 100644
+--- a/crates/gitql-parser/src/parse_function_call.rs
++++ b/crates/gitql-parser/src/parse_function_call.rs
+@@ -11,6 +11,7 @@ use gitql_ast::statement::WindowOrderingClause;
+ use gitql_ast::statement::WindowPartitioningClause;
+ use gitql_ast::statement::WindowValue;
+ use gitql_core::environment::Environment;
++use gitql_core::signature::is_order_key_required_window_function;
+ 
+ use crate::context::ParserContext;
+ use crate::diagnostic::Diagnostic;
+@@ -249,6 +250,18 @@ pub(crate) fn parse_function_call_expression(
+ 
+                 let order_clauses = parse_over_window_definition(context, env, tokens, position)?;
+ 
++                // A named window's ordering clause is only known once it is resolved against
++                // `WINDOW ... AS (...)` later in `parse_gql`, so the ORDER BY requirement for
++                // order-key-required functions is checked there, not here.
++                if order_clauses.name.is_none()
++                    && is_order_key_required_window_function(function_name)
++                    && order_clauses.ordering_clause.is_none()
++                {
++                    return Err(order_key_required_diagnostic(function_name)
++                        .with_location(function_name_location)
++                        .as_boxed());
++                }
++
+                 let function = WindowFunction {
+                     function_name: function_name.to_string(),
+                     arguments,
+@@ -288,6 +301,16 @@ pub(crate) fn parse_function_call_expression(
+     parse_member_access_expression(context, env, tokens, position)
+ }
+ 
++pub(crate) fn order_key_required_diagnostic(function_name: &str) -> Diagnostic {
++    Diagnostic::error(&format!(
++        "Window function `{function_name}` requires an `ORDER BY` clause inside its `OVER(...)` window definition",
++    ))
++    .add_help(&format!(
++        "Add `ORDER BY` inside `{function_name}(...) OVER(...)` to define the ordering its result is computed from",
++    ))
++    .add_note("Rank and distribution window functions are derived from row position, not from an explicit argument")
++}
++
+ pub(crate) fn parse_over_window_definition(
+     context: &mut ParserContext,
+     env: &mut Environment,
+diff --git a/crates/gitql-parser/src/parser.rs b/crates/gitql-parser/src/parser.rs
+index 6f44d2b..07c4db0 100644
+--- a/crates/gitql-parser/src/parser.rs
++++ b/crates/gitql-parser/src/parser.rs
+@@ -26,12 +26,14 @@ use gitql_ast::types::row::RowType;
+ use gitql_ast::types::undefined::UndefType;
+ use gitql_ast::types::DataType;
+ use gitql_core::environment::Environment;
++use gitql_core::signature::is_order_key_required_window_function;
+ 
+ use crate::context::ParserContext;
+ use crate::diagnostic::Diagnostic;
+ use crate::name_similarity::find_closeest_string;
+ use crate::parse_cast::parse_cast_call_expression;
+ use crate::parse_comparisons::parse_comparison_expression;
++use crate::parse_function_call::order_key_required_diagnostic;
+ use crate::parse_function_call::parse_function_call_expression;
+ use crate::parse_function_call::parse_over_window_definition;
+ use crate::parse_interval::parse_interval_expression;
+@@ -457,6 +459,14 @@ fn parse_select_query(
+                     }
+ 
+                     function.window_definition = context.named_window_clauses[window_name].clone();
++
++                    if is_order_key_required_window_function(&function.function_name)
++                        && function.window_definition.ordering_clause.is_none()
++                    {
++                        return Err(
++                            order_key_required_diagnostic(&function.function_name).as_boxed()
++                        );
++                    }
+                 }
+             }
+         }
+diff --git a/crates/gitql-std/src/window.rs b/crates/gitql-std/src/window.rs
+index a8e3120..66ca9bf 100644
+--- a/crates/gitql-std/src/window.rs
++++ b/crates/gitql-std/src/window.rs
+@@ -3,9 +3,11 @@ use std::sync::OnceLock;
+ 
+ use gitql_ast::types::any::AnyType;
+ use gitql_ast::types::dynamic::DynamicType;
++use gitql_ast::types::float::FloatType;
+ use gitql_ast::types::integer::IntType;
+ use gitql_core::signature::Signature;
+ use gitql_core::signature::WindowFunction;
++use gitql_core::values::float::FloatValue;
+ use gitql_core::values::integer::IntValue;
+ use gitql_core::values::null::NullValue;
+ use gitql_core::values::Value;
+@@ -20,6 +22,10 @@ pub fn window_functions() -> &'static HashMap<&'static str, WindowFunction> {
+         map.insert("nth_value", window_nth_value);
+         map.insert("last_value", window_last_value);
+         map.insert("row_number", window_row_number);
++        map.insert("rank", window_rank);
++        map.insert("dense_rank", window_dense_rank);
++        map.insert("percent_rank", window_percent_rank);
++        map.insert("cume_dist", window_cume_dist);
+         map
+     })
+ }
+@@ -63,6 +69,38 @@ pub fn window_function_signatures() -> HashMap<&'static str, Signature> {
+             return_type: Box::new(IntType),
+         },
+     );
++
++    map.insert(
++        "rank",
++        Signature {
++            parameters: vec![],
++            return_type: Box::new(IntType),
++        },
++    );
++
++    map.insert(
++        "dense_rank",
++        Signature {
++            parameters: vec![],
++            return_type: Box::new(IntType),
++        },
++    );
++
++    map.insert(
++        "percent_rank",
++        Signature {
++            parameters: vec![],
++            return_type: Box::new(FloatType),
++        },
++    );
++
++    map.insert(
++        "cume_dist",
++        Signature {
++            parameters: vec![],
++            return_type: Box::new(FloatType),
++        },
++    );
+     map
+ }
+ 
+@@ -111,3 +149,123 @@ pub fn window_row_number(frame: &[Vec<Box<dyn Value>>]) -> Vec<Box<dyn Value>> {
+     }
+     values
+ }
++
++fn ordering_keys_equal(left: &[Box<dyn Value>], right: &[Box<dyn Value>]) -> bool {
++    left.len() == right.len()
++        && left
++            .iter()
++            .zip(right)
++            .all(|(left, right)| left.equals(right))
++}
++
++fn broadcast_rank(frame_len: usize, rank: i64) -> Vec<Box<dyn Value>> {
++    let mut values: Vec<Box<dyn Value>> = Vec::with_capacity(frame_len);
++    for _ in 0..frame_len {
++        values.push(Box::new(IntValue { value: rank }));
++    }
++    values
++}
++
++fn count_trailing_tied(frame: &[Vec<Box<dyn Value>>], current_key: &[Box<dyn Value>]) -> usize {
++    let mut tied = 0usize;
++    for row in frame.iter().rev() {
++        if ordering_keys_equal(row, current_key) {
++            tied += 1;
++        } else {
++            break;
++        }
++    }
++    tied
++}
++
++fn count_distinct_groups_before(
++    frame: &[Vec<Box<dyn Value>>],
++    current_key: &[Box<dyn Value>],
++) -> i64 {
++    let frame_len = frame.len();
++    let mut distinct_lesser = 0i64;
++    let mut index = 0;
++    while index < frame_len {
++        let group_key = &frame[index];
++        if ordering_keys_equal(group_key, current_key) {
++            break;
++        }
++
++        distinct_lesser += 1;
++        index += 1;
++        while index < frame_len && ordering_keys_equal(&frame[index], group_key) {
++            index += 1;
++        }
++    }
++    distinct_lesser
++}
++
++pub fn window_rank(frame: &[Vec<Box<dyn Value>>]) -> Vec<Box<dyn Value>> {
++    let frame_len = frame.len();
++    let current_key = &frame[frame_len - 1];
++    let tied = count_trailing_tied(frame, current_key);
++    let rank = (frame_len - tied + 1) as i64;
++    broadcast_rank(frame_len, rank)
++}
++
++pub fn window_dense_rank(frame: &[Vec<Box<dyn Value>>]) -> Vec<Box<dyn Value>> {
++    let frame_len = frame.len();
++    let current_key = &frame[frame_len - 1];
++    let rank = count_distinct_groups_before(frame, current_key) + 1;
++    broadcast_rank(frame_len, rank)
++}
++
++fn ranks_within_partition(frame: &[Vec<Box<dyn Value>>]) -> Vec<i64> {
++    let frame_len = frame.len();
++    let mut ranks: Vec<i64> = Vec::with_capacity(frame_len);
++    let mut index = 0;
++    while index < frame_len {
++        let group_key = &frame[index];
++        let mut group_end = index + 1;
++        while group_end < frame_len && ordering_keys_equal(&frame[group_end], group_key) {
++            group_end += 1;
++        }
++
++        let rank = index as i64 + 1;
++        for _ in index..group_end {
++            ranks.push(rank);
++        }
++        index = group_end;
++    }
++    ranks
++}
++
++pub fn window_percent_rank(frame: &[Vec<Box<dyn Value>>]) -> Vec<Box<dyn Value>> {
++    let frame_len = frame.len();
++    let ranks = ranks_within_partition(frame);
++    let mut values: Vec<Box<dyn Value>> = Vec::with_capacity(frame_len);
++    for rank in ranks {
++        let percent = if frame_len <= 1 {
++            0.0
++        } else {
++            (rank - 1) as f64 / (frame_len - 1) as f64
++        };
++        values.push(Box::new(FloatValue::new(percent)));
++    }
++    values
++}
++
++pub fn window_cume_dist(frame: &[Vec<Box<dyn Value>>]) -> Vec<Box<dyn Value>> {
++    let frame_len = frame.len();
++    let mut values: Vec<Box<dyn Value>> = Vec::with_capacity(frame_len);
++    let mut index = 0;
++    while index < frame_len {
++        let group_key = &frame[index];
++        let mut group_end = index + 1;
++        while group_end < frame_len && ordering_keys_equal(&frame[group_end], group_key) {
++            group_end += 1;
++        }
++
++        let dist = group_end as f64 / frame_len as f64;
++        for _ in index..group_end {
++            values.push(Box::new(FloatValue::new(dist)));
++        }
++        index = group_end;
++    }
++    values
++}

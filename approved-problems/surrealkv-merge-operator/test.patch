@@ -1,0 +1,994 @@
+diff --git a/.config/nextest.toml b/.config/nextest.toml
+new file mode 100644
+index 0000000..f2db926
+--- /dev/null
++++ b/.config/nextest.toml
+@@ -0,0 +1,6 @@
++[profile.ci]
++fail-fast = false
++retries = 2
++
++[profile.ci.junit]
++path = "junit.xml"
+diff --git a/Cargo.toml b/Cargo.toml
+index 903487c..66670f1 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -42,6 +42,9 @@ fs2 = "0.4.3"
+ [target.'cfg(target_family = "wasm")'.dependencies]
+ getrandom = { version = "0.3.3", features = ["wasm_js"] }
+ 
++[features]
++merge_op_tests = []
++
+ [dev-dependencies]
+ tempdir = "0.3"
+ criterion = { version = "0.5.1", features = ["html_reports"] }
+diff --git a/src/test/merge_fold_behavior.rs b/src/test/merge_fold_behavior.rs
+new file mode 100644
+index 0000000..6cbe83a
+--- /dev/null
++++ b/src/test/merge_fold_behavior.rs
+@@ -0,0 +1,860 @@
++use std::collections::{BTreeMap, BTreeSet};
++use std::sync::Arc;
++
++use proptest::prelude::*;
++use tempdir::TempDir;
++use test_log::test;
++
++use crate::clock::MockLogicalClock;
++use crate::compaction::leveled::Strategy as LeveledStrategy;
++use crate::compaction::CompactionStrategy;
++use crate::lsm::Tree;
++use crate::test::{collect_transaction_all, collect_transaction_reverse};
++use crate::{LSMIterator, Mode, Options, Transaction};
++
++fn temp() -> TempDir {
++	TempDir::new("merge_fold").unwrap()
++}
++
++fn open(td: &TempDir) -> Tree {
++	let mut opts = Options {
++		path: td.path().to_path_buf(),
++		..Default::default()
++	};
++	opts.level_count = 3;
++	opts.level0_max_files = 4;
++	opts.l0_stall_threshold = 12;
++	opts.max_memtable_size = 1 << 20;
++	Tree::new(Arc::new(opts)).unwrap()
++}
++
++fn open_versioned(td: &TempDir) -> Tree {
++	let mut opts = Options {
++		path: td.path().to_path_buf(),
++		..Default::default()
++	};
++	opts.level_count = 3;
++	opts.enable_versioning = true;
++	opts.enable_vlog = true;
++	opts.vlog_value_threshold = 0;
++	Tree::new(Arc::new(opts)).unwrap()
++}
++
++fn open_for_compaction(td: &TempDir) -> Tree {
++	let mut opts = Options {
++		path: td.path().to_path_buf(),
++		..Default::default()
++	};
++	opts.level_count = 2;
++	opts.level0_max_files = 1;
++	opts.l0_stall_threshold = 12;
++	opts.max_memtable_size = 1 << 20;
++	Tree::new(Arc::new(opts)).unwrap()
++}
++
++fn open_versioned_compaction(td: &TempDir) -> Tree {
++	let mut opts = Options {
++		path: td.path().to_path_buf(),
++		..Default::default()
++	};
++	opts.level_count = 2;
++	opts.level0_max_files = 1;
++	opts.l0_stall_threshold = 12;
++	opts.max_memtable_size = 1 << 20;
++	opts.enable_versioning = true;
++	opts.enable_vlog = true;
++	opts.vlog_value_threshold = 0;
++	Tree::new(Arc::new(opts)).unwrap()
++}
++
++fn open_versioned_clock(td: &TempDir) -> (Tree, Arc<MockLogicalClock>) {
++	let clock = Arc::new(MockLogicalClock::new());
++	let mut opts = Options {
++		path: td.path().to_path_buf(),
++		..Default::default()
++	};
++	opts.level_count = 3;
++	opts.enable_versioning = true;
++	opts.enable_vlog = true;
++	opts.vlog_value_threshold = 0;
++	opts.clock = Arc::clone(&clock) as Arc<dyn crate::clock::LogicalClock>;
++	(Tree::new(Arc::new(opts)).unwrap(), clock)
++}
++
++fn open_versioned_compaction_clock(td: &TempDir) -> (Tree, Arc<MockLogicalClock>) {
++	let clock = Arc::new(MockLogicalClock::new());
++	let mut opts = Options {
++		path: td.path().to_path_buf(),
++		..Default::default()
++	};
++	opts.level_count = 2;
++	opts.level0_max_files = 1;
++	opts.l0_stall_threshold = 12;
++	opts.max_memtable_size = 1 << 20;
++	opts.enable_versioning = true;
++	opts.enable_vlog = true;
++	opts.vlog_value_threshold = 0;
++	opts.clock = Arc::clone(&clock) as Arc<dyn crate::clock::LogicalClock>;
++	(Tree::new(Arc::new(opts)).unwrap(), clock)
++}
++
++fn force_compact(tree: &Tree) {
++	let strategy: Arc<dyn CompactionStrategy> =
++		Arc::new(LeveledStrategy::from_options(Arc::clone(&tree.core.inner.opts)));
++	for _ in 0..8 {
++		tree.compact(Arc::clone(&strategy)).unwrap();
++	}
++}
++
++fn pinned_reader(tree: &Tree) -> Transaction {
++	let tx = tree.begin_with_mode(Mode::ReadOnly).unwrap();
++	let current = tree.core.seq_num();
++	tree.core.commit_pipeline.set_seq_num(current + 1);
++	tx
++}
++
++fn add(v: u64) -> Vec<u8> {
++	let mut o = vec![0u8];
++	o.extend_from_slice(&v.to_le_bytes());
++	o
++}
++
++fn min_op(v: u64) -> Vec<u8> {
++	let mut o = vec![1u8];
++	o.extend_from_slice(&v.to_le_bytes());
++	o
++}
++
++fn max_op(v: u64) -> Vec<u8> {
++	let mut o = vec![2u8];
++	o.extend_from_slice(&v.to_le_bytes());
++	o
++}
++
++fn baseval(n: u64) -> Vec<u8> {
++	n.to_le_bytes().to_vec()
++}
++
++fn read_u64(v: &[u8]) -> u64 {
++	let mut b = [0u8; 8];
++	b.copy_from_slice(&v[..8]);
++	u64::from_le_bytes(b)
++}
++
++async fn put(tree: &Tree, key: &[u8], v: u64) {
++	let mut tx = tree.begin().unwrap();
++	tx.set(key, baseval(v)).unwrap();
++	tx.commit().await.unwrap();
++}
++
++async fn put_at(tree: &Tree, key: &[u8], v: u64, ts: u64) {
++	let mut tx = tree.begin().unwrap();
++	tx.set_at(key, baseval(v), ts).unwrap();
++	tx.commit().await.unwrap();
++}
++
++async fn merge(tree: &Tree, key: &[u8], operand: Vec<u8>) {
++	let mut tx = tree.begin().unwrap();
++	tx.merge(key, operand).unwrap();
++	tx.commit().await.unwrap();
++}
++
++async fn merge_at(tree: &Tree, clock: &MockLogicalClock, key: &[u8], operand: Vec<u8>, ts: u64) {
++	clock.set_time(ts);
++	let mut tx = tree.begin().unwrap();
++	tx.merge(key, operand).unwrap();
++	tx.commit().await.unwrap();
++}
++
++async fn delete(tree: &Tree, key: &[u8]) {
++	let mut tx = tree.begin().unwrap();
++	tx.delete(key).unwrap();
++	tx.commit().await.unwrap();
++}
++
++fn get(tree: &Tree, key: &[u8]) -> Option<u64> {
++	let tx = tree.begin().unwrap();
++	tx.get(key).unwrap().map(|v| read_u64(&v))
++}
++
++fn scan_fwd(tree: &Tree, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, u64)> {
++	let tx = tree.begin().unwrap();
++	let pairs = collect_transaction_all(&mut tx.range(start, end).unwrap()).unwrap();
++	pairs.into_iter().map(|(k, v)| (k, read_u64(&v))).collect()
++}
++
++fn scan_bwd(tree: &Tree, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, u64)> {
++	let tx = tree.begin().unwrap();
++	let pairs = collect_transaction_reverse(&mut tx.range(start, end).unwrap()).unwrap();
++	pairs.into_iter().map(|(k, v)| (k, read_u64(&v))).collect()
++}
++
++#[test(tokio::test)]
++async fn basic_add_fold() {
++	let td = temp();
++	let tree = open(&td);
++	for _ in 0..3 {
++		merge(&tree, b"k", add(2)).await;
++	}
++	assert_eq!(get(&tree, b"k"), Some(6));
++}
++
++#[test(tokio::test)]
++async fn folded_reads_are_8_bytes() {
++	let td = temp();
++	let tree = open_versioned(&td);
++	put(&tree, b"k", 5).await;
++	merge(&tree, b"k", add(10)).await;
++	merge(&tree, b"k", min_op(8)).await;
++
++	let tx = tree.begin().unwrap();
++	assert_eq!(tx.get(b"k").unwrap().unwrap().len(), 8);
++	assert_eq!(tx.get_at(b"k", u64::MAX).unwrap().unwrap().len(), 8);
++
++	let fwd = collect_transaction_all(&mut tx.range(b"k", b"l").unwrap()).unwrap();
++	assert_eq!(fwd.len(), 1);
++	for (_, v) in &fwd {
++		assert_eq!(v.len(), 8);
++	}
++	let bwd = collect_transaction_reverse(&mut tx.range(b"k", b"l").unwrap()).unwrap();
++	assert_eq!(bwd.len(), 1);
++	for (_, v) in &bwd {
++		assert_eq!(v.len(), 8);
++	}
++
++	let mut it = tx.history(b"k", b"l").unwrap();
++	it.seek_first().unwrap();
++	let mut seen = 0;
++	while it.valid() {
++		assert_eq!(it.value().unwrap().len(), 8);
++		seen += 1;
++		if !it.next().unwrap() {
++			break;
++		}
++	}
++	assert_eq!(seen, 2);
++}
++
++#[test(tokio::test)]
++async fn min_basic_both_orders() {
++	let td = temp();
++	let tree = open(&td);
++	put(&tree, b"k", 50).await;
++	merge(&tree, b"k", min_op(30)).await;
++	merge(&tree, b"k", min_op(40)).await;
++	assert_eq!(get(&tree, b"k"), Some(30));
++
++	let td2 = temp();
++	let t2 = open(&td2);
++	put(&t2, b"k", 50).await;
++	merge(&t2, b"k", min_op(40)).await;
++	merge(&t2, b"k", min_op(30)).await;
++	assert_eq!(get(&t2, b"k"), Some(30));
++}
++
++#[test(tokio::test)]
++async fn max_basic_both_orders() {
++	let td = temp();
++	let tree = open(&td);
++	put(&tree, b"k", 5).await;
++	merge(&tree, b"k", max_op(30)).await;
++	merge(&tree, b"k", max_op(20)).await;
++	assert_eq!(get(&tree, b"k"), Some(30));
++
++	let td2 = temp();
++	let t2 = open(&td2);
++	put(&t2, b"k", 5).await;
++	merge(&t2, b"k", max_op(20)).await;
++	merge(&t2, b"k", max_op(30)).await;
++	assert_eq!(get(&t2, b"k"), Some(30));
++}
++
++#[test(tokio::test)]
++async fn mixed_op_order() {
++	let td = temp();
++	let tree = open(&td);
++	put(&tree, b"k", 5).await;
++	merge(&tree, b"k", add(2)).await;
++	merge(&tree, b"k", add(3)).await;
++	merge(&tree, b"k", min_op(4)).await;
++	merge(&tree, b"k", add(1)).await;
++	assert_eq!(get(&tree, b"k"), Some(5));
++}
++
++#[test(tokio::test)]
++async fn base_then_merges() {
++	let td = temp();
++	let tree = open(&td);
++	put(&tree, b"k", 10).await;
++	merge(&tree, b"k", add(5)).await;
++	merge(&tree, b"k", max_op(20)).await;
++	assert_eq!(get(&tree, b"k"), Some(20));
++}
++
++#[test(tokio::test)]
++async fn absent_base_zero() {
++	let td = temp();
++	let tree = open(&td);
++	merge(&tree, b"k", add(3)).await;
++	merge(&tree, b"k", max_op(10)).await;
++	assert_eq!(get(&tree, b"k"), Some(10));
++	assert_eq!(scan_fwd(&tree, b"k", b"l"), vec![(b"k".to_vec(), 10)]);
++	assert_eq!(scan_bwd(&tree, b"k", b"l"), vec![(b"k".to_vec(), 10)]);
++
++	let td2 = temp();
++	let t2 = open(&td2);
++	merge(&t2, b"k", add(7)).await;
++	assert_eq!(get(&t2, b"k"), Some(7));
++	assert_eq!(scan_fwd(&t2, b"k", b"l"), vec![(b"k".to_vec(), 7)]);
++	assert_eq!(scan_bwd(&t2, b"k", b"l"), vec![(b"k".to_vec(), 7)]);
++
++	let td3 = temp();
++	let t3 = open_versioned(&td3);
++	merge(&t3, b"k", add(7)).await;
++	let tx3 = t3.begin().unwrap();
++	assert_eq!(tx3.get_at(b"k", u64::MAX).unwrap().map(|v| read_u64(&v)), Some(7));
++	assert_eq!(scan_fwd(&t3, b"k", b"l"), vec![(b"k".to_vec(), 7)]);
++	assert_eq!(scan_bwd(&t3, b"k", b"l"), vec![(b"k".to_vec(), 7)]);
++}
++
++#[test(tokio::test)]
++async fn delete_resets_then_merge() {
++	let td = temp();
++	let tree = open(&td);
++	put(&tree, b"k", 5).await;
++	delete(&tree, b"k").await;
++	merge(&tree, b"k", add(3)).await;
++	assert_eq!(get(&tree, b"k"), Some(3));
++	assert_eq!(scan_fwd(&tree, b"k", b"l"), vec![(b"k".to_vec(), 3)]);
++	assert_eq!(scan_bwd(&tree, b"k", b"l"), vec![(b"k".to_vec(), 3)]);
++
++	let tdv = temp();
++	let tv = open_versioned(&tdv);
++	put(&tv, b"k", 5).await;
++	delete(&tv, b"k").await;
++	merge(&tv, b"k", add(3)).await;
++	let tx = tv.begin().unwrap();
++	assert_eq!(tx.get_at(b"k", u64::MAX).unwrap().map(|v| read_u64(&v)), Some(3));
++	let tx2 = tv.begin().unwrap();
++	let hf = hist_set(&mut tx2.history(b"k", b"l").unwrap(), true);
++	assert_eq!(hf, BTreeSet::from([3u64]));
++	let tx3 = tv.begin().unwrap();
++	let hb = hist_set(&mut tx3.history(b"k", b"l").unwrap(), false);
++	assert_eq!(hb, BTreeSet::from([3u64]));
++}
++
++#[test(tokio::test)]
++async fn later_put_replaces() {
++	let td = temp();
++	let tree = open(&td);
++	merge(&tree, b"k", add(7)).await;
++	put(&tree, b"k", 2).await;
++	assert_eq!(get(&tree, b"k"), Some(2));
++	merge(&tree, b"k", add(3)).await;
++	assert_eq!(get(&tree, b"k"), Some(5));
++}
++
++#[test(tokio::test)]
++async fn regular_key_untouched() {
++	let td = temp();
++	let tree = open(&td);
++	put(&tree, b"a", 42).await;
++	put(&tree, b"b", 7).await;
++	delete(&tree, b"b").await;
++	assert_eq!(get(&tree, b"a"), Some(42));
++	assert_eq!(get(&tree, b"b"), None);
++	assert_eq!(scan_fwd(&tree, b"a", b"z"), vec![(b"a".to_vec(), 42)]);
++}
++
++#[test(tokio::test)]
++async fn ryow_uncommitted() {
++	let td = temp();
++	let tree = open(&td);
++	put(&tree, b"k", 5).await;
++	let mut tx = tree.begin().unwrap();
++	tx.merge(b"k", add(2)).unwrap();
++	tx.merge(b"k", max_op(100)).unwrap();
++	assert_eq!(tx.get(b"k").unwrap().map(|v| read_u64(&v)), Some(100));
++	let fwd = collect_transaction_all(&mut tx.range(b"k", b"l").unwrap()).unwrap();
++	assert_eq!(
++		fwd.into_iter().map(|(k, v)| (k, read_u64(&v))).collect::<Vec<_>>(),
++		vec![(b"k".to_vec(), 100)]
++	);
++}
++
++#[test(tokio::test)]
++async fn ryow_get_at_uncommitted() {
++	let td = temp();
++	let tree = open_versioned(&td);
++	put_at(&tree, b"k", 10, 50).await;
++	let mut tx = tree.begin().unwrap();
++	tx.merge(b"k", add(3)).unwrap();
++	tx.merge(b"k", add(7)).unwrap();
++	assert_eq!(tx.get_at(b"k", 100).unwrap().map(|v| read_u64(&v)), Some(20));
++}
++
++#[test(tokio::test)]
++async fn mvcc_as_of() {
++	let td = temp();
++	let tree = open_versioned(&td);
++	put_at(&tree, b"k", 10, 50).await;
++	merge(&tree, b"k", add(5)).await;
++	merge(&tree, b"k", max_op(20)).await;
++	let s0 = pinned_reader(&tree);
++	merge(&tree, b"k", add(1000)).await;
++	assert_eq!(get(&tree, b"k"), Some(1020));
++	assert_eq!(s0.get(b"k").unwrap().map(|v| read_u64(&v)), Some(20));
++
++	assert_eq!(s0.get_at(b"k", u64::MAX).unwrap().map(|v| read_u64(&v)), Some(20));
++	let live = tree.begin().unwrap();
++	assert_eq!(live.get_at(b"k", u64::MAX).unwrap().map(|v| read_u64(&v)), Some(1020));
++
++	let s0_fwd = collect_transaction_all(&mut s0.range(b"k", b"l").unwrap()).unwrap();
++	assert_eq!(s0_fwd.iter().map(|(_, v)| read_u64(v)).collect::<Vec<_>>(), vec![20]);
++	let s0_bwd = collect_transaction_reverse(&mut s0.range(b"k", b"l").unwrap()).unwrap();
++	assert_eq!(s0_bwd.iter().map(|(_, v)| read_u64(v)).collect::<Vec<_>>(), vec![20]);
++	assert_eq!(scan_fwd(&tree, b"k", b"l"), vec![(b"k".to_vec(), 1020)]);
++	assert_eq!(scan_bwd(&tree, b"k", b"l"), vec![(b"k".to_vec(), 1020)]);
++
++	let s0_hist = hist_set(&mut s0.history(b"k", b"l").unwrap(), true);
++	assert!(s0_hist.contains(&20));
++	assert!(!s0_hist.contains(&1020));
++	let lh = tree.begin().unwrap();
++	let live_hist = hist_set(&mut lh.history(b"k", b"l").unwrap(), true);
++	assert!(live_hist.contains(&1020));
++}
++
++#[test(tokio::test)]
++async fn scan_fold_fwd_bwd() {
++	let td = temp();
++	let tree = open(&td);
++	for k in [b"a", b"b", b"c"] {
++		put(&tree, k.as_slice(), 1).await;
++		merge(&tree, k.as_slice(), add(10)).await;
++		merge(&tree, k.as_slice(), max_op(100)).await;
++	}
++	assert_eq!(
++		scan_fwd(&tree, b"a", b"d"),
++		vec![(b"a".to_vec(), 100), (b"b".to_vec(), 100), (b"c".to_vec(), 100)]
++	);
++	assert_eq!(
++		scan_bwd(&tree, b"a", b"d"),
++		vec![(b"c".to_vec(), 100), (b"b".to_vec(), 100), (b"a".to_vec(), 100)]
++	);
++}
++
++#[test(tokio::test)]
++async fn history_fold_fwd_bwd() {
++	let td = temp();
++	let tree = open_versioned(&td);
++	put(&tree, b"k", 5).await;
++	merge(&tree, b"k", add(10)).await;
++	merge(&tree, b"k", min_op(8)).await;
++
++	let tx = tree.begin().unwrap();
++	let fwd = hist_set(&mut tx.history(b"k", b"l").unwrap(), true);
++	assert_eq!(fwd, BTreeSet::from([5u64, 8]));
++
++	let tx2 = tree.begin().unwrap();
++	let bwd = hist_set(&mut tx2.history(b"k", b"l").unwrap(), false);
++	assert_eq!(bwd, BTreeSet::from([5u64, 8]));
++
++	let tx3 = tree.begin().unwrap();
++	let fwd_ord = hist_vec(&mut tx3.history(b"k", b"l").unwrap(), true);
++	assert_eq!(fwd_ord, vec![8u64, 5]);
++	let tx4 = tree.begin().unwrap();
++	let bwd_ord = hist_vec(&mut tx4.history(b"k", b"l").unwrap(), false);
++	let mut expected = fwd_ord.clone();
++	expected.reverse();
++	assert_eq!(bwd_ord, expected);
++}
++
++fn hist_vec(it: &mut impl LSMIterator, forward: bool) -> Vec<u64> {
++	if forward {
++		it.seek_first().unwrap();
++	} else {
++		it.seek_last().unwrap();
++	}
++	let mut out = Vec::new();
++	while it.valid() {
++		out.push(read_u64(&it.value().unwrap()));
++		let advanced = if forward { it.next().unwrap() } else { it.prev().unwrap() };
++		if !advanced {
++			break;
++		}
++	}
++	out
++}
++
++fn hist_set(it: &mut impl LSMIterator, forward: bool) -> BTreeSet<u64> {
++	if forward {
++		it.seek_first().unwrap();
++	} else {
++		it.seek_last().unwrap();
++	}
++	let mut out = BTreeSet::new();
++	while it.valid() {
++		out.insert(read_u64(&it.value().unwrap()));
++		let advanced = if forward { it.next().unwrap() } else { it.prev().unwrap() };
++		if !advanced {
++			break;
++		}
++	}
++	out
++}
++
++#[test(tokio::test)]
++async fn ryow_history_uncommitted() {
++	let td = temp();
++	let tree = open_versioned(&td);
++	put(&tree, b"k", 5).await;
++
++	let mut tx = tree.begin().unwrap();
++	tx.merge(b"k", add(10)).unwrap();
++	tx.merge(b"k", min_op(8)).unwrap();
++
++	let fwd = hist_set(&mut tx.history(b"k", b"l").unwrap(), true);
++	assert_eq!(fwd, BTreeSet::from([5u64, 8]));
++
++	let bwd = hist_set(&mut tx.history(b"k", b"l").unwrap(), false);
++	assert_eq!(bwd, BTreeSet::from([5u64, 8]));
++}
++
++#[test(tokio::test)]
++async fn non_bottom_compaction_preserves_base() {
++	let td = temp();
++	let mut opts = Options {
++		path: td.path().to_path_buf(),
++		..Default::default()
++	};
++	opts.level_count = 3;
++	opts.level0_max_files = 1;
++	opts.l0_stall_threshold = 12;
++	opts.max_memtable_size = 1 << 20;
++	let tree = Tree::new(Arc::new(opts)).unwrap();
++
++	put(&tree, b"k", 100).await;
++	tree.flush().unwrap();
++	merge(&tree, b"k", add(5)).await;
++	merge(&tree, b"k", add(7)).await;
++	tree.flush().unwrap();
++
++	let strategy: Arc<dyn CompactionStrategy> =
++		Arc::new(LeveledStrategy::from_options(Arc::clone(&tree.core.inner.opts)));
++	tree.compact(Arc::clone(&strategy)).unwrap();
++
++	assert_eq!(get(&tree, b"k"), Some(112));
++}
++
++#[test(tokio::test)]
++async fn get_at_after_compaction_versioned() {
++	let td = temp();
++	let tree = open_versioned_compaction(&td);
++
++	put_at(&tree, b"k", 5, 10).await;
++	tree.flush().unwrap();
++	merge(&tree, b"k", add(10)).await;
++	merge(&tree, b"k", min_op(8)).await;
++	tree.flush().unwrap();
++	force_compact(&tree);
++
++	assert_eq!(get(&tree, b"k"), Some(8));
++	let tx = tree.begin().unwrap();
++	assert_eq!(tx.get_at(b"k", 15).unwrap().map(|v| read_u64(&v)), Some(5));
++	assert_eq!(tx.get_at(b"k", u64::MAX).unwrap().map(|v| read_u64(&v)), Some(8));
++}
++
++#[test(tokio::test)]
++async fn get_at_selects_by_timestamp_not_commit_order() {
++	let td = temp();
++	let tree = open_versioned(&td);
++
++	put_at(&tree, b"k", 100, 40).await;
++	put_at(&tree, b"k", 200, 30).await;
++
++	let tx = tree.begin().unwrap();
++	assert_eq!(tx.get_at(b"k", 45).unwrap().map(|v| read_u64(&v)), Some(100));
++	assert_eq!(tx.get_at(b"k", 35).unwrap().map(|v| read_u64(&v)), Some(200));
++}
++
++#[test(tokio::test)]
++async fn get_at_merge_selects_by_timestamp() {
++	let td = temp();
++	let (tree, clock) = open_versioned_clock(&td);
++
++	put_at(&tree, b"k", 100, 40).await;
++	merge_at(&tree, &clock, b"k", add(5), 50).await;
++	put_at(&tree, b"k", 200, 30).await;
++
++	let tx = tree.begin().unwrap();
++	assert_eq!(tx.get_at(b"k", 45).unwrap().map(|v| read_u64(&v)), Some(100));
++	assert_eq!(tx.get_at(b"k", 55).unwrap().map(|v| read_u64(&v)), Some(105));
++	assert_eq!(tx.get_at(b"k", 35).unwrap().map(|v| read_u64(&v)), Some(200));
++}
++
++#[test(tokio::test)]
++async fn get_at_per_group_timestamps_survive_compaction() {
++	let td = temp();
++	let (tree, clock) = open_versioned_compaction_clock(&td);
++
++	put_at(&tree, b"k", 100, 5).await;
++	tree.flush().unwrap();
++	merge_at(&tree, &clock, b"k", add(10), 10).await;
++	merge_at(&tree, &clock, b"k", min_op(20), 20).await;
++	merge_at(&tree, &clock, b"k", add(30), 30).await;
++	tree.flush().unwrap();
++	force_compact(&tree);
++
++	let tx = tree.begin().unwrap();
++	assert_eq!(tx.get_at(b"k", 15).unwrap().map(|v| read_u64(&v)), Some(110));
++	assert_eq!(tx.get_at(b"k", 25).unwrap().map(|v| read_u64(&v)), Some(20));
++	assert_eq!(tx.get_at(b"k", 35).unwrap().map(|v| read_u64(&v)), Some(50));
++}
++
++#[test(tokio::test)]
++async fn history_folds_vlog_backed_values() {
++	let td = temp();
++	let tree = open_versioned(&td);
++
++	put(&tree, b"k", 5).await;
++	merge(&tree, b"k", add(10)).await;
++	merge(&tree, b"k", min_op(8)).await;
++	tree.flush().unwrap();
++
++	let tx = tree.begin().unwrap();
++	let fwd = hist_set(&mut tx.history(b"k", b"l").unwrap(), true);
++	assert!(fwd.contains(&8));
++	assert!(fwd.contains(&5));
++	assert!(!fwd.contains(&0));
++}
++
++#[test(tokio::test)]
++async fn same_op_combine_survives_compaction() {
++	let td = temp();
++	let tree = open_for_compaction(&td);
++	put(&tree, b"k", 1).await;
++	merge(&tree, b"k", add(2)).await;
++	tree.flush().unwrap();
++	merge(&tree, b"k", add(3)).await;
++	tree.flush().unwrap();
++	force_compact(&tree);
++	assert_eq!(get(&tree, b"k"), Some(6));
++}
++
++#[test(tokio::test)]
++async fn mixed_op_survives_compaction_no_reorder() {
++	let td = temp();
++	let tree = open_for_compaction(&td);
++	put(&tree, b"k", 10).await;
++	merge(&tree, b"k", add(5)).await;
++	tree.flush().unwrap();
++	merge(&tree, b"k", min_op(8)).await;
++	merge(&tree, b"k", add(100)).await;
++	tree.flush().unwrap();
++	force_compact(&tree);
++	assert_eq!(get(&tree, b"k"), Some(108));
++}
++
++#[test(tokio::test)]
++async fn saturating_add_overflow() {
++	let td = temp();
++	let tree = open(&td);
++	put(&tree, b"k", u64::MAX - 1).await;
++	merge(&tree, b"k", add(100)).await;
++	assert_eq!(get(&tree, b"k"), Some(u64::MAX));
++}
++
++#[test(tokio::test)]
++async fn same_op_distinct_ts_intermediate_after_compaction() {
++	let td = temp();
++	let (tree, clock) = open_versioned_compaction_clock(&td);
++
++	put_at(&tree, b"k", 100, 5).await;
++	tree.flush().unwrap();
++	merge_at(&tree, &clock, b"k", add(10), 10).await;
++	merge_at(&tree, &clock, b"k", add(20), 20).await;
++	tree.flush().unwrap();
++	force_compact(&tree);
++
++	let tx = tree.begin().unwrap();
++	assert_eq!(tx.get_at(b"k", 15).unwrap().map(|v| read_u64(&v)), Some(110));
++	assert_eq!(tx.get_at(b"k", 25).unwrap().map(|v| read_u64(&v)), Some(130));
++}
++
++#[test(tokio::test)]
++async fn ryow_reverse_scan_uncommitted() {
++	let td = temp();
++	let tree = open(&td);
++	put(&tree, b"k", 5).await;
++	let mut tx = tree.begin().unwrap();
++	tx.merge(b"k", add(2)).unwrap();
++	tx.merge(b"k", max_op(100)).unwrap();
++	let bwd = collect_transaction_reverse(&mut tx.range(b"k", b"l").unwrap()).unwrap();
++	assert_eq!(
++		bwd.into_iter().map(|(k, v)| (k, read_u64(&v))).collect::<Vec<_>>(),
++		vec![(b"k".to_vec(), 100)]
++	);
++}
++
++#[test(tokio::test)]
++async fn get_at_none_below_earliest() {
++	let td = temp();
++	let tree = open_versioned(&td);
++	put_at(&tree, b"k", 42, 10).await;
++	let tx = tree.begin().unwrap();
++	assert_eq!(tx.get_at(b"k", 9).unwrap().map(|v| read_u64(&v)), None);
++}
++
++#[derive(Clone, Debug)]
++enum ModelOp {
++	Put(u8, u64),
++	Merge(u8, u8, u64),
++	Delete(u8),
++	Snapshot,
++	Read(u8),
++}
++
++#[derive(Default)]
++struct Model {
++	versions: BTreeMap<u8, Vec<(u64, Op)>>,
++	seq: u64,
++}
++
++#[derive(Clone, Copy)]
++enum Op {
++	Put(u64),
++	Merge(u8, u64),
++	Delete,
++}
++
++impl Model {
++	fn next_seq(&mut self) -> u64 {
++		self.seq += 1;
++		self.seq
++	}
++
++	fn push(&mut self, k: u8, op: Op) {
++		let s = self.next_seq();
++		self.versions.entry(k).or_default().push((s, op));
++	}
++
++	fn snapshot(&self) -> u64 {
++		self.seq
++	}
++
++	fn read_at(&self, k: u8, snap: u64) -> Option<u64> {
++		let vers = self.versions.get(&k)?;
++		let visible: Vec<&(u64, Op)> = vers.iter().filter(|(s, _)| *s <= snap).collect();
++		if visible.is_empty() {
++			return None;
++		}
++		match visible.last().unwrap().1 {
++			Op::Delete => return None,
++			Op::Put(v) => return Some(v),
++			Op::Merge(_, _) => {}
++		}
++		let mut base: u64 = 0;
++		let mut start = 0usize;
++		for i in (0..visible.len()).rev() {
++			match visible[i].1 {
++				Op::Merge(_, _) => {}
++				Op::Put(v) => {
++					base = v;
++					start = i + 1;
++					break;
++				}
++				Op::Delete => {
++					base = 0;
++					start = i + 1;
++					break;
++				}
++			}
++		}
++		let mut acc = base;
++		for entry in visible.iter().skip(start) {
++			if let Op::Merge(opb, v) = entry.1 {
++				acc = match opb {
++					1 => acc.min(v),
++					2 => acc.max(v),
++					_ => acc.saturating_add(v),
++				};
++			}
++		}
++		Some(acc)
++	}
++}
++
++fn op_strategy() -> impl Strategy<Value = ModelOp> {
++	prop_oneof![
++		(0u8..5, 0u64..50).prop_map(|(k, v)| ModelOp::Put(k, v)),
++		(0u8..5, 0u8..3, 0u64..50).prop_map(|(k, o, v)| ModelOp::Merge(k, o, v)),
++		(0u8..5).prop_map(ModelOp::Delete),
++		Just(ModelOp::Snapshot),
++		(0u8..5).prop_map(ModelOp::Read),
++	]
++}
++
++#[test]
++fn model_equivalence() {
++	use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
++	let config = ProptestConfig {
++		cases: 64,
++		failure_persistence: None,
++		..ProptestConfig::default()
++	};
++	let mut runner =
++		TestRunner::new_with_rng(config, TestRng::deterministic_rng(RngAlgorithm::ChaCha));
++	runner
++		.run(&prop::collection::vec(op_strategy(), 1..40), |ops| {
++			let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
++			rt.block_on(async {
++				let td = temp();
++				let tree = open(&td);
++				let mut model = Model::default();
++				let mut snapshots: Vec<(Transaction, u64)> = Vec::new();
++
++				for op in &ops {
++					match op {
++						ModelOp::Put(k, v) => {
++							put(&tree, &[*k], *v).await;
++							model.push(*k, Op::Put(*v));
++						}
++						ModelOp::Merge(k, o, v) => {
++							let operand = {
++								let mut b = vec![*o];
++								b.extend_from_slice(&v.to_le_bytes());
++								b
++							};
++							merge(&tree, &[*k], operand).await;
++							model.push(*k, Op::Merge(*o, *v));
++						}
++						ModelOp::Delete(k) => {
++							delete(&tree, &[*k]).await;
++							model.push(*k, Op::Delete);
++						}
++						ModelOp::Snapshot => {
++							let tx = tree.begin_with_mode(Mode::ReadOnly).unwrap();
++							let snap = model.snapshot();
++							snapshots.push((tx, snap));
++						}
++						ModelOp::Read(k) => {
++							let got = get(&tree, &[*k]);
++							let expected = model.read_at(*k, model.snapshot());
++							prop_assert_eq!(got, expected, "live read mismatch key {}", k);
++						}
++					}
++				}
++
++				for (tx, snap) in &snapshots {
++					for k in 0u8..5 {
++						let got = tx.get(&[k][..]).unwrap().map(|v| read_u64(&v));
++						let expected = model.read_at(k, *snap);
++						prop_assert_eq!(got, expected, "snapshot read mismatch key {} snap {}", k, snap);
++					}
++				}
++
++				Ok(())
++			})
++		})
++		.unwrap();
++}
+diff --git a/src/test/mod.rs b/src/test/mod.rs
+index 63118ba..666636c 100644
+--- a/src/test/mod.rs
++++ b/src/test/mod.rs
+@@ -46,6 +46,8 @@ pub mod snapshot_tests;
+ pub mod sstable_tests;
+ #[cfg(test)]
+ pub mod stall_tests;
++#[cfg(all(test, feature = "merge_op_tests"))]
++pub mod merge_fold_behavior;
+ #[cfg(test)]
+ pub mod transaction_tests;
+ #[cfg(test)]
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..f31b1d9
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,83 @@
++#!/usr/bin/env bash
++set -uo pipefail
++export PATH="/usr/local/bin:/root/.cargo/bin:${PATH}"
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++    case "$1" in
++        --output_path) OUTPUT_PATH="$2"; shift 2 ;;
++        --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++        base|new) MODE="$1"; shift ;;
++        *) echo "Usage: $0 --output_path <path> base|new"; exit 1 ;;
++    esac
++done
++
++if [ -z "$MODE" ] || [ -z "$OUTPUT_PATH" ]; then
++    echo "Usage: $0 --output_path <path> base|new"
++    exit 1
++fi
++
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites/>\n' > "$OUTPUT_PATH"
++
++FILTER='test(/merge_fold_behavior/)'
++
++NEW_TESTS="test::merge_fold_behavior::absent_base_zero test::merge_fold_behavior::base_then_merges test::merge_fold_behavior::basic_add_fold test::merge_fold_behavior::delete_resets_then_merge test::merge_fold_behavior::folded_reads_are_8_bytes test::merge_fold_behavior::get_at_after_compaction_versioned test::merge_fold_behavior::get_at_merge_selects_by_timestamp test::merge_fold_behavior::get_at_none_below_earliest test::merge_fold_behavior::get_at_per_group_timestamps_survive_compaction test::merge_fold_behavior::get_at_selects_by_timestamp_not_commit_order test::merge_fold_behavior::history_fold_fwd_bwd test::merge_fold_behavior::history_folds_vlog_backed_values test::merge_fold_behavior::later_put_replaces test::merge_fold_behavior::max_basic_both_orders test::merge_fold_behavior::min_basic_both_orders test::merge_fold_behavior::mixed_op_order test::merge_fold_behavior::mixed_op_survives_compaction_no_reorder test::merge_fold_behavior::model_equivalence test::merge_fold_behavior::mvcc_as_of test::merge_fold_behavior::non_bottom_compaction_preserves_base test::merge_fold_behavior::regular_key_untouched test::merge_fold_behavior::ryow_get_at_uncommitted test::merge_fold_behavior::ryow_history_uncommitted test::merge_fold_behavior::ryow_reverse_scan_uncommitted test::merge_fold_behavior::ryow_uncommitted test::merge_fold_behavior::same_op_combine_survives_compaction test::merge_fold_behavior::same_op_distinct_ts_intermediate_after_compaction test::merge_fold_behavior::saturating_add_overflow test::merge_fold_behavior::scan_fold_fwd_bwd"
++
++write_fallback_failures() {
++    local cases=""
++    local count=0
++    for name in $NEW_TESTS; do
++        cases+="    <testcase name=\"${name}\" classname=\"surrealkv\"><failure message=\"build failed: merge operator not implemented\"/></testcase>"$'\n'
++        count=$((count + 1))
++    done
++    cat > "$OUTPUT_PATH" <<XMLEOF
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites>
++  <testsuite name="surrealkv" tests="${count}" failures="${count}" errors="0">
++${cases}  </testsuite>
++</testsuites>
++XMLEOF
++}
++
++write_fallback_single() {
++    cat > "$OUTPUT_PATH" <<XMLEOF
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites>
++  <testsuite name="surrealkv" tests="1" failures="1" errors="0">
++    <testcase name="lib_build" classname="surrealkv"><failure message="lib build failed"/></testcase>
++  </testsuite>
++</testsuites>
++XMLEOF
++}
++
++find target/nextest -name junit.xml -delete 2>/dev/null || true
++
++case "$MODE" in
++    new)
++        cargo nextest run --profile ci --no-fail-fast --features merge_op_tests --lib -E "$FILTER"
++        code=$?
++        JUNIT="$(find target/nextest -name junit.xml -type f 2>/dev/null | head -1)"
++        if [ -n "$JUNIT" ] && [ -f "$JUNIT" ]; then
++            cp "$JUNIT" "$OUTPUT_PATH"
++            exit $code
++        else
++            write_fallback_failures
++            exit 1
++        fi
++        ;;
++    base)
++        cargo nextest run --profile ci --no-fail-fast --lib
++        code=$?
++        JUNIT="$(find target/nextest -name junit.xml -type f 2>/dev/null | head -1)"
++        if [ -n "$JUNIT" ] && [ -f "$JUNIT" ]; then
++            cp "$JUNIT" "$OUTPUT_PATH"
++            exit $code
++        else
++            write_fallback_single
++            exit 1
++        fi
++        ;;
++esac

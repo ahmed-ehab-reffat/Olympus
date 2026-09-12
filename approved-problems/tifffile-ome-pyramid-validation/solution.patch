@@ -1,0 +1,242 @@
+diff --git a/tifffile/tifffile.py b/tifffile/tifffile.py
+index a50c122..cda8100 100644
+--- a/tifffile/tifffile.py
++++ b/tifffile/tifffile.py
+@@ -4712,6 +4712,237 @@ class TiffFile:
+         for tif in self._files.values():
+             tif.filehandle.close()
+ 
++    def validate_ome_pyramid(
++        self, *, strict: bool = False, assert_: bool = True
++    ) -> bool:
++        """Return whether OME pyramid storage is valid.
++
++        Parameters:
++            strict:
++                Also validate recommended sub-resolution properties.
++            assert_:
++                Raise AssertionError if validation fails.
++
++        Returns:
++            ``True`` if validation passed.
++            ``False`` if validation failed and ``assert_`` is ``False``.
++
++        Raises:
++            AssertionError:
++                Validation failed and ``assert_`` is ``True``.
++
++        """
++
++        def intersect_ranges(
++            left: list[tuple[int, int]],
++            right: list[tuple[int, int]],
++        ) -> list[tuple[int, int]]:
++            """Return intersections of sorted integer ranges."""
++            result = []
++            for left_start, left_stop in left:
++                for right_start, right_stop in right:
++                    start = max(left_start, right_start)
++                    stop = min(left_stop, right_stop)
++                    if start <= stop:
++                        result.append((start, stop))
++            return result
++
++        def axis_factor_ranges(
++            size: int, subsize: int, maximum: int
++        ) -> list[tuple[int, int]]:
++            """Return factors producing subsize by floor or ceiling."""
++            ranges = []
++            start = max(2, size // (subsize + 1) + 1)
++            stop = min(maximum, size // subsize)
++            if start <= stop:
++                ranges.append((start, stop))
++            start = max(2, (size + subsize - 1) // subsize)
++            stop = (
++                maximum
++                if subsize == 1
++                else min(maximum, (size - 1) // (subsize - 1))
++            )
++            if start <= stop:
++                if ranges and start <= ranges[-1][1] + 1:
++                    ranges[-1] = (ranges[-1][0], max(ranges[-1][1], stop))
++                else:
++                    ranges.append((start, stop))
++            return ranges
++
++        def factors(
++            width: int,
++            length: int,
++            subwidth: int,
++            sublength: int,
++        ) -> list[tuple[int, int]]:
++            maximum = max(width, length)
++            return intersect_ranges(
++                axis_factor_ranges(width, subwidth, maximum),
++                axis_factor_ranges(length, sublength, maximum),
++            )
++
++        valid = False
++        try:
++            if not self.is_ome:
++                raise ValueError
++
++            ome_series: list[
++                tuple[TiffPageSeries, tuple[TiffPage | TiffFrame | None, ...]]
++            ] = [
++                (series, tuple(series))
++                for series in self.series
++                if series.kind == 'ome'
++            ]
++            if not ome_series:
++                raise ValueError
++
++            parents: dict[int, TiffFile] = {id(self): self}
++            for _, pages in ome_series:
++                for page in pages:
++                    if page is not None:
++                        parents[id(page.parent)] = page.parent
++
++            primary: set[tuple[int, int]] = set()
++            for parent in parents.values():
++                fh = parent.filehandle
++                was_closed = fh.closed
++                if was_closed:
++                    fh.open()
++                try:
++                    primary.update(
++                        (id(parent), page.offset) for page in parent.pages
++                    )
++                finally:
++                    if was_closed:
++                        fh.close()
++            used_subifds: set[tuple[int, int]] = set()
++
++            for _, basepages in ome_series:
++                base_shape: tuple[int, int] | None = None
++                level_count: int | None = None
++                level_shapes: list[tuple[int, int]] = []
++                common_factors: list[tuple[int, int]] | None = None
++
++                for base in basepages:
++                    if base is None:
++                        raise ValueError
++                    fh = base.parent.filehandle
++                    was_closed = fh.closed
++                    if was_closed:
++                        fh.open()
++                    try:
++                        if (id(base.parent), base.offset) not in primary:
++                            raise ValueError
++                        if isinstance(base, TiffPage):
++                            basepage = base
++                        else:
++                            fh.seek(base.offset)
++                            basepage = TiffPage(base.parent, base.index)
++                        shape = (basepage.imagelength, basepage.imagewidth)
++                        if base_shape is None:
++                            base_shape = shape
++                        elif base_shape != shape:
++                            raise ValueError
++                        offsets = (
++                            ()
++                            if basepage.subifds is None
++                            else basepage.subifds
++                        )
++                        if level_count is None:
++                            level_count = len(offsets)
++                            level_shapes = [(0, 0)] * level_count
++                        elif len(offsets) != level_count:
++                            raise ValueError
++                        previous_width = basepage.imagewidth
++                        previous_length = basepage.imagelength
++                        previous_size = previous_width * previous_length
++                        base_axes = dict(
++                            zip(basepage.axes, basepage.shape, strict=True)
++                        )
++
++                        for level, offset in enumerate(offsets):
++                            key = (id(base.parent), offset)
++                            if (
++                                offset < 8
++                                or key in primary
++                                or key in used_subifds
++                            ):
++                                raise ValueError
++                            used_subifds.add(key)
++
++                            fh.seek(offset)
++                            child = TiffPage(
++                                base.parent, (base.index, level + 1)
++                            )
++                            nextifd = child._nextifd()
++                            if (
++                                child.offset != offset
++                                or nextifd
++                                and nextifd not in offsets
++                            ):
++                                raise ValueError
++
++                            width = child.imagewidth
++                            length = child.imagelength
++                            size = width * length
++                            if (
++                                width >= basepage.imagewidth
++                                or length >= basepage.imagelength
++                                or size >= previous_size
++                            ):
++                                raise ValueError
++
++                            shape = (length, width)
++                            if level_shapes[level] == (0, 0):
++                                level_shapes[level] = shape
++                            elif level_shapes[level] != shape:
++                                raise ValueError
++
++                            if strict:
++                                if (
++                                    not child.is_reduced
++                                    or child.axes != basepage.axes
++                                ):
++                                    raise ValueError
++                                child_axes = dict(
++                                    zip(child.axes, child.shape, strict=True)
++                                )
++                                if any(
++                                    base_axes[axis] != child_axes[axis]
++                                    for axis in base_axes
++                                    if axis not in 'XY'
++                                ):
++                                    raise ValueError
++                                candidates = factors(
++                                    previous_width,
++                                    previous_length,
++                                    width,
++                                    length,
++                                )
++                                if common_factors is None:
++                                    common_factors = candidates
++                                else:
++                                    common_factors = intersect_ranges(
++                                        common_factors, candidates
++                                    )
++                                if not common_factors:
++                                    raise ValueError
++
++                            previous_width = width
++                            previous_length = length
++                            previous_size = size
++                    finally:
++                        if was_closed:
++                            fh.close()
++
++            valid = True
++        except Exception:
++            valid = False
++
++        if not valid and assert_:
++            raise AssertionError('invalid OME-TIFF pyramid')
++        return valid
++
+     def asarray(
+         self,
+         key: int | slice | Sequence[int] | None = None,

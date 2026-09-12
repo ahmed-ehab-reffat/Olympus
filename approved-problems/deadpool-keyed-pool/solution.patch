@@ -1,0 +1,1006 @@
+diff --git a/crates/deadpool/src/managed/keyed/config.rs b/crates/deadpool/src/managed/keyed/config.rs
+new file mode 100644
+index 0000000..7084ec6
+--- /dev/null
++++ b/crates/deadpool/src/managed/keyed/config.rs
+@@ -0,0 +1,158 @@
++use std::{fmt, time::Duration};
++
++use crate::{
++    Runtime,
++    managed::{BuildError, Timeouts},
++};
++
++use super::{KeyedManager, KeyedPool};
++
++/// Configuration of a [`KeyedPool`].
++///
++/// [`KeyedPool`]: super::KeyedPool
++#[derive(Clone, Copy, Debug)]
++pub struct KeyedPoolConfig {
++    /// Maximum number of objects across all keys.
++    pub max_size: usize,
++
++    /// Maximum number of objects for a single key. `0` means unlimited.
++    pub max_per_key: usize,
++
++    /// Timeouts of the pool.
++    ///
++    /// Default: No timeouts.
++    pub timeouts: Timeouts,
++
++    /// Maximum lifetime of an idle object before it is reaped.
++    ///
++    /// Default: `None` (idle objects live forever).
++    pub max_idle_lifetime: Option<Duration>,
++}
++
++impl KeyedPoolConfig {
++    /// Creates a new [`KeyedPoolConfig`] with the given `max_size` and
++    /// `max_per_key` and no timeouts.
++    #[must_use]
++    pub fn new(max_size: usize, max_per_key: usize) -> Self {
++        Self {
++            max_size,
++            max_per_key,
++            timeouts: Timeouts::default(),
++            max_idle_lifetime: None,
++        }
++    }
++}
++
++impl Default for KeyedPoolConfig {
++    fn default() -> Self {
++        Self::new(crate::util::get_default_pool_max_size(), 0)
++    }
++}
++
++/// Builder for [`KeyedPool`]s.
++///
++/// Instances of this are created by calling [`KeyedPool::builder()`].
++///
++/// [`KeyedPool`]: super::KeyedPool
++#[must_use = "builder does nothing itself, use `.build()` to build it"]
++pub struct KeyedPoolBuilder<M: KeyedManager> {
++    pub(crate) manager: M,
++    pub(crate) config: KeyedPoolConfig,
++    pub(crate) runtime: Option<Runtime>,
++}
++
++impl<M> fmt::Debug for KeyedPoolBuilder<M>
++where
++    M: fmt::Debug + KeyedManager,
++{
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("KeyedPoolBuilder")
++            .field("manager", &self.manager)
++            .field("config", &self.config)
++            .field("runtime", &self.runtime)
++            .finish()
++    }
++}
++
++impl<M: KeyedManager> KeyedPoolBuilder<M> {
++    pub(crate) fn new(manager: M) -> Self {
++        Self {
++            manager,
++            config: KeyedPoolConfig::default(),
++            runtime: None,
++        }
++    }
++
++    /// Builds the [`KeyedPool`].
++    ///
++    /// # Errors
++    ///
++    /// See [`BuildError`] for details.
++    pub fn build(self) -> Result<KeyedPool<M>, BuildError> {
++        let t = &self.config.timeouts;
++        if (t.wait.is_some() || t.create.is_some() || t.recycle.is_some()) && self.runtime.is_none()
++        {
++            return Err(BuildError::NoRuntimeSpecified);
++        }
++        Ok(KeyedPool::from_builder(self))
++    }
++
++    /// Sets a [`KeyedPoolConfig`] to build the [`KeyedPool`] with.
++    pub fn config(mut self, value: KeyedPoolConfig) -> Self {
++        self.config = value;
++        self
++    }
++
++    /// Sets the [`KeyedPoolConfig::max_size`].
++    pub fn max_size(mut self, value: usize) -> Self {
++        self.config.max_size = value;
++        self
++    }
++
++    /// Sets the [`KeyedPoolConfig::max_per_key`].
++    pub fn max_per_key(mut self, value: usize) -> Self {
++        self.config.max_per_key = value;
++        self
++    }
++
++    /// Sets the [`KeyedPoolConfig::timeouts`].
++    pub fn timeouts(mut self, value: Timeouts) -> Self {
++        self.config.timeouts = value;
++        self
++    }
++
++    /// Sets the [`Timeouts::wait`] value of the [`KeyedPoolConfig::timeouts`].
++    pub fn wait_timeout(mut self, value: Option<Duration>) -> Self {
++        self.config.timeouts.wait = value;
++        self
++    }
++
++    /// Sets the [`Timeouts::create`] value of the [`KeyedPoolConfig::timeouts`].
++    pub fn create_timeout(mut self, value: Option<Duration>) -> Self {
++        self.config.timeouts.create = value;
++        self
++    }
++
++    /// Sets the [`Timeouts::recycle`] value of the
++    /// [`KeyedPoolConfig::timeouts`].
++    pub fn recycle_timeout(mut self, value: Option<Duration>) -> Self {
++        self.config.timeouts.recycle = value;
++        self
++    }
++
++    /// Sets the [`KeyedPoolConfig::max_idle_lifetime`].
++    pub fn max_idle_lifetime(mut self, value: Option<Duration>) -> Self {
++        self.config.max_idle_lifetime = value;
++        self
++    }
++
++    /// Sets the [`Runtime`].
++    ///
++    /// A [`Runtime`] is required whenever any timeout is configured. Building a
++    /// pool with timeouts but no [`Runtime`] fails with
++    /// [`BuildError::NoRuntimeSpecified`].
++    pub fn runtime(mut self, value: Runtime) -> Self {
++        self.runtime = Some(value);
++        self
++    }
++}
+diff --git a/crates/deadpool/src/managed/keyed/manager.rs b/crates/deadpool/src/managed/keyed/manager.rs
+new file mode 100644
+index 0000000..afe0a46
+--- /dev/null
++++ b/crates/deadpool/src/managed/keyed/manager.rs
+@@ -0,0 +1,50 @@
++use std::{future::Future, hash::Hash};
++
++use crate::managed::{Metrics, RecycleResult};
++
++/// Manager responsible for creating and recycling keyed
++/// [`KeyedObject`](super::KeyedObject)s.
++///
++/// Objects are grouped by [`KeyedManager::Key`]. The same manager creates and
++/// recycles objects for every key; the key is passed to each method so the
++/// backend can, for example, connect to a different endpoint per key.
++pub trait KeyedManager: Sync + Send {
++    /// Type used to group objects.
++    type Key: Clone + Eq + Hash + Send + Sync;
++    /// Type of objects that this [`KeyedManager`] creates and recycles.
++    type Type: Send;
++    /// Error that this [`KeyedManager`] can return when creating and/or
++    /// recycling objects.
++    type Error: Send;
++
++    /// Creates a new instance of [`KeyedManager::Type`] for the given `key`.
++    fn create(
++        &self,
++        key: &Self::Key,
++    ) -> impl Future<Output = Result<Self::Type, Self::Error>> + Send;
++
++    /// Tries to recycle an instance of [`KeyedManager::Type`].
++    ///
++    /// # Errors
++    ///
++    /// Returns [`RecycleError`](crate::managed::RecycleError) if the instance
++    /// couldn't be recycled.
++    fn recycle(
++        &self,
++        key: &Self::Key,
++        obj: &mut Self::Type,
++        metrics: &Metrics,
++    ) -> impl Future<Output = RecycleResult<Self::Error>> + Send;
++
++    /// Detaches an instance of [`KeyedManager::Type`] from this
++    /// [`KeyedManager`].
++    ///
++    /// This is called whenever an object is permanently removed from the pool
++    /// (eviction, [`resize`](super::KeyedPool::resize),
++    /// [`clear_key`](super::KeyedPool::clear_key),
++    /// [`retain`](super::KeyedPool::retain) or
++    /// [`reap_idle`](super::KeyedPool::reap_idle)). If the [`KeyedManager`]
++    /// doesn't hold any references to the handed out objects the default
++    /// no-op implementation can be used.
++    fn detach(&self, _key: &Self::Key, _obj: &mut Self::Type) {}
++}
+diff --git a/crates/deadpool/src/managed/keyed/mod.rs b/crates/deadpool/src/managed/keyed/mod.rs
+new file mode 100644
+index 0000000..188e4b1
+--- /dev/null
++++ b/crates/deadpool/src/managed/keyed/mod.rs
+@@ -0,0 +1,740 @@
++//! Keyed variant of the managed pool.
++//!
++//! A [`KeyedPool`] manages objects that are grouped by a key. All keys share a
++//! single global capacity (`max_size` objects across every key) while each key
++//! is additionally limited to `max_per_key` objects. When the pool is globally
++//! full and an object is requested for a key that has no idle object of its
++//! own, the least-recently-inserted idle object of a *different* key is evicted
++//! to make room.
++
++mod config;
++mod manager;
++
++#[cfg(not(target_arch = "wasm32"))]
++use std::time::Instant;
++use std::{
++    collections::{HashMap, VecDeque},
++    fmt,
++    future::Future,
++    ops::{Deref, DerefMut},
++    sync::{
++        Arc, Mutex, Weak,
++        atomic::{AtomicUsize, Ordering},
++    },
++    time::Duration,
++};
++
++use deadpool_runtime::{Runtime, timeout};
++use tokio::sync::{Semaphore, TryAcquireError};
++
++use crate::managed::{Metrics, ObjectId, PoolError, TimeoutType, Timeouts, dropguard::DropGuard};
++
++pub use self::{
++    config::{KeyedPoolBuilder, KeyedPoolConfig},
++    manager::KeyedManager,
++};
++
++/// Runtime status of a [`KeyedPool`].
++#[derive(Clone, Copy, Debug)]
++pub struct KeyedStatus {
++    /// Maximum number of objects across all keys.
++    pub max_size: usize,
++    /// Current number of objects across all keys (idle plus in-flight).
++    pub size: usize,
++    /// Number of idle objects available to be handed out without creating a
++    /// new one.
++    pub available: usize,
++    /// Number of distinct keys that currently hold objects.
++    pub keys: usize,
++}
++
++/// Status of a single key within a [`KeyedPool`].
++#[derive(Clone, Copy, Debug, Default)]
++pub struct KeyedKeyStatus {
++    /// Number of objects (idle plus in-flight) for this key.
++    pub size: usize,
++    /// Number of idle objects for this key.
++    pub available: usize,
++    /// Maximum number of objects allowed for this key. `0` means unlimited.
++    pub max_per_key: usize,
++}
++
++/// Result of [`KeyedPool::retain()`].
++#[derive(Clone, Copy, Debug, Default)]
++pub struct KeyedRetainResult {
++    /// Number of idle objects that were kept.
++    pub retained: usize,
++    /// Number of idle objects that were removed.
++    pub removed: usize,
++}
++
++struct KeyedObjectInner<M: KeyedManager> {
++    key: M::Key,
++    obj: M::Type,
++    id: usize,
++    metrics: Metrics,
++}
++
++struct KeyedSlots<M: KeyedManager> {
++    /// Idle objects grouped by key.
++    idle: HashMap<M::Key, VecDeque<KeyedObjectInner<M>>>,
++    /// Total object count (idle plus in-flight) per key.
++    key_size: HashMap<M::Key, usize>,
++    /// Idle objects in least-recently-inserted order, identified by their
++    /// `(key, id)`. Used to pick eviction victims.
++    lru: VecDeque<(M::Key, usize)>,
++    /// Global total object count.
++    size: usize,
++    /// Current global capacity. Mutated by [`KeyedPool::resize()`].
++    max_size: usize,
++}
++
++impl<M: KeyedManager> KeyedSlots<M> {
++    fn take_idle(&mut self, key: &M::Key) -> Option<KeyedObjectInner<M>> {
++        let obj = self.idle.get_mut(key)?.pop_front()?;
++        self.remove_lru(key, obj.id);
++        Some(obj)
++    }
++
++    fn remove_idle_by_id(&mut self, key: &M::Key, id: usize) -> Option<KeyedObjectInner<M>> {
++        let dq = self.idle.get_mut(key)?;
++        let pos = dq.iter().position(|o| o.id == id)?;
++        dq.remove(pos)
++    }
++
++    fn remove_lru(&mut self, key: &M::Key, id: usize) {
++        if let Some(pos) = self.lru.iter().position(|(k, i)| k == key && *i == id) {
++            let _ = self.lru.remove(pos);
++        }
++    }
++
++    fn dec_counts(&mut self, key: &M::Key) {
++        self.size -= 1;
++        if let Some(n) = self.key_size.get_mut(key) {
++            *n -= 1;
++            if *n == 0 {
++                let _ = self.key_size.remove(key);
++            }
++        }
++    }
++
++    fn inc_counts(&mut self, key: &M::Key) {
++        self.size += 1;
++        *self.key_size.entry(key.clone()).or_insert(0) += 1;
++    }
++
++    /// Removes and returns the least-recently-returned idle object, if any.
++    fn evict_lru(&mut self) -> Option<KeyedObjectInner<M>> {
++        loop {
++            let (key, id) = self.lru.pop_front()?;
++            if let Some(obj) = self.remove_idle_by_id(&key, id) {
++                self.dec_counts(&key);
++                return Some(obj);
++            }
++        }
++    }
++}
++
++pub(crate) struct KeyedPoolInner<M: KeyedManager> {
++    manager: M,
++    semaphore: Semaphore,
++    slots: Mutex<KeyedSlots<M>>,
++    per_key: Mutex<HashMap<M::Key, Arc<Semaphore>>>,
++    next_id: AtomicUsize,
++    config: KeyedPoolConfig,
++    runtime: Option<Runtime>,
++}
++
++/// Object and connection pool that groups objects by a key.
++///
++/// This struct can be cloned and transferred across thread boundaries and uses
++/// reference counting for its internal state.
++pub struct KeyedPool<M: KeyedManager> {
++    inner: Arc<KeyedPoolInner<M>>,
++}
++
++impl<M: KeyedManager> Clone for KeyedPool<M> {
++    fn clone(&self) -> Self {
++        Self {
++            inner: self.inner.clone(),
++        }
++    }
++}
++
++impl<M: KeyedManager> fmt::Debug for KeyedPool<M> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("KeyedPool")
++            .field("config", &self.inner.config)
++            .field("status", &self.status())
++            .finish()
++    }
++}
++
++enum Decision<M: KeyedManager> {
++    Recycle(KeyedObjectInner<M>),
++    Create,
++    Evict(KeyedObjectInner<M>),
++}
++
++impl<M: KeyedManager> KeyedPool<M> {
++    /// Instantiates a [`KeyedPoolBuilder`] for a new [`KeyedPool`].
++    pub fn builder(manager: M) -> KeyedPoolBuilder<M> {
++        KeyedPoolBuilder::new(manager)
++    }
++
++    /// Creates a new [`KeyedPool`] managing objects via the given `manager`.
++    ///
++    /// This is a shorthand for [`KeyedPool::builder()`] without a [`Runtime`].
++    /// Configure a [`Runtime`] via the builder if you rely on timeouts.
++    pub fn new(manager: M, config: KeyedPoolConfig) -> Self {
++        Self::from_parts(manager, config, None)
++    }
++
++    pub(crate) fn from_builder(builder: KeyedPoolBuilder<M>) -> Self {
++        Self::from_parts(builder.manager, builder.config, builder.runtime)
++    }
++
++    fn from_parts(manager: M, config: KeyedPoolConfig, runtime: Option<Runtime>) -> Self {
++        Self {
++            inner: Arc::new(KeyedPoolInner {
++                manager,
++                semaphore: Semaphore::new(config.max_size),
++                slots: Mutex::new(KeyedSlots {
++                    idle: HashMap::new(),
++                    key_size: HashMap::new(),
++                    lru: VecDeque::new(),
++                    size: 0,
++                    max_size: config.max_size,
++                }),
++                per_key: Mutex::new(HashMap::new()),
++                next_id: AtomicUsize::new(0),
++                config,
++                runtime,
++            }),
++        }
++    }
++
++    fn per_key_semaphore(&self, key: &M::Key) -> Arc<Semaphore> {
++        let closed = self.inner.semaphore.is_closed();
++        self.inner
++            .per_key
++            .lock()
++            .unwrap()
++            .entry(key.clone())
++            .or_insert_with(|| {
++                let sem = Arc::new(Semaphore::new(self.inner.config.max_per_key));
++                if closed {
++                    // A key first seen after the pool was closed must not admit
++                    // waiters either.
++                    sem.close();
++                }
++                sem
++            })
++            .clone()
++    }
++
++    /// Retrieves a [`KeyedObject`] for the given `key`, waiting for one to
++    /// become available according to the configured timeouts.
++    ///
++    /// # Errors
++    ///
++    /// See [`PoolError`] for details.
++    pub async fn get(&self, key: M::Key) -> Result<KeyedObject<M>, PoolError<M::Error>> {
++        self.timeout_get(key, &self.inner.config.timeouts).await
++    }
++
++    /// Retrieves a [`KeyedObject`] using a different set of `timeouts` than the
++    /// configured ones.
++    ///
++    /// # Errors
++    ///
++    /// See [`PoolError`] for details.
++    pub async fn timeout_get(
++        &self,
++        key: M::Key,
++        timeouts: &Timeouts,
++    ) -> Result<KeyedObject<M>, PoolError<M::Error>> {
++        let non_blocking = matches!(timeouts.wait, Some(t) if t.as_nanos() == 0);
++
++        let per_key_permit = if self.inner.config.max_per_key > 0 {
++            let sem = self.per_key_semaphore(&key);
++            Some(if non_blocking {
++                sem.try_acquire_owned().map_err(map_try_acquire)?
++            } else {
++                apply_timeout(self.inner.runtime, TimeoutType::Wait, timeouts.wait, async {
++                    sem.acquire_owned().await.map_err(|_| PoolError::Closed)
++                })
++                .await?
++            })
++        } else {
++            None
++        };
++
++        let permit = if non_blocking {
++            self.inner.semaphore.try_acquire().map_err(map_try_acquire)?
++        } else {
++            apply_timeout(self.inner.runtime, TimeoutType::Wait, timeouts.wait, async {
++                self.inner
++                    .semaphore
++                    .acquire()
++                    .await
++                    .map_err(|_| PoolError::Closed)
++            })
++            .await?
++        };
++
++        let inner_obj = loop {
++            let decision = {
++                let mut slots = self.inner.slots.lock().unwrap();
++                if let Some(obj) = slots.take_idle(&key) {
++                    Decision::Recycle(obj)
++                } else if slots.size < slots.max_size {
++                    slots.inc_counts(&key);
++                    Decision::Create
++                } else if let Some(victim) = slots.evict_lru() {
++                    slots.inc_counts(&key);
++                    Decision::Evict(victim)
++                } else {
++                    // At capacity with nothing idle to evict. This is only
++                    // reachable while the pool is over capacity after a shrink
++                    // that could not remove checked-out objects; the surplus
++                    // object is discarded again when it is returned.
++                    slots.inc_counts(&key);
++                    Decision::Create
++                }
++            };
++
++            // Every branch below holds a slot that `slots` no longer accounts
++            // for: the recycled object has been taken out of the idle list and
++            // the created one has been counted in advance. The guard gives that
++            // slot back if the branch does not reach a usable object, including
++            // when the caller drops this future while an await point is pending.
++            let slot = DropGuard(|| self.inner.slots.lock().unwrap().dec_counts(&key));
++
++            match decision {
++                Decision::Recycle(mut obj) => {
++                    if self.is_stale(&obj.metrics) {
++                        self.inner.manager.detach(&key, &mut obj.obj);
++                        continue;
++                    }
++                    let recycled = apply_timeout(
++                        self.inner.runtime,
++                        TimeoutType::Recycle,
++                        timeouts.recycle,
++                        self.inner.manager.recycle(&key, &mut obj.obj, &obj.metrics),
++                    )
++                    .await
++                    .is_ok();
++                    if recycled {
++                        obj.metrics.recycle_count += 1;
++                        #[cfg(not(target_arch = "wasm32"))]
++                        {
++                            obj.metrics.recycled = Some(Instant::now());
++                        }
++                        slot.disarm();
++                        break obj;
++                    }
++                    self.inner.manager.detach(&key, &mut obj.obj);
++                }
++                Decision::Evict(mut victim) => {
++                    self.inner.manager.detach(&victim.key, &mut victim.obj);
++                    let obj = self.create(&key, timeouts).await?;
++                    slot.disarm();
++                    break obj;
++                }
++                Decision::Create => {
++                    let obj = self.create(&key, timeouts).await?;
++                    slot.disarm();
++                    break obj;
++                }
++            }
++        };
++
++        permit.forget();
++        if let Some(p) = per_key_permit {
++            p.forget();
++        }
++
++        Ok(KeyedObject {
++            inner: Some(inner_obj),
++            pool: Arc::downgrade(&self.inner),
++        })
++    }
++
++    async fn create(
++        &self,
++        key: &M::Key,
++        timeouts: &Timeouts,
++    ) -> Result<KeyedObjectInner<M>, PoolError<M::Error>> {
++        let obj = apply_timeout(
++            self.inner.runtime,
++            TimeoutType::Create,
++            timeouts.create,
++            self.inner.manager.create(key),
++        )
++        .await?;
++        Ok(KeyedObjectInner {
++            key: key.clone(),
++            obj,
++            id: self.inner.next_id.fetch_add(1, Ordering::Relaxed),
++            metrics: Metrics::default(),
++        })
++    }
++
++    fn is_stale(&self, metrics: &Metrics) -> bool {
++        #[cfg(not(target_arch = "wasm32"))]
++        if let Some(max_life) = self.inner.config.max_idle_lifetime {
++            return metrics.last_used() >= max_life;
++        }
++        let _ = metrics;
++        false
++    }
++
++    /// Resizes the pool, changing the global `max_size`.
++    ///
++    /// Growing adds global permits and raises the cap. Shrinking drops idle
++    /// objects (forgetting their permits) until the size fits the new cap; it
++    /// never removes in-flight objects. Does nothing on a closed pool.
++    pub fn resize(&self, max_size: usize) {
++        if self.inner.semaphore.is_closed() {
++            return;
++        }
++        let mut slots = self.inner.slots.lock().unwrap();
++        let old_max_size = slots.max_size;
++        slots.max_size = max_size;
++        if max_size < old_max_size {
++            while slots.size > slots.max_size {
++                if slots.lru.is_empty() {
++                    break;
++                }
++                match self.inner.semaphore.try_acquire() {
++                    Ok(permit) => {
++                        permit.forget();
++                        let (k, id) = slots.lru.pop_front().unwrap();
++                        if let Some(mut obj) = slots.remove_idle_by_id(&k, id) {
++                            slots.dec_counts(&k);
++                            self.inner.manager.detach(&obj.key, &mut obj.obj);
++                        }
++                    }
++                    Err(_) => break,
++                }
++            }
++        }
++        if max_size > old_max_size {
++            // A previous shrink may have left the pool over capacity, because
++            // checked-out objects are never removed. Those objects already
++            // occupy part of the new capacity, so only the genuinely new slots
++            // may be handed out; adding `max_size - old_max_size` permits
++            // unconditionally would over-issue and let a caller reach the
++            // eviction path with nothing idle to evict.
++            let additional = max_size.saturating_sub(old_max_size.max(slots.size));
++            if additional > 0 {
++                self.inner.semaphore.add_permits(additional);
++            }
++        }
++    }
++
++    /// Closes this [`KeyedPool`].
++    ///
++    /// All current and future tasks waiting for objects will get
++    /// [`PoolError::Closed`]. In-flight objects still return cleanly when
++    /// dropped. This resizes the pool to 0.
++    pub fn close(&self) {
++        self.resize(0);
++        // The per-key semaphores are acquired before the global one, so closing
++        // only the global semaphore would leave a caller waiting on a saturated
++        // key blocked forever instead of seeing `PoolError::Closed`. The lock is
++        // held while the global semaphore is closed so that a key first seen
++        // concurrently cannot be registered as open afterwards.
++        let per_key = self.inner.per_key.lock().unwrap();
++        self.inner.semaphore.close();
++        for sem in per_key.values() {
++            sem.close();
++        }
++    }
++
++    /// Indicates whether this [`KeyedPool`] has been closed.
++    pub fn is_closed(&self) -> bool {
++        self.inner.semaphore.is_closed()
++    }
++
++    /// Detaches and removes ALL idle objects for a single `key`.
++    ///
++    /// In-flight objects for the key are left untouched; the freed slots become
++    /// available for reuse by any key.
++    pub fn clear_key(&self, key: &M::Key) {
++        let removed = {
++            let mut slots = self.inner.slots.lock().unwrap();
++            let dq = match slots.idle.remove(key) {
++                Some(dq) => dq,
++                None => return,
++            };
++            slots.lru.retain(|(k, _)| k != key);
++            for _ in 0..dq.len() {
++                slots.dec_counts(key);
++            }
++            dq
++        };
++        for mut obj in removed {
++            self.inner.manager.detach(&obj.key, &mut obj.obj);
++        }
++    }
++
++    /// Retains only the idle objects for which `predicate` returns `true`.
++    ///
++    /// Rejected idle objects are detached and removed; the freed slots become
++    /// available for reuse. In-flight objects are never inspected.
++    pub fn retain(
++        &self,
++        mut predicate: impl FnMut(&M::Key, &M::Type, Metrics) -> bool,
++    ) -> KeyedRetainResult {
++        let mut result = KeyedRetainResult::default();
++        let mut slots = self.inner.slots.lock().unwrap();
++        let keys = slots.idle.keys().cloned().collect::<Vec<_>>();
++        for key in keys {
++            let dq = slots.idle.remove(&key).unwrap();
++            let mut kept = VecDeque::with_capacity(dq.len());
++            for mut obj in dq {
++                if predicate(&key, &obj.obj, obj.metrics) {
++                    kept.push_back(obj);
++                    result.retained += 1;
++                } else {
++                    slots.remove_lru(&key, obj.id);
++                    slots.dec_counts(&key);
++                    self.inner.manager.detach(&key, &mut obj.obj);
++                    result.removed += 1;
++                }
++            }
++            if !kept.is_empty() {
++                let _ = slots.idle.insert(key, kept);
++            }
++        }
++        result
++    }
++
++    /// Detaches idle objects whose idle lifetime exceeds
++    /// [`KeyedPoolConfig::max_idle_lifetime`], returning how many were reaped.
++    ///
++    /// Returns `0` when no idle lifetime is configured.
++    pub fn reap_idle(&self) -> usize {
++        #[cfg(not(target_arch = "wasm32"))]
++        if let Some(max_life) = self.inner.config.max_idle_lifetime {
++            return self
++                .retain(|_, _, metrics| metrics.last_used() < max_life)
++                .removed;
++        }
++        0
++    }
++
++    /// Retrieves the [`KeyedStatus`] of this [`KeyedPool`].
++    #[must_use]
++    pub fn status(&self) -> KeyedStatus {
++        let slots = self.inner.slots.lock().unwrap();
++        KeyedStatus {
++            max_size: slots.max_size,
++            size: slots.size,
++            available: slots.lru.len(),
++            keys: slots.key_size.len(),
++        }
++    }
++
++    /// Returns the total number of objects (idle plus in-flight) for `key`.
++    #[must_use]
++    pub fn key_size(&self, key: &M::Key) -> usize {
++        self.inner
++            .slots
++            .lock()
++            .unwrap()
++            .key_size
++            .get(key)
++            .copied()
++            .unwrap_or(0)
++    }
++
++    /// Returns the [`KeyedKeyStatus`] for a single `key`.
++    #[must_use]
++    pub fn key_status(&self, key: &M::Key) -> KeyedKeyStatus {
++        let slots = self.inner.slots.lock().unwrap();
++        KeyedKeyStatus {
++            size: slots.key_size.get(key).copied().unwrap_or(0),
++            available: slots.idle.get(key).map_or(0, VecDeque::len),
++            max_per_key: self.inner.config.max_per_key,
++        }
++    }
++
++    /// Returns every key that currently holds at least one object.
++    #[must_use]
++    pub fn keys(&self) -> Vec<M::Key> {
++        self.inner
++            .slots
++            .lock()
++            .unwrap()
++            .key_size
++            .keys()
++            .cloned()
++            .collect()
++    }
++
++    /// Returns the [`KeyedManager`] of this [`KeyedPool`].
++    #[must_use]
++    pub fn manager(&self) -> &M {
++        &self.inner.manager
++    }
++}
++
++/// Smart handle around a keyed pooled object.
++///
++/// Use this object just as if it was of type `M::Type`; upon leaving a scope
++/// the [`Drop::drop()`] implementation returns it to the [`KeyedPool`] as an
++/// idle object.
++#[must_use]
++pub struct KeyedObject<M: KeyedManager> {
++    inner: Option<KeyedObjectInner<M>>,
++    pool: Weak<KeyedPoolInner<M>>,
++}
++
++impl<M: KeyedManager> KeyedObject<M> {
++    /// Returns the key this [`KeyedObject`] belongs to.
++    pub fn key(&self) -> &M::Key {
++        &self.inner.as_ref().unwrap().key
++    }
++
++    /// Takes this [`KeyedObject`] out of its [`KeyedPool`] permanently.
++    ///
++    /// This detaches the object, decrements the pool size for its key and
++    /// frees the slot so another object can be created in its place.
++    #[must_use]
++    pub fn take(mut this: Self) -> M::Type {
++        let mut inner = this.inner.take().unwrap();
++        if let Some(pool) = this.pool.upgrade() {
++            let key = inner.key.clone();
++            let add_global = {
++                let mut slots = pool.slots.lock().unwrap();
++                let add = slots.size <= slots.max_size;
++                slots.dec_counts(&key);
++                add
++            };
++            if add_global {
++                pool.semaphore.add_permits(1);
++            }
++            if pool.config.max_per_key > 0 {
++                if let Some(sem) = pool.per_key.lock().unwrap().get(&key) {
++                    sem.add_permits(1);
++                }
++            }
++            pool.manager.detach(&key, &mut inner.obj);
++        }
++        inner.obj
++    }
++
++    /// Returns the unique ID of this object.
++    ///
++    /// Object IDs are strictly monotonically increasing - each new object
++    /// receives an ID greater than that of the previously created object.
++    pub fn id(this: &Self) -> ObjectId {
++        ObjectId::new(this.inner.as_ref().unwrap().id)
++    }
++
++    /// Returns the [`Metrics`] of this object.
++    pub fn metrics(this: &Self) -> &Metrics {
++        &this.inner.as_ref().unwrap().metrics
++    }
++
++    /// Returns the [`KeyedPool`] this object belongs to, if it still exists.
++    pub fn pool(this: &Self) -> Option<KeyedPool<M>> {
++        Some(KeyedPool {
++            inner: this.pool.upgrade()?,
++        })
++    }
++}
++
++impl<M> fmt::Debug for KeyedObject<M>
++where
++    M: fmt::Debug + KeyedManager,
++    M::Key: fmt::Debug,
++    M::Type: fmt::Debug,
++{
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let inner = self.inner.as_ref().unwrap();
++        f.debug_struct("KeyedObject")
++            .field("key", &inner.key)
++            .field("obj", &inner.obj)
++            .field("id", &inner.id)
++            .finish()
++    }
++}
++
++impl<M: KeyedManager> Drop for KeyedObject<M> {
++    fn drop(&mut self) {
++        let Some(inner) = self.inner.take() else {
++            return;
++        };
++        let Some(pool) = self.pool.upgrade() else {
++            return;
++        };
++        let key = inner.key.clone();
++        let id = inner.id;
++        let mut slot = Some(inner);
++        let returned = {
++            let mut slots = pool.slots.lock().unwrap();
++            if slots.size <= slots.max_size {
++                slots
++                    .idle
++                    .entry(key.clone())
++                    .or_default()
++                    .push_back(slot.take().unwrap());
++                slots.lru.push_back((key.clone(), id));
++                true
++            } else {
++                slots.dec_counts(&key);
++                false
++            }
++        };
++        if returned {
++            pool.semaphore.add_permits(1);
++        } else if let Some(mut discarded) = slot {
++            pool.manager.detach(&key, &mut discarded.obj);
++        }
++        if pool.config.max_per_key > 0 {
++            if let Some(sem) = pool.per_key.lock().unwrap().get(&key) {
++                sem.add_permits(1);
++            }
++        }
++    }
++}
++
++impl<M: KeyedManager> Deref for KeyedObject<M> {
++    type Target = M::Type;
++    fn deref(&self) -> &M::Type {
++        &self.inner.as_ref().unwrap().obj
++    }
++}
++
++impl<M: KeyedManager> DerefMut for KeyedObject<M> {
++    fn deref_mut(&mut self) -> &mut M::Type {
++        &mut self.inner.as_mut().unwrap().obj
++    }
++}
++
++fn map_try_acquire<E>(e: TryAcquireError) -> PoolError<E> {
++    match e {
++        TryAcquireError::Closed => PoolError::Closed,
++        TryAcquireError::NoPermits => PoolError::Timeout(TimeoutType::Wait),
++    }
++}
++
++async fn apply_timeout<O, E>(
++    runtime: Option<Runtime>,
++    timeout_type: TimeoutType,
++    duration: Option<Duration>,
++    future: impl Future<Output = Result<O, impl Into<PoolError<E>>>>,
++) -> Result<O, PoolError<E>> {
++    match (runtime, duration) {
++        (_, None) => future.await.map_err(Into::into),
++        (Some(runtime), Some(duration)) => timeout(runtime, duration, future)
++            .await
++            .ok_or(PoolError::Timeout(timeout_type))?
++            .map_err(Into::into),
++        (None, Some(_)) => Err(PoolError::NoRuntimeSpecified),
++    }
++}
+diff --git a/crates/deadpool/src/managed/mod.rs b/crates/deadpool/src/managed/mod.rs
+index 96b3ed5..41cd0be 100644
+--- a/crates/deadpool/src/managed/mod.rs
++++ b/crates/deadpool/src/managed/mod.rs
+@@ -53,6 +53,7 @@ mod config;
+ mod dropguard;
+ mod errors;
+ mod hooks;
++mod keyed;
+ mod manager;
+ mod metrics;
+ mod object;
+@@ -66,6 +67,10 @@ pub use self::{
+     config::{CreatePoolError, PoolConfig, QueueMode, Timeouts},
+     errors::{PoolError, RecycleError, TimeoutType},
+     hooks::{Hook, HookError, HookFuture, HookResult},
++    keyed::{
++        KeyedKeyStatus, KeyedManager, KeyedObject, KeyedPool, KeyedPoolBuilder, KeyedPoolConfig,
++        KeyedRetainResult, KeyedStatus,
++    },
+     manager::{Manager, RecycleResult},
+     metrics::Metrics,
+     object::{Object, ObjectId},
+diff --git a/crates/deadpool/src/managed/object.rs b/crates/deadpool/src/managed/object.rs
+index 8f23847..9a8892c 100644
+--- a/crates/deadpool/src/managed/object.rs
++++ b/crates/deadpool/src/managed/object.rs
+@@ -133,6 +133,12 @@ impl<M: Manager> AsMut<M::Type> for Object<M> {
+ #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
+ pub struct ObjectId(usize);
+ 
++impl ObjectId {
++    pub(crate) const fn new(id: usize) -> Self {
++        Self(id)
++    }
++}
++
+ impl fmt::Display for ObjectId {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         write!(f, "{}", self.0)

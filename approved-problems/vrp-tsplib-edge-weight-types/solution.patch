@@ -1,0 +1,881 @@
+diff --git a/vrp-cli/src/extensions/solve/formats.rs b/vrp-cli/src/extensions/solve/formats.rs
+index 25ec57e..a43a258 100644
+--- a/vrp-cli/src/extensions/solve/formats.rs
++++ b/vrp-cli/src/extensions/solve/formats.rs
+@@ -1,6 +1,6 @@
+ //! Contains format readers and writers.
+ 
+-use crate::get_locations_serialized;
++use crate::{get_locations_serialized, get_tsplib_locations_serialized};
+ use std::collections::HashMap;
+ use std::fs::File;
+ use std::io::{BufReader, BufWriter, Write};
+@@ -8,7 +8,7 @@ use std::sync::Arc;
+ use vrp_core::models::{Problem, Solution};
+ use vrp_core::prelude::{GenericError, Random};
+ use vrp_pragmatic::format::solution::{PragmaticOutputType, write_pragmatic};
+-use vrp_scientific::tsplib::{TsplibProblem, TsplibSolution};
++use vrp_scientific::tsplib::{TsplibProblem, TsplibSolution, read_tsplib_for_locations};
+ 
+ /// A reader for problem.
+ #[allow(clippy::type_complexity)]
+@@ -91,7 +91,11 @@ fn add_scientific(formats: &mut FormatMap, is_rounded: bool, random: Arc<dyn Ran
+                     read_init_solution(BufReader::new(file), problem, random.clone())
+                 })),
+                 SolutionWriter(Box::new(|_, solution, mut writer, _| solution.write_tsplib(&mut writer))),
+-                LocationWriter(Box::new(|_, _| unimplemented!())),
++                LocationWriter(Box::new(|problem: File, mut writer| {
++                    read_tsplib_for_locations(BufReader::new(problem))
++                        .and_then(|problem: Problem| get_tsplib_locations_serialized(&problem))
++                        .and_then(|json| writer.write_all(json.as_bytes()).map_err(From::from))
++                })),
+             ),
+         );
+     }
+diff --git a/vrp-cli/src/lib.rs b/vrp-cli/src/lib.rs
+index 3043918..fd51ba9 100644
+--- a/vrp-cli/src/lib.rs
++++ b/vrp-cli/src/lib.rs
+@@ -45,6 +45,7 @@ use vrp_pragmatic::format::problem::{PragmaticProblem, Problem, serialize_proble
+ use vrp_pragmatic::format::solution::{PragmaticOutputType, write_pragmatic};
+ use vrp_pragmatic::get_unique_locations;
+ use vrp_pragmatic::validation::ValidationContext;
++use vrp_scientific::tsplib::TsplibLocations;
+ 
+ #[cfg(not(target_arch = "wasm32"))]
+ #[allow(unsafe_code)]
+@@ -506,6 +507,21 @@ pub fn get_locations_serialized(problem: &Problem) -> Result<String, GenericErro
+     serde_json::to_string_pretty(&locations).map_err(|err| err.to_string().into())
+ }
+ 
++/// Gets a TSPLIB `EXPLICIT` instance's `DISPLAY_DATA_SECTION` locations serialized in json.
++/// Errors when the source instance declared no `DISPLAY_DATA_SECTION`.
++pub fn get_tsplib_locations_serialized(problem: &CoreProblem) -> Result<String, GenericError> {
++    problem
++        .get_tsplib_locations()
++        .ok_or_else(|| GenericError::from("cannot export locations: instance has no DISPLAY_DATA_SECTION"))
++        .and_then(|locations| {
++            let serialized = locations
++                .into_iter()
++                .map(|(id, x, y)| serde_json::json!({ "id": id, "x": x, "y": y }))
++                .collect::<Vec<_>>();
++            serde_json::to_string_pretty(&serialized).map_err(|err| err.to_string().into())
++        })
++}
++
+ /// Gets solution serialized in json.
+ pub fn get_solution_serialized(problem: Arc<CoreProblem>, config: Config) -> Result<String, GenericError> {
+     let solution = create_builder_from_config(problem.clone(), Default::default(), &config)
+diff --git a/vrp-scientific/src/common/mod.rs b/vrp-scientific/src/common/mod.rs
+index 80292d4..78dfa99 100644
+--- a/vrp-scientific/src/common/mod.rs
++++ b/vrp-scientific/src/common/mod.rs
+@@ -13,7 +13,8 @@ pub use self::initial_reader::read_init_solution;
+ 
+ mod routing;
+ 
+-pub use self::routing::{CoordIndex, CoordIndexExtraProperty};
++pub use self::routing::{CoordIndex, CoordIndexExtraProperty, DisplayCoordinatesExtraProperty};
++pub(crate) use self::routing::{FloatEdgeWeight, create_transport_from_float_coords, create_transport_from_matrix};
+ 
+ use vrp_core::models::Extras;
+ use vrp_core::solver::{HeuristicFilterExtraProperty, HeuristicFilterFn};
+diff --git a/vrp-scientific/src/common/routing.rs b/vrp-scientific/src/common/routing.rs
+index fc0b1a7..1c956df 100644
+--- a/vrp-scientific/src/common/routing.rs
++++ b/vrp-scientific/src/common/routing.rs
+@@ -2,6 +2,7 @@
+ #[path = "../../tests/unit/common/routing_test.rs"]
+ mod routing_test;
+ 
++use std::collections::HashMap;
+ use std::sync::Arc;
+ use vrp_core::custom_extra_property;
+ use vrp_core::models::Extras;
+@@ -13,6 +14,8 @@ use vrp_core::utils::{Float, GenericResult, Timer};
+ 
+ custom_extra_property!(pub CoordIndex typeof CoordIndex);
+ 
++custom_extra_property!(pub DisplayCoordinates typeof HashMap<String, (Float, Float)>);
++
+ /// Represents a coord index which can be used to analyze customer's locations.
+ #[derive(Clone, Default)]
+ pub struct CoordIndex {
+@@ -68,6 +71,101 @@ impl CoordIndex {
+     }
+ }
+ 
++/// Creates transport (fleet index) from a precomputed (TSPLIB `EXPLICIT`) distance matrix.
++/// Values are used exactly as given: no rounding is applied.
++pub(crate) fn create_transport_from_matrix(
++    values: Vec<Float>,
++    logger: &InfoLogger,
++) -> Result<Arc<dyn TransportCost>, GenericError> {
++    Timer::measure_duration_with_callback(
++        || {
++            let transport: Arc<dyn TransportCost> = Arc::new(SingleDataTransportCost::new(values)?);
++            Ok(transport)
++        },
++        |duration| (logger)(format!("fleet index created in {}ms", duration.as_millis()).as_str()),
++    )
++}
++
++/// TSPLIB edge weight types computed from full-precision `(Float, Float)` coordinate pairs.
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub(crate) enum FloatEdgeWeight {
++    /// Euclidean distance rounded up.
++    Ceiling2D,
++    /// The pseudo-Euclidean formula TSPLIB defines for its ATT-class instances.
++    PseudoEuclidean,
++    /// Great-circle distance between two geographic (degrees-and-minutes) coordinates.
++    Geographic,
++}
++
++/// Earth radius (km) used by the TSPLIB GEO distance formula.
++const GEO_EARTH_RADIUS: Float = 6378.388;
++
++/// Converts a TSPLIB geographic coordinate (encoded as `DDD.MM`, i.e. whole degrees in the
++/// integer part and minutes in the fractional part) to radians.
++pub(crate) fn to_geo_radians(coord: Float) -> Float {
++    let degrees = coord.trunc();
++    let minutes = coord - degrees;
++
++    std::f64::consts::PI * (degrees + 5.0 * minutes / 3.0) / 180.0
++}
++
++/// Computes the great-circle distance between two points, each given as (latitude, longitude)
++/// in radians.
++fn geo_distance(lat1: Float, lon1: Float, lat2: Float, lon2: Float) -> Float {
++    let q1 = (lon1 - lon2).cos();
++    let q2 = (lat1 - lat2).cos();
++    let q3 = (lat1 + lat2).cos();
++
++    (GEO_EARTH_RADIUS * (0.5 * ((1.0 + q1) * q2 - (1.0 - q1) * q3)).acos() + 1.0).floor()
++}
++
++/// Computes the edge weight between two full-precision coordinate pairs.
++fn compute_float_edge_weight(edge_type: FloatEdgeWeight, x1: Float, y1: Float, x2: Float, y2: Float) -> Float {
++    match edge_type {
++        FloatEdgeWeight::Ceiling2D => {
++            let (dx, dy) = (x1 - x2, y1 - y2);
++            (dx * dx + dy * dy).sqrt().ceil()
++        }
++        FloatEdgeWeight::PseudoEuclidean => {
++            let (dx, dy) = (x1 - x2, y1 - y2);
++            let rij = ((dx * dx + dy * dy) / 10.0).sqrt();
++            let tij = rij.round();
++            if tij < rij { tij + 1.0 } else { tij }
++        }
++        FloatEdgeWeight::Geographic => {
++            let (lat1, lon1) = (to_geo_radians(x1), to_geo_radians(y1));
++            let (lat2, lon2) = (to_geo_radians(x2), to_geo_radians(y2));
++            geo_distance(lat1, lon1, lat2, lon2)
++        }
++    }
++}
++
++/// Creates transport (fleet index) for TSPLIB `CEIL_2D`, `ATT`, and `GEO` instances from
++/// full-precision coordinate pairs, independent of `CoordIndex`'s `(i32, i32)` locations.
++pub(crate) fn create_transport_from_float_coords(
++    edge_type: FloatEdgeWeight,
++    coordinates: &[(Float, Float)],
++    logger: &InfoLogger,
++) -> Result<Arc<dyn TransportCost>, GenericError> {
++    Timer::measure_duration_with_callback(
++        || {
++            let mut matrix_values = coordinates
++                .iter()
++                .flat_map(|&(x1, y1)| {
++                    coordinates.iter().map(move |&(x2, y2)| compute_float_edge_weight(edge_type, x1, y1, x2, y2))
++                })
++                .collect::<Vec<Float>>();
++
++            matrix_values.shrink_to_fit();
++
++            let transport: Arc<dyn TransportCost> = Arc::new(SingleDataTransportCost::new(matrix_values)?);
++
++            Ok(transport)
++        },
++        |duration| (logger)(format!("fleet index created in {}ms", duration.as_millis()).as_str()),
++    )
++}
++
+ /// Represents a transport cost which has the same distances as durations and single profile.
+ struct SingleDataTransportCost {
+     size: usize,
+diff --git a/vrp-scientific/src/common/text_reader.rs b/vrp-scientific/src/common/text_reader.rs
+index 8e97346..8fc2dde 100644
+--- a/vrp-scientific/src/common/text_reader.rs
++++ b/vrp-scientific/src/common/text_reader.rs
+@@ -6,7 +6,7 @@ use vrp_core::models::common::*;
+ use vrp_core::models::problem::*;
+ use vrp_core::models::*;
+ use vrp_core::prelude::{GenericError, InfoLogger};
+-use vrp_core::utils::GenericResult;
++use vrp_core::utils::{Float, GenericResult};
+ 
+ pub(crate) trait TextReader {
+     fn read_problem(&mut self, is_rounded: bool) -> GenericResult<Problem> {
+@@ -166,3 +166,32 @@ pub(crate) fn skip_lines<R: Read>(
+ 
+     Ok(())
+ }
++
++/// Reads exactly `count` whitespace-separated numeric tokens, consuming as many lines as needed.
++/// Unlike `read_line`, a single logical section can be wrapped across an arbitrary number of
++/// physical lines, so tokens are accumulated until the target count is reached.
++pub(crate) fn read_n_values<R: Read>(
++    count: usize,
++    reader: &mut BufReader<R>,
++    buffer: &mut String,
++) -> Result<Vec<Float>, GenericError> {
++    let mut values = Vec::with_capacity(count);
++
++    while values.len() < count {
++        let bytes_read = read_line(reader, buffer)?;
++
++        if bytes_read == 0 {
++            return Err(format!("unexpected end of data: expected {count} values, got {}", values.len()).into());
++        }
++
++        for token in buffer.split_whitespace() {
++            values.push(token.parse::<Float>().map_err(|err| format!("cannot parse value '{token}': {err}"))?);
++        }
++    }
++
++    if values.len() != count {
++        return Err(format!("expected {count} values, got {}", values.len()).into());
++    }
++
++    Ok(values)
++}
+diff --git a/vrp-scientific/src/tsplib/locations.rs b/vrp-scientific/src/tsplib/locations.rs
+new file mode 100644
+index 0000000..b8865b0
+--- /dev/null
++++ b/vrp-scientific/src/tsplib/locations.rs
+@@ -0,0 +1,19 @@
++use crate::common::DisplayCoordinatesExtraProperty;
++use vrp_core::models::Problem;
++use vrp_core::utils::Float;
++
++/// A trait to recover a TSPLIB `EXPLICIT` instance's `DISPLAY_DATA_SECTION` locations.
++pub trait TsplibLocations {
++    /// Gets `(id, x, y)` triples for every declared location, or `None` if there are none.
++    fn get_tsplib_locations(&self) -> Option<Vec<(String, Float, Float)>>;
++}
++
++impl TsplibLocations for Problem {
++    fn get_tsplib_locations(&self) -> Option<Vec<(String, Float, Float)>> {
++        self.extras.get_display_coordinates().map(|coordinates| {
++            let mut locations = coordinates.iter().map(|(id, (x, y))| (id.clone(), *x, *y)).collect::<Vec<_>>();
++            locations.sort_by_key(|(id, _, _)| id.parse::<i32>().unwrap_or(i32::MAX));
++            locations
++        })
++    }
++}
+diff --git a/vrp-scientific/src/tsplib/mod.rs b/vrp-scientific/src/tsplib/mod.rs
+index c9bfaf6..7acfebd 100644
+--- a/vrp-scientific/src/tsplib/mod.rs
++++ b/vrp-scientific/src/tsplib/mod.rs
+@@ -1,7 +1,10 @@
+ //! Contains functionality to read tsplib95 problem and write its solution.
+ 
+ mod reader;
+-pub use self::reader::TsplibProblem;
++pub use self::reader::{TsplibProblem, read_tsplib_for_locations};
+ 
+ mod writer;
+ pub use self::writer::TsplibSolution;
++
++mod locations;
++pub use self::locations::TsplibLocations;
+diff --git a/vrp-scientific/src/tsplib/reader.rs b/vrp-scientific/src/tsplib/reader.rs
+index 22d1318..0e295cd 100644
+--- a/vrp-scientific/src/tsplib/reader.rs
++++ b/vrp-scientific/src/tsplib/reader.rs
+@@ -10,7 +10,7 @@ use vrp_core::construction::features::JobDemandDimension;
+ use vrp_core::models::common::*;
+ use vrp_core::models::problem::*;
+ use vrp_core::models::*;
+-use vrp_core::prelude::GenericError;
++use vrp_core::prelude::{GenericError, InfoLogger};
+ use vrp_core::utils::Float;
+ 
+ /// A trait to read tsplib95 problem. Please note that it is very basic implementation of the format specification.
+@@ -31,12 +31,45 @@ impl TsplibProblem for String {
+     }
+ }
+ 
++/// Reads a tsplib95 problem for the `--get-locations` CLI path only, suppressing the reader's
++/// transport-log message so location JSON output stays the only thing written to stdout.
++pub fn read_tsplib_for_locations<R: Read>(reader: BufReader<R>) -> Result<Problem, GenericError> {
++    TsplibReader::new(reader).quiet().read_problem(false)
++}
++
++/// TSPLIB `EDGE_WEIGHT_FORMAT` layouts used to lay out an `EDGE_WEIGHT_SECTION` matrix.
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum EdgeWeightFormat {
++    FullMatrix,
++    UpperRow,
++    LowerRow,
++    UpperDiagRow,
++    LowerDiagRow,
++}
++
++/// The parsed `EDGE_WEIGHT_TYPE`, dispatching to the right definitions/transport strategy.
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum TsplibEdgeType {
++    /// Straight-line Euclidean distance from `(i32, i32)` coordinates, optionally rounded.
++    Euclidean2D,
++    /// A formula computed from full-precision `(Float, Float)` coordinates.
++    FloatComputed(FloatEdgeWeight),
++    /// A precomputed matrix supplied in an `EDGE_WEIGHT_SECTION`.
++    Explicit(EdgeWeightFormat),
++}
++
+ struct TsplibReader<R: Read> {
+     buffer: String,
+     reader: BufReader<R>,
+     dimension: Option<usize>,
+     vehicle_capacity: Option<usize>,
+     coord_index: CoordIndex,
++    edge_type: Option<TsplibEdgeType>,
++    float_coordinates: HashMap<i32, (Float, Float)>,
++    explicit_matrix: Option<Vec<Float>>,
++    has_display_data: bool,
++    display_coordinates: HashMap<String, (Float, Float)>,
++    quiet: bool,
+ }
+ 
+ impl<R: Read> TextReader for TsplibReader<R> {
+@@ -52,6 +85,159 @@ impl<R: Read> TextReader for TsplibReader<R> {
+     fn read_definitions(&mut self) -> Result<(Vec<Job>, Fleet), GenericError> {
+         self.read_meta()?;
+ 
++        match self.edge_type.expect("edge type is set by read_meta") {
++            TsplibEdgeType::Euclidean2D => self.read_definitions_computed(),
++            TsplibEdgeType::FloatComputed(_) => self.read_definitions_float_computed(),
++            TsplibEdgeType::Explicit(format) => self.read_definitions_explicit(format),
++        }
++    }
++
++    fn create_transport(&self, is_rounded: bool) -> Result<Arc<dyn TransportCost>, GenericError> {
++        match self.edge_type.expect("edge type is set by read_meta") {
++            TsplibEdgeType::Euclidean2D => self.coord_index.create_transport(is_rounded, &self.get_logger()),
++            TsplibEdgeType::FloatComputed(edge_type) => {
++                let dimension = self.dimension.unwrap();
++                let coordinates = (0..dimension as i32)
++                    .map(|idx| {
++                        self.float_coordinates
++                            .get(&(idx + 1))
++                            .copied()
++                            .ok_or_else(|| GenericError::from(format!("cannot find coordinate for id: '{}'", idx + 1)))
++                    })
++                    .collect::<Result<Vec<_>, GenericError>>()?;
++
++                create_transport_from_float_coords(edge_type, &coordinates, &self.get_logger())
++            }
++            TsplibEdgeType::Explicit(_) => {
++                let matrix = self.explicit_matrix.clone().expect("explicit matrix is set by read_definitions");
++                create_transport_from_matrix(matrix, &self.get_logger())
++            }
++        }
++    }
++
++    fn create_extras(&self) -> Extras {
++        let mut extras = get_extras(self.coord_index.clone());
++        if !self.display_coordinates.is_empty() {
++            extras.set_display_coordinates(Arc::new(self.display_coordinates.clone()));
++        }
++        extras
++    }
++
++    fn get_logger(&self) -> InfoLogger {
++        if self.quiet { Arc::new(|_| {}) } else { Arc::new(|msg| println!("{msg}")) }
++    }
++}
++
++type ProblemData = (HashMap<i32, (i32, i32)>, HashMap<i32, i32>);
++
++impl<R: Read> TsplibReader<R> {
++    fn new(reader: BufReader<R>) -> Self {
++        Self {
++            buffer: String::new(),
++            reader,
++            dimension: None,
++            vehicle_capacity: None,
++            coord_index: CoordIndex::default(),
++            edge_type: None,
++            float_coordinates: HashMap::new(),
++            explicit_matrix: None,
++            has_display_data: false,
++            display_coordinates: HashMap::new(),
++            quiet: false,
++        }
++    }
++
++    fn quiet(mut self) -> Self {
++        self.quiet = true;
++        self
++    }
++
++    fn read_meta(&mut self) -> Result<(), GenericError> {
++        self.skip_lines(2)?;
++
++        let problem_type = self.read_key_value("TYPE")?;
++        if problem_type != "CVRP" {
++            return Err(format!("expecting 'CVRP' as TYPE, got '{problem_type}'").into());
++        }
++
++        self.dimension = Some(
++            self.read_key_value("DIMENSION")
++                .and_then(|dimen| parse_int(&dimen, "cannot parse DIMENSION").map(|v| v as usize))?,
++        );
++
++        let edge_weight_type = self.read_key_value("EDGE_WEIGHT_TYPE")?;
++        self.edge_type = Some(match edge_weight_type.as_str() {
++            "EUC_2D" => TsplibEdgeType::Euclidean2D,
++            "CEIL_2D" => TsplibEdgeType::FloatComputed(FloatEdgeWeight::Ceiling2D),
++            "ATT" => TsplibEdgeType::FloatComputed(FloatEdgeWeight::PseudoEuclidean),
++            "GEO" => TsplibEdgeType::FloatComputed(FloatEdgeWeight::Geographic),
++            "EXPLICIT" => {
++                let (format, has_display_data) = self.read_explicit_header_fields()?;
++                self.has_display_data = has_display_data;
++                TsplibEdgeType::Explicit(format)
++            }
++            _ => {
++                return Err(format!(
++                    "expecting one of 'EUC_2D', 'CEIL_2D', 'ATT', 'GEO', 'EXPLICIT' as EDGE_WEIGHT_TYPE, got '{edge_weight_type}'"
++                )
++                .into());
++            }
++        });
++
++        if self.vehicle_capacity.is_none() {
++            self.vehicle_capacity = Some(
++                self.read_key_value("CAPACITY")
++                    .and_then(|capacity| parse_int(&capacity, "cannot parse CAPACITY").map(|v| v as usize))?,
++            );
++        }
++
++        Ok(())
++    }
++
++    /// Reads `EDGE_WEIGHT_FORMAT`, `DISPLAY_DATA_TYPE`, and `CAPACITY` for an `EXPLICIT` instance
++    /// in whichever order the file declares them: the format does not fix their position relative
++    /// to each other. Sets `self.vehicle_capacity` directly so the trailing `CAPACITY` read in
++    /// `read_meta` is skipped once this loop has already consumed it.
++    fn read_explicit_header_fields(&mut self) -> Result<(EdgeWeightFormat, bool), GenericError> {
++        let mut format = None;
++        let mut has_display_data = None;
++
++        while format.is_none() || has_display_data.is_none() || self.vehicle_capacity.is_none() {
++            let (key, value) = self.read_any_key_value().map_err(|_| {
++                let missing = [
++                    ("EDGE_WEIGHT_FORMAT", format.is_none()),
++                    ("DISPLAY_DATA_TYPE", has_display_data.is_none()),
++                    ("CAPACITY", self.vehicle_capacity.is_none()),
++                ]
++                .into_iter()
++                .filter(|(_, is_missing)| *is_missing)
++                .map(|(name, _)| format!("'{name}'"))
++                .collect::<Vec<_>>()
++                .join(", ");
++                GenericError::from(format!("missing {missing} before the EXPLICIT data section"))
++            })?;
++
++            match key.as_str() {
++                "EDGE_WEIGHT_FORMAT" if format.is_none() => format = Some(parse_edge_weight_format(&value)?),
++                "DISPLAY_DATA_TYPE" if has_display_data.is_none() => {
++                    has_display_data = Some(parse_display_data_type(&value)?)
++                }
++                "CAPACITY" if self.vehicle_capacity.is_none() => {
++                    self.vehicle_capacity = Some(parse_int(&value, "cannot parse CAPACITY").map(|v| v as usize)?)
++                }
++                _ => {
++                    return Err(format!(
++                        "expecting one of 'EDGE_WEIGHT_FORMAT', 'DISPLAY_DATA_TYPE', 'CAPACITY', got '{key}'"
++                    )
++                    .into());
++                }
++            }
++        }
++
++        Ok((format.unwrap(), has_display_data.unwrap()))
++    }
++
++    fn read_definitions_computed(&mut self) -> Result<(Vec<Job>, Fleet), GenericError> {
+         let (coordinates, demands) = self.read_customer_data()?;
+         let depot_id = self.read_depot_data()?;
+         self.read_expected_line("EOF")?;
+@@ -82,61 +268,101 @@ impl<R: Read> TextReader for TsplibReader<R> {
+         Ok((jobs, fleet))
+     }
+ 
+-    fn create_transport(&self, is_rounded: bool) -> Result<Arc<dyn TransportCost>, GenericError> {
+-        self.coord_index.create_transport(is_rounded, &self.get_logger())
+-    }
++    fn read_definitions_float_computed(&mut self) -> Result<(Vec<Job>, Fleet), GenericError> {
++        let coordinates = self.read_float_coordinates()?;
++        let demands = self.read_demand_data()?;
++        let depot_id = self.read_depot_data()?;
++        self.read_expected_line("EOF")?;
+ 
+-    fn create_extras(&self) -> Extras {
+-        get_extras(self.coord_index.clone())
+-    }
+-}
++        let dimension = self.dimension.unwrap();
+ 
+-type ProblemData = (HashMap<i32, (i32, i32)>, HashMap<i32, i32>);
++        self.float_coordinates = coordinates;
+ 
+-impl<R: Read> TsplibReader<R> {
+-    fn new(reader: BufReader<R>) -> Self {
+-        Self {
+-            buffer: String::new(),
+-            reader,
+-            dimension: None,
+-            vehicle_capacity: None,
+-            coord_index: CoordIndex::default(),
+-        }
++        self.build_jobs_and_fleet_by_id(dimension, depot_id, &demands)
+     }
+ 
+-    fn read_meta(&mut self) -> Result<(), GenericError> {
+-        self.skip_lines(2)?;
++    fn read_definitions_explicit(&mut self, format: EdgeWeightFormat) -> Result<(Vec<Job>, Fleet), GenericError> {
++        let matrix = self.read_edge_weight_section(format)?;
+ 
+-        let problem_type = self.read_key_value("TYPE")?;
+-        if problem_type != "CVRP" {
+-            return Err(format!("expecting 'CVRP' as TYPE, got '{problem_type}'").into());
++        if self.has_display_data {
++            self.display_coordinates = self.read_display_data_section()?;
+         }
+ 
+-        self.dimension = Some(
+-            self.read_key_value("DIMENSION")
+-                .and_then(|dimen| parse_int(&dimen, "cannot parse DIMENSION").map(|v| v as usize))?,
+-        );
++        let demands = self.read_demand_data()?;
++        let depot_id = self.read_depot_data()?;
++        self.read_expected_line("EOF")?;
+ 
+-        let edge_type = self.read_key_value("EDGE_WEIGHT_TYPE")?;
+-        if edge_type != "EUC_2D" {
+-            return Err(format!("expecting 'EUC_2D' as EDGE_WEIGHT_TYPE, got '{edge_type}'").into());
+-        }
++        let dimension = self.dimension.unwrap();
++
++        self.explicit_matrix = Some(matrix);
+ 
+-        self.vehicle_capacity = Some(
+-            self.read_key_value("CAPACITY")
+-                .and_then(|capacity| parse_int(&capacity, "cannot parse CAPACITY").map(|v| v as usize))?,
++        self.build_jobs_and_fleet_by_id(dimension, depot_id, &demands)
++    }
++
++    /// Builds jobs and fleet using each customer's original TSPLIB id directly as its location
++    /// index (`id - 1`), independent of the order customer/demand lines appear in the file.
++    fn build_jobs_and_fleet_by_id(
++        &self,
++        dimension: usize,
++        depot_id: i32,
++        demands: &HashMap<i32, i32>,
++    ) -> Result<(Vec<Job>, Fleet), GenericError> {
++        let jobs = (1..=dimension as i32)
++            .filter(|id| *id != depot_id)
++            .map(|id| {
++                let demand = *demands.get(&id).ok_or_else(|| format!("cannot find demand for id: '{id}'"))?;
++                Ok(build_single_job(&(id - 1).to_string(), (id - 1) as usize, demand))
++            })
++            .collect::<Result<Vec<_>, GenericError>>()?;
++
++        let fleet = create_fleet_with_distance_costs(
++            dimension,
++            self.vehicle_capacity.unwrap(),
++            (depot_id - 1) as usize,
++            TimeWindow::max(),
+         );
+ 
+-        Ok(())
++        Ok((jobs, fleet))
++    }
++
++    /// Reads a `DISPLAY_DATA_SECTION`. Its coordinates are for visualization only.
++    fn read_display_data_section(&mut self) -> Result<HashMap<String, (Float, Float)>, GenericError> {
++        let dimension = self.dimension.unwrap();
++
++        self.read_expected_line("DISPLAY_DATA_SECTION")?;
++
++        let mut coordinates = HashMap::with_capacity(dimension);
++        for _ in 0..dimension {
++            let line = self.read_line()?.trim();
++            let data = line.split_whitespace().collect::<Vec<_>>();
++
++            if data.len() != 3 {
++                return Err(format!("unexpected display data: '{line}'").into());
++            }
++
++            let id = parse_int(data[0], "cannot parse id")?;
++            let x = parse_float(data[1], "cannot parse display coord.0")?;
++            let y = parse_float(data[2], "cannot parse display coord.1")?;
++
++            coordinates.insert((id - 1).to_string(), (x, y));
++        }
++
++        Ok(coordinates)
+     }
+ 
+     fn read_customer_data(&mut self) -> Result<ProblemData, GenericError> {
++        let coordinates = self.read_node_coordinates()?;
++        let demands = self.read_demand_data()?;
++
++        Ok((coordinates, demands))
++    }
++
++    fn read_node_coordinates(&mut self) -> Result<HashMap<i32, (i32, i32)>, GenericError> {
+         let dimension = self.dimension.unwrap();
+ 
+-        // read coordinates
+         self.read_expected_line("NODE_COORD_SECTION")?;
+ 
+-        let mut coordinates = HashMap::with_capacity(self.dimension.unwrap());
++        let mut coordinates = HashMap::with_capacity(dimension);
+         for _ in 0..dimension {
+             let line = self.read_line()?.trim();
+             let data = line.split_whitespace().collect::<Vec<_>>();
+@@ -150,10 +376,40 @@ impl<R: Read> TsplibReader<R> {
+             coordinates.insert(parse_int(data[0], "cannot parse id")?, coord);
+         }
+ 
+-        // read demand
++        Ok(coordinates)
++    }
++
++    /// Reads `NODE_COORD_SECTION` as full-precision coordinates, for `CEIL_2D`/`ATT`/`GEO`.
++    /// Parsing through the integer parser used by the `EUC_2D` path would round away real
++    /// fractional distance (`ATT`/`CEIL_2D`) or the minutes component of a `GEO` coordinate.
++    fn read_float_coordinates(&mut self) -> Result<HashMap<i32, (Float, Float)>, GenericError> {
++        let dimension = self.dimension.unwrap();
++
++        self.read_expected_line("NODE_COORD_SECTION")?;
++
++        let mut coordinates = HashMap::with_capacity(dimension);
++        for _ in 0..dimension {
++            let line = self.read_line()?.trim();
++            let data = line.split_whitespace().collect::<Vec<_>>();
++
++            if data.len() != 3 {
++                return Err(format!("unexpected coord data: '{line}'").into());
++            }
++
++            let coord = (parse_float(data[1], "cannot parse coord.0")?, parse_float(data[2], "cannot parse coord.1")?);
++
++            coordinates.insert(parse_int(data[0], "cannot parse id")?, coord);
++        }
++
++        Ok(coordinates)
++    }
++
++    fn read_demand_data(&mut self) -> Result<HashMap<i32, i32>, GenericError> {
++        let dimension = self.dimension.unwrap();
++
+         self.read_expected_line("DEMAND_SECTION")?;
+ 
+-        let mut demands = HashMap::with_capacity(self.dimension.unwrap());
++        let mut demands = HashMap::with_capacity(dimension);
+         for _ in 0..dimension {
+             let line = self.read_line()?.trim();
+             let data = line.split_whitespace().collect::<Vec<_>>();
+@@ -165,7 +421,18 @@ impl<R: Read> TsplibReader<R> {
+             demands.insert(parse_int(data[0], "cannot parse id")?, parse_int(data[1], "cannot parse demand")?);
+         }
+ 
+-        Ok((coordinates, demands))
++        Ok(demands)
++    }
++
++    fn read_edge_weight_section(&mut self, format: EdgeWeightFormat) -> Result<Vec<Float>, GenericError> {
++        let dimension = self.dimension.unwrap();
++
++        self.read_expected_line("EDGE_WEIGHT_SECTION")?;
++
++        let count = edge_weight_section_len(format, dimension);
++        let values = read_n_values(count, &mut self.reader, &mut self.buffer)?;
++
++        Ok(expand_edge_weight_matrix(format, dimension, &values))
+     }
+ 
+     fn read_depot_data(&mut self) -> Result<i32, GenericError> {
+@@ -177,19 +444,23 @@ impl<R: Read> TsplibReader<R> {
+     }
+ 
+     fn read_key_value(&mut self, expected_key: &str) -> Result<String, GenericError> {
++        let (actual_key, value) = self.read_any_key_value()?;
++        if actual_key != expected_key {
++            return Err(format!("unexpected key, expecting: '{expected_key}', got: '{actual_key}'").into());
++        }
++
++        Ok(value)
++    }
++
++    fn read_any_key_value(&mut self) -> Result<(String, String), GenericError> {
+         let line = self.read_line()?;
+-        let key_value = line.split(':').map(|v| v.to_string()).collect::<Vec<_>>();
++        let key_value = line.split(':').map(|v| v.trim().to_string()).collect::<Vec<_>>();
+ 
+         if key_value.len() != 2 {
+             return Err(format!("expected colon separated string, got: '{line}'").into());
+         }
+ 
+-        let actual_key = key_value[0].trim();
+-        if actual_key.trim() != expected_key {
+-            return Err(format!("unexpected key, expecting: '{expected_key}', got: '{actual_key}'").into());
+-        }
+-
+-        Ok(key_value[1].trim().to_string())
++        Ok((key_value[0].clone(), key_value[1].clone()))
+     }
+ 
+     fn read_expected_line(&mut self, expected: &str) -> Result<(), GenericError> {
+@@ -207,19 +478,116 @@ impl<R: Read> TsplibReader<R> {
+     }
+ 
+     fn create_job(&mut self, id: &str, location: (i32, i32), demand: i32) -> Job {
+-        let mut dimens = Dimensions::default();
+-        dimens.set_job_id(id.to_string()).set_job_demand(Demand::<SingleDimLoad> {
+-            pickup: (SingleDimLoad::default(), SingleDimLoad::default()),
+-            delivery: (SingleDimLoad::new(demand), SingleDimLoad::default()),
+-        });
+-        Job::Single(Arc::new(Single {
+-            places: vec![Place {
+-                location: Some(self.coord_index.collect(location)),
+-                duration: 0.,
+-                times: vec![TimeSpan::Window(TimeWindow::max())],
+-            }],
+-            dimens,
+-        }))
++        build_single_job(id, self.coord_index.collect(location), demand)
++    }
++}
++
++/// Builds a single-place job at the given location. Shared by every `EDGE_WEIGHT_TYPE` path:
++/// callers differ only in how `location` is derived (via `CoordIndex` append order for computed
++/// formula for `EUC_2D`, or directly from the original TSPLIB id for every other type).
++fn build_single_job(id: &str, location: Location, demand: i32) -> Job {
++    let mut dimens = Dimensions::default();
++    dimens.set_job_id(id.to_string()).set_job_demand(Demand::<SingleDimLoad> {
++        pickup: (SingleDimLoad::default(), SingleDimLoad::default()),
++        delivery: (SingleDimLoad::new(demand), SingleDimLoad::default()),
++    });
++    Job::Single(Arc::new(Single {
++        places: vec![Place {
++            location: Some(location),
++            duration: 0.,
++            times: vec![TimeSpan::Window(TimeWindow::max())],
++        }],
++        dimens,
++    }))
++}
++
++/// Number of numeric tokens an `EDGE_WEIGHT_SECTION` carries for the given format and dimension.
++fn edge_weight_section_len(format: EdgeWeightFormat, dimension: usize) -> usize {
++    match format {
++        EdgeWeightFormat::FullMatrix => dimension * dimension,
++        EdgeWeightFormat::UpperRow | EdgeWeightFormat::LowerRow => dimension * dimension.saturating_sub(1) / 2,
++        EdgeWeightFormat::UpperDiagRow | EdgeWeightFormat::LowerDiagRow => dimension * (dimension + 1) / 2,
++    }
++}
++
++/// Writes one parsed value into both `(i, j)` and its mirror `(j, i)`, keeping the expanded
++/// matrix symmetric regardless of which half the source format stored.
++fn set_symmetric(matrix: &mut [Float], dimension: usize, values: &mut std::slice::Iter<Float>, i: usize, j: usize) {
++    let value = *values.next().expect("edge weight section value count already validated by read_n_values");
++    matrix[i * dimension + j] = value;
++    matrix[j * dimension + i] = value;
++}
++
++/// Expands a triangular or full `EDGE_WEIGHT_SECTION` token stream into a full, symmetric
++/// `dimension x dimension` row-major matrix.
++fn expand_edge_weight_matrix(format: EdgeWeightFormat, dimension: usize, values: &[Float]) -> Vec<Float> {
++    let mut matrix = vec![0.; dimension * dimension];
++    let mut values = values.iter();
++
++    match format {
++        EdgeWeightFormat::FullMatrix => {
++            for i in 0..dimension {
++                for j in 0..dimension {
++                    matrix[i * dimension + j] =
++                        *values.next().expect("edge weight section value count already validated by read_n_values");
++                }
++            }
++        }
++        EdgeWeightFormat::UpperRow => {
++            for i in 0..dimension {
++                for j in (i + 1)..dimension {
++                    set_symmetric(&mut matrix, dimension, &mut values, i, j);
++                }
++            }
++        }
++        EdgeWeightFormat::LowerRow => {
++            for i in 0..dimension {
++                for j in 0..i {
++                    set_symmetric(&mut matrix, dimension, &mut values, i, j);
++                }
++            }
++        }
++        EdgeWeightFormat::UpperDiagRow => {
++            for i in 0..dimension {
++                for j in i..dimension {
++                    set_symmetric(&mut matrix, dimension, &mut values, i, j);
++                }
++            }
++        }
++        EdgeWeightFormat::LowerDiagRow => {
++            for i in 0..dimension {
++                for j in 0..=i {
++                    set_symmetric(&mut matrix, dimension, &mut values, i, j);
++                }
++            }
++        }
++    }
++
++    matrix
++}
++
++fn parse_edge_weight_format(format: &str) -> Result<EdgeWeightFormat, GenericError> {
++    match format {
++        "FULL_MATRIX" => Ok(EdgeWeightFormat::FullMatrix),
++        "UPPER_ROW" => Ok(EdgeWeightFormat::UpperRow),
++        "LOWER_ROW" => Ok(EdgeWeightFormat::LowerRow),
++        "UPPER_DIAG_ROW" => Ok(EdgeWeightFormat::UpperDiagRow),
++        "LOWER_DIAG_ROW" => Ok(EdgeWeightFormat::LowerDiagRow),
++        _ => Err(format!(
++            "expecting one of 'FULL_MATRIX', 'UPPER_ROW', 'LOWER_ROW', 'UPPER_DIAG_ROW', 'LOWER_DIAG_ROW' as EDGE_WEIGHT_FORMAT, got '{format}'"
++        )
++        .into()),
++    }
++}
++
++fn parse_display_data_type(display_type: &str) -> Result<bool, GenericError> {
++    match display_type {
++        "NO_DISPLAY" => Ok(false),
++        "TWOD_DISPLAY" => Ok(true),
++        _ => {
++            Err(format!("expecting one of 'NO_DISPLAY', 'TWOD_DISPLAY' as DISPLAY_DATA_TYPE, got '{display_type}'")
++                .into())
++        }
+     }
+ }
+ 
+@@ -229,3 +597,7 @@ fn parse_int(data: &str, err_msg: &str) -> Result<i32, GenericError> {
+         .map(|value| value.round() as i32)
+         .map_err(|err| format!("{err_msg}: '{err}'").into())
+ }
++
++fn parse_float(data: &str, err_msg: &str) -> Result<Float, GenericError> {
++    data.parse::<Float>().map_err(|err| format!("{err_msg}: '{err}'").into())
++}

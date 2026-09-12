@@ -1,0 +1,773 @@
+diff --git a/petl/__init__.py b/petl/__init__.py
+index 36ac634..48409d0 100644
+--- a/petl/__init__.py
++++ b/petl/__init__.py
+@@ -13,3 +13,5 @@ from petl.transform import *
+ from petl import config
+ from petl import errors
+ from petl.errors import *
++from petl import delta
++from petl.delta import *
+diff --git a/petl/delta/__init__.py b/petl/delta/__init__.py
+new file mode 100644
+index 0000000..50f7eb3
+--- /dev/null
++++ b/petl/delta/__init__.py
+@@ -0,0 +1,5 @@
++from __future__ import absolute_import, print_function, division
++
++
++from petl.delta.feed import Feed, feed
++from petl.delta.pipeline import IncrementalPipeline, Refresh, incremental, resume
+diff --git a/petl/delta/feed.py b/petl/delta/feed.py
+new file mode 100644
+index 0000000..d018849
+--- /dev/null
++++ b/petl/delta/feed.py
+@@ -0,0 +1,65 @@
++from __future__ import absolute_import, print_function, division
++
++
++from petl.errors import ArgumentError
++from petl.util.base import Table
++
++
++class Feed(Table):
++    """A source table an incremental pipeline can follow."""
++
++    def __init__(self, header, rows=()):
++        self._header = tuple(header)
++        self._rows = [tuple(row) for row in rows]
++        self._gone = set()
++        self.rows_read = 0
++
++    def append(self, row):
++        """Add a single data row to the end of the feed."""
++        self._rows.append(tuple(row))
++
++    def extend(self, rows):
++        """Add several data rows to the end of the feed."""
++        for row in rows:
++            self._rows.append(tuple(row))
++
++    def discard(self, index):
++        """Drop the row at `index`, leaving the other positions where they are."""
++        if index < 0 or index >= len(self._rows) or index in self._gone:
++            raise ArgumentError('no row at position %s' % index)
++        self._gone.add(index)
++
++    def discards(self):
++        """Return the positions dropped so far, lowest first."""
++        return tuple(sorted(self._gone))
++
++    def rows_from(self, index):
++        """Return the data rows held from position `index` onwards."""
++        rows = [row for position, row in enumerate(self._rows)
++                if position >= index and position not in self._gone]
++        self.rows_read += len(rows)
++        return rows
++
++    def __len__(self):
++        return len(self._rows) - len(self._gone) + 1
++
++    def __iter__(self):
++        yield self._header
++        for position, row in enumerate(self._rows):
++            if position in self._gone:
++                continue
++            self.rows_read += 1
++            yield row
++
++
++def feed(header, rows=()):
++    """Return an append-only table that an incremental pipeline can follow.
++
++    The header is fixed when the feed is made. Rows are added with
++    :meth:`Feed.append` and :meth:`Feed.extend`, a row already handed out is
++    dropped with :meth:`Feed.discard`, and the feed keeps count of the rows it
++    has handed out in :attr:`Feed.rows_read`.
++
++    """
++
++    return Feed(header, rows)
+diff --git a/petl/delta/operators.py b/petl/delta/operators.py
+new file mode 100644
+index 0000000..0921e75
+--- /dev/null
++++ b/petl/delta/operators.py
+@@ -0,0 +1,370 @@
++from __future__ import absolute_import, print_function, division
++
++
++import operator
++
++
++from petl.comparison import Comparable
++from petl.util.base import asindices
++from petl.transform.basics import CutView, CatView, AddFieldView, RowSliceView
++from petl.transform.conversions import FieldConvertView
++from petl.transform.dedup import DistinctView
++from petl.transform.joins import JoinView
++from petl.transform.reductions import SimpleAggregateView, MultiAggregateView
++from petl.transform.selects import FieldSelectView, RowSelectView
++from petl.transform.sorts import SortView
++
++
++def rebuild(node, tables):
++    """Re-apply the transform a node holds to already materialized tables."""
++
++    view = node.view
++    kind = node.kind
++    if kind == 'cut':
++        return CutView(tables[0], view.spec, view.missing)
++    if kind == 'addfield':
++        return AddFieldView(tables[0], view.field, view.value, view._index,
++                            view.source.missing)
++    if kind == 'convert':
++        return FieldConvertView(tables[0], view.converters, view.failonerror,
++                                view.errorvalue, view.where, view.pass_row,
++                                view.trusted)
++    if kind == 'select':
++        if isinstance(view, FieldSelectView):
++            return FieldSelectView(tables[0], view.field, view.where,
++                                   view._complement, view.missing)
++        return RowSelectView(tables[0], view.where, view.missing,
++                             view._complement)
++    if kind == 'cat':
++        return CatView(tables, view.missing, view._header)
++    if kind == 'sort':
++        return SortView(tables[0], view.key, view.reverse)
++    if kind == 'distinct':
++        return DistinctView(tables[0], view.key, view.count)
++    if kind == 'head':
++        return RowSliceView(tables[0], *view.sliceargs)
++    if kind == 'join':
++        return JoinView(tables[0], tables[1], view.lkey, view.rkey,
++                        leftouter=view.leftouter, rightouter=view.rightouter,
++                        missing=view.missing, lprefix=view.lprefix,
++                        rprefix=view.rprefix)
++    if isinstance(view, SimpleAggregateView):
++        return SimpleAggregateView(tables[0], view.key, view.aggregation,
++                                   view.value, field=view.field)
++    return MultiAggregateView(tables[0], view.key, view.aggregation)
++
++
++def as_rows(rows):
++    return [list(row) for row in rows]
++
++
++def as_tuples(rows):
++    return [tuple(row) for row in rows]
++
++
++def keygetter(header, key):
++    indices = asindices(header, key)
++    return operator.itemgetter(*indices)
++
++
++def group_by_key(rows, getkey):
++    groups = {}
++    for row in rows:
++        groups.setdefault(getkey(row), []).append(row)
++    return groups
++
++
++class Operator(object):
++    """Holds the current output of one plan node between refreshes."""
++
++    def __init__(self, node):
++        self.node = node
++        self.header = None
++        self.rows = []
++
++    def evaluate(self, inputs):
++        raise NotImplementedError
++
++    def state(self):
++        return self.header, list(self.rows)
++
++    def restore(self, state):
++        self.header = state[0]
++        self.rows = list(state[1])
++
++    def checkpoint(self):
++        """Return this node's state as plain lists and mappings."""
++
++        return {'header': list(self.header), 'rows': as_rows(self.rows)}
++
++    def load(self, saved):
++        """Take the state back from a checkpoint."""
++
++        self.header = tuple(saved['header'])
++        self.rows = as_tuples(saved['rows'])
++
++    def _materialize(self, inputs):
++        return [[header] + list(rows) for header, rows in inputs]
++
++    def _run(self, tables):
++        return [tuple(row) for row in rebuild(self.node, tables)]
++
++
++class FeedOperator(Operator):
++    """Reads what a feed has gained and dropped since the previous refresh."""
++
++    def __init__(self, node):
++        Operator.__init__(self, node)
++        self.cursor = 0
++        self.held = []
++
++    def evaluate(self, inputs):
++        view = self.node.view
++        gone = set(view.discards())
++        fresh = view.rows_from(self.cursor)
++        live = [position for position in range(self.cursor, self.cursor
++                                               + len(fresh) + len(gone))
++                if position not in gone][:len(fresh)]
++        held = self.held + [[position, row]
++                            for position, row in zip(live, fresh)]
++        self.cursor += len(fresh) + sum(1 for position in gone
++                                        if position >= self.cursor)
++        self.held = [pair for pair in held if pair[0] not in gone]
++        self.header = view._header
++        self.rows = [row for _, row in self.held]
++
++    def state(self):
++        return self.header, list(self.rows), self.cursor, list(self.held)
++
++    def restore(self, state):
++        Operator.restore(self, state)
++        self.cursor = state[2]
++        self.held = [list(pair) for pair in state[3]]
++
++    def checkpoint(self):
++        saved = Operator.checkpoint(self)
++        saved['cursor'] = self.cursor
++        saved['held'] = [[position, list(row)] for position, row in self.held]
++        return saved
++
++    def load(self, saved):
++        Operator.load(self, saved)
++        self.cursor = saved['cursor']
++        self.held = [[position, tuple(row)] for position, row in saved['held']]
++
++
++class PipelineOperator(Operator):
++    """Follows the output another pipeline has already worked out."""
++
++    def evaluate(self, inputs):
++        out = [tuple(row) for row in self.node.view]
++        self.header = out[0]
++        self.rows = out[1:]
++
++
++class ViewOperator(Operator):
++    """Derives its output from the rows its children now hold."""
++
++    def evaluate(self, inputs):
++        out = self._run(self._materialize(inputs))
++        self.header = out[0]
++        self.rows = out[1:]
++
++
++class RowWiseOperator(Operator):
++    """Maps rows one at a time, keeping the result of every row it has seen."""
++
++    def __init__(self, node):
++        Operator.__init__(self, node)
++        self.results = {}
++        self.headers = {}
++
++    def evaluate(self, inputs):
++        header, rows = inputs[0]
++        seen = {}
++        out = []
++        for row in rows:
++            occurrence = seen.get(row, 0)
++            seen[row] = occurrence + 1
++            results = self.results.setdefault(row, [])
++            if len(results) == occurrence:
++                results.append(self._run([[header, row]])[1:])
++            out.extend(results[occurrence])
++        self._retire(seen)
++        self.header = self._header_for(header)
++        self.rows = out
++
++    def _retire(self, seen):
++        for row in list(self.results):
++            kept = seen.get(row, 0)
++            if kept:
++                del self.results[row][kept:]
++            else:
++                del self.results[row]
++
++    def _header_for(self, header):
++        if header not in self.headers:
++            self.headers[header] = self._run([[header]])[0]
++        return self.headers[header]
++
++    def state(self):
++        return (self.header, list(self.rows),
++                dict((row, list(results))
++                     for row, results in self.results.items()))
++
++    def restore(self, state):
++        Operator.restore(self, state)
++        self.results = dict((row, list(results))
++                            for row, results in state[2].items())
++
++    def checkpoint(self):
++        saved = Operator.checkpoint(self)
++        saved['results'] = [[list(row), [as_rows(mapped) for mapped in results]]
++                            for row, results in self.results.items()]
++        return saved
++
++    def load(self, saved):
++        Operator.load(self, saved)
++        self.results = dict((tuple(row), [as_tuples(mapped)
++                                          for mapped in results])
++                            for row, results in saved['results'])
++        self.headers = {}
++
++
++class AggregateOperator(Operator):
++    """Re-runs the aggregation for the keys whose rows changed."""
++
++    def __init__(self, node):
++        Operator.__init__(self, node)
++        self.groups = {}
++        self.child_header = None
++
++    def evaluate(self, inputs):
++        header, rows = inputs[0]
++        self.child_header = header
++        getkey = keygetter(header, self.node.view.key)
++        grouped = group_by_key(rows, getkey)
++        groups = {}
++        for key, group in grouped.items():
++            held = tuple(group)
++            previous = self.groups.get(key)
++            if previous is not None and previous[0] == held:
++                groups[key] = previous
++            else:
++                out = self._run([[header] + list(group)])
++                self.header = out[0]
++                groups[key] = (held, out[1])
++        self.groups = groups
++        if self.header is None:
++            self.header = self._run([[header]])[0]
++        self.rows = [groups[key][1]
++                     for key in sorted(grouped, key=Comparable)]
++
++    def state(self):
++        return self.header, list(self.rows), dict(self.groups)
++
++    def restore(self, state):
++        Operator.restore(self, state)
++        self.groups = dict(state[2])
++
++    def checkpoint(self):
++        saved = Operator.checkpoint(self)
++        saved['groups'] = [[as_rows(held), list(result)]
++                           for held, result in self.groups.values()]
++        saved['child_header'] = list(self.child_header)
++        return saved
++
++    def load(self, saved):
++        Operator.load(self, saved)
++        self.child_header = tuple(saved['child_header'])
++        getkey = keygetter(self.child_header, self.node.view.key)
++        self.groups = {}
++        for held, result in saved['groups']:
++            held = as_tuples(held)
++            self.groups[getkey(held[0])] = (tuple(held), tuple(result))
++
++
++class JoinOperator(Operator):
++    """Rebuilds only the key blocks whose left or right rows changed."""
++
++    def __init__(self, node):
++        Operator.__init__(self, node)
++        self.blocks = {}
++        self.lheader = None
++        self.rheader = None
++
++    def evaluate(self, inputs):
++        view = self.node.view
++        (lheader, lrows), (rheader, rrows) = inputs
++        self.lheader = lheader
++        self.rheader = rheader
++        lgroups = group_by_key(lrows, keygetter(lheader, view.lkey))
++        rgroups = group_by_key(rrows, keygetter(rheader, view.rkey))
++        blocks = {}
++        keys = set(lgroups) | set(rgroups)
++        for key in keys:
++            left = tuple(lgroups.get(key, ()))
++            right = tuple(rgroups.get(key, ()))
++            previous = self.blocks.get(key)
++            if previous is not None and previous[0] == left \
++                    and previous[1] == right:
++                blocks[key] = previous
++            else:
++                out = self._run([[lheader] + list(left),
++                                 [rheader] + list(right)])
++                self.header = out[0]
++                blocks[key] = (left, right, out[1:])
++        self.blocks = blocks
++        if self.header is None:
++            self.header = self._run([[lheader], [rheader]])[0]
++        self.rows = [row
++                     for key in sorted(keys, key=Comparable)
++                     for row in blocks[key][2]]
++
++    def state(self):
++        return self.header, list(self.rows), dict(self.blocks)
++
++    def restore(self, state):
++        Operator.restore(self, state)
++        self.blocks = dict(state[2])
++
++    def checkpoint(self):
++        saved = Operator.checkpoint(self)
++        saved['blocks'] = [[as_rows(left), as_rows(right), as_rows(out)]
++                           for left, right, out in self.blocks.values()]
++        saved['headers'] = [list(self.lheader), list(self.rheader)]
++        return saved
++
++    def load(self, saved):
++        Operator.load(self, saved)
++        self.lheader = tuple(saved['headers'][0])
++        self.rheader = tuple(saved['headers'][1])
++        view = self.node.view
++        lkey = keygetter(self.lheader, view.lkey)
++        rkey = keygetter(self.rheader, view.rkey)
++        self.blocks = {}
++        for left, right, out in saved['blocks']:
++            left = as_tuples(left)
++            right = as_tuples(right)
++            key = lkey(left[0]) if left else rkey(right[0])
++            self.blocks[key] = (tuple(left), tuple(right), as_tuples(out))
++
++
++OPERATORS = {
++    'feed': FeedOperator,
++    'pipeline': PipelineOperator,
++    'cut': RowWiseOperator,
++    'addfield': RowWiseOperator,
++    'convert': RowWiseOperator,
++    'select': RowWiseOperator,
++    'cat': ViewOperator,
++    'sort': ViewOperator,
++    'distinct': ViewOperator,
++    'head': ViewOperator,
++    'join': JoinOperator,
++    'aggregate': AggregateOperator,
++}
++
++
++def make_operator(node):
++    return OPERATORS[node.kind](node)
+diff --git a/petl/delta/pipeline.py b/petl/delta/pipeline.py
+new file mode 100644
+index 0000000..57b6a73
+--- /dev/null
++++ b/petl/delta/pipeline.py
+@@ -0,0 +1,141 @@
++from __future__ import absolute_import, print_function, division
++
++
++from collections import Counter
++
++
++from petl.errors import IncrementalError
++from petl.util.base import Table
++from petl.delta.operators import make_operator
++from petl.delta.plan import build_plan, register_kind, render_plan
++
++
++def bag_difference(old, new):
++    """Return the rows `new` gained over `old`, earliest occurrences first."""
++
++    excess = Counter(new)
++    excess.subtract(Counter(old))
++    gained = []
++    for row in new:
++        if excess[row] > 0:
++            excess[row] -= 1
++            gained.append(row)
++    return gained
++
++
++class Refresh(object):
++    """What one refresh did to a pipeline."""
++
++    def __init__(self, added, removed, emitted):
++        self.added = tuple(added)
++        self.removed = tuple(removed)
++        self.emitted = emitted
++
++    def to_dict(self):
++        """Return the added rows, removed rows and emission counts."""
++
++        return {'added': list(self.added),
++                'removed': list(self.removed),
++                'emitted': dict(self.emitted)}
++
++    def __repr__(self):
++        return 'Refresh(added=%s, removed=%s)' % (len(self.added),
++                                                  len(self.removed))
++
++
++class IncrementalPipeline(Table):
++    """A materialized table expression that follows the feeds it reads."""
++
++    def __init__(self, table, saved=None):
++        self.nodes = build_plan(table)
++        self.operators = [make_operator(node) for node in self.nodes]
++        self.positions = dict((id(node), index)
++                              for index, node in enumerate(self.nodes))
++        if saved is None:
++            self._sweep()
++        else:
++            self._load(saved)
++
++    def __iter__(self):
++        root = self.operators[-1]
++        yield root.header
++        for row in root.rows:
++            yield row
++
++    def plan(self):
++        """Return one line per node, naming the children it reads."""
++
++        return render_plan(self.nodes)
++
++    def refresh(self):
++        """Take in the rows the feeds gained and update the output."""
++
++        before = [list(operator.rows) for operator in self.operators]
++        saved = [operator.state() for operator in self.operators]
++        try:
++            self._sweep()
++        except Exception:
++            for operator, state in zip(self.operators, saved):
++                operator.restore(state)
++            raise
++        emitted = {}
++        for node, operator, old in zip(self.nodes, self.operators, before):
++            gained = bag_difference(old, operator.rows)
++            lost = bag_difference(operator.rows, old)
++            emitted[node.node_id] = len(gained) + len(lost)
++        root = self.operators[-1]
++        return Refresh(bag_difference(before[-1], root.rows),
++                       bag_difference(root.rows, before[-1]),
++                       emitted)
++
++    def checkpoint(self):
++        """Return the state of every node as plain lists and mappings."""
++
++        return {'plan': self.plan(),
++                'nodes': dict((node.node_id, operator.checkpoint())
++                              for node, operator
++                              in zip(self.nodes, self.operators))}
++
++    def _load(self, saved):
++        if saved.get('plan') != self.plan():
++            raise IncrementalError('a checkpoint taken from another plan')
++        for node, operator in zip(self.nodes, self.operators):
++            operator.load(saved['nodes'][node.node_id])
++
++    def _sweep(self):
++        for node, operator in zip(self.nodes, self.operators):
++            inputs = [(self.operators[self.positions[id(child)]].header,
++                       self.operators[self.positions[id(child)]].rows)
++                      for child in node.children]
++            operator.evaluate(inputs)
++
++
++def incremental(table):
++    """Materialize a table expression and keep it up to date from its feeds.
++
++    The expression must be built over :func:`petl.delta.feed.feed` sources or
++    over other pipelines.
++    Building the pipeline reads every row the feeds hold and works the
++    expression out once. Rows appended to a feed afterwards are taken in by
++    :meth:`IncrementalPipeline.refresh`.
++
++    """
++
++    return IncrementalPipeline(table)
++
++
++def resume(table, saved):
++    """Rebuild a pipeline over `table` from the state a checkpoint holds.
++
++    The expression has to have the plan the checkpoint was taken from. No feed
++    is read and no caller supplied callable is applied; the pipeline carries on
++    from the rows the checkpoint left it with.
++
++    """
++
++    return IncrementalPipeline(table, saved)
++
++
++Table.incremental = incremental
++Table.resume = resume
++register_kind(IncrementalPipeline, 'pipeline')
+diff --git a/petl/delta/plan.py b/petl/delta/plan.py
+new file mode 100644
+index 0000000..56cc2ab
+--- /dev/null
++++ b/petl/delta/plan.py
+@@ -0,0 +1,135 @@
++from __future__ import absolute_import, print_function, division
++
++
++from petl.errors import IncrementalError
++from petl.delta.feed import Feed
++from petl.transform.basics import CutView, CatView, AddFieldView, \
++    RowSliceView, StackView
++from petl.transform.conversions import FieldConvertView
++from petl.transform.dedup import DistinctView
++from petl.transform.joins import JoinView
++from petl.transform.reductions import SimpleAggregateView, MultiAggregateView
++from petl.transform.selects import FieldSelectView, RowSelectView
++from petl.transform.sorts import SortView
++
++
++KINDS = [
++    (Feed, 'feed'),
++    (CutView, 'cut'),
++    (AddFieldView, 'addfield'),
++    (FieldConvertView, 'convert'),
++    (RowSelectView, 'select'),
++    (FieldSelectView, 'select'),
++    (CatView, 'cat'),
++    (SortView, 'sort'),
++    (DistinctView, 'distinct'),
++    (RowSliceView, 'head'),
++    (JoinView, 'join'),
++    (SimpleAggregateView, 'aggregate'),
++    (MultiAggregateView, 'aggregate'),
++]
++
++
++def register_kind(cls, kind):
++    """Let a table class outside this module stand as a plan node."""
++
++    KINDS.append((cls, kind))
++
++
++class PlanNode(object):
++    """One table in an incremental pipeline, with its position in the plan."""
++
++    def __init__(self, node_id, kind, view, children):
++        self.node_id = node_id
++        self.kind = kind
++        self.view = view
++        self.children = children
++
++    def __repr__(self):
++        return 'PlanNode(%r)' % self.node_id
++
++
++def node_kind(view):
++    for cls, kind in KINDS:
++        if isinstance(view, cls):
++            return kind
++    raise IncrementalError(type(view).__name__)
++
++
++def unsort(view, key):
++    """Strip the sort a petl constructor wraps a source in."""
++
++    if isinstance(view, SortView) and view.key == key:
++        return view.source
++    return view
++
++
++def unstack(view):
++    """Strip the row length padding a petl constructor wraps a source in."""
++
++    if isinstance(view, StackView) and len(view.sources) == 1:
++        return view.sources[0]
++    return view
++
++
++def node_children(view, kind):
++    if kind in ('feed', 'pipeline'):
++        return []
++    if kind == 'cat':
++        return list(view.sources)
++    if kind == 'join':
++        return [unstack(unsort(view.left, view.lkey)),
++                unstack(unsort(view.right, view.rkey))]
++    if kind == 'distinct':
++        return [unsort(view.table, view.key)]
++    if kind == 'aggregate':
++        source = getattr(view, 'table', None)
++        if source is None:
++            source = view.source
++        return [unsort(source, view.key)]
++    if kind == 'head':
++        if len(view.sliceargs) != 1:
++            raise IncrementalError(type(view).__name__)
++        return [view.source]
++    if kind == 'addfield':
++        return [unstack(view.source)]
++    source = getattr(view, 'source', None)
++    if source is None:
++        source = view.table
++    return [source]
++
++
++def build_plan(table):
++    """Walk a table expression and return its plan nodes in evaluation order."""
++
++    nodes = []
++    by_identity = {}
++    _visit(table, nodes, by_identity)
++    return nodes
++
++
++def _visit(view, nodes, by_identity):
++    known = by_identity.get(id(view))
++    if known is not None:
++        return known
++    kind = node_kind(view)
++    children = [_visit(child, nodes, by_identity)
++                for child in node_children(view, kind)]
++    node_id = '%s#%s' % (kind, len(nodes) + 1)
++    node = PlanNode(node_id, kind, view, children)
++    nodes.append(node)
++    by_identity[id(view)] = node
++    return node
++
++
++def render_plan(nodes):
++    """Return one line per plan node, naming the children it reads."""
++
++    lines = []
++    for node in nodes:
++        if node.children:
++            children = ', '.join(child.node_id for child in node.children)
++        else:
++            children = '-'
++        lines.append('%s: %s' % (node.node_id, children))
++    return '\n'.join(lines)
+diff --git a/petl/errors.py b/petl/errors.py
+index 39f1e4f..ba65ee9 100644
+--- a/petl/errors.py
++++ b/petl/errors.py
+@@ -26,3 +26,12 @@ class ArgumentError(Exception):
+ 
+     def __str__(self):
+         return 'argument error: %s' % self.message
++
++
++class IncrementalError(Exception):
++
++    def __init__(self, name):
++        self.name = name
++
++    def __str__(self):
++        return 'not supported by an incremental pipeline: %s' % self.name

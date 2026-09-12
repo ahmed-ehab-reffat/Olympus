@@ -1,0 +1,858 @@
+diff --git a/costbasis/corporate.go b/costbasis/corporate.go
+new file mode 100644
+index 0000000..4b15d9e
+--- /dev/null
++++ b/costbasis/corporate.go
+@@ -0,0 +1,48 @@
++package costbasis
++
++import (
++	"time"
++
++	"github.com/sdcoffey/big"
++	"github.com/sdcoffey/techan"
++)
++
++// Split applies a stock split by ratio (shares held after per share held before,
++// e.g. 2 for a 2-for-1 split). Each open lot's amount is multiplied by ratio and
++// its price divided by ratio, so total cost basis is preserved. Recorded realized
++// results are unaffected.
++func (l *Ledger) Split(ratio big.Decimal) {
++	if ratio.LTE(big.ZERO) {
++		return
++	}
++	for i := range l.lots {
++		l.lots[i].Amount = l.lots[i].Amount.Mul(ratio)
++		l.lots[i].Price = l.lots[i].Price.Div(ratio)
++	}
++}
++
++// ReturnOfCapital reduces the cost basis of every open lot by perShare, floored
++// at zero (a distribution that is a return of capital rather than income). No
++// realized profit or loss is recorded.
++func (l *Ledger) ReturnOfCapital(perShare big.Decimal) {
++	for i := range l.lots {
++		price := l.lots[i].Price.Sub(perShare)
++		if price.LT(big.ZERO) {
++			price = big.ZERO
++		}
++		l.lots[i].Price = price
++	}
++}
++
++// DividendReinvest pays a cash dividend of perShare on the open long position and
++// buys (position times perShare) divided by price additional shares at price,
++// opening a lot at time t. It does nothing when flat or short, or when price is
++// not positive.
++func (l *Ledger) DividendReinvest(perShare, price big.Decimal, t time.Time) {
++	pos := l.Position()
++	if pos.LTE(big.ZERO) || price.LTE(big.ZERO) {
++		return
++	}
++	shares := pos.Mul(perShare).Div(price)
++	l.Apply(techan.Order{Side: techan.BUY, Price: price, Amount: shares, ExecutionTime: t}, big.ZERO)
++}
+diff --git a/costbasis/costbasis.go b/costbasis/costbasis.go
+new file mode 100644
+index 0000000..af0dd1e
+--- /dev/null
++++ b/costbasis/costbasis.go
+@@ -0,0 +1,115 @@
++// Package costbasis provides a stateful cost-basis ledger that tracks realized
++// and unrealized profit and loss across a sequence of orders, matching closing
++// trades against open lots by a configurable method. All arithmetic uses
++// big.Decimal; commissions are accounted as a separate cash cost rather than
++// folded into per-lot cost basis. Lot matching for the FIFO, LIFO, HIFO, and
++// LOFO methods, and the realized/unrealized results they produce, use only
++// addition, subtraction, and multiplication; the Average method, corporate
++// actions, wash-sale basis adjustment, and AverageCost use big.Decimal division.
++package costbasis
++
++import (
++	"time"
++
++	"github.com/sdcoffey/big"
++)
++
++// Method selects which open lot a closing trade is matched against.
++type Method int
++
++const (
++	// FIFO matches the oldest open lot first.
++	FIFO Method = iota
++	// LIFO matches the newest open lot first.
++	LIFO
++	// HIFO matches the open lot with the highest cost price first.
++	HIFO
++	// LOFO matches the open lot with the lowest cost price first.
++	LOFO
++	// Average merges same-side purchases into one lot at the weighted-average
++	// cost, so closing trades always realize against that average.
++	Average
++)
++
++// Term classifies a realized event by how long the closed lot was held.
++type Term int
++
++const (
++	// ShortTerm marks a lot held at or below the long-term threshold.
++	ShortTerm Term = iota
++	// LongTerm marks a lot held strictly longer than the threshold.
++	LongTerm
++)
++
++// Lot is an open parcel of inventory: a positive Amount acquired at Price at
++// time Acquired.
++type Lot struct {
++	Amount   big.Decimal
++	Price    big.Decimal
++	Acquired time.Time
++}
++
++// RealizedEvent records one lot-close: Amount units of a lot opened at OpenPrice
++// were closed at ClosePrice for the given PnL (excluding commission), after
++// being held for Held; Term is the resulting classification.
++type RealizedEvent struct {
++	Amount     big.Decimal
++	OpenPrice  big.Decimal
++	ClosePrice big.Decimal
++	PnL        big.Decimal
++	Held       time.Duration
++	Term       Term
++}
++
++// Ledger tracks a single security. Open lots are all on the same side of the
++// market (long or short); a trade in the opposite direction closes lots and, if
++// it exceeds the open quantity, flips the position and opens a lot on the other
++// side.
++type Ledger struct {
++	method      Method
++	longTerm    time.Duration
++	washWindow  time.Duration
++	long        bool
++	lots        []Lot
++	realized    big.Decimal
++	commissions big.Decimal
++	shortTerm   big.Decimal
++	longTermPnL big.Decimal
++	disallowed  big.Decimal
++	washQueue   []washLot
++	events      []RealizedEvent
++}
++
++// washLot records a realized loss on a long position that is eligible to trigger
++// a wash sale when replacement shares are bought within the window.
++type washLot struct {
++	time         time.Time
++	remaining    big.Decimal
++	perShareLoss big.Decimal
++	term         Term
++	acquired     time.Time
++}
++
++// NewLedger returns a ledger using the given matching method with wash-sale
++// handling disabled. A lot held strictly longer than longTerm when closed is
++// classified LongTerm.
++func NewLedger(method Method, longTerm time.Duration) *Ledger {
++	return &Ledger{
++		method:      method,
++		longTerm:    longTerm,
++		realized:    big.ZERO,
++		commissions: big.ZERO,
++		shortTerm:   big.ZERO,
++		longTermPnL: big.ZERO,
++		disallowed:  big.ZERO,
++	}
++}
++
++// NewWashSaleLedger returns a ledger that additionally applies the wash-sale
++// rule: a loss realized closing a long position is disallowed when replacement
++// shares are purchased within washWindow after the sale.
++func NewWashSaleLedger(method Method, longTerm, washWindow time.Duration) *Ledger {
++	l := NewLedger(method, longTerm)
++	l.washWindow = washWindow
++	return l
++}
+diff --git a/costbasis/match.go b/costbasis/match.go
+new file mode 100644
+index 0000000..f1114c2
+--- /dev/null
++++ b/costbasis/match.go
+@@ -0,0 +1,140 @@
++package costbasis
++
++import (
++	"time"
++
++	"github.com/sdcoffey/big"
++	"github.com/sdcoffey/techan"
++)
++
++// Apply records an order against the ledger, charging the given commission. A
++// trade on the current side (or when flat) opens inventory; a trade on the
++// opposite side closes open lots by the ledger's method, and any quantity beyond
++// the open position flips the side and opens inventory at the trade price.
++func (l *Ledger) Apply(order techan.Order, commission big.Decimal) {
++	l.commissions = l.commissions.Add(commission)
++
++	buy := order.Side == techan.BUY
++	if len(l.lots) == 0 || buy == l.long {
++		l.long = buy
++		l.openInventory(order, order.Amount)
++		return
++	}
++
++	remaining := order.Amount
++	for remaining.GT(big.ZERO) && len(l.lots) > 0 {
++		idx := l.selectLot()
++		lot := l.lots[idx]
++
++		matched := lot.Amount
++		if remaining.LT(matched) {
++			matched = remaining
++		}
++		l.recordClose(lot, matched, order.Price, order.ExecutionTime)
++
++		if matched.EQ(lot.Amount) {
++			l.lots = append(l.lots[:idx], l.lots[idx+1:]...)
++		} else {
++			l.lots[idx].Amount = lot.Amount.Sub(matched)
++		}
++		remaining = remaining.Sub(matched)
++	}
++
++	if remaining.GT(big.ZERO) {
++		l.long = buy
++		l.openInventory(order, remaining)
++	}
++}
++
++// recordClose books the realized profit, holding-period classification, and
++// realized event for closing matched units of lot at closePrice/closeTime, and
++// queues a wash-sale entry when a long position is closed at a loss. It does not
++// remove or resize the lot itself.
++func (l *Ledger) recordClose(lot Lot, matched, closePrice big.Decimal, closeTime time.Time) {
++	var pnl big.Decimal
++	if l.long {
++		pnl = closePrice.Sub(lot.Price).Mul(matched)
++	} else {
++		pnl = lot.Price.Sub(closePrice).Mul(matched)
++	}
++	l.realized = l.realized.Add(pnl)
++
++	held := closeTime.Sub(lot.Acquired)
++	term := ShortTerm
++	if held > l.longTerm {
++		term = LongTerm
++		l.longTermPnL = l.longTermPnL.Add(pnl)
++	} else {
++		l.shortTerm = l.shortTerm.Add(pnl)
++	}
++	l.events = append(l.events, RealizedEvent{
++		Amount:     matched,
++		OpenPrice:  lot.Price,
++		ClosePrice: closePrice,
++		PnL:        pnl,
++		Held:       held,
++		Term:       term,
++	})
++
++	if l.washWindow > 0 && l.long && pnl.LT(big.ZERO) {
++		l.washQueue = append(l.washQueue, washLot{
++			time:         closeTime,
++			remaining:    matched,
++			perShareLoss: pnl.Div(matched),
++			term:         term,
++			acquired:     lot.Acquired,
++		})
++	}
++}
++
++// openInventory adds amount units of new inventory on the current side. Under the
++// Average method same-side purchases merge into the single open lot at the
++// weighted-average price. Every long purchase (a fresh lot, an average merge, or
++// the long remainder of a flip) is routed through the wash-sale rule.
++func (l *Ledger) openInventory(order techan.Order, amount big.Decimal) {
++	buy := order.Side == techan.BUY
++
++	if l.method == Average && len(l.lots) == 1 {
++		old := l.lots[0]
++		total := old.Amount.Add(amount)
++		price := old.Amount.Mul(old.Price).Add(amount.Mul(order.Price)).Div(total)
++		l.lots[0] = Lot{Amount: total, Price: price, Acquired: old.Acquired}
++		if buy && l.washWindow > 0 {
++			l.washNewLot(&l.lots[0], amount, order.ExecutionTime)
++		}
++		return
++	}
++
++	lot := Lot{Amount: amount, Price: order.Price, Acquired: order.ExecutionTime}
++	if buy && l.washWindow > 0 {
++		l.washNewLot(&lot, amount, order.ExecutionTime)
++	}
++	l.lots = append(l.lots, lot)
++}
++
++// selectLot returns the index of the open lot a closing trade matches next,
++// according to the ledger's method.
++func (l *Ledger) selectLot() int {
++	switch l.method {
++	case LIFO:
++		return len(l.lots) - 1
++	case HIFO:
++		idx := 0
++		for i := range l.lots {
++			if l.lots[i].Price.GT(l.lots[idx].Price) {
++				idx = i
++			}
++		}
++		return idx
++	case LOFO:
++		idx := 0
++		for i := range l.lots {
++			if l.lots[i].Price.LT(l.lots[idx].Price) {
++				idx = i
++			}
++		}
++		return idx
++	default:
++		return 0
++	}
++}
+diff --git a/costbasis/portfolio.go b/costbasis/portfolio.go
+new file mode 100644
+index 0000000..d2e944c
+--- /dev/null
++++ b/costbasis/portfolio.go
+@@ -0,0 +1,87 @@
++package costbasis
++
++import (
++	"time"
++
++	"github.com/sdcoffey/big"
++	"github.com/sdcoffey/techan"
++)
++
++// Portfolio holds one Ledger per security, all using the same method and
++// long-term threshold, and aggregates their results.
++type Portfolio struct {
++	method   Method
++	longTerm time.Duration
++	books    map[string]*Ledger
++	order    []string
++}
++
++// NewPortfolio returns an empty portfolio whose ledgers use method and longTerm.
++func NewPortfolio(method Method, longTerm time.Duration) *Portfolio {
++	return &Portfolio{
++		method:   method,
++		longTerm: longTerm,
++		books:    map[string]*Ledger{},
++	}
++}
++
++// Apply routes the order to the ledger for order.Security, creating it on first
++// use, and charges commission there.
++func (p *Portfolio) Apply(order techan.Order, commission big.Decimal) {
++	book, ok := p.books[order.Security]
++	if !ok {
++		book = NewLedger(p.method, p.longTerm)
++		p.books[order.Security] = book
++		p.order = append(p.order, order.Security)
++	}
++	book.Apply(order, commission)
++}
++
++// Ledger returns the ledger for security, or nil if none has traded.
++func (p *Portfolio) Ledger(security string) *Ledger {
++	return p.books[security]
++}
++
++// Securities returns the securities that have traded, in first-seen order.
++func (p *Portfolio) Securities() []string {
++	out := make([]string, len(p.order))
++	copy(out, p.order)
++	return out
++}
++
++// RealizedPnL sums net realized profit and loss across every ledger.
++func (p *Portfolio) RealizedPnL() big.Decimal {
++	total := big.ZERO
++	for _, s := range p.order {
++		total = total.Add(p.books[s].RealizedPnL())
++	}
++	return total
++}
++
++// UnrealizedPnL marks each security's open position to its price in marks (a
++// missing mark contributes nothing) and sums the result.
++func (p *Portfolio) UnrealizedPnL(marks map[string]big.Decimal) big.Decimal {
++	total := big.ZERO
++	for _, s := range p.order {
++		mark, ok := marks[s]
++		if !ok {
++			continue
++		}
++		total = total.Add(p.books[s].UnrealizedPnL(mark))
++	}
++	return total
++}
++
++// GrossExposure sums the absolute market value of every open position marked to
++// marks; a security without a mark contributes nothing.
++func (p *Portfolio) GrossExposure(marks map[string]big.Decimal) big.Decimal {
++	total := big.ZERO
++	for _, s := range p.order {
++		mark, ok := marks[s]
++		if !ok {
++			continue
++		}
++		total = total.Add(p.books[s].Position().Abs().Mul(mark))
++	}
++	return total
++}
+diff --git a/costbasis/query.go b/costbasis/query.go
+new file mode 100644
+index 0000000..84a8be0
+--- /dev/null
++++ b/costbasis/query.go
+@@ -0,0 +1,85 @@
++package costbasis
++
++import "github.com/sdcoffey/big"
++
++// GrossRealizedPnL is the realized profit and loss from matched trades, before
++// commissions.
++func (l *Ledger) GrossRealizedPnL() big.Decimal {
++	return l.realized
++}
++
++// Commissions is the cumulative commission charged across all trades.
++func (l *Ledger) Commissions() big.Decimal {
++	return l.commissions
++}
++
++// RealizedPnL is the net realized profit and loss: GrossRealizedPnL minus
++// Commissions.
++func (l *Ledger) RealizedPnL() big.Decimal {
++	return l.realized.Sub(l.commissions)
++}
++
++// ShortTermRealized is the gross realized profit and loss from lots closed at or
++// below the long-term holding threshold.
++func (l *Ledger) ShortTermRealized() big.Decimal {
++	return l.shortTerm
++}
++
++// LongTermRealized is the gross realized profit and loss from lots held strictly
++// longer than the long-term threshold.
++func (l *Ledger) LongTermRealized() big.Decimal {
++	return l.longTermPnL
++}
++
++// Position is the net open quantity: positive when long, negative when short,
++// zero when flat.
++func (l *Ledger) Position() big.Decimal {
++	total := big.ZERO
++	for _, lot := range l.lots {
++		total = total.Add(lot.Amount)
++	}
++	if !l.long {
++		return total.Neg()
++	}
++	return total
++}
++
++// CostBasis is the total cost of the open inventory (sum of Amount times Price
++// over open lots), regardless of side.
++func (l *Ledger) CostBasis() big.Decimal {
++	total := big.ZERO
++	for _, lot := range l.lots {
++		total = total.Add(lot.Amount.Mul(lot.Price))
++	}
++	return total
++}
++
++// UnrealizedPnL marks the open position to mark and returns the profit and loss
++// that would be realized if it were closed there.
++func (l *Ledger) UnrealizedPnL(mark big.Decimal) big.Decimal {
++	total := big.ZERO
++	for _, lot := range l.lots {
++		var pnl big.Decimal
++		if l.long {
++			pnl = mark.Sub(lot.Price).Mul(lot.Amount)
++		} else {
++			pnl = lot.Price.Sub(mark).Mul(lot.Amount)
++		}
++		total = total.Add(pnl)
++	}
++	return total
++}
++
++// OpenLots returns a copy of the currently open lots in insertion order.
++func (l *Ledger) OpenLots() []Lot {
++	out := make([]Lot, len(l.lots))
++	copy(out, l.lots)
++	return out
++}
++
++// Events returns a copy of the realized events in the order they occurred.
++func (l *Ledger) Events() []RealizedEvent {
++	out := make([]RealizedEvent, len(l.events))
++	copy(out, l.events)
++	return out
++}
+diff --git a/costbasis/report.go b/costbasis/report.go
+new file mode 100644
+index 0000000..8bf2e05
+--- /dev/null
++++ b/costbasis/report.go
+@@ -0,0 +1,69 @@
++package costbasis
++
++import "github.com/sdcoffey/big"
++
++// TaxSummary is an aggregate report over a ledger's realized events.
++type TaxSummary struct {
++	Proceeds        big.Decimal
++	CostBasisClosed big.Decimal
++	NetRealized     big.Decimal
++	ShortTerm       big.Decimal
++	LongTerm        big.Decimal
++	Disallowed      big.Decimal
++	Commissions     big.Decimal
++	Wins            int
++	Losses          int
++}
++
++// TaxSummary aggregates the ledger's realized events into a report: gross
++// proceeds and cost basis of closed lots, net realized profit and loss, the
++// short- and long-term split, the wash-sale disallowed amount, and total
++// commissions.
++func (l *Ledger) TaxSummary() TaxSummary {
++	s := TaxSummary{
++		Proceeds:        big.ZERO,
++		CostBasisClosed: big.ZERO,
++		ShortTerm:       l.shortTerm,
++		LongTerm:        l.longTermPnL,
++		Disallowed:      l.disallowed,
++		Commissions:     l.commissions,
++		NetRealized:     l.RealizedPnL(),
++	}
++	for i := range l.events {
++		e := l.events[i]
++		s.Proceeds = s.Proceeds.Add(e.ClosePrice.Mul(e.Amount))
++		s.CostBasisClosed = s.CostBasisClosed.Add(e.OpenPrice.Mul(e.Amount))
++		if e.PnL.GT(big.ZERO) {
++			s.Wins++
++		} else if e.PnL.LT(big.ZERO) {
++			s.Losses++
++		}
++	}
++	return s
++}
++
++// TaxSummary aggregates the tax summaries of every ledger in the portfolio.
++func (p *Portfolio) TaxSummary() TaxSummary {
++	total := TaxSummary{
++		Proceeds:        big.ZERO,
++		CostBasisClosed: big.ZERO,
++		NetRealized:     big.ZERO,
++		ShortTerm:       big.ZERO,
++		LongTerm:        big.ZERO,
++		Disallowed:      big.ZERO,
++		Commissions:     big.ZERO,
++	}
++	for _, s := range p.order {
++		ss := p.books[s].TaxSummary()
++		total.Proceeds = total.Proceeds.Add(ss.Proceeds)
++		total.CostBasisClosed = total.CostBasisClosed.Add(ss.CostBasisClosed)
++		total.NetRealized = total.NetRealized.Add(ss.NetRealized)
++		total.ShortTerm = total.ShortTerm.Add(ss.ShortTerm)
++		total.LongTerm = total.LongTerm.Add(ss.LongTerm)
++		total.Disallowed = total.Disallowed.Add(ss.Disallowed)
++		total.Commissions = total.Commissions.Add(ss.Commissions)
++		total.Wins += ss.Wins
++		total.Losses += ss.Losses
++	}
++	return total
++}
+diff --git a/costbasis/specific.go b/costbasis/specific.go
+new file mode 100644
+index 0000000..9fbb06d
+--- /dev/null
++++ b/costbasis/specific.go
+@@ -0,0 +1,35 @@
++package costbasis
++
++import (
++	"github.com/sdcoffey/big"
++	"github.com/sdcoffey/techan"
++)
++
++// CloseLot closes order.Amount units against the open lot at index lot,
++// ignoring the ledger's method (specific-lot identification, e.g. for tax-loss
++// harvesting). The order side must oppose the current position, the index must
++// be valid, and the trade must not exceed that lot's remaining quantity. It
++// reports whether the close was applied; if not, the ledger is unchanged.
++func (l *Ledger) CloseLot(order techan.Order, lot int, commission big.Decimal) bool {
++	if lot < 0 || lot >= len(l.lots) {
++		return false
++	}
++	buy := order.Side == techan.BUY
++	if len(l.lots) == 0 || buy == l.long {
++		return false
++	}
++	target := l.lots[lot]
++	if order.Amount.GT(target.Amount) {
++		return false
++	}
++
++	l.commissions = l.commissions.Add(commission)
++	l.recordClose(target, order.Amount, order.Price, order.ExecutionTime)
++
++	if order.Amount.EQ(target.Amount) {
++		l.lots = append(l.lots[:lot], l.lots[lot+1:]...)
++	} else {
++		l.lots[lot].Amount = target.Amount.Sub(order.Amount)
++	}
++	return true
++}
+diff --git a/costbasis/stats.go b/costbasis/stats.go
+new file mode 100644
+index 0000000..7e4cda8
+--- /dev/null
++++ b/costbasis/stats.go
+@@ -0,0 +1,83 @@
++package costbasis
++
++import "github.com/sdcoffey/big"
++
++// WinCount is the number of realized events with a positive profit and loss.
++func (l *Ledger) WinCount() int {
++	n := 0
++	for i := range l.events {
++		if l.events[i].PnL.GT(big.ZERO) {
++			n++
++		}
++	}
++	return n
++}
++
++// LossCount is the number of realized events with a negative profit and loss.
++func (l *Ledger) LossCount() int {
++	n := 0
++	for i := range l.events {
++		if l.events[i].PnL.LT(big.ZERO) {
++			n++
++		}
++	}
++	return n
++}
++
++// BreakevenCount is the number of realized events with exactly zero profit and
++// loss.
++func (l *Ledger) BreakevenCount() int {
++	n := 0
++	for i := range l.events {
++		if l.events[i].PnL.EQ(big.ZERO) {
++			n++
++		}
++	}
++	return n
++}
++
++// GrossProfit is the sum of the positive realized profits.
++func (l *Ledger) GrossProfit() big.Decimal {
++	total := big.ZERO
++	for i := range l.events {
++		if l.events[i].PnL.GT(big.ZERO) {
++			total = total.Add(l.events[i].PnL)
++		}
++	}
++	return total
++}
++
++// GrossLoss is the sum of the negative realized profits, returned as a
++// non-positive value.
++func (l *Ledger) GrossLoss() big.Decimal {
++	total := big.ZERO
++	for i := range l.events {
++		if l.events[i].PnL.LT(big.ZERO) {
++			total = total.Add(l.events[i].PnL)
++		}
++	}
++	return total
++}
++
++// LargestWin is the greatest single realized profit, or zero if there are none.
++func (l *Ledger) LargestWin() big.Decimal {
++	best := big.ZERO
++	for i := range l.events {
++		if l.events[i].PnL.GT(best) {
++			best = l.events[i].PnL
++		}
++	}
++	return best
++}
++
++// LargestLoss is the most negative single realized profit, or zero if there are
++// none.
++func (l *Ledger) LargestLoss() big.Decimal {
++	worst := big.ZERO
++	for i := range l.events {
++		if l.events[i].PnL.LT(worst) {
++			worst = l.events[i].PnL
++		}
++	}
++	return worst
++}
+diff --git a/costbasis/valuation.go b/costbasis/valuation.go
+new file mode 100644
+index 0000000..74289ee
+--- /dev/null
++++ b/costbasis/valuation.go
+@@ -0,0 +1,82 @@
++package costbasis
++
++import "github.com/sdcoffey/big"
++
++// MarketValue is the signed value of the open position marked to mark (positive
++// for a long position, negative for a short one).
++func (l *Ledger) MarketValue(mark big.Decimal) big.Decimal {
++	return l.Position().Mul(mark)
++}
++
++// AverageCost is the cost basis per open unit (total cost basis divided by the
++// absolute open quantity), or zero when the position is flat.
++func (l *Ledger) AverageCost() big.Decimal {
++	pos := l.Position().Abs()
++	if pos.IsZero() {
++		return big.ZERO
++	}
++	return l.CostBasis().Div(pos)
++}
++
++// NetExposure is the signed market value of the whole portfolio: the sum of each
++// security's position marked to its price in marks (securities without a mark
++// contribute nothing).
++func (p *Portfolio) NetExposure(marks map[string]big.Decimal) big.Decimal {
++	total := big.ZERO
++	for _, s := range p.order {
++		mark, ok := marks[s]
++		if !ok {
++			continue
++		}
++		total = total.Add(p.books[s].MarketValue(mark))
++	}
++	return total
++}
++
++// LongExposure sums the market value of the securities that are net long,
++// marked to marks; securities without a mark contribute nothing.
++func (p *Portfolio) LongExposure(marks map[string]big.Decimal) big.Decimal {
++	total := big.ZERO
++	for _, s := range p.order {
++		mark, ok := marks[s]
++		if !ok {
++			continue
++		}
++		if v := p.books[s].MarketValue(mark); v.GT(big.ZERO) {
++			total = total.Add(v)
++		}
++	}
++	return total
++}
++
++// ShortExposure sums the absolute market value of the securities that are net
++// short, marked to marks; securities without a mark contribute nothing.
++func (p *Portfolio) ShortExposure(marks map[string]big.Decimal) big.Decimal {
++	total := big.ZERO
++	for _, s := range p.order {
++		mark, ok := marks[s]
++		if !ok {
++			continue
++		}
++		if v := p.books[s].MarketValue(mark); v.LT(big.ZERO) {
++			total = total.Add(v.Neg())
++		}
++	}
++	return total
++}
++
++// NetLiquidationValue is the portfolio's total profit and loss if every open
++// position were closed at its mark: realized (net of commissions) plus
++// unrealized.
++func (p *Portfolio) NetLiquidationValue(marks map[string]big.Decimal) big.Decimal {
++	return p.RealizedPnL().Add(p.UnrealizedPnL(marks))
++}
++
++// Positions returns the net open quantity of every security that has traded.
++func (p *Portfolio) Positions() map[string]big.Decimal {
++	out := make(map[string]big.Decimal, len(p.order))
++	for _, s := range p.order {
++		out[s] = p.books[s].Position()
++	}
++	return out
++}
+diff --git a/costbasis/wash.go b/costbasis/wash.go
+new file mode 100644
+index 0000000..01e29b3
+--- /dev/null
++++ b/costbasis/wash.go
+@@ -0,0 +1,54 @@
++package costbasis
++
++import (
++	"time"
++
++	"github.com/sdcoffey/big"
++)
++
++// washNewLot applies the wash-sale rule to a lot being opened by a purchase of
++// `purchased` shares at time t (which may be fewer than lot.Amount when the
++// purchase merged into an existing average-cost lot). Starting from the most
++// recent unwashed loss whose sale falls within the window before t, it disallows
++// losses up to the purchased quantity: each disallowed loss is removed from
++// realized results and its magnitude is added to the lot's cost basis, and the
++// lot's holding period is tacked to the washed lots.
++func (l *Ledger) washNewLot(lot *Lot, purchased big.Decimal, t time.Time) {
++	remaining := purchased
++	totalDisallowed := big.ZERO
++	for i := len(l.washQueue) - 1; i >= 0 && remaining.GT(big.ZERO); i-- {
++		wl := &l.washQueue[i]
++		if wl.remaining.LTE(big.ZERO) {
++			continue
++		}
++		if t.Before(wl.time) || t.Sub(wl.time) > l.washWindow {
++			continue
++		}
++
++		washed := wl.remaining
++		if remaining.LT(washed) {
++			washed = remaining
++		}
++		disallowed := wl.perShareLoss.Mul(washed) // negative
++
++		l.realized = l.realized.Sub(disallowed)
++		if wl.term == LongTerm {
++			l.longTermPnL = l.longTermPnL.Sub(disallowed)
++		} else {
++			l.shortTerm = l.shortTerm.Sub(disallowed)
++		}
++		l.disallowed = l.disallowed.Add(disallowed.Neg())
++		totalDisallowed = totalDisallowed.Add(disallowed.Neg())
++		lot.Acquired = wl.acquired
++		wl.remaining = wl.remaining.Sub(washed)
++		remaining = remaining.Sub(washed)
++	}
++	if totalDisallowed.GT(big.ZERO) {
++		lot.Price = lot.Price.Add(totalDisallowed.Div(lot.Amount))
++	}
++}
++
++// Disallowed is the cumulative loss disallowed by the wash-sale rule.
++func (l *Ledger) Disallowed() big.Decimal {
++	return l.disallowed
++}

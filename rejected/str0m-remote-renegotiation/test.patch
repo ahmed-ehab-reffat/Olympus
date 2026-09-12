@@ -1,0 +1,582 @@
+diff --git a/.config/nextest.toml b/.config/nextest.toml
+new file mode 100644
+index 0000000..88457dc
+--- /dev/null
++++ b/.config/nextest.toml
+@@ -0,0 +1,2 @@
++[profile.default.junit]
++path = "junit.xml"
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..8cc5651
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,91 @@
++#!/usr/bin/env bash
++#
++# Test runner.
++#
++#   ./test.sh [--output_path <path>] <base|new>
++#
++#   base  runs the existing SDP negotiation and m-line recycling tests
++#   new   runs the rejected-offer state tests
++#
++# JUnit XML is written to --output_path when given.
++
++set -uo pipefail
++
++OUTPUT_PATH=""
++MODE=""
++
++while [ $# -gt 0 ]; do
++    case "$1" in
++        --output_path)
++            OUTPUT_PATH="${2-}"
++            shift 2
++            ;;
++        --output_path=*)
++            OUTPUT_PATH="${1#*=}"
++            shift
++            ;;
++        base | new)
++            MODE="$1"
++            shift
++            ;;
++        *)
++            shift
++            ;;
++    esac
++done
++
++if [ -z "$MODE" ]; then
++    echo "usage: $0 [--output_path <path>] <base|new>" >&2
++    exit 2
++fi
++
++cd "$(dirname "$0")" || exit 2
++
++case "$MODE" in
++    base)
++        TARGET=(
++            --test sdp-negotiation
++            --test sdp-m-recycle
++        )
++        ;;
++    new)
++        TARGET=(
++            --test sdp-rejected-offer-state_83efa2
++        )
++        ;;
++esac
++
++find target/nextest -name junit.xml -type f -delete 2>/dev/null
++
++cargo nextest run \
++    --locked \
++    --offline \
++    --no-default-features \
++    --features rust-crypto \
++    --profile default \
++    --no-fail-fast \
++    "${TARGET[@]}"
++STATUS=$?
++
++if [ -n "$OUTPUT_PATH" ]; then
++    mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++    JUNIT_SRC="$(find target/nextest -name junit.xml -type f 2>/dev/null | head -1)"
++
++    if [ -n "$JUNIT_SRC" ] && [ -f "$JUNIT_SRC" ]; then
++        cp "$JUNIT_SRC" "$OUTPUT_PATH"
++    else
++        cat > "$OUTPUT_PATH" <<XML
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites tests="1" failures="1" errors="0">
++  <testsuite name="$MODE" tests="1" failures="1" errors="0">
++    <testcase name="run" classname="$MODE">
++      <failure message="test run failed before producing a report (exit $STATUS)"/>
++    </testcase>
++  </testsuite>
++</testsuites>
++XML
++    fi
++fi
++
++exit "$STATUS"
+diff --git a/tests/sdp-rejected-offer-state_83efa2.rs b/tests/sdp-rejected-offer-state_83efa2.rs
+new file mode 100644
+index 0000000..160fafc
+--- /dev/null
++++ b/tests/sdp-rejected-offer-state_83efa2.rs
+@@ -0,0 +1,471 @@
++mod common;
++
++use std::net::Ipv4Addr;
++use std::time::Instant;
++
++use common::{
++    Peer, TestRtc, init_crypto_default, init_log, negotiate, progress, replace_sctp_init,
++};
++use str0m::change::SdpOffer;
++use str0m::media::{Direction, MediaKind};
++use str0m::{Event, Output, Rtc, RtcError};
++use tracing::info_span;
++
++#[test]
++fn rejected_reordered_offer_does_not_apply_media_state_or_events() {
++    init_log();
++    init_crypto_default();
++
++    let mut l = TestRtc::new(Peer::Left);
++    let mut r = TestRtc::new(Peer::Right);
++
++    let mids = negotiate(&mut l, &mut r, |change| {
++        [
++            change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None),
++            change.add_media(MediaKind::Video, Direction::SendRecv, None, None, None),
++            change.add_media(MediaKind::Video, Direction::SendRecv, None, None, None),
++        ]
++    });
++
++    let before = l.media(mids[0]).unwrap().direction();
++    assert_eq!(before, Direction::SendRecv);
++    drain_events(&mut l.rtc);
++
++    let (offer, _) = {
++        let mut change = r.rtc.sdp_api();
++        change.set_direction(mids[0], Direction::SendOnly);
++        change.apply().expect("direction change produces an offer")
++    };
++
++    let malformed = reorder_last_two_media_sections(&offer.to_sdp_string());
++    let offer = SdpOffer::from_sdp_string(&malformed).expect("reordered offer parses");
++
++    let err = l
++        .rtc
++        .sdp_api()
++        .accept_offer(offer)
++        .expect_err("changed m-line order must be rejected");
++    assert_remote_sdp(err);
++
++    assert_eq!(
++        l.media(mids[0]).unwrap().direction(),
++        before,
++        "a rejected offer must not apply changes from an earlier m-line"
++    );
++
++    let leaked = drain_events(&mut l.rtc)
++        .into_iter()
++        .any(|event| matches!(event, Event::MediaAdded(_) | Event::MediaChanged(_)));
++    assert!(!leaked, "a rejected offer must not queue media events");
++}
++
++#[test]
++fn rejected_reordered_offer_does_not_apply_remote_extension_changes() {
++    init_log();
++    init_crypto_default();
++
++    let mut l = TestRtc::new(Peer::Left);
++    let mut r = TestRtc::new(Peer::Right);
++
++    let mids = negotiate(&mut l, &mut r, |change| {
++        [
++            change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None),
++            change.add_media(MediaKind::Video, Direction::SendRecv, None, None, None),
++            change.add_media(MediaKind::Video, Direction::SendRecv, None, None, None),
++        ]
++    });
++    let extensions_before = l.media(mids[0]).unwrap().remote_extmap().clone();
++
++    let (offer, _) = {
++        let mut change = r.rtc.sdp_api();
++        change.set_direction(mids[0], Direction::SendOnly);
++        change.apply().expect("direction change produces an offer")
++    };
++    let without_first_media_extensions =
++        remove_first_media_attributes(&offer.to_sdp_string(), &["a=extmap:"]);
++    let malformed = reorder_last_two_media_sections(&without_first_media_extensions);
++
++    let err = l
++        .rtc
++        .sdp_api()
++        .accept_offer(SdpOffer::from_sdp_string(&malformed).unwrap())
++        .expect_err("changed m-line order must be rejected");
++    assert_remote_sdp(err);
++
++    assert_eq!(
++        l.media(mids[0]).unwrap().remote_extmap(),
++        &extensions_before,
++        "a rejected offer must not apply remote extension changes"
++    );
++}
++
++#[test]
++fn rejected_reordered_offer_does_not_apply_ice_restart() {
++    init_log();
++    init_crypto_default();
++
++    let mut l = TestRtc::new(Peer::Left);
++    let mut r = TestRtc::new(Peer::Right);
++
++    let mids = negotiate(&mut l, &mut r, |change| {
++        [
++            change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None),
++            change.add_media(MediaKind::Video, Direction::SendRecv, None, None, None),
++            change.add_media(MediaKind::Video, Direction::SendRecv, None, None, None),
++        ]
++    });
++
++    let credentials_before = l.rtc.direct_api().local_ice_credentials();
++
++    let (offer, pending) = {
++        let mut change = r.rtc.sdp_api();
++        change.ice_restart(true);
++        change.set_direction(mids[0], Direction::SendOnly);
++        change.apply().expect("ICE restart produces an offer")
++    };
++    let valid_sdp = offer.to_sdp_string();
++    let malformed = reorder_last_two_media_sections(&valid_sdp);
++
++    let err = l
++        .rtc
++        .sdp_api()
++        .accept_offer(SdpOffer::from_sdp_string(&malformed).unwrap())
++        .expect_err("changed m-line order must be rejected");
++    assert_remote_sdp(err);
++
++    assert_eq!(
++        l.rtc.direct_api().local_ice_credentials(),
++        credentials_before,
++        "a rejected remote ICE restart must not rotate local credentials"
++    );
++
++    let answer = l
++        .rtc
++        .sdp_api()
++        .accept_offer(SdpOffer::from_sdp_string(&valid_sdp).unwrap())
++        .expect("the original valid offer remains acceptable");
++    r.rtc
++        .sdp_api()
++        .accept_answer(pending, answer)
++        .expect("the retry answer remains acceptable");
++
++    assert_ne!(
++        l.rtc.direct_api().local_ice_credentials(),
++        credentials_before,
++        "the valid retry must still commit the ICE restart"
++    );
++}
++
++#[test]
++fn rejected_offer_does_not_retain_remote_candidates() {
++    init_log();
++    init_crypto_default();
++
++    let mut l = TestRtc::new(Peer::Left);
++    let mut r = TestRtc::new(Peer::Right);
++    let mids = negotiate(&mut l, &mut r, |change| {
++        [
++            change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None),
++            change.add_media(MediaKind::Video, Direction::SendRecv, None, None, None),
++            change.add_media(MediaKind::Video, Direction::SendRecv, None, None, None),
++        ]
++    });
++    let candidate = r.add_host_candidate((Ipv4Addr::new(203, 0, 113, 10), 5000).into());
++
++    let (offer, _) = {
++        let mut change = r.rtc.sdp_api();
++        change.set_direction(mids[0], Direction::SendOnly);
++        change.apply().expect("direction change produces an offer")
++    };
++    let malformed = reorder_last_two_media_sections(&offer.to_sdp_string());
++
++    let err = l
++        .rtc
++        .sdp_api()
++        .accept_offer(SdpOffer::from_sdp_string(&malformed).unwrap())
++        .expect_err("changed m-line order must be rejected");
++    assert_remote_sdp(err);
++
++    assert!(
++        !l.rtc.direct_api().invalidate_candidate(&candidate),
++        "a rejected offer must not install its remote candidate"
++    );
++}
++
++#[test]
++fn missing_initial_fingerprint_does_not_disconnect_receiver() {
++    init_log();
++    init_crypto_default();
++
++    let mut l = TestRtc::new(Peer::Left);
++    let mut r = TestRtc::new(Peer::Right);
++
++    let (offer, pending) = {
++        let mut change = r.rtc.sdp_api();
++        change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
++        change.apply().expect("media addition produces an offer")
++    };
++    let valid_sdp = offer.to_sdp_string();
++    let missing_fingerprint = remove_sdp_attributes(&valid_sdp, &["a=fingerprint:"]);
++
++    let err = l
++        .rtc
++        .sdp_api()
++        .accept_offer(SdpOffer::from_sdp_string(&missing_fingerprint).unwrap())
++        .expect_err("an initial offer without a fingerprint must be rejected");
++    assert_remote_sdp(err);
++    assert!(
++        l.rtc.is_alive(),
++        "invalid remote input must not disconnect a live receiver"
++    );
++
++    let answer = l
++        .rtc
++        .sdp_api()
++        .accept_offer(SdpOffer::from_sdp_string(&valid_sdp).unwrap())
++        .expect("the untouched valid offer remains acceptable");
++    r.rtc
++        .sdp_api()
++        .accept_answer(pending, answer)
++        .expect("the retry answer remains acceptable");
++
++    assert_rejected_initial_offer_does_not_pin_fingerprint();
++    assert_rejected_offer_still_invalidates_pending_local_offer();
++}
++
++fn assert_rejected_initial_offer_does_not_pin_fingerprint() {
++    let mut l = TestRtc::new(Peer::Left);
++    let mut rejected_remote = TestRtc::new(Peer::Right);
++    let mut valid_remote = TestRtc::new(Peer::Right);
++
++    let (rejected_offer, _) = {
++        let mut change = rejected_remote.rtc.sdp_api();
++        change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
++        change.apply().expect("media addition produces an offer")
++    };
++    let missing_ice = remove_sdp_attributes(
++        &rejected_offer.to_sdp_string(),
++        &["a=ice-ufrag:", "a=ice-pwd:"],
++    );
++
++    let err = l
++        .rtc
++        .sdp_api()
++        .accept_offer(SdpOffer::from_sdp_string(&missing_ice).unwrap())
++        .expect_err("an offer without ICE credentials must be rejected");
++    assert_remote_sdp(err);
++
++    l.add_host_candidate((Ipv4Addr::new(192, 0, 2, 1), 1000).into());
++    valid_remote.add_host_candidate((Ipv4Addr::new(192, 0, 2, 2), 2000).into());
++    let (valid_offer, pending) = {
++        let mut change = valid_remote.rtc.sdp_api();
++        change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
++        change.apply().expect("media addition produces an offer")
++    };
++    let answer = l
++        .rtc
++        .sdp_api()
++        .accept_offer(valid_offer)
++        .expect("a valid offer from another peer remains acceptable");
++    valid_remote
++        .rtc
++        .sdp_api()
++        .accept_answer(pending, answer)
++        .expect("the valid answer remains acceptable");
++
++    for _ in 0..1000 {
++        if l.is_connected() && valid_remote.is_connected() {
++            break;
++        }
++        progress(&mut l, &mut valid_remote).expect("valid peers make progress");
++    }
++    assert!(
++        l.is_connected() && valid_remote.is_connected(),
++        "the rejected offer's fingerprint must not poison a later valid handshake"
++    );
++}
++
++fn assert_rejected_offer_still_invalidates_pending_local_offer() {
++    let mut l = TestRtc::new(Peer::Left);
++    let mut r = TestRtc::new(Peer::Right);
++    let mut remote = TestRtc::new(Peer::Right);
++
++    let (local_offer, pending) = {
++        let mut change = l.rtc.sdp_api();
++        change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
++        change.apply().expect("media addition produces an offer")
++    };
++    let local_answer = r
++        .rtc
++        .sdp_api()
++        .accept_offer(local_offer)
++        .expect("the local offer is valid");
++
++    let (remote_offer, _) = {
++        let mut change = remote.rtc.sdp_api();
++        change.add_media(MediaKind::Video, Direction::SendRecv, None, None, None);
++        change.apply().expect("media addition produces an offer")
++    };
++    let missing_ice = remove_sdp_attributes(
++        &remote_offer.to_sdp_string(),
++        &["a=ice-ufrag:", "a=ice-pwd:"],
++    );
++
++    let err = l
++        .rtc
++        .sdp_api()
++        .accept_offer(SdpOffer::from_sdp_string(&missing_ice).unwrap())
++        .expect_err("an offer without ICE credentials must be rejected");
++    assert_remote_sdp(err);
++
++    let err = l
++        .rtc
++        .sdp_api()
++        .accept_answer(pending, local_answer)
++        .expect_err("accept_offer must invalidate the old pending offer");
++    assert!(
++        matches!(err, RtcError::ChangesOutOfOrder),
++        "unexpected pending-offer error: {err}"
++    );
++}
++
++#[test]
++fn rejected_snap_reoffer_does_not_apply_ice_or_media_state() {
++    init_log();
++    init_crypto_default();
++
++    let now = Instant::now();
++    let mut l = TestRtc::new_with_rtc(
++        info_span!("L"),
++        Rtc::builder().set_snap_enabled(true).build(now),
++    );
++    let mut r = TestRtc::new_with_rtc(
++        info_span!("R"),
++        Rtc::builder().set_snap_enabled(true).build(now),
++    );
++    l.add_host_candidate((Ipv4Addr::new(1, 1, 1, 1), 1000).into());
++    r.add_host_candidate((Ipv4Addr::new(2, 2, 2, 2), 2000).into());
++
++    let mid = negotiate(&mut l, &mut r, |change| {
++        change.add_channel("snap-atomicity".into());
++        change.add_media(MediaKind::Video, Direction::SendRecv, None, None, None)
++    });
++
++    for _ in 0..1000 {
++        if l.is_connected() && r.is_connected() {
++            break;
++        }
++        progress(&mut l, &mut r).expect("SNAP peers make progress");
++    }
++    assert!(
++        l.is_connected() && r.is_connected(),
++        "SNAP association must be established before testing a re-offer"
++    );
++
++    let credentials_before = r.rtc.direct_api().local_ice_credentials();
++    let direction_before = r.media(mid).unwrap().direction();
++
++    let (offer, pending) = {
++        let mut change = l.rtc.sdp_api();
++        change.ice_restart(true);
++        change.set_direction(mid, Direction::SendOnly);
++        change.apply().expect("SNAP re-offer is generated")
++    };
++    let valid_sdp = offer.to_sdp_string();
++    let tampered = replace_sctp_init(&valid_sdp, "AQ==");
++
++    let err = r
++        .rtc
++        .sdp_api()
++        .accept_offer(SdpOffer::from_sdp_string(&tampered).unwrap())
++        .expect_err("a changed established SNAP value must be rejected");
++    assert_remote_sdp(err);
++    assert_eq!(
++        r.rtc.direct_api().local_ice_credentials(),
++        credentials_before,
++        "a rejected SNAP re-offer must not apply its earlier ICE restart"
++    );
++    assert_eq!(
++        r.media(mid).unwrap().direction(),
++        direction_before,
++        "a rejected SNAP re-offer must not apply media changes"
++    );
++
++    let answer = r
++        .rtc
++        .sdp_api()
++        .accept_offer(SdpOffer::from_sdp_string(&valid_sdp).unwrap())
++        .expect("the original SNAP re-offer remains acceptable");
++    l.rtc
++        .sdp_api()
++        .accept_answer(pending, answer)
++        .expect("the SNAP retry answer remains acceptable");
++
++    assert_ne!(
++        r.rtc.direct_api().local_ice_credentials(),
++        credentials_before,
++        "the valid SNAP retry must commit its ICE restart"
++    );
++    assert_ne!(
++        r.media(mid).unwrap().direction(),
++        direction_before,
++        "the valid SNAP retry must commit its media change"
++    );
++}
++
++fn reorder_last_two_media_sections(sdp: &str) -> String {
++    let mut sections = Vec::new();
++    let mut current = String::new();
++
++    for line in sdp.split_inclusive("\r\n") {
++        if line.starts_with("m=") && !current.is_empty() {
++            sections.push(std::mem::take(&mut current));
++        }
++        current.push_str(line);
++    }
++    if !current.is_empty() {
++        sections.push(current);
++    }
++
++    assert_eq!(sections.len(), 4, "session plus three media sections");
++    sections.swap(2, 3);
++    sections.concat()
++}
++
++fn remove_sdp_attributes(sdp: &str, prefixes: &[&str]) -> String {
++    sdp.split_inclusive("\r\n")
++        .filter(|line| !prefixes.iter().any(|prefix| line.starts_with(prefix)))
++        .collect()
++}
++
++fn remove_first_media_attributes(sdp: &str, prefixes: &[&str]) -> String {
++    let mut media_index = 0;
++
++    sdp.split_inclusive("\r\n")
++        .filter(|line| {
++            if line.starts_with("m=") {
++                media_index += 1;
++            }
++            media_index != 1 || !prefixes.iter().any(|prefix| line.starts_with(prefix))
++        })
++        .collect()
++}
++
++fn drain_events(rtc: &mut Rtc) -> Vec<Event> {
++    let mut events = Vec::new();
++
++    loop {
++        match rtc.poll_output().expect("polling output succeeds") {
++            Output::Event(event) => events.push(event),
++            Output::Transmit(_) => {}
++            Output::Timeout(_) => return events,
++        }
++    }
++}
++
++fn assert_remote_sdp(err: RtcError) {
++    assert!(
++        matches!(err, RtcError::RemoteSdp(_)),
++        "expected RemoteSdp, got {err}"
++    );
++}

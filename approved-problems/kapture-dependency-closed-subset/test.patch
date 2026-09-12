@@ -1,0 +1,698 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..61e831f
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,47 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++output_path=""
++while [[ $# -gt 0 ]]; do
++    case "$1" in
++        --output_path)
++            output_path="${2:-}"
++            shift 2
++            ;;
++        base|new)
++            mode="$1"
++            shift
++            ;;
++        *)
++            echo "usage: ./test.sh --output_path PATH {base|new}" >&2
++            exit 2
++            ;;
++    esac
++done
++
++if [[ -z "${output_path:-}" || -z "${mode:-}" ]]; then
++    echo "usage: ./test.sh --output_path PATH {base|new}" >&2
++    exit 2
++fi
++
++case "$output_path" in
++    /*) ;;
++    *) output_path="$PWD/$output_path" ;;
++esac
++
++runtime_root="$(mktemp -d /tmp/kapture-subset-tests.XXXXXX)"
++cleanup() {
++    rm -rf -- "$runtime_root"
++}
++trap cleanup EXIT
++
++cp -R . "$runtime_root/repo"
++chmod -R u+w "$runtime_root/repo"
++cd "$runtime_root/repo"
++export PYTHONDONTWRITEBYTECODE=1
++
++if [[ "$mode" == "base" ]]; then
++    python -m pytest tests --ignore=tests/test_dataset_partitioning.py --junitxml="$output_path"
++else
++    python -m pytest tests/test_dataset_partitioning.py --junitxml="$output_path"
++fi
+diff --git a/tests/test_dataset_partitioning.py b/tests/test_dataset_partitioning.py
+new file mode 100644
+index 0000000..fea3e07
+--- /dev/null
++++ b/tests/test_dataset_partitioning.py
+@@ -0,0 +1,638 @@
++#!/usr/bin/env python3
++# Copyright 2020-present NAVER Corp. Under BSD 3-clause license
++
++import copy
++import hashlib
++import os
++import os.path as path
++import subprocess
++import sys
++import tempfile
++import tomllib
++import unittest
++
++import numpy as np
++
++import kapture
++import kapture.io.features
++from kapture.algo.compare import equal_kapture
++from kapture.io.csv import current_format_version, get_all_tar_handlers, kapture_from_dir, kapture_to_dir
++from kapture.io.records import get_record_fullpath
++from kapture.io.tar import TarHandler, get_feature_tar_fullpath
++
++try:
++    from kapture.algo.subset import subset_kapture, subset_kapture_from_dir
++except ImportError:
++    subset_kapture = None
++    subset_kapture_from_dir = None
++
++
++IMAGES = ('left/early.jpg', 'left/middle.jpg', 'right/middle.jpg', 'right/late.jpg')
++RECORD_ATTRIBUTES = (
++    'records_camera', 'records_depth', 'records_lidar', 'records_wifi',
++    'records_bluetooth', 'records_gnss', 'records_accelerometer',
++    'records_gyroscope', 'records_magnetic',
++)
++
++
++def _camera(sensor_type=kapture.SensorType.camera.name):
++    return kapture.Camera(kapture.CameraType.SIMPLE_PINHOLE,
++                          [32, 24, 12, 16, 12], sensor_type=sensor_type)
++
++
++def _two_records(record_type, sensor_id, first, second):
++    records = record_type()
++    records[10, sensor_id] = first
++    records[20, sensor_id] = second
++    return records
++
++
++def _make_model():
++    sensors = kapture.Sensors({
++        'left': _camera(),
++        'right': _camera(),
++        'depth': _camera(kapture.SensorType.depth.name),
++        'lidar': kapture.Sensor(kapture.SensorType.lidar.name),
++        'wifi': kapture.Sensor(kapture.SensorType.wifi.name),
++        'bluetooth': kapture.Sensor(kapture.SensorType.bluetooth.name),
++        'gnss': kapture.Sensor(kapture.SensorType.gnss.name, ['EPSG:4326']),
++        'accelerometer': kapture.Sensor(kapture.SensorType.accelerometer.name),
++        'gyroscope': kapture.Sensor(kapture.SensorType.gyroscope.name),
++        'magnetic': kapture.Sensor(kapture.SensorType.magnetic.name),
++    })
++
++    rigs = kapture.Rigs()
++    rigs['stereo', 'left'] = kapture.PoseTransform(t=[-1, 0, 0])
++    rigs['stereo', 'right'] = kapture.PoseTransform(t=[1, 0, 0])
++    rigs['vehicle', 'stereo'] = kapture.PoseTransform(t=[0, 0, 1])
++    rigs['unused_rig', 'depth'] = kapture.PoseTransform()
++
++    trajectories = kapture.Trajectories()
++    for timestamp in (10, 20, 30):
++        trajectories[timestamp, 'vehicle'] = kapture.PoseTransform(t=[0, 0, timestamp])
++    trajectories[20, 'depth'] = kapture.PoseTransform(t=[2, 0, 20])
++    trajectories[20, 'unused_rig'] = kapture.PoseTransform(t=[3, 0, 20])
++
++    records_camera = kapture.RecordsCamera()
++    records_camera[10, 'left'] = IMAGES[0]
++    records_camera[20, 'left'] = IMAGES[1]
++    records_camera[20, 'right'] = IMAGES[2]
++    records_camera[30, 'right'] = IMAGES[3]
++
++    records_depth = _two_records(kapture.RecordsDepth, 'depth', 'depth/10.bin', 'depth/20.bin')
++    records_lidar = _two_records(kapture.RecordsLidar, 'lidar', 'lidar/10.bin', 'lidar/20.bin')
++    records_wifi = _two_records(
++        kapture.RecordsWifi, 'wifi',
++        kapture.RecordWifi({'ap': kapture.RecordWifiSignal(2412, -30.0, 'early')}),
++        kapture.RecordWifi({'ap': kapture.RecordWifiSignal(2412, -31.0, 'middle')}))
++    records_bluetooth = _two_records(
++        kapture.RecordsBluetooth, 'bluetooth',
++        kapture.RecordBluetooth({'beacon': kapture.RecordBluetoothSignal(-60.0, 'early')}),
++        kapture.RecordBluetooth({'beacon': kapture.RecordBluetoothSignal(-61.0, 'middle')}))
++    records_gnss = _two_records(
++        kapture.RecordsGnss, 'gnss',
++        kapture.RecordGnss(1, 2, 3, 10, .5), kapture.RecordGnss(4, 5, 6, 20, .6))
++    records_accelerometer = _two_records(
++        kapture.RecordsAccelerometer, 'accelerometer',
++        kapture.RecordAccelerometer(1, 2, 3), kapture.RecordAccelerometer(4, 5, 6))
++    records_gyroscope = _two_records(
++        kapture.RecordsGyroscope, 'gyroscope',
++        kapture.RecordGyroscope(1, 2, 3), kapture.RecordGyroscope(4, 5, 6))
++    records_magnetic = _two_records(
++        kapture.RecordsMagnetic, 'magnetic',
++        kapture.RecordMagnetic(1, 2, 3), kapture.RecordMagnetic(4, 5, 6))
++
++    keypoints = {
++        'SIFT': kapture.Keypoints('SIFT', np.float32, 2, IMAGES),
++        'PARTIAL': kapture.Keypoints('PARTIAL', np.float64, 1, (IMAGES[1], IMAGES[3])),
++    }
++    descriptors = {'SIFT': kapture.Descriptors('SIFT', np.uint8, 4, 'SIFT', 'L2', IMAGES)}
++    global_features = {'GLOBAL': kapture.GlobalFeatures('GLOBAL', np.float32, 3, 'L2', IMAGES)}
++    matches = kapture.Matches()
++    matches.add(IMAGES[0], IMAGES[1])
++    matches.add(IMAGES[1], IMAGES[2])
++    matches.add(IMAGES[2], IMAGES[3])
++
++    observations = kapture.Observations()
++    observations.add(0, 'SIFT', IMAGES[1], 0)
++    observations.add(0, 'SIFT', IMAGES[2], 1)
++    observations.add(1, 'SIFT', IMAGES[0], 0)
++    observations.add(2, 'SIFT', IMAGES[1], 1)
++    observations.add(3, 'SIFT', IMAGES[3], 0)
++    points3d = kapture.Points3d([
++        [0, 0, 0, 10, 11, 12],
++        [1, 1, 1, 20, 21, 22],
++        [2, 2, 2, 30, 31, 32],
++        [3, 3, 3, 40, 41, 42],
++    ])
++
++    model = kapture.Kapture(
++        sensors=sensors, rigs=rigs, trajectories=trajectories,
++        records_camera=records_camera, records_depth=records_depth,
++        records_lidar=records_lidar, records_wifi=records_wifi,
++        records_bluetooth=records_bluetooth, records_gnss=records_gnss,
++        records_accelerometer=records_accelerometer,
++        records_gyroscope=records_gyroscope, records_magnetic=records_magnetic,
++        keypoints=keypoints, descriptors=descriptors,
++        global_features=global_features, matches={'SIFT': matches},
++        observations=observations, points3d=points3d,
++    )
++    model.__version__ = current_format_version()
++    return model
++
++
++def _arrays():
++    values = {}
++    for index, image in enumerate(IMAGES, 1):
++        values[kapture.Keypoints, 'SIFT', image] = np.full((2, 2), index, np.float32)
++        values[kapture.Descriptors, 'SIFT', image] = np.full((2, 4), index + 10, np.uint8)
++        values[kapture.GlobalFeatures, 'GLOBAL', image] = np.full((1, 3), index + 20, np.float32)
++    values[kapture.Keypoints, 'PARTIAL', IMAGES[1]] = np.array([[31.]], np.float64)
++    values[kapture.Keypoints, 'PARTIAL', IMAGES[3]] = np.array([[32.]], np.float64)
++    values[kapture.Matches, 'SIFT', (IMAGES[0], IMAGES[1])] = np.array([[0., 0., .8]], np.float64)
++    values[kapture.Matches, 'SIFT', (IMAGES[1], IMAGES[2])] = np.array([[0., 1., .9]], np.float64)
++    values[kapture.Matches, 'SIFT', (IMAGES[2], IMAGES[3])] = np.array([[1., 0., .7]], np.float64)
++    return values
++
++
++def _write_source(root, tarred_types=frozenset()):
++    model = _make_model()
++    kapture_to_dir(root, model)
++    for filename in model.records_camera.data_list() + model.records_depth.data_list() + model.records_lidar.data_list():
++        fullpath = get_record_fullpath(root, filename)
++        os.makedirs(path.dirname(fullpath), exist_ok=True)
++        with open(fullpath, 'wb') as output:
++            output.write(('payload:' + filename).encode())
++
++    handlers = {}
++    try:
++        for (data_type, feature_type, key), values in _arrays().items():
++            handler = None
++            handler_key = data_type, feature_type
++            if handler_key in tarred_types:
++                if handler_key not in handlers:
++                    tar_path = get_feature_tar_fullpath(data_type, feature_type, root)
++                    os.makedirs(path.dirname(tar_path), exist_ok=True)
++                    handlers[handler_key] = TarHandler(tar_path, 'a')
++                handler = handlers[handler_key]
++            if data_type == kapture.Matches:
++                fullpath = kapture.io.features.get_matches_fullpath(key, feature_type, root, handler)
++                kapture.io.features.image_matches_to_file(fullpath, values)
++            else:
++                fullpath = kapture.io.features.get_features_fullpath(data_type, feature_type, root, key, handler)
++                if isinstance(fullpath, str):
++                    os.makedirs(path.dirname(fullpath), exist_ok=True)
++                    values.tofile(fullpath)
++                else:
++                    handler.add_array_to_tar(fullpath[0], values)
++    finally:
++        for handler in handlers.values():
++            handler.close()
++
++
++def _tree_hash(root):
++    digest = hashlib.sha256()
++    for directory, directories, filenames in os.walk(root):
++        directories.sort()
++        for filename in sorted(filenames):
++            fullpath = path.join(directory, filename)
++            digest.update(path.relpath(fullpath, root).encode())
++            with open(fullpath, 'rb') as source:
++                digest.update(source.read())
++    return digest.hexdigest()
++
++
++class TestDependencyClosedSubset(unittest.TestCase):
++    def require_api(self):
++        if subset_kapture is None or subset_kapture_from_dir is None:
++            self.fail('kapture.algo.subset must provide both public subset operations')
++
++    def test_combined_filter_closes_nested_rigs_trajectories_and_reconstruction(self):
++        self.require_api()
++        source = _make_model()
++        before = copy.deepcopy(source)
++        result = subset_kapture(source, 20, 20, {'left'})
++
++        self.assertEqual({'left'}, set(result.sensors))
++        self.assertEqual({('stereo', 'left'), ('vehicle', 'stereo')}, set(result.rigs.key_pairs()))
++        self.assertEqual({(20, 'vehicle')}, set(result.trajectories.key_pairs()))
++        self.assertEqual({(20, 'left')}, set(result.records_camera.key_pairs()))
++        for attribute in RECORD_ATTRIBUTES[1:]:
++            value = getattr(result, attribute)
++            self.assertTrue(value is None or len(value) == 0, attribute)
++        self.assertEqual({IMAGES[1]}, set(result.keypoints['SIFT']))
++        self.assertEqual({IMAGES[1]}, set(result.keypoints['PARTIAL']))
++        self.assertEqual({IMAGES[1]}, set(result.descriptors['SIFT']))
++        self.assertEqual({IMAGES[1]}, set(result.global_features['GLOBAL']))
++        self.assertFalse(any(match_set for match_set in (result.matches or {}).values()))
++        self.assertEqual([[0, 0, 0, 10, 11, 12], [2, 2, 2, 30, 31, 32]], result.points3d.tolist())
++        self.assertEqual({0, 1}, set(result.observations))
++        self.assertEqual([(IMAGES[1], 0)], result.observations[0, 'SIFT'])
++        self.assertEqual([(IMAGES[1], 1)], result.observations[1, 'SIFT'])
++        self.assertTrue(equal_kapture(source, before))
++
++    def test_inclusive_interval_is_applied_to_all_nine_record_families(self):
++        self.require_api()
++        result = subset_kapture(_make_model(), 10, 20)
++        self.assertEqual({10, 20}, set(result.records_camera))
++        self.assertEqual(3, len(result.records_camera.key_pairs()))
++        for attribute in RECORD_ATTRIBUTES[1:]:
++            records = getattr(result, attribute)
++            self.assertEqual({10, 20}, set(records), attribute)
++            self.assertEqual(2, len(records.key_pairs()), attribute)
++        self.assertEqual({(IMAGES[0], IMAGES[1]), (IMAGES[1], IMAGES[2])},
++                         set(result.matches['SIFT']))
++        self.assertEqual([0, 1, 2], sorted(result.observations))
++        self.assertEqual([0, 1, 2], result.points3d[:, 0].astype(int).tolist())
++
++    def test_sensor_only_no_filter_empty_and_validation_paths(self):
++        self.require_api()
++        source = _make_model()
++        before = copy.deepcopy(source)
++
++        from_middle = subset_kapture(source, start_timestamp=20)
++        self.assertEqual({(20, 'left'), (20, 'right'), (30, 'right')},
++                         set(from_middle.records_camera.key_pairs()))
++        through_middle = subset_kapture(source, end_timestamp=20)
++        self.assertEqual({(10, 'left'), (20, 'left'), (20, 'right')},
++                         set(through_middle.records_camera.key_pairs()))
++
++        right = subset_kapture(source, sensor_ids=['right'])
++        self.assertEqual({(20, 'right'), (30, 'right')}, set(right.records_camera.key_pairs()))
++        self.assertEqual({(IMAGES[2], IMAGES[3])}, set(right.matches['SIFT']))
++        self.assertEqual({20, 30}, set(right.trajectories))
++
++        depth = subset_kapture(source, 20, 20, {'depth'})
++        self.assertEqual({('unused_rig', 'depth')}, set(depth.rigs.key_pairs()))
++        self.assertEqual({(20, 'depth'), (20, 'unused_rig')}, set(depth.trajectories.key_pairs()))
++
++        complete = subset_kapture(source)
++        self.assertTrue(equal_kapture(source, complete))
++        complete.records_camera[10, 'left'] = 'changed.jpg'
++        self.assertEqual(IMAGES[0], source.records_camera[10, 'left'])
++
++        empty = subset_kapture(source, 999, 1000)
++        self.assertTrue(empty.sensors is None or len(empty.sensors) == 0)
++        self.assertTrue(empty.records_camera is None or len(empty.records_camera) == 0)
++        self.assertTrue(empty.points3d is None or len(empty.points3d) == 0)
++
++        with self.assertRaises(ValueError):
++            subset_kapture(source, 30, 10)
++        with self.assertRaises(ValueError):
++            subset_kapture(source, sensor_ids={'not-a-sensor'})
++        self.assertTrue(equal_kapture(source, before))
++
++    def test_no_filter_result_is_deeply_independent(self):
++        self.require_api()
++        source = _make_model()
++        source.sensors['idle'] = _camera()
++        result = subset_kapture(source)
++        self.assertTrue(equal_kapture(source, result))
++        filtered = subset_kapture(source, 20, 20)
++
++        original_idle_params = list(source.sensors['idle'].sensor_params)
++        original_sensor_params = list(source.sensors['left'].sensor_params)
++        original_rig_translation = source.rigs['stereo', 'left'].t.copy()
++        original_trajectory_translation = source.trajectories[20, 'vehicle'].t.copy()
++        original_point = np.asarray(source.points3d[0]).copy()
++
++        result.sensors['idle'].sensor_params[1] = '777'
++        filtered.sensors['left'].sensor_params[1] = '999'
++        filtered.rigs['stereo', 'left'].t[0] = 999
++        filtered.trajectories[20, 'vehicle'].t[0] = 999
++        filtered.records_wifi[20, 'wifi'].clear()
++        filtered.points3d[0, 0] = 999
++        filtered.keypoints['SIFT'].add('invented.jpg')
++
++        self.assertEqual(original_idle_params, source.sensors['idle'].sensor_params)
++        self.assertEqual(original_sensor_params, source.sensors['left'].sensor_params)
++        np.testing.assert_array_equal(original_rig_translation, source.rigs['stereo', 'left'].t)
++        np.testing.assert_array_equal(original_trajectory_translation, source.trajectories[20, 'vehicle'].t)
++        self.assertTrue(source.records_wifi[20, 'wifi'])
++        np.testing.assert_array_equal(original_point, np.asarray(source.points3d[0]))
++        self.assertNotIn('invented.jpg', source.keypoints['SIFT'])
++
++    def test_absent_families_and_physical_sensor_validation(self):
++        self.require_api()
++        result = subset_kapture(kapture.Kapture(), start_timestamp=0)
++        self.assertIsInstance(result, kapture.Kapture)
++        for attribute in RECORD_ATTRIBUTES:
++            records = getattr(result, attribute)
++            self.assertTrue(records is None or len(records) == 0, attribute)
++
++        source = _make_model()
++        source.sensors['idle'] = _camera()
++        idle = subset_kapture(source, sensor_ids=['idle'])
++        self.assertTrue(idle.sensors is None or len(idle.sensors) == 0)
++        self.assertTrue(idle.records_camera is None or len(idle.records_camera) == 0)
++        with self.assertRaises(ValueError):
++            subset_kapture(source, sensor_ids=['stereo'])
++
++    def test_shared_camera_path_remains_a_surviving_image_identifier(self):
++        self.require_api()
++        source = _make_model()
++        source.records_camera[10, 'left'] = IMAGES[1]
++        result = subset_kapture(source, 20, 20, ['left'])
++        self.assertEqual({IMAGES[1]}, set(result.records_camera.data_list()))
++        self.assertEqual({IMAGES[1]}, set(result.keypoints['SIFT']))
++        self.assertEqual({IMAGES[1]}, set(result.descriptors['SIFT']))
++        self.assertEqual({IMAGES[1]}, set(result.global_features['GLOBAL']))
++        self.assertEqual([0, 2], result.points3d[:, 0].astype(int).tolist())
++
++    def test_image_seeds_reverse_select_record_timestamps_and_validate_ids(self):
++        self.require_api()
++        source = _make_model()
++
++        single = subset_kapture(source, image_ids=[IMAGES[2]])
++        self.assertEqual({(20, 'right')}, set(single.records_camera.key_pairs()))
++        for attribute in RECORD_ATTRIBUTES[1:]:
++            records = getattr(single, attribute)
++            self.assertEqual({20}, set(records), attribute)
++
++        source.records_camera[10, 'left'] = IMAGES[1]
++
++        result = subset_kapture(source, start_timestamp=20, image_ids=[IMAGES[1]])
++        self.assertEqual({(20, 'left')}, set(result.records_camera.key_pairs()))
++        for attribute in RECORD_ATTRIBUTES[1:]:
++            records = getattr(result, attribute)
++            self.assertEqual({20}, set(records), attribute)
++            self.assertEqual(1, len(records.key_pairs()), attribute)
++        self.assertEqual({IMAGES[1]}, set(result.keypoints['SIFT']))
++        self.assertFalse(any(match_set for match_set in (result.matches or {}).values()))
++        self.assertEqual([0, 2], result.points3d[:, 0].astype(int).tolist())
++
++        repeated = subset_kapture(source, image_ids=[IMAGES[1], IMAGES[3]])
++        self.assertEqual({(10, 'left'), (20, 'left'), (30, 'right')},
++                         set(repeated.records_camera.key_pairs()))
++        self.assertEqual({10, 20}, set(repeated.records_depth))
++
++        excluded = subset_kapture(source, sensor_ids=['right'], image_ids=[IMAGES[1]])
++        self.assertTrue(excluded.records_camera is None or len(excluded.records_camera) == 0)
++        with self.assertRaises(ValueError):
++            subset_kapture(source, image_ids=['not-an-image.jpg'])
++
++    def test_saved_subset_copies_payloads_and_preserves_mixed_storage(self):
++        self.require_api()
++        tarred = {
++            (kapture.Keypoints, 'SIFT'),
++            (kapture.GlobalFeatures, 'GLOBAL'),
++            (kapture.Matches, 'SIFT'),
++        }
++        with tempfile.TemporaryDirectory() as tempdir:
++            source_path = path.join(tempdir, 'source')
++            output_path = path.join(tempdir, 'output')
++            _write_source(source_path, tarred)
++            source_hash = _tree_hash(source_path)
++
++            returned = subset_kapture_from_dir(source_path, output_path, 20, 20)
++            self.assertIsInstance(returned, kapture.Kapture)
++            self.assertEqual(source_hash, _tree_hash(source_path))
++            self.assertEqual({IMAGES[1], IMAGES[2]}, set(returned.records_camera.data_list()))
++            self.assertEqual({'depth/20.bin'}, set(returned.records_depth.data_list()))
++            self.assertEqual({'lidar/20.bin'}, set(returned.records_lidar.data_list()))
++            self.assertEqual({(IMAGES[1], IMAGES[2])}, set(returned.matches['SIFT']))
++            self.assertEqual(2, len(returned.points3d))
++            with get_all_tar_handlers(output_path) as handlers:
++                reopened = kapture_from_dir(output_path, tar_handlers=handlers)
++                self.assertEqual({IMAGES[1], IMAGES[2]}, set(reopened.records_camera.data_list()))
++                self.assertEqual({'depth/20.bin'}, set(reopened.records_depth.data_list()))
++                self.assertEqual({'lidar/20.bin'}, set(reopened.records_lidar.data_list()))
++                for attribute in RECORD_ATTRIBUTES[3:]:
++                    records = getattr(reopened, attribute)
++                    self.assertEqual({20}, set(records), attribute)
++                    self.assertEqual(1, len(records.key_pairs()), attribute)
++                self.assertEqual({(IMAGES[1], IMAGES[2])}, set(reopened.matches['SIFT']))
++                self.assertEqual(2, len(reopened.points3d))
++                for data_type, feature_type, image in (
++                        (kapture.Keypoints, 'SIFT', IMAGES[1]),
++                        (kapture.Descriptors, 'SIFT', IMAGES[2]),
++                        (kapture.GlobalFeatures, 'GLOBAL', IMAGES[1]),
++                        (kapture.Keypoints, 'PARTIAL', IMAGES[1])):
++                    metadata = getattr(reopened, {
++                        kapture.Keypoints: 'keypoints',
++                        kapture.Descriptors: 'descriptors',
++                        kapture.GlobalFeatures: 'global_features',
++                    }[data_type])[feature_type]
++                    feature_path = kapture.io.features.get_features_fullpath(
++                        data_type, feature_type, output_path, image, handlers)
++                    reader = {
++                        kapture.Keypoints: kapture.io.features.image_keypoints_from_file,
++                        kapture.Descriptors: kapture.io.features.image_descriptors_from_file,
++                        kapture.GlobalFeatures: kapture.io.features.image_global_features_from_file,
++                    }[data_type]
++                    actual = reader(feature_path, metadata.dtype, metadata.dsize)
++                    np.testing.assert_array_equal(_arrays()[data_type, feature_type, image], actual)
++                match_path = kapture.io.features.get_matches_fullpath(
++                    (IMAGES[1], IMAGES[2]), 'SIFT', output_path, handlers)
++                actual_matches = kapture.io.features.image_matches_from_file(match_path)
++                np.testing.assert_array_equal(
++                    _arrays()[kapture.Matches, 'SIFT', (IMAGES[1], IMAGES[2])], actual_matches)
++
++            for filename in (IMAGES[1], IMAGES[2], 'depth/20.bin', 'lidar/20.bin'):
++                record_path = get_record_fullpath(output_path, filename)
++                self.assertTrue(path.isfile(record_path))
++                with open(record_path, 'rb') as payload:
++                    self.assertEqual(('payload:' + filename).encode(), payload.read())
++            for data_type, feature_type in (
++                    (kapture.Keypoints, 'SIFT'),
++                    (kapture.GlobalFeatures, 'GLOBAL'),
++                    (kapture.Matches, 'SIFT')):
++                self.assertTrue(path.isfile(get_feature_tar_fullpath(data_type, feature_type, output_path)))
++            for data_type, feature_type in (
++                    (kapture.Keypoints, 'PARTIAL'),
++                    (kapture.Descriptors, 'SIFT')):
++                self.assertFalse(path.exists(get_feature_tar_fullpath(data_type, feature_type, output_path)))
++
++    def test_saved_empty_selection_round_trips_and_same_path_is_rejected(self):
++        self.require_api()
++        with tempfile.TemporaryDirectory() as tempdir:
++            source_path = path.join(tempdir, 'source')
++            output_path = path.join(tempdir, 'empty')
++            _write_source(source_path)
++            source_hash = _tree_hash(source_path)
++            subset_kapture_from_dir(source_path, output_path, 100, 200)
++            reopened = kapture_from_dir(output_path)
++            self.assertTrue(reopened.records_camera is None or len(reopened.records_camera) == 0)
++            self.assertTrue(reopened.sensors is None or len(reopened.sensors) == 0)
++            with self.assertRaises(ValueError):
++                subset_kapture_from_dir(source_path, source_path)
++            self.assertEqual(source_hash, _tree_hash(source_path))
++
++    def test_existing_output_requires_force_and_normalized_same_path_is_rejected(self):
++        self.require_api()
++        from unittest import mock
++
++        with tempfile.TemporaryDirectory() as tempdir:
++            source_path = path.join(tempdir, 'source')
++            output_path = path.join(tempdir, 'output')
++            _write_source(source_path)
++            source_hash = _tree_hash(source_path)
++            _write_source(output_path)
++            with open(get_record_fullpath(output_path, IMAGES[0]), 'wb') as payload:
++                payload.write(b'pre-existing-output')
++            output_hash = _tree_hash(output_path)
++            with mock.patch('builtins.input', return_value='n'):
++                try:
++                    subset_kapture_from_dir(source_path, output_path)
++                except Exception:
++                    pass
++            self.assertEqual(output_hash, _tree_hash(output_path))
++
++            alias_path = path.join(source_path, '.')
++            with mock.patch('builtins.input', side_effect=AssertionError('must reject before deleting')):
++                with self.assertRaises(ValueError):
++                    subset_kapture_from_dir(source_path, alias_path, force=True)
++            self.assertEqual(source_hash, _tree_hash(source_path))
++
++            returned = subset_kapture_from_dir(
++                source_path, output_path, 20, 20, ['left'], force=True)
++            self.assertIsInstance(returned, kapture.Kapture)
++            reopened = kapture_from_dir(output_path)
++            self.assertEqual({(20, 'left')}, set(returned.records_camera.key_pairs()))
++            self.assertEqual({(20, 'left')}, set(reopened.records_camera.key_pairs()))
++
++    def test_directory_materialization_is_transactional(self):
++        self.require_api()
++        with tempfile.TemporaryDirectory() as tempdir:
++            source_path = path.join(tempdir, 'source')
++            fresh_output = path.join(tempdir, 'fresh-output')
++            existing_output = path.join(tempdir, 'existing-output')
++            _write_source(source_path)
++
++            missing_record = get_record_fullpath(source_path, 'lidar/20.bin')
++            os.remove(missing_record)
++            with self.assertRaises(FileNotFoundError):
++                subset_kapture_from_dir(
++                    source_path, fresh_output, 20, 20, image_ids=[IMAGES[1]])
++            self.assertFalse(path.lexists(fresh_output))
++
++            with open(missing_record, 'wb') as payload:
++                payload.write(b'payload:lidar/20.bin')
++            _write_source(existing_output, {(kapture.Keypoints, 'SIFT')})
++            sentinels = {
++                path.join(existing_output, 'keep.me'): b'unrelated-destination-data',
++                get_record_fullpath(existing_output, 'operator/record-note.keep'): b'record-sidecar',
++                path.join(existing_output, 'reconstruction', 'keypoints', 'SIFT',
++                          'operator', 'tar-note.keep'): b'tar-sidecar',
++                path.join(existing_output, 'reconstruction', 'descriptors', 'SIFT',
++                          'operator', 'descriptor-note.keep'): b'descriptor-sidecar',
++                path.join(existing_output, 'reconstruction', 'matches', 'SIFT',
++                          'operator', 'match-note.keep'): b'match-sidecar',
++            }
++            for sentinel_path, contents in sentinels.items():
++                os.makedirs(path.dirname(sentinel_path), exist_ok=True)
++                with open(sentinel_path, 'wb') as sentinel:
++                    sentinel.write(contents)
++            stale_payloads = {
++                get_record_fullpath(existing_output, IMAGES[0]),
++                kapture.io.features.get_features_fullpath(
++                    kapture.Descriptors, 'SIFT', existing_output, IMAGES[0], None),
++                kapture.io.features.get_matches_fullpath(
++                    (IMAGES[0], IMAGES[1]), 'SIFT', existing_output, None),
++                get_feature_tar_fullpath(kapture.Keypoints, 'SIFT', existing_output),
++            }
++            self.assertTrue(all(path.isfile(payload) for payload in stale_payloads))
++            output_hash = _tree_hash(existing_output)
++
++            descriptor_path = kapture.io.features.get_features_fullpath(
++                kapture.Descriptors, 'SIFT', source_path, IMAGES[1], None)
++            os.remove(descriptor_path)
++            os.mkdir(descriptor_path)
++            try:
++                subset_kapture_from_dir(
++                    source_path, existing_output, 20, 20,
++                    image_ids=[IMAGES[1]], force=True)
++            except Exception:
++                pass
++            else:
++                self.fail('a retained payload cannot be copied when its source file is absent')
++            self.assertEqual(output_hash, _tree_hash(existing_output))
++
++            os.rmdir(descriptor_path)
++            os.makedirs(path.dirname(descriptor_path), exist_ok=True)
++            _arrays()[kapture.Descriptors, 'SIFT', IMAGES[1]].tofile(descriptor_path)
++            subset_kapture_from_dir(
++                source_path, existing_output, 20, 20,
++                image_ids=[IMAGES[1]], force=True)
++            for sentinel_path, expected in sentinels.items():
++                with open(sentinel_path, 'rb') as sentinel:
++                    self.assertEqual(expected, sentinel.read(), sentinel_path)
++            for stale_payload in stale_payloads:
++                self.assertFalse(path.lexists(stale_payload), stale_payload)
++            reopened = kapture_from_dir(existing_output)
++            self.assertEqual({(20, 'left')}, set(reopened.records_camera.key_pairs()))
++
++    def test_cli_exposes_exact_callable_and_short_options(self):
++        self.require_api()
++        import tools.kapture_subset as subset_tool
++        self.assertTrue(callable(getattr(subset_tool, 'subset_command_line', None)))
++
++        project_root = path.dirname(path.dirname(path.abspath(__file__)))
++        with tempfile.TemporaryDirectory() as tempdir:
++            source_path = path.join(tempdir, 'source')
++            output_path = path.join(tempdir, 'output')
++            _write_source(source_path)
++            completed = subprocess.run(
++                [sys.executable, '-m', 'tools.kapture_subset', '-i', source_path, '-o', output_path,
++                 '--start-timestamp', '20', '--end-timestamp', '20', '--image', IMAGES[1]],
++                cwd=project_root, capture_output=True, text=True, check=False)
++            self.assertEqual(0, completed.returncode, completed.stderr)
++            reopened = kapture_from_dir(output_path)
++            self.assertEqual({(20, 'left')}, set(reopened.records_camera.key_pairs()))
++
++    def test_command_line_and_installed_entry_point(self):
++        self.require_api()
++        project_root = path.dirname(path.dirname(path.abspath(__file__)))
++        tool_path = path.join(project_root, 'tools', 'kapture_subset.py')
++        self.assertTrue(path.isfile(tool_path), 'tools/kapture_subset.py is missing')
++        with open(path.join(project_root, 'pyproject.toml'), 'rb') as source:
++            packaging = tomllib.load(source)
++        self.assertEqual('tools.kapture_subset:subset_command_line',
++                         packaging.get('project', {}).get('scripts', {}).get('kapture_subset'))
++
++        with tempfile.TemporaryDirectory() as install_tempdir:
++            wheel_dir = path.join(install_tempdir, 'dist')
++            install_dir = path.join(install_tempdir, 'install')
++            built = subprocess.run(
++                [sys.executable, '-m', 'build', '--wheel', '--no-isolation',
++                 '--outdir', wheel_dir],
++                cwd=project_root, capture_output=True, text=True, check=False)
++            self.assertEqual(0, built.returncode, built.stderr)
++            wheel = next(
++                path.join(wheel_dir, filename)
++                for filename in os.listdir(wheel_dir) if filename.endswith('.whl'))
++            installed = subprocess.run(
++                [sys.executable, '-m', 'pip', 'install', '--no-deps',
++                 '--target', install_dir, wheel],
++                cwd=install_tempdir, capture_output=True, text=True, check=False)
++            self.assertEqual(0, installed.returncode, installed.stderr)
++            installed_env = os.environ.copy()
++            installed_env['PYTHONPATH'] = install_dir
++            installed_command = path.join(install_dir, 'bin', 'kapture_subset')
++            completed = subprocess.run(
++                [installed_command, '--help'], cwd=install_tempdir,
++                env=installed_env, capture_output=True, text=True, check=False)
++            self.assertEqual(0, completed.returncode, completed.stderr)
++
++        with tempfile.TemporaryDirectory() as tempdir:
++            source_path = path.join(tempdir, 'source')
++            output_path = path.join(tempdir, 'output')
++            _write_source(source_path)
++            completed = subprocess.run(
++                [sys.executable, '-m', 'tools.kapture_subset', '--input', source_path, '--output', output_path,
++                 '--start-timestamp', '20', '--end-timestamp', '30',
++                 '--sensor', 'right', '--sensor', 'depth',
++                 '--image', IMAGES[2], '--image', IMAGES[3]],
++                cwd=project_root, capture_output=True, text=True, check=False)
++            self.assertEqual(0, completed.returncode, completed.stderr)
++            reopened = kapture_from_dir(output_path)
++            self.assertEqual({(20, 'right'), (30, 'right')}, set(reopened.records_camera.key_pairs()))
++            self.assertEqual({(20, 'depth')}, set(reopened.records_depth.key_pairs()))
++            self.assertEqual({(IMAGES[2], IMAGES[3])}, set(reopened.matches['SIFT']))
++
++            replaced = subprocess.run(
++                [sys.executable, '-m', 'tools.kapture_subset', '--input', source_path, '--output', output_path,
++                 '--start-timestamp', '20', '--end-timestamp', '20', '--sensor', 'left', '--force'],
++                cwd=project_root, capture_output=True, text=True, check=False)
++            self.assertEqual(0, replaced.returncode, replaced.stderr)
++            reopened = kapture_from_dir(output_path)
+

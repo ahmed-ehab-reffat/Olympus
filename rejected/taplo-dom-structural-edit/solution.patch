@@ -1,0 +1,416 @@
+diff --git a/crates/taplo-lsp/src/diagnostics.rs b/crates/taplo-lsp/src/diagnostics.rs
+index 9d9765d..3ef38b3 100644
+--- a/crates/taplo-lsp/src/diagnostics.rs
++++ b/crates/taplo-lsp/src/diagnostics.rs
+@@ -268,7 +268,11 @@ fn collect_dom_errors(
+                     });
+                 }
+                 taplo::dom::Error::InvalidEscapeSequence { string: _ }
+-                | taplo::dom::Error::Query(_) => {}
++                | taplo::dom::Error::Query(_)
++                | taplo::dom::Error::DuplicateKey { .. }
++                | taplo::dom::Error::IndexOutOfBounds { .. }
++                | taplo::dom::Error::PseudoTableUnsupported
++                | taplo::dom::Error::ExpectedInlineCollection => {}
+                 taplo::dom::Error::UnexpectedSyntax { syntax } => {
+                     tracing::error!("unexpected syntax in dom: {syntax:#?}");
+                 }
+diff --git a/crates/taplo/src/dom/error.rs b/crates/taplo/src/dom/error.rs
+index 1d38e5f..b92ee54 100644
+--- a/crates/taplo/src/dom/error.rs
++++ b/crates/taplo/src/dom/error.rs
+@@ -1,5 +1,6 @@
+ use super::node::Key;
+ use crate::syntax::SyntaxElement;
++use std::sync::Arc;
+ use thiserror::Error;
+ 
+ #[derive(Debug, Clone, Error)]
+@@ -17,6 +18,14 @@ pub enum Error {
+         not_array_of_tables: Key,
+         required_by: Key,
+     },
++    #[error("an entry with key `{key}` already exists")]
++    DuplicateKey { key: Arc<str> },
++    #[error("index {index} is out of bounds for a collection of length {len}")]
++    IndexOutOfBounds { index: usize, len: usize },
++    #[error("the key does not address a single `key = value` entry (dotted-key table or header-declared table)")]
++    PseudoTableUnsupported,
++    #[error("expected an inline table or inline array")]
++    ExpectedInlineCollection,
+     #[error("{0}")]
+     Query(#[from] QueryError),
+ }
+diff --git a/crates/taplo/src/dom/rewrite.rs b/crates/taplo/src/dom/rewrite.rs
+index df39d4c..f63acc7 100644
+--- a/crates/taplo/src/dom/rewrite.rs
++++ b/crates/taplo/src/dom/rewrite.rs
+@@ -1,12 +1,14 @@
+ use super::{
+-    node::{DomNode, Node},
++    node::{ArrayKind, DomNode, Node, TableKind},
+     Keys,
+ };
+ use crate::{dom, syntax::SyntaxKind};
+-use rowan::TextRange;
++use rowan::{TextRange, TextSize};
+ use std::{ops::Range, sync::Arc};
+ use thiserror::Error;
+ 
++use crate::syntax::SyntaxElement;
++
+ #[derive(Debug)]
+ pub struct Rewrite {
+     root: Node,
+@@ -48,6 +50,40 @@ impl Rewrite {
+                     }
+                 }
+             }
++            Patch::InsertEntry { table, key, value } => {
++                let (offset, text) = self.entry_insertion(&table, &key, &value)?;
++                let range = TextRange::empty(TextSize::from(offset as u32));
++                self.check_overlap(range)?;
++                self.patches.push(PendingPatch {
++                    range,
++                    kind: PendingPatchKind::Replace(text.into()),
++                })
++            }
++            Patch::RemoveEntry { key } => {
++                let range = self.entry_removal_range(&key)?;
++                self.check_overlap(range)?;
++                self.patches.push(PendingPatch {
++                    range,
++                    kind: PendingPatchKind::Replace(Arc::from("")),
++                })
++            }
++            Patch::InsertArrayValue { array, value } => {
++                let (offset, text) = self.array_insertion(&array, &value)?;
++                let range = TextRange::empty(TextSize::from(offset as u32));
++                self.check_overlap(range)?;
++                self.patches.push(PendingPatch {
++                    range,
++                    kind: PendingPatchKind::Replace(text.into()),
++                })
++            }
++            Patch::RemoveArrayValue { array, index } => {
++                let range = self.array_value_removal_range(&array, index)?;
++                self.check_overlap(range)?;
++                self.patches.push(PendingPatch {
++                    range,
++                    kind: PendingPatchKind::Replace(Arc::from("")),
++                })
++            }
+         }
+ 
+         self.patches
+@@ -82,6 +118,282 @@ impl Rewrite {
+             to: to.into(),
+         })
+     }
++
++    pub fn insert_entry(&mut self, table: &str, key: &str, value: &str) -> Result<&mut Self, Error> {
++        self.add(Patch::InsertEntry {
++            table: table.into(),
++            key: key.into(),
++            value: value.into(),
++        })
++    }
++
++    pub fn remove_entry(&mut self, key: &str) -> Result<&mut Self, Error> {
++        self.add(Patch::RemoveEntry { key: key.into() })
++    }
++
++    pub fn insert_array_value(&mut self, array: &str, value: &str) -> Result<&mut Self, Error> {
++        self.add(Patch::InsertArrayValue {
++            array: array.into(),
++            value: value.into(),
++        })
++    }
++
++    pub fn remove_array_value(&mut self, array: &str, index: usize) -> Result<&mut Self, Error> {
++        self.add(Patch::RemoveArrayValue {
++            array: array.into(),
++            index,
++        })
++    }
++}
++
++impl Rewrite {
++    fn resolve_table(&self, table: &str) -> Result<Node, Error> {
++        if table.is_empty() {
++            return Ok(self.root.clone());
++        }
++
++        let keys = table.parse::<Keys>()?;
++        self.root
++            .find_all_matches(keys, false)?
++            .map(|(_, node)| node)
++            .next()
++            .ok_or_else(|| Error::Dom(dom::error::QueryError::NotFound.into()))
++    }
++
++    fn resolve_array(&self, array: &str) -> Result<Node, Error> {
++        let keys = array.parse::<Keys>()?;
++        self.root
++            .find_all_matches(keys, false)?
++            .map(|(_, node)| node)
++            .next()
++            .ok_or_else(|| Error::Dom(dom::error::QueryError::NotFound.into()))
++    }
++
++    fn entry_insertion(&self, table: &str, key: &str, value: &str) -> Result<(usize, String), Error> {
++        let target = self.resolve_table(table)?;
++        let table_node = target.as_table().ok_or(Error::ExpectedTable)?;
++
++        if table_node.get(key).is_some() {
++            return Err(Error::Dom(dom::error::Error::DuplicateKey {
++                key: Arc::from(key),
++            }));
++        }
++
++        match table_node.kind() {
++            TableKind::Pseudo => Err(Error::Dom(dom::error::Error::PseudoTableUnsupported)),
++            TableKind::Inline => {
++                let syntax = table_node.syntax().ok_or(Error::ExpectedTable)?;
++                let has_entries = !table_node.entries().read().is_empty();
++                append_into_bracketed(syntax, has_entries, &format!("{key} = {value}"))
++            }
++            TableKind::Regular => {
++                let anchor = self.regular_table_anchor(table_node.syntax().ok_or(Error::ExpectedTable)?);
++                let text = if anchor == 0 {
++                    format!("{key} = {value}\n")
++                } else {
++                    format!("\n{key} = {value}")
++                };
++                Ok((anchor, text))
++            }
++        }
++    }
++
++    fn regular_table_anchor(&self, syntax: &SyntaxElement) -> usize {
++        if syntax.kind() == SyntaxKind::ROOT {
++            let mut anchor = 0usize;
++            let mut cursor = syntax.as_node().and_then(|n| n.first_child_or_token());
++
++            while let Some(elem) = cursor {
++                match elem.kind() {
++                    SyntaxKind::ENTRY => {
++                        anchor = usize::from(elem.text_range().end());
++                        cursor = elem.next_sibling_or_token();
++                    }
++                    SyntaxKind::TABLE_HEADER | SyntaxKind::TABLE_ARRAY_HEADER => break,
++                    _ => cursor = elem.next_sibling_or_token(),
++                }
++            }
++
++            anchor
++        } else {
++            let mut anchor = usize::from(syntax.text_range().end());
++            let mut cursor = syntax.next_sibling_or_token();
++
++            while let Some(elem) = cursor {
++                match elem.kind() {
++                    SyntaxKind::ENTRY => {
++                        anchor = usize::from(elem.text_range().end());
++                        cursor = elem.next_sibling_or_token();
++                    }
++                    SyntaxKind::TABLE_HEADER | SyntaxKind::TABLE_ARRAY_HEADER => break,
++                    _ => cursor = elem.next_sibling_or_token(),
++                }
++            }
++
++            anchor
++        }
++    }
++
++    fn entry_removal_range(&self, key: &str) -> Result<TextRange, Error> {
++        let keys = key.parse::<Keys>()?;
++        let (_, node) = self
++            .root
++            .find_all_matches(keys, false)?
++            .next()
++            .ok_or_else(|| Error::Dom(dom::error::QueryError::NotFound.into()))?;
++
++        if let Node::Table(t) = &node {
++            if t.kind() == TableKind::Pseudo {
++                return Err(Error::Dom(dom::error::Error::PseudoTableUnsupported));
++            }
++        }
++
++        let syntax = node.syntax().ok_or(Error::ExpectedTable)?;
++        let entry = find_entry_ancestor(syntax)
++            .ok_or(Error::Dom(dom::error::Error::PseudoTableUnsupported))?;
++
++        let in_inline_table = entry
++            .parent()
++            .map(|p| p.kind() == SyntaxKind::INLINE_TABLE)
++            .unwrap_or(false);
++
++        if in_inline_table {
++            Ok(inline_member_removal_range(&entry))
++        } else {
++            Ok(line_removal_range(&entry))
++        }
++    }
++
++    fn array_insertion(&self, array: &str, value: &str) -> Result<(usize, String), Error> {
++        let target = self.resolve_array(array)?;
++        let arr = target
++            .as_array()
++            .ok_or(Error::Dom(dom::error::Error::ExpectedInlineCollection))?;
++
++        if arr.kind() != ArrayKind::Inline {
++            return Err(Error::Dom(dom::error::Error::ExpectedInlineCollection));
++        }
++
++        let syntax = arr.syntax().ok_or(Error::ExpectedTable)?;
++        let has_items = !arr.items().read().is_empty();
++        append_into_bracketed(syntax, has_items, value)
++    }
++
++    fn array_value_removal_range(&self, array: &str, index: usize) -> Result<TextRange, Error> {
++        let target = self.resolve_array(array)?;
++        let arr = target
++            .as_array()
++            .ok_or(Error::Dom(dom::error::Error::ExpectedInlineCollection))?;
++
++        if arr.kind() != ArrayKind::Inline {
++            return Err(Error::Dom(dom::error::Error::ExpectedInlineCollection));
++        }
++
++        let items = arr.items().read();
++        let len = items.len();
++        let item = items
++            .get(index)
++            .ok_or(Error::Dom(dom::error::Error::IndexOutOfBounds { index, len }))?;
++
++        let syntax = item.syntax().ok_or(Error::ExpectedTable)?;
++        let member = find_array_member(syntax).ok_or(Error::ExpectedTable)?;
++
++        Ok(inline_member_removal_range(&member))
++    }
++}
++
++fn append_into_bracketed(
++    syntax: &SyntaxElement,
++    has_existing: bool,
++    text: &str,
++) -> Result<(usize, String), Error> {
++    let node = syntax.as_node().ok_or(Error::ExpectedTable)?;
++    let close = node.last_child_or_token().ok_or(Error::ExpectedTable)?;
++    let offset = usize::from(close.text_range().start());
++    let prefix = if has_existing { ", " } else { "" };
++
++    Ok((offset, format!("{prefix}{text}")))
++}
++
++fn line_removal_range(entry: &SyntaxElement) -> TextRange {
++    let mut end = entry.text_range().end();
++
++    if let Some(next) = entry.next_sibling_or_token() {
++        if next.kind() == SyntaxKind::NEWLINE {
++            end = next.text_range().end();
++        }
++    }
++
++    TextRange::new(entry.text_range().start(), end)
++}
++
++fn inline_member_removal_range(member: &SyntaxElement) -> TextRange {
++    let start = member.text_range().start();
++    let end = member.text_range().end();
++
++    if let Some(next) = member.next_sibling_or_token() {
++        if next.kind() == SyntaxKind::COMMA {
++            let mut end = next.text_range().end();
++
++            if let Some(after_comma) = next.next_sibling_or_token() {
++                if after_comma.kind() == SyntaxKind::WHITESPACE {
++                    end = after_comma.text_range().end();
++                }
++            }
++
++            return TextRange::new(start, end);
++        }
++    }
++
++    if let Some(preceding_comma_start) = preceding_comma_start(member) {
++        return TextRange::new(preceding_comma_start, end);
++    }
++
++    TextRange::new(start, end)
++}
++
++fn preceding_comma_start(member: &SyntaxElement) -> Option<TextSize> {
++    let before = member.prev_sibling_or_token()?;
++
++    let comma = match before.kind() {
++        SyntaxKind::COMMA => before,
++        SyntaxKind::WHITESPACE => {
++            let before_ws = before.prev_sibling_or_token()?;
++            if before_ws.kind() != SyntaxKind::COMMA {
++                return None;
++            }
++            before_ws
++        }
++        _ => return None,
++    };
++
++    Some(comma.text_range().start())
++}
++
++fn find_entry_ancestor(value_syntax: &SyntaxElement) -> Option<SyntaxElement> {
++    let mut current = value_syntax.clone();
++
++    loop {
++        if current.kind() == SyntaxKind::ENTRY {
++            return Some(current);
++        }
++
++        current = current.parent()?.into();
++    }
++}
++
++fn find_array_member(item_syntax: &SyntaxElement) -> Option<SyntaxElement> {
++    let mut current = item_syntax.clone();
++
++    loop {
++        let parent = current.parent()?;
++
++        if parent.kind() == SyntaxKind::ARRAY {
++            return Some(current);
++        }
++
++        current = parent.into();
++    }
+ }
+ 
+ impl core::fmt::Display for Rewrite {
+@@ -102,7 +414,26 @@ impl core::fmt::Display for Rewrite {
+ 
+ #[derive(Debug)]
+ pub enum Patch {
+-    RenameKeys { key: Arc<str>, to: Arc<str> },
++    RenameKeys {
++        key: Arc<str>,
++        to: Arc<str>,
++    },
++    InsertEntry {
++        table: Arc<str>,
++        key: Arc<str>,
++        value: Arc<str>,
++    },
++    RemoveEntry {
++        key: Arc<str>,
++    },
++    InsertArrayValue {
++        array: Arc<str>,
++        value: Arc<str>,
++    },
++    RemoveArrayValue {
++        array: Arc<str>,
++        index: usize,
++    },
+ }
+ 
+ #[derive(Debug)]

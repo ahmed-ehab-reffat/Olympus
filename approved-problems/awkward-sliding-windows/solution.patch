@@ -1,0 +1,1109 @@
+diff --git a/docs/reference/toctree.txt b/docs/reference/toctree.txt
+index 4d166fd6..46c99364 100644
+--- a/docs/reference/toctree.txt
++++ b/docs/reference/toctree.txt
+@@ -96,6 +96,7 @@
+ 
+     generated/ak.zip
+     generated/ak.zip_no_broadcast
++    generated/ak.unwindows
+     generated/ak.unzip
+     generated/ak.merge_union_of_records
+     generated/ak.merge_option_of_records
+@@ -303,6 +304,7 @@
+     :caption: Manipulating type metadata
+ 
+     generated/ak.with_name
++    generated/ak.windows
+     generated/ak.with_field
+     generated/ak.without_field
+     generated/ak.with_parameter
+diff --git a/src/awkward/__init__.py b/src/awkward/__init__.py
+index c70c9f0e..de156998 100644
+--- a/src/awkward/__init__.py
++++ b/src/awkward/__init__.py
+@@ -20,6 +20,7 @@ from awkward import forms
+ from awkward import _do
+ from awkward import _slicing
+ from awkward import _broadcasting
++from awkward import _windowing
+ from awkward import _reducers
+ from awkward import _util
+ from awkward import _errors
+diff --git a/src/awkward/_do.py b/src/awkward/_do.py
+index e2ead191..3791f810 100644
+--- a/src/awkward/_do.py
++++ b/src/awkward/_do.py
+@@ -124,6 +124,21 @@ def local_index(layout: Content, axis: Integral):
+     return layout._local_index(axis, 1)
+ 
+ 
++def windows(
++    layout: Content,
++    size: Integral,
++    stride: Integral,
++    incomplete: str,
++    align: str,
++    axis: Integral,
++):
++    return layout._windows(size, stride, incomplete, align, axis, 1)
++
++
++def unwindows(layout: Content, stride: Integral, axis: Integral):
++    return layout._unwindows(stride, axis, 1)
++
++
+ def combinations(
+     layout: Content,
+     n: Integral,
+diff --git a/src/awkward/_windowing.py b/src/awkward/_windowing.py
+new file mode 100644
+index 00000000..1328b267
+--- /dev/null
++++ b/src/awkward/_windowing.py
+@@ -0,0 +1,277 @@
++# BSD 3-Clause License; see https://github.com/scikit-hep/awkward/blob/main/LICENSE
++
++from __future__ import annotations
++
++import awkward as ak
++from awkward._backends.backend import Backend
++from awkward._nplikes.numpy_like import NumpyMetadata
++from awkward._nplikes.shape import unknown_length
++from awkward._regularize import is_integer
++from awkward._typing import Any
++from awkward.index import Index64
++
++np = NumpyMetadata.instance()
++
++INCOMPLETE_CHOICES = ("drop", "keep", "pad")
++ALIGN_CHOICES = ("left", "right")
++
++
++def regularize_windows(size, stride, incomplete, align) -> tuple[int, int, str, str]:
++    if not is_integer(size):
++        raise TypeError(f"size must be an integer, not {size!r}")
++    if not is_integer(stride):
++        raise TypeError(f"stride must be an integer, not {stride!r}")
++    size = int(size)
++    stride = int(stride)
++    if size < 1:
++        raise ValueError(f"size must be at least 1, not {size}")
++    if stride < 1:
++        raise ValueError(f"stride must be at least 1, not {stride}")
++    if incomplete not in INCOMPLETE_CHOICES:
++        raise ValueError(
++            "incomplete must be 'drop', 'keep', or 'pad', not {!r}".format(incomplete)
++        )
++    if align not in ALIGN_CHOICES:
++        raise ValueError(f"align must be 'left' or 'right', not {align!r}")
++    return size, stride, incomplete, align
++
++
++def window_count(length: int, size: int, stride: int, incomplete: str) -> int:
++    if length == 0:
++        return 0
++    elif incomplete == "drop":
++        if length < size:
++            return 0
++        else:
++            return (length - size) // stride + 1
++    else:
++        return (length - 1) // stride + 1
++
++
++def padded_window(content, parameters, incomplete: str):
++    """The content and window parameters to use for one windowed dimension.
++
++    A string or bytestring cannot hold missing characters, so padding gives up that
++    tag, and its characters give up theirs with it; every other parameter moves to the
++    windows unchanged.
++    """
++    if incomplete != "pad" or not parameters:
++        return content, parameters
++    if parameters.get("__array__") not in ("string", "bytestring"):
++        return content, parameters
++
++    def without_array(existing):
++        remaining = {k: v for k, v in (existing or {}).items() if k != "__array__"}
++        return remaining or None
++
++    return content.copy(parameters=without_array(content._parameters)), without_array(
++        parameters
++    )
++
++
++def _unknown_windows(backend: Backend, content, size, incomplete, parameters):
++    nplike = backend.nplike
++    if incomplete == "keep":
++        inner = ak.contents.ListOffsetArray(
++            Index64(nplike.empty(unknown_length, dtype=np.int64), nplike=nplike),
++            content._carry(
++                Index64(nplike.empty(unknown_length, dtype=np.int64), nplike=nplike),
++                False,
++            ),
++            parameters=parameters,
++        )
++    else:
++        gathered = content._carry(
++            Index64(nplike.empty(unknown_length, dtype=np.int64), nplike=nplike), False
++        )
++        if incomplete == "pad":
++            gathered = ak.contents.IndexedOptionArray.simplified(
++                Index64(nplike.empty(unknown_length, dtype=np.int64), nplike=nplike),
++                gathered,
++            )
++        inner = ak.contents.RegularArray(
++            gathered, size, unknown_length, parameters=parameters
++        )
++    return (
++        Index64(nplike.empty(unknown_length, dtype=np.int64), nplike=nplike),
++        inner,
++    )
++
++
++def windows_of_offsets(
++    backend: Backend,
++    offsets: Index64,
++    content,
++    size: int,
++    stride: int,
++    incomplete: str,
++    align: str,
++    parameters: dict[str, Any] | None,
++):
++    """Builds the windows of every list described by `offsets` over `content`.
++
++    Returns the offsets of the outer (one entry per input list) dimension and the
++    contents of that dimension, which is one list per window.
++    """
++    nplike = backend.nplike
++
++    content, parameters = padded_window(content, parameters, incomplete)
++
++    if not nplike.known_data:
++        return _unknown_windows(backend, content, size, incomplete, parameters)
++
++    offsets_data = nplike.asarray(offsets.data, dtype=np.int64)
++    starts = offsets_data[:-1]
++    lengths = offsets_data[1:] - starts
++
++    if incomplete == "drop":
++        counts = nplike.where(
++            lengths < size,
++            nplike.zeros_like(lengths),
++            (lengths - size) // stride + 1,
++        )
++    else:
++        counts = nplike.where(
++            lengths == 0,
++            nplike.zeros_like(lengths),
++            (lengths - 1) // stride + 1,
++        )
++
++    outer_offsets = nplike.empty(offsets_data.shape[0], dtype=np.int64)
++    outer_offsets[0] = 0
++    outer_offsets[1:] = nplike.cumsum(counts)
++    num_windows = int(outer_offsets[-1])
++
++    within = nplike.arange(num_windows, dtype=np.int64) - nplike.repeat(
++        outer_offsets[:-1], counts
++    )
++    window_lengths = nplike.repeat(lengths, counts)
++    window_bases = nplike.repeat(starts, counts)
++
++    if align == "left":
++        window_starts = within * stride
++    else:
++        window_starts = (
++            window_lengths - (nplike.repeat(counts, counts) - 1 - within) * stride - size
++        )
++
++    if incomplete == "keep":
++        clipped_starts = nplike.maximum(window_starts, nplike.zeros_like(window_starts))
++        clipped_stops = nplike.minimum(window_starts + size, window_lengths)
++        kept = clipped_stops - clipped_starts
++
++        inner_offsets = nplike.empty(num_windows + 1, dtype=np.int64)
++        inner_offsets[0] = 0
++        inner_offsets[1:] = nplike.cumsum(kept)
++        total = int(inner_offsets[-1])
++
++        local = nplike.arange(total, dtype=np.int64) - nplike.repeat(
++            inner_offsets[:-1], kept
++        )
++        carry = nplike.repeat(window_bases + clipped_starts, kept) + local
++        inner = ak.contents.ListOffsetArray(
++            Index64(inner_offsets, nplike=nplike),
++            content._carry(Index64(carry, nplike=nplike), False),
++            parameters=parameters,
++        )
++    else:
++        local = nplike.arange(num_windows * size, dtype=np.int64) % size
++        positions = nplike.repeat(window_starts, size) + local
++        carry = nplike.repeat(window_bases, size) + positions
++
++        if incomplete == "pad":
++            inside = (positions >= 0) & (positions < nplike.repeat(window_lengths, size))
++            gathered = content._carry(Index64(carry[inside], nplike=nplike), False)
++            outindex = nplike.full(num_windows * size, -1, dtype=np.int64)
++            outindex[inside] = nplike.arange(
++                nplike.shape_item_as_index(gathered.length), dtype=np.int64
++            )
++            gathered = ak.contents.IndexedOptionArray.simplified(
++                Index64(outindex, nplike=nplike), gathered
++            )
++        else:
++            gathered = content._carry(Index64(carry, nplike=nplike), False)
++
++        inner = ak.contents.RegularArray(
++            gathered, size, num_windows, parameters=parameters
++        )
++
++    return Index64(outer_offsets, nplike=nplike), inner
++
++
++def regularize_unwindows(stride) -> int:
++    if not is_integer(stride):
++        raise TypeError(f"stride must be an integer, not {stride!r}")
++    stride = int(stride)
++    if stride < 1:
++        raise ValueError(f"stride must be at least 1, not {stride}")
++    return stride
++
++
++def _unknown_merge(backend: Backend, content):
++    nplike = backend.nplike
++    return (
++        Index64(nplike.empty(unknown_length, dtype=np.int64), nplike=nplike),
++        content._carry(
++            Index64(nplike.empty(unknown_length, dtype=np.int64), nplike=nplike), False
++        ),
++    )
++
++
++def merge_windows(
++    backend: Backend,
++    outer_offsets: Index64,
++    inner_offsets: Index64,
++    content,
++    stride: int,
++):
++    """Lays the windows described by `inner_offsets` back over one another.
++
++    Window `j` of a list sits `j * stride` elements along, and contributes only what
++    the window before it did not reach. Returns the offsets of the rebuilt lists and
++    their elements.
++    """
++    nplike = backend.nplike
++
++    if not nplike.known_data:
++        return _unknown_merge(backend, content)
++
++    outer_data = nplike.asarray(outer_offsets.data, dtype=np.int64)
++    inner_data = nplike.asarray(inner_offsets.data, dtype=np.int64)
++
++    counts = outer_data[1:] - outer_data[:-1]
++    starts = inner_data[:-1]
++    lengths = inner_data[1:] - starts
++    num_windows = starts.shape[0]
++
++    within = nplike.arange(num_windows, dtype=np.int64) - nplike.repeat(
++        outer_data[:-1], counts
++    )
++    placed = within * stride
++    ends = placed + lengths
++
++    previous_ends = nplike.empty(num_windows, dtype=np.int64)
++    if num_windows > 0:
++        previous_ends[0] = 0
++        previous_ends[1:] = ends[:-1]
++        previous_ends[within == 0] = 0
++
++    skipped = nplike.maximum(previous_ends - placed, nplike.zeros_like(placed))
++    taken = nplike.maximum(lengths - skipped, nplike.zeros_like(lengths))
++
++    window_offsets = nplike.empty(num_windows + 1, dtype=np.int64)
++    window_offsets[0] = 0
++    window_offsets[1:] = nplike.cumsum(taken)
++    total = int(window_offsets[-1])
++
++    local = nplike.arange(total, dtype=np.int64) - nplike.repeat(
++        window_offsets[:-1], taken
++    )
++    carry = nplike.repeat(starts + skipped, taken) + local
++
++    rebuilt_offsets = window_offsets[outer_data]
++
++    return (
++        Index64(rebuilt_offsets, nplike=nplike),
++        content._carry(Index64(carry, nplike=nplike), False),
++    )
+diff --git a/src/awkward/contents/bitmaskedarray.py b/src/awkward/contents/bitmaskedarray.py
+index cfc7a321..f69f1f6a 100644
+--- a/src/awkward/contents/bitmaskedarray.py
++++ b/src/awkward/contents/bitmaskedarray.py
+@@ -646,6 +646,14 @@ class BitMaskedArray(BitMaskedMeta[Content], Content):
+     def _local_index(self, axis, depth):
+         return self.to_ByteMaskedArray()._local_index(axis, depth)
+ 
++    def _windows(self, size, stride, incomplete, align, axis, depth):
++        return self.to_ByteMaskedArray()._windows(
++            size, stride, incomplete, align, axis, depth
++        )
++
++    def _unwindows(self, stride, axis, depth):
++        return self.to_ByteMaskedArray()._unwindows(stride, axis, depth)
++
+     def _numbers_to_type(self, name, including_unknown):
+         return self.to_ByteMaskedArray()._numbers_to_type(name, including_unknown)
+ 
+diff --git a/src/awkward/contents/bytemaskedarray.py b/src/awkward/contents/bytemaskedarray.py
+index d0e5a09e..e55c6dc0 100644
+--- a/src/awkward/contents/bytemaskedarray.py
++++ b/src/awkward/contents/bytemaskedarray.py
+@@ -794,6 +794,30 @@ class ByteMaskedArray(ByteMaskedMeta[Content], Content):
+                 outindex, out, parameters=self._parameters
+             )
+ 
++    def _windows(self, size, stride, incomplete, align, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self._windows_axis0(size, stride, incomplete, align)
++        else:
++            _, nextcarry, outindex = self._nextcarry_outindex()
++            next = self._content._carry(nextcarry, False)
++            out = next._windows(size, stride, incomplete, align, axis, depth)
++            return ak.contents.IndexedOptionArray.simplified(
++                outindex, out, parameters=self._parameters
++            )
++
++    def _unwindows(self, stride, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        _, nextcarry, outindex = self._nextcarry_outindex()
++        next = self._content._carry(nextcarry, False)
++        if posaxis is not None and posaxis + 1 == depth:
++            out = next._unwindows_axis0(stride)
++        else:
++            out = next._unwindows(stride, axis, depth)
++        return ak.contents.IndexedOptionArray.simplified(
++            outindex, out, parameters=self._parameters
++        )
++
+     def _numbers_to_type(self, name, including_unknown):
+         return ak.contents.ByteMaskedArray(
+             self._mask,
+diff --git a/src/awkward/contents/content.py b/src/awkward/contents/content.py
+index 99f7820d..535efe9c 100644
+--- a/src/awkward/contents/content.py
++++ b/src/awkward/contents/content.py
+@@ -887,6 +887,55 @@ class Content(Meta):
+     def _local_index(self, axis: int, depth: int):
+         raise NotImplementedError
+ 
++    def _windows_axis0(
++        self, size: int, stride: int, incomplete: str, align: str
++    ) -> Content:
++        nplike = self._backend.nplike
++        if nplike.known_data:
++            offsets = Index64(
++                nplike.asarray(
++                    [0, nplike.shape_item_as_index(self.length)], dtype=np.int64
++                ),
++                nplike=nplike,
++            )
++        else:
++            self._touch_shape(recursive=False)
++            offsets = Index64(nplike.empty(2, dtype=np.int64), nplike=nplike)
++        _, out = ak._windowing.windows_of_offsets(
++            self._backend, offsets, self, size, stride, incomplete, align, None
++        )
++        return out
++
++    def _windows(
++        self, size: int, stride: int, incomplete: str, align: str, axis: int, depth: int
++    ) -> Content:
++        raise NotImplementedError
++
++    def _unwindows_axis0(self, stride: int) -> Content:
++        nplike = self._backend.nplike
++        if nplike.known_data:
++            outer = Index64(
++                nplike.asarray(
++                    [0, nplike.shape_item_as_index(self.length)], dtype=np.int64
++                ),
++                nplike=nplike,
++            )
++        else:
++            self._touch_shape(recursive=False)
++            outer = Index64(nplike.empty(2, dtype=np.int64), nplike=nplike)
++        if not self.is_list:
++            raise ValueError(
++                "the windows to lay back over one another must be lists"
++            )
++        windows = self.to_ListOffsetArray64(True)
++        _, out = ak._windowing.merge_windows(
++            self._backend, outer, windows.offsets, windows.content, stride
++        )
++        return out
++
++    def _unwindows(self, stride: int, axis: int, depth: int) -> Content:
++        raise NotImplementedError
++
+     def _reduce_next(
+         self,
+         reducer: ak._reducers.Reducer,
+diff --git a/src/awkward/contents/emptyarray.py b/src/awkward/contents/emptyarray.py
+index d50d1985..40cded70 100644
+--- a/src/awkward/contents/emptyarray.py
++++ b/src/awkward/contents/emptyarray.py
+@@ -302,6 +302,18 @@ class EmptyArray(EmptyMeta, Content):
+         else:
+             raise AxisError(f"axis={axis} exceeds the depth of this array ({depth})")
+ 
++    def _windows(self, size, stride, incomplete, align, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self.to_NumpyArray(np.dtype(np.float64))._windows(
++                size, stride, incomplete, align, axis, depth
++            )
++        else:
++            raise AxisError(f"axis={axis} exceeds the depth of this array ({depth})")
++
++    def _unwindows(self, stride, axis, depth):
++        raise AxisError(f"axis={axis} exceeds the depth of this array ({depth})")
++
+     def _numbers_to_type(self, name, including_unknown):
+         if including_unknown:
+             return self.to_NumpyArray(ak.types.numpytype.primitive_to_dtype(name))
+diff --git a/src/awkward/contents/indexedarray.py b/src/awkward/contents/indexedarray.py
+index aeaf5d7e..0bca4bb8 100644
+--- a/src/awkward/contents/indexedarray.py
++++ b/src/awkward/contents/indexedarray.py
+@@ -743,6 +743,22 @@ class IndexedArray(IndexedMeta[Content], Content):
+         else:
+             return self.project()._local_index(axis, depth)
+ 
++    def _windows(self, size, stride, incomplete, align, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self._windows_axis0(size, stride, incomplete, align)
++        else:
++            return self.project()._windows(
++                size, stride, incomplete, align, axis, depth
++            )
++
++    def _unwindows(self, stride, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self.project()._unwindows_axis0(stride)
++        else:
++            return self.project()._unwindows(stride, axis, depth)
++
+     def _unique_index(self):
+         return ak.index.Index64(
+             self._backend.nplike.unique_values(self._index.data),
+diff --git a/src/awkward/contents/indexedoptionarray.py b/src/awkward/contents/indexedoptionarray.py
+index 11151a40..15d82568 100644
+--- a/src/awkward/contents/indexedoptionarray.py
++++ b/src/awkward/contents/indexedoptionarray.py
+@@ -919,6 +919,30 @@ class IndexedOptionArray(IndexedOptionMeta[Content], Content):
+             )
+             return out2
+ 
++    def _windows(self, size, stride, incomplete, align, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self._windows_axis0(size, stride, incomplete, align)
++        else:
++            _, nextcarry, outindex = self._nextcarry_outindex()
++            next = self._content._carry(nextcarry, False)
++            out = next._windows(size, stride, incomplete, align, axis, depth)
++            return ak.contents.IndexedOptionArray.simplified(
++                outindex, out, parameters=self._parameters
++            )
++
++    def _unwindows(self, stride, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        _, nextcarry, outindex = self._nextcarry_outindex()
++        next = self._content._carry(nextcarry, False)
++        if posaxis is not None and posaxis + 1 == depth:
++            out = next._unwindows_axis0(stride)
++        else:
++            out = next._unwindows(stride, axis, depth)
++        return ak.contents.IndexedOptionArray.simplified(
++            outindex, out, parameters=self._parameters
++        )
++
+     def _is_subrange_equal(self, starts, stops, length, sorted=True):
+         nextstarts = ak.index.Index64.empty(length, self._backend.nplike)
+         nextstops = ak.index.Index64.empty(length, self._backend.nplike)
+diff --git a/src/awkward/contents/listarray.py b/src/awkward/contents/listarray.py
+index 62658587..da6cb657 100644
+--- a/src/awkward/contents/listarray.py
++++ b/src/awkward/contents/listarray.py
+@@ -1316,6 +1316,38 @@ class ListArray(ListMeta[Content], Content):
+                 self._content._local_index(axis, depth + 1),
+             )
+ 
++    def _windows(self, size, stride, incomplete, align, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self._windows_axis0(size, stride, incomplete, align)
++        elif posaxis is not None and posaxis + 1 == depth + 1:
++            return self.to_ListOffsetArray64(True)._windows(
++                size, stride, incomplete, align, axis, depth
++            )
++        else:
++            return ListArray(
++                self._starts,
++                self._stops,
++                self._content._windows(
++                    size, stride, incomplete, align, axis, depth + 1
++                ),
++                parameters=self._parameters,
++            )
++
++    def _unwindows(self, stride, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self._unwindows_axis0(stride)
++        elif posaxis is not None and posaxis + 1 == depth + 1:
++            return self.to_ListOffsetArray64(True)._unwindows(stride, axis, depth)
++        else:
++            return ListArray(
++                self._starts,
++                self._stops,
++                self._content._unwindows(stride, axis, depth + 1),
++                parameters=self._parameters,
++            )
++
+     def _numbers_to_type(self, name, including_unknown):
+         return ak.contents.ListArray(
+             self._starts,
+diff --git a/src/awkward/contents/listoffsetarray.py b/src/awkward/contents/listoffsetarray.py
+index eed51860..68bf3967 100644
+--- a/src/awkward/contents/listoffsetarray.py
++++ b/src/awkward/contents/listoffsetarray.py
+@@ -696,6 +696,60 @@ class ListOffsetArray(ListOffsetMeta[Content], Content):
+                 self._offsets, self._content._local_index(axis, depth + 1)
+             )
+ 
++    def _windows(self, size, stride, incomplete, align, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self._windows_axis0(size, stride, incomplete, align)
++        elif posaxis is not None and posaxis + 1 == depth + 1:
++            offsets = self._compact_offsets64(True)
++            flat = self._broadcast_tooffsets64(offsets).content
++            outer_offsets, inner = ak._windowing.windows_of_offsets(
++                self._backend,
++                offsets,
++                flat,
++                size,
++                stride,
++                incomplete,
++                align,
++                self._parameters,
++            )
++            return ListOffsetArray(outer_offsets, inner)
++        else:
++            return ListOffsetArray(
++                self._offsets,
++                self._content._windows(
++                    size, stride, incomplete, align, axis, depth + 1
++                ),
++                parameters=self._parameters,
++            )
++
++    def _unwindows(self, stride, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self._unwindows_axis0(stride)
++        elif posaxis is not None and posaxis + 1 == depth + 1:
++            outer_offsets = self._compact_offsets64(True)
++            content = self._broadcast_tooffsets64(outer_offsets).content
++            if not content.is_list:
++                raise ValueError(
++                    "the windows to lay back over one another must be lists"
++                )
++            windows = content.to_ListOffsetArray64(True)
++            rebuilt_offsets, rebuilt = ak._windowing.merge_windows(
++                self._backend,
++                outer_offsets,
++                windows.offsets,
++                windows.content,
++                stride,
++            )
++            return ListOffsetArray(rebuilt_offsets, rebuilt, parameters=windows._parameters)
++        else:
++            return ListOffsetArray(
++                self._offsets,
++                self._content._unwindows(stride, axis, depth + 1),
++                parameters=self._parameters,
++            )
++
+     def _numbers_to_type(self, name, including_unknown):
+         return ak.contents.ListOffsetArray(
+             self._offsets,
+diff --git a/src/awkward/contents/numpyarray.py b/src/awkward/contents/numpyarray.py
+index 3fc0a6cb..67902eef 100644
+--- a/src/awkward/contents/numpyarray.py
++++ b/src/awkward/contents/numpyarray.py
+@@ -596,6 +596,26 @@ class NumpyArray(NumpyMeta, Content):
+         else:
+             return self.to_RegularArray()._local_index(axis, depth)
+ 
++    def _windows(self, size, stride, incomplete, align, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self._windows_axis0(size, stride, incomplete, align)
++        elif len(self.shape) <= 1:
++            raise AxisError(f"axis={axis} exceeds the depth of this array ({depth})")
++        else:
++            return self.to_RegularArray()._windows(
++                size, stride, incomplete, align, axis, depth
++            )
++
++    def _unwindows(self, stride, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self._unwindows_axis0(stride)
++        elif len(self.shape) <= 1:
++            raise AxisError(f"axis={axis} exceeds the depth of this array ({depth})")
++        else:
++            return self.to_RegularArray()._unwindows(stride, axis, depth)
++
+     def to_contiguous(self) -> Self:
+         if self.is_contiguous:
+             return self
+diff --git a/src/awkward/contents/recordarray.py b/src/awkward/contents/recordarray.py
+index 7ae0e24b..8389fccd 100644
+--- a/src/awkward/contents/recordarray.py
++++ b/src/awkward/contents/recordarray.py
+@@ -874,6 +874,38 @@ class RecordArray(RecordMeta[Content], Content):
+                 backend=self._backend,
+             )
+ 
++    def _windows(self, size, stride, incomplete, align, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self._windows_axis0(size, stride, incomplete, align)
++        else:
++            contents = [
++                content._windows(size, stride, incomplete, align, axis, depth)
++                for content in self._contents
++            ]
++            return RecordArray(
++                contents,
++                self._fields,
++                self.length,
++                parameters=self._parameters,
++                backend=self._backend,
++            )
++
++    def _unwindows(self, stride, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            raise AxisError("a record array has no windows to lay over one another")
++        contents = [
++            content._unwindows(stride, axis, depth) for content in self._contents
++        ]
++        return RecordArray(
++            contents,
++            self._fields,
++            self.length,
++            parameters=self._parameters,
++            backend=self._backend,
++        )
++
+     def _numbers_to_type(self, name, including_unknown):
+         contents = []
+         for x in self._contents:
+diff --git a/src/awkward/contents/regulararray.py b/src/awkward/contents/regulararray.py
+index 2d065022..6abb4bf9 100644
+--- a/src/awkward/contents/regulararray.py
++++ b/src/awkward/contents/regulararray.py
+@@ -878,6 +878,52 @@ class RegularArray(RegularMeta[Content], Content):
+                 self._content._local_index(axis, depth + 1), self._size, self.length
+             )
+ 
++    def _windows(self, size, stride, incomplete, align, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self._windows_axis0(size, stride, incomplete, align)
++        elif posaxis is not None and posaxis + 1 == depth + 1:
++            offsets = self._compact_offsets64(True)
++            flat = self._broadcast_tooffsets64(offsets).content
++            _, inner = ak._windowing.windows_of_offsets(
++                self._backend,
++                offsets,
++                flat,
++                size,
++                stride,
++                incomplete,
++                align,
++                self._parameters,
++            )
++            return RegularArray(
++                inner,
++                ak._windowing.window_count(self._size, size, stride, incomplete),
++                self.length,
++            )
++        else:
++            return RegularArray(
++                self._content._windows(
++                    size, stride, incomplete, align, axis, depth + 1
++                ),
++                self._size,
++                self.length,
++                parameters=self._parameters,
++            )
++
++    def _unwindows(self, stride, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self._unwindows_axis0(stride)
++        elif posaxis is not None and posaxis + 1 == depth + 1:
++            return self.to_ListOffsetArray64(True)._unwindows(stride, axis, depth)
++        else:
++            return RegularArray(
++                self._content._unwindows(stride, axis, depth + 1),
++                self._size,
++                self.length,
++                parameters=self._parameters,
++            )
++
+     def _numbers_to_type(self, name, including_unknown):
+         return ak.contents.RegularArray(
+             self._content._numbers_to_type(name, including_unknown),
+diff --git a/src/awkward/contents/unionarray.py b/src/awkward/contents/unionarray.py
+index b9cf1abb..2a693a17 100644
+--- a/src/awkward/contents/unionarray.py
++++ b/src/awkward/contents/unionarray.py
+@@ -1355,6 +1355,41 @@ class UnionArray(UnionMeta[Content], Content):
+                 parameters=self._parameters,
+             )
+ 
++    def _windows(self, size, stride, incomplete, align, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self._windows_axis0(size, stride, incomplete, align)
++        elif posaxis is None:
++            raise AxisError(
++                f"axis={axis} is ambiguous for a union of different depths"
++            )
++        else:
++            contents = [
++                content._windows(size, stride, incomplete, align, axis, depth)
++                for content in self._contents
++            ]
++            return UnionArray.simplified(
++                self._tags,
++                self._index,
++                contents,
++                parameters=self._parameters,
++            )
++
++    def _unwindows(self, stride, axis, depth):
++        if maybe_posaxis(self, axis, depth) is None:
++            raise AxisError(
++                f"axis={axis} is ambiguous for a union of different depths"
++            )
++        contents = [
++            content._unwindows(stride, axis, depth) for content in self._contents
++        ]
++        return UnionArray.simplified(
++            self._tags,
++            self._index,
++            contents,
++            parameters=self._parameters,
++        )
++
+     def _combinations(self, n, replacement, recordlookup, parameters, axis, depth):
+         posaxis = maybe_posaxis(self, axis, depth)
+         if posaxis is not None and posaxis + 1 == depth:
+diff --git a/src/awkward/contents/unmaskedarray.py b/src/awkward/contents/unmaskedarray.py
+index 7f3b1e2e..8b49e126 100644
+--- a/src/awkward/contents/unmaskedarray.py
++++ b/src/awkward/contents/unmaskedarray.py
+@@ -410,6 +410,22 @@ class UnmaskedArray(UnmaskedMeta[Content], Content):
+                 self._content._local_index(axis, depth), parameters=self._parameters
+             )
+ 
++    def _windows(self, size, stride, incomplete, align, axis, depth):
++        posaxis = maybe_posaxis(self, axis, depth)
++        if posaxis is not None and posaxis + 1 == depth:
++            return self._windows_axis0(size, stride, incomplete, align)
++        else:
++            return UnmaskedArray.simplified(
++                self._content._windows(size, stride, incomplete, align, axis, depth),
++                parameters=self._parameters,
++            )
++
++    def _unwindows(self, stride, axis, depth):
++        return UnmaskedArray.simplified(
++            self._content._unwindows(stride, axis, depth),
++            parameters=self._parameters,
++        )
++
+     def _numbers_to_type(self, name, including_unknown):
+         return ak.contents.UnmaskedArray(
+             self._content._numbers_to_type(name, including_unknown),
+diff --git a/src/awkward/operations/__init__.py b/src/awkward/operations/__init__.py
+index c2e87236..cdc75912 100644
+--- a/src/awkward/operations/__init__.py
++++ b/src/awkward/operations/__init__.py
+@@ -112,6 +112,7 @@ from awkward.operations.ak_to_torch import *
+ from awkward.operations.ak_transform import *
+ from awkward.operations.ak_type import *
+ from awkward.operations.ak_unflatten import *
++from awkward.operations.ak_unwindows import *
+ from awkward.operations.ak_unzip import *
+ from awkward.operations.ak_validity_error import *
+ from awkward.operations.ak_values_astype import *
+@@ -120,6 +121,7 @@ from awkward.operations.ak_where import *
+ from awkward.operations.ak_with_field import *
+ from awkward.operations.ak_with_name import *
+ from awkward.operations.ak_with_named_axis import *
++from awkward.operations.ak_windows import *
+ from awkward.operations.ak_with_parameter import *
+ from awkward.operations.ak_without_field import *
+ from awkward.operations.ak_without_named_axis import *
+diff --git a/src/awkward/operations/ak_unwindows.py b/src/awkward/operations/ak_unwindows.py
+new file mode 100644
+index 00000000..514c3704
+--- /dev/null
++++ b/src/awkward/operations/ak_unwindows.py
+@@ -0,0 +1,102 @@
++# BSD 3-Clause License; see https://github.com/scikit-hep/awkward/blob/main/LICENSE
++
++from __future__ import annotations
++
++import awkward as ak
++from awkward._dispatch import high_level_function
++from awkward._layout import HighLevelContext
++from awkward._namedaxis import (
++    _get_named_axis,
++    _named_axis_to_positional_axis,
++    _remove_named_axis,
++)
++from awkward._nplikes.numpy_like import NumpyMetadata
++from awkward._regularize import regularize_axis
++
++__all__ = ("unwindows",)
++
++np = NumpyMetadata.instance()
++
++
++@high_level_function()
++def unwindows(
++    array, *, stride=1, axis=-2, highlevel=True, behavior=None, attrs=None
++):
++    """Lays every list of windows back over one another, undoing #ak.windows.
++
++    Args:
++        array: Array-like data (anything #ak.to_layout recognizes).
++        stride (int): Distance between the starts of consecutive windows; at
++            least 1.
++        axis (int or str): The dimension holding the windows, the one that
++            #ak.windows was applied at. The outermost dimension is `0`, followed
++            by `1`, etc., and negative values count backward from the innermost:
++            `-1` is the innermost dimension, `-2` is the next level up, etc.
++            If a str, it is interpreted as the name of the axis which maps
++            to an int if named axes are present. Named axes are attached
++            to an array using #ak.with_named_axis and removed with
++            #ak.without_named_axis; also see the
++            [Named axes user guide](../../user-guide/how-to-array-properties-named-axis.html).
++        highlevel (bool): If True, return an #ak.Array; otherwise, return
++            a low-level #ak.contents.Content subclass.
++        behavior (None or dict): Custom #ak.behavior for the output array, if
++            high-level.
++        attrs (None or dict): Custom attributes for the output array, if
++            high-level.
++
++    Returns:
++        An array with one fewer dimension than `array`, in which every list of
++        windows has become a single list.
++
++    Overlapping windows are laid back over one another:
++
++        >>> windows = ak.Array([[[1, 2, 3], [2, 3, 4], [3, 4, 5]], [[6, 7], [7, 8]]])
++        >>> ak.unwindows(windows).to_list()
++        [[1, 2, 3, 4, 5], [6, 7, 8]]
++
++    Two elements apart, the windows of the first list no longer overlap at all:
++
++        >>> ak.unwindows(windows, stride=3).to_list()
++        [[1, 2, 3, 2, 3, 4, 3, 4, 5], [6, 7, 7, 8]]
++
++    It recovers the lists that #ak.windows was given, as long as the windows
++    that ran off the end were kept:
++
++        >>> array = ak.Array([[1, 2, 3, 4], [5, 6], []])
++        >>> ak.unwindows(ak.windows(array, 3, incomplete="keep")).to_list()
++        [[1, 2, 3, 4], [5, 6], []]
++    """
++    # Dispatch
++    yield (array,)
++
++    # Implementation
++    return _impl(array, stride, axis, highlevel, behavior, attrs)
++
++
++def _impl(array, stride, axis, highlevel, behavior, attrs):
++    stride = ak._windowing.regularize_unwindows(stride)
++
++    with HighLevelContext(behavior=behavior, attrs=attrs) as ctx:
++        layout = ctx.unwrap(array, allow_record=False, primitive_policy="error")
++
++    named_axis = _get_named_axis(ctx)
++    axis = _named_axis_to_positional_axis(named_axis, axis)
++    axis = regularize_axis(axis, none_allowed=False)
++
++    out_named_axis = _remove_named_axis(
++        named_axis=named_axis,
++        axis=axis,
++        total=layout.minmax_depth[1],
++    )
++
++    out = ak._do.unwindows(layout, stride, axis)
++
++    wrapped_out = ctx.wrap(out, highlevel=highlevel)
++
++    return ak.operations.ak_with_named_axis._impl(
++        wrapped_out,
++        named_axis=out_named_axis,
++        highlevel=highlevel,
++        behavior=ctx.behavior,
++        attrs=ctx.attrs,
++    )
+diff --git a/src/awkward/operations/ak_windows.py b/src/awkward/operations/ak_windows.py
+new file mode 100644
+index 00000000..0365f916
+--- /dev/null
++++ b/src/awkward/operations/ak_windows.py
+@@ -0,0 +1,123 @@
++# BSD 3-Clause License; see https://github.com/scikit-hep/awkward/blob/main/LICENSE
++
++from __future__ import annotations
++
++import awkward as ak
++from awkward._dispatch import high_level_function
++from awkward._layout import HighLevelContext
++from awkward._namedaxis import (
++    _add_named_axis,
++    _get_named_axis,
++    _named_axis_to_positional_axis,
++)
++from awkward._nplikes.numpy_like import NumpyMetadata
++from awkward._regularize import regularize_axis
++
++__all__ = ("windows",)
++
++np = NumpyMetadata.instance()
++
++
++@high_level_function()
++def windows(
++    array,
++    size,
++    *,
++    stride=1,
++    incomplete="drop",
++    align="left",
++    axis=-1,
++    highlevel=True,
++    behavior=None,
++    attrs=None,
++):
++    """Replaces every list at an axis with the list of its sliding windows.
++
++    Args:
++        array: Array-like data (anything #ak.to_layout recognizes).
++        size (int): Number of elements in a complete window; at least 1.
++        stride (int): Distance between the starts of consecutive windows; at
++            least 1.
++        incomplete (str): `"drop"` to emit only windows that fit entirely in
++            their list, `"keep"` to emit truncated windows as well, or `"pad"`
++            to fill those windows out to `size` with None.
++        align (str): `"left"` to lay windows out from the start of each list,
++            `"right"` to lay them out from its end.
++        axis (int or str): The dimension at which this operation is applied. The
++            outermost dimension is `0`, followed by `1`, etc., and negative
++            values count backward from the innermost: `-1` is the innermost
++            dimension, `-2` is the next level up, etc.
++            If a str, it is interpreted as the name of the axis which maps
++            to an int if named axes are present. Named axes are attached
++            to an array using #ak.with_named_axis and removed with
++            #ak.without_named_axis; also see the
++            [Named axes user guide](../../user-guide/how-to-array-properties-named-axis.html).
++        highlevel (bool): If True, return an #ak.Array; otherwise, return
++            a low-level #ak.contents.Content subclass.
++        behavior (None or dict): Custom #ak.behavior for the output array, if
++            high-level.
++        attrs (None or dict): Custom attributes for the output array, if
++            high-level.
++
++    Returns:
++        An array with one more dimension than `array`, in which every list at
++        `axis` has become a list of windows.
++
++    Windows of three consecutive elements, one element apart:
++
++        >>> array = ak.Array([[1, 2, 3, 4], [5, 6], []])
++        >>> ak.windows(array, 3)
++        <Array [[[1, 2, 3], [2, 3, 4]], [], []] type='3 * var * 3 * int64'>
++
++    A list shorter than `size` contributes no window, unless the truncated
++    windows are asked for:
++
++        >>> ak.windows(array, 3, incomplete="keep")
++        <Array [[[1, 2, 3], [...], [3, 4], [4]], [[5, 6], [6]], []] type='3 * va...'>
++        >>> ak.windows(array, 3, incomplete="pad").to_list()
++        [[[1, 2, 3], [2, 3, 4], [3, 4, None], [4, None, None]],
++         [[5, 6, None], [6, None, None]],
++         []]
++
++    Right-aligned windows are laid out from the end of each list, so the
++    truncated window is the first one rather than the last:
++
++        >>> ak.windows(array, 3, stride=2, align="right", incomplete="keep").to_list()
++        [[[2, 3, 4]], [[5, 6]], []]
++    """
++    # Dispatch
++    yield (array,)
++
++    # Implementation
++    return _impl(
++        array, size, stride, incomplete, align, axis, highlevel, behavior, attrs
++    )
++
++
++def _impl(array, size, stride, incomplete, align, axis, highlevel, behavior, attrs):
++    size, stride, incomplete, align = ak._windowing.regularize_windows(
++        size, stride, incomplete, align
++    )
++
++    with HighLevelContext(behavior=behavior, attrs=attrs) as ctx:
++        layout = ctx.unwrap(array, allow_record=False, primitive_policy="error")
++
++    named_axis = _get_named_axis(ctx)
++    axis = _named_axis_to_positional_axis(named_axis, axis)
++    axis = regularize_axis(axis, none_allowed=False)
++
++    out_named_axis = _add_named_axis(
++        named_axis, (axis + 1) if axis >= 0 else axis, layout.minmax_depth[1]
++    )
++
++    out = ak._do.windows(layout, size, stride, incomplete, align, axis)
++
++    wrapped_out = ctx.wrap(out, highlevel=highlevel)
++
++    return ak.operations.ak_with_named_axis._impl(
++        wrapped_out,
++        named_axis=out_named_axis,
++        highlevel=highlevel,
++        behavior=ctx.behavior,
++        attrs=ctx.attrs,
++    )

@@ -1,0 +1,239 @@
+diff --git a/src/rust/iced-x86/src/block_enc/block.rs b/src/rust/iced-x86/src/block_enc/block.rs
+index 7276430..042483e 100644
+--- a/src/rust/iced-x86/src/block_enc/block.rs
++++ b/src/rust/iced-x86/src/block_enc/block.rs
+@@ -12,6 +12,7 @@ pub(super) struct Block {
+ 	pub(super) rip: u64,
+ 	reloc_infos: Option<Vec<RelocInfo>>,
+ 	data_vec: Vec<Rc<RefCell<BlockData>>>,
++	pointer_data_by_key: Vec<(TargetKey, Rc<RefCell<BlockData>>)>,
+ 	alignment: u64,
+ 	valid_data: Vec<Rc<RefCell<BlockData>>>,
+ 	valid_data_address: u64,
+@@ -27,6 +28,7 @@ impl Block {
+ 			rip,
+ 			reloc_infos,
+ 			data_vec: Vec::new(),
++			pointer_data_by_key: Vec::new(),
+ 			alignment: bitness as u64 / 8,
+ 			valid_data: Vec::new(),
+ 			valid_data_address: 0,
+@@ -39,10 +41,41 @@ impl Block {
+ 		self.instr_indexes.0 <= instr_index && instr_index < self.instr_indexes.1
+ 	}
+ 
+-	pub(super) fn alloc_pointer_location(&mut self) -> Rc<RefCell<BlockData>> {
+-		let data = Rc::new(RefCell::new(BlockData { data: 0, address: 0, address_initd: false, is_valid: true }));
+-		self.data_vec.push(data.clone());
+-		data
++	// Long-form branches that resolve to the same final target (whether that target is another
++	// instruction being relocated in this call, or a fixed external address) share one pointer
++	// data slot instead of each getting their own. `target` identifies the caller's resolved
++	// target so a repeat request for the same target reuses the existing slot.
++	pub(super) fn alloc_pointer_location(&mut self, target: &TargetInstr) -> Rc<RefCell<BlockData>> {
++		if let Some(key) = target.dedup_key() {
++			if let Some((_, data)) = self.pointer_data_by_key.iter().find(|(k, _)| *k == key) {
++				data.borrow_mut().sharer_count += 1;
++				return data.clone();
++			}
++			let data = Self::new_pointer_data();
++			self.data_vec.push(data.clone());
++			self.pointer_data_by_key.push((key, data.clone()));
++			data
++		} else {
++			let data = Self::new_pointer_data();
++			self.data_vec.push(data.clone());
++			data
++		}
++	}
++
++	fn new_pointer_data() -> Rc<RefCell<BlockData>> {
++		Rc::new(RefCell::new(BlockData { data: 0, address: 0, address_initd: false, is_valid: true, sharer_count: 1 }))
++	}
++
++	// Releases one sharer's claim on a pointer data slot. A shared slot is only removed from the
++	// output once every branch that was assigned to it has released its claim; while at least one
++	// sharer still needs it, it stays valid.
++	pub(super) fn release_pointer_location(&self, data: &Rc<RefCell<BlockData>>) {
++		let mut data = data.borrow_mut();
++		debug_assert!(data.sharer_count > 0);
++		data.sharer_count -= 1;
++		if data.sharer_count == 0 {
++			data.is_valid = false;
++		}
+ 	}
+ 
+ 	pub(super) fn initialize_data(&mut self, base_addr: u64) {
+@@ -113,6 +146,7 @@ impl Block {
+ 
+ 	pub(super) fn dispose(&mut self) {
+ 		self.data_vec.clear();
++		self.pointer_data_by_key.clear();
+ 		self.valid_data.clear();
+ 	}
+ 
+@@ -132,6 +166,7 @@ pub(super) struct BlockData {
+ 	address: u64,
+ 	address_initd: bool,
+ 	pub(super) is_valid: bool,
++	sharer_count: u32,
+ }
+ 
+ impl BlockData {
+diff --git a/src/rust/iced-x86/src/block_enc/instr/call_instr.rs b/src/rust/iced-x86/src/block_enc/instr/call_instr.rs
+index a38bbfd..6e6c071 100644
+--- a/src/rust/iced-x86/src/block_enc/instr/call_instr.rs
++++ b/src/rust/iced-x86/src/block_enc/instr/call_instr.rs
+@@ -58,8 +58,8 @@ impl CallInstr {
+ 		}
+ 
+ 		if use_short {
+-			if let Some(ref pointer_data) = self.pointer_data {
+-				pointer_data.borrow_mut().is_valid = false;
++			if let Some(pointer_data) = self.pointer_data.take() {
++				ctx.block.release_pointer_location(&pointer_data);
+ 			}
+ 			base.size = self.orig_instruction_size as u32;
+ 			self.use_orig_instruction = true;
+@@ -68,7 +68,7 @@ impl CallInstr {
+ 		}
+ 
+ 		if self.pointer_data.is_none() {
+-			self.pointer_data = Some(ctx.block.alloc_pointer_location());
++			self.pointer_data = Some(ctx.block.alloc_pointer_location(&self.target_instr));
+ 		}
+ 		false
+ 	}
+diff --git a/src/rust/iced-x86/src/block_enc/instr/jcc_instr.rs b/src/rust/iced-x86/src/block_enc/instr/jcc_instr.rs
+index 3cc2ffe..38459b1 100644
+--- a/src/rust/iced-x86/src/block_enc/instr/jcc_instr.rs
++++ b/src/rust/iced-x86/src/block_enc/instr/jcc_instr.rs
+@@ -99,8 +99,8 @@ impl JccInstr {
+ 		let mut diff = target_address.wrapping_sub(next_rip) as i64;
+ 		diff = InstrUtils::convert_diff_to_bitness_diff(self.bitness, correct_diff(self.target_instr.is_in_block(ctx.block), diff, gained));
+ 		if i8::MIN as i64 <= diff && diff <= i8::MAX as i64 {
+-			if let Some(ref pointer_data) = self.pointer_data {
+-				pointer_data.borrow_mut().is_valid = false;
++			if let Some(pointer_data) = self.pointer_data.take() {
++				ctx.block.release_pointer_location(&pointer_data);
+ 			}
+ 			self.instr_kind = InstrKind::Short;
+ 			base.size = self.short_instruction_size as u32;
+@@ -118,8 +118,8 @@ impl JccInstr {
+ 			use_near = i32::MIN as i64 <= diff && diff <= i32::MAX as i64;
+ 		}
+ 		if use_near {
+-			if let Some(ref pointer_data) = self.pointer_data {
+-				pointer_data.borrow_mut().is_valid = false;
++			if let Some(pointer_data) = self.pointer_data.take() {
++				ctx.block.release_pointer_location(&pointer_data);
+ 			}
+ 			if diff < (IcedConstants::MAX_INSTRUCTION_LENGTH as i64) * (i8::MIN as i64)
+ 				|| diff > (IcedConstants::MAX_INSTRUCTION_LENGTH as i64) * (i8::MAX as i64)
+@@ -132,7 +132,7 @@ impl JccInstr {
+ 		}
+ 
+ 		if self.pointer_data.is_none() {
+-			self.pointer_data = Some(ctx.block.alloc_pointer_location());
++			self.pointer_data = Some(ctx.block.alloc_pointer_location(&self.target_instr));
+ 		}
+ 		self.instr_kind = InstrKind::Long;
+ 		false
+diff --git a/src/rust/iced-x86/src/block_enc/instr/jmp_instr.rs b/src/rust/iced-x86/src/block_enc/instr/jmp_instr.rs
+index 4dc9eb5..05da30c 100644
+--- a/src/rust/iced-x86/src/block_enc/instr/jmp_instr.rs
++++ b/src/rust/iced-x86/src/block_enc/instr/jmp_instr.rs
+@@ -79,8 +79,8 @@ impl JmpInstr {
+ 		let mut diff = target_address.wrapping_sub(next_rip) as i64;
+ 		diff = InstrUtils::convert_diff_to_bitness_diff(self.bitness, correct_diff(self.target_instr.is_in_block(ctx.block), diff, gained));
+ 		if i8::MIN as i64 <= diff && diff <= i8::MAX as i64 {
+-			if let Some(ref pointer_data) = self.pointer_data {
+-				pointer_data.borrow_mut().is_valid = false;
++			if let Some(pointer_data) = self.pointer_data.take() {
++				ctx.block.release_pointer_location(&pointer_data);
+ 			}
+ 			self.instr_kind = InstrKind::Short;
+ 			base.size = self.short_instruction_size as u32;
+@@ -98,8 +98,8 @@ impl JmpInstr {
+ 			use_near = i32::MIN as i64 <= diff && diff <= i32::MAX as i64;
+ 		}
+ 		if use_near {
+-			if let Some(ref pointer_data) = self.pointer_data {
+-				pointer_data.borrow_mut().is_valid = false;
++			if let Some(pointer_data) = self.pointer_data.take() {
++				ctx.block.release_pointer_location(&pointer_data);
+ 			}
+ 			if diff < (IcedConstants::MAX_INSTRUCTION_LENGTH as i64) * (i8::MIN as i64)
+ 				|| diff > (IcedConstants::MAX_INSTRUCTION_LENGTH as i64) * (i8::MAX as i64)
+@@ -112,7 +112,7 @@ impl JmpInstr {
+ 		}
+ 
+ 		if self.pointer_data.is_none() {
+-			self.pointer_data = Some(ctx.block.alloc_pointer_location());
++			self.pointer_data = Some(ctx.block.alloc_pointer_location(&self.target_instr));
+ 		}
+ 		self.instr_kind = InstrKind::Long;
+ 		false
+diff --git a/src/rust/iced-x86/src/block_enc/instr/mod.rs b/src/rust/iced-x86/src/block_enc/instr/mod.rs
+index caad388..995e6bd 100644
+--- a/src/rust/iced-x86/src/block_enc/instr/mod.rs
++++ b/src/rust/iced-x86/src/block_enc/instr/mod.rs
+@@ -109,6 +109,23 @@ impl TargetInstr {
+ 			TargetInstr::Uninitialized => unreachable!(),
+ 		}
+ 	}
++
++	// Identifies the final target a long-form branch resolves to, so that two branches sharing
++	// the same target can share one pointer data slot. `IsOwner` resolves to the encoding
++	// instruction's own (per-instruction) address, so it's never shareable between instructions.
++	pub(super) fn dedup_key(&self) -> Option<TargetKey> {
++		match self {
++			TargetInstr::Instruction(instr_index) => Some(TargetKey::Instr(*instr_index)),
++			TargetInstr::Address(address) => Some(TargetKey::Addr(*address)),
++			TargetInstr::IsOwner | TargetInstr::Uninitialized => None,
++		}
++	}
++}
++
++#[derive(Debug, Copy, Clone, Eq, PartialEq)]
++pub(super) enum TargetKey {
++	Instr(usize),
++	Addr(u64),
+ }
+ 
+ pub(super) struct InstrUtils;
+diff --git a/src/rust/iced-x86/src/block_enc/instr/simple_br_instr.rs b/src/rust/iced-x86/src/block_enc/instr/simple_br_instr.rs
+index e061d7f..0f51141 100644
+--- a/src/rust/iced-x86/src/block_enc/instr/simple_br_instr.rs
++++ b/src/rust/iced-x86/src/block_enc/instr/simple_br_instr.rs
+@@ -102,8 +102,8 @@ impl SimpleBranchInstr {
+ 		let mut diff = target_address.wrapping_sub(next_rip) as i64;
+ 		diff = InstrUtils::convert_diff_to_bitness_diff(self.bitness, correct_diff(self.target_instr.is_in_block(ctx.block), diff, gained));
+ 		if i8::MIN as i64 <= diff && diff <= i8::MAX as i64 {
+-			if let Some(ref pointer_data) = self.pointer_data {
+-				pointer_data.borrow_mut().is_valid = false;
++			if let Some(pointer_data) = self.pointer_data.take() {
++				ctx.block.release_pointer_location(&pointer_data);
+ 			}
+ 			self.instr_kind = InstrKind::Short;
+ 			base.size = self.short_instruction_size as u32;
+@@ -121,8 +121,8 @@ impl SimpleBranchInstr {
+ 			use_near = i32::MIN as i64 <= diff && diff <= i32::MAX as i64;
+ 		}
+ 		if use_near {
+-			if let Some(ref pointer_data) = self.pointer_data {
+-				pointer_data.borrow_mut().is_valid = false;
++			if let Some(pointer_data) = self.pointer_data.take() {
++				ctx.block.release_pointer_location(&pointer_data);
+ 			}
+ 			if diff < (IcedConstants::MAX_INSTRUCTION_LENGTH as i64) * (i8::MIN as i64)
+ 				|| diff > (IcedConstants::MAX_INSTRUCTION_LENGTH as i64) * (i8::MAX as i64)
+@@ -135,7 +135,7 @@ impl SimpleBranchInstr {
+ 		}
+ 
+ 		if self.pointer_data.is_none() {
+-			self.pointer_data = Some(ctx.block.alloc_pointer_location());
++			self.pointer_data = Some(ctx.block.alloc_pointer_location(&self.target_instr));
+ 		}
+ 		self.instr_kind = InstrKind::Long;
+ 		false

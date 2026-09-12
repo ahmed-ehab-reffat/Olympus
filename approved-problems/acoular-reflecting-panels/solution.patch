@@ -1,0 +1,1199 @@
+diff --git a/acoular/environments.py b/acoular/environments.py
+index 03aadf8..0e07e3c 100644
+--- a/acoular/environments.py
++++ b/acoular/environments.py
+@@ -24,6 +24,8 @@ Implements acoustic environments with and without flow.
+     Environment
+     UniformFlowEnvironment
+     GeneralFlowEnvironment
++    ReflectingPlane
++    ReflectiveEnvironment
+     FlowField
+     OpenJet
+     RotatingFlow
+@@ -37,7 +39,7 @@ Implements acoustic environments with and without flow.
+ from abc import abstractmethod
+ from warnings import warn as _warn
+ 
+-from .internal import digest, lazyjit
++from .internal import digest, ldigest, lazyjit
+ 
+ import numba as nb
+ import numpy as np
+@@ -53,14 +55,20 @@ from traits.api import (
+     HasStrictTraits,
+     Instance,
+     Int,
++    List,
+     Property,
++    Str,
+     Union,
+     cached_property,
++    observe,
+ )
+ 
+ f64ro = nb.types.Array(nb.types.float64, 2, 'C', readonly=True)
+ f32ro = nb.types.Array(nb.types.float32, 2, 'C', readonly=True)
+ 
++# tolerance for the geometric predicates of ReflectingPlane, in units of the panel edge lengths
++_REFLECTION_TOL = 1e-9
++
+ 
+ @lazyjit(nb.njit([(f64ro, f64ro), (f64ro, f32ro), (f32ro, f64ro), (f32ro, f32ro)], cache=True, fastmath=True))
+ def dist_mat(gpos, mpos):  # pragma: no cover
+@@ -169,6 +177,35 @@ def cylToCart(x, Q=None):  # noqa: N802, N803
+     return np.array([x[1] * np.sin(x[0]), x[1] * np.cos(x[0]), x[2]])
+ 
+ 
++def _check_index(index):
++    """Reject a path index that would wrap around the end of the sequence list."""
++    if index < 0:
++        msg = 'path indices must not be negative'
++        raise IndexError(msg)
++
++
++def _check_sequence(sequence):
++    """Reject a panel sequence that names a panel by a negative index."""
++    if any(index < 0 for index in sequence):
++        msg = 'panel indices must not be negative'
++        raise IndexError(msg)
++
++
++def _check_points(*arrays):
++    """Reject anything that is not a (3, N) coordinate array."""
++    for array in arrays:
++        if array.ndim != 2 or array.shape[0] != 3:
++            msg = 'coordinate arrays must be shaped (3, N)'
++            raise ValueError(msg)
++
++
++def _check_pairs(gpos, mpos):
++    """Reject matched-pair input whose two sides hold a different number of points."""
++    if gpos.shape[-1] != mpos.shape[-1]:
++        msg = 'paths_at needs one receiving point per emitting point'
++        raise ValueError(msg)
++
++
+ class Environment(HasStrictTraits):
+     """
+     A simple acoustic environment without flow.
+@@ -237,6 +274,181 @@ class Environment(HasStrictTraits):
+             rm = rm[:, 0]
+         return rm
+ 
++    def path_sequences(self):
++        """Return the propagation paths the environment provides.
++
++        Each entry is a tuple of indices into the reflecting planes of the environment, listing the
++        planes in the order a ray meets them. A plain :class:`Environment` offers the direct path
++        only, so the returned list holds the empty tuple alone.
++
++        Returns
++        -------
++        :class:`list` of :class:`tuple`
++            The path sequences, the direct path first.
++        """
++        return [()]
++
++    def _sequence_position(self, sequence):
++        if tuple(sequence):
++            msg = 'sequence is not one of the environment paths'
++            raise IndexError(msg)
++        return 0
++
++    def paths(self, gpos, mpos):
++        """Compute travel distance, amplitude factor and validity for every propagation path.
++
++        Parameters
++        ----------
++        gpos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the emitting points, shape ``(3, N)``.
++
++        mpos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the receiving points, shape ``(3, M)``.
++
++        Returns
++        -------
++        :class:`tuple` of :class:`numpy.ndarray`
++            Three arrays of shape ``(P, N, M)`` holding the travel distance along each path, the
++            amplitude factor collected along it, and whether the path exists.
++        """
++        _check_points(np.asarray(gpos), np.asarray(mpos))
++        rm = self.apparent_r(gpos, mpos).reshape((1, gpos.shape[-1], mpos.shape[-1]))
++        return rm, np.ones_like(rm), np.ones(rm.shape, dtype=bool)
++
++    def image(self, sequence, pos):
++        """Mirror positions about the panels of a path sequence.
++
++        Parameters
++        ----------
++        sequence : :class:`tuple` of :class:`int`
++            Panel indices in the order the ray meets them.
++
++        pos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates to mirror, shape ``(3, N)``.
++
++        Returns
++        -------
++        :class:`numpy.ndarray` of :class:`floats<float>`
++            The mirrored coordinates, shape ``(3, N)``. A plain :class:`Environment` has no panels
++            and returns them unchanged.
++        """
++        _check_sequence(sequence)
++        _check_points(np.asarray(pos))
++        if tuple(sequence):
++            msg = 'sequence is not one of the environment paths'
++            raise IndexError(msg)
++
++        return np.asarray(pos, dtype=np.float64)
++
++    def image_velocity(self, sequence, vec):
++        """Mirror direction vectors about the panels of a path sequence.
++
++        Unlike :meth:`image` this ignores the position of the panels, so a velocity keeps its
++        magnitude and only turns.
++
++        Parameters
++        ----------
++        sequence : :class:`tuple` of :class:`int`
++            Panel indices in the order the ray meets them.
++
++        vec : :class:`numpy.ndarray` of :class:`floats<float>`
++            The vectors to mirror, shape ``(3, N)``.
++
++        Returns
++        -------
++        :class:`numpy.ndarray` of :class:`floats<float>`
++            The mirrored vectors, shape ``(3, N)``.
++        """
++        _check_sequence(sequence)
++        _check_points(np.asarray(vec))
++        if tuple(sequence):
++            msg = 'sequence is not one of the environment paths'
++            raise IndexError(msg)
++
++        return np.asarray(vec, dtype=np.float64)
++
++    def paths_at(self, gpos, mpos):
++        """Compute the propagation paths of matched pairs of emitting and receiving points.
++
++        Unlike :meth:`paths`, which pairs every emitting point with every receiving point, this
++        evaluates the `N` pairs formed elementwise.
++
++        Parameters
++        ----------
++        gpos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the emitting points, shape ``(3, N)``.
++
++        mpos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the receiving points, shape ``(3, N)``.
++
++        Returns
++        -------
++        :class:`tuple` of :class:`numpy.ndarray`
++            Three arrays of shape ``(P, N)`` holding the travel distance along each path, the
++            amplitude factor collected along it, and whether the path exists.
++
++        Raises
++        ------
++        :obj:`ValueError`
++            If ``gpos`` and ``mpos`` do not hold the same number of points.
++        """
++        _check_points(np.asarray(gpos), np.asarray(mpos))
++        gpos = np.asarray(gpos, dtype=np.float64)
++        mpos = np.asarray(mpos, dtype=np.float64)
++        _check_pairs(gpos, mpos)
++        rm = self._pair_r(gpos, mpos)[np.newaxis]
++        return rm, np.ones_like(rm), np.ones(rm.shape, dtype=bool)
++
++    def _pair_r(self, gpos, mpos):
++        # pairwise counterpart of apparent_r, so that paths_at follows whatever an environment
++        # makes of the propagation between one emitting and one receiving point
++        offset = np.asarray(gpos, dtype=np.float64) - np.asarray(mpos, dtype=np.float64)
++        return np.sqrt(np.einsum('i...,i...->...', offset, offset))
++
++    def impulse_response(self, gpos, mpos, sample_freq, num_samples):
++        """Sample the impulse response between emitting and receiving points.
++
++        Every path that exists deposits its amplitude factor divided by its travel distance at the
++        delay it needs, split over the two neighbouring samples in proportion to the fractional
++        part of that delay. Contributions that would fall beyond the last sample are dropped, and a
++        path of zero length deposits nothing.
++
++        Parameters
++        ----------
++        gpos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the emitting points, shape ``(3, N)``.
++
++        mpos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the receiving points, shape ``(3, M)``.
++
++        sample_freq : :class:`float`
++            Sampling frequency of the response.
++
++        num_samples : :class:`int`
++            Number of samples of the response.
++
++        Returns
++        -------
++        :class:`numpy.ndarray` of :class:`floats<float>`
++            The sampled responses, shape ``(N, M, num_samples)``.
++        """
++        _check_points(np.asarray(gpos), np.asarray(mpos))
++        distance, amplitude, valid = self.paths(gpos, mpos)
++        valid = valid & (distance > 0.0)
++        response = np.zeros((*distance.shape[1:], num_samples))
++        delay = distance / self.c * sample_freq
++        first = np.floor(delay).astype(np.int64)
++        share = delay - first
++        with np.errstate(divide='ignore', invalid='ignore'):
++            weight = np.where(valid, amplitude / np.where(valid, distance, 1.0), 0.0)
++        for path in range(distance.shape[0]):
++            for offset, portion in ((0, 1.0 - share[path]), (1, share[path])):
++                target = first[path] + offset
++                hit = valid[path] & (target >= 0) & (target < num_samples)
++                rows, columns = np.nonzero(hit)
++                np.add.at(response, (rows, columns, target[hit]), (weight[path] * portion)[hit])
++        return response
++
+     def _r(self, gpos, mpos=0.0):
+         """Compute the apparent distances between two sets of points.
+ 
+@@ -332,6 +544,14 @@ class UniformFlowEnvironment(Environment):
+         return rm
+ 
+ 
++    def _pair_r(self, gpos, mpos):
++        fdv = self.fdv / np.sqrt((self.fdv * self.fdv).sum())
++        rmv = np.asarray(gpos, dtype=np.float64) - np.asarray(mpos, dtype=np.float64)
++        rm = np.sqrt(np.einsum('i...,i...->...', rmv, rmv))
++        macostheta = self.ma * np.einsum('i...,i->...', rmv, fdv) / rm
++        return rm / (-macostheta + np.sqrt(macostheta * macostheta - self.ma * self.ma + 1))
++
++
+ class FlowField(ABCHasStrictTraits):
+     """An abstract base class for a spatial flow field."""
+ 
+@@ -966,3 +1186,527 @@ class GeneralFlowEnvironment(Environment):
+         xyz = np.array(xyz)
+         t = np.array(t)
+         return LinearNDInterpolator(xyz, t)
++
++
++class ReflectingPlane(HasStrictTraits):
++    """
++    A flat rectangular panel that reflects sound specularly.
++
++    The panel is spanned by two perpendicular edges starting at a common corner. It reflects on both
++    of its faces and it is opaque, so it can also block a path that would otherwise cross it.
++
++    See Also
++    --------
++    :class:`~acoular.environments.ReflectiveEnvironment` : Propagation in the presence of panels.
++
++    Examples
++    --------
++    A one by one metre panel in the ground plane, mirroring a point one metre above it:
++
++    >>> import acoular as ac
++    >>> plane = ac.ReflectingPlane(corner=(-0.5, -0.5, 0.0), edge1=(1.0, 0.0, 0.0), edge2=(0.0, 1.0, 0.0))
++    >>> plane.normal
++    array([0., 0., 1.])
++    >>> plane.mirror([[0.0], [0.0], [1.0]])
++    array([[ 0.],
++           [ 0.],
++           [-1.]])
++    """
++
++    #: Coordinates ``(x, y, z)`` of one corner of the panel. Default is ``(0.0, 0.0, 0.0)``.
++    corner = CArray(dtype=np.float64, shape=(3,), value=np.array((0.0, 0.0, 0.0)))
++
++    #: First edge of the panel, starting at :attr:`corner`. Default is ``(1.0, 0.0, 0.0)``.
++    edge1 = CArray(dtype=np.float64, shape=(3,), value=np.array((1.0, 0.0, 0.0)))
++
++    #: Second edge of the panel, starting at :attr:`corner` and perpendicular to :attr:`edge1`.
++    #: Default is ``(0.0, 1.0, 0.0)``.
++    edge2 = CArray(dtype=np.float64, shape=(3,), value=np.array((0.0, 1.0, 0.0)))
++
++    #: Amplitude factor applied to the sound pressure on every reflection off this panel. Ignored
++    #: when :attr:`impedance` is set. Default is ``1.0``.
++    reflection_factor = Float(1.0)
++
++    #: Normalized surface impedance of the panel. When set, the amplitude factor of a reflection
++    #: depends on the angle at which the ray meets the panel. Default is :obj:`None`, which makes
++    #: the panel use :attr:`reflection_factor` at every angle.
++    impedance = Union(None, Float)
++
++    #: Unit normal of the panel, along the cross product of :attr:`edge1` and :attr:`edge2`.
++    #: (read-only)
++    normal = Property(depends_on=['edge1', 'edge2'])
++
++    #: A unique identifier based on the panel properties. (read-only)
++    digest = Property(depends_on=['corner', 'edge1', 'edge2', 'reflection_factor', 'impedance'])
++
++    @cached_property
++    def _get_digest(self):
++        return digest(self)
++
++    @cached_property
++    def _get_normal(self):
++        len1 = np.sqrt(np.dot(self.edge1, self.edge1))
++        len2 = np.sqrt(np.dot(self.edge2, self.edge2))
++        if len1 == 0.0 or len2 == 0.0:
++            msg = 'edge1 and edge2 must have non-zero length'
++            raise ValueError(msg)
++        if abs(np.dot(self.edge1, self.edge2)) > _REFLECTION_TOL * len1 * len2:
++            msg = 'edge1 and edge2 must be perpendicular'
++            raise ValueError(msg)
++        vec = np.cross(self.edge1, self.edge2)
++        return vec / np.sqrt(np.dot(vec, vec))
++
++    def signed_distance(self, pos):
++        """Compute the distance of points from the panel plane, signed along :attr:`normal`.
++
++        Parameters
++        ----------
++        pos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the points, shape ``(3, N)``.
++
++        Returns
++        -------
++        :class:`numpy.ndarray` of :class:`floats<float>`
++            The signed distances, shape ``(N,)``. Positive values lie on the side
++            :attr:`normal` points to.
++        """
++        pos = np.asarray(pos, dtype=np.float64)
++        _check_points(pos)
++        return self._signed_distance(pos)
++
++    def _signed_distance(self, pos):
++        return np.einsum('i...,i->...', self._relative(pos), self.normal)
++
++    def mirror(self, pos):
++        """Reflect points about the panel plane.
++
++        Parameters
++        ----------
++        pos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the points, shape ``(3, N)``.
++
++        Returns
++        -------
++        :class:`numpy.ndarray` of :class:`floats<float>`
++            The mirrored coordinates, shape ``(3, N)``.
++        """
++        pos = np.asarray(pos, dtype=np.float64)
++        _check_points(pos)
++        return self._mirror(pos)
++
++    def _mirror(self, pos):
++        offset = self._signed_distance(pos)[np.newaxis] * self._aligned(self.normal, pos.ndim)
++        return pos - 2.0 * offset
++
++    def mirror_direction(self, vec):
++        """Reflect direction vectors about the panel plane.
++
++        The panel position plays no role here, so the vectors keep their length and only turn.
++
++        Parameters
++        ----------
++        vec : :class:`numpy.ndarray` of :class:`floats<float>`
++            The vectors to reflect, shape ``(3, N)``.
++
++        Returns
++        -------
++        :class:`numpy.ndarray` of :class:`floats<float>`
++            The reflected vectors, shape ``(3, N)``.
++        """
++        vec = np.asarray(vec, dtype=np.float64)
++        _check_points(vec)
++        return self._mirror_direction(vec)
++
++    def _mirror_direction(self, vec):
++        projection = np.einsum('i...,i->...', vec, self.normal)
++        return vec - 2.0 * projection[np.newaxis] * self._aligned(self.normal, vec.ndim)
++
++    def contains(self, pos):
++        """Test whether points lie on the panel plane and within its rectangle.
++
++        Parameters
++        ----------
++        pos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the points, shape ``(3, N)``.
++
++        Returns
++        -------
++        :class:`numpy.ndarray` of :class:`bool`
++            :obj:`True` where the point lies on the panel, shape ``(N,)``.
++        """
++        pos = np.asarray(pos, dtype=np.float64)
++        _check_points(pos)
++        return self._contains(pos)
++
++    def _contains(self, pos):
++        rel = self._relative(pos)
++        on_plane = np.abs(np.einsum('i...,i->...', rel, self.normal)) <= _REFLECTION_TOL
++        first = np.einsum('i...,i->...', rel, self.edge1) / np.dot(self.edge1, self.edge1)
++        second = np.einsum('i...,i->...', rel, self.edge2) / np.dot(self.edge2, self.edge2)
++        within = (
++            (first >= -_REFLECTION_TOL)
++            & (first <= 1.0 + _REFLECTION_TOL)
++            & (second >= -_REFLECTION_TOL)
++            & (second <= 1.0 + _REFLECTION_TOL)
++        )
++        return on_plane & within
++
++    def factor_at(self, cosine):
++        """Compute the amplitude factor of a reflection at a given angle of incidence.
++
++        Without an :attr:`impedance` the panel applies :attr:`reflection_factor` at every angle.
++        With one, the factor follows the plane wave reflection coefficient of a locally reacting
++        surface, which requires a positive impedance.
++
++        Parameters
++        ----------
++        cosine : :class:`numpy.ndarray` of :class:`floats<float>`
++            Cosine of the angle between the incoming ray and the panel normal, shape ``(N,)``.
++
++        Returns
++        -------
++        :class:`numpy.ndarray` of :class:`floats<float>`
++            The amplitude factors, shape ``(N,)``.
++
++        Raises
++        ------
++        :obj:`ValueError`
++            If :attr:`impedance` is set to a value that is not positive.
++        """
++        cosine = np.asarray(cosine, dtype=np.float64)
++        if self.impedance is None:
++            return np.full(cosine.shape, self.reflection_factor, dtype=np.float64)
++        if self.impedance <= 0.0:
++            msg = 'impedance must be positive'
++            raise ValueError(msg)
++        scaled = self.impedance * cosine
++        return (scaled - 1.0) / (scaled + 1.0)
++
++    def crossing(self, start, end):
++        """Compute where a segment crosses the panel plane, strictly between its endpoints.
++
++        Parameters
++        ----------
++        start : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the segment starts, shape ``(3, N)``.
++
++        end : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the segment ends, shape ``(3, N)``.
++
++        Returns
++        -------
++        :class:`tuple` of :class:`numpy.ndarray`
++            The crossing coordinates of shape ``(3, N)``, :obj:`nan` where the segment does not
++            cross the plane between its endpoints, and a boolean array of shape ``(N,)`` marking
++            the segments that do.
++        """
++        start = np.asarray(start, dtype=np.float64)
++        end = np.asarray(end, dtype=np.float64)
++        _check_points(start, end)
++        if start.shape != end.shape:
++            msg = 'crossing needs matching start and end arrays'
++            raise ValueError(msg)
++        return self._crossing(start, end)
++
++    def _crossing(self, start, end):
++        near = self._signed_distance(start)
++        far = self._signed_distance(end)
++        denominator = near - far
++        with np.errstate(divide='ignore', invalid='ignore'):
++            share = np.where(denominator != 0.0, near / denominator, np.nan)
++        crosses = (share > _REFLECTION_TOL) & (share < 1.0 - _REFLECTION_TOL)
++        point = start + share[np.newaxis] * (end - start)
++        return np.where(crosses[np.newaxis], point, np.nan), crosses
++
++    def _relative(self, pos):
++        pos = np.asarray(pos, dtype=np.float64)
++        return pos - self._aligned(self.corner, pos.ndim)
++
++    @staticmethod
++    def _aligned(vec, ndim):
++        return vec.reshape((3, *([1] * (ndim - 1))))
++
++
++class ReflectiveEnvironment(Environment):
++    """
++    An acoustic environment with specularly reflecting panels.
++
++    Sound reaches a receiver on the direct path and on every path that bounces off the panels in
++    :attr:`planes` up to :attr:`max_order` times. Each such path is described by the sequence of
++    panels the ray meets, and the pressure contributed by it follows from the length of the folded
++    ray and the reflection factors collected along it.
++
++    See Also
++    --------
++    :class:`~acoular.environments.ReflectingPlane` : A single reflecting panel.
++    :class:`~acoular.environments.Environment` : Propagation without reflections.
++
++    Notes
++    -----
++    - :meth:`~acoular.environments.Environment.apparent_r` is inherited unchanged and always reports
++      the direct distance.
++    - The image of the emitting point for a path is built by mirroring it about the panels of the
++      sequence one after another, in the order the ray meets them.
++    """
++
++    #: The reflecting panels present in the medium. Default is an empty list.
++    planes = List(Instance(ReflectingPlane))
++
++    #: The largest number of reflections a path may contain. Default is ``1``.
++    max_order = Int(1)
++
++    #: A unique identifier for the current set of panels. (read-only)
++    plane_digest = Str()
++
++    #: A unique identifier based on the environment properties. (read-only)
++    digest = Property(depends_on=['c', 'plane_digest', 'max_order'])
++
++    @cached_property
++    def _get_digest(self):
++        return digest(self)
++
++    @observe('planes.items.digest')
++    def _set_planesdigest(self, event):  # noqa: ARG002
++        self.plane_digest = ldigest(self.planes)
++
++    _sequence_cache = Property(depends_on=['plane_digest', 'max_order'])
++
++    @cached_property
++    def _get__sequence_cache(self):
++        sequences = [()]
++        current = [()]
++        for _ in range(max(self.max_order, 0)):
++            longer = [
++                (*sequence, index)
++                for sequence in current
++                for index in range(len(self.planes))
++                if not sequence or sequence[-1] != index
++            ]
++            sequences.extend(longer)
++            current = longer
++        return sequences, {sequence: position for position, sequence in enumerate(sequences)}
++
++    def _sequence_position(self, sequence):
++        position = self._sequence_cache[1].get(tuple(sequence))
++        if position is None:
++            msg = 'sequence is not one of the environment paths'
++            raise IndexError(msg)
++        return position
++
++    def path_sequences(self):
++        """Return every panel sequence a path may follow.
++
++        A sequence lists the indices into :attr:`planes` in the order the ray meets them. Two
++        consecutive reflections off the same panel are impossible, so no sequence repeats an index
++        next to itself. Sequences are grouped by increasing length and ordered lexicographically
++        within a group, which puts the empty tuple of the direct path first.
++
++        Returns
++        -------
++        :class:`list` of :class:`tuple`
++            The panel sequences.
++        """
++        if self.max_order < 0:
++            msg = 'max_order must not be negative'
++            raise ValueError(msg)
++        return list(self._sequence_cache[0])
++
++    def image(self, sequence, pos):
++        """Mirror positions about the panels of a path sequence, in the order they are met."""
++        _check_sequence(sequence)
++        _check_points(np.asarray(pos))
++        self._sequence_position(sequence)
++
++        pos = np.asarray(pos, dtype=np.float64)
++        for plane_index in sequence:
++            pos = self.planes[plane_index]._mirror(pos)
++        return pos
++
++    def image_velocity(self, sequence, vec):
++        """Mirror direction vectors about the panels of a path sequence, in the order they are met."""
++        _check_sequence(sequence)
++        _check_points(np.asarray(vec))
++        self._sequence_position(sequence)
++
++        vec = np.asarray(vec, dtype=np.float64)
++        for plane_index in sequence:
++            vec = self.planes[plane_index]._mirror_direction(vec)
++        return vec
++
++    def reflection_points(self, index, gpos, mpos):
++        """Compute the points at which a path touches the panels it reflects off.
++
++        The points are found by walking the path backwards from the receiver: the last one is where
++        the segment from the final image to the receiver crosses the last panel of the sequence, and
++        every earlier one is where the segment from the corresponding image to the point already
++        found crosses the preceding panel.
++
++        Parameters
++        ----------
++        index : :class:`int`
++            Position of the path within :meth:`path_sequences`.
++
++        gpos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the emitting points, shape ``(3, N)``.
++
++        mpos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the receiving points, shape ``(3, M)``.
++
++        Returns
++        -------
++        :class:`numpy.ndarray` of :class:`floats<float>`
++            The reflection points in the order the ray meets them, shape ``(L, 3, N, M)`` for a
++            sequence of `L` panels. Entries are :obj:`nan` where the walk cannot be continued.
++        """
++        _check_points(np.asarray(gpos), np.asarray(mpos))
++        _check_index(index)
++        emitter, receiver = self._spread(gpos, mpos)
++        return self._walk(self._sequence_cache[0][index], emitter, receiver)
++
++    def incidence(self, index, gpos, mpos):
++        """Compute the cosine of the angle at which a path meets each of its panels.
++
++        The angle is measured between the incoming ray and the panel normal, so a ray arriving
++        along the normal gives a cosine of one and a grazing ray gives zero.
++
++        Parameters
++        ----------
++        index : :class:`int`
++            Position of the path within :meth:`path_sequences`.
++
++        gpos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the emitting points, shape ``(3, N)``.
++
++        mpos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the receiving points, shape ``(3, M)``.
++
++        Returns
++        -------
++        :class:`numpy.ndarray` of :class:`floats<float>`
++            The cosines in the order the ray meets the panels, shape ``(L, N, M)`` for a sequence
++            of `L` panels, :obj:`nan` where the reflection point is missing.
++        """
++        _check_points(np.asarray(gpos), np.asarray(mpos))
++        _check_index(index)
++        emitter, receiver = self._spread(gpos, mpos)
++        sequence = self._sequence_cache[0][index]
++        return self._incidence_from(sequence, self._walk(sequence, emitter, receiver), emitter)
++
++    def paths(self, gpos, mpos):
++        """Compute travel distance, amplitude factor and validity for every propagation path.
++
++        The travel distance of a path is the distance from the image of the emitting point to the
++        receiving point. The amplitude factor is the product of the factors the panels of the
++        sequence apply and is reported whether or not the path exists. A path exists when all of
++        its reflection points lie on their own panel and no panel blocks any of its segments.
++
++        Parameters
++        ----------
++        gpos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the emitting points, shape ``(3, N)``.
++
++        mpos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the receiving points, shape ``(3, M)``.
++
++        Returns
++        -------
++        :class:`tuple` of :class:`numpy.ndarray`
++            Three arrays of shape ``(P, N, M)`` holding the travel distance along each path, the
++            amplitude factor collected along it, and whether the path exists.
++        """
++        _check_points(np.asarray(gpos), np.asarray(mpos))
++        return self._collect(*self._spread(gpos, mpos))
++
++    def paths_at(self, gpos, mpos):
++        """Compute the propagation paths of matched pairs of emitting and receiving points.
++
++        Unlike :meth:`paths`, which pairs every emitting point with every receiving point, this
++        evaluates the `N` pairs formed elementwise.
++
++        Parameters
++        ----------
++        gpos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the emitting points, shape ``(3, N)``.
++
++        mpos : :class:`numpy.ndarray` of :class:`floats<float>`
++            The coordinates of the receiving points, shape ``(3, N)``.
++
++        Returns
++        -------
++        :class:`tuple` of :class:`numpy.ndarray`
++            Three arrays of shape ``(P, N)`` holding the travel distance along each path, the
++            amplitude factor collected along it, and whether the path exists.
++        """
++        _check_points(np.asarray(gpos), np.asarray(mpos))
++        emitter = np.asarray(gpos, dtype=np.float64)
++        receiver = np.asarray(mpos, dtype=np.float64)
++        _check_pairs(emitter, receiver)
++        return self._collect(emitter, receiver)
++
++    def _spread(self, gpos, mpos):
++        gpos = np.asarray(gpos, dtype=np.float64)
++        mpos = np.asarray(mpos, dtype=np.float64)
++        shape = (3, gpos.shape[-1], mpos.shape[-1])
++        return np.broadcast_to(gpos[:, :, np.newaxis], shape), np.broadcast_to(mpos[:, np.newaxis, :], shape)
++
++    def _collect(self, emitter, receiver):
++        sequences = self._sequence_cache[0]
++        shape = (len(sequences), *emitter.shape[1:])
++        distance = np.empty(shape)
++        amplitude = np.empty(shape)
++        valid = np.empty(shape, dtype=bool)
++        for index, sequence in enumerate(sequences):
++            offset = self._images(sequence, emitter)[-1] - receiver
++            distance[index] = np.sqrt(np.einsum('i...,i...->...', offset, offset))
++            points = self._walk(sequence, emitter, receiver)
++            cosines = self._incidence_from(sequence, points, emitter)
++            factor = np.ones(shape[1:])
++            exists = np.ones(shape[1:], dtype=bool)
++            previous = emitter
++            for step, plane_index in enumerate(sequence):
++                plane = self.planes[plane_index]
++                factor = factor * plane.factor_at(cosines[step])
++                exists &= plane._contains(points[step])
++                exists &= ~self._blocked(previous, points[step])
++                previous = points[step]
++            amplitude[index] = factor
++            valid[index] = exists & ~self._blocked(previous, receiver)
++        return distance, amplitude, valid
++
++    def _walk(self, sequence, emitter, receiver):
++        points = np.full((len(sequence), *emitter.shape), np.nan)
++        images = self._images(sequence, emitter)
++        target = receiver
++        for step in range(len(sequence) - 1, -1, -1):
++            points[step] = self.planes[sequence[step]]._crossing(images[step + 1], target)[0]
++            target = points[step]
++        return points
++
++    def _incidence_from(self, sequence, points, emitter):
++        cosines = np.empty((len(sequence), *emitter.shape[1:]))
++        previous = emitter
++        for step, plane_index in enumerate(sequence):
++            direction = points[step] - previous
++            length = np.sqrt(np.einsum('i...,i...->...', direction, direction))
++            projection = np.einsum('i...,i->...', direction, self.planes[plane_index].normal)
++            cosines[step] = np.abs(projection) / length
++            previous = points[step]
++        return cosines
++
++    def _images(self, sequence, gpos):
++        positions = [np.asarray(gpos, dtype=np.float64)]
++        for index in sequence:
++            positions.append(self.planes[index]._mirror(positions[-1]))
++        return positions
++
++    def _blocked(self, start, end):
++        blocked = np.zeros(np.broadcast(start[0], end[0]).shape, dtype=bool)
++        span = np.linalg.norm(end - start, axis=0)
++        reach = _REFLECTION_TOL * np.where(span > 0.0, span, 1.0)
++        for plane in self.planes:
++            point, crosses = plane._crossing(start, end)
++            own = (np.linalg.norm(point - start, axis=0) <= reach) | (
++                np.linalg.norm(point - end, axis=0) <= reach
++            )
++            blocked |= crosses & plane._contains(point) & ~own
++        return blocked
+diff --git a/acoular/fbeamform.py b/acoular/fbeamform.py
+index b8c5e36..3fcef26 100644
+--- a/acoular/fbeamform.py
++++ b/acoular/fbeamform.py
+@@ -232,6 +232,30 @@ class SteeringVector(HasStrictTraits):
+             trans = calcTransfer(self.r0[ind], self.rm[ind, :][np.newaxis], np.array(2 * np.pi * f / self.env.c))
+         else:
+             trans = calcTransfer(self.r0[ind], self.rm[ind, :], np.array(2 * np.pi * f / self.env.c))
++        # panels can block the direct path even when they reflect nothing, so the mask is applied
++        # whenever the environment has any
++        if getattr(self.env, 'planes', None) or len(self.env.path_sequences()) > 1:
++            trans = self._add_reflected(trans, f, ind)
++        return trans
++
++    def _add_reflected(self, trans, f, ind):
++        # drops a direct path that a panel blocks and adds the contribution of every reflected path
++        if ind is None:
++            gpos = self.grid.pos
++            r0 = self.r0
++        elif not isinstance(ind, np.ndarray):
++            gpos = self.grid.pos[:, ind][:, np.newaxis]
++            r0 = np.atleast_1d(self.r0[ind])
++        else:
++            gpos = self.grid.pos[:, ind]
++            r0 = self.r0[ind]
++        distance, amplitude, valid = self.env.paths(gpos, self.mics.pos)
++        wavenumber = 2 * np.pi * f / self.env.c
++        ref = r0[:, np.newaxis]
++        trans = trans * valid[0]
++        for path in range(1, distance.shape[0]):
++            contribution = amplitude[path] * ref / distance[path] * np.exp(-1j * wavenumber * (distance[path] - ref))
++            trans = trans + np.where(valid[path], contribution, 0.0)
+         return trans
+ 
+     def steer_vector(self, f, ind=None):
+diff --git a/acoular/sources.py b/acoular/sources.py
+index 984df16..17534c3 100644
+--- a/acoular/sources.py
++++ b/acoular/sources.py
+@@ -803,28 +803,37 @@ class PointSource(SamplesGenerator):
+         N = int(np.ceil(num_samples_estimate / num))  # number of output blocks
+         signal = self.signal.usignal(self.up)
+         out = np.empty((num, self.num_channels))
+-        # distances
+-        rm = self.env.apparent_r(self.loc, self.mics.pos).reshape(1, -1)
++        work = np.empty((num, self.num_channels))
++        # travel distance, amplitude factor and existence of every propagation path
++        distance, amplitude, valid = self.env.paths(self.loc, self.mics.pos)
++        rm = [distance[p, 0].reshape(1, -1) for p in range(distance.shape[0])]
++        gain = [np.where(valid[p, 0], amplitude[p, 0], 0.0) for p in range(distance.shape[0])]
+         # emission time relative to start_t (in samples) for first sample
+-        ind = (-rm / self.env.c - self.start_t + self.start) * self.sample_freq * self.up
++        ind = [(-r / self.env.c - self.start_t + self.start) * self.sample_freq * self.up for r in rm]
++
++        def fill(blocksize, prepadding):
++            out[:blocksize] = 0.0
++            for p in range(len(rm)):
++                _fill_mic_signal_block(work, signal, rm[p], ind[p], blocksize, self.num_channels, self.up, prepadding)
++                out[:blocksize] += work[:blocksize] * gain[p]
+ 
+         if self.prepadding == 'zeros':
+             # number of blocks where signal behaviour is amended
+-            pre = -int(np.min(ind[0]) // (self.up * num))
++            pre = -int(min(i[0].min() for i in ind) // (self.up * num))
+             # amend signal for first blocks
+             # if signal stops during prepadding, terminate
+             if pre >= N:
+                 for _nb in range(N - 1):
+-                    _fill_mic_signal_block(out, signal, rm, ind, num, self.num_channels, self.up, True)
++                    fill(num, True)
+                     yield out
+ 
+                 blocksize = self.num_samples % num or num
+-                _fill_mic_signal_block(out, signal, rm, ind, blocksize, self.num_channels, self.up, True)
++                fill(blocksize, True)
+                 yield out[:blocksize]
+                 return
+             else:
+                 for _nb in range(pre):
+-                    _fill_mic_signal_block(out, signal, rm, ind, num, self.num_channels, self.up, True)
++                    fill(num, True)
+                     yield out
+ 
+         else:
+@@ -832,12 +841,12 @@ class PointSource(SamplesGenerator):
+ 
+         # main generator
+         for _nb in range(N - pre - 1):
+-            _fill_mic_signal_block(out, signal, rm, ind, num, self.num_channels, self.up, False)
++            fill(num, False)
+             yield out
+ 
+         # last block of variable size
+         blocksize = self.num_samples % num or num
+-        _fill_mic_signal_block(out, signal, rm, ind, blocksize, self.num_channels, self.up, False)
++        fill(blocksize, False)
+         yield out[:blocksize]
+ 
+ 
+@@ -1110,44 +1119,69 @@ class MovingPointSource(PointSource):
+         mpos = self.mics.pos[:, :, np.newaxis]
+         t = self.start + np.ones(num_mics)[:, np.newaxis] * np.arange(num) / self.sample_freq
+         epslim = 0.1 / self.up / self.sample_freq
+-        c0 = self.env.c
+-        tr = self.trajectory
+         n = self.num_samples
++        sequences = self.env.path_sequences()
++        length = signal.shape[0]
+         while n > 0:
+-            eps = np.ones_like(t)  # init discrepancy in time
+-            te = t.copy()  # init emission time = receiving time
+-            j = 0
+-            # Newton-Rhapson iteration
+-            while abs(eps).max() > epslim and j < 100:
+-                loc = np.array(tr.location(te.flatten())).reshape((3, num_mics, -1))
+-                der = np.array(tr.location(te.flatten(), der=1)).reshape((3, num_mics, -1))
+-                dv = mpos - loc  # distance vectors from source to microphones
+-                rm = np.sqrt((dv * dv).sum(0))  # absolute distance
+-                dv /= rm  # just directions from source to microphones
+-                Mr = (der * dv).sum(0) / c0  # radial Mach number
+-                eps[:] = (te + rm / c0 - t) / (1 - Mr)  # discrepancy in time
+-                te -= eps
+-                j += 1  # iteration count
+-            t += num / self.sample_freq
+-            # emission time relative to start time
+-            ind = (te - self.start_t + self.start) * self.sample_freq
+-            if self.conv_amp:
+-                rm *= (1 - Mr) ** 2
+-            try:
++            out = np.zeros((num_mics, num))
++            complete = num
++            for sequence in sequences:
++                te, rm, mach, loc = self._emission_time(sequence, t, mpos, epslim)
++                # emission time relative to start time
++                ind = (te - self.start_t + self.start) * self.sample_freq
++                if self.conv_amp:
++                    rm = rm * (1 - mach) ** 2
+                 ind = np.array(0.5 + ind * self.up, dtype=np.int64)
+-                out = (signal[ind] / rm).T
+-                yield out[:n]
+-            except IndexError:  # last incomplete frame
+-                signal_length = signal.shape[0]
+-                # Filter ind to exclude columns containing values greater than signal_length
+-                mask = (ind < signal_length).all(axis=0)
+-                out = (signal[ind[:, mask]] / rm[:, mask]).T
+-                # If out is not empty, yield it
+-                if out.size > 0:
+-                    yield out[:n]
++                # samples before the start are taken from the end of the signal, so only the
++                # upper bound truncates a path
++                inside = ind < length
++                gain = self._path_gain(sequence, loc, mpos) * inside
++                out += signal[np.minimum(ind, length - 1)] / rm * gain
++                if not sequence:
++                    complete = int(inside.all(0).sum())
++            t += num / self.sample_freq
++            if complete < num:  # last incomplete frame
++                if complete > 0:
++                    yield out.T[: min(complete, n)]
+                 break
++            yield out.T[:n]
+             n -= num
+ 
++    def _emission_time(self, sequence, t, mpos, epslim):
++        """Solve the emission time of one path against the image of the trajectory.
++
++        The image position follows the panels of the sequence, while the trajectory velocity is a
++        direction and therefore turns with :meth:`~acoular.environments.Environment.image_velocity`.
++        """
++        c0 = self.env.c
++        tr = self.trajectory
++        num_mics = self.num_channels
++        eps = np.ones_like(t)  # init discrepancy in time
++        te = t.copy()  # init emission time = receiving time
++        j = 0
++        # Newton-Rhapson iteration
++        while abs(eps).max() > epslim and j < 100:
++            loc = np.array(tr.location(te.flatten())).reshape((3, num_mics, -1))
++            der = np.array(tr.location(te.flatten(), der=1)).reshape((3, num_mics, -1))
++            image = self.env.image(sequence, loc.reshape(3, -1)).reshape(loc.shape)
++            velocity = self.env.image_velocity(sequence, der.reshape(3, -1)).reshape(der.shape)
++            dv = mpos - image  # distance vectors from the image to the microphones
++            rm = np.sqrt((dv * dv).sum(0))  # absolute distance
++            dv = dv / rm  # just directions from the image to the microphones
++            mach = (velocity * dv).sum(0) / c0  # radial Mach number
++            eps[:] = (te + rm / c0 - t) / (1 - mach)  # discrepancy in time
++            te -= eps
++            j += 1  # iteration count
++        return te, rm, mach, loc
++
++    def _path_gain(self, sequence, loc, mpos):
++        """Return the amplitude factor of one path at every emission position, zero where it does
++        not exist."""
++        index = self.env._sequence_position(sequence)
++        receiver = np.broadcast_to(mpos, loc.shape)
++        _, amplitude, valid = self.env.paths_at(loc.reshape(3, -1), receiver.reshape(3, -1))
++        return np.where(valid[index], amplitude[index], 0.0).reshape(loc.shape[1:])
++
+ 
+ class PointSourceDipole(PointSource):
+     """
+@@ -1258,9 +1292,13 @@ class PointSourceDipole(PointSource):
+         # distance from dipole center to microphones
+         rm = self.env.apparent_r(loc, mpos)
+ 
+-        # distances from monopoles to microphones
+-        rm1 = self.env.apparent_r(loc + dir2, mpos)
+-        rm2 = self.env.apparent_r(loc - dir2, mpos)
++        # travel distances and amplitude factors of every path of both monopoles
++        first, gain1, valid1 = self.env.paths(loc + dir2, mpos)
++        second, gain2, valid2 = self.env.paths(loc - dir2, mpos)
++        rm1 = first[:, 0]
++        rm2 = second[:, 0]
++        weight1 = np.where(valid1[:, 0], gain1[:, 0], 0.0)
++        weight2 = np.where(valid2[:, 0], gain2[:, 0], 0.0)
+ 
+         # emission time relative to start_t (in samples) for first sample
+         ind1 = (-rm1 / c - self.start_t + self.start) * self.sample_freq
+@@ -1276,8 +1314,8 @@ class PointSourceDipole(PointSource):
+                     rm
+                     / dist
+                     * (
+-                        signal[np.array(0.5 + ind1 * self.up, dtype=np.int64)] / rm1
+-                        - signal[np.array(0.5 + ind2 * self.up, dtype=np.int64)] / rm2
++                        (weight1 * signal[np.array(0.5 + ind1 * self.up, dtype=np.int64)] / rm1).sum(0)
++                        - (weight2 * signal[np.array(0.5 + ind2 * self.up, dtype=np.int64)] / rm2).sum(0)
+                     )
+                 )
+                 ind1 += 1.0
+@@ -1574,14 +1612,18 @@ class LineSource(PointSource):
+         # distance from line start position to microphones
+         loc = self.loc
+ 
+-        # distances from monopoles in the line to microphones
+-        rms = np.empty((self.num_channels, self.num_sources))
+-        inds = np.empty((self.num_channels, self.num_sources))
++        # distances from monopoles in the line to microphones, one entry per propagation path
++        num_paths = len(self.env.path_sequences())
++        rms = np.empty((num_paths, self.num_channels, self.num_sources))
++        inds = np.empty((num_paths, self.num_channels, self.num_sources))
++        gains = np.empty((num_paths, self.num_channels, self.num_sources))
+         signals = np.empty((self.num_sources, len(self.signal.usignal(self.up))))
+         # for every source - distances
+         for s in range(self.num_sources):
+-            rms[:, s] = self.env.apparent_r((loc.T + direc_n * dist * s).T, mpos)
+-            inds[:, s] = (-rms[:, s] / c - self.start_t + self.start) * self.sample_freq
++            distance, amplitude, valid = self.env.paths((loc.T + direc_n * dist * s).T, mpos)
++            rms[:, :, s] = distance[:, 0]
++            gains[:, :, s] = np.where(valid[:, 0], amplitude[:, 0], 0.0)
++            inds[:, :, s] = (-rms[:, :, s] / c - self.start_t + self.start) * self.sample_freq
+             # new seed for every source
+             if self.coherence == 'incoherent':
+                 self.signal.seed = s + abs(int(hash(self.digest) // 10e12))
+@@ -1593,8 +1635,9 @@ class LineSource(PointSource):
+             n -= 1
+             try:
+                 for s in range(self.num_sources):
+-                    # sum sources
+-                    out[i] += signals[s, np.array(0.5 + inds[:, s].T * self.up, dtype=np.int64)] / rms[:, s]
++                    # sum sources over all paths
++                    taps = signals[s, np.array(0.5 + inds[:, :, s] * self.up, dtype=np.int64)]
++                    out[i] += (gains[:, :, s] * taps / rms[:, :, s]).sum(0)
+ 
+                 inds += 1.0
+                 i += 1
+diff --git a/acoular/tbeamform.py b/acoular/tbeamform.py
+index e7f8f00..bc2072b 100644
+--- a/acoular/tbeamform.py
++++ b/acoular/tbeamform.py
+@@ -31,7 +31,7 @@ from .grids import RectGrid
+ # acoular imports
+ from .internal import digest
+ from .process import SamplesBuffer
+-from .tfastfuncs import _delayandsum4, _delayandsum5, _delays
++from .tfastfuncs import _delayandsum4, _delayandsum5, _delayandsumreflect, _delays
+ from .trajectory import Trajectory
+ 
+ import numpy as np
+@@ -137,15 +137,20 @@ class BeamformerTime(TimeOut):
+         num_mics = self.steer.mics.num_mics
+         n_index = np.arange(0, num + 1)[:, np.newaxis]
+         c = self.steer.env.c / self.source.sample_freq
+-        amp = np.empty((1, self.steer.grid.size, num_mics), dtype=fdtype)
+-        d_index = np.empty((1, self.steer.grid.size, num_mics), dtype=idtype)
+-        d_interp2 = np.empty((1, self.steer.grid.size, num_mics), dtype=fdtype)
+-        steer_func(self.steer.rm[np.newaxis, :, :], self.steer.r0[np.newaxis, :], amp)
+-        _delays(self.steer.rm[np.newaxis, :, :], c, d_interp2, d_index)
+-        amp = amp.reshape(amp.shape[1:])
+-        d_index = d_index.reshape(d_index.shape[1:])
+-        d_interp2 = d_interp2.reshape(d_interp2.shape[1:])
+-        max_sample_delay = int((self.steer.rm / c).max()) + 2
++        distance, gain, exists = self.steer.env.paths(self.steer.grid.pos, self.steer.mics.pos)
++        distance = np.ascontiguousarray(distance, dtype=fdtype)
++        num_paths = distance.shape[0]
++        amp = np.empty((num_paths, self.steer.grid.size, num_mics), dtype=fdtype)
++        d_index = np.empty((num_paths, self.steer.grid.size, num_mics), dtype=idtype)
++        d_interp2 = np.empty((num_paths, self.steer.grid.size, num_mics), dtype=fdtype)
++        reference = np.tile(self.steer.r0.astype(fdtype), (num_paths, 1))
++        steer_func(distance, reference, amp)
++        _delays(distance, c, d_interp2, d_index)
++        amp *= np.where(exists, gain, 0.0)
++        d_index[~exists] = 0
++        d_interp2[~exists] = 0.0
++        reachable = distance[exists]
++        max_sample_delay = int((reachable / c).max()) + 2 if reachable.size else 2
+         weights = self._get_weights()
+ 
+         buffer = SamplesBuffer(
+@@ -182,7 +187,7 @@ class BeamformerTime(TimeOut):
+                     # print(f"start clean iteration {j+1} of max {self.n_iter}")
+                     pow_phi = (phi[:num] ** 2 - autopow).sum(0).clip(min=0) if self.r_diag else (phi[:num] ** 2).sum(0)
+                     imax = np.argmax(pow_phi)
+-                    t_float = d_interp2[imax] + d_index[imax] + n_index
++                    t_float = d_interp2[0, imax] + d_index[0, imax] + n_index
+                     t_ind = t_float.astype(np.int64)
+                     for m in range(num_mics):
+                         p_res_copy[t_ind[: num + 1, m], m] -= self.damp * np.interp(
+@@ -216,7 +221,10 @@ class BeamformerTime(TimeOut):
+         """Standard delay-and-sum method."""
+         result = np.empty((num, self.steer.grid.size), dtype=float)  # output array
+         autopow = np.empty((num, self.steer.grid.size), dtype=float)  # output array
+-        _delayandsum4(p_res, d_index, d_interp2, amp, result, autopow)
++        if d_index.shape[0] == 1:
++            _delayandsum4(p_res, d_index[0], d_interp2[0], amp[0], result, autopow)
++        else:
++            _delayandsumreflect(p_res, d_index, d_interp2, amp, result, autopow)
+         return result, autopow
+ 
+ 
+diff --git a/acoular/tfastfuncs.py b/acoular/tfastfuncs.py
+index 5591ed6..7a92f9c 100644
+--- a/acoular/tfastfuncs.py
++++ b/acoular/tfastfuncs.py
+@@ -126,6 +126,61 @@ def _delayandsum5(data, offsets, ifactor2, steeramp, out, autopower):
+                 autopower[n, gi] += r * r
+ 
+ 
++@lazyjit(
++    nb.njit(
++        [
++            (
++                nb.float64[:, ::1],
++                nb.int64[:, :, ::1],
++                nb.float64[:, :, ::1],
++                nb.float64[:, :, ::1],
++                nb.float64[:, ::1],
++                nb.float64[:, ::1],
++            ),
++        ],
++        cache=True,
++        parallel=True,
++        fastmath=True,
++    ),
++)
++def _delayandsumreflect(data, offsets, ifactor2, steeramp, out, autopower):
++    """Performs delay and sum over several propagation paths per channel.
++
++    Parameters
++    ----------
++    data : float64[nSamples, nMics]
++        The time history for all channels.
++    offsets : int64[nPaths, gridSize, nMics]
++        Indices for each path, each grid point and each channel.
++    ifactor2: float64[nPaths, gridSize, nMics]
++        Second interpolation factor, the first one is computed internally.
++    steeramp: float64[nPaths, gridSize, nMics]
++        Amplitude factor from steering vector, zero for paths that do not exist.
++
++    Returns
++    -------
++    None : as the inputs out and autopower get overwritten.
++
++    """
++    num_paths, gridsize, num_channels = offsets.shape
++    num = out.shape[0]
++    zero_constant = data.dtype.type(0.0)
++    for n in nb.prange(num):
++        for gi in nb.prange(gridsize):
++            out[n, gi] = zero_constant
++            autopower[n, gi] = zero_constant
++            for mi in range(num_channels):
++                r = zero_constant
++                for pi in range(num_paths):
++                    ind = (pi, gi, mi)
++                    r += (
++                        data[offsets[ind] + n, mi] * (1.0 - ifactor2[ind])
++                        + data[offsets[ind] + n + 1, mi] * ifactor2[ind]
++                    ) * steeramp[ind]
++                out[n, gi] += r
++                autopower[n, gi] += r * r
++
++
+ @lazyjit(
+     nb.njit(
+         [

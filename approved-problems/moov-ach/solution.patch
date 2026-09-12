@@ -1,0 +1,737 @@
+diff --git a/correction.go b/correction.go
+new file mode 100644
+index 00000000..424fc515
+--- /dev/null
++++ b/correction.go
+@@ -0,0 +1,354 @@
++// Licensed to The Moov Authors under one or more contributor
++// license agreements. See the NOTICE file distributed with
++// this work for additional information regarding copyright
++// ownership. The Moov Authors licenses this file to you under
++// the Apache License, Version 2.0 (the "License"); you may
++// not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++package ach
++
++import "strings"
++
++// CorrectionResult contains the two files produced while applying Notifications of Change.
++// Either file is nil when it would contain no entries.
++type CorrectionResult struct {
++	Refused *File
++	Undo    *File
++}
++
++type acceptedNotification struct {
++	header *BatchHeader
++	entry  *EntryDetail
++	target *correctionTarget
++	before correctionState
++}
++
++type refusedNotification struct {
++	source int
++	header *BatchHeader
++	entry  *EntryDetail
++	code   string
++}
++
++// ApplyCorrections updates f from ordinary Notification of Change entries. Every notification
++// applies or is refused independently. The result also contains reverse-order notifications
++// which undo every accepted change.
++func (f *File) ApplyCorrections(corrections ...*File) (*CorrectionResult, error) {
++	if f == nil {
++		return nil, nil
++	}
++
++	index := newCorrectionIndex(f)
++	changedBatches := make(map[Batcher]bool)
++	changedIATBatches := make(map[*IATBatch]bool)
++
++	var accepted []acceptedNotification
++	var refused []refusedNotification
++	hasNotifications := false
++
++	for source, correctionFile := range corrections {
++		if correctionFile == nil {
++			continue
++		}
++		for _, batch := range correctionFile.Batches {
++			for _, entry := range batch.GetEntries() {
++				if entry == nil || entry.Addenda98 == nil {
++					continue
++				}
++				hasNotifications = true
++
++				target, data, code := classifyCorrection(entry.Addenda98, index)
++				var before correctionState
++				if code == "" {
++					before = target.snapshot()
++					target.apply(data)
++
++					if data.TransactionCode != 0 && !target.transactionValid() {
++						target.restore(before)
++						code = "C69"
++					} else if !target.offsetsFeasible() {
++						target.restore(before)
++						code = "C69"
++					}
++				}
++
++				if code != "" {
++					refused = append(refused, refusedNotification{
++						source: source,
++						header: batch.GetHeader(),
++						entry:  entry,
++						code:   code,
++					})
++					continue
++				}
++
++				accepted = append(accepted, acceptedNotification{
++					header: batch.GetHeader(),
++					entry:  entry,
++					target: target,
++					before: before,
++				})
++				if target.batch != nil {
++					changedBatches[target.batch] = true
++				}
++				if target.iatBatch != nil {
++					changedIATBatches[target.iatBatch] = true
++				}
++			}
++		}
++	}
++
++	if !hasNotifications {
++		return nil, nil
++	}
++
++	if err := rebuildCorrectedFile(f, changedBatches, changedIATBatches); err != nil {
++		return nil, err
++	}
++	refusedFile, err := buildRefusedFile(f, refused)
++	if err != nil {
++		return nil, err
++	}
++	undoFile, err := buildUndoFile(f, accepted)
++	if err != nil {
++		return nil, err
++	}
++	return &CorrectionResult{Refused: refusedFile, Undo: undoFile}, nil
++}
++
++// classifyCorrection performs every check which does not require tentatively applying the
++// corrected fields. Its ordering is observable through the refused change code.
++func classifyCorrection(addenda98 *Addenda98, index *correctionIndex) (*correctionTarget, *CorrectedData, string) {
++	data := parseCorrectionData(addenda98)
++	if data == nil {
++		return nil, nil, "C65"
++	}
++
++	key := originalEntryKey{
++		trace: addenda98.OriginalTraceField(),
++		dfi:   addenda98.OriginalDFIField(),
++	}
++	if !index.institutions[key.dfi] {
++		return nil, nil, "C61"
++	}
++	target := index.entries[key]
++	if target == nil {
++		return nil, nil, "C62"
++	}
++	if target.isOffset() {
++		return nil, nil, "C62"
++	}
++	if !target.supports(addenda98.ChangeCode) {
++		return nil, nil, "C65"
++	}
++	if data.RoutingNumber != "" {
++		if err := CheckRoutingNumber(data.RoutingNumber); err != nil {
++			return nil, nil, "C67"
++		}
++	}
++	if data.TransactionCode != 0 {
++		if err := StandardTransactionCode(data.TransactionCode); err != nil {
++			return nil, nil, "C69"
++		}
++	}
++	return target, data, ""
++}
++
++func parseCorrectionData(addenda98 *Addenda98) *CorrectedData {
++	if addenda98 == nil {
++		return nil
++	}
++	if strings.EqualFold(addenda98.ChangeCode, "C08") {
++		routing := strings.TrimSpace(addenda98.CorrectedData)
++		if routing == "" {
++			return nil
++		}
++		return &CorrectedData{RoutingNumber: routing}
++	}
++	return addenda98.ParseCorrectedData()
++}
++
++type originalEntryKey struct {
++	trace string
++	dfi   string
++}
++
++type correctionIndex struct {
++	entries      map[originalEntryKey]*correctionTarget
++	institutions map[string]bool
++}
++
++func newCorrectionIndex(f *File) *correctionIndex {
++	index := &correctionIndex{
++		entries:      make(map[originalEntryKey]*correctionTarget),
++		institutions: make(map[string]bool),
++	}
++	for _, batch := range f.Batches {
++		for _, entry := range batch.GetEntries() {
++			if entry == nil {
++				continue
++			}
++			target := &correctionTarget{
++				entry:         entry,
++				batch:         batch,
++				originalTrace: entry.TraceNumberField(),
++				originalDFI:   entry.RDFIIdentificationField(),
++			}
++			index.add(target)
++		}
++	}
++	for i := range f.IATBatches {
++		batch := &f.IATBatches[i]
++		for _, entry := range batch.GetEntries() {
++			if entry == nil {
++				continue
++			}
++			target := &correctionTarget{
++				iatEntry:      entry,
++				iatBatch:      batch,
++				originalTrace: entry.TraceNumberField(),
++				originalDFI:   entry.RDFIIdentificationField(),
++			}
++			index.add(target)
++		}
++	}
++	return index
++}
++
++func (index *correctionIndex) add(target *correctionTarget) {
++	key := originalEntryKey{trace: target.originalTrace, dfi: target.originalDFI}
++	index.entries[key] = target
++	index.institutions[key.dfi] = true
++}
++
++func rebuildCorrectedFile(f *File, batches map[Batcher]bool, iatBatches map[*IATBatch]bool) error {
++	for batch := range batches {
++		rebalanceOffsets(batch.GetEntries())
++		header := batch.GetHeader()
++		header.ServiceClassCode = coveringServiceClassCode(header.ServiceClassCode, batch.GetEntries())
++		if err := batch.Create(); err != nil {
++			return err
++		}
++	}
++	for batch := range iatBatches {
++		batch.Header.ServiceClassCode = coveringIATServiceClassCode(batch.Header.ServiceClassCode, batch.Entries)
++		if err := batch.Create(); err != nil {
++			return err
++		}
++	}
++	if len(batches) > 0 || len(iatBatches) > 0 {
++		return f.Create()
++	}
++	return nil
++}
++
++func offsetsRemainFeasible(entries []*EntryDetail) bool {
++	credits, debits := nonOffsetAmounts(entries)
++	for _, entry := range entries {
++		if entry == nil || entry.IndividualName != offsetIndividualName {
++			continue
++		}
++		switch entry.CreditOrDebit() {
++		case "C":
++			if debits == 0 {
++				return false
++			}
++		case "D":
++			if credits == 0 {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++func rebalanceOffsets(entries []*EntryDetail) {
++	credits, debits := nonOffsetAmounts(entries)
++	for _, entry := range entries {
++		if entry == nil || entry.IndividualName != offsetIndividualName {
++			continue
++		}
++		switch entry.CreditOrDebit() {
++		case "C":
++			entry.Amount = debits
++		case "D":
++			entry.Amount = credits
++		}
++	}
++}
++
++func nonOffsetAmounts(entries []*EntryDetail) (credits, debits int) {
++	for _, entry := range entries {
++		if entry == nil || entry.IndividualName == offsetIndividualName {
++			continue
++		}
++		switch entry.CreditOrDebit() {
++		case "C":
++			credits += entry.Amount
++		case "D":
++			debits += entry.Amount
++		}
++	}
++	return credits, debits
++}
++
++func coveringServiceClassCode(current int, entries []*EntryDetail) int {
++	var credits, debits bool
++	for _, entry := range entries {
++		if entry == nil {
++			continue
++		}
++		switch entry.CreditOrDebit() {
++		case "C":
++			credits = true
++		case "D":
++			debits = true
++		}
++	}
++	return coveringCode(current, credits, debits)
++}
++
++func coveringIATServiceClassCode(current int, entries []*IATEntryDetail) int {
++	var credits, debits bool
++	for _, entry := range entries {
++		if entry == nil {
++			continue
++		}
++		direction := (&EntryDetail{TransactionCode: entry.TransactionCode}).CreditOrDebit()
++		credits = credits || direction == "C"
++		debits = debits || direction == "D"
++	}
++	return coveringCode(current, credits, debits)
++}
++
++func createCorrectionBatch(batch *BatchCOR) error {
++	header := batch.GetHeader()
++	header.ServiceClassCode = coveringServiceClassCode(header.ServiceClassCode, batch.GetEntries())
++	return batch.Create()
++}
++
++func coveringCode(current int, credits, debits bool) int {
++	switch {
++	case credits && debits:
++		return MixedDebitsAndCredits
++	case credits:
++		if current != MixedDebitsAndCredits {
++			return CreditsOnly
++		}
++	case debits:
++		if current != MixedDebitsAndCredits {
++			return DebitsOnly
++		}
++	}
++	return current
++}
+diff --git a/correction_refused.go b/correction_refused.go
+new file mode 100644
+index 00000000..2d0f9faa
+--- /dev/null
++++ b/correction_refused.go
+@@ -0,0 +1,93 @@
++// Licensed to The Moov Authors under one or more contributor
++// license agreements. See the NOTICE file distributed with
++// this work for additional information regarding copyright
++// ownership. The Moov Authors licenses this file to you under
++// the Apache License, Version 2.0 (the "License"); you may
++// not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++package ach
++
++// traceSequenceLength is the number of trailing digits of a Notification of Change trace
++// number which the refused Addenda98 carries as its Trace Sequence Number.
++const traceSequenceLength = 7
++
++// buildRefusedFile assembles the file of refused Notifications of Change.
++//
++// Each supplied file which produced a refusal contributes one COR batch, in the order the
++// files were supplied, and each refusal contributes one entry to the batch for its file.
++// Returns nil when nothing was refused.
++func buildRefusedFile(f *File, refused []refusedNotification) (*File, error) {
++	if len(refused) == 0 {
++		return nil, nil
++	}
++
++	file := NewFile()
++	file.SetHeader(f.Header)
++
++	// The refusals are already in the order they were read, so walking them in that order
++	// keeps both the batches and the entries within them in that order too.
++	var batch *BatchCOR
++	source := -1
++	for _, refusal := range refused {
++		if batch == nil || refusal.source != source {
++			if batch != nil {
++				if err := createCorrectionBatch(batch); err != nil {
++					return nil, err
++				}
++				file.AddBatch(batch)
++			}
++			// A batch takes the header of the batch which held the first refusal of its
++			// file, so the refused notifications go back the way they arrived.
++			header := *refusal.header
++			batch = NewBatchCOR(&header)
++			source = refusal.source
++		}
++		batch.AddEntry(refusedEntry(refusal))
++	}
++	if err := createCorrectionBatch(batch); err != nil {
++		return nil, err
++	}
++	file.AddBatch(batch)
++
++	if err := file.Create(); err != nil {
++		return nil, err
++	}
++	return file, nil
++}
++
++// refusedEntry copies the entry which carried a refused Notification of Change, replacing its
++// Addenda98 with the refused form which names why it was refused.
++func refusedEntry(refusal refusedNotification) *EntryDetail {
++	entry := *refusal.entry
++	addenda98 := refusal.entry.Addenda98
++
++	trace := refusal.entry.TraceNumberField()
++	if len(trace) > traceSequenceLength {
++		trace = trace[len(trace)-traceSequenceLength:]
++	}
++
++	entry.Addenda98 = nil
++	entry.Addenda98Refused = &Addenda98Refused{
++		TypeCode:            addenda98.TypeCode,
++		RefusedChangeCode:   refusal.code,
++		OriginalTrace:       addenda98.OriginalTrace,
++		OriginalDFI:         addenda98.OriginalDFI,
++		CorrectedData:       addenda98.CorrectedData,
++		ChangeCode:          addenda98.ChangeCode,
++		TraceSequenceNumber: trace,
++		TraceNumber:         refusal.entry.TraceNumber,
++	}
++	entry.AddendaRecordIndicator = 1
++
++	return &entry
++}
+diff --git a/correction_target.go b/correction_target.go
+new file mode 100644
+index 00000000..318d06eb
+--- /dev/null
++++ b/correction_target.go
+@@ -0,0 +1,200 @@
++// Licensed to The Moov Authors under one or more contributor
++// license agreements. See the NOTICE file distributed with
++// this work for additional information regarding copyright
++// ownership. The Moov Authors licenses this file to you under
++// the Apache License, Version 2.0 (the "License"); you may
++// not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++package ach
++
++import (
++	"encoding/json"
++	"strings"
++)
++
++type correctionTarget struct {
++	entry    *EntryDetail
++	batch    Batcher
++	iatEntry *IATEntryDetail
++	iatBatch *IATBatch
++
++	originalTrace string
++	originalDFI   string
++}
++
++type correctionState struct {
++	routing        string
++	account        string
++	name           string
++	transaction    int
++	identification string
++}
++
++func (target *correctionTarget) supports(code string) bool {
++	code = strings.ToUpper(code)
++	if target.iatEntry != nil {
++		switch code {
++		case "C02", "C05", "C08", "C09":
++			return true
++		default:
++			return false
++		}
++	}
++	return code != "C08"
++}
++
++func (target *correctionTarget) isOffset() bool {
++	return target.entry != nil && target.entry.IndividualName == offsetIndividualName
++}
++
++func (target *correctionTarget) snapshot() correctionState {
++	if target.entry != nil {
++		return correctionState{
++			routing:        target.entry.RDFIIdentificationField() + target.entry.CheckDigit,
++			account:        target.entry.DFIAccountNumber,
++			name:           target.entry.IndividualName,
++			transaction:    target.entry.TransactionCode,
++			identification: target.entry.IdentificationNumber,
++		}
++	}
++	state := correctionState{
++		routing:     target.iatEntry.RDFIIdentificationField() + target.iatEntry.CheckDigit,
++		account:     target.iatEntry.DFIAccountNumber,
++		transaction: target.iatEntry.TransactionCode,
++	}
++	if target.iatEntry.Addenda10 != nil {
++		state.name = target.iatEntry.Addenda10.Name
++	}
++	if target.iatEntry.Addenda15 != nil {
++		state.identification = target.iatEntry.Addenda15.ReceiverIDNumber
++	}
++	return state
++}
++
++func (target *correctionTarget) restore(state correctionState) {
++	if target.entry != nil {
++		target.entry.SetRDFI(state.routing)
++		target.entry.DFIAccountNumber = state.account
++		target.entry.IndividualName = state.name
++		target.entry.TransactionCode = state.transaction
++		target.entry.IdentificationNumber = state.identification
++		return
++	}
++	target.iatEntry.SetRDFI(state.routing)
++	target.iatEntry.DFIAccountNumber = state.account
++	target.iatEntry.TransactionCode = state.transaction
++	if target.iatEntry.Addenda10 != nil {
++		target.iatEntry.Addenda10.Name = state.name
++	}
++	if target.iatEntry.Addenda15 != nil {
++		target.iatEntry.Addenda15.ReceiverIDNumber = state.identification
++	}
++}
++
++func (target *correctionTarget) apply(data *CorrectedData) {
++	if target.entry != nil {
++		if data.RoutingNumber != "" {
++			target.entry.SetRDFI(data.RoutingNumber)
++		}
++		if data.AccountNumber != "" {
++			target.entry.DFIAccountNumber = data.AccountNumber
++		}
++		if data.Name != "" {
++			target.entry.IndividualName = data.Name
++		}
++		if data.TransactionCode != 0 {
++			target.entry.TransactionCode = data.TransactionCode
++		}
++		if data.Identification != "" {
++			target.entry.IdentificationNumber = data.Identification
++		}
++		return
++	}
++	if data.RoutingNumber != "" {
++		target.iatEntry.SetRDFI(data.RoutingNumber)
++	}
++	if data.TransactionCode != 0 {
++		target.iatEntry.TransactionCode = data.TransactionCode
++	}
++	if data.Identification != "" && target.iatEntry.Addenda15 != nil {
++		target.iatEntry.Addenda15.ReceiverIDNumber = data.Identification
++	}
++}
++
++func (target *correctionTarget) finalDFI() string {
++	if target.entry != nil {
++		return target.entry.RDFIIdentificationField()
++	}
++	return target.iatEntry.RDFIIdentificationField()
++}
++
++func (target *correctionTarget) offsetsFeasible() bool {
++	return target.batch == nil || offsetsRemainFeasible(target.batch.GetEntries())
++}
++
++type invalidEntryLister interface {
++	InvalidEntries() []InvalidEntry
++}
++
++func (target *correctionTarget) transactionValid() bool {
++	if target.entry != nil {
++		header := target.batch.GetHeader()
++		originalServiceClass := header.ServiceClassCode
++		header.ServiceClassCode = coveringServiceClassCode(originalServiceClass, target.batch.GetEntries())
++		invalid := target.batch.(invalidEntryLister).InvalidEntries()
++		header.ServiceClassCode = originalServiceClass
++		return len(invalid) == 0
++	}
++
++	data, err := json.Marshal(target.iatBatch)
++	if err != nil {
++		return false
++	}
++	var staged IATBatch
++	if err := json.Unmarshal(data, &staged); err != nil {
++		return false
++	}
++	staged.category = target.iatBatch.category
++	staged.Header.ServiceClassCode = coveringIATServiceClassCode(staged.Header.ServiceClassCode, staged.Entries)
++	return staged.Create() == nil
++}
++
++func inverseCorrectedData(code string, before correctionState) string {
++	data := &CorrectedData{}
++	switch strings.ToUpper(code) {
++	case "C01":
++		data.AccountNumber = before.account
++	case "C02", "C08":
++		data.RoutingNumber = before.routing
++	case "C03":
++		data.RoutingNumber = before.routing
++		data.AccountNumber = before.account
++	case "C04":
++		data.Name = before.name
++	case "C05":
++		data.TransactionCode = before.transaction
++	case "C06":
++		data.AccountNumber = before.account
++		data.TransactionCode = before.transaction
++	case "C07":
++		data.RoutingNumber = before.routing
++		data.AccountNumber = before.account
++		data.TransactionCode = before.transaction
++	case "C09":
++		data.Identification = before.identification
++	}
++	if strings.EqualFold(code, "C08") {
++		return before.routing
++	}
++	return WriteCorrectionData(code, data)
++}
+diff --git a/correction_undo.go b/correction_undo.go
+new file mode 100644
+index 00000000..71c8d5db
+--- /dev/null
++++ b/correction_undo.go
+@@ -0,0 +1,66 @@
++// Licensed to The Moov Authors under one or more contributor
++// license agreements. See the NOTICE file distributed with
++// this work for additional information regarding copyright
++// ownership. The Moov Authors licenses this file to you under
++// the Apache License, Version 2.0 (the "License"); you may
++// not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++package ach
++
++// buildUndoFile builds one COR batch whose notifications reverse every acceptance. Identity
++// fields are resolved after the forward pass so all notifications for a target name the same
++// call-start DFI when the file is later applied.
++func buildUndoFile(f *File, accepted []acceptedNotification) (*File, error) {
++	if len(accepted) == 0 {
++		return nil, nil
++	}
++
++	file := NewFile()
++	file.SetHeader(f.Header)
++	header := *accepted[len(accepted)-1].header
++	header.StandardEntryClassCode = COR
++	header.BatchNumber = 1
++	batch := NewBatchCOR(&header)
++
++	sequence := 1
++	for i := len(accepted) - 1; i >= 0; i-- {
++		batch.AddEntry(undoEntry(accepted[i], header.ODFIIdentification, sequence))
++		sequence++
++	}
++	if err := createCorrectionBatch(batch); err != nil {
++		return nil, err
++	}
++	file.AddBatch(batch)
++	if err := file.Create(); err != nil {
++		return nil, err
++	}
++	return file, nil
++}
++
++func undoEntry(accepted acceptedNotification, odfi string, sequence int) *EntryDetail {
++	entry := *accepted.entry
++	entry.Amount = 0
++	entry.Category = CategoryNOC
++	entry.AddendaRecordIndicator = 1
++	entry.Addenda98Refused = nil
++
++	entry.Addenda98 = &Addenda98{
++		TypeCode:      "98",
++		ChangeCode:    accepted.entry.Addenda98.ChangeCode,
++		OriginalTrace: accepted.target.originalTrace,
++		OriginalDFI:   accepted.target.finalDFI(),
++		CorrectedData: inverseCorrectedData(accepted.entry.Addenda98.ChangeCode, accepted.before),
++	}
++	entry.SetTraceNumber(odfi, sequence)
++	return &entry
++}

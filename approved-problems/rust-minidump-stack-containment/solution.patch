@@ -1,0 +1,952 @@
+diff --git a/breakpad-symbols/src/lib.rs b/breakpad-symbols/src/lib.rs
+index e0cc33c..c2d7f7f 100644
+--- a/breakpad-symbols/src/lib.rs
++++ b/breakpad-symbols/src/lib.rs
+@@ -606,6 +606,12 @@ pub trait FrameWalker {
+     /// Report where the CFI rule range covering the instruction begins
+     /// (the `STACK CFI INIT` row's start address).
+     fn set_cfi_rules_start_address(&mut self, _addr: Option<u64>) {}
++    /// Report that the unwind information states this frame has no caller.
++    ///
++    /// This is stronger than failing to recover a caller. It means the module
++    /// declared the call chain to end here, so looking any further would invent
++    /// frames that were never on the stack.
++    fn set_end_of_stack(&mut self) {}
+ }
+ 
+ /// A simple implementation of `FrameSymbolizer` that just holds data.
+diff --git a/breakpad-symbols/src/sym_file/mod.rs b/breakpad-symbols/src/sym_file/mod.rs
+index cfed65e..44f2862 100644
+--- a/breakpad-symbols/src/sym_file/mod.rs
++++ b/breakpad-symbols/src/sym_file/mod.rs
+@@ -494,6 +494,13 @@ impl SymbolFile {
+         }
+         let addr = walker.get_instruction() - module.base_address();
+ 
++        // A declared end of the call chain is not a rule to evaluate, so it is answered
++        // before any of the unwind strategies get a chance to invent a caller.
++        if self.end_of_stack.get(addr).is_some() {
++            walker.set_end_of_stack();
++            return None;
++        }
++
+         // Preferentially use framedata over fpo, because if both are present,
+         // the former tends to be more precise (breakpad heuristic).
+         let win_stack_result = if let Some(info) = self.win_stack_framedata_info.get(addr) {
+diff --git a/breakpad-symbols/src/sym_file/parser.rs b/breakpad-symbols/src/sym_file/parser.rs
+index 473dad9..5fbe4d7 100644
+--- a/breakpad-symbols/src/sym_file/parser.rs
++++ b/breakpad-symbols/src/sym_file/parser.rs
+@@ -425,9 +425,11 @@ pub struct SymbolParser {
+     // save a giant allocation+copy.
+     functions: Vec<(Range<u64>, Function)>,
+     cfi_stack_info: Vec<(Range<u64>, StackInfoCfi)>,
++    end_of_stack: Vec<(Range<u64>, EndOfStack)>,
+     win_stack_framedata_info: Vec<(Range<u64>, StackInfoWin)>,
+     win_stack_fpo_info: Vec<(Range<u64>, StackInfoWin)>,
+     url: Option<String>,
++    corruptions: u64,
+     pub lines: u64,
+     cur_item: Option<Line>,
+ }
+@@ -682,7 +684,15 @@ impl SymbolParser {
+             Line::StackCfi(mut cur) => {
+                 cur.add_rules.sort();
+                 if let Some(range) = cur.memory_range() {
+-                    self.cfi_stack_info.push((range, cur));
++                    match end_of_stack_ranges(&cur, range) {
++                        None => self.corruptions += 1,
++                        Some(declared) => {
++                            for declared_range in declared {
++                                self.end_of_stack.push((declared_range, EndOfStack));
++                            }
++                            self.cfi_stack_info.push((range, cur));
++                        }
++                    }
+                 }
+             }
+             _ => {
+@@ -711,19 +721,95 @@ impl SymbolParser {
+             functions: into_rangemap_safe(self.functions),
+             inline_origins: self.inline_origins,
+             cfi_stack_info: into_rangemap_safe(self.cfi_stack_info),
++            end_of_stack: into_rangemap_safe(self.end_of_stack),
+             win_stack_framedata_info: into_rangemap_safe(self.win_stack_framedata_info),
+             win_stack_fpo_info: into_rangemap_safe(self.win_stack_fpo_info),
+             // Will get filled in by the caller
+             url: self.url,
+             ambiguities_repaired: 0,
+             ambiguities_discarded: 0,
+-            corruptions_discarded: 0,
++            corruptions_discarded: self.corruptions,
+             cfi_eval_corruptions: 0,
+         }
+     }
+ }
+ 
+ // Copied from minidump-common, because we've preconstructed the array to sort.
++/// Work out which parts of a CFI record's range declare that there is no caller.
++///
++/// A return address rule in a later row replaces the one an earlier row gave rather
++/// than joining it, so a declaration only covers the addresses up to the next row that
++/// says something about the return address. A single row that both declares no caller
++/// and computes one is contradicting itself, and the whole record is dropped as corrupt
++/// rather than guessed at, which is reported here as `None`.
++fn end_of_stack_ranges(info: &StackInfoCfi, range: Range<u64>) -> Option<Vec<Range<u64>>> {
++    let mut declared = Vec::new();
++    let mut current = row_return_address(&info.init.rules)?;
++    let mut start = range.start;
++    for row in &info.add_rules {
++        let next = row_return_address(&row.rules)?;
++        if next.is_none() {
++            continue;
++        }
++        if row.address <= start || row.address > range.end {
++            current = next;
++            continue;
++        }
++        if current.as_deref() == Some(crate::sym_file::walker::UNDEFINED_RETURN_ADDRESS) {
++            declared.push(Range::new(start, row.address - 1));
++        }
++        start = row.address;
++        current = next;
++    }
++    if current.as_deref() == Some(crate::sym_file::walker::UNDEFINED_RETURN_ADDRESS) {
++        declared.push(Range::new(start, range.end));
++    }
++    Some(declared)
++}
++
++/// The return address a single row leaves in effect, or `None` if it says nothing.
++///
++/// A row that both declares no caller and computes one cannot be honoured either way,
++/// and is reported as the error case.
++fn row_return_address(rules: &str) -> Option<Option<String>> {
++    let exprs = return_address_exprs(rules);
++    if exprs.is_empty() {
++        return Some(None);
++    }
++    let undefined = crate::sym_file::walker::UNDEFINED_RETURN_ADDRESS;
++    if exprs.iter().any(|expr| expr == undefined) && exprs.iter().any(|expr| expr != undefined) {
++        return None;
++    }
++    Some(exprs.into_iter().next_back())
++}
++
++/// Pull out every expression a rules string assigns to the return address.
++///
++/// A row may assign the same register more than once, and the evaluator honours the
++/// last assignment, so every occurrence has to be recovered rather than just the first.
++fn return_address_exprs(rules: &str) -> Vec<String> {
++    let mut found = Vec::new();
++    let mut current: Option<Vec<&str>> = None;
++    for token in rules.split_whitespace() {
++        if token == ".ra:" {
++            if let Some(expr) = current.replace(Vec::new()) {
++                found.push(expr.join(" "));
++            }
++        } else if token.ends_with(':') {
++            if let Some(expr) = current.take() {
++                found.push(expr.join(" "));
++            }
++        } else if let Some(expr) = current.as_mut() {
++            expr.push(token);
++        }
++    }
++    if let Some(expr) = current.take() {
++        found.push(expr.join(" "));
++    }
++    found.retain(|expr| !expr.is_empty());
++    found
++}
++
+ fn into_rangemap_safe<V: Clone + Eq + Debug>(mut input: Vec<(Range<u64>, V)>) -> RangeMap<u64, V> {
+     input.sort_by_key(|x| x.0);
+     let mut vec: Vec<(Range<u64>, V)> = Vec::with_capacity(input.len());
+diff --git a/breakpad-symbols/src/sym_file/types.rs b/breakpad-symbols/src/sym_file/types.rs
+index 68d6c9a..708e24e 100644
+--- a/breakpad-symbols/src/sym_file/types.rs
++++ b/breakpad-symbols/src/sym_file/types.rs
+@@ -167,6 +167,13 @@ pub struct CfiRules {
+     pub rules: String,
+ }
+ 
++/// A declaration that a range of code has no caller.
++///
++/// This is deliberately empty. The fact that a range is present is the whole of the
++/// information, and giving it a name keeps the range map readable.
++#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
++pub struct EndOfStack;
++
+ /// Information used for unwinding stack frames using DWARF CFI.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct StackInfoCfi {
+@@ -258,6 +265,13 @@ pub struct SymbolFile {
+     pub inline_origins: HashMap<u32, String>,
+     /// DWARF CFI unwind information.
+     pub cfi_stack_info: RangeMap<u64, StackInfoCfi>,
++    /// Address ranges the file declares to be the end of a call chain.
++    ///
++    /// A module can state that a function has no caller, which DWARF expresses as an
++    /// undefined return address. The text format already spells that, but the
++    /// evaluator can only fail on it, so it is carried here as a fact about the
++    /// program rather than as another rule to evaluate.
++    pub end_of_stack: RangeMap<u64, EndOfStack>,
+     /// Windows unwind information (frame data).
+     pub win_stack_framedata_info: RangeMap<u64, StackInfoWin>,
+     /// Windows unwind information (FPO data).
+diff --git a/breakpad-symbols/src/sym_file/walker.rs b/breakpad-symbols/src/sym_file/walker.rs
+index 8a2471d..8c086a1 100644
+--- a/breakpad-symbols/src/sym_file/walker.rs
++++ b/breakpad-symbols/src/sym_file/walker.rs
+@@ -485,6 +485,11 @@
+ //! Giving a final output of `ebp=(*16)`, `esp=24`, `eip=(*20)`.
+ 
+ use super::{CfiRules, StackInfoWin, WinStackThing};
++
++/// The expression a `.ra` rule carries when the module declares that this frame
++/// has no caller. It mirrors DWARF's undefined return address rule.
++pub const UNDEFINED_RETURN_ADDRESS: &str = ".undef";
++
+ use crate::FrameWalker;
+ use std::collections::HashMap;
+ use std::str::FromStr;
+@@ -514,6 +519,15 @@ pub fn walk_with_stack_cfi(
+     // These two are special and *must* always be present
+     let cfa_expr = exprs.remove(&CfiReg::Cfa)?;
+     let ra_expr = exprs.remove(&CfiReg::Ra)?;
++
++    // A module can declare that a frame has no caller at all, which DWARF expresses
++    // as an undefined return address. That is a statement about the program, not a
++    // failure to read the unwind information, so it is reported rather than retried.
++    if ra_expr.trim() == UNDEFINED_RETURN_ADDRESS {
++        trace!("STACK CFI declares the return address undefined, this is the end of the stack");
++        walker.set_end_of_stack();
++        return None;
++    }
+     trace!("STACK CFI seems reasonable, evaluating");
+ 
+     // Evaluating the CFA cannot itself use the CFA
+diff --git a/minidump-processor/src/process_state.rs b/minidump-processor/src/process_state.rs
+index bee5e92..871cdde 100644
+--- a/minidump-processor/src/process_state.rs
++++ b/minidump-processor/src/process_state.rs
+@@ -14,7 +14,7 @@ use crate::op_analysis::{InstructionPointerUpdate, InstructionProperties, Memory
+ use minidump::system_info::PointerWidth;
+ use minidump::*;
+ use minidump_common::utils::basename;
+-use minidump_unwind::{CallStack, CallStackInfo, SymbolStats, SystemInfo};
++use minidump_unwind::{CallStack, CallStackInfo, SymbolStats, SystemInfo, WalkTermination};
+ use serde_json::json;
+ 
+ #[derive(Default)]
+@@ -1058,14 +1058,16 @@ Unknown streams encountered:
+                 self.time.duration_since(time).unwrap_or_default().as_secs()
+             }),
+             "thread_count": self.threads.len(),
+-            "threads": self.threads.iter().map(|thread| json!({
++            "threads": self.threads.iter().map(|thread| {
++                let mut thread_value = json!({
+                 "frame_count": thread.frames.len(),
+                 // optional
+                 "last_error_value": thread.last_error_value.map(|error| error.to_string()),
+                 // optional
+                 "thread_name": thread.thread_name,
+                 "thread_id" : thread.thread_id,
+-                "frames": thread.frames.iter().enumerate().map(|(idx, frame)| json!({
++                "frames": thread.frames.iter().enumerate().map(|(idx, frame)| {
++                    let mut value = json!({
+                     "frame": idx,
+                     // optional
+                     "module": frame.module.as_ref().map(|module| basename(&module.name)),
+@@ -1111,8 +1113,49 @@ Unknown streams encountered:
+                     "missing_symbols": frame.function_name.is_none(),
+                     // none | scan | cfi_scan | frame_pointer | cfi | context | prewalked
+                     "trust": frame.trust.as_str()
+-                })).collect::<Vec<_>>(),
+-            })).collect::<Vec<_>>(),
++                    });
++                    // Only reported for frames the containment rules actually touched,
++                    // so output for an untouched walk keeps its existing shape.
++                    if frame.trust_degraded {
++                        if let Some(object) = value.as_object_mut() {
++                            object.insert("trust_degraded".to_string(), json!(true));
++                            object.insert(
++                                "claimed_trust".to_string(),
++                                json!(frame.claimed_trust.as_str()),
++                            );
++                            if let Some(reason) = frame.degrade_reason {
++                                object.insert("degrade_reason".to_string(), json!(reason.as_str()));
++                            }
++                        }
++                    }
++                    value
++                }).collect::<Vec<_>>(),
++                });
++                // Only reported when the walk did not simply run out of callers.
++                if thread.termination != WalkTermination::Exhausted {
++                    if let Some(object) = thread_value.as_object_mut() {
++                        object.insert(
++                            "termination".to_string(),
++                            json!(thread.termination.as_str()),
++                        );
++                    }
++                }
++                let degraded = thread.degraded_frame_count();
++                if degraded > 0 {
++                    if let Some(object) = thread_value.as_object_mut() {
++                        object.insert("degraded_frame_count".to_string(), json!(degraded));
++                        object.insert(
++                            "trusted_prefix_len".to_string(),
++                            json!(thread.trusted_prefix_len()),
++                        );
++                        object.insert(
++                            "degrade_reasons".to_string(),
++                            json!(thread.degrade_reason_counts()),
++                        );
++                    }
++                }
++                thread_value
++            }).collect::<Vec<_>>(),
+ 
+             "unloaded_modules": self.unloaded_modules.iter().map(|module| json!({
+                 "base_addr": json_hex(module.raw.base_of_image),
+diff --git a/minidump-processor/src/processor.rs b/minidump-processor/src/processor.rs
+index 2345a4d..e4af5b7 100644
+--- a/minidump-processor/src/processor.rs
++++ b/minidump-processor/src/processor.rs
+@@ -11,6 +11,7 @@ use minidump::system_info::PointerWidth;
+ use minidump::*;
+ use minidump_unwind::{
+     walk_stack, CallStack, CallStackInfo, FrameTrust, StackFrame, SymbolProvider, SystemInfo,
++    WalkTermination,
+ };
+ 
+ use crate::op_analysis::MemoryAddressInfo;
+@@ -1095,6 +1096,7 @@ impl<'a> MinidumpInfo<'a> {
+                     thread_id: id,
+                     thread_name: name,
+                     last_error_value: thread.last_error(self.system_info.cpu, &self.memory_list),
++                    termination: WalkTermination::Exhausted,
+                 }
+             })
+             .collect();
+diff --git a/minidump-unwind/src/bounds.rs b/minidump-unwind/src/bounds.rs
+new file mode 100644
+index 0000000..b588428
+--- /dev/null
++++ b/minidump-unwind/src/bounds.rs
+@@ -0,0 +1,296 @@
++// Copyright 2015 Ted Mielczarek. See the COPYRIGHT
++// file at the top-level directory of this distribution.
++
++//! Containment rules that constrain a stack walk to the thread's own stack.
++//!
++//! Each architecture's unwinder reports how it recovered a frame, and that report is
++//! taken at face value by the walker. These rules give the walk a notion of where the
++//! thread's stack actually lives, so a frame recovered from somewhere else can be
++//! recorded at a weaker trust than the unwinder claimed for it.
++
++use crate::{FrameTrust, FrameWalker, StackFrame};
++use minidump::UnifiedMemory;
++
++/// The address range that a thread's stack occupies.
++///
++/// The low address is part of the region and the high address is not, so a stack
++/// pointer exactly equal to [`StackRegion::end`][] lies outside of it.
++#[derive(Copy, Clone, Debug, PartialEq, Eq)]
++pub struct StackRegion {
++    /// The lowest address that belongs to the region.
++    pub base: u64,
++    /// The first address past the region.
++    pub end: u64,
++}
++
++impl StackRegion {
++    /// Derive the region from the stack memory a walk was handed.
++    ///
++    /// Returns `None` for memory that reports no usable range, which is the same
++    /// condition that stops the walker from unwinding past the context frame.
++    pub fn from_memory(stack_memory: UnifiedMemory<'_, '_>) -> Option<StackRegion> {
++        let range = stack_memory.memory_range()?;
++        let end = range.end.checked_add(1)?;
++        if end <= range.start {
++            return None;
++        }
++        Some(StackRegion {
++            base: range.start,
++            end,
++        })
++    }
++
++    /// Build a region from an inclusive-low, exclusive-high address pair.
++    pub fn new(base: u64, end: u64) -> StackRegion {
++        StackRegion { base, end }
++    }
++
++    /// Whether an address belongs to the region.
++    pub fn contains(&self, address: u64) -> bool {
++        address >= self.base && address < self.end
++    }
++}
++
++/// Why a stack walk stopped producing frames.
++#[derive(Copy, Clone, Debug, PartialEq, Eq)]
++pub enum WalkTermination {
++    /// An unwinder declined to produce a caller, which is the ordinary way a walk ends.
++    Exhausted,
++    /// The walk ran off the thread's stack and was cut short.
++    LeftStackRegion,
++    /// The thread had no usable stack memory, so nothing past the context frame was reachable.
++    NoStackMemory,
++    /// The walk produced as many frames as it is willing to record.
++    FrameLimit,
++    /// Unwind information declared that the last frame has no caller.
++    EndOfStack,
++}
++
++impl WalkTermination {
++    /// A stable token identifying the termination, for machine-readable output.
++    pub fn as_str(&self) -> &'static str {
++        match *self {
++            WalkTermination::Exhausted => "exhausted",
++            WalkTermination::LeftStackRegion => "left_stack_region",
++            WalkTermination::NoStackMemory => "no_stack_memory",
++            WalkTermination::FrameLimit => "frame_limit",
++            WalkTermination::EndOfStack => "end_of_stack",
++        }
++    }
++
++    /// A human-readable explanation of the termination.
++    pub fn description(&self) -> &'static str {
++        match *self {
++            WalkTermination::Exhausted => "no more callers could be recovered",
++            WalkTermination::LeftStackRegion => "the walk left the thread's stack",
++            WalkTermination::NoStackMemory => "the thread had no usable stack memory",
++            WalkTermination::FrameLimit => "the walk reached its frame limit",
++            WalkTermination::EndOfStack => "the module declared the call chain ends here",
++        }
++    }
++
++    /// Whether the walk was cut short rather than ending on its own terms.
++    pub fn is_truncated(&self) -> bool {
++        matches!(
++            *self,
++            WalkTermination::LeftStackRegion | WalkTermination::FrameLimit
++        )
++    }
++}
++
++impl Default for WalkTermination {
++    fn default() -> Self {
++        WalkTermination::Exhausted
++    }
++}
++/// Why a frame was recorded at a weaker trust than its unwinder claimed.
++#[derive(Copy, Clone, Debug, PartialEq, Eq)]
++pub enum DegradeReason {
++    /// The frame's stack pointer was not inside the thread's stack region.
++    OutsideStackRegion,
++}
++
++impl DegradeReason {
++    /// A stable token identifying the reason, for machine-readable output.
++    pub fn as_str(&self) -> &'static str {
++        match *self {
++            DegradeReason::OutsideStackRegion => "outside_stack_region",
++        }
++    }
++}
++
++/// The weakest trust a recovered frame can be recorded at.
++///
++/// A degraded frame is worth no more than one that was found by scanning, because
++/// whatever the unwinder believed about it did not survive the containment rules.
++pub(crate) const DEGRADED_TRUST: FrameTrust = FrameTrust::Scan;
++
++/// Reduce a frame's trust, keeping a record of what its unwinder originally claimed.
++///
++/// Frames that already sit at or below the degraded trust keep their trust value but
++/// are still marked, so that consecutive degradations can be counted.
++pub(crate) fn degrade_frame(frame: &mut StackFrame, reason: DegradeReason) {
++    if !frame.trust_degraded {
++        frame.claimed_trust = frame.trust;
++    }
++    frame.trust_degraded = true;
++    frame.degrade_reason = Some(reason);
++    if trust_rank(frame.trust) > trust_rank(DEGRADED_TRUST) {
++        frame.trust = DEGRADED_TRUST;
++    }
++}
++
++/// Order the trust levels from weakest to strongest.
++///
++/// [`FrameTrust`][] carries no ordering of its own, so the walk needs one to tell
++/// whether a degradation would actually weaken a frame.
++fn trust_rank(trust: FrameTrust) -> u8 {
++    match trust {
++        FrameTrust::None => 0,
++        FrameTrust::Scan => 1,
++        FrameTrust::CfiScan => 2,
++        FrameTrust::FramePointer => 3,
++        FrameTrust::CallFrameInfo => 4,
++        FrameTrust::PreWalked => 5,
++        FrameTrust::Context => 6,
++    }
++}
++
++/// Whether a frame was recovered by guesswork and could be corroborated.
++///
++/// Only a scan is guesswork. The other strategies work from register state or unwind
++/// tables, so there is nothing about them left to corroborate.
++pub(crate) fn can_be_corroborated(frame: &StackFrame) -> bool {
++    frame.trust == FrameTrust::Scan && !frame.trust_degraded
++}
++
++/// Asks the unwind machinery whether it has anything to say about an address.
++///
++/// The walker reports the range its rules cover before it tries to apply them, so a
++/// probe that supplies no register values learns whether rules exist without needing
++/// them to succeed. That is the right question here, because the address came from a
++/// guess and there is no frame to unwind from yet.
++#[derive(Debug)]
++pub(crate) struct UnwindInfoProbe {
++    instruction: u64,
++    covered: bool,
++}
++
++impl UnwindInfoProbe {
++    pub(crate) fn new(instruction: u64) -> UnwindInfoProbe {
++        UnwindInfoProbe {
++            instruction,
++            covered: false,
++        }
++    }
++
++    pub(crate) fn covered(&self) -> bool {
++        self.covered
++    }
++}
++
++impl FrameWalker for UnwindInfoProbe {
++    fn get_instruction(&self) -> u64 {
++        self.instruction
++    }
++    fn has_grand_callee(&self) -> bool {
++        false
++    }
++    fn get_grand_callee_parameter_size(&self) -> u32 {
++        0
++    }
++    fn get_register_at_address(&self, _address: u64) -> Option<u64> {
++        None
++    }
++    fn get_callee_register(&self, _name: &str) -> Option<u64> {
++        None
++    }
++    fn set_caller_register(&mut self, _name: &str, _val: u64) -> Option<()> {
++        None
++    }
++    fn clear_caller_register(&mut self, _name: &str) {}
++    fn set_cfa(&mut self, _val: u64) -> Option<()> {
++        None
++    }
++    fn set_ra(&mut self, _val: u64) -> Option<()> {
++        None
++    }
++    fn set_cfi_rules_start_address(&mut self, addr: Option<u64>) {
++        // The walker clears this again once it is done, so the probe has to latch
++        // the fact that rules were reported rather than read the final value.
++        self.covered |= addr.is_some();
++    }
++    fn set_end_of_stack(&mut self) {
++        // A declaration that the range has no caller is published unwind information
++        // too, so an address landing on one is just as corroborated as an address
++        // landing on a rule.
++        self.covered = true;
++    }
++}
++
++/// Raise a scanned frame's trust because unwind information covers where it landed.
++///
++/// The frame was still found by guesswork, so this does not make it as good as one
++/// the unwind tables produced. It records that the guess landed somewhere the module
++/// describes, which is more than a bare scan can say.
++pub(crate) fn promote_frame(frame: &mut StackFrame) {
++    frame.trust = FrameTrust::CfiScan;
++    frame.claimed_trust = FrameTrust::CfiScan;
++}
++
++/// Tracks whether the walk has already recorded a frame off the thread's stack.
++///
++/// One frame off the stack is recoverable, because the unwinder may find its way back.
++/// A second one means the walk is no longer following the thread's stack at all, whether
++/// or not the two are adjacent, so an intervening contained frame does not clear this.
++#[derive(Debug, Default)]
++pub(crate) struct DegradeRun {
++    already_degraded: bool,
++}
++
++impl DegradeRun {
++    pub(crate) fn new() -> DegradeRun {
++        DegradeRun {
++            already_degraded: false,
++        }
++    }
++
++    /// Record whether the newest frame was degraded.
++    ///
++    /// Returns the termination to record when this frame is the second degraded one of
++    /// the walk, in which case the frame must not become part of the result.
++    pub(crate) fn observe(&mut self, degraded: bool) -> Option<WalkTermination> {
++        if !degraded {
++            return None;
++        }
++        if self.already_degraded {
++            return Some(WalkTermination::LeftStackRegion);
++        }
++        self.already_degraded = true;
++        None
++    }
++}
++
++/// Decide whether a freshly produced frame belongs to the thread's stack.
++///
++/// The frame is only inspected once it has been produced and returned by an
++/// architecture's unwinder, so nothing here can influence how that unwinder chose to
++/// recover it.
++pub(crate) fn containment_reason(
++    region: Option<StackRegion>,
++    frame: &StackFrame,
++) -> Option<DegradeReason> {
++    let region = region?;
++    let stack_pointer = frame.context.get_stack_pointer();
++    if region.contains(stack_pointer) {
++        None
++    } else {
++        Some(DegradeReason::OutsideStackRegion)
++    }
++}
++
++/// The greatest number of frames a single walk will record.
++///
++/// A walk that reaches this has stopped describing a real call chain, and going
++/// further only costs time and produces noise.
++pub const MAX_WALK_FRAMES: usize = 1024;
+diff --git a/minidump-unwind/src/lib.rs b/minidump-unwind/src/lib.rs
+index b4539bb..d9f6c72 100644
+--- a/minidump-unwind/src/lib.rs
++++ b/minidump-unwind/src/lib.rs
+@@ -10,6 +10,7 @@ mod amd64;
+ mod arm;
+ mod arm64;
+ mod arm64_old;
++pub mod bounds;
+ mod mips;
+ pub mod symbols;
+ pub mod system_info;
+@@ -22,11 +23,18 @@ use std::borrow::Cow;
+ use std::collections::{BTreeMap, BTreeSet, HashSet};
+ use std::convert::TryFrom;
+ use std::io::{self, Write};
++use std::sync::atomic::{AtomicBool, Ordering};
+ use tracing::trace;
+ 
++pub use crate::bounds::*;
+ pub use crate::symbols::*;
+ pub use crate::system_info::*;
+ 
++use crate::bounds::{
++    can_be_corroborated, containment_reason, degrade_frame, promote_frame, DegradeRun,
++    UnwindInfoProbe,
++};
++
+ #[derive(Clone, Copy)]
+ struct GetCallerFrameArgs<'a, P> {
+     callee_frame: &'a StackFrame,
+@@ -35,6 +43,11 @@ struct GetCallerFrameArgs<'a, P> {
+     modules: &'a MinidumpModuleList,
+     system_info: &'a SystemInfo,
+     symbol_provider: &'a P,
++    /// Set when unwind information declares the callee has no caller.
++    ///
++    /// This is shared with the walker each architecture builds so the answer
++    /// survives the strategy that discovered it being abandoned.
++    end_of_stack: &'a AtomicBool,
+ }
+ 
+ impl<P> GetCallerFrameArgs<'_, P> {
+@@ -261,8 +274,22 @@ pub struct StackFrame {
+ 
+     /// Amount of trust the stack walker has in the instruction pointer
+     /// of this frame.
++    ///
++    /// This is the value the rest of the walk observes. If the containment rules
++    /// reduced it, [`StackFrame::claimed_trust`][] holds what the unwinder reported.
+     pub trust: FrameTrust,
+ 
++    /// The trust the unwinder originally reported for this frame.
++    ///
++    /// Equal to [`StackFrame::trust`][] unless the containment rules reduced it.
++    pub claimed_trust: FrameTrust,
++
++    /// Whether the containment rules reduced this frame's trust.
++    pub trust_degraded: bool,
++
++    /// Why this frame's trust was reduced, if it was.
++    pub degrade_reason: Option<DegradeReason>,
++
+     /// The CPU context containing register state for this frame.
+     pub context: MinidumpContext,
+ 
+@@ -288,6 +315,9 @@ impl StackFrame {
+             inlines: Vec::new(),
+             arguments: None,
+             trust,
++            claimed_trust: trust,
++            trust_degraded: false,
++            degrade_reason: None,
+             context,
+         }
+     }
+@@ -332,6 +362,8 @@ pub enum CallStackInfo {
+     UnsupportedCpu,
+     /// This thread wrote the minidump, it was skipped.
+     DumpThreadSkipped,
++    /// The walk was cut short because it left the thread's stack.
++    WalkTruncated,
+ }
+ 
+ /// A stack of `StackFrame`s produced as a result of unwinding a thread.
+@@ -350,6 +382,8 @@ pub struct CallStack {
+     pub thread_name: Option<String>,
+     /// The GetLastError() value stored in the TEB.
+     pub last_error_value: Option<CrashReason>,
++    /// Why the walk stopped producing frames.
++    pub termination: WalkTermination,
+ }
+ 
+ impl CallStack {
+@@ -363,6 +397,7 @@ impl CallStack {
+             thread_id: 0,
+             thread_name: None,
+             last_error_value: None,
++            termination: WalkTermination::Exhausted,
+         }
+     }
+ 
+@@ -374,7 +409,45 @@ impl CallStack {
+             thread_id: id,
+             thread_name: None,
+             last_error_value: None,
++            termination: WalkTermination::Exhausted,
++        }
++    }
++
++    /// How many frames had their trust reduced by the containment rules.
++    pub fn degraded_frame_count(&self) -> usize {
++        self.frames
++            .iter()
++            .filter(|frame| frame.trust_degraded)
++            .count()
++    }
++
++    /// How many frames from the innermost one were recorded without any reduction.
++    ///
++    /// This is the part of the stack that can be read at face value, which is usually
++    /// what a reader wants before deciding how much of the rest to believe.
++    pub fn trusted_prefix_len(&self) -> usize {
++        self.frames
++            .iter()
++            .position(|frame| frame.trust_degraded)
++            .unwrap_or(self.frames.len())
++    }
++
++    /// How many frames were degraded for each recorded reason.
++    ///
++    /// Reasons that did not occur are absent rather than present with a zero.
++    pub fn degrade_reason_counts(&self) -> BTreeMap<&'static str, usize> {
++        let mut counts = BTreeMap::new();
++        for frame in &self.frames {
++            if let Some(reason) = frame.degrade_reason {
++                *counts.entry(reason.as_str()).or_insert(0) += 1;
++            }
+         }
++        counts
++    }
++
++    /// Whether the walk was cut short instead of running out of callers.
++    pub fn is_truncated(&self) -> bool {
++        self.termination.is_truncated()
+     }
+ 
+     /// Write a human-readable description of the call stack to `f`.
+@@ -512,6 +585,16 @@ impl CallStack {
+ 
+             // And the trust we have of this result
+             writeln!(f, "    Found by: {}", frame.trust.description())?;
++            if frame.trust_degraded {
++                writeln!(
++                    f,
++                    "    Trust reduced from: {}",
++                    frame.claimed_trust.description()
++                )?;
++                if let Some(reason) = frame.degrade_reason {
++                    writeln!(f, "    Reduced because: {}", reason.as_str())?;
++                }
++            }
+ 
+             // Now print out recovered args
+             if let Some(args) = &frame.arguments {
+@@ -546,6 +629,18 @@ impl CallStack {
+                 writeln!(f)?;
+             }
+         }
++        if self.termination != WalkTermination::Exhausted {
++            writeln!(f, "    Walk stopped: {}", self.termination.description())?;
++            let degraded = self.degraded_frame_count();
++            if degraded > 0 {
++                writeln!(
++                    f,
++                    "    Frames with reduced trust: {} of {}",
++                    degraded,
++                    self.frames.len()
++                )?;
++            }
++        }
+         Ok(())
+     }
+ }
+@@ -563,6 +658,7 @@ struct CfiStackWalker<'a, C: CpuContext> {
+     caller_validity: HashSet<&'static str>,
+ 
+     cfi_rules_start_address: Option<u64>,
++    end_of_stack: &'a AtomicBool,
+ 
+     module: &'a MinidumpModule,
+     stack_memory: UnifiedMemory<'a, 'a>,
+@@ -600,6 +696,7 @@ where
+             caller_validity: callee_forwarded_regs(args.valid()),
+ 
+             cfi_rules_start_address: None,
++            end_of_stack: args.end_of_stack,
+ 
+             module,
+             stack_memory: args.stack_memory,
+@@ -664,6 +761,9 @@ where
+     fn set_cfi_rules_start_address(&mut self, addr: Option<u64>) {
+         self.cfi_rules_start_address = addr;
+     }
++    fn set_end_of_stack(&mut self) {
++        self.end_of_stack.store(true, Ordering::Relaxed);
++    }
+ }
+ 
+ #[tracing::instrument(name = "unwind_frame", level = "trace", skip_all, fields(idx = _frame_idx, fname = args.callee_frame.function_name.as_deref().unwrap_or("")))]
+@@ -761,6 +861,15 @@ pub async fn walk_stack<P>(
+     let stack_memory =
+         stack_memory.and_then(|stack_memory| stack_memory.memory_range().map(|_| stack_memory));
+ 
++    let region = stack_memory.and_then(StackRegion::from_memory);
++    let end_of_stack = AtomicBool::new(false);
++    let mut degrade_run = DegradeRun::new();
++    stack.termination = if stack_memory.is_none() {
++        WalkTermination::NoStackMemory
++    } else {
++        WalkTermination::Exhausted
++    };
++
+     // Begin with the context frame, and keep getting callers until there are no more.
+     let mut has_new_frame = !stack.frames.is_empty();
+     let mut on_walked_frame = on_walked_frame.into();
+@@ -791,6 +900,7 @@ pub async fn walk_stack<P>(
+             Some(name) => trace!("unwinding {}", name),
+             None => trace!("unwinding 0x{:016x}", callee_frame.instruction),
+         }
++        end_of_stack.store(false, Ordering::Relaxed);
+         let new_frame = get_caller_frame(
+             frame_idx,
+             &GetCallerFrameArgs {
+@@ -800,17 +910,56 @@ pub async fn walk_stack<P>(
+                 modules,
+                 system_info,
+                 symbol_provider,
++                end_of_stack: &end_of_stack,
+             },
+         )
+         .await;
+ 
++        // A declared end of the call chain outranks whatever a later strategy managed
++        // to produce, because those frames were never on the stack to begin with.
++        if end_of_stack.load(Ordering::Relaxed) {
++            trace!("{}", WalkTermination::EndOfStack.description());
++            stack.termination = WalkTermination::EndOfStack;
++            break;
++        }
++
+         // Check if we're done
+-        if let Some(new_frame) = new_frame {
+-            stack.frames.push(new_frame);
++        if let Some(mut new_frame) = new_frame {
++            // The frame has already been produced and returned by its unwinder, so
++            // nothing decided here could have changed how it was recovered.
++            //
++            // Corroboration is considered first and containment second, so a frame that
++            // is corroborated but off the stack still ends up reduced.
++            if can_be_corroborated(&new_frame)
++                && frame_has_unwind_info(&new_frame, modules, symbol_provider).await
++            {
++                trace!("scan landed on unwind info, raising trust");
++                promote_frame(&mut new_frame);
++            }
++            let reason = containment_reason(region, &new_frame);
++            if let Some(reason) = reason {
++                trace!("degrading frame trust: {}", reason.as_str());
++                degrade_frame(&mut new_frame, reason);
++            }
++            if let Some(termination) = degrade_run.observe(new_frame.trust_degraded) {
++                trace!("{}", termination.description());
++                stack.termination = termination;
++                has_new_frame = false;
++            } else {
++                stack.frames.push(new_frame);
++                if stack.frames.len() >= MAX_WALK_FRAMES {
++                    trace!("{}", WalkTermination::FrameLimit.description());
++                    stack.termination = WalkTermination::FrameLimit;
++                    has_new_frame = false;
++                }
++            }
+         } else {
+             has_new_frame = false;
+         }
+     }
++    if stack.termination.is_truncated() {
++        stack.info = CallStackInfo::WalkTruncated;
++    }
+     trace!(
+         "finished stack unwind of thread {} {}\n",
+         stack.thread_id,
+@@ -818,6 +967,23 @@ pub async fn walk_stack<P>(
+     );
+ }
+ 
++/// Whether unwind information covers where a frame landed.
++async fn frame_has_unwind_info<P>(
++    frame: &StackFrame,
++    modules: &MinidumpModuleList,
++    symbol_provider: &P,
++) -> bool
++where
++    P: SymbolProvider + Sync,
++{
++    let Some(module) = modules.module_at_address(frame.instruction) else {
++        return false;
++    };
++    let mut probe = UnwindInfoProbe::new(frame.instruction);
++    let _ = symbol_provider.walk_frame(module, &mut probe).await;
++    probe.covered()
++}
++
+ /// Checks if we can dismiss the validity of an instruction based on our symbols,
+ /// to refine the quality of each unwinder's instruction_seems_valid implementation.
+ async fn instruction_seems_valid_by_symbols<P>(

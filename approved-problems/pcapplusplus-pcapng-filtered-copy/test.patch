@@ -1,0 +1,1341 @@
+diff --git a/Tests/CMakeLists.txt b/Tests/CMakeLists.txt
+index f684a169..b1796b74 100644
+--- a/Tests/CMakeLists.txt
++++ b/Tests/CMakeLists.txt
+@@ -5,6 +5,7 @@ if(PCAPPP_BUILD_TESTS)
+ 
+   if(PCAPPP_BUILD_PCAPPP)
+     add_subdirectory(Pcap++Test)
++    add_subdirectory(PcapNgCopyTest)
+   endif()
+ endif()
+ 
+diff --git a/Tests/PcapNgCopyTest/CMakeLists.txt b/Tests/PcapNgCopyTest/CMakeLists.txt
+new file mode 100644
+index 00000000..bfed8fbb
+--- /dev/null
++++ b/Tests/PcapNgCopyTest/CMakeLists.txt
+@@ -0,0 +1,29 @@
++add_executable(PcapNgCopyTest PcapNgCopyTest.cpp)
++
++target_link_libraries(PcapNgCopyTest PRIVATE Pcap++)
++
++foreach(
++  scenario
++  StructureAndFiltering
++  InPlaceReplacement
++  InterfaceSelection
++  OptionPreservation
++  DiscardedPacketOptions
++  OptionTermination
++  FilterState
++  DefaultAndClearedFilter
++  ReservedFieldOpacity
++  LocalUseOpacity
++  ReaderLifecycle
++  NoMatchingPackets
++  MalformedFraming
++  MalformedOptions
++  MalformedReferences
++  UnsupportedAndIo
++)
++  add_test(
++    NAME PcapNgCopy.${scenario}
++    COMMAND $<TARGET_FILE:PcapNgCopyTest> ${scenario}
++    WORKING_DIRECTORY $<TARGET_FILE_DIR:PcapNgCopyTest>
++  )
++endforeach()
+diff --git a/Tests/PcapNgCopyTest/PcapNgCopyTest.cpp b/Tests/PcapNgCopyTest/PcapNgCopyTest.cpp
+new file mode 100644
+index 00000000..92c6504f
+--- /dev/null
++++ b/Tests/PcapNgCopyTest/PcapNgCopyTest.cpp
+@@ -0,0 +1,1118 @@
++#include "PcapFileDevice.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdint>
++#include <fstream>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace
++{
++	enum class ByteOrder
++	{
++		Little,
++		Big
++	};
++
++	using Bytes = std::vector<uint8_t>;
++
++	constexpr uint32_t SectionHeader = 0x0a0d0d0a;
++	constexpr uint32_t InterfaceDescription = 1;
++	constexpr uint32_t ObsoletePacket = 2;
++	constexpr uint32_t SimplePacket = 3;
++	constexpr uint32_t NameResolution = 4;
++	constexpr uint32_t InterfaceStatistics = 5;
++	constexpr uint32_t EnhancedPacket = 6;
++	constexpr uint32_t DecryptionSecrets = 10;
++	constexpr uint32_t CopyableCustom = 0x00000bad;
++	constexpr uint32_t DoNotCopyCustom = 0x40000bad;
++	constexpr uint32_t LocalUseBlock = 0x80000001;
++	constexpr uint32_t UnknownBlock = 0x8000beef;
++	constexpr uint16_t CopyableCustomOption = 2989;
++	constexpr uint16_t DoNotCopyCustomOption = 19373;
++
++	void require(bool condition, const std::string& message)
++	{
++		if (!condition)
++			throw std::runtime_error(message);
++	}
++
++	void append16(Bytes& bytes, uint16_t value, ByteOrder order)
++	{
++		if (order == ByteOrder::Little)
++		{
++			bytes.push_back(static_cast<uint8_t>(value));
++			bytes.push_back(static_cast<uint8_t>(value >> 8));
++		}
++		else
++		{
++			bytes.push_back(static_cast<uint8_t>(value >> 8));
++			bytes.push_back(static_cast<uint8_t>(value));
++		}
++	}
++
++	void append32(Bytes& bytes, uint32_t value, ByteOrder order)
++	{
++		if (order == ByteOrder::Little)
++		{
++			for (unsigned shift = 0; shift < 32; shift += 8)
++				bytes.push_back(static_cast<uint8_t>(value >> shift));
++		}
++		else
++		{
++			for (int shift = 24; shift >= 0; shift -= 8)
++				bytes.push_back(static_cast<uint8_t>(value >> shift));
++		}
++	}
++
++	void append64(Bytes& bytes, uint64_t value, ByteOrder order)
++	{
++		if (order == ByteOrder::Little)
++		{
++			for (unsigned shift = 0; shift < 64; shift += 8)
++				bytes.push_back(static_cast<uint8_t>(value >> shift));
++		}
++		else
++		{
++			for (int shift = 56; shift >= 0; shift -= 8)
++				bytes.push_back(static_cast<uint8_t>(value >> shift));
++		}
++	}
++
++	uint16_t read16(const uint8_t* data, ByteOrder order)
++	{
++		if (order == ByteOrder::Little)
++			return static_cast<uint16_t>(data[0] | (data[1] << 8));
++		return static_cast<uint16_t>((data[0] << 8) | data[1]);
++	}
++
++	uint32_t read32(const uint8_t* data, ByteOrder order)
++	{
++		uint32_t value = 0;
++		if (order == ByteOrder::Little)
++		{
++			for (int index = 3; index >= 0; --index)
++				value = (value << 8) | data[index];
++		}
++		else
++		{
++			for (int index = 0; index < 4; ++index)
++				value = (value << 8) | data[index];
++		}
++		return value;
++	}
++
++	uint64_t read64(const uint8_t* data, ByteOrder order)
++	{
++		uint64_t value = 0;
++		if (order == ByteOrder::Little)
++		{
++			for (int index = 7; index >= 0; --index)
++				value = (value << 8) | data[index];
++		}
++		else
++		{
++			for (int index = 0; index < 8; ++index)
++				value = (value << 8) | data[index];
++		}
++		return value;
++	}
++
++	void set16(Bytes& bytes, size_t offset, uint16_t value, ByteOrder order)
++	{
++		Bytes encoded;
++		append16(encoded, value, order);
++		std::copy(encoded.begin(), encoded.end(), bytes.begin() + static_cast<std::ptrdiff_t>(offset));
++	}
++
++	void set32(Bytes& bytes, size_t offset, uint32_t value, ByteOrder order)
++	{
++		Bytes encoded;
++		append32(encoded, value, order);
++		std::copy(encoded.begin(), encoded.end(), bytes.begin() + static_cast<std::ptrdiff_t>(offset));
++	}
++
++	void set64(Bytes& bytes, size_t offset, uint64_t value, ByteOrder order)
++	{
++		Bytes encoded;
++		append64(encoded, value, order);
++		std::copy(encoded.begin(), encoded.end(), bytes.begin() + static_cast<std::ptrdiff_t>(offset));
++	}
++
++	void appendPadded(Bytes& bytes, const Bytes& value)
++	{
++		bytes.insert(bytes.end(), value.begin(), value.end());
++		while (bytes.size() % 4 != 0)
++			bytes.push_back(0);
++	}
++
++	Bytes text(const std::string& value)
++	{
++		return Bytes(value.begin(), value.end());
++	}
++
++	void appendOption(Bytes& body, ByteOrder order, uint16_t code, const Bytes& value)
++	{
++		append16(body, code, order);
++		append16(body, static_cast<uint16_t>(value.size()), order);
++		appendPadded(body, value);
++	}
++
++	void finishOptions(Bytes& body, ByteOrder order)
++	{
++		append16(body, 0, order);
++		append16(body, 0, order);
++	}
++
++	void appendStandardCustomOptions(Bytes& body, ByteOrder order, uint8_t marker)
++	{
++		Bytes copyable;
++		append32(copyable, 32473, order);
++		copyable.insert(copyable.end(), { marker, 0xc0, 0x50, 0x59 });
++		appendOption(body, order, CopyableCustomOption, copyable);
++
++		Bytes doNotCopy;
++		append32(doNotCopy, 32473, order);
++		doNotCopy.insert(doNotCopy.end(), { marker, 0x4e, 0x43, 0x50 });
++		appendOption(body, order, DoNotCopyCustomOption, doNotCopy);
++	}
++
++	Bytes makeBlock(ByteOrder order, uint32_t type, const Bytes& body)
++	{
++		Bytes result;
++		const uint32_t length = static_cast<uint32_t>(body.size() + 12);
++		append32(result, type, order);
++		append32(result, length, order);
++		result.insert(result.end(), body.begin(), body.end());
++		append32(result, length, order);
++		return result;
++	}
++
++	Bytes withoutEndOption(Bytes block, ByteOrder order)
++	{
++		require(block.size() >= 16, "option block is too short");
++		require(read32(block.data() + block.size() - 8, order) == 0, "option block has no final end marker");
++		block.erase(block.end() - 8, block.end() - 4);
++		const auto blockLength = static_cast<uint32_t>(block.size());
++		set32(block, 4, blockLength, order);
++		set32(block, block.size() - 4, blockLength, order);
++		return block;
++	}
++
++	Bytes makeSectionHeader(ByteOrder order, uint64_t sectionLength, const std::string& comment)
++	{
++		Bytes body;
++		append32(body, 0x1a2b3c4d, order);
++		append16(body, 1, order);
++		append16(body, 0, order);
++		append64(body, sectionLength, order);
++		appendOption(body, order, 1, text(comment));
++		finishOptions(body, order);
++		return makeBlock(order, SectionHeader, body);
++	}
++
++	Bytes makeInterface(ByteOrder order, uint16_t linkType, uint32_t snapLength, uint8_t resolution,
++	                    const std::string& name, bool customOptions = false)
++	{
++		Bytes body;
++		append16(body, linkType, order);
++		append16(body, 0, order);
++		append32(body, snapLength, order);
++		appendOption(body, order, 2, text(name));
++		appendOption(body, order, 3, text("description-" + name));
++		appendOption(body, order, 9, Bytes{ resolution });
++		Bytes offset;
++		append64(offset, 7, order);
++		appendOption(body, order, 14, offset);
++		appendOption(body, order, 0x1234, Bytes{ 0xde, 0xad, 0xbe });
++		if (customOptions)
++			appendStandardCustomOptions(body, order, static_cast<uint8_t>(name.size()));
++		finishOptions(body, order);
++		return makeBlock(order, InterfaceDescription, body);
++	}
++
++	Bytes makeIpv4Packet(bool ethernet, uint8_t protocol, uint8_t marker)
++	{
++		Bytes packet;
++		if (ethernet)
++		{
++			packet.insert(packet.end(),
++			              { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0x08, 0x00 });
++		}
++		else
++		{
++			packet.insert(packet.end(), { 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0x00,
++			                              0x00, 0x08, 0x00 });
++		}
++
++		const uint16_t transportLength = protocol == 6 ? 20 : 8;
++		const uint16_t totalLength = static_cast<uint16_t>(20 + transportLength);
++		packet.insert(packet.end(), { 0x45, marker });
++		packet.push_back(static_cast<uint8_t>(totalLength >> 8));
++		packet.push_back(static_cast<uint8_t>(totalLength));
++		packet.insert(packet.end(), { 0x12, marker, 0x00, 0x00, 0x40, protocol, 0x00, 0x00, 192, 0, 2, marker, 198, 51,
++		                              100, marker });
++		if (protocol == 6)
++		{
++			packet.insert(packet.end(),
++			              { 0x04, 0xd2, 0x01, 0xbb, 0, 0, 0, marker, 0, 0, 0, 0, 0x50, 0x02, 0x20, 0, 0, 0, 0, 0 });
++		}
++		else
++		{
++			packet.insert(packet.end(), { 0x14, 0xe9, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00 });
++		}
++		return packet;
++	}
++
++	Bytes makeEnhancedPacket(ByteOrder order, const Bytes& packet, uint64_t timestamp, uint32_t originalLength,
++	                         const std::string& comment, uint8_t marker, uint32_t interfaceId = 0,
++	                         bool customOptions = false)
++	{
++		Bytes body;
++		append32(body, interfaceId, order);
++		append32(body, static_cast<uint32_t>(timestamp >> 32), order);
++		append32(body, static_cast<uint32_t>(timestamp), order);
++		append32(body, static_cast<uint32_t>(packet.size()), order);
++		append32(body, originalLength, order);
++		appendPadded(body, packet);
++		appendOption(body, order, 1, text(comment));
++		Bytes flags;
++		append32(flags, 2, order);
++		appendOption(body, order, 2, flags);
++		appendOption(body, order, 3, Bytes{ 2, marker, 0x5a, 0xa5 });
++		Bytes dropCount;
++		append64(dropCount, 3 + marker, order);
++		appendOption(body, order, 4, dropCount);
++		Bytes packetId;
++		append64(packetId, 0x0102030405060700ULL | marker, order);
++		appendOption(body, order, 5, packetId);
++		Bytes queue;
++		append32(queue, marker, order);
++		appendOption(body, order, 6, queue);
++		appendOption(body, order, 0x2222, Bytes{ marker, 0xca, 0xfe });
++		if (customOptions)
++			appendStandardCustomOptions(body, order, marker);
++		finishOptions(body, order);
++		return makeBlock(order, EnhancedPacket, body);
++	}
++
++	Bytes makeSimplePacket(ByteOrder order, const Bytes& packet, uint32_t originalLength)
++	{
++		Bytes body;
++		append32(body, originalLength, order);
++		appendPadded(body, packet);
++		return makeBlock(order, SimplePacket, body);
++	}
++
++	Bytes makeNameResolution(ByteOrder order, const std::string& name, uint8_t addressSuffix)
++	{
++		Bytes body;
++		Bytes record{ 203, 0, 113, addressSuffix };
++		record.insert(record.end(), name.begin(), name.end());
++		record.push_back(0);
++		append16(body, 1, order);
++		append16(body, static_cast<uint16_t>(record.size()), order);
++		appendPadded(body, record);
++		append16(body, 0, order);
++		append16(body, 0, order);
++		appendOption(body, order, 1, text("nrb-" + name));
++		finishOptions(body, order);
++		return makeBlock(order, NameResolution, body);
++	}
++
++	Bytes makeInterfaceStatistics(ByteOrder order, uint64_t timestamp, uint64_t received, uint32_t interfaceId = 0)
++	{
++		Bytes body;
++		append32(body, interfaceId, order);
++		append32(body, static_cast<uint32_t>(timestamp >> 32), order);
++		append32(body, static_cast<uint32_t>(timestamp), order);
++		Bytes receivedValue;
++		append64(receivedValue, received, order);
++		appendOption(body, order, 4, receivedValue);
++		appendOption(body, order, 1, text("interface-statistics-" + std::to_string(interfaceId)));
++		finishOptions(body, order);
++		return makeBlock(order, InterfaceStatistics, body);
++	}
++
++	Bytes makeSecrets(ByteOrder order, const std::string& secret)
++	{
++		Bytes body;
++		append32(body, 0x544c534b, order);
++		append32(body, static_cast<uint32_t>(secret.size()), order);
++		appendPadded(body, text(secret));
++		appendOption(body, order, 1, text("opaque-secret"));
++		finishOptions(body, order);
++		return makeBlock(order, DecryptionSecrets, body);
++	}
++
++	Bytes makeCustom(ByteOrder order, uint32_t type, uint32_t pen, uint8_t marker)
++	{
++		Bytes body;
++		append32(body, pen, order);
++		body.insert(body.end(), { marker, 0xaa, 0x55, marker });
++		return makeBlock(order, type, body);
++	}
++
++	Bytes makeUnknown(ByteOrder order, uint8_t marker)
++	{
++		return makeBlock(order, UnknownBlock, Bytes{ marker, 1, 2, 3, 4, 5, 6, marker });
++	}
++
++	void appendBlock(Bytes& section, const Bytes& block)
++	{
++		section.insert(section.end(), block.begin(), block.end());
++	}
++
++	Bytes makeLittleSection(bool filtered, bool noMatches)
++	{
++		const auto order = ByteOrder::Little;
++		Bytes section = makeSectionHeader(order, 0, "little-endian-section");
++		const size_t headerLength = section.size();
++		appendBlock(section, makeInterface(order, 1, 65535, 6, "eth-little"));
++		if (!filtered || !noMatches)
++		{
++			appendBlock(section,
++			            makeEnhancedPacket(order, makeIpv4Packet(true, noMatches ? 17 : 6, 1), 0x000000020001e241ULL,
++			                               80, noMatches ? "drop-little-udp-one" : "keep-little-tcp", 1));
++		}
++		appendBlock(section, makeNameResolution(order, "little.example", 1));
++		if (!filtered)
++			appendBlock(section, makeCustom(order, DoNotCopyCustom, 32473, 0xd1));
++		if (!filtered)
++		{
++			appendBlock(section, makeEnhancedPacket(order, makeIpv4Packet(true, 17, 2), 0x0000000200067932ULL, 72,
++			                                        "drop-little-udp-two", 2));
++		}
++		appendBlock(section, makeInterfaceStatistics(order, 0x0000000200080001ULL, 17));
++		appendBlock(section, makeCustom(order, CopyableCustom, 32473, 0xc1));
++		appendBlock(section, makeUnknown(order, 0xa1));
++		appendBlock(section, makeSecrets(order, "CLIENT_RANDOM 0102 0304\n"));
++		set64(section, 16, section.size() - headerLength, order);
++		return section;
++	}
++
++	Bytes makeBigSection(bool filtered, bool noMatches)
++	{
++		const auto order = ByteOrder::Big;
++		Bytes section = makeSectionHeader(order, UINT64_MAX, "big-endian-section");
++		appendBlock(section, makeInterface(order, 113, 56, 9, "sll-big"));
++		appendBlock(section, makeSecrets(order, "SERVER_HANDSHAKE_TRAFFIC_SECRET 0a 0b\n"));
++		if (!filtered)
++		{
++			appendBlock(section, makeEnhancedPacket(order, makeIpv4Packet(false, 17, 3), 0x0102030405060708ULL, 64,
++			                                        "drop-big-udp", 3));
++		}
++		appendBlock(section, makeNameResolution(order, "big.example", 2));
++		appendBlock(section, makeCustom(order, CopyableCustom, 32473, 0xc2));
++		if (!filtered || !noMatches)
++		{
++			auto packet = makeIpv4Packet(false, noMatches ? 17 : 6, 4);
++			if (noMatches)
++				packet.resize(56, 0);
++			appendBlock(section, makeSimplePacket(order, packet, 72));
++		}
++		appendBlock(section, makeInterfaceStatistics(order, 0x1112131415161718ULL, 23));
++		if (!filtered)
++			appendBlock(section, makeCustom(order, DoNotCopyCustom, 32473, 0xd2));
++		appendBlock(section, makeUnknown(order, 0xa2));
++		return section;
++	}
++
++	Bytes makeComplexCapture(bool filtered, bool noMatches)
++	{
++		Bytes result = makeLittleSection(filtered, noMatches);
++		appendBlock(result, makeBigSection(filtered, noMatches));
++		return result;
++	}
++
++	Bytes makeInterfaceSelectionSection(ByteOrder order, bool filtered)
++	{
++		const bool ethernetPacket = order == ByteOrder::Little;
++		const uint16_t firstLinkType = ethernetPacket ? 113 : 1;
++		const uint16_t secondLinkType = ethernetPacket ? 1 : 113;
++		const uint64_t declaredLength = order == ByteOrder::Little ? 0 : UINT64_MAX;
++		Bytes section =
++		    makeSectionHeader(order, declaredLength, ethernetPacket ? "multi-interface-little" : "multi-interface-big");
++		const size_t headerLength = section.size();
++		appendBlock(section, makeInterface(order, firstLinkType, 96, 6, "unused-interface-zero"));
++		appendBlock(section, makeInterface(order, secondLinkType, 65535, 9, "selected-interface-one"));
++		appendBlock(section, makeEnhancedPacket(order, makeIpv4Packet(ethernetPacket, 6, ethernetPacket ? 31 : 41),
++		                                        ethernetPacket ? 0x0102030405060708ULL : 0x1112131415161718ULL, 96,
++		                                        "keep-interface-one-tcp", ethernetPacket ? 31 : 41, 1));
++		if (!filtered)
++		{
++			appendBlock(section, makeEnhancedPacket(order, makeIpv4Packet(ethernetPacket, 17, ethernetPacket ? 32 : 42),
++			                                        ethernetPacket ? 0x2122232425262728ULL : 0x3132333435363738ULL, 96,
++			                                        "drop-interface-one-udp", ethernetPacket ? 32 : 42, 1));
++		}
++		appendBlock(section, makeInterfaceStatistics(order, 0x4142434445464748ULL, 29, 1));
++		if (order == ByteOrder::Little)
++			set64(section, 16, section.size() - headerLength, order);
++		return section;
++	}
++
++	Bytes makeInterfaceSelectionCapture(bool filtered)
++	{
++		Bytes result = makeInterfaceSelectionSection(ByteOrder::Little, filtered);
++		appendBlock(result, makeInterfaceSelectionSection(ByteOrder::Big, filtered));
++		return result;
++	}
++
++	Bytes makeOptionCapture()
++	{
++		const auto order = ByteOrder::Little;
++		Bytes result = makeSectionHeader(order, UINT64_MAX, "custom-options");
++		appendBlock(result, makeInterface(order, 1, 65535, 6, "custom-option-interface", true));
++		appendBlock(result, makeEnhancedPacket(order, makeIpv4Packet(true, 6, 51), 0x5152535455565758ULL, 96,
++		                                       "custom-option-packet", 51, 0, true));
++		appendBlock(result, makeInterfaceStatistics(order, 0x6162636465666768ULL, 31));
++		appendBlock(result, makeNameResolution(order, "options.example", 51));
++		appendBlock(result, makeSecrets(order, "CLIENT_RANDOM 5152 5354\n"));
++		return result;
++	}
++
++	Bytes makeDiscardedOptionCapture(bool filtered)
++	{
++		const auto order = ByteOrder::Little;
++		Bytes result = makeSectionHeader(order, UINT64_MAX, "discarded-packet-options");
++		appendBlock(result, makeInterface(order, 1, 65535, 6, "discarded-option-interface"));
++		if (!filtered)
++		{
++			const auto udp = makeIpv4Packet(true, 17, 61);
++			auto discarded = makeEnhancedPacket(order, udp, 61, 80, "discard-malformed-options", 61);
++			const size_t optionsOffset = 28 + ((udp.size() + 3) & ~size_t(3));
++			set16(discarded, optionsOffset + 2, 0xfffc, order);
++			appendBlock(result, discarded);
++		}
++		appendBlock(result, makeEnhancedPacket(order, makeIpv4Packet(true, 6, 62), 62, 80, "keep-valid-options", 62));
++		return result;
++	}
++
++	Bytes makeOptionTerminationSection(ByteOrder order, uint8_t marker)
++	{
++		Bytes result = withoutEndOption(makeSectionHeader(order, UINT64_MAX, "unterminated-options"), order);
++		appendBlock(result, withoutEndOption(makeInterface(order, 1, 65535, 6, "unterminated-interface"), order));
++		appendBlock(result, withoutEndOption(makeEnhancedPacket(order, makeIpv4Packet(true, 6, marker), marker, 80,
++		                                                        "unterminated-packet", marker),
++		                                     order));
++		appendBlock(result, withoutEndOption(makeInterfaceStatistics(order, marker, marker), order));
++		appendBlock(result, withoutEndOption(makeNameResolution(order, "unterminated.example", marker), order));
++		appendBlock(result, withoutEndOption(makeSecrets(order, "CLIENT_RANDOM 7172 7374\n"), order));
++		return result;
++	}
++
++	Bytes makeOptionTerminationCapture()
++	{
++		Bytes result = makeOptionTerminationSection(ByteOrder::Little, 71);
++		appendBlock(result, makeOptionTerminationSection(ByteOrder::Big, 72));
++		return result;
++	}
++
++	Bytes makeFilterStateCapture(bool filtered)
++	{
++		const auto order = ByteOrder::Little;
++		Bytes result = makeSectionHeader(order, UINT64_MAX, "filter-state");
++		appendBlock(result, makeInterface(order, 1, 65535, 6, "filter-state-interface"));
++		if (!filtered)
++		{
++			appendBlock(result, makeEnhancedPacket(order, makeIpv4Packet(true, 6, 81), 81, 80,
++			                                       "reject-current-filter-tcp", 81));
++		}
++		appendBlock(result,
++		            makeEnhancedPacket(order, makeIpv4Packet(true, 17, 82), 82, 80, "keep-current-filter-udp", 82));
++		if (!filtered)
++			appendBlock(result, makeSimplePacket(order, makeIpv4Packet(true, 6, 83), 54));
++		appendBlock(result, makeSimplePacket(order, makeIpv4Packet(true, 17, 84), 42));
++		return result;
++	}
++
++	Bytes makeReservedFieldCapture()
++	{
++		const auto order = ByteOrder::Little;
++		const auto packet = makeIpv4Packet(true, 6, 85);
++		Bytes result = makeSectionHeader(order, UINT64_MAX, "reserved-field");
++		auto interface = makeInterface(order, 1, 65535, 6, "reserved-field-interface");
++		set16(interface, 10, 0xa55a, order);
++		appendBlock(result, interface);
++		appendBlock(result, makeEnhancedPacket(order, packet, 85, 80, "reserved-field-epb", 85));
++		appendBlock(result, makeSimplePacket(order, packet, static_cast<uint32_t>(packet.size())));
++		return result;
++	}
++
++	Bytes makeLocalUseCapture()
++	{
++		const auto order = ByteOrder::Little;
++		const auto packet = makeIpv4Packet(true, 6, 86);
++		Bytes result = makeSectionHeader(order, UINT64_MAX, "local-use");
++		appendBlock(result, makeInterface(order, 1, 65535, 6, "local-use-interface"));
++		Bytes opaqueBody;
++		append32(opaqueBody, 0x10203040, order);
++		append16(opaqueBody, 0x1234, order);
++		append16(opaqueBody, 0xfffc, order);
++		appendBlock(result, makeBlock(order, LocalUseBlock, opaqueBody));
++		appendBlock(result, makeEnhancedPacket(order, packet, 86, 80, "local-use-epb", 86));
++		return result;
++	}
++
++	Bytes makeSimpleLengthCapture()
++	{
++		const auto order = ByteOrder::Little;
++		const auto packet = makeIpv4Packet(true, 6, 91);
++		Bytes result = makeSectionHeader(order, UINT64_MAX, "simple-length");
++		appendBlock(result, makeInterface(order, 1, 65535, 6, "simple-length-interface"));
++		appendBlock(result, makeSimplePacket(order, packet, static_cast<uint32_t>(packet.size())));
++		return result;
++	}
++
++	Bytes makeLifecycleCapture()
++	{
++		const auto order = ByteOrder::Little;
++		Bytes result = makeSectionHeader(order, UINT64_MAX, "lifecycle");
++		appendBlock(result, makeInterface(order, 1, 65535, 6, "lifecycle-eth"));
++		appendBlock(result, makeEnhancedPacket(order, makeIpv4Packet(true, 6, 10), 1001, 80, "lifecycle-first", 10));
++		appendBlock(result, makeEnhancedPacket(order, makeIpv4Packet(true, 6, 11), 1002, 81, "lifecycle-second", 11));
++		return result;
++	}
++
++	void writeFile(const std::string& path, const Bytes& bytes)
++	{
++		std::ofstream output(path, std::ios::binary | std::ios::trunc);
++		require(static_cast<bool>(output), "cannot open output fixture: " + path);
++		output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++		require(static_cast<bool>(output), "cannot write fixture: " + path);
++	}
++
++	Bytes readFile(const std::string& path)
++	{
++		std::ifstream input(path, std::ios::binary);
++		require(static_cast<bool>(input), "cannot open input fixture: " + path);
++		return Bytes(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
++	}
++
++	class Files
++	{
++	public:
++		~Files()
++		{
++			for (const auto& path : paths)
++				std::remove(path.c_str());
++		}
++
++		std::string add(const std::string& name)
++		{
++			const std::string path = "pcapng-copy-" + name;
++			std::remove(path.c_str());
++			paths.push_back(path);
++			return path;
++		}
++
++	private:
++		std::vector<std::string> paths;
++	};
++
++	struct ScanStats
++	{
++		size_t sections = 0;
++		size_t interfaces = 0;
++		size_t packets = 0;
++		size_t statistics = 0;
++		size_t names = 0;
++		size_t secrets = 0;
++		size_t copyableCustom = 0;
++		size_t doNotCopyCustom = 0;
++		size_t unknown = 0;
++	};
++
++	ScanStats scan(const Bytes& bytes)
++	{
++		ScanStats stats;
++		ByteOrder order = ByteOrder::Little;
++		size_t offset = 0;
++		size_t interfacesInSection = 0;
++		size_t finiteEnd = 0;
++		bool finite = false;
++		bool haveSection = false;
++		while (offset < bytes.size())
++		{
++			require(bytes.size() - offset >= 12, "scanner found truncated block");
++			const uint8_t* block = bytes.data() + offset;
++			const bool section = block[0] == 0x0a && block[1] == 0x0d && block[2] == 0x0d && block[3] == 0x0a;
++			if (section)
++			{
++				if (finite)
++					require(offset == finiteEnd, "finite section does not end at next SHB");
++				require(bytes.size() - offset >= 28, "short SHB");
++				if (block[8] == 0x4d && block[9] == 0x3c && block[10] == 0x2b && block[11] == 0x1a)
++					order = ByteOrder::Little;
++				else if (block[8] == 0x1a && block[9] == 0x2b && block[10] == 0x3c && block[11] == 0x4d)
++					order = ByteOrder::Big;
++				else
++					throw std::runtime_error("invalid scanner byte-order magic");
++				haveSection = true;
++				interfacesInSection = 0;
++				stats.sections++;
++			}
++			require(haveSection, "block before SHB");
++			const uint32_t type = read32(block, order);
++			const uint32_t length = read32(block + 4, order);
++			require(length >= 12 && length % 4 == 0 && length <= bytes.size() - offset, "invalid block length");
++			require(read32(block + length - 4, order) == length, "mismatched trailing block length");
++
++			if (type == SectionHeader)
++			{
++				require(section && read16(block + 12, order) == 1, "invalid section header");
++				const uint64_t declared = read64(block + 16, order);
++				finite = declared != UINT64_MAX;
++				if (finite)
++					finiteEnd = offset + length + static_cast<size_t>(declared);
++			}
++			else if (type == InterfaceDescription)
++			{
++				interfacesInSection++;
++				stats.interfaces++;
++			}
++			else if (type == EnhancedPacket)
++			{
++				require(length >= 32 && read32(block + 8, order) < interfacesInSection, "invalid EPB interface");
++				stats.packets++;
++			}
++			else if (type == SimplePacket)
++			{
++				require(interfacesInSection > 0, "SPB has no local IDB 0");
++				stats.packets++;
++			}
++			else if (type == InterfaceStatistics)
++			{
++				require(length >= 24 && read32(block + 8, order) < interfacesInSection, "invalid ISB interface");
++				stats.statistics++;
++			}
++			else if (type == NameResolution)
++				stats.names++;
++			else if (type == DecryptionSecrets)
++				stats.secrets++;
++			else if (type == CopyableCustom)
++				stats.copyableCustom++;
++			else if (type == DoNotCopyCustom)
++				stats.doNotCopyCustom++;
++			else if (type == UnknownBlock)
++				stats.unknown++;
++			offset += length;
++		}
++		if (finite)
++			require(offset == finiteEnd, "finite final section has wrong end");
++		return stats;
++	}
++
++	void verifyComplex(const Bytes& actual, const Bytes& expected, size_t packets)
++	{
++		require(actual == expected, "filtered output differs from expected retained bytes");
++		const auto stats = scan(actual);
++		require(stats.sections == 2 && stats.interfaces == 2, "section/interface count mismatch");
++		require(stats.packets == packets, "packet count mismatch");
++		require(stats.statistics == 2 && stats.names == 2 && stats.secrets == 2, "metadata block count mismatch");
++		require(stats.copyableCustom == 2 && stats.doNotCopyCustom == 0, "Custom Block copy policy mismatch");
++		require(stats.unknown == 2, "unknown block count mismatch");
++	}
++
++	bool copyTcp(const std::string& input, const std::string& output)
++	{
++		pcpp::PcapNgFileReaderDevice reader(input);
++		require(reader.setFilter("tcp"), "cannot configure TCP filter");
++		return reader.copyFiltered(output);
++	}
++
++	size_t findBlock(const Bytes& bytes, uint32_t wanted, size_t occurrence)
++	{
++		ByteOrder order = ByteOrder::Little;
++		size_t offset = 0;
++		while (offset < bytes.size())
++		{
++			const uint8_t* block = bytes.data() + offset;
++			const bool section = block[0] == 0x0a && block[1] == 0x0d && block[2] == 0x0d && block[3] == 0x0a;
++			if (section)
++			{
++				if (block[8] == 0x4d)
++					order = ByteOrder::Little;
++				else
++					order = ByteOrder::Big;
++			}
++			const uint32_t type = read32(block, order);
++			const uint32_t length = read32(block + 4, order);
++			if (type == wanted)
++			{
++				if (occurrence == 0)
++					return offset;
++				occurrence--;
++			}
++			offset += length;
++		}
++		throw std::runtime_error("block type not found");
++	}
++
++	void expectReject(const Bytes& inputBytes, const std::string& suffix)
++	{
++		Files files;
++		const auto input = files.add(suffix + "-input.pcapng");
++		const auto output = files.add(suffix + "-output.pcapng");
++		const Bytes sentinel{ 0x73, 0x61, 0x66, 0x65 };
++		writeFile(input, inputBytes);
++		writeFile(output, sentinel);
++		require(!copyTcp(input, output), "invalid input was accepted: " + suffix);
++		require(readFile(output) == sentinel, "destination changed after invalid input: " + suffix);
++	}
++
++	void testStructureAndFiltering()
++	{
++		Files files;
++		const auto input = files.add("structure-input.pcapng");
++		const auto output = files.add("structure-output.pcapng");
++		const auto inputBytes = makeComplexCapture(false, false);
++		const auto expected = makeComplexCapture(true, false);
++		writeFile(input, inputBytes);
++
++		pcpp::PcapNgFileReaderDevice reader(input);
++		require(!reader.isOpened(), "reader unexpectedly open");
++		require(reader.setFilter("tcp"), "cannot configure filter");
++		const pcpp::PcapNgFileReaderDevice& constReader = reader;
++		require(constReader.copyFiltered(output), "filtered copy failed");
++		require(!reader.isOpened(), "copy changed reader open state");
++		verifyComplex(readFile(output), expected, 2);
++	}
++
++	void testInPlaceReplacement()
++	{
++		Files files;
++		const auto path = files.add("in-place.pcapng");
++		writeFile(path, makeFilterStateCapture(false));
++
++		pcpp::PcapNgFileReaderDevice reader(path);
++		require(reader.setFilter("udp"), "cannot configure in-place filter");
++		require(reader.copyFiltered(path), "same-path filtered copy failed");
++		require(readFile(path) == makeFilterStateCapture(true), "same-path replacement differs");
++	}
++
++	void testInterfaceSelection()
++	{
++		Files files;
++		const auto input = files.add("interface-selection-input.pcapng");
++		const auto output = files.add("interface-selection-output.pcapng");
++		const auto expected = makeInterfaceSelectionCapture(true);
++		writeFile(input, makeInterfaceSelectionCapture(false));
++
++		require(copyTcp(input, output), "multi-interface filtered copy failed");
++		const auto actual = readFile(output);
++		require(actual == expected, "multi-interface output differs from expected retained bytes");
++		const auto stats = scan(actual);
++		require(stats.sections == 2, "multi-interface section count mismatch");
++		require(stats.interfaces == 4, "not all Interface Description Blocks were retained");
++		require(stats.packets == 2, "nonzero-interface packet filtering mismatch");
++		require(stats.statistics == 2, "nonzero-interface statistics blocks were not retained");
++	}
++
++	void testOptionPreservation()
++	{
++		Files files;
++		const auto input = files.add("option-preservation-input.pcapng");
++		const auto output = files.add("option-preservation-output.pcapng");
++		const auto bytes = makeOptionCapture();
++		writeFile(input, bytes);
++
++		require(copyTcp(input, output), "Custom Option filtered copy failed");
++		require(readFile(output) == bytes, "copyable or do-not-copy Custom Option bytes changed");
++	}
++
++	void testDiscardedPacketOptions()
++	{
++		Files files;
++		const auto input = files.add("discarded-options-input.pcapng");
++		const auto output = files.add("discarded-options-output.pcapng");
++		writeFile(input, makeDiscardedOptionCapture(false));
++
++		require(copyTcp(input, output), "discarded EPB options were parsed");
++		require(readFile(output) == makeDiscardedOptionCapture(true), "discarded EPB was retained");
++	}
++
++	void testOptionTermination()
++	{
++		Files files;
++		const auto input = files.add("option-termination-input.pcapng");
++		const auto output = files.add("option-termination-output.pcapng");
++		const auto bytes = makeOptionTerminationCapture();
++		writeFile(input, bytes);
++
++		require(copyTcp(input, output), "block-bounded option lists without end markers were rejected");
++		require(readFile(output) == bytes, "unterminated option-list bytes changed");
++	}
++
++	void testFilterState()
++	{
++		Files files;
++		const auto input = files.add("filter-state-input.pcapng");
++		const auto output = files.add("filter-state-output.pcapng");
++		writeFile(input, makeFilterStateCapture(false));
++
++		pcpp::PcapNgFileReaderDevice reader(input);
++		require(reader.setFilter("udp"), "cannot configure non-TCP filter");
++		require(reader.copyFiltered(output), "non-TCP filtered copy failed");
++		require(readFile(output) == makeFilterStateCapture(true), "copy did not use the reader's current filter");
++	}
++
++	void testDefaultAndClearedFilter()
++	{
++		Files files;
++		const auto input = files.add("default-filter-input.pcapng");
++		const auto defaultOutput = files.add("default-filter-output.pcapng");
++		const auto clearedOutput = files.add("cleared-filter-output.pcapng");
++		const auto bytes = makeFilterStateCapture(false);
++		writeFile(input, bytes);
++
++		pcpp::PcapNgFileReaderDevice reader(input);
++		require(reader.copyFiltered(defaultOutput), "copy with the default filter failed");
++		require(readFile(defaultOutput) == bytes, "default filter did not retain every packet block");
++
++		require(reader.setFilter("tcp"), "cannot configure filter before clearing");
++		require(reader.clearFilter(), "cannot clear packet filter");
++		require(reader.copyFiltered(clearedOutput), "copy with a cleared filter failed");
++		require(readFile(clearedOutput) == bytes, "cleared filter did not retain every packet block");
++	}
++
++	void testReservedFieldOpacity()
++	{
++		Files files;
++		const auto input = files.add("reserved-field-input.pcapng");
++		const auto output = files.add("reserved-field-output.pcapng");
++		const auto bytes = makeReservedFieldCapture();
++		writeFile(input, bytes);
++
++		require(copyTcp(input, output), "copy rejected an ignored IDB reserved field");
++		require(readFile(output) == bytes, "IDB reserved field bytes changed");
++	}
++
++	void testLocalUseOpacity()
++	{
++		Files files;
++		const auto input = files.add("local-use-input.pcapng");
++		const auto output = files.add("local-use-output.pcapng");
++		const auto bytes = makeLocalUseCapture();
++		writeFile(input, bytes);
++
++		require(copyTcp(input, output), "copy interpreted opaque local-use block data");
++		require(readFile(output) == bytes, "opaque local-use block bytes changed");
++	}
++
++	void testReaderLifecycle()
++	{
++		Files files;
++		const auto input = files.add("lifecycle-input.pcapng");
++		const auto output = files.add("lifecycle-output.pcapng");
++		const auto outputAfterClose = files.add("lifecycle-after-close.pcapng");
++		const auto bytes = makeLifecycleCapture();
++		writeFile(input, bytes);
++
++		pcpp::PcapNgFileReaderDevice reader(input);
++		require(reader.open(), "cannot open lifecycle reader");
++		require(reader.setFilter("tcp"), "cannot configure lifecycle filter");
++		pcpp::RawPacket packet;
++		std::string comment;
++		require(reader.getNextPacket(packet, comment) && comment == "lifecycle-first", "cannot read first packet");
++		require(reader.copyFiltered(output), "copy while open failed");
++		require(reader.getNextPacket(packet, comment) && comment == "lifecycle-second", "copy changed read position");
++		require(readFile(output) == bytes, "lifecycle output changed accepted blocks");
++		reader.close();
++		require(reader.copyFiltered(outputAfterClose), "copy after close failed");
++		require(readFile(outputAfterClose) == bytes, "copy after close differs");
++	}
++
++	void testNoMatchingPackets()
++	{
++		Files files;
++		const auto input = files.add("no-match-input.pcapng");
++		const auto output = files.add("no-match-output.pcapng");
++		writeFile(input, makeComplexCapture(false, true));
++		require(copyTcp(input, output), "no-match copy failed");
++		verifyComplex(readFile(output), makeComplexCapture(true, true), 0);
++	}
++
++	void testMalformedFraming()
++	{
++		auto trailing = makeComplexCapture(false, false);
++		set32(trailing, trailing.size() - 4, 12, ByteOrder::Big);
++		expectReject(trailing, "bad-trailing-length");
++
++		auto byteOrder = makeComplexCapture(false, false);
++		std::fill(byteOrder.begin() + 8, byteOrder.begin() + 12, 0);
++		expectReject(byteOrder, "bad-byte-order");
++
++		auto finite = makeComplexCapture(false, false);
++		set64(finite, 16, finite.size() + 100, ByteOrder::Little);
++		expectReject(finite, "bad-finite-length");
++
++		auto version = makeComplexCapture(false, false);
++		set16(version, 12, 2, ByteOrder::Little);
++		expectReject(version, "bad-version");
++
++		auto truncated = makeComplexCapture(false, false);
++		truncated.pop_back();
++		expectReject(truncated, "truncated");
++
++		expectReject(makeUnknown(ByteOrder::Little, 9), "block-before-section");
++	}
++
++	void testMalformedOptions()
++	{
++		auto sectionOption = makeOptionCapture();
++		set16(sectionOption, 26, 0xfffc, ByteOrder::Little);
++		expectReject(sectionOption, "bad-section-option-length");
++
++		auto interfaceOption = makeOptionCapture();
++		const auto interfaceOffset = findBlock(interfaceOption, InterfaceDescription, 0);
++		set16(interfaceOption, interfaceOffset + 18, 0xfffc, ByteOrder::Little);
++		expectReject(interfaceOption, "bad-interface-option-length");
++
++		auto packetOption = makeOptionCapture();
++		const auto packetOffset = findBlock(packetOption, EnhancedPacket, 0);
++		const size_t packetDataLength = read32(packetOption.data() + packetOffset + 20, ByteOrder::Little);
++		const size_t packetOptions = packetOffset + 28 + ((packetDataLength + 3) & ~size_t(3));
++		set16(packetOption, packetOptions + 2, 0xfffc, ByteOrder::Little);
++		expectReject(packetOption, "bad-packet-option-length");
++
++		auto statisticsOption = makeOptionCapture();
++		const auto statisticsOffset = findBlock(statisticsOption, InterfaceStatistics, 0);
++		set16(statisticsOption, statisticsOffset + 22, 0xfffc, ByteOrder::Little);
++		expectReject(statisticsOption, "bad-statistics-option-length");
++
++		auto nameRecord = makeOptionCapture();
++		const auto nameOffset = findBlock(nameRecord, NameResolution, 0);
++		set16(nameRecord, nameOffset + 10, 0xfffc, ByteOrder::Little);
++		expectReject(nameRecord, "bad-name-record-length");
++
++		auto nameOption = makeOptionCapture();
++		const auto nameOptionOffset = findBlock(nameOption, NameResolution, 0);
++		const size_t nameRecordLength = read16(nameOption.data() + nameOptionOffset + 10, ByteOrder::Little);
++		const size_t nameOptions = nameOptionOffset + 16 + ((nameRecordLength + 3) & ~size_t(3));
++		set16(nameOption, nameOptions + 2, 0xfffc, ByteOrder::Little);
++		expectReject(nameOption, "bad-name-option-length");
++
++		auto secretsOption = makeOptionCapture();
++		const auto secretsOffset = findBlock(secretsOption, DecryptionSecrets, 0);
++		const size_t secretsLength = read32(secretsOption.data() + secretsOffset + 12, ByteOrder::Little);
++		const size_t secretsOptions = secretsOffset + 16 + ((secretsLength + 3) & ~size_t(3));
++		set16(secretsOption, secretsOptions + 2, 0xfffc, ByteOrder::Little);
++		expectReject(secretsOption, "bad-secrets-option-length");
++	}
++
++	void testMalformedReferences()
++	{
++		auto packetReference = makeComplexCapture(false, false);
++		const auto packetOffset = findBlock(packetReference, EnhancedPacket, 0);
++		set32(packetReference, packetOffset + 8, 1, ByteOrder::Little);
++		expectReject(packetReference, "bad-packet-interface");
++
++		auto statisticsReference = makeComplexCapture(false, false);
++		const auto statisticsOffset = findBlock(statisticsReference, InterfaceStatistics, 0);
++		set32(statisticsReference, statisticsOffset + 8, 1, ByteOrder::Little);
++		expectReject(statisticsReference, "bad-statistics-interface");
++
++		auto packetLength = makeComplexCapture(false, false);
++		const auto lengthOffset = findBlock(packetLength, EnhancedPacket, 0);
++		set32(packetLength, lengthOffset + 20, 100, ByteOrder::Little);
++		set32(packetLength, lengthOffset + 24, 10, ByteOrder::Little);
++		expectReject(packetLength, "bad-packet-length");
++
++		auto shortSimple = makeSimpleLengthCapture();
++		const auto shortSimpleOffset = findBlock(shortSimple, SimplePacket, 0);
++		const auto simpleLength = read32(shortSimple.data() + shortSimpleOffset + 8, ByteOrder::Little);
++		set32(shortSimple, shortSimpleOffset + 8, simpleLength + 4, ByteOrder::Little);
++		expectReject(shortSimple, "short-simple-packet");
++
++		auto longSimple = makeSimpleLengthCapture();
++		const auto longSimpleOffset = findBlock(longSimple, SimplePacket, 0);
++		set32(longSimple, longSimpleOffset + 8, simpleLength - 4, ByteOrder::Little);
++		expectReject(longSimple, "long-simple-packet");
++
++		Bytes noInterface = makeSectionHeader(ByteOrder::Little, UINT64_MAX, "no-interface");
++		appendBlock(noInterface, makeSimplePacket(ByteOrder::Little, makeIpv4Packet(true, 6, 1), 80));
++		expectReject(noInterface, "simple-without-interface");
++	}
++
++	void testUnsupportedAndIo()
++	{
++		Files files;
++		const auto missing = files.add("missing-input.pcapng");
++		const auto missingOutput = files.add("missing-output.pcapng");
++		const Bytes sentinel{ 0x73, 0x61, 0x66, 0x65 };
++		writeFile(missingOutput, sentinel);
++		require(!copyTcp(missing, missingOutput), "missing input was accepted");
++		require(readFile(missingOutput) == sentinel, "missing input changed destination");
++
++		expectReject(Bytes{ 0x28, 0xb5, 0x2f, 0xfd }, "compressed");
++
++		Bytes obsolete = makeSectionHeader(ByteOrder::Little, UINT64_MAX, "obsolete");
++		appendBlock(obsolete, makeInterface(ByteOrder::Little, 1, 65535, 6, "obsolete-eth"));
++		appendBlock(obsolete, makeBlock(ByteOrder::Little, ObsoletePacket, Bytes{}));
++		expectReject(obsolete, "obsolete-packet");
++
++		const auto validInput = files.add("io-input.pcapng");
++		writeFile(validInput, makeLifecycleCapture());
++		pcpp::PcapNgFileReaderDevice reader(validInput);
++		require(reader.setFilter("tcp"), "cannot configure I/O filter");
++		require(!reader.copyFiltered("."), "directory output was accepted");
++	}
++}  // namespace
++
++int main(int argc, char* argv[])
++{
++	if (argc != 2)
++	{
++		std::cerr << "usage: PcapNgCopyTest SCENARIO\n";
++		return 2;
++	}
++
++	try
++	{
++		const std::string scenario = argv[1];
++		if (scenario == "StructureAndFiltering")
++			testStructureAndFiltering();
++		else if (scenario == "InPlaceReplacement")
++			testInPlaceReplacement();
++		else if (scenario == "InterfaceSelection")
++			testInterfaceSelection();
++		else if (scenario == "OptionPreservation")
++			testOptionPreservation();
++		else if (scenario == "DiscardedPacketOptions")
++			testDiscardedPacketOptions();
++		else if (scenario == "OptionTermination")
++			testOptionTermination();
++		else if (scenario == "FilterState")
++			testFilterState();
++		else if (scenario == "DefaultAndClearedFilter")
++			testDefaultAndClearedFilter();
++		else if (scenario == "ReservedFieldOpacity")
++			testReservedFieldOpacity();
++		else if (scenario == "LocalUseOpacity")
++			testLocalUseOpacity();
++		else if (scenario == "ReaderLifecycle")
++			testReaderLifecycle();
++		else if (scenario == "NoMatchingPackets")
++			testNoMatchingPackets();
++		else if (scenario == "MalformedFraming")
++			testMalformedFraming();
++		else if (scenario == "MalformedOptions")
++			testMalformedOptions();
++		else if (scenario == "MalformedReferences")
++			testMalformedReferences();
++		else if (scenario == "UnsupportedAndIo")
++			testUnsupportedAndIo();
++		else
++			throw std::runtime_error("unknown scenario: " + scenario);
++		return 0;
++	}
++	catch (const std::exception& error)
++	{
++		std::cerr << error.what() << '\n';
++		return 1;
++	}
++}
+diff --git a/Tests/PcapNgCopyTest/ptf_to_junit.py b/Tests/PcapNgCopyTest/ptf_to_junit.py
+new file mode 100755
+index 00000000..68d49ec0
+--- /dev/null
++++ b/Tests/PcapNgCopyTest/ptf_to_junit.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++
++import argparse
++import re
++import sys
++import xml.etree.ElementTree as ET
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("log")
++    parser.add_argument("output")
++    parser.add_argument("status", type=int)
++    parser.add_argument("--expected-test", action="append", default=[])
++    args = parser.parse_args()
++
++    with open(args.log, encoding="utf-8", errors="replace") as handle:
++        log = handle.read()
++
++    pattern = re.compile(r"^(Test[A-Za-z0-9_]+)\s*:\s*(PASSED|FAILED|SKIPPED)\s*$", re.MULTILINE)
++    results = pattern.findall(log)
++    suite = ET.Element("testsuite", name="Pcap++Test")
++
++    failures = 0
++    skipped = 0
++    for name, result in results:
++        case = ET.SubElement(suite, "testcase", classname="Pcap++Test", name=name)
++        if result == "FAILED":
++            failures += 1
++            failure = ET.SubElement(case, "failure", message="test failed")
++            failure.text = log
++        elif result == "SKIPPED":
++            skipped += 1
++            ET.SubElement(case, "skipped")
++
++    if not results:
++        expected_tests = args.expected_test or ["Harness"]
++        for name in expected_tests:
++            failures += 1
++            case = ET.SubElement(suite, "testcase", classname=name, name=name)
++            failure = ET.SubElement(case, "failure", message="test command failed")
++            failure.text = log
++    elif args.status != 0 and failures == 0:
++        failures += 1
++        case = ET.SubElement(suite, "testcase", classname="Pcap++Test", name="Harness")
++        failure = ET.SubElement(case, "failure", message="test command failed")
++        failure.text = log
++
++    suite.set("tests", str(len(suite.findall("testcase"))))
++    suite.set("failures", str(failures))
++    suite.set("errors", "0")
++    suite.set("skipped", str(skipped))
++    tree = ET.ElementTree(suite)
++    tree.write(args.output, encoding="utf-8", xml_declaration=True)
++    return 0 if args.status == 0 and failures == 0 else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..9776dc57
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,99 @@
++#!/usr/bin/env bash
++
++set -u
++
++output_path=""
++mode=""
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --output_path)
++      output_path="$2"
++      shift 2
++      ;;
++    base|new)
++      mode="$1"
++      shift
++      ;;
++    *)
++      echo "usage: $0 --output_path FILE {base|new}" >&2
++      exit 2
++      ;;
++  esac
++done
++
++if [[ -z "$output_path" || -z "$mode" ]]; then
++  echo "usage: $0 --output_path FILE {base|new}" >&2
++  exit 2
++fi
++
++output_path="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$output_path")"
++build_dir="build-pcapng-copy-tests"
++configure_log="$build_dir/configure.log"
++mkdir -p "$build_dir"
++
++new_test_args=()
++if [[ "$mode" == "new" ]]; then
++  new_test_args=(
++    --expected-test PcapNgCopy.StructureAndFiltering
++    --expected-test PcapNgCopy.InPlaceReplacement
++    --expected-test PcapNgCopy.InterfaceSelection
++    --expected-test PcapNgCopy.OptionPreservation
++    --expected-test PcapNgCopy.DiscardedPacketOptions
++    --expected-test PcapNgCopy.OptionTermination
++    --expected-test PcapNgCopy.FilterState
++    --expected-test PcapNgCopy.DefaultAndClearedFilter
++    --expected-test PcapNgCopy.ReservedFieldOpacity
++    --expected-test PcapNgCopy.LocalUseOpacity
++    --expected-test PcapNgCopy.ReaderLifecycle
++    --expected-test PcapNgCopy.NoMatchingPackets
++    --expected-test PcapNgCopy.MalformedFraming
++    --expected-test PcapNgCopy.MalformedOptions
++    --expected-test PcapNgCopy.MalformedReferences
++    --expected-test PcapNgCopy.UnsupportedAndIo
++  )
++fi
++
++cmake -S . -B "$build_dir" \
++  -DCMAKE_BUILD_TYPE=Debug \
++  -DPCAPPP_BUILD_TESTS=ON \
++  -DPCAPPP_BUILD_EXAMPLES=OFF \
++  -DPCAPPP_BUILD_TUTORIALS=OFF >"$configure_log" 2>&1
++configure_status=$?
++if [[ $configure_status -ne 0 ]]; then
++  python3 Tests/PcapNgCopyTest/ptf_to_junit.py \
++    "$configure_log" "$output_path" "$configure_status" "${new_test_args[@]}"
++  exit $?
++fi
++
++if [[ "$mode" == "base" ]]; then
++  build_log="$build_dir/base-build.log"
++  cmake --build "$build_dir" --target Pcap++Test --parallel >"$build_log" 2>&1
++  build_status=$?
++  if [[ $build_status -ne 0 ]]; then
++    python3 Tests/PcapNgCopyTest/ptf_to_junit.py "$build_log" "$output_path" "$build_status"
++    exit $?
++  fi
++
++  test_log="$build_dir/base-test.log"
++  (
++    cd "$build_dir/Tests/Pcap++Test"
++    ./Pcap++Test -n -s -x live_device
++  ) >"$test_log" 2>&1
++  test_status=$?
++  python3 Tests/PcapNgCopyTest/ptf_to_junit.py "$test_log" "$output_path" "$test_status"
++  exit $?
++fi
++
++build_log="$build_dir/new-build.log"
++cmake --build "$build_dir" --target PcapNgCopyTest --parallel >"$build_log" 2>&1
++build_status=$?
++if [[ $build_status -ne 0 ]]; then
++  python3 Tests/PcapNgCopyTest/ptf_to_junit.py \
++    "$build_log" "$output_path" "$build_status" "${new_test_args[@]}"
++  exit $?
++fi
++
++ctest --test-dir "$build_dir" \
++  --output-on-failure \
++  --output-junit "$output_path" \
++  -R '^PcapNgCopy\.'

@@ -1,0 +1,418 @@
+diff --git a/src/mach/chained_fixups.rs b/src/mach/chained_fixups.rs
+new file mode 100644
+index 0000000..a0ade3b
+--- /dev/null
++++ b/src/mach/chained_fixups.rs
+@@ -0,0 +1,332 @@
++//! `LC_DYLD_CHAINED_FIXUPS` support: the on-disk format Apple's dyld uses (since it replaced
++//! `LC_DYLD_INFO`/`LC_DYLD_INFO_ONLY` as the default) to describe rebases and binds as a chain of
++//! encoded pointer slots living directly inside the segments they fix up, plus a compact imports
++//! table those chains index into.
++
++use alloc::vec::Vec;
++use core::fmt;
++use scroll::{Pread, SizeWith};
++
++use crate::container;
++use crate::error;
++use crate::mach::imports::Import;
++use crate::mach::load_command::LinkeditDataCommand;
++use crate::mach::segment::Segment;
++
++/// unauth target is vmaddr, stride 8
++pub const DYLD_CHAINED_PTR_ARM64E: u16 = 1;
++/// target is vmaddr, stride 4
++pub const DYLD_CHAINED_PTR_64: u16 = 2;
++/// target is vm offset, stride 4
++pub const DYLD_CHAINED_PTR_64_OFFSET: u16 = 6;
++
++/// plain `dyld_chained_import`, 4 bytes/entry
++pub const DYLD_CHAINED_IMPORT: u32 = 1;
++/// `dyld_chained_import_addend`, 8 bytes/entry
++pub const DYLD_CHAINED_IMPORT_ADDEND: u32 = 2;
++
++const DYLD_CHAINED_PTR_START_NONE: u16 = 0xFFFF;
++
++#[repr(C)]
++#[derive(Debug, Clone, Copy, Pread, SizeWith)]
++struct FixupsHeader {
++    fixups_version: u32,
++    starts_offset: u32,
++    imports_offset: u32,
++    symbols_offset: u32,
++    imports_count: u32,
++    imports_format: u32,
++    symbols_format: u32,
++}
++
++/// One decoded chain-pointer slot, in a shape common to every `pointer_format`.
++#[derive(Debug, Clone, Copy)]
++struct ChainEntry {
++    bind: bool,
++    /// stride units to the next entry in the chain; `0` means this is the last entry
++    next: u32,
++    /// meaningful only when `bind` is true: the index into the imports table
++    ordinal: u32,
++    /// meaningful only when `bind` is true and the import format carries one
++    addend: i64,
++}
++
++fn decode_arm64e(raw: u64) -> ChainEntry {
++    let auth = (raw >> 63) & 1 != 0;
++    let bind = (raw >> 62) & 1 != 0;
++    let next = ((raw >> 51) & 0x7FF) as u32;
++    if !bind {
++        return ChainEntry {
++            bind: false,
++            next,
++            ordinal: 0,
++            addend: 0,
++        };
++    }
++    if auth {
++        // dyld_chained_ptr_arm64e_auth_bind: ordinal:16, zero:16, diversity:16, addrDiv:1, key:2, next:11, bind:1, auth:1
++        let ordinal = (raw & 0xFFFF) as u32;
++        ChainEntry {
++            bind: true,
++            next,
++            ordinal,
++            addend: 0,
++        }
++    } else {
++        // dyld_chained_ptr_arm64e_bind: ordinal:16, zero:16, addend:19, next:11, bind:1, auth:1
++        let ordinal = (raw & 0xFFFF) as u32;
++        let addend = ((raw >> 32) & 0x7_FFFF) as i64;
++        ChainEntry {
++            bind: true,
++            next,
++            ordinal,
++            addend,
++        }
++    }
++}
++
++fn decode_ptr64(raw: u64) -> ChainEntry {
++    // dyld_chained_ptr_64(_offset): both bind and rebase share bit 63 == bind
++    let bind = (raw >> 63) & 1 != 0;
++    if !bind {
++        // dyld_chained_ptr_64_rebase: target:36, high8:8, reserved:7, next:12, bind:1
++        let next = ((raw >> 51) & 0xFFF) as u32;
++        return ChainEntry {
++            bind: false,
++            next,
++            ordinal: 0,
++            addend: 0,
++        };
++    }
++    // dyld_chained_ptr_64_bind: ordinal:24, addend:8, reserved:19, next:12, bind:1
++    let ordinal = (raw & 0x00FF_FFFF) as u32;
++    let addend = ((raw >> 24) & 0xFF) as i64;
++    let next = ((raw >> 51) & 0xFFF) as u32;
++    ChainEntry {
++        bind: true,
++        next,
++        ordinal,
++        addend,
++    }
++}
++
++fn decode_entry(raw: u64, pointer_format: u16) -> error::Result<ChainEntry> {
++    match pointer_format {
++        DYLD_CHAINED_PTR_ARM64E => Ok(decode_arm64e(raw)),
++        DYLD_CHAINED_PTR_64 | DYLD_CHAINED_PTR_64_OFFSET => Ok(decode_ptr64(raw)),
++        other => Err(error::Error::Malformed(format!(
++            "unsupported chained-fixups pointer_format {other}"
++        ))),
++    }
++}
++
++/// stride, in bytes, between chain entries for a given pointer format
++fn stride(pointer_format: u16) -> u64 {
++    match pointer_format {
++        DYLD_CHAINED_PTR_ARM64E => 8,
++        DYLD_CHAINED_PTR_64 | DYLD_CHAINED_PTR_64_OFFSET => 4,
++        _ => 4,
++    }
++}
++
++fn import_entry_at(
++    bytes: &[u8],
++    offset: usize,
++    imports_format: u32,
++    le: scroll::Endian,
++) -> error::Result<(u32, bool, u32, i64)> {
++    match imports_format {
++        DYLD_CHAINED_IMPORT => {
++            let raw: u32 = bytes.pread_with(offset, le)?;
++            let lib_ordinal = raw & 0xFF;
++            let weak_import = (raw >> 8) & 1 != 0;
++            let name_offset = raw >> 9;
++            Ok((lib_ordinal, weak_import, name_offset, 0))
++        }
++        DYLD_CHAINED_IMPORT_ADDEND => {
++            let raw: u32 = bytes.pread_with(offset, le)?;
++            let lib_ordinal = raw & 0xFF;
++            let weak_import = (raw >> 8) & 1 != 0;
++            let name_offset = raw >> 9;
++            let addend: i32 = bytes.pread_with(offset + 4, le)?;
++            Ok((lib_ordinal, weak_import, name_offset, addend as i64))
++        }
++        other => Err(error::Error::Malformed(format!(
++            "unsupported chained-fixups imports_format {other}"
++        ))),
++    }
++}
++
++fn import_entry_size(imports_format: u32) -> usize {
++    match imports_format {
++        DYLD_CHAINED_IMPORT_ADDEND => 8,
++        _ => 4,
++    }
++}
++
++fn read_str_at(bytes: &[u8], offset: usize) -> error::Result<&str> {
++    Ok(bytes.pread::<&str>(offset)?)
++}
++
++/// An interpreter for the `LC_DYLD_CHAINED_FIXUPS` payload: walks the per-segment, per-page
++/// pointer chains and resolves every bind entry into an [`Import`].
++pub struct ChainedFixupsInterpreter<'a> {
++    data: &'a [u8],
++    dataoff: usize,
++    datasize: usize,
++}
++
++impl<'a> fmt::Debug for ChainedFixupsInterpreter<'a> {
++    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
++        fmt.debug_struct("ChainedFixupsInterpreter")
++            .field("dataoff", &self.dataoff)
++            .field("datasize", &self.datasize)
++            .finish()
++    }
++}
++
++impl<'a> ChainedFixupsInterpreter<'a> {
++    /// Construct a new chained-fixups interpreter from the whole-file `bytes` and the
++    /// `LC_DYLD_CHAINED_FIXUPS` load command
++    pub fn new(bytes: &'a [u8], command: &LinkeditDataCommand) -> Self {
++        ChainedFixupsInterpreter {
++            data: bytes,
++            dataoff: command.dataoff as usize,
++            datasize: command.datasize as usize,
++        }
++    }
++
++    /// Return every imported symbol this chained-fixups payload binds
++    pub fn imports(
++        &self,
++        libs: &[&'a str],
++        segments: &[Segment<'a>],
++        ctx: container::Ctx,
++    ) -> error::Result<Vec<Import<'a>>> {
++        if self.datasize == 0 {
++            return Ok(Vec::new());
++        }
++        let le = ctx.le;
++        let blob = self.dataoff;
++        let header: FixupsHeader = self.data.pread_with(blob, le)?;
++        if header.symbols_format != 0 {
++            return Err(error::Error::Malformed(format!(
++                "unsupported chained-fixups symbols_format {}",
++                header.symbols_format
++            )));
++        }
++        if header.imports_count == 0 {
++            return Ok(Vec::new());
++        }
++
++        let starts_in_image = blob + header.starts_offset as usize;
++        let seg_count: u32 = self.data.pread_with(starts_in_image, le)?;
++
++        let mut imports = Vec::new();
++        for seg_index in 0..seg_count as usize {
++            let seg_info_offset: u32 = self
++                .data
++                .pread_with(starts_in_image + 4 + seg_index * 4, le)?;
++            if seg_info_offset == 0 {
++                continue;
++            }
++            let segment = match segments.get(seg_index) {
++                Some(segment) => segment,
++                None => continue,
++            };
++            self.walk_segment(
++                starts_in_image + seg_info_offset as usize,
++                segment,
++                blob,
++                &header,
++                libs,
++                le,
++                &mut imports,
++            )?;
++        }
++        Ok(imports)
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn walk_segment(
++        &self,
++        starts_in_segment_off: usize,
++        segment: &Segment<'a>,
++        blob: usize,
++        header: &FixupsHeader,
++        libs: &[&'a str],
++        le: scroll::Endian,
++        imports: &mut Vec<Import<'a>>,
++    ) -> error::Result<()> {
++        let page_size: u16 = self.data.pread_with(starts_in_segment_off + 4, le)?;
++        let pointer_format: u16 = self.data.pread_with(starts_in_segment_off + 6, le)?;
++        let page_count: u16 = self.data.pread_with(starts_in_segment_off + 20, le)?;
++        let stride_bytes = stride(pointer_format);
++
++        for page in 0..page_count as usize {
++            let page_start: u16 = self
++                .data
++                .pread_with(starts_in_segment_off + 22 + page * 2, le)?;
++            if page_start == DYLD_CHAINED_PTR_START_NONE {
++                continue;
++            }
++            let page_byte_base = page * page_size as usize;
++            let mut entry_offset = page_byte_base + page_start as usize;
++            loop {
++                let raw: u64 = segment.data.pread_with(entry_offset, le)?;
++                let entry = decode_entry(raw, pointer_format)?;
++                if entry.bind {
++                    imports.push(self.resolve_import(
++                        entry.ordinal,
++                        entry.addend,
++                        libs,
++                        blob,
++                        header,
++                        segment,
++                        entry_offset,
++                        le,
++                    )?);
++                }
++                if entry.next == 0 {
++                    break;
++                }
++                entry_offset += entry.next as usize * stride_bytes as usize;
++            }
++        }
++        Ok(())
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn resolve_import(
++        &self,
++        ordinal: u32,
++        addend: i64,
++        libs: &[&'a str],
++        blob: usize,
++        header: &FixupsHeader,
++        segment: &Segment<'a>,
++        page_byte_offset: usize,
++        le: scroll::Endian,
++    ) -> error::Result<Import<'a>> {
++        let entry_size = import_entry_size(header.imports_format);
++        let entry_off =
++            blob + header.imports_offset as usize + ordinal as usize * entry_size;
++        let (lib_ordinal, weak_import, name_offset, table_addend) =
++            import_entry_at(self.data, entry_off, header.imports_format, le)?;
++        let name_off = blob + header.symbols_offset as usize + name_offset as usize;
++        let name = read_str_at(self.data, name_off)?;
++        let dylib = libs.get(lib_ordinal as usize).copied().unwrap_or("");
++
++        Ok(Import {
++            name,
++            dylib,
++            is_lazy: false,
++            offset: segment.fileoff + page_byte_offset as u64,
++            size: 0,
++            address: segment.vmaddr + page_byte_offset as u64,
++            addend: if table_addend != 0 { table_addend } else { addend },
++            is_weak: weak_import,
++            start_of_sequence_offset: page_byte_offset as u64,
++        })
++    }
++}
+diff --git a/src/mach/mod.rs b/src/mach/mod.rs
+index 301a8ee..20364d4 100644
+--- a/src/mach/mod.rs
++++ b/src/mach/mod.rs
+@@ -11,6 +11,7 @@ use crate::{archive, container};
+ use crate::{error, take_hint_bytes};
+ 
+ pub mod bind_opcodes;
++pub mod chained_fixups;
+ pub mod constants;
+ pub mod exports;
+ pub mod fat;
+@@ -80,6 +81,7 @@ pub struct MachO<'a> {
+     ctx: container::Ctx,
+     export_trie: Option<exports::ExportTrie<'a>>,
+     bind_interpreter: Option<imports::BindInterpreter<'a>>,
++    chained_fixups_interpreter: Option<chained_fixups::ChainedFixupsInterpreter<'a>>,
+ }
+ 
+ impl<'a> fmt::Debug for MachO<'a> {
+@@ -138,13 +140,28 @@ impl<'a> MachO<'a> {
+             Ok(vec![])
+         }
+     }
+-    /// Return the imported symbols in this binary that dyld knows about (if any)
++    /// Return the imported symbols in this binary that dyld knows about (if any).
++    ///
++    /// A binary may declare its imports through the legacy `LC_DYLD_INFO`/`LC_DYLD_INFO_ONLY`
++    /// bind-opcode stream, through `LC_DYLD_CHAINED_FIXUPS`, or (rarely) both; results from every
++    /// source present are combined, legacy imports first.
+     pub fn imports(&self) -> error::Result<Vec<imports::Import<'_>>> {
++        let mut imports = Vec::new();
+         if let Some(ref interpreter) = self.bind_interpreter {
+-            interpreter.imports(self.libs.as_slice(), self.segments.as_slice(), self.ctx)
+-        } else {
+-            Ok(vec![])
++            imports.extend(interpreter.imports(
++                self.libs.as_slice(),
++                self.segments.as_slice(),
++                self.ctx,
++            )?);
+         }
++        if let Some(ref interpreter) = self.chained_fixups_interpreter {
++            imports.extend(interpreter.imports(
++                self.libs.as_slice(),
++                self.segments.as_slice(),
++                self.ctx,
++            )?);
++        }
++        Ok(imports)
+     }
+     /// Parses the Mach-o binary from `bytes` at `offset`
+     pub fn parse(bytes: &'a [u8], offset: usize) -> error::Result<MachO<'a>> {
+@@ -185,6 +202,7 @@ impl<'a> MachO<'a> {
+         let mut rpaths = vec![];
+         let mut export_trie = None;
+         let mut bind_interpreter = None;
++        let mut chained_fixups_interpreter = None;
+         let mut unixthread_entry_address = None;
+         let mut main_entry_offset = None;
+         let mut name = None;
+@@ -240,6 +258,10 @@ impl<'a> MachO<'a> {
+                         bytes, &command,
+                     ));
+                 }
++                load_command::CommandVariant::DyldChainedFixups(command) => {
++                    chained_fixups_interpreter =
++                        Some(chained_fixups::ChainedFixupsInterpreter::new(bytes, &command));
++                }
+                 load_command::CommandVariant::Unixthread(command) => {
+                     // dyld cares only about the first LC_UNIXTHREAD
+                     if unixthread_entry_address.is_none() {
+@@ -302,6 +324,7 @@ impl<'a> MachO<'a> {
+             rpaths,
+             export_trie,
+             bind_interpreter,
++            chained_fixups_interpreter,
+             entry,
+             old_style_entry,
+             name,

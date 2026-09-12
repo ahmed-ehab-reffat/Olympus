@@ -1,0 +1,442 @@
+diff --git a/pulldown-cmark/src/autolink.rs b/pulldown-cmark/src/autolink.rs
+new file mode 100644
+index 0000000..f0b2750
+--- /dev/null
++++ b/pulldown-cmark/src/autolink.rs
+@@ -0,0 +1,228 @@
++use alloc::{
++    format,
++    string::{String, ToString},
++    vec::Vec,
++};
++use core::ops::Range;
++
++use crate::{strings::CowStr, Event, LinkType, Tag, TagEnd};
++
++/// The source-position map of a merged text run: each entry pairs the byte offset at which a
++/// segment begins in the merged text with that segment's range in the original source.
++pub(crate) type SourceMap = [(usize, Range<usize>)];
++
++fn map_offset(segments: &SourceMap, total: usize, offset: usize) -> usize {
++    for i in 0..segments.len() {
++        let seg_start = segments[i].0;
++        let seg_end = segments.get(i + 1).map(|s| s.0).unwrap_or(total);
++        if offset >= seg_start && offset <= seg_end {
++            let src = &segments[i].1;
++            return (src.start + (offset - seg_start)).min(src.end);
++        }
++    }
++    segments.last().map(|s| s.1.end).unwrap_or(0)
++}
++
++fn map_range(segments: &SourceMap, total: usize, start: usize, end: usize) -> Range<usize> {
++    let s = map_offset(segments, total, start);
++    let e = map_offset(segments, total, end);
++    s..e.max(s)
++}
++
++pub(crate) fn find_autolinks<'input>(
++    text: &str,
++    segments: &SourceMap,
++    preceding: Option<u8>,
++) -> Option<Vec<(Event<'input>, Range<usize>)>> {
++    let bytes = text.as_bytes();
++    let total = text.len();
++    let mut out: Vec<(Event<'input>, Range<usize>)> = Vec::new();
++    let mut last = 0;
++    let mut i = 0;
++    while i < text.len() {
++        let boundary = if i == 0 {
++            preceding.map_or(true, is_boundary_before)
++        } else {
++            is_boundary_before(bytes[i - 1])
++        };
++        if boundary {
++            if let Some((end, href, link_type)) = match_at(text, i) {
++                if last < i {
++                    out.push((
++                        Event::Text(text[last..i].to_string().into()),
++                        map_range(segments, total, last, i),
++                    ));
++                }
++                let link_range = map_range(segments, total, i, end);
++                out.push((
++                    Event::Start(Tag::Link {
++                        link_type,
++                        dest_url: href.into(),
++                        title: CowStr::from(""),
++                        id: CowStr::from(""),
++                    }),
++                    link_range.clone(),
++                ));
++                out.push((Event::Text(text[i..end].to_string().into()), link_range.clone()));
++                out.push((Event::End(TagEnd::Link), link_range));
++                last = end;
++                i = end;
++                continue;
++            }
++        }
++        i += 1;
++        while i < text.len() && (bytes[i] & 0xC0) == 0x80 {
++            i += 1;
++        }
++    }
++    if out.is_empty() {
++        return None;
++    }
++    if last < text.len() {
++        out.push((
++            Event::Text(text[last..].to_string().into()),
++            map_range(segments, total, last, total),
++        ));
++    }
++    Some(out)
++}
++
++fn is_boundary_before(b: u8) -> bool {
++    b.is_ascii_whitespace() || matches!(b, b'*' | b'_' | b'~' | b'(')
++}
++
++/// Whether the text ends with an autolink whose recognized run reaches the very end. Used to decide
++/// whether an interrupting inline construct (such as emphasis) is actually part of a longer URL.
++pub(crate) fn url_reaches_end(text: &str) -> bool {
++    let bytes = text.as_bytes();
++    let mut start = text.len();
++    while start > 0 && !is_boundary_before(bytes[start - 1]) {
++        start -= 1;
++    }
++    while start < text.len() && (bytes[start] & 0xC0) == 0x80 {
++        start += 1;
++    }
++    match match_at(text, start) {
++        Some((end, _, _)) => end == text.len(),
++        None => false,
++    }
++}
++
++fn match_at(text: &str, i: usize) -> Option<(usize, String, LinkType)> {
++    let rest = &text[i..];
++    if rest.starts_with("https://") {
++        let end_rel = scan_url_body(rest, 8)?;
++        return Some((i + end_rel, rest[..end_rel].to_string(), LinkType::Autolink));
++    }
++    if rest.starts_with("http://") {
++        let end_rel = scan_url_body(rest, 7)?;
++        return Some((i + end_rel, rest[..end_rel].to_string(), LinkType::Autolink));
++    }
++    if rest.starts_with("www.") {
++        let end_rel = scan_url_body(rest, 0)?;
++        return Some((i + end_rel, format!("http://{}", &rest[..end_rel]), LinkType::Autolink));
++    }
++    if let Some(end_rel) = scan_email(rest) {
++        return Some((i + end_rel, rest[..end_rel].to_string(), LinkType::Email));
++    }
++    None
++}
++
++fn scan_url_body(s: &str, host_start: usize) -> Option<usize> {
++    let bytes = s.as_bytes();
++    if host_start >= s.len() || !bytes[host_start].is_ascii_alphanumeric() {
++        return None;
++    }
++    let mut end = host_start;
++    while end < s.len() && !bytes[end].is_ascii_whitespace() && bytes[end] != b'<' {
++        end += 1;
++    }
++    end = trim_trailing(&s[..end]);
++    if end <= host_start {
++        return None;
++    }
++    let host_end = s[host_start..end]
++        .find(['/', '?', '#'])
++        .map(|p| host_start + p)
++        .unwrap_or(end);
++    if !is_valid_domain(&s[host_start..host_end]) {
++        return None;
++    }
++    Some(end)
++}
++
++fn is_valid_domain(host: &str) -> bool {
++    if !host
++        .bytes()
++        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
++    {
++        return false;
++    }
++    let segments: Vec<&str> = host.split('.').collect();
++    if segments.len() < 2 {
++        return false;
++    }
++    if segments.iter().any(|s| s.is_empty()) {
++        return false;
++    }
++    let n = segments.len();
++    if segments[n - 1].contains('_') || segments[n - 2].contains('_') {
++        return false;
++    }
++    if host.ends_with('-') {
++        return false;
++    }
++    true
++}
++
++fn scan_email(s: &str) -> Option<usize> {
++    let bytes = s.as_bytes();
++    let mut i = 0;
++    while i < s.len()
++        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'.' | b'_' | b'+' | b'-'))
++    {
++        i += 1;
++    }
++    if i == 0 || i >= s.len() || bytes[i] != b'@' {
++        return None;
++    }
++    let domain_start = i + 1;
++    let mut j = domain_start;
++    while j < s.len() && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'-' | b'.' | b'_'))
++    {
++        j += 1;
++    }
++    let mut end = j;
++    while end > domain_start && matches!(bytes[end - 1], b'_' | b'.') {
++        end -= 1;
++    }
++    if !is_valid_domain(&s[domain_start..end]) {
++        return None;
++    }
++    Some(end)
++}
++
++fn trim_trailing(link: &str) -> usize {
++    let bytes = link.as_bytes();
++    let mut end = link.len();
++    loop {
++        let before = end;
++        while end > 0 && matches!(bytes[end - 1], b'?' | b'!' | b'.' | b',' | b':' | b'*' | b'_' | b'~')
++        {
++            end -= 1;
++        }
++        if end > 0 && bytes[end - 1] == b')' {
++            let open = link[..end].bytes().filter(|&c| c == b'(').count();
++            let close = link[..end].bytes().filter(|&c| c == b')').count();
++            let mut excess = close.saturating_sub(open);
++            while excess > 0 && end > 0 && bytes[end - 1] == b')' {
++                end -= 1;
++                excess -= 1;
++            }
++        }
++        if end == before {
++            break;
++        }
++    }
++    end
++}
+diff --git a/pulldown-cmark/src/lib.rs b/pulldown-cmark/src/lib.rs
+index 849b40f..6dc9a9d 100644
+--- a/pulldown-cmark/src/lib.rs
++++ b/pulldown-cmark/src/lib.rs
+@@ -101,6 +101,7 @@ pub mod html;
+ 
+ pub mod utils;
+ 
++mod autolink;
+ mod entities;
+ mod firstpass;
+ mod linklabel;
+@@ -781,6 +782,9 @@ bitflags::bitflags! {
+         /// `<mark>highlight</mark>`. Originates from markdown-it / pandoc; not part
+         /// of CommonMark or GFM.
+         const ENABLE_HIGHLIGHT = 1 << 17;
++        /// Recognize bare URLs and email addresses in text and turn them into links,
++        /// following the GFM autolink extension.
++        const ENABLE_BARE_URL_AUTOLINKS = 1 << 18;
+     }
+ }
+ 
+diff --git a/pulldown-cmark/src/parse.rs b/pulldown-cmark/src/parse.rs
+index 90488bc..881bc04 100644
+--- a/pulldown-cmark/src/parse.rs
++++ b/pulldown-cmark/src/parse.rs
+@@ -231,6 +231,12 @@ struct ParserInner<'input> {
+     wikilink_stack: LinkStack,
+     code_delims: CodeDelims,
+     math_delims: MathDelims,
++
++    // Bare-URL autolink state. `autolink_pending` holds the events produced by splitting a text
++    // run around detected autolinks, stored in reverse so `pop` yields them in order.
++    autolink_pending: Vec<(Event<'input>, Range<usize>)>,
++    autolink_in_code_block: bool,
++    autolink_link_depth: usize,
+ }
+ 
+ impl<'input, CB> core::fmt::Debug for Parser<'input, CB> {
+@@ -317,6 +323,9 @@ impl<'input, CB: ParserCallbacks<'input>> Parser<'input, CB> {
+                 link_ref_expansion_limit: text.len().max(100_000),
+                 code_delims: CodeDelims::new(),
+                 math_delims: MathDelims::new(),
++                autolink_pending: Vec::new(),
++                autolink_in_code_block: false,
++                autolink_link_depth: 0,
+             },
+         }
+     }
+@@ -2303,10 +2312,149 @@ impl<'a, CB: ParserCallbacks<'a>> Iterator for Parser<'a, CB> {
+ 
+ impl<'a, CB: ParserCallbacks<'a>> FusedIterator for Parser<'a, CB> {}
+ 
++fn is_inline_formatting(tag: &Tag<'_>) -> bool {
++    matches!(
++        tag,
++        Tag::Emphasis
++            | Tag::Strong
++            | Tag::Strikethrough
++            | Tag::Superscript
++            | Tag::Subscript
++            | Tag::Highlight
++    )
++}
++
++fn is_inline_formatting_end(tag: TagEnd) -> bool {
++    matches!(
++        tag,
++        TagEnd::Emphasis
++            | TagEnd::Strong
++            | TagEnd::Strikethrough
++            | TagEnd::Superscript
++            | TagEnd::Subscript
++            | TagEnd::Highlight
++    )
++}
++
+ impl<'input> ParserInner<'input> {
+     fn next_event_range(
+         &mut self,
+         callbacks: &mut dyn ParserCallbacks<'input>,
++    ) -> Option<(Event<'input>, Range<usize>)> {
++        if let Some(pending) = self.autolink_pending.pop() {
++            return Some(pending);
++        }
++        let (event, range) = self.pull_autolink_raw(callbacks)?;
++        if !self.options.contains(Options::ENABLE_BARE_URL_AUTOLINKS)
++            || self.autolink_in_code_block
++            || self.autolink_link_depth > 0
++        {
++            return Some((event, range));
++        }
++        let first_text = match event {
++            Event::Text(text) => text,
++            other => return Some((other, range)),
++        };
++        let mut merged = String::from(first_text.as_ref());
++        let mut segments: Vec<(usize, Range<usize>)> = alloc::vec![(0, range)];
++        let mut trailing: Vec<(Event<'input>, Range<usize>)> = Vec::new();
++        loop {
++            match self.pull_autolink_raw(callbacks) {
++                Some((Event::Text(t), r))
++                    if !self.autolink_in_code_block && self.autolink_link_depth == 0 =>
++                {
++                    segments.push((merged.len(), r));
++                    merged.push_str(t.as_ref());
++                }
++                Some((event, r))
++                    if !self.autolink_in_code_block
++                        && self.autolink_link_depth == 0
++                        && matches!(&event, Event::Start(tag) if is_inline_formatting(tag))
++                        && crate::autolink::url_reaches_end(&merged) =>
++                {
++                    let src_start = r.start;
++                    let (inner, src_end, text_only) = self.consume_inline_construct(callbacks);
++                    if text_only {
++                        segments.push((merged.len(), src_start..src_end));
++                        merged.push_str(&self.text[src_start..src_end]);
++                    } else {
++                        trailing.push((event, r));
++                        trailing.extend(inner);
++                        break;
++                    }
++                }
++                Some(other) => {
++                    trailing.push(other);
++                    break;
++                }
++                None => break,
++            }
++        }
++        let run_start = segments[0].1.start;
++        let full = run_start..segments[segments.len() - 1].1.end;
++        let preceding = run_start.checked_sub(1).map(|p| self.text.as_bytes()[p]);
++        let mut events = crate::autolink::find_autolinks(&merged, &segments, preceding)
++            .unwrap_or_else(|| alloc::vec![(Event::Text(merged.into()), full)]);
++        events.extend(trailing);
++        let first = events.remove(0);
++        events.reverse();
++        self.autolink_pending = events;
++        Some(first)
++    }
++
++    fn pull_autolink_raw(
++        &mut self,
++        callbacks: &mut dyn ParserCallbacks<'input>,
++    ) -> Option<(Event<'input>, Range<usize>)> {
++        let (event, range) = self.next_event_range_raw(callbacks)?;
++        match &event {
++            Event::Start(Tag::CodeBlock(_)) => self.autolink_in_code_block = true,
++            Event::End(TagEnd::CodeBlock) => self.autolink_in_code_block = false,
++            Event::Start(Tag::Link { .. }) | Event::Start(Tag::Image { .. }) => {
++                self.autolink_link_depth += 1
++            }
++            Event::End(TagEnd::Link) | Event::End(TagEnd::Image) => {
++                self.autolink_link_depth = self.autolink_link_depth.saturating_sub(1)
++            }
++            _ => {}
++        }
++        Some((event, range))
++    }
++
++    /// Consume the remaining events of an inline-formatting construct whose opening event was just
++    /// pulled. Returns the buffered events, the source offset at which the construct ends, and
++    /// whether the construct contains only text (and nested formatting). A construct that contains a
++    /// higher-priority inline construct (code, link, image, and the like) is not text-only, so its
++    /// events are returned for re-emission rather than being folded into a URL.
++    fn consume_inline_construct(
++        &mut self,
++        callbacks: &mut dyn ParserCallbacks<'input>,
++    ) -> (Vec<(Event<'input>, Range<usize>)>, usize, bool) {
++        let mut buf = Vec::new();
++        let mut depth = 1usize;
++        let mut end = 0;
++        let mut text_only = true;
++        while depth > 0 {
++            match self.pull_autolink_raw(callbacks) {
++                Some((event, r)) => {
++                    match &event {
++                        Event::Start(tag) if is_inline_formatting(tag) => depth += 1,
++                        Event::End(tag_end) if is_inline_formatting_end(*tag_end) => depth -= 1,
++                        Event::Text(_) => {}
++                        _ => text_only = false,
++                    }
++                    end = r.end;
++                    buf.push((event, r));
++                }
++                None => break,
++            }
++        }
++        (buf, end, text_only)
++    }
++
++    fn next_event_range_raw(
++        &mut self,
++        callbacks: &mut dyn ParserCallbacks<'input>,
+     ) -> Option<(Event<'input>, Range<usize>)> {
+         match self.tree.cur() {
+             None => {
+@@ -2314,7 +2462,7 @@ impl<'input> ParserInner<'input> {
+                 let ix = if matches!(self.tree[ix].item.body, ItemBody::TightParagraph) {
+                     // tight paragraphs emit nothing
+                     self.tree.next_sibling(ix);
+-                    return self.next_event_range(callbacks);
++                    return self.next_event_range_raw(callbacks);
+                 } else {
+                     ix
+                 };

@@ -1,0 +1,1085 @@
+diff --git a/crates/turmoil/src/builder.rs b/crates/turmoil/src/builder.rs
+index 8761dec..45cc48c 100644
+--- a/crates/turmoil/src/builder.rs
++++ b/crates/turmoil/src/builder.rs
+@@ -77,6 +77,7 @@ impl Builder {
+             link: config::Link {
+                 latency: Some(config::Latency::default()),
+                 message_loss: Some(config::MessageLoss::default()),
++                capacity: Some(config::Capacity::default()),
+             },
+             rng_seed: None,
+         }
+@@ -136,6 +137,30 @@ impl Builder {
+         self
+     }
+ 
++    /// How many bytes per second every link carries. Zero, the default, is
++    /// unlimited.
++    ///
++    /// A link that is not unlimited spends `size / bandwidth` carrying a
++    /// message, and the messages queued on it wait their turn.
++    pub fn bandwidth(&mut self, value: u64) -> &mut Self {
++        self.link.capacity_mut().bandwidth = value;
++        self
++    }
++
++    /// How many bytes each direction of a link queues before it starts
++    /// dropping datagrams. Zero, the default, is unlimited.
++    pub fn queue_capacity(&mut self, value: u64) -> &mut Self {
++        self.link.capacity_mut().queue_capacity = value;
++        self
++    }
++
++    /// How many bytes every message carries on top of what it holds, which is
++    /// none by default.
++    pub fn message_overhead(&mut self, value: u64) -> &mut Self {
++        self.link.capacity_mut().overhead = value;
++        self
++    }
++
+     /// The Dynamic Ports, also known as the Private or Ephemeral Ports.
+     /// See: <https://www.rfc-editor.org/rfc/rfc6335#section-6>
+     pub fn ephemeral_ports(&mut self, value: RangeInclusive<u16>) -> &mut Self {
+diff --git a/crates/turmoil/src/config.rs b/crates/turmoil/src/config.rs
+index 3618a9d..c795bbc 100644
+--- a/crates/turmoil/src/config.rs
++++ b/crates/turmoil/src/config.rs
+@@ -60,6 +60,42 @@ pub(crate) struct Link {
+ 
+     /// How often sending a message works vs. the message getting dropped
+     pub(crate) message_loss: Option<MessageLoss>,
++
++    /// How fast a link carries messages, and how much it buffers
++    pub(crate) capacity: Option<Capacity>,
++}
++
++/// Configure how much traffic a link carries.
++///
++/// Provides default values of:
++/// - bandwidth: 0 (unlimited)
++/// - queue_capacity: 0 (unlimited)
++#[derive(Clone, Copy, Default)]
++pub(crate) struct Capacity {
++    /// Bytes per second the link transmits, or zero for unlimited
++    pub(crate) bandwidth: u64,
++
++    /// Bytes the link buffers before dropping datagrams, or zero for unlimited
++    pub(crate) queue_capacity: u64,
++
++    /// Bytes every message carries on top of what it holds
++    pub(crate) overhead: u64,
++}
++
++impl Capacity {
++    /// The time spent putting `size` bytes on a wire running at `bandwidth`,
++    /// rounded up to the next nanosecond. An unlimited link is instant.
++    pub(crate) fn transmit_time(bandwidth: u64, size: u64) -> Duration {
++        if bandwidth == 0 || size == 0 {
++            return Duration::ZERO;
++        }
++
++        let nanos = u128::from(size) * 1_000_000_000;
++        let bandwidth = u128::from(bandwidth);
++        let rounded_up = nanos.div_ceil(bandwidth);
++
++        Duration::from_nanos(u64::try_from(rounded_up).unwrap_or(u64::MAX))
++    }
+ }
+ 
+ /// Configure latency behavior between two hosts.
+@@ -125,6 +161,14 @@ impl Link {
+     pub(crate) fn message_loss_mut(&mut self) -> &mut MessageLoss {
+         self.message_loss.as_mut().expect("`MessageLoss` missing")
+     }
++
++    pub(crate) fn capacity(&self) -> &Capacity {
++        self.capacity.as_ref().expect("`Capacity` missing")
++    }
++
++    pub(crate) fn capacity_mut(&mut self) -> &mut Capacity {
++        self.capacity.as_mut().expect("`Capacity` missing")
++    }
+ }
+ 
+ impl Default for Latency {
+diff --git a/crates/turmoil/src/envelope.rs b/crates/turmoil/src/envelope.rs
+index 373e047..22410a9 100644
+--- a/crates/turmoil/src/envelope.rs
++++ b/crates/turmoil/src/envelope.rs
+@@ -39,6 +39,27 @@ pub struct Syn {
+     pub(crate) ack: oneshot::Sender<()>,
+ }
+ 
++impl Protocol {
++    /// The bytes a message puts on the wire, which is what it carries: the
++    /// contents of a datagram, or the payload of a data segment. Segments that
++    /// only open, close or reset a connection carry nothing.
++    pub(crate) fn size(&self) -> u64 {
++        let bytes = match self {
++            Protocol::Tcp(Segment::Data(_, data)) => data.len(),
++            Protocol::Tcp(_) => 0,
++            Protocol::Udp(Datagram(bytes)) => bytes.len(),
++        };
++
++        bytes as u64
++    }
++
++    /// Whether the message belongs to a connection, in which case a full queue
++    /// never drops it.
++    pub(crate) fn is_connection_oriented(&self) -> bool {
++        matches!(self, Protocol::Tcp(_))
++    }
++}
++
+ impl Display for Protocol {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         match self {
+diff --git a/crates/turmoil/src/lib.rs b/crates/turmoil/src/lib.rs
+index d7c0aa6..b9bf46a 100644
+--- a/crates/turmoil/src/lib.rs
++++ b/crates/turmoil/src/lib.rs
+@@ -228,7 +228,7 @@ pub use sim::Sim;
+ 
+ mod top;
+ use top::Topology;
+-pub use top::{LinkIter, LinksIter, SentRef};
++pub use top::{Duplex, HostStats, LinkIter, LinkStats, LinksIter, SentRef};
+ 
+ mod world;
+ use world::World;
+diff --git a/crates/turmoil/src/sim.rs b/crates/turmoil/src/sim.rs
+index e81de29..b17aadf 100644
+--- a/crates/turmoil/src/sim.rs
++++ b/crates/turmoil/src/sim.rs
+@@ -12,7 +12,8 @@ use tracing::Level;
+ 
+ use crate::host::HostTimer;
+ use crate::{
+-    for_pairs, rt, Config, LinksIter, Result, Rt, ToIpAddr, ToIpAddrs, World, TRACING_TARGET,
++    for_pairs, rt, Config, Duplex, HostStats, LinkStats, LinksIter, Result, Rt, ToIpAddr,
++    ToIpAddrs, World, TRACING_TARGET,
+ };
+ 
+ /// A handle for interacting with the simulation.
+@@ -361,6 +362,118 @@ impl<'a> Sim<'a> {
+             .set_message_latency_curve(value);
+     }
+ 
++    /// Set how many bytes per second every link carries.
++    ///
++    /// Zero is unlimited, which is how a simulation starts out.
++    pub fn set_bandwidth(&self, value: u64) {
++        self.world.borrow_mut().topology.set_bandwidth(value);
++    }
++
++    /// Set how many bytes per second the links matching `a` and `b` carry, in
++    /// both directions.
++    pub fn set_link_bandwidth(&self, a: impl ToIpAddrs, b: impl ToIpAddrs, value: u64) {
++        let mut world = self.world.borrow_mut();
++        let a = world.lookup_many(a);
++        let b = world.lookup_many(b);
++
++        for_pairs(&a, &b, |a, b| {
++            world.topology.set_link_bandwidth(a, b, value);
++        });
++    }
++
++    /// Set how many bytes per second the links matching `from` and `to` carry
++    /// from `from` to `to`, leaving the other direction alone.
++    pub fn set_link_bandwidth_oneway(&self, from: impl ToIpAddrs, to: impl ToIpAddrs, value: u64) {
++        let mut world = self.world.borrow_mut();
++        let from = world.lookup_many(from);
++        let to = world.lookup_many(to);
++
++        for_pairs(&from, &to, |a, b| {
++            world.topology.set_link_bandwidth_oneway(a, b, value);
++        });
++    }
++
++    /// Set how many bytes per second the hosts matching `addrs` send, across
++    /// every link out of each of them.
++    pub fn set_host_send_bandwidth(&self, addrs: impl ToIpAddrs, value: u64) {
++        let mut world = self.world.borrow_mut();
++
++        for addr in world.lookup_many(addrs) {
++            world.topology.set_host_send_bandwidth(addr, value);
++        }
++    }
++
++    /// Set how many bytes per second the hosts matching `addrs` take in, across
++    /// every link into each of them.
++    pub fn set_host_receive_bandwidth(&self, addrs: impl ToIpAddrs, value: u64) {
++        let mut world = self.world.borrow_mut();
++
++        for addr in world.lookup_many(addrs) {
++            world.topology.set_host_receive_bandwidth(addr, value);
++        }
++    }
++
++    /// Set how many bytes every message carries on top of what it holds.
++    pub fn set_message_overhead(&self, value: u64) {
++        self.world.borrow_mut().topology.set_message_overhead(value);
++    }
++
++    /// Set how many bytes each direction of every link queues before it starts
++    /// dropping datagrams.
++    pub fn set_queue_capacity(&self, value: u64) {
++        self.world.borrow_mut().topology.set_queue_capacity(value);
++    }
++
++    /// Set how many bytes each direction of the links matching `a` and `b`
++    /// queues before it starts dropping datagrams.
++    pub fn set_link_queue_capacity(&self, a: impl ToIpAddrs, b: impl ToIpAddrs, value: u64) {
++        let mut world = self.world.borrow_mut();
++        let a = world.lookup_many(a);
++        let b = world.lookup_many(b);
++
++        for_pairs(&a, &b, |a, b| {
++            world.topology.set_link_queue_capacity(a, b, value);
++        });
++    }
++
++    /// How many bytes sent from `from` to `to` have not arrived yet.
++    pub fn queued_bytes(&self, from: impl ToIpAddr, to: impl ToIpAddr) -> u64 {
++        let mut world = self.world.borrow_mut();
++        let from = world.lookup(from);
++        let to = world.lookup(to);
++
++        world.topology.queued_bytes(from, to)
++    }
++
++    /// What the interface of `addr` has carried so far.
++    pub fn host_stats(&self, addr: impl ToIpAddr) -> HostStats {
++        let mut world = self.world.borrow_mut();
++        let addr = world.lookup(addr);
++
++        world.topology.host_stats(addr)
++    }
++
++    /// What the direction from `from` to `to` has carried so far.
++    pub fn link_stats(&self, from: impl ToIpAddr, to: impl ToIpAddr) -> LinkStats {
++        let mut world = self.world.borrow_mut();
++        let from = world.lookup(from);
++        let to = world.lookup(to);
++
++        world.topology.link_stats(from, to)
++    }
++
++    /// Set whether the links matching `a` and `b` carry both directions at the
++    /// same time.
++    pub fn set_link_duplex(&self, a: impl ToIpAddrs, b: impl ToIpAddrs, value: Duplex) {
++        let mut world = self.world.borrow_mut();
++        let a = world.lookup_many(a);
++        let b = world.lookup_many(b);
++
++        for_pairs(&a, &b, |a, b| {
++            world.topology.set_link_duplex(a, b, value);
++        });
++    }
++
+     pub fn set_fail_rate(&mut self, value: f64) {
+         self.world.borrow_mut().topology.set_fail_rate(value);
+     }
+diff --git a/crates/turmoil/src/top.rs b/crates/turmoil/src/top.rs
+index 682d659..44459dd 100644
+--- a/crates/turmoil/src/top.rs
++++ b/crates/turmoil/src/top.rs
+@@ -19,12 +19,19 @@ pub(crate) struct Topology {
+     /// Specific configuration overrides between specific hosts.
+     links: IndexMap<Pair, Link>,
+ 
++    /// The interface each host sends through.
++    interfaces: IndexMap<IpAddr, Interface>,
++
+     /// We don't use a Rt for async. Right now, we just use it to tick time
+     /// forward in the same way we do it elsewhere. We'd like to represent
+     /// network state with async in the future.
+     rt: Rt<'static>,
+ }
+ 
++/// The interfaces of every host that has sent or been configured, keyed by
++/// address.
++type Interfaces = IndexMap<IpAddr, Interface>;
++
+ /// This type is used as the key in the [`Topology::links`] map. See [`new`]
+ /// which orders the addrs, such that this type uniquely identifies the link
+ /// between two hosts on the network.
+@@ -154,6 +161,126 @@ struct Link {
+ 
+     /// The current network time, moved forward with [`Link::tick`].
+     now: Instant,
++
++    /// How much traffic the link carries from 'a' to 'b'.
++    wire_a_b: Wire,
++
++    /// How much traffic the link carries from 'b' to 'a'.
++    wire_b_a: Wire,
++
++    /// Whether the two directions can carry a message at the same time.
++    duplex: Duplex,
++}
++
++/// Whether both directions of a link can carry a message at the same time.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub enum Duplex {
++    /// Each direction carries its own messages, at the same time as the other.
++    #[default]
++    Full,
++
++    /// The two directions share one wire, so only one of them carries a
++    /// message at a time.
++    Half,
++}
++
++/// What one direction of a link has carried.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct LinkStats {
++    /// Messages the direction took on.
++    pub sent: u64,
++
++    /// Messages that arrived at the far end.
++    pub delivered: u64,
++
++    /// Bytes the direction took on.
++    pub bytes_sent: u64,
++
++    /// Bytes that arrived at the far end.
++    pub bytes_delivered: u64,
++
++    /// Datagrams the direction dropped because its queue was full.
++    pub dropped: u64,
++
++    /// How long the direction spent carrying messages.
++    pub busy: Duration,
++}
++
++/// One direction of a link, which carries one message at a time.
++struct Wire {
++    /// Bytes per second this direction carries, when it has its own rate.
++    bandwidth: Option<u64>,
++
++    /// Bytes this direction queues, when it has its own bound.
++    queue_capacity: Option<u64>,
++
++    /// When the direction finishes transmitting everything it has taken on.
++    free_at: Instant,
++
++    /// When the last message taken on arrives at the far end.
++    last_arrival: Instant,
++
++    /// Bytes taken on that have not arrived yet.
++    queued: u64,
++
++    /// What the direction has carried.
++    stats: LinkStats,
++}
++
++/// The interface a host is attached to the network by, shared by every link
++/// it has.
++struct Interface {
++    /// The side that puts messages on the network.
++    send: Lane,
++
++    /// The side that takes messages off it.
++    receive: Lane,
++}
++
++/// One side of an interface, which carries one message at a time.
++struct Lane {
++    /// Bytes per second the side carries, or zero for unlimited.
++    bandwidth: u64,
++
++    /// When the side finishes carrying everything it has taken on.
++    free_at: Instant,
++
++    /// Messages the side has carried.
++    messages: u64,
++
++    /// Messages the side lost to a full queue.
++    dropped: u64,
++
++    /// Bytes the side has carried.
++    bytes: u64,
++
++    /// How long the side spent carrying them.
++    busy: Duration,
++}
++
++/// What the interface of a host has carried.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct HostStats {
++    /// Messages the host put on the network.
++    pub sent: u64,
++
++    /// Messages the host took off it.
++    pub received: u64,
++
++    /// Bytes the host put on the network.
++    pub bytes_sent: u64,
++
++    /// Bytes the host took off it.
++    pub bytes_received: u64,
++
++    /// How long the sending side spent carrying messages.
++    pub send_busy: Duration,
++
++    /// How long the receiving side spent carrying them.
++    pub receive_busy: Duration,
++
++    /// Datagrams the host sent that a full queue dropped.
++    pub dropped: u64,
+ }
+ 
+ /// States that a link between two nodes can be in.
+@@ -177,6 +304,7 @@ impl Topology {
+         Topology {
+             config,
+             links: IndexMap::new(),
++            interfaces: IndexMap::new(),
+             rt: Rt::no_software(),
+         }
+     }
+@@ -184,7 +312,14 @@ impl Topology {
+     /// Register a link between two hosts
+     pub(crate) fn register(&mut self, a: IpAddr, b: IpAddr) {
+         let pair = Pair::new(a, b);
+-        assert!(self.links.insert(pair, Link::new(self.rt.now())).is_none());
++        let now = self.rt.now();
++        assert!(self.links.insert(pair, Link::new(now)).is_none());
++
++        for host in [a, b] {
++            self.interfaces
++                .entry(host)
++                .or_insert_with(|| Interface::new(now));
++        }
+     }
+ 
+     pub(crate) fn set_max_message_latency(&mut self, value: Duration) {
+@@ -215,6 +350,98 @@ impl Topology {
+         self.config.latency_mut().latency_distribution = Exp::new(value).unwrap();
+     }
+ 
++    pub(crate) fn set_bandwidth(&mut self, value: u64) {
++        self.config.capacity_mut().bandwidth = value;
++    }
++
++    pub(crate) fn set_link_bandwidth(&mut self, a: IpAddr, b: IpAddr, value: u64) {
++        let link = self.get_link_mut(&Pair::new(a, b));
++        link.wire_a_b.bandwidth = Some(value);
++        link.wire_b_a.bandwidth = Some(value);
++    }
++
++    pub(crate) fn set_link_bandwidth_oneway(&mut self, from: IpAddr, to: IpAddr, value: u64) {
++        let link = self.get_link_mut(&Pair::new(from, to));
++        link.wire_mut(from, to).bandwidth = Some(value);
++    }
++
++    pub(crate) fn set_queue_capacity(&mut self, value: u64) {
++        self.config.capacity_mut().queue_capacity = value;
++    }
++
++    pub(crate) fn set_message_overhead(&mut self, value: u64) {
++        self.config.capacity_mut().overhead = value;
++    }
++
++    pub(crate) fn set_link_queue_capacity(&mut self, a: IpAddr, b: IpAddr, value: u64) {
++        let link = self.get_link_mut(&Pair::new(a, b));
++        link.wire_a_b.queue_capacity = Some(value);
++        link.wire_b_a.queue_capacity = Some(value);
++    }
++
++    pub(crate) fn set_host_send_bandwidth(&mut self, host: IpAddr, value: u64) {
++        self.interface_mut(host).send.bandwidth = value;
++    }
++
++    pub(crate) fn set_host_receive_bandwidth(&mut self, host: IpAddr, value: u64) {
++        self.interface_mut(host).receive.bandwidth = value;
++    }
++
++    fn interface_mut(&mut self, host: IpAddr) -> &mut Interface {
++        let now = self.rt.now();
++        self.interfaces
++            .entry(host)
++            .or_insert_with(|| Interface::new(now))
++    }
++
++    /// Bytes sent from `from` to `to` that have not arrived yet.
++    pub(crate) fn queued_bytes(&self, from: IpAddr, to: IpAddr) -> u64 {
++        self.get_link(&Pair::new(from, to)).wire(from, to).queued
++    }
++
++    /// What the interface of `host` has carried.
++    pub(crate) fn host_stats(&self, host: IpAddr) -> HostStats {
++        let Some(interface) = self.interfaces.get(&host) else {
++            return HostStats::default();
++        };
++
++        let mut received = 0;
++        let mut bytes_received = 0;
++
++        for (pair, link) in &self.links {
++            let far = if pair.0 == host {
++                pair.1
++            } else if pair.1 == host {
++                pair.0
++            } else {
++                continue;
++            };
++
++            let arriving = link.wire(far, host).stats;
++            received += arriving.delivered;
++            bytes_received += arriving.bytes_delivered;
++        }
++
++        HostStats {
++            sent: interface.send.messages,
++            received,
++            bytes_sent: interface.send.bytes,
++            bytes_received,
++            send_busy: interface.send.busy,
++            receive_busy: interface.receive.busy,
++            dropped: interface.send.dropped,
++        }
++    }
++
++    /// What the direction from `from` to `to` has carried.
++    pub(crate) fn link_stats(&self, from: IpAddr, to: IpAddr) -> LinkStats {
++        self.get_link(&Pair::new(from, to)).wire(from, to).stats
++    }
++
++    pub(crate) fn set_link_duplex(&mut self, a: IpAddr, b: IpAddr, value: Duplex) {
++        self.get_link_mut(&Pair::new(a, b)).duplex = value;
++    }
++
+     pub(crate) fn set_fail_rate(&mut self, value: f64) {
+         self.config.message_loss_mut().fail_rate = value;
+     }
+@@ -238,8 +465,15 @@ impl Topology {
+         dst: SocketAddr,
+         message: Protocol,
+     ) -> Result<()> {
+-        if let Some(link) = self.links.get_mut(&Pair::new(src.ip(), dst.ip())) {
+-            link.enqueue_message(&self.config, rand, src, dst, message)
++        let Topology {
++            config,
++            links,
++            interfaces,
++            ..
++        } = self;
++
++        if let Some(link) = links.get_mut(&Pair::new(src.ip(), dst.ip())) {
++            link.enqueue_message(config, rand, src, dst, message, interfaces)
+         } else {
+             Err(Error::new(
+                 ErrorKind::ConnectionRefused,
+@@ -250,9 +484,16 @@ impl Topology {
+ 
+     // Move messages from any network links to the `dst` host.
+     pub(crate) fn deliver_messages(&mut self, rand: &mut dyn RngCore, dst: &mut Host) {
+-        for (pair, link) in &mut self.links {
++        let Topology {
++            config,
++            links,
++            interfaces,
++            ..
++        } = self;
++
++        for (pair, link) in links {
+             if pair.0 == dst.addr || pair.1 == dst.addr {
+-                link.deliver_messages(&self.config, rand, dst);
++                link.deliver_messages(config, rand, dst, interfaces);
+             }
+         }
+     }
+@@ -262,7 +503,18 @@ impl Topology {
+     }
+ 
+     pub(crate) fn release(&mut self, a: IpAddr, b: IpAddr) {
+-        self.get_link_mut(&Pair::new(a, b)).release();
++        let Topology {
++            config,
++            links,
++            interfaces,
++            ..
++        } = self;
++
++        let pair = Pair::new(a, b);
++        links
++            .get_mut(&pair)
++            .unwrap_or_else(|| panic!("unable to find link between {pair:?}"))
++            .release(config, interfaces);
+     }
+ 
+     pub(crate) fn partition(&mut self, a: IpAddr, b: IpAddr) {
+@@ -302,12 +554,150 @@ impl Topology {
+             .get_mut(pair)
+             .unwrap_or_else(|| panic!("unable to find link between {pair:?}"))
+     }
++
++    #[inline]
++    fn get_link(&self, pair: &Pair) -> &Link {
++        self.links
++            .get(pair)
++            .unwrap_or_else(|| panic!("unable to find link between {pair:?}"))
++    }
++}
++
++impl Interface {
++    fn new(now: Instant) -> Interface {
++        Interface {
++            send: Lane::new(now),
++            receive: Lane::new(now),
++        }
++    }
++}
++
++impl Lane {
++    fn new(now: Instant) -> Lane {
++        Lane {
++            bandwidth: 0,
++            free_at: now,
++            messages: 0,
++            dropped: 0,
++            bytes: 0,
++            busy: Duration::ZERO,
++        }
++    }
++
++    /// The earliest the side can start carrying something, which is right away
++    /// while it is unlimited.
++    fn ready(&self, now: Instant) -> Instant {
++        if self.bandwidth == 0 {
++            now
++        } else {
++            now.max(self.free_at)
++        }
++    }
++
++    /// Hold the side for as long as `size` bytes need, from `start`, and
++    /// return how long that is.
++    fn hold(&mut self, start: Instant, size: u64) -> Duration {
++        let held = config::Capacity::transmit_time(self.bandwidth, size);
++
++        if self.bandwidth != 0 {
++            self.free_at = start + held;
++        }
++
++        self.messages += 1;
++        self.bytes = self.bytes.saturating_add(size);
++        self.busy += held;
++
++        held
++    }
++}
++
++impl Wire {
++    fn new(now: Instant) -> Wire {
++        Wire {
++            bandwidth: None,
++            queue_capacity: None,
++            free_at: now,
++            last_arrival: now,
++            queued: 0,
++            stats: LinkStats::default(),
++        }
++    }
++
++    /// The settings in force for this direction: whatever it was given of its
++    /// own, and the simulation's for everything else, read afresh each time so
++    /// a later change still lands.
++    fn settings(&self, global: &config::Capacity) -> config::Capacity {
++        config::Capacity {
++            bandwidth: self.bandwidth.unwrap_or(global.bandwidth),
++            queue_capacity: self.queue_capacity.unwrap_or(global.queue_capacity),
++            overhead: global.overhead,
++        }
++    }
++
++    /// Take `size` bytes on, returning when they have been taken in at the far
++    /// end, `latency` after they left. Everything taken on ahead of the message
++    /// goes first, on the sending side, on the wire and at the far end alike,
++    /// each is held for as long as it needs, and nothing overtakes what was
++    /// taken on before it.
++    fn transmit(
++        &mut self,
++        sender: &mut Lane,
++        receiver: &mut Lane,
++        now: Instant,
++        size: u64,
++        latency: Duration,
++        bandwidth: u64,
++        busy_until: Instant,
++    ) -> Instant {
++        let start = if bandwidth == 0 {
++            sender.ready(now)
++        } else {
++            sender.ready(now).max(busy_until)
++        };
++
++        let on_wire = config::Capacity::transmit_time(bandwidth, size);
++        let on_sender = sender.hold(start, size);
++
++        if bandwidth != 0 {
++            self.free_at = start + on_wire;
++        }
++        self.queued = self.queued.saturating_add(size);
++        self.stats.sent += 1;
++        self.stats.bytes_sent = self.stats.bytes_sent.saturating_add(size);
++        self.stats.busy += on_wire;
++
++        let reaches = start + on_wire.max(on_sender) + latency;
++        let taken_in = receiver.ready(reaches);
++        let arrival = (taken_in + receiver.hold(taken_in, size)).max(self.last_arrival);
++        self.last_arrival = arrival;
++
++        arrival
++    }
++
++    /// Give back everything the wire was carrying, which happens when the
++    /// messages on it are discarded.
++    fn clear(&mut self, now: Instant) {
++        self.free_at = now;
++        self.last_arrival = now;
++        self.queued = 0;
++    }
++
++    /// Whether a message of `size` bytes does not fit in what the queue has
++    /// left.
++    fn is_full(&self, capacity: u64, size: u64) -> bool {
++        capacity != 0 && self.queued.saturating_add(size) > capacity
++    }
+ }
+ 
+ /// Represents a message sent between two hosts on the network.
+ struct Sent {
+     src: SocketAddr,
+     dst: SocketAddr,
++    /// Bytes the message put on the wire.
++    size: u64,
++    /// Whether the wire has taken the message on. A message sent while its
++    /// direction is holding has not.
++    transmitted: bool,
+     status: DeliveryStatus,
+     protocol: Protocol,
+ }
+@@ -332,9 +722,62 @@ impl Link {
+             sent: VecDeque::new(),
+             deliverable: IndexMap::new(),
+             now,
++            wire_a_b: Wire::new(now),
++            wire_b_a: Wire::new(now),
++            duplex: Duplex::Full,
+         }
+     }
+ 
++    /// The direction of the link that carries traffic from `src` to `dst`. As
++    /// with the states above, 'a' is the end whose address sorts smaller.
++    fn wire(&self, src: IpAddr, dst: IpAddr) -> &Wire {
++        if src < dst {
++            &self.wire_a_b
++        } else {
++            &self.wire_b_a
++        }
++    }
++
++    fn wire_mut(&mut self, src: IpAddr, dst: IpAddr) -> &mut Wire {
++        if src < dst {
++            &mut self.wire_a_b
++        } else {
++            &mut self.wire_b_a
++        }
++    }
++
++    /// Put `size` bytes on the wire from `src` to `dst`, sharing the wire with
++    /// the other direction when the link is half duplex.
++    fn schedule(
++        &mut self,
++        sender: &mut Lane,
++        receiver: &mut Lane,
++        src: IpAddr,
++        dst: IpAddr,
++        size: u64,
++        latency: Duration,
++        bandwidth: u64,
++        earliest: Instant,
++    ) -> Instant {
++        let now = self.now.max(earliest);
++        let busy_until = match self.duplex {
++            Duplex::Full => self.wire(src, dst).free_at,
++            Duplex::Half => self.wire_a_b.free_at.max(self.wire_b_a.free_at),
++        };
++
++        let arrival = self.wire_mut(src, dst).transmit(
++            sender,
++            receiver,
++            now,
++            size,
++            latency,
++            bandwidth,
++            busy_until,
++        );
++
++        arrival
++    }
++
+     fn enqueue_message(
+         &mut self,
+         global_config: &config::Link,
+@@ -342,15 +785,40 @@ impl Link {
+         src: SocketAddr,
+         dst: SocketAddr,
+         message: Protocol,
++        interfaces: &mut Interfaces,
+     ) -> Result<()> {
+         tracing::trace!(target: TRACING_TARGET, ?src, ?dst, protocol = %message, "Send");
+ 
+         self.rand_partition_or_repair(global_config, rand);
+-        let result = self.enqueue(global_config, rand, src, dst, message);
++        let result = self.enqueue(global_config, rand, src, dst, message, interfaces);
+         self.process_deliverables();
+         result
+     }
+ 
++    /// The sending side of `src` and the receiving side of `dst`, which every
++    /// link of those hosts shares.
++    fn lanes<'a>(
++        &self,
++        interfaces: &'a mut Interfaces,
++        src: IpAddr,
++        dst: IpAddr,
++    ) -> (&'a mut Lane, &'a mut Lane) {
++        let now = self.now;
++        interfaces
++            .entry(src)
++            .or_insert_with(|| Interface::new(now));
++        interfaces
++            .entry(dst)
++            .or_insert_with(|| Interface::new(now));
++
++        let (sender, receiver) = interfaces
++            .get_disjoint_mut([&src, &dst])
++            .map(|lane| lane.expect("interface just inserted"))
++            .into();
++
++        (&mut sender.send, &mut receiver.receive)
++    }
++
+     fn get_state_for_message(&self, src: IpAddr, dst: IpAddr) -> State {
+         // Between each pair of ip-addresses there can exist a link.
+         // A link between two such pairs can be constructed as
+@@ -378,12 +846,44 @@ impl Link {
+         src: SocketAddr,
+         dst: SocketAddr,
+         message: Protocol,
++        interfaces: &mut Interfaces,
+     ) -> Result<()> {
+         let state = self.get_state_for_message(src.ip(), dst.ip());
++        let capacity = *global_config.capacity();
++        let size = message.size().saturating_add(capacity.overhead);
+         let status = match state {
+             State::Healthy => {
+                 let delay = self.delay(global_config.latency(), rand);
+-                DeliveryStatus::DeliverAfter(self.now + delay)
++                let settings = self.wire(src.ip(), dst.ip()).settings(&capacity);
++                let mut earliest = self.now;
++
++                if self
++                    .wire(src.ip(), dst.ip())
++                    .is_full(settings.queue_capacity, size)
++                {
++                    if !message.is_connection_oriented() {
++                        self.wire_mut(src.ip(), dst.ip()).stats.dropped += 1;
++                        self.lanes(interfaces, src.ip(), dst.ip()).0.dropped += 1;
++                        tracing::trace!(target: TRACING_TARGET, ?src, ?dst, protocol = %message, "Congested");
++                        return Ok(());
++                    }
++
++                    earliest = self.room_for(src.ip(), dst.ip(), size, settings.queue_capacity);
++                    tracing::trace!(target: TRACING_TARGET, ?src, ?dst, protocol = %message, "Waiting for room");
++                }
++
++                let (sender, receiver) = self.lanes(interfaces, src.ip(), dst.ip());
++                let arrival = self.schedule(
++                    sender,
++                    receiver,
++                    src.ip(),
++                    dst.ip(),
++                    size,
++                    delay,
++                    settings.bandwidth,
++                    earliest,
++                );
++                DeliveryStatus::DeliverAfter(arrival)
+             }
+             // Only A->B is blocked, so B can send, so we can send if src is B
+             State::Hold => {
+@@ -399,6 +899,8 @@ impl Link {
+         let sent = Sent {
+             src,
+             dst,
++            size,
++            transmitted: matches!(status, DeliveryStatus::DeliverAfter(_)),
+             status,
+             protocol: message,
+         };
+@@ -422,6 +924,11 @@ impl Link {
+             if let DeliveryStatus::DeliverAfter(time) = sent.status {
+                 if time <= self.now {
+                     let sent = self.sent.remove(index).unwrap();
++                    let wire = self.wire_mut(sent.src.ip(), sent.dst.ip());
++                    wire.queued = wire.queued.saturating_sub(sent.size);
++                    wire.stats.delivered += 1;
++                    wire.stats.bytes_delivered =
++                        wire.stats.bytes_delivered.saturating_add(sent.size);
+                     let envelope = Envelope {
+                         src: sent.src,
+                         dst: sent.dst,
+@@ -445,6 +952,7 @@ impl Link {
+         global_config: &config::Link,
+         rand: &mut dyn RngCore,
+         host: &mut Host,
++        interfaces: &mut Interfaces,
+     ) {
+         let deliverable = self
+             .deliverable
+@@ -456,7 +964,7 @@ impl Link {
+         for message in deliverable {
+             let (src, dst) = (message.src, message.dst);
+             if let Err(message) = host.receive_from_network(message) {
+-                let _ = self.enqueue_message(global_config, rand, dst, src, message);
++                let _ = self.enqueue_message(global_config, rand, dst, src, message, interfaces);
+             }
+         }
+     }
+@@ -469,17 +977,59 @@ impl Link {
+                 self.state_a_b = State::RandPartition;
+                 self.state_b_a = State::RandPartition;
+ 
+-                self.sent.clear();
++                self.discard_all();
+             }
+             (State::RandPartition, _) | (_, State::RandPartition)
+                 if self.rand_repair(global_config.message_loss(), rand) =>
+             {
+-                self.release();
++                self.state_a_b = State::Healthy;
++                self.state_b_a = State::Healthy;
+             }
+             _ => {}
+         }
+     }
+ 
++    /// When the queue from `from` to `to` has room for `size` bytes, which is
++    /// once enough of what it is carrying has arrived.
++    fn room_for(&self, from: IpAddr, to: IpAddr, size: u64, capacity: u64) -> Instant {
++        let mut carrying = self.wire(from, to).queued;
++        let mut room_at = self.now;
++
++        for sent in &self.sent {
++            if carrying + size <= capacity {
++                break;
++            }
++
++            if sent.src.ip() != from {
++                continue;
++            }
++
++            if let DeliveryStatus::DeliverAfter(arrival) = sent.status {
++                carrying = carrying.saturating_sub(sent.size);
++                room_at = room_at.max(arrival);
++            }
++        }
++
++        room_at
++    }
++
++    /// Throw away everything the link is carrying, in both directions, and
++    /// give both wires their capacity back.
++    fn discard_all(&mut self) {
++        let now = self.now;
++        self.sent.clear();
++        self.wire_a_b.clear(now);
++        self.wire_b_a.clear(now);
++    }
++
++    /// Throw away what the link is carrying from `from` to `to`, and give that
++    /// wire its capacity back.
++    fn discard_one_way(&mut self, from: IpAddr, to: IpAddr) {
++        let now = self.now;
++        self.sent.retain(|sent| sent.src.ip() != from);
++        self.wire_mut(from, to).clear(now);
++    }
++
+     fn hold(&mut self) {
+         self.state_a_b = State::Hold;
+         self.state_b_a = State::Hold;
+@@ -489,14 +1039,45 @@ impl Link {
+         }
+     }
+ 
+-    // This link becomes healthy, and any held messages are scheduled for delivery.
+-    fn release(&mut self) {
++    // This link becomes healthy, and any held messages are scheduled for
++    // delivery. A message that was held before it reached the wire goes on it
++    // now, behind whatever the wire is already carrying.
++    fn release(&mut self, global_config: &config::Link, interfaces: &mut Interfaces) {
+         self.state_a_b = State::Healthy;
+         self.state_b_a = State::Healthy;
+-        for sent in &mut self.sent {
+-            if let DeliveryStatus::Hold = sent.status {
+-                sent.deliver(self.now);
++
++        let now = self.now;
++        let capacity = *global_config.capacity();
++
++        for index in 0..self.sent.len() {
++            let sent = &self.sent[index];
++            if !matches!(sent.status, DeliveryStatus::Hold) {
++                continue;
+             }
++
++            let (src, dst, size, transmitted) =
++                (sent.src, sent.dst, sent.size, sent.transmitted);
++
++            let arrival = if transmitted {
++                now
++            } else {
++                let bandwidth = self.wire(src.ip(), dst.ip()).settings(&capacity).bandwidth;
++                let (sender, receiver) = self.lanes(interfaces, src.ip(), dst.ip());
++                self.schedule(
++                    sender,
++                    receiver,
++                    src.ip(),
++                    dst.ip(),
++                    size,
++                    Duration::ZERO,
++                    bandwidth,
++                    now,
++                )
++            };
++
++            let sent = &mut self.sent[index];
++            sent.transmitted = true;
++            sent.status = DeliveryStatus::DeliverAfter(arrival);
+         }
+     }
+ 
+@@ -504,7 +1085,7 @@ impl Link {
+         self.state_a_b = State::ExplicitPartition;
+         self.state_b_a = State::ExplicitPartition;
+ 
+-        self.sent.clear();
++        self.discard_all();
+     }
+ 
+     fn partition_oneway(&mut self, from: IpAddr, to: IpAddr) {
+@@ -514,7 +1095,7 @@ impl Link {
+             self.state_b_a = State::ExplicitPartition;
+         }
+ 
+-        self.sent.retain(|sent| sent.src.ip() != from);
++        self.discard_one_way(from, to);
+     }
+ 
+     fn repair_oneway(&mut self, from: IpAddr, to: IpAddr) {

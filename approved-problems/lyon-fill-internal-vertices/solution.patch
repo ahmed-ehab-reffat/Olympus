@@ -1,0 +1,504 @@
+diff --git a/crates/tessellation/src/event_queue.rs b/crates/tessellation/src/event_queue.rs
+index ea88fd8..b8bdbc0 100644
+--- a/crates/tessellation/src/event_queue.rs
++++ b/crates/tessellation/src/event_queue.rs
+@@ -19,6 +19,7 @@ pub(crate) type TessEventId = u32;
+ 
+ pub(crate) const INVALID_EVENT_ID: TessEventId = u32::MAX;
+ 
++#[derive(Clone)]
+ pub(crate) struct Event {
+     pub next_sibling: TessEventId,
+     pub next_event: TessEventId,
+@@ -37,6 +38,7 @@ pub(crate) struct EdgeData {
+ 
+ #[doc(hidden)]
+ /// A queue of sorted events for the fill tessellator's sweep-line algorithm.
++#[derive(Clone)]
+ pub struct EventQueue {
+     pub(crate) events: Vec<Event>,
+     pub(crate) edge_data: Vec<EdgeData>,
+diff --git a/crates/tessellation/src/fill.rs b/crates/tessellation/src/fill.rs
+index 6c88a10..71d7c71 100644
+--- a/crates/tessellation/src/fill.rs
++++ b/crates/tessellation/src/fill.rs
+@@ -1,5 +1,6 @@
+ use crate::event_queue::*;
+ use crate::geom::LineSegment;
++use crate::interior::{FilteringBuilder, MeshRecorder};
+ use crate::math::*;
+ use crate::monotone::*;
+ use crate::path::polygon::Polygon;
+@@ -758,6 +759,29 @@ impl FillTessellator {
+             ));
+         }
+ 
++        if !options.eliminate_interior_vertices {
++            return self.tessellate_pass(options, attrib_store, builder);
++        }
++
++        let events = self.events.clone();
++
++        let mut recorder = MeshRecorder::new();
++        self.tessellate_pass(options, attrib_store, &mut recorder)?;
++        let plan = recorder.into_plan();
++
++        self.events = events;
++
++        let mut filtered = FilteringBuilder::new(builder, plan);
++
++        self.tessellate_pass(options, attrib_store, &mut filtered)
++    }
++
++    fn tessellate_pass(
++        &mut self,
++        options: &FillOptions,
++        attrib_store: Option<&dyn AttributeStore>,
++        builder: &mut dyn FillGeometryBuilder,
++    ) -> TessellationResult {
+         self.reset();
+ 
+         if let Some(store) = attrib_store {
+diff --git a/crates/tessellation/src/interior.rs b/crates/tessellation/src/interior.rs
+new file mode 100644
+index 0000000..28c041b
+--- /dev/null
++++ b/crates/tessellation/src/interior.rs
+@@ -0,0 +1,391 @@
++use crate::geometry_builder::{GeometryBuilder, GeometryBuilderError};
++use crate::math::Point;
++use crate::{FillGeometryBuilder, FillVertex, VertexId};
++
++use alloc::vec;
++use alloc::vec::Vec;
++
++fn edge_key(from: u32, to: u32) -> u64 {
++    ((from as u64) << 32) | (to as u64)
++}
++
++fn edge_ends(key: u64) -> (u32, u32) {
++    ((key >> 32) as u32, (key & 0xffff_ffff) as u32)
++}
++
++fn directed_edges(triangles: &[[u32; 3]]) -> Vec<u64> {
++    let mut edges = Vec::with_capacity(triangles.len() * 3);
++    for t in triangles {
++        edges.push(edge_key(t[0], t[1]));
++        edges.push(edge_key(t[1], t[2]));
++        edges.push(edge_key(t[2], t[0]));
++    }
++    edges.sort_unstable();
++
++    edges
++}
++
++fn unpaired_edges(edges: &[u64]) -> Vec<(u32, u32)> {
++    let mut unpaired = Vec::new();
++    for key in edges {
++        let (from, to) = edge_ends(*key);
++        if edges.binary_search(&edge_key(to, from)).is_err() {
++            unpaired.push((from, to));
++        }
++    }
++
++    unpaired
++}
++
++fn boundary_vertices(triangles: &[[u32; 3]], vertex_count: usize) -> Vec<bool> {
++    let mut on_boundary = vec![false; vertex_count];
++    for (from, to) in unpaired_edges(&directed_edges(triangles)) {
++        on_boundary[from as usize] = true;
++        on_boundary[to as usize] = true;
++    }
++
++    on_boundary
++}
++
++fn patch_outline(patch: &[[u32; 3]]) -> Option<Vec<u32>> {
++    let ring = unpaired_edges(&directed_edges(patch));
++    if ring.len() < 3 {
++        return None;
++    }
++
++    let start = ring[0].0;
++    let mut outline = Vec::with_capacity(ring.len());
++    let mut current = start;
++    loop {
++        outline.push(current);
++        let next = ring.iter().find(|(from, _)| *from == current)?.1;
++        if next == start {
++            break;
++        }
++        if outline.len() >= ring.len() {
++            return None;
++        }
++        current = next;
++    }
++
++    if outline.len() != ring.len() {
++        return None;
++    }
++
++    Some(outline)
++}
++
++fn cross(a: Point, b: Point, c: Point) -> f32 {
++    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
++}
++
++fn is_clockwise(outline: &[u32], positions: &[Point]) -> bool {
++    let mut total = 0.0;
++    for i in 0..outline.len() {
++        let a = positions[outline[i] as usize];
++        let b = positions[outline[(i + 1) % outline.len()] as usize];
++        total += a.x * b.y - b.x * a.y;
++    }
++
++    total < 0.0
++}
++
++fn triangle_contains(a: Point, b: Point, c: Point, p: Point) -> bool {
++    cross(a, b, p) >= 0.0 && cross(b, c, p) >= 0.0 && cross(c, a, p) >= 0.0
++}
++
++fn ear_clip(outline: &[u32], positions: &[Point]) -> Option<Vec<[u32; 3]>> {
++    let clockwise = is_clockwise(outline, positions);
++    let mut remaining: Vec<u32> = outline.to_vec();
++    if clockwise {
++        remaining.reverse();
++    }
++
++    let mut triangles = Vec::with_capacity(outline.len());
++    while remaining.len() > 3 {
++        let count = remaining.len();
++        let mut clipped = false;
++        for i in 0..count {
++            let a = remaining[(i + count - 1) % count];
++            let b = remaining[i];
++            let c = remaining[(i + 1) % count];
++            let pa = positions[a as usize];
++            let pb = positions[b as usize];
++            let pc = positions[c as usize];
++            if cross(pa, pb, pc) <= 0.0 {
++                continue;
++            }
++
++            let mut empty = true;
++            for other in &remaining {
++                if *other == a || *other == b || *other == c {
++                    continue;
++                }
++                if triangle_contains(pa, pb, pc, positions[*other as usize]) {
++                    empty = false;
++                    break;
++                }
++            }
++
++            if empty {
++                triangles.push([a, b, c]);
++                remaining.remove(i);
++                clipped = true;
++                break;
++            }
++        }
++
++        if !clipped {
++            return None;
++        }
++    }
++
++    triangles.push([remaining[0], remaining[1], remaining[2]]);
++
++    if clockwise {
++        for t in &mut triangles {
++            t.swap(0, 2);
++        }
++    }
++
++    Some(triangles)
++}
++
++fn boundary_neighbors(triangles: &[[u32; 3]], vertex_count: usize) -> Vec<Option<(u32, u32)>> {
++    let mut incoming: Vec<Option<u32>> = vec![None; vertex_count];
++    let mut outgoing: Vec<Option<u32>> = vec![None; vertex_count];
++    let mut forked = vec![false; vertex_count];
++
++    for (from, to) in unpaired_edges(&directed_edges(triangles)) {
++        if outgoing[from as usize].is_some() {
++            forked[from as usize] = true;
++        }
++        outgoing[from as usize] = Some(to);
++
++        if incoming[to as usize].is_some() {
++            forked[to as usize] = true;
++        }
++        incoming[to as usize] = Some(from);
++    }
++
++    let mut neighbors = vec![None; vertex_count];
++    for id in 0..vertex_count {
++        if forked[id] {
++            continue;
++        }
++        if let (Some(previous), Some(next)) = (incoming[id], outgoing[id]) {
++            neighbors[id] = Some((previous, next));
++        }
++    }
++
++    neighbors
++}
++
++fn lies_between(previous: Point, vertex: Point, next: Point) -> bool {
++    if cross(previous, vertex, next) != 0.0 {
++        return false;
++    }
++
++    let incoming_x = vertex.x - previous.x;
++    let incoming_y = vertex.y - previous.y;
++    let outgoing_x = next.x - vertex.x;
++    let outgoing_y = next.y - vertex.y;
++
++    incoming_x * outgoing_x + incoming_y * outgoing_y > 0.0
++}
++
++fn next_removable_vertex(
++    triangles: &[[u32; 3]],
++    blocked: &[bool],
++    positions: &[Point],
++) -> Option<u32> {
++    let vertex_count = positions.len();
++    let on_boundary = boundary_vertices(triangles, vertex_count);
++    for t in triangles {
++        for id in t {
++            let index = *id as usize;
++            if !on_boundary[index] && !blocked[index] {
++                return Some(*id);
++            }
++        }
++    }
++
++    let neighbors = boundary_neighbors(triangles, vertex_count);
++    for t in triangles {
++        for id in t {
++            let index = *id as usize;
++            if blocked[index] {
++                continue;
++            }
++            if let Some((previous, next)) = neighbors[index] {
++                if lies_between(
++                    positions[previous as usize],
++                    positions[index],
++                    positions[next as usize],
++                ) {
++                    return Some(*id);
++                }
++            }
++        }
++    }
++
++    None
++}
++
++fn simplify(positions: &[Point], mut triangles: Vec<[u32; 3]>) -> Vec<[u32; 3]> {
++    let mut blocked = vec![false; positions.len()];
++    while let Some(vertex) = next_removable_vertex(&triangles, &blocked, positions) {
++        let patch: Vec<[u32; 3]> = triangles
++            .iter()
++            .filter(|t| t.contains(&vertex))
++            .cloned()
++            .collect();
++
++        let fan = patch_outline(&patch).and_then(|mut outline| {
++            outline.retain(|id| *id != vertex);
++            if outline.len() < 3 {
++                return None;
++            }
++
++            ear_clip(&outline, positions)
++        });
++
++        match fan {
++            Some(fan) => {
++                triangles.retain(|t| !t.contains(&vertex));
++                triangles.extend(fan);
++            }
++            None => {
++                blocked[vertex as usize] = true;
++            }
++        }
++    }
++
++    triangles
++}
++
++pub(crate) struct SimplificationPlan {
++    keep: Vec<bool>,
++    triangles: Vec<[u32; 3]>,
++}
++
++/// Collects the mesh of a full sweep so that interior vertices can be identified
++/// before anything reaches the real geometry builder.
++pub(crate) struct MeshRecorder {
++    positions: Vec<Point>,
++    triangles: Vec<[u32; 3]>,
++}
++
++impl MeshRecorder {
++    pub(crate) fn new() -> Self {
++        MeshRecorder {
++            positions: Vec::new(),
++            triangles: Vec::new(),
++        }
++    }
++
++    pub(crate) fn into_plan(self) -> SimplificationPlan {
++        let triangles = simplify(&self.positions, self.triangles);
++        let mut keep = vec![false; self.positions.len()];
++        for t in &triangles {
++            for id in t {
++                keep[*id as usize] = true;
++            }
++        }
++
++        SimplificationPlan { keep, triangles }
++    }
++}
++
++impl GeometryBuilder for MeshRecorder {
++    fn begin_geometry(&mut self) {
++        self.positions.clear();
++        self.triangles.clear();
++    }
++
++    fn add_triangle(&mut self, a: VertexId, b: VertexId, c: VertexId) {
++        self.triangles.push([a.0, b.0, c.0]);
++    }
++
++    fn abort_geometry(&mut self) {
++        self.positions.clear();
++        self.triangles.clear();
++    }
++}
++
++impl FillGeometryBuilder for MeshRecorder {
++    fn add_fill_vertex(&mut self, vertex: FillVertex) -> Result<VertexId, GeometryBuilderError> {
++        let id = self.positions.len() as u32;
++        self.positions.push(vertex.position());
++
++        Ok(VertexId(id))
++    }
++}
++
++/// Replays a sweep against the real geometry builder, forwarding only the vertices
++/// the plan keeps and emitting the simplified triangles at the end.
++pub(crate) struct FilteringBuilder<'l> {
++    output: &'l mut dyn FillGeometryBuilder,
++    plan: SimplificationPlan,
++    remap: Vec<VertexId>,
++    next: u32,
++}
++
++impl<'l> FilteringBuilder<'l> {
++    pub(crate) fn new(
++        output: &'l mut dyn FillGeometryBuilder,
++        plan: SimplificationPlan,
++    ) -> Self {
++        let remap = vec![VertexId::INVALID; plan.keep.len()];
++
++        FilteringBuilder {
++            output,
++            plan,
++            remap,
++            next: 0,
++        }
++    }
++}
++
++impl<'l> GeometryBuilder for FilteringBuilder<'l> {
++    fn begin_geometry(&mut self) {
++        self.next = 0;
++        for id in &mut self.remap {
++            *id = VertexId::INVALID;
++        }
++        self.output.begin_geometry();
++    }
++
++    fn add_triangle(&mut self, _a: VertexId, _b: VertexId, _c: VertexId) {}
++
++    fn end_geometry(&mut self) {
++        for i in 0..self.plan.triangles.len() {
++            let t = self.plan.triangles[i];
++            let a = self.remap[t[0] as usize];
++            let b = self.remap[t[1] as usize];
++            let c = self.remap[t[2] as usize];
++            if a != VertexId::INVALID && b != VertexId::INVALID && c != VertexId::INVALID {
++                self.output.add_triangle(a, b, c);
++            }
++        }
++        self.output.end_geometry();
++    }
++
++    fn abort_geometry(&mut self) {
++        self.output.abort_geometry();
++    }
++}
++
++impl<'l> FillGeometryBuilder for FilteringBuilder<'l> {
++    fn add_fill_vertex(&mut self, vertex: FillVertex) -> Result<VertexId, GeometryBuilderError> {
++        let id = self.next;
++        self.next += 1;
++
++        let index = id as usize;
++        if index < self.plan.keep.len() && self.plan.keep[index] {
++            self.remap[index] = self.output.add_fill_vertex(vertex)?;
++        }
++
++        Ok(VertexId(id))
++    }
++}
+diff --git a/crates/tessellation/src/lib.rs b/crates/tessellation/src/lib.rs
+index 556d1d3..81c3baa 100644
+--- a/crates/tessellation/src/lib.rs
++++ b/crates/tessellation/src/lib.rs
+@@ -203,6 +203,7 @@ mod error;
+ mod event_queue;
+ mod fill;
+ pub mod geometry_builder;
++mod interior;
+ mod math_utils;
+ mod monotone;
+ mod stroke;
+@@ -471,6 +472,12 @@ pub struct FillOptions {
+     ///
+     /// Default value: `true`.
+     pub handle_intersections: bool,
++
++    /// Emit only the vertices on the boundary of the filled region, removing the
++    /// ones that fall strictly inside it.
++    ///
++    /// Default value: `false`.
++    pub eliminate_interior_vertices: bool,
+ }
+ 
+ impl FillOptions {
+@@ -486,6 +493,7 @@ impl FillOptions {
+         fill_rule: Self::DEFAULT_FILL_RULE,
+         sweep_orientation: Self::DEFAULT_SWEEP_ORIENTATION,
+         handle_intersections: true,
++        eliminate_interior_vertices: false,
+     };
+ 
+     #[inline]
+@@ -528,6 +536,12 @@ impl FillOptions {
+         self.handle_intersections = intersections;
+         self
+     }
++
++    #[inline]
++    pub const fn with_interior_vertex_elimination(mut self, eliminate: bool) -> Self {
++        self.eliminate_interior_vertices = eliminate;
++        self
++    }
+ }
+ 
+ impl Default for FillOptions {

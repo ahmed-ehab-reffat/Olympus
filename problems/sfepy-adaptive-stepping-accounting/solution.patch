@@ -1,0 +1,1016 @@
+diff --git a/sfepy/discrete/problem.py b/sfepy/discrete/problem.py
+index d80fe11..6fe00bf 100644
+--- a/sfepy/discrete/problem.py
++++ b/sfepy/discrete/problem.py
+@@ -1345,9 +1345,16 @@ class Problem(Struct):
+ 
+             restart_filename = self.conf.options.get('load_restart', None)
+             if restart_filename is not None:
++                from sfepy.solvers.ts_solvers import \
++                    is_resumed_step_unfinished
++
+                 variables = self.load_restart(restart_filename, ts=ts)
+                 self.advance(ts)
+-                ts.advance()
++                solver = getattr(self, 'solver', None)
++                is_unfinished = ((solver is not None)
++                                 and is_resumed_step_unfinished(solver, ts))
++                if (ts.nt < 1.0) and not is_unfinished:
++                    ts.advance()
+                 vec0 = variables.get_state(self.active_only)
+ 
+             return vec0
+@@ -2076,6 +2083,75 @@ class Problem(Struct):
+ 
+         return restart_filename
+ 
++    def get_stepping_state(self):
++        """
++        Return the adaptation state of the time stepping solver.
++
++        The state is what a restarted run needs to continue the step size
++        sequence of an uninterrupted one.
++
++        Returns
++        -------
++        tsc_state : dict or None
++            The time step controller state.
++        adt_state : dict or None
++            The adaptivity state of the time stepping solver itself.
++        log_state : dict or None
++            The step log, as arrays.
++        """
++        solver = getattr(self, 'solver', None)
++
++        tsc = getattr(solver, 'tsc', None)
++        tsc_state = tsc.get_state() if tsc is not None else None
++
++        adt = getattr(solver, 'adt', None)
++        adt_state = ({'red' : adt.red, 'wait' : adt.wait}
++                     if adt is not None else None)
++
++        step_log = getattr(solver, 'step_log', None)
++        log_state = step_log.to_arrays() if step_log is not None else None
++
++        return tsc_state, adt_state, log_state
++
++    def set_stepping_state(self, tsc_state, adt_state, log_state=None):
++        """
++        Restore the adaptation state of the time stepping solver.
++
++        Parameters
++        ----------
++        tsc_state : dict or None
++            The time step controller state.
++        adt_state : dict or None
++            The adaptivity state of the time stepping solver itself.
++        log_state : dict or None
++            The step log, as arrays.
++        """
++        from sfepy.solvers.ts_solvers import StepLog
++
++        solver = getattr(self, 'solver', None)
++
++        tsc = getattr(solver, 'tsc', None)
++        if (tsc is not None) and (tsc_state is not None):
++            tsc.set_state(**tsc_state)
++
++        adt = getattr(solver, 'adt', None)
++        if (adt is not None) and (adt_state is not None):
++            adt.red = float(adt_state['red'])
++            adt.wait = int(adt_state['wait'])
++
++        if solver is not None:
++            solver.is_resumed = True
++            if log_state is not None:
++                solver.step_log = StepLog.from_arrays(log_state)
++
++    @staticmethod
++    def _read_restart_group(fd, name):
++        if not hasattr(fd.root, name):
++            return None
++
++        return {val.name : val.read()
++                for val in fd.root._f_get_child(name)._f_walknodes()}
++
+     def save_restart(self, filename, ts=None):
+         """
+         Save the current state and time step to a restart file.
+@@ -2102,6 +2178,16 @@ class Problem(Struct):
+         for key, val in ts.get_state().items():
+             fd.create_array(tgroup, key, val, key)
+ 
++        tsc_state, adt_state, log_state = self.get_stepping_state()
++        for name, state in [('tsc', tsc_state), ('adt', adt_state),
++                            ('step_log', log_state)]:
++            if state is None:
++                continue
++
++            group = fd.create_group('/', name, name)
++            for key, val in state.items():
++                fd.create_array(group, key, val, key)
++
+         variables = self.get_variables()
+         if variables.r_vec is not None:
+             fd.create_array('/', 'r_vec', variables.r_vec,
+@@ -2173,6 +2259,10 @@ class Problem(Struct):
+ 
+             ts.set_state(**ts_state)
+ 
++            self.set_stepping_state(self._read_restart_group(fd, 'tsc'),
++                                    self._read_restart_group(fd, 'adt'),
++                                    self._read_restart_group(fd, 'step_log'))
++
+             vec = variables.create_vec()
+             for var in variables.iter_state():
+                 vgroup = fd.root._f_get_child(var.name)
+diff --git a/sfepy/solvers/solvers.py b/sfepy/solvers/solvers.py
+index c68cfc7..571e529 100644
+--- a/sfepy/solvers/solvers.py
++++ b/sfepy/solvers/solvers.py
+@@ -307,6 +307,32 @@ class TimeStepController(Solver):
+     def get_initial_dt(self, ts, vec, **kwargs):
+         return ts.dt
+ 
++    def get_state(self):
++        """
++        Return the adaptation state of the controller.
++
++        The state has to be sufficient to continue the step size sequence of an
++        interrupted run. Controllers that adapt without keeping any information
++        between steps return an empty dictionary.
++
++        Returns
++        -------
++        state : dict
++            The adaptation state, with values storable in a restart file.
++        """
++        return {}
++
++    def set_state(self, **state):
++        """
++        Restore the adaptation state of the controller.
++
++        Parameters
++        ----------
++        **state : dict
++            The state as returned by :func:`TimeStepController.get_state()`.
++        """
++        pass
++
+     def __call__(self, ts, vec0, vec1, **kwargs):
+         raise ValueError('called an abstract TimeStepController instance!')
+ 
+@@ -319,6 +345,8 @@ class TimeSteppingSolver(Solver):
+                  **kwargs):
+         Solver.__init__(self, conf=conf, nls=nls, tsc=tsc, status=status,
+                         context=context, **kwargs)
++        self.step_log = None
++        self.is_resumed = False
+ 
+     def set_dof_info(self, di):
+         self.di = di
+diff --git a/sfepy/solvers/ts.py b/sfepy/solvers/ts.py
+index 4b1f50a..75846f2 100644
+--- a/sfepy/solvers/ts.py
++++ b/sfepy/solvers/ts.py
+@@ -159,8 +159,8 @@ class VariableTimeStepper(TimeStepper):
+         assert_(len(times) == (step + 1))
+ 
+         self.step = step
+-        self.dt = dt
+-        self.times = times
++        self.dt = float(dt)
++        self.times = [float(ii) for ii in times]
+ 
+         self.time = self.times[-1]
+         self.normalize_time()
+@@ -191,10 +191,29 @@ class VariableTimeStepper(TimeStepper):
+         self.dt = dt
+ 
+         if update_time:
+-            self.time = self.times[self.step - 1] + self.dt
++            start = self.times[self.step - 1]
++            self.clamp_time_step(start)
++            self.time = start + self.dt
+             self.times[self.step] = self.time
+             self.normalize_time()
+ 
++    def clamp_time_step(self, start):
++        """
++        Shorten the current time step so that a step taken from `start` ends at
++        the final time at the latest.
++
++        Returns
++        -------
++        is_shortened : bool
++            True if the time step was shortened.
++        """
++        remaining = self.t1 - start
++        if (remaining > 0.0) and (self.dt > remaining):
++            self.dt = remaining
++            return True
++
++        return False
++
+     def advance(self):
+         self.step += 1
+         self.time += self.dt
+diff --git a/sfepy/solvers/ts_controllers.py b/sfepy/solvers/ts_controllers.py
+index 79bc596..bc0d4da 100644
+--- a/sfepy/solvers/ts_controllers.py
++++ b/sfepy/solvers/ts_controllers.py
+@@ -27,19 +27,89 @@ class TimesSequenceTSC(TimeStepController):
+         TimeStepController.__init__(self, conf=conf, **kwargs)
+ 
+         self.iter_times = iter(self.conf.times)
++        self.times = []
++        self.index = 0
++        self.is_complete = False
++        self.t1 = None
++
++    def _fill_times(self, count):
++        """
++        Pull times from the sequence until `count` of them are retained.
++
++        Only the times a run has reached are kept, so an endless sequence is
++        never exhausted and a one-shot iterator stays replayable. A sequence
++        that runs out is complete, and so is one restored from a state: neither
++        is asked for more, so a restored run falls back to the final time where
++        the run it continues did. What has been pulled is kept, so a state that
++        holds no schedule of its own rewinds within the one already retained.
++        """
++        while len(self.times) < count:
++            if self.is_complete:
++                return False
++
++            try:
++                self.times.append(next(self.iter_times))
++
++            except StopIteration:
++                self.is_complete = True
++                return False
++
++        return True
++
++    def _next_time(self, default):
++        if not self._fill_times(self.index + 1):
++            return default
++
++        time = self.times[self.index]
++        self.index += 1
++
++        return time
++
++    def _retain_schedule(self):
++        """
++        Pull every time up to the final time from the sequence.
++
++        A one-shot iterator is spent by the run that saves a state, so a
++        resumed run has to get the times it has not reached yet from the state
++        rather than from the sequence. Nothing past the final time is pulled,
++        so an endless sequence stays usable.
++        """
++        if self.t1 is None:
++            return
++
++        while not self.is_complete:
++            if self.times and (self.times[-1] >= self.t1):
++                self.is_complete = True
++
++            elif not self._fill_times(len(self.times) + 1):
++                return
++
++    def get_state(self):
++        self._retain_schedule()
++        state = {'index' : self.index}
++        if self.times:
++            state['times'] = list(self.times)
++
++        return state
++
++    def set_state(self, index=0, times=(), **kwargs):
++        times = [float(ii) for ii in times]
++        if len(times) > len(self.times):
++            self.times = times
++            self.is_complete = True
++
++        self.index = int(index)
+ 
+     def get_initial_dt(self, ts, vec, **kwargs):
+         # This cannot be called repeatedly!
+         self.t0 = ts.t0
+-        return next(self.iter_times) - self.t0
++        self.t1 = ts.t1
++        return self._next_time(ts.t1) - self.t0
+ 
+     def __call__(self, ts, vec0, vec1, **kwargs):
+         self.t0 = ts.time
+-        try:
+-            t1 = next(self.iter_times)
+-
+-        except StopIteration:
+-            t1 = ts.t1
++        self.t1 = ts.t1
++        t1 = self._next_time(ts.t1)
+ 
+         new_dt = t1 - self.t0
+         if new_dt == 0.0:
+@@ -125,7 +195,7 @@ class ElastodynamicsBasicTSC(TimeStepController):
+         eps_a = min(*conf.eps_a)
+         eps_r = min(*conf.eps_r)
+ 
+-        aux = unpack(vec0)
++        aux = unpack(vec)
+         u0, v0, a0 = aux if unpack.n_arg == 3 else (aux[0], aux[2], aux[3])
+ 
+         d0 = eval_scaled_norm(u0, eps_a, eps_r)
+@@ -204,6 +274,13 @@ class ElastodynamicsPIDTSC(ElastodynamicsBasicTSC):
+         self.emax0 = 1.0
+         self.emax00 = 1.0
+ 
++    def get_state(self):
++        return {'emax0' : self.emax0, 'emax00' : self.emax00}
++
++    def set_state(self, emax0=1.0, emax00=1.0, **kwargs):
++        self.emax0 = float(emax0)
++        self.emax00 = float(emax00)
++
+     def __call__(self, ts, vec0, vec1, unpack, **kwargs):
+         conf = self.conf
+         dt = ts.dt
+@@ -274,6 +351,12 @@ class ElastodynamicsLinearTSC(ElastodynamicsBasicTSC):
+             )
+         self.count = 0
+ 
++    def get_state(self):
++        return {'count' : self.count}
++
++    def set_state(self, count=0, **kwargs):
++        self.count = int(count)
++
+     def __call__(self, ts, vec0, vec1, unpack, **kwargs):
+         conf = self.conf
+         dt = ts.dt
+diff --git a/sfepy/solvers/ts_solvers.py b/sfepy/solvers/ts_solvers.py
+index c486fc3..dd9cc63 100644
+--- a/sfepy/solvers/ts_solvers.py
++++ b/sfepy/solvers/ts_solvers.py
+@@ -169,9 +169,26 @@ class SimpleTimeSteppingSolver(TimeSteppingSolver):
+         self.format = format
+         self.verbose = self.conf.verbose
+ 
++    def record_initial_step(self, nls):
++        """
++        Log the nonlinear solve made at the initial time of a quasistatic run.
++
++        The solve is an attempt at step zero like any other, but it has no step
++        size to reduce, so a rejected one is recorded without being retried.
++        """
++        nls_status = getattr(nls, 'status', None)
++        is_accepted = ((nls_status is None)
++                       or (nls_status.get('condition', 0) == 0))
++        ts = self.ts
++        self.step_log.append(
++            make_step_record(ts, ts.dt, 'accept' if is_accepted else 'reject',
++                             None, nls_status)
++        )
++
+     def solve_step0(self, nls, vec0):
+         if self.conf.quasistatic:
+             vec = nls(vec0)
++            self.record_initial_step(nls)
+ 
+         else:
+             res = nls.fun(vec0)
+@@ -184,6 +201,20 @@ class SimpleTimeSteppingSolver(TimeSteppingSolver):
+     def solve_step(self, ts, nls, vec, prestep_fun=None):
+         return nls(vec)
+ 
++    def is_initial_step_accepted(self):
++        """
++        Tell whether the state the initial solve produced may be returned as an
++        accepted one.
++
++        A quasistatic initial solve that did not converge is recorded as a
++        rejection, so a run stopped before accepting any step falls back to the
++        state before that solve.
++        """
++        if not self.conf.quasistatic:
++            return True
++
++        return self.step_log[-1].result == 'accept'
++
+     def output_step_info(self, ts):
+         output(self.format % (ts.time, ts.step + 1, ts.n_step),
+                verbose=self.verbose)
+@@ -199,6 +230,13 @@ class SimpleTimeSteppingSolver(TimeSteppingSolver):
+ 
+         vec0 = init_fun(ts, vec0)
+ 
++        is_finished = is_resumed_run_finished(self, ts)
++        step_log = setup_step_log(self, ts)
++        if is_finished:
++            set_stepping_status(status, step_log, None)
++
++            return vec0
++
+         self.output_step_info(ts)
+         if ts.step == 0:
+             vec0 = prestep_fun(ts, vec0)
+@@ -207,6 +245,10 @@ class SimpleTimeSteppingSolver(TimeSteppingSolver):
+ 
+             vec = poststep_fun(ts, vec)
+             ts.advance()
++            if ts.step == 0:
++                set_stepping_status(status, step_log, None)
++
++                return vec
+ 
+         else:
+             vec = vec0
+@@ -216,12 +258,23 @@ class SimpleTimeSteppingSolver(TimeSteppingSolver):
+ 
+             vec = prestep_fun(ts, vec)
+ 
++            dt = ts.dt
+             vect = self.solve_step(ts, nls, vec, prestep_fun)
+ 
++            nls_status = getattr(nls, 'status', None)
++            is_accepted = ((nls_status is None)
++                           or (nls_status.get('condition', 0) == 0))
++            step_log.append(
++                make_step_record(ts, dt, 'accept' if is_accepted else 'reject',
++                                 None, nls_status)
++            )
++
+             vect = poststep_fun(ts, vect)
+ 
+             vec = vect
+ 
++        set_stepping_status(status, step_log, None)
++
+         return vec
+ 
+ def get_min_dt(adt):
+@@ -233,6 +286,294 @@ def get_min_dt(adt):
+ 
+     return dt
+ 
++class StepRecord(Struct):
++    """
++    A record of a single attempt at a time step.
++
++    Attributes
++    ----------
++    step : int
++        The index of the time step the attempt belongs to.
++    time : float
++        The time the attempt aimed at.
++    dt : float
++        The time step size used by the attempt.
++    result : str
++        Either 'accept' or 'reject'.
++    emax : float or None
++        The error estimate of the time step controller, None if the controller
++        computes none.
++    condition : int
++        The exit condition of the nonlinear solver.
++    n_iter : int
++        The number of nonlinear solver iterations.
++    """
++
++    def __init__(self, step, time, dt, result, emax, condition, n_iter):
++        Struct.__init__(self, step=step, time=time, dt=dt, result=result,
++                        emax=emax, condition=condition, n_iter=n_iter)
++
++def make_step_record(ts, dt, result, emax, nls_status, time=None):
++    """
++    Build the record of a single time step attempt.
++
++    `time` is the time the attempt aimed at. It defaults to the current
++    stepper time, and has to be passed explicitly by callers that adapt the
++    step size before recording, as adapting moves the stepper to the retry.
++    """
++    if nls_status is not None:
++        condition = nls_status.get('condition', 0)
++        n_iter = nls_status.get('n_iter', 0)
++
++    else:
++        condition, n_iter = 0, 0
++
++    return StepRecord(ts.step, ts.time if time is None else float(time),
++                      dt, result, emax if emax is None else float(emax),
++                      condition, n_iter)
++
++def get_retry_time_step(ts, dt, red_factor):
++    """
++    Size the retry of a rejected attempt.
++
++    The retry has to be smaller than the attempt it replaces and has to stay
++    within the final time. The size the controller proposes need not do either,
++    as it comes from the default step size and so ignores both the shortening
++    of the attempt that was rejected and the time left to run.
++    """
++    return min(get_reduced_time_step(ts, dt, red_factor),
++               ts.t1 - ts.times[ts.step - 1])
++
++def get_reduced_time_step(ts, dt, red_factor):
++    """
++    Return the size a retry reduces to, before the final time is taken into
++    account.
++
++    The reduction is what the floor is measured against, so a retry shortened
++    only because little time is left does not count as one.
++    """
++    return min(ts.dt, dt * red_factor)
++
++def is_past_reduction_floor(adt, dt_next):
++    """
++    Tell whether a retry of the given size has shrunk past the floor the
++    adaptivity parameters allow.
++
++    The size is compared with the default step, so the floor is reached
++    whatever adapts the step, the built-in function or a user supplied one.
++    """
++    return dt_next < adt.dt0 * adt.red_max
++
++def classify_termination(is_over_cap, is_floor):
++    """
++    Resolve the reason a time stepping run stopped early.
++
++    Reaching the rejection limit takes precedence over exhausting the step
++    size.
++    """
++    if is_over_cap:
++        return 'max_rejections'
++
++    elif is_floor:
++        return 'step_floor'
++
++    return None
++
++class StepLog(Struct):
++    """
++    The record of every attempt a time stepping run made.
++
++    Attempts appear in the order they were made, so a rejected attempt precedes
++    the retry that replaces it. A run resumed from a restart file continues the
++    log of the run it resumed, keeping the step indices aligned with the time
++    stepper.
++    """
++    _fields = ['step', 'time', 'dt', 'result', 'emax', 'condition', 'n_iter']
++
++    def __init__(self, records=None):
++        Struct.__init__(self, records=get_default(records, []))
++
++    def __len__(self):
++        return len(self.records)
++
++    def __iter__(self):
++        return iter(self.records)
++
++    def __getitem__(self, ii):
++        return self.records[ii]
++
++    def append(self, record):
++        self.records.append(record)
++
++    def accepted(self):
++        """
++        Return the attempts that were accepted.
++        """
++        return [ii for ii in self.records if ii.result == 'accept']
++
++    def rejected(self):
++        """
++        Return the attempts that were rejected.
++        """
++        return [ii for ii in self.records if ii.result == 'reject']
++
++    def for_step(self, step):
++        """
++        Return the attempts made at the given time step, in order.
++        """
++        return [ii for ii in self.records if ii.step == step]
++
++    def attempts_per_step(self):
++        """
++        Return the number of attempts made at each time step, by step index.
++        """
++        counts = {}
++        for record in self.records:
++            counts[record.step] = counts.get(record.step, 0) + 1
++
++        return counts
++
++    def dts(self):
++        """
++        Return the sizes of the accepted steps, in order.
++        """
++        return [ii.dt for ii in self.accepted()]
++
++    def summary(self):
++        """
++        Summarize the run.
++
++        Returns
++        -------
++        summary : Struct
++            Has `n_attempt`, `n_accepted`, `n_rejected`, `n_step`, and
++            `max_attempts`, the largest number of attempts spent on one step.
++        """
++        counts = self.attempts_per_step()
++        n_rejected = len(self.rejected())
++
++        return Struct(n_attempt=len(self.records),
++                      n_accepted=len(self.records) - n_rejected,
++                      n_rejected=n_rejected,
++                      n_step=len(counts),
++                      max_attempts=max(counts.values()) if counts else 0)
++
++    def truncate_from(self, step):
++        """
++        Drop the attempts made at the given time step and after it.
++
++        A run resumed from a restart file uses this to discard the attempts of
++        a step that the restart file does not account for.
++        """
++        self.records = [ii for ii in self.records if ii.step < step]
++
++    def to_arrays(self):
++        """
++        Convert the log into arrays storable in a restart file.
++
++        A missing controller error is stored as a NaN.
++        """
++        out = {}
++        for name in self._fields:
++            vals = [getattr(ii, name) for ii in self.records]
++            if name == 'result':
++                out[name] = nm.array([val == 'accept' for val in vals],
++                                     dtype=nm.bool_)
++
++            elif name == 'emax':
++                out[name] = nm.array(
++                    [nm.nan if val is None else val for val in vals],
++                    dtype=nm.float64,
++                )
++
++            else:
++                out[name] = nm.array(vals)
++
++        return out
++
++    @staticmethod
++    def from_arrays(arrays):
++        """
++        Rebuild a log from the arrays of :func:`StepLog.to_arrays()`.
++
++        A NaN controller error is restored as None.
++        """
++        log = StepLog()
++        for ii in range(len(arrays['step'])):
++            emax = arrays['emax'][ii]
++            log.append(StepRecord(
++                int(arrays['step'][ii]), float(arrays['time'][ii]),
++                float(arrays['dt'][ii]),
++                'accept' if arrays['result'][ii] else 'reject',
++                None if nm.isnan(emax) else float(emax),
++                int(arrays['condition'][ii]), int(arrays['n_iter'][ii]),
++            ))
++
++        return log
++
++def is_resumed_run_finished(solver, ts):
++    """
++    Tell whether a run resumed from a restart file has nothing left to solve.
++
++    A restart file written for an accepted final step restores a stepper that
++    already stands at the final time and a log that already accounts for that
++    step. Such a run keeps the state and the log it was given instead of
++    stepping past the end. A file written earlier, or one whose final step was
++    rejected, restores a step that is still to be solved.
++    """
++    step_log = solver.step_log
++    is_accounted = ((step_log is not None) and len(step_log)
++                    and (step_log[-1].step >= ts.step)
++                    and (step_log[-1].result == 'accept'))
++
++    return bool(solver.is_resumed and (ts.step > 0) and (ts.nt >= 1.0)
++                and is_accounted)
++
++def is_resumed_step_unfinished(solver, ts):
++    """
++    Tell whether the step a restart file was written at is still to be solved.
++
++    A run stopped by its rejection cap or step floor leaves the stepper on the
++    attempt it rejected and keeps the state it accepted before it, so a restart
++    written there resumes that step instead of moving past it.
++    """
++    step_log = getattr(solver, 'step_log', None)
++    records = step_log.for_step(ts.step) if step_log is not None else []
++
++    return bool(records) and (records[-1].result == 'reject')
++
++def setup_step_log(solver, ts):
++    """
++    Return the step log a time stepping run should append to.
++
++    A run resumed from a restart file continues the log it was given, without
++    the attempts of the step it resumes, which it is about to solve again. A
++    run that resumes an already finished one keeps every attempt it was given.
++    """
++    step_log = solver.step_log
++    if solver.is_resumed and (step_log is not None):
++        if not is_resumed_run_finished(solver, ts):
++            step_log.truncate_from(ts.step)
++
++    else:
++        step_log = StepLog()
++
++    solver.is_resumed = False
++    solver.step_log = step_log
++
++    return step_log
++
++def set_stepping_status(status, step_log, termination):
++    """
++    Report the step accounting of a finished run on the solver status.
++    """
++    if status is None:
++        return
++
++    status['step_log'] = step_log
++    status['n_rejected'] = len(step_log.rejected())
++    status['termination'] = get_default(termination, 'completed')
++
+ def adapt_time_step(ts, status, adt, context=None, verbose=False):
+     """
+     Adapt the time step of `ts` according to the exit status of the
+@@ -314,7 +655,10 @@ class AdaptiveTimeSteppingSolver(SimpleTimeSteppingSolver):
+          None, False,
+          """If given, use this function to set the time step in `ts`. The
+             function return value is a bool - if True, the adaptivity loop
+-            should stop. The other parameters below are collected in `adt`,
++            should stop. A rejected attempt is retried regardless of the
++            return value, until `adt.red` drops below `adt.red_max`, the
++            retry would fall below `dt_min` or `max_rejections` is exceeded.
++            The other parameters below are collected in `adt`,
+             `status` is the nonlinear solver status, `context` is
+             a user-defined context and `verbose` is a verbosity flag.
+             Solvers created by
+@@ -332,6 +676,12 @@ class AdaptiveTimeSteppingSolver(SimpleTimeSteppingSolver):
+             steps."""),
+         ('dt_inc_wait', 'int', 5, False,
+          'The number of consecutive time steps, see `dt_inc_on_iter`.'),
++        ('max_rejections', 'int', 10, False,
++         """The number of consecutive rejections allowed at a single time
++            step. The count starts anew at each time step."""),
++        ('dt_min', 'float', 0.0, False,
++         """The smallest time step size the solver may use. A non-positive
++            value imposes no limit."""),
+     ]
+ 
+     def __init__(self, conf, nls=None, context=None, **kwargs):
+@@ -347,6 +697,10 @@ class AdaptiveTimeSteppingSolver(SimpleTimeSteppingSolver):
+                      inc_on_iter=get('dt_inc_on_iter', 4),
+                      inc_wait=get('dt_inc_wait', 5),
+                      red=1.0, wait=0, dt0=0.0)
++        if not (0.0 < adt.red_factor < 1.0):
++            raise ValueError('dt_red_factor has to be in (0, 1)! (got %s)'
++                             % adt.red_factor)
++
+         self.adt = adt
+ 
+         adt.dt0 = self.ts.get_default_time_step()
+@@ -363,15 +717,39 @@ class AdaptiveTimeSteppingSolver(SimpleTimeSteppingSolver):
+         """
+         Solve a single time step.
+         """
++        n_reject = 0
+         while 1:
++            dt, time = ts.dt, ts.time
+             vect = nls(vec, status=nls.status)
+ 
+-            is_break = self.adapt_time_step(ts, nls.status, self.adt,
+-                                            self.context, verbose=self.verbose)
++            self.adapt_time_step(ts, nls.status, self.adt, self.context,
++                                 verbose=self.verbose)
++
++            is_accepted = nls.status.get('condition', 0) == 0
++            self.step_log.append(
++                make_step_record(ts, dt,
++                                 'accept' if is_accepted else 'reject',
++                                 None, nls.status, time=time)
++            )
++
++            if is_accepted:
++                ts.clamp_time_step(time)
++                break
+ 
+-            if is_break:
++            n_reject += 1
++            dt_min = self.conf.dt_min
++            reduced = get_reduced_time_step(ts, dt, self.adt.red_factor)
++            new_dt = get_retry_time_step(ts, dt, self.adt.red_factor)
++            self.termination = classify_termination(
++                n_reject > self.conf.max_rejections,
++                is_past_reduction_floor(self.adt, reduced)
++                or ((dt_min > 0.0) and (new_dt < dt_min)),
++            )
++            if self.termination is not None:
+                 break
+ 
++            ts.set_time_step(new_dt, update_time=True)
++
+             vec = prestep_fun(ts, vec)
+ 
+         return vect
+@@ -381,6 +759,58 @@ class AdaptiveTimeSteppingSolver(SimpleTimeSteppingSolver):
+                               ts.step + 1, ts.n_step),
+                verbose=self.verbose)
+ 
++    @standard_ts_call
++    def __call__(self, vec0=None, nls=None, init_fun=None, prestep_fun=None,
++                 poststep_fun=None, status=None, **kwargs):
++        """
++        Solve the time-dependent problem, adapting the time step.
++        """
++        ts = self.ts
++        nls = get_default(nls, self.nls)
++
++        vec0 = init_fun(ts, vec0)
++
++        is_finished = is_resumed_run_finished(self, ts)
++        setup_step_log(self, ts)
++        self.termination = None
++        if is_finished:
++            set_stepping_status(status, self.step_log, None)
++
++            return vec0
++
++        self.output_step_info(ts)
++        if ts.step == 0:
++            vec0 = prestep_fun(ts, vec0)
++            initial = vec0.copy()
++
++            vec = self.solve_step0(nls, vec0)
++            accepted = vec if self.is_initial_step_accepted() else initial
++
++            vec = poststep_fun(ts, vec)
++            ts.advance()
++
++        else:
++            vec = accepted = vec0
++
++        for step, time in ts.iter_from(ts.step):
++            self.output_step_info(ts)
++
++            vec1 = prestep_fun(ts, vec)
++
++            vect = self.solve_step(ts, nls, vec1, prestep_fun)
++
++            if self.termination is not None:
++                vec = accepted
++                break
++
++            vect = poststep_fun(ts, vect)
++
++            vec = accepted = vect
++
++        set_stepping_status(status, self.step_log, self.termination)
++
++        return vec
++
+ #
+ # Elastodynamics solvers.
+ #
+@@ -572,6 +1002,12 @@ class ElastodynamicsBaseTS(TimeSteppingSolver):
+          """The mapping of variables with keys 'u', 'du', 'ddu' and 'extra',
+             and values corresponding to the names of the actual variables.
+             See `var_names` returned from :func:`transform_equations_ed()`"""),
++        ('max_rejections', 'int', 10, False,
++         """The number of consecutive rejections allowed at a single time
++            step. The count starts anew at each time step."""),
++        ('dt_min', 'float', 0.0, False,
++         """The smallest time step size the controller may propose. A
++            non-positive value imposes no limit."""),
+     ]
+ 
+     def __init__(self, conf, nls=None, tsc=None, context=None, **kwargs):
+@@ -679,11 +1115,18 @@ class ElastodynamicsBaseTS(TimeSteppingSolver):
+             else:
+                 vec = pack(u0, v0, a0)
+ 
++            if not isinstance(self.tsc, FixedTSC):
++                ts.set_time_step(
++                    self.tsc.get_initial_dt(ts, vec, unpack=unpack)
++                )
++                ts.clamp_time_step(ts.time)
++
+             vec = poststep_fun(ts, vec)
+             ts.advance()
+ 
+         else:
+-            vec = vec0
++            vec = vec0.copy()
++            self.get_matrices(nls, vec, unpack)
+ 
+         return vec, unpack, pack
+ 
+@@ -708,15 +1151,25 @@ class ElastodynamicsBaseTS(TimeSteppingSolver):
+             nls, vec0, init_fun, prestep_fun, poststep_fun)
+ 
+         ts = self.ts
+-        dt0 = self.tsc.get_initial_dt(ts, vec, unpack=unpack)
+-        if not isinstance(self.tsc, FixedTSC):
+-            ts.set_time_step(dt0, update_time=True)
++        is_finished = is_resumed_run_finished(self, ts)
++        step_log = setup_step_log(self, ts)
++        termination = None
++        if is_finished:
++            set_stepping_status(status, step_log, None)
++
++            return vec
++
++        dt_min = self.conf.dt_min
++        max_rejections = self.conf.max_rejections
++        accepted = vec
++
+         while 1:
+             output(self.format % (ts.time, ts.step + 1, ts.n_step),
+                    verbose=self.verbose)
+             # step, time = time step to compute = n+1
+             # step-1, time-ts.dt = previous known step data = n
+             # adaptivity modifies dt and time.
++            n_reject = 0
+             while 1:
+                 # Previous step state q(t_n).
+                 # Both prestep_fun() and poststep_fun() apply EBCs to vec/vect
+@@ -724,38 +1177,60 @@ class ElastodynamicsBaseTS(TimeSteppingSolver):
+                 # TODO: Generalized alpha: EBCs for current time t_{n+1}. but
+                 # loads should be applied in the mid-step time t_{n+1-a}.
+                 vec = prestep_fun(ts, vec)
++                dt = ts.dt
+                 vect = self.step(ts, vec, nls, pack, unpack,
+                                  prestep_fun=prestep_fun)
++                nls_status = getattr(nls, 'status', None)
+ 
+                 if isinstance(self.tsc, FixedTSC):
+                     new_dt = ts.dt
++                    step_log.append(make_step_record(ts, dt, 'accept', None,
++                                                     nls_status))
+                     break
+ 
+-                new_dt, status = self.tsc(ts, vec, vect, unpack=unpack)
+-                output('dt:', ts.dt, 'new dt:', new_dt, 'status:', status,
++                new_dt, tsc_status = self.tsc(ts, vec, vect, unpack=unpack)
++                output('dt:', ts.dt, 'new dt:', new_dt, 'status:', tsc_status,
+                        verbose=self.verbose)
++                step_log.append(make_step_record(ts, dt, tsc_status.result,
++                                                 tsc_status.emax, nls_status))
+                 if new_dt != ts.dt:
+                     self.clear_lin_solver(
+                         clear_constant_matrices=self.conf.has_time_derivatives,
+                     )
+ 
+-                if status.result == 'accept':
++                if tsc_status.result == 'accept':
++                    break
++
++                n_reject += 1
++                termination = classify_termination(
++                    n_reject > max_rejections,
++                    (dt_min > 0.0) and (new_dt < dt_min),
++                )
++                if termination is not None:
+                     break
+ 
+                 ts.set_time_step(new_dt, update_time=True)
+ 
++            if termination is not None:
++                vec = accepted
++                break
++
++            if new_dt != ts.dt:
++                ts.set_time_step(new_dt, update_time=False)
++
+             # Current step state q(t_{n+1}).
+             vect = poststep_fun(ts, vect)
++            accepted = vect
+ 
+             if ts.nt >= 1:
+                 break
+ 
+-            if new_dt != ts.dt:
+-                ts.set_time_step(new_dt, update_time=False)
+             ts.advance()
+ 
+             vec = vect
+ 
++        set_stepping_status(status, step_log, termination)
++
+         return vec
+ 
+ class VelocityVerletTS(ElastodynamicsBaseTS):

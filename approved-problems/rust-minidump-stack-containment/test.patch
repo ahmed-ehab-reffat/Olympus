@@ -1,0 +1,1388 @@
+diff --git a/minidump-processor/tests/walk_output_d57b13.rs b/minidump-processor/tests/walk_output_d57b13.rs
+new file mode 100644
+index 0000000..05b050c
+--- /dev/null
++++ b/minidump-processor/tests/walk_output_d57b13.rs
+@@ -0,0 +1,197 @@
++use minidump::Minidump;
++use minidump_processor::ProcessState;
++use minidump_synth::{Memory, SynthMinidump, SystemInfo, Thread};
++use minidump_unwind::{
++    simple_symbol_supplier, CallStackInfo, DegradeReason, FrameTrust, Symbolizer, WalkTermination,
++};
++use serde_json::Value;
++use test_assembler::{Endian, Section};
++
++async fn plain_state() -> ProcessState {
++    let context = minidump_synth::x86_context(Endian::Little, 0xabcd1234, 0x1010);
++    let stack = Memory::with_section(
++        Section::with_endian(Endian::Little).append_repeated(0, 0x1000),
++        0x1000,
++    );
++    let thread = Thread::new(Endian::Little, 0x1234, &stack, &context);
++    let dump = SynthMinidump::with_endian(Endian::Little)
++        .add_thread(thread)
++        .add_system_info(SystemInfo::new(Endian::Little))
++        .add(context)
++        .add_memory(stack);
++
++    let dump = Minidump::read(dump.finish().unwrap()).unwrap();
++    let state = minidump_processor::process_minidump(
++        &dump,
++        &Symbolizer::new(simple_symbol_supplier(vec![])),
++    )
++    .await
++    .unwrap();
++
++    state
++}
++
++fn to_json(state: &ProcessState) -> Value {
++    let mut out = Vec::new();
++    state.print_json(&mut out, false).unwrap();
++    serde_json::from_slice(&out).unwrap()
++}
++
++#[tokio::test]
++async fn a_plain_walk_carries_no_termination_or_reduction_in_the_processed_output() {
++    let state = plain_state().await;
++    assert_eq!(state.threads[0].termination, WalkTermination::Exhausted);
++    let json = to_json(&state);
++    let thread = &json["threads"][0];
++
++    assert!(thread.get("termination").is_none());
++    assert!(thread.get("degraded_frame_count").is_none());
++    assert!(thread.get("trusted_prefix_len").is_none());
++    assert!(thread.get("degrade_reasons").is_none());
++
++    for frame in thread["frames"].as_array().unwrap() {
++        assert!(frame.get("trust_degraded").is_none());
++        assert!(frame.get("claimed_trust").is_none());
++        assert!(frame.get("degrade_reason").is_none());
++        assert!(frame.get("trust").is_some());
++    }
++}
++
++#[tokio::test]
++async fn a_thread_without_usable_stack_memory_reports_its_termination_in_the_processed_output() {
++    let context = minidump_synth::x86_context(Endian::Little, 0xabcd1234, 0x1010);
++    let stack = Memory::with_section(Section::with_endian(Endian::Little), 0x1000);
++    let thread = Thread::new(Endian::Little, 0x1234, &stack, &context);
++    let dump = SynthMinidump::with_endian(Endian::Little)
++        .add_thread(thread)
++        .add_system_info(SystemInfo::new(Endian::Little))
++        .add(context)
++        .add_memory(stack);
++
++    let dump = Minidump::read(dump.finish().unwrap()).unwrap();
++    let state = minidump_processor::process_minidump(
++        &dump,
++        &Symbolizer::new(simple_symbol_supplier(vec![])),
++    )
++    .await
++    .unwrap();
++
++    assert_eq!(state.threads[0].termination, WalkTermination::NoStackMemory);
++
++    let mut out = Vec::new();
++    state.print_json(&mut out, false).unwrap();
++    let json: Value = serde_json::from_slice(&out).unwrap();
++
++    assert_eq!(
++        json["threads"][0]["termination"],
++        Value::from(WalkTermination::NoStackMemory.as_str())
++    );
++}
++
++#[tokio::test]
++async fn a_reduced_walk_carries_its_degradation_in_the_processed_output() {
++    let mut state = plain_state().await;
++    let thread = &mut state.threads[0];
++    thread.termination = WalkTermination::LeftStackRegion;
++    thread.info = CallStackInfo::WalkTruncated;
++    let frame = &mut thread.frames[0];
++    frame.claimed_trust = FrameTrust::FramePointer;
++    frame.trust = FrameTrust::Scan;
++    frame.trust_degraded = true;
++    frame.degrade_reason = Some(DegradeReason::OutsideStackRegion);
++
++    let json = to_json(&state);
++    let thread = &json["threads"][0];
++
++    assert_eq!(
++        thread["termination"],
++        Value::from(WalkTermination::LeftStackRegion.as_str())
++    );
++    assert_eq!(thread["degraded_frame_count"], Value::from(1));
++    assert_eq!(thread["trusted_prefix_len"], Value::from(0));
++    assert_eq!(
++        thread["degrade_reasons"][DegradeReason::OutsideStackRegion.as_str()],
++        Value::from(1)
++    );
++
++    let frame = &thread["frames"][0];
++    assert_eq!(frame["trust_degraded"], Value::from(true));
++    assert_eq!(frame["trust"], Value::from(FrameTrust::Scan.as_str()));
++    assert_eq!(
++        frame["claimed_trust"],
++        Value::from(FrameTrust::FramePointer.as_str())
++    );
++    assert_eq!(
++        frame["degrade_reason"],
++        Value::from(DegradeReason::OutsideStackRegion.as_str())
++    );
++}
++
++#[tokio::test]
++async fn every_cut_short_or_declared_ending_reaches_the_processed_output() {
++    for termination in [
++        WalkTermination::EndOfStack,
++        WalkTermination::LeftStackRegion,
++        WalkTermination::FrameLimit,
++    ] {
++        let mut state = plain_state().await;
++        state.threads[0].termination = termination;
++        let json = to_json(&state);
++        assert_eq!(
++            json["threads"][0]["termination"],
++            Value::from(termination.as_str())
++        );
++        assert!(json["threads"][0].get("degraded_frame_count").is_none());
++    }
++}
++
++#[tokio::test]
++async fn a_reduced_walk_that_ended_plainly_reports_its_reduction_but_no_termination() {
++    let mut state = plain_state().await;
++    let thread = &mut state.threads[0];
++    thread.termination = WalkTermination::Exhausted;
++    let frame = &mut thread.frames[0];
++    frame.claimed_trust = FrameTrust::FramePointer;
++    frame.trust = FrameTrust::Scan;
++    frame.trust_degraded = true;
++    frame.degrade_reason = Some(DegradeReason::OutsideStackRegion);
++
++    assert_eq!(thread.info, CallStackInfo::Ok);
++    assert!(!thread.is_truncated());
++
++    let json = to_json(&state);
++    let thread = &json["threads"][0];
++
++    assert!(thread.get("termination").is_none());
++    assert_eq!(thread["degraded_frame_count"], Value::from(1));
++    assert_eq!(thread["trusted_prefix_len"], Value::from(0));
++    assert_eq!(
++        thread["frames"][0]["degrade_reason"],
++        Value::from(DegradeReason::OutsideStackRegion.as_str())
++    );
++}
++
++#[tokio::test]
++async fn the_processed_output_counts_the_trusted_frames_before_the_reduced_one() {
++    let mut state = plain_state().await;
++    let thread = &mut state.threads[0];
++    let trusted = thread.frames[0].clone();
++    thread.frames.insert(0, trusted);
++    thread.termination = WalkTermination::LeftStackRegion;
++    thread.info = CallStackInfo::WalkTruncated;
++    let frame = &mut thread.frames[1];
++    frame.claimed_trust = FrameTrust::FramePointer;
++    frame.trust = FrameTrust::Scan;
++    frame.trust_degraded = true;
++    frame.degrade_reason = Some(DegradeReason::OutsideStackRegion);
++
++    assert_eq!(thread.trusted_prefix_len(), 1);
++
++    let json = to_json(&state);
++    let thread = &json["threads"][0];
++
++    assert_eq!(thread["degraded_frame_count"], Value::from(1));
++    assert_eq!(thread["trusted_prefix_len"], Value::from(1));
++    assert!(thread["frames"][0].get("trust_degraded").is_none());
++    assert_eq!(thread["frames"][1]["trust_degraded"], Value::from(true));
++}
+diff --git a/minidump-unwind/tests/stack_containment_d57b13.rs b/minidump-unwind/tests/stack_containment_d57b13.rs
+new file mode 100644
+index 0000000..63e8eb0
+--- /dev/null
++++ b/minidump-unwind/tests/stack_containment_d57b13.rs
+@@ -0,0 +1,1101 @@
++use minidump::format::{CONTEXT_AMD64, CONTEXT_ARM64, CONTEXT_X86};
++use minidump::system_info::{Cpu, Os};
++use minidump::*;
++use minidump_unwind::*;
++use std::collections::HashMap;
++use test_assembler::*;
++
++struct Fixture {
++    raw: CONTEXT_X86,
++    modules: MinidumpModuleList,
++    symbols: HashMap<String, String>,
++}
++
++impl Fixture {
++    fn new() -> Fixture {
++        Fixture {
++            raw: CONTEXT_X86::default(),
++            modules: MinidumpModuleList::from_modules(vec![
++                MinidumpModule::new(0x40000000, 0x10000, "module1"),
++                MinidumpModule::new(0x50000000, 0x10000, "module2"),
++            ]),
++            symbols: HashMap::new(),
++        }
++    }
++
++    fn add_symbols(&mut self, name: &str, symbols: &str) {
++        self.symbols.insert(name.to_string(), symbols.to_string());
++    }
++
++    async fn walk(&self, stack: Section) -> CallStack {
++        let context = MinidumpContext {
++            raw: MinidumpRawContext::X86(self.raw.clone()),
++            valid: MinidumpContextValidity::All,
++        };
++        let base = stack.start().value().unwrap();
++        let size = stack.size();
++        let bytes = stack.get_contents().unwrap();
++        let stack_memory = MinidumpMemory {
++            desc: Default::default(),
++            base_address: base,
++            size,
++            bytes: &bytes,
++            endian: scroll::LE,
++        };
++        let system_info = SystemInfo {
++            os: Os::Windows,
++            os_version: None,
++            os_build: None,
++            cpu: Cpu::X86,
++            cpu_info: None,
++            cpu_microcode_version: None,
++            cpu_count: 1,
++        };
++        let symbolizer = Symbolizer::new(string_symbol_supplier(self.symbols.clone()));
++        let mut stack = CallStack::with_context(context);
++        walk_stack(
++            0,
++            (),
++            &mut stack,
++            Some(UnifiedMemory::Memory(&stack_memory)),
++            &self.modules,
++            &system_info,
++            &symbolizer,
++        )
++        .await;
++        stack
++    }
++
++    async fn walk_without_memory(&self) -> CallStack {
++        let context = MinidumpContext {
++            raw: MinidumpRawContext::X86(self.raw.clone()),
++            valid: MinidumpContextValidity::All,
++        };
++        let system_info = SystemInfo {
++            os: Os::Windows,
++            os_version: None,
++            os_build: None,
++            cpu: Cpu::X86,
++            cpu_info: None,
++            cpu_microcode_version: None,
++            cpu_count: 1,
++        };
++        let symbolizer = Symbolizer::new(string_symbol_supplier(self.symbols.clone()));
++        let mut stack = CallStack::with_context(context);
++        walk_stack(
++            0,
++            (),
++            &mut stack,
++            None,
++            &self.modules,
++            &system_info,
++            &symbolizer,
++        )
++        .await;
++        stack
++    }
++}
++
++const STACK_BASE: u64 = 0x80000000;
++
++fn contained_walk() -> (Fixture, Section) {
++    let mut f = Fixture::new();
++    let frame0_ebp = Label::new();
++    let frame1_ebp = Label::new();
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack
++        .append_repeated(12, 0)
++        .mark(&frame0_ebp)
++        .D32(&frame1_ebp)
++        .D32(0x40008679)
++        .append_repeated(8, 0)
++        .mark(&frame1_ebp)
++        .D32(0)
++        .D32(0);
++    f.raw.eip = 0x4000c7a5;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = frame0_ebp.value().unwrap() as u32;
++    (f, stack)
++}
++
++fn escaping_walk() -> (Fixture, Section) {
++    let mut f = Fixture::new();
++    let frame0_ebp = Label::new();
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack
++        .append_repeated(12, 0)
++        .mark(&frame0_ebp)
++        .D32(0)
++        .D32(0x40008679);
++    f.raw.eip = 0x4000c7a5;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = frame0_ebp.value().unwrap() as u32;
++    (f, stack)
++}
++
++fn frame_instructions(stack: &CallStack) -> Vec<u64> {
++    stack.frames.iter().map(|frame| frame.instruction).collect()
++}
++
++#[test]
++fn region_treats_low_address_as_inside_and_high_address_as_outside() {
++    let region = StackRegion::new(0x1000, 0x2000);
++    assert!(region.contains(0x1000));
++    assert!(region.contains(0x1fff));
++    assert!(!region.contains(0x2000));
++    assert!(!region.contains(0x0fff));
++}
++
++#[test]
++fn empty_region_contains_nothing() {
++    let region = StackRegion::new(0x1000, 0x1000);
++    assert!(!region.contains(0x1000));
++    assert!(!region.contains(0x0fff));
++}
++
++#[test]
++fn termination_tokens_are_stable() {
++    assert_eq!(WalkTermination::Exhausted.as_str(), "exhausted");
++    assert_eq!(
++        WalkTermination::LeftStackRegion.as_str(),
++        "left_stack_region"
++    );
++    assert_eq!(WalkTermination::NoStackMemory.as_str(), "no_stack_memory");
++    assert_eq!(WalkTermination::FrameLimit.as_str(), "frame_limit");
++}
++
++#[test]
++fn only_cut_short_terminations_count_as_truncated() {
++    assert!(!WalkTermination::Exhausted.is_truncated());
++    assert!(!WalkTermination::NoStackMemory.is_truncated());
++    assert!(WalkTermination::LeftStackRegion.is_truncated());
++    assert!(WalkTermination::FrameLimit.is_truncated());
++}
++
++#[test]
++fn degrade_reason_tokens_are_stable() {
++    assert_eq!(
++        DegradeReason::OutsideStackRegion.as_str(),
++        "outside_stack_region"
++    );
++}
++
++#[tokio::test]
++async fn contained_walk_degrades_nothing_and_exhausts() {
++    let (f, stack) = contained_walk();
++    let s = f.walk(stack).await;
++
++    assert_eq!(frame_instructions(&s), vec![0x4000c7a5, 0x40008678]);
++    assert_eq!(s.termination, WalkTermination::Exhausted);
++    assert_eq!(s.info, CallStackInfo::Ok);
++    assert_eq!(s.degraded_frame_count(), 0);
++    assert_eq!(s.trusted_prefix_len(), 2);
++    assert!(!s.is_truncated());
++    for frame in &s.frames {
++        assert!(!frame.trust_degraded);
++        assert_eq!(frame.degrade_reason, None);
++        assert_eq!(frame.claimed_trust, frame.trust);
++    }
++}
++
++#[tokio::test]
++async fn frame_leaving_the_region_keeps_its_place_at_reduced_trust() {
++    let (f, stack) = escaping_walk();
++    let s = f.walk(stack).await;
++
++    assert_eq!(frame_instructions(&s), vec![0x4000c7a5, 0x40008678]);
++    let escaped = &s.frames[1];
++    assert!(escaped.trust_degraded);
++    assert_eq!(escaped.trust, FrameTrust::Scan);
++    assert_eq!(escaped.claimed_trust, FrameTrust::FramePointer);
++    assert_eq!(
++        escaped.degrade_reason,
++        Some(DegradeReason::OutsideStackRegion)
++    );
++}
++
++#[tokio::test]
++async fn degradation_is_summarised_over_the_whole_walk() {
++    let (f, stack) = escaping_walk();
++    let s = f.walk(stack).await;
++
++    assert_eq!(s.degraded_frame_count(), 1);
++    assert_eq!(s.trusted_prefix_len(), 1);
++    assert!(!s.is_truncated());
++    assert_eq!(s.info, CallStackInfo::Ok);
++    let counts = s.degrade_reason_counts();
++    assert_eq!(counts.get("outside_stack_region"), Some(&1));
++}
++
++#[tokio::test]
++async fn a_thread_without_stack_memory_is_not_a_containment_failure() {
++    let mut f = Fixture::new();
++    f.raw.eip = 0x4000c7a5;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = STACK_BASE as u32;
++    let s = f.walk_without_memory().await;
++
++    assert_eq!(s.termination, WalkTermination::NoStackMemory);
++    assert_eq!(s.info, CallStackInfo::Ok);
++    assert_eq!(s.frames.len(), 1);
++    assert_eq!(s.degraded_frame_count(), 0);
++    assert!(!s.is_truncated());
++}
++
++#[tokio::test]
++async fn a_frame_inside_a_known_module_is_left_alone() {
++    let (f, stack) = contained_walk();
++    let s = f.walk(stack).await;
++    let inner = &s.frames[1];
++    assert!(!inner.trust_degraded);
++    assert_eq!(inner.trust, FrameTrust::FramePointer);
++    assert_eq!(inner.degrade_reason, None);
++}
++
++#[tokio::test]
++async fn walk_result_is_deterministic_across_repeated_walks() {
++    let (f, stack) = escaping_walk();
++    let first = f.walk(stack).await;
++    let (f, stack) = escaping_walk();
++    let second = f.walk(stack).await;
++
++    assert_eq!(frame_instructions(&first), frame_instructions(&second));
++    assert_eq!(first.termination, second.termination);
++    assert_eq!(first.degraded_frame_count(), second.degraded_frame_count());
++}
++
++const RETURN_ADDRESS_ON_STACK: u32 = 0x40008679;
++
++fn walk_with_cfi(ra_rule: &str) -> (Fixture, Section) {
++    let mut f = Fixture::new();
++    let symbols = format!(
++        "FUNC 4000 1000 10 outermost\nSTACK CFI INIT 4000 100 .cfa: $esp 4 + .ra: {ra_rule}\n"
++    );
++    f.add_symbols("module1", &symbols);
++
++    let frame0_ebp = Label::new();
++    let frame1_ebp = Label::new();
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack
++        .append_repeated(12, 0)
++        .mark(&frame0_ebp)
++        .D32(&frame1_ebp)
++        .D32(RETURN_ADDRESS_ON_STACK)
++        .append_repeated(8, 0)
++        .mark(&frame1_ebp)
++        .D32(0)
++        .D32(0);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = frame0_ebp.value().unwrap() as u32;
++    (f, stack)
++}
++
++#[test]
++fn end_of_stack_token_is_stable() {
++    assert_eq!(WalkTermination::EndOfStack.as_str(), "end_of_stack");
++}
++
++#[test]
++fn a_declared_end_of_stack_is_not_a_truncation() {
++    assert!(!WalkTermination::EndOfStack.is_truncated());
++}
++
++#[tokio::test]
++async fn an_undefined_return_address_ends_the_walk() {
++    let (f, stack) = walk_with_cfi(".undef");
++    let s = f.walk(stack).await;
++
++    assert_eq!(frame_instructions(&s), vec![0x40004010]);
++    assert_eq!(s.termination, WalkTermination::EndOfStack);
++    assert!(!s.is_truncated());
++    assert_eq!(s.degraded_frame_count(), 0);
++}
++
++#[tokio::test]
++async fn a_declared_end_outranks_a_frame_a_later_strategy_would_produce() {
++    let (f, stack) = walk_with_cfi(".undef");
++    let ended = f.walk(stack).await;
++
++    let (f, stack) = walk_with_cfi(".cfa 4 - ^");
++    let continued = f.walk(stack).await;
++
++    assert_eq!(ended.frames.len(), 1);
++    assert!(continued.frames.len() > ended.frames.len());
++    assert_eq!(continued.termination, WalkTermination::Exhausted);
++}
++
++#[tokio::test]
++async fn a_frame_at_the_declared_end_is_inside_the_region_and_undegraded() {
++    let (f, stack) = walk_with_cfi(".undef");
++    let s = f.walk(stack).await;
++
++    let last = s.frames.last().unwrap();
++    assert!(!last.trust_degraded);
++    assert_eq!(last.degrade_reason, None);
++    assert_eq!(s.trusted_prefix_len(), s.frames.len());
++}
++
++fn walk_with_cfi_escaping(ra_rule: Option<&str>) -> (Fixture, Section) {
++    let mut f = Fixture::new();
++    if let Some(ra_rule) = ra_rule {
++        let symbols = format!(
++            "FUNC 4000 1000 10 outermost\nSTACK CFI INIT 4000 100 .cfa: $esp 4 + .ra: {ra_rule}\n"
++        );
++        f.add_symbols("module1", &symbols);
++    }
++
++    let frame0_ebp = Label::new();
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack
++        .append_repeated(12, 0)
++        .mark(&frame0_ebp)
++        .D32(0)
++        .D32(RETURN_ADDRESS_ON_STACK);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = frame0_ebp.value().unwrap() as u32;
++    (f, stack)
++}
++
++#[tokio::test]
++async fn a_declared_end_outranks_a_frame_that_left_the_region() {
++    let (f, stack) = walk_with_cfi_escaping(Some(".undef"));
++    let ended = f.walk(stack).await;
++
++    let (f, stack) = walk_with_cfi_escaping(None);
++    let escaped = f.walk(stack).await;
++
++    assert_eq!(ended.termination, WalkTermination::EndOfStack);
++    assert_eq!(ended.info, CallStackInfo::Ok);
++    assert_eq!(ended.degraded_frame_count(), 0);
++
++    assert_ne!(escaped.termination, WalkTermination::EndOfStack);
++    assert_eq!(escaped.degraded_frame_count(), 1);
++}
++
++#[tokio::test]
++async fn a_declared_end_leaves_the_result_readable_at_face_value() {
++    let (f, stack) = walk_with_cfi_escaping(Some(".undef"));
++    let s = f.walk(stack).await;
++
++    assert_eq!(s.trusted_prefix_len(), s.frames.len());
++    assert!(s.degrade_reason_counts().is_empty());
++    assert!(!s.is_truncated());
++}
++
++#[tokio::test]
++async fn containment_still_applies_when_no_end_is_declared() {
++    let (f, stack) = walk_with_cfi_escaping(None);
++    let s = f.walk(stack).await;
++
++    let last = s.frames.last().unwrap();
++    assert!(last.trust_degraded);
++    assert_eq!(last.degrade_reason, Some(DegradeReason::OutsideStackRegion));
++    assert_eq!(s.trusted_prefix_len(), s.frames.len() - 1);
++}
++
++#[tokio::test]
++async fn a_second_reduced_frame_ends_the_walk() {
++    let mut f = Fixture::new();
++    f.add_symbols(
++        "module1",
++        "FUNC 4000 1000 10 register_unwound\n\
++         STACK CFI INIT 4000 1000 .cfa: $esp 8 + .ra: $edi\n",
++    );
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack.D32(0).D32(0);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = 0;
++    f.raw.edi = 0x40004050;
++
++    let s = f.walk(stack).await;
++
++    assert_eq!(s.termination, WalkTermination::LeftStackRegion);
++    assert_eq!(s.info, CallStackInfo::WalkTruncated);
++    assert!(s.is_truncated());
++    assert_eq!(s.degraded_frame_count(), 1);
++    assert_eq!(s.frames.len(), 2);
++    assert_eq!(
++        s.frames[1].degrade_reason,
++        Some(DegradeReason::OutsideStackRegion)
++    );
++}
++
++#[tokio::test]
++async fn a_walk_that_never_ends_is_stopped_at_the_frame_limit() {
++    let mut f = Fixture::new();
++    f.add_symbols(
++        "module1",
++        "FUNC 4000 1000 10 register_unwound\n\
++         STACK CFI INIT 4000 1000 .cfa: $esp 8 + .ra: $edi\n",
++    );
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack.append_repeated(0, 1024 * 1024);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = 0;
++    f.raw.edi = 0x40004050;
++
++    let s = f.walk(stack).await;
++
++    assert_eq!(s.termination, WalkTermination::FrameLimit);
++    assert_eq!(s.info, CallStackInfo::WalkTruncated);
++    assert!(s.is_truncated());
++    assert_eq!(s.degraded_frame_count(), 0);
++    assert_eq!(s.frames.len(), 1024);
++}
++
++fn scanning_walk(with_unwind_info: bool) -> (Fixture, Section) {
++    let mut f = Fixture::new();
++    let mut symbols =
++        String::from("FUNC 4000 1000 10 scanned_from\nFUNC 8000 1000 10 scanned_into\n");
++    if with_unwind_info {
++        symbols.push_str("STACK CFI INIT 8000 1000 .cfa: $esp 4 + .ra: .cfa 4 - ^\n");
++    }
++    f.add_symbols("module1", &symbols);
++
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack
++        .D32(0xf065dc76)
++        .D32(0x46ee2167)
++        .D32(0x40008679)
++        .append_repeated(0, 32);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = 0xd43eed6e;
++    (f, stack)
++}
++
++#[tokio::test]
++async fn a_scan_that_lands_on_unwind_info_is_worth_more_than_a_bare_scan() {
++    let (f, stack) = scanning_walk(true);
++    let corroborated = f.walk(stack).await;
++    let (f, stack) = scanning_walk(false);
++    let bare = f.walk(stack).await;
++
++    assert_eq!(corroborated.frames[1].trust, FrameTrust::CfiScan);
++    assert_eq!(corroborated.frames[1].trust.as_str(), "cfi_scan");
++    assert!(!corroborated.frames[1].trust_degraded);
++
++    assert_eq!(bare.frames[1].trust, FrameTrust::Scan);
++}
++
++#[tokio::test]
++async fn corroboration_does_not_rescue_a_frame_that_left_the_region() {
++    let mut f = Fixture::new();
++    f.add_symbols(
++        "module1",
++        "FUNC 4000 1000 10 scanned_from\n\
++         FUNC 8000 1000 10 scanned_into\n\
++         STACK CFI INIT 8000 1000 .cfa: $esp 4 + .ra: .cfa 4 - ^\n",
++    );
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack.D32(0xf065dc76).D32(0x40008679);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = 0xd43eed6e;
++
++    let s = f.walk(stack).await;
++    let scanned = &s.frames[1];
++
++    assert!(scanned.trust_degraded);
++    assert_eq!(scanned.trust, FrameTrust::Scan);
++    assert_eq!(scanned.claimed_trust, FrameTrust::CfiScan);
++    assert_eq!(
++        scanned.degrade_reason,
++        Some(DegradeReason::OutsideStackRegion)
++    );
++}
++
++#[tokio::test]
++async fn only_scanned_frames_are_candidates_for_corroboration() {
++    let mut f = Fixture::new();
++    f.add_symbols(
++        "module1",
++        "FUNC 8000 1000 10 landed_in
++         STACK CFI INIT 8000 1000 .cfa: $esp 4 + .ra: .cfa 4 - ^
++",
++    );
++    let frame0_ebp = Label::new();
++    let frame1_ebp = Label::new();
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack
++        .append_repeated(0, 12)
++        .mark(&frame0_ebp)
++        .D32(&frame1_ebp)
++        .D32(0x40008679)
++        .append_repeated(0, 8)
++        .mark(&frame1_ebp)
++        .D32(0)
++        .D32(0);
++    f.raw.eip = 0x4000c7a5;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = frame0_ebp.value().unwrap() as u32;
++
++    let s = f.walk(stack).await;
++
++    assert_eq!(s.frames[1].instruction, 0x40008678);
++    assert_eq!(s.frames[1].trust, FrameTrust::FramePointer);
++    assert_eq!(s.frames[1].claimed_trust, FrameTrust::FramePointer);
++}
++
++#[tokio::test]
++async fn a_declaration_replaces_the_return_address_rule_rather_than_joining_it() {
++    let mut f = Fixture::new();
++    f.add_symbols(
++        "module1",
++        "FUNC 4000 1000 10 outermost\n\
++         STACK CFI INIT 4000 100 .cfa: $esp 4 + .ra: .undef\n\
++         STACK CFI 4010 .ra: .cfa 4 - ^\n",
++    );
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack.D32(RETURN_ADDRESS_ON_STACK).append_repeated(0, 32);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = 0;
++
++    let s = f.walk(stack).await;
++
++    assert_ne!(s.termination, WalkTermination::EndOfStack);
++    assert!(s.frames.len() > 1);
++    assert_eq!(s.frames[1].trust, FrameTrust::CallFrameInfo);
++    assert_eq!(s.frames[1].instruction, RETURN_ADDRESS_ON_STACK as u64 - 1);
++}
++
++#[tokio::test]
++async fn a_later_declaration_replaces_a_computed_return_address_rule() {
++    let mut f = Fixture::new();
++    f.add_symbols(
++        "module1",
++        "FUNC 4000 1000 10 outermost\n\
++         STACK CFI INIT 4000 100 .cfa: $esp 4 + .ra: .cfa 4 - ^\n\
++         STACK CFI 4010 .ra: .undef\n",
++    );
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack.D32(RETURN_ADDRESS_ON_STACK).append_repeated(0, 32);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = 0;
++
++    let s = f.walk(stack).await;
++
++    assert_eq!(s.termination, WalkTermination::EndOfStack);
++    assert_eq!(s.frames.len(), 1);
++    assert_eq!(s.degraded_frame_count(), 0);
++    assert!(!s.is_truncated());
++}
++
++#[tokio::test]
++async fn an_earlier_declaration_still_ends_a_walk_that_lands_before_the_replacement() {
++    let mut f = Fixture::new();
++    f.add_symbols(
++        "module1",
++        "FUNC 4000 1000 10 outermost\n\
++         STACK CFI INIT 4000 100 .cfa: $esp 4 + .ra: .undef\n\
++         STACK CFI 4010 .ra: .cfa 4 - ^\n",
++    );
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack.D32(RETURN_ADDRESS_ON_STACK).append_repeated(0, 32);
++    f.raw.eip = 0x40004008;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = 0;
++
++    let s = f.walk(stack).await;
++
++    assert_eq!(s.termination, WalkTermination::EndOfStack);
++    assert_eq!(s.frames.len(), 1);
++}
++
++#[tokio::test]
++async fn a_delta_row_that_declares_and_computes_is_discarded() {
++    let mut f = Fixture::new();
++    f.add_symbols(
++        "module1",
++        "FUNC 4000 1000 10 outermost\n\
++         STACK CFI INIT 4000 100 .cfa: $esp 4 + .ra: .cfa 4 - ^\n\
++         STACK CFI 4010 .ra: .undef .ra: .cfa 4 - ^\n",
++    );
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack
++        .append_repeated(0, 12)
++        .D32(0)
++        .D32(RETURN_ADDRESS_ON_STACK)
++        .append_repeated(0, 16);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = STACK_BASE as u32 + 12;
++
++    let s = f.walk(stack).await;
++
++    assert_ne!(s.termination, WalkTermination::EndOfStack);
++    assert!(s.frames.len() > 1);
++    assert_eq!(s.frames[1].trust, FrameTrust::FramePointer);
++}
++
++#[tokio::test]
++async fn a_record_that_declares_and_computes_in_one_row_is_discarded() {
++    let mut f = Fixture::new();
++    f.add_symbols(
++        "module1",
++        "FUNC 4000 1000 10 outermost\n\
++         STACK CFI INIT 4000 100 .cfa: $esp 4 + .ra: .undef .ra: .cfa 4 - ^\n",
++    );
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack
++        .append_repeated(0, 12)
++        .D32(0)
++        .D32(RETURN_ADDRESS_ON_STACK)
++        .append_repeated(0, 16);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = STACK_BASE as u32 + 12;
++
++    let s = f.walk(stack).await;
++
++    assert_ne!(s.termination, WalkTermination::EndOfStack);
++    assert!(s.frames.len() > 1);
++    assert_eq!(s.frames[1].instruction, RETURN_ADDRESS_ON_STACK as u64 - 1);
++}
++
++#[tokio::test]
++async fn a_row_that_computes_before_declaring_is_discarded_too() {
++    let mut f = Fixture::new();
++    f.add_symbols(
++        "module1",
++        "FUNC 4000 1000 10 outermost\n\
++         STACK CFI INIT 4000 100 .cfa: $esp 4 + .ra: .cfa 4 - ^ .ra: .undef\n",
++    );
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack
++        .append_repeated(0, 12)
++        .D32(0)
++        .D32(RETURN_ADDRESS_ON_STACK)
++        .append_repeated(0, 16);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = STACK_BASE as u32 + 12;
++
++    let s = f.walk(stack).await;
++
++    assert_ne!(s.termination, WalkTermination::EndOfStack);
++    assert!(s.frames.len() > 1);
++    assert_eq!(s.frames[1].trust, FrameTrust::FramePointer);
++    assert_eq!(s.frames[1].instruction, RETURN_ADDRESS_ON_STACK as u64 - 1);
++}
++
++#[tokio::test]
++async fn a_later_delta_replaces_an_earlier_delta_return_address_rule() {
++    let mut f = Fixture::new();
++    f.add_symbols(
++        "module1",
++        "FUNC 4000 1000 10 outermost\n\
++         STACK CFI INIT 4000 100 .cfa: $esp 4 + .ra: $edi\n\
++         STACK CFI 4008 .ra: $esi\n\
++         STACK CFI 4010 .ra: .cfa 4 - ^\n",
++    );
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack.D32(RETURN_ADDRESS_ON_STACK).append_repeated(0, 32);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = 0;
++    f.raw.edi = 0x40004500;
++    f.raw.esi = 0x40004600;
++
++    let s = f.walk(stack).await;
++
++    assert!(s.frames.len() > 1);
++    assert_eq!(s.frames[1].instruction, RETURN_ADDRESS_ON_STACK as u64 - 1);
++    assert_eq!(s.frames[1].trust, FrameTrust::CallFrameInfo);
++}
++
++#[tokio::test]
++async fn a_declaration_is_honoured_before_any_unwind_rule_is_evaluated() {
++    let mut f = Fixture::new();
++    f.add_symbols(
++        "module1",
++        "FUNC 4000 1000 10 outermost\n\
++         STACK CFI INIT 4000 100 .cfa: $esp 4 + .ra: .undef\n",
++    );
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack
++        .append_repeated(0, 12)
++        .D32(0)
++        .D32(RETURN_ADDRESS_ON_STACK)
++        .append_repeated(0, 16);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = STACK_BASE as u32 + 12;
++
++    let s = f.walk(stack).await;
++
++    assert_eq!(s.termination, WalkTermination::EndOfStack);
++    assert_eq!(s.frames.len(), 1);
++    assert_eq!(s.degraded_frame_count(), 0);
++}
++
++#[tokio::test]
++async fn a_frame_already_at_the_weakest_trust_is_still_marked_when_it_leaves_the_region() {
++    let mut f = Fixture::new();
++    f.add_symbols("module1", "FUNC 4000 1000 10 scanned_from\n");
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack.D32(0xf065dc76).D32(0x40004679);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = 0xd43eed6e;
++
++    let s = f.walk(stack).await;
++    assert_eq!(s.frames.len(), 2);
++    let scanned = &s.frames[1];
++
++    assert_eq!(scanned.claimed_trust, FrameTrust::Scan);
++    assert_eq!(scanned.trust, FrameTrust::Scan);
++    assert!(scanned.trust_degraded);
++    assert_eq!(
++        scanned.degrade_reason,
++        Some(DegradeReason::OutsideStackRegion)
++    );
++    assert_eq!(s.degraded_frame_count(), 1);
++    assert_eq!(s.trusted_prefix_len(), 1);
++}
++
++fn printed(stack: &CallStack) -> String {
++    let mut out = Vec::new();
++    stack.print(&mut out).unwrap();
++    String::from_utf8(out).unwrap()
++}
++
++#[tokio::test]
++async fn a_reduced_frame_and_a_cut_short_walk_are_both_surfaced() {
++    let mut f = Fixture::new();
++    f.add_symbols(
++        "module1",
++        "FUNC 4000 1000 10 register_unwound\n\
++         STACK CFI INIT 4000 1000 .cfa: $esp 8 + .ra: $edi\n",
++    );
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack.D32(0).D32(0);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = 0;
++    f.raw.edi = 0x40004050;
++
++    let s = f.walk(stack).await;
++    let text = printed(&s);
++
++    assert_eq!(s.termination, WalkTermination::LeftStackRegion);
++    assert!(text.contains("outside_stack_region"));
++    assert!(text.contains(WalkTermination::LeftStackRegion.description()));
++    assert!(text.contains(s.frames[1].claimed_trust.description()));
++}
++
++#[tokio::test]
++async fn a_walk_with_nothing_to_report_carries_none_of_those_lines() {
++    let (f, stack) = contained_walk();
++    let s = f.walk(stack).await;
++    let text = printed(&s);
++
++    assert_eq!(s.termination, WalkTermination::Exhausted);
++    assert!(!text.contains("outside_stack_region"));
++    assert!(!text.contains(WalkTermination::LeftStackRegion.description()));
++    assert!(!text.contains(WalkTermination::FrameLimit.description()));
++}
++
++#[tokio::test]
++async fn a_reduced_frame_is_surfaced_even_when_the_walk_ended_plainly() {
++    let (f, stack) = escaping_walk();
++    let s = f.walk(stack).await;
++    let text = printed(&s);
++
++    assert_eq!(s.termination, WalkTermination::Exhausted);
++    assert_eq!(s.degraded_frame_count(), 1);
++    assert!(text.contains("outside_stack_region"));
++    assert!(text.contains(s.frames[1].claimed_trust.description()));
++    assert!(!text.contains(WalkTermination::Exhausted.description()));
++}
++
++#[tokio::test]
++async fn a_walk_stopped_at_the_frame_limit_says_so_in_the_text() {
++    let mut f = Fixture::new();
++    f.add_symbols(
++        "module1",
++        "FUNC 4000 1000 10 register_unwound\n\
++         STACK CFI INIT 4000 1000 .cfa: $esp 8 + .ra: $edi\n",
++    );
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack.append_repeated(0, 1024 * 1024);
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = 0;
++    f.raw.edi = 0x40004050;
++
++    let s = f.walk(stack).await;
++    let text = printed(&s);
++
++    assert_eq!(s.termination, WalkTermination::FrameLimit);
++    assert!(text.contains(WalkTermination::FrameLimit.description()));
++}
++
++#[tokio::test]
++async fn a_walk_without_stack_memory_says_so_in_the_text() {
++    let mut f = Fixture::new();
++    f.add_symbols("module1", "FUNC 4000 1000 10 outermost\n");
++    f.raw.eip = 0x40004010;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = STACK_BASE as u32;
++
++    let s = f.walk_without_memory().await;
++    let text = printed(&s);
++
++    assert_eq!(s.termination, WalkTermination::NoStackMemory);
++    assert!(text.contains(WalkTermination::NoStackMemory.description()));
++    assert!(!text.contains(WalkTermination::LeftStackRegion.description()));
++}
++
++#[test]
++fn every_termination_has_a_human_readable_description() {
++    for termination in [
++        WalkTermination::Exhausted,
++        WalkTermination::LeftStackRegion,
++        WalkTermination::NoStackMemory,
++        WalkTermination::FrameLimit,
++        WalkTermination::EndOfStack,
++    ] {
++        let text = termination.description();
++        assert!(!text.is_empty());
++        assert_ne!(text, termination.as_str());
++    }
++}
++
++#[tokio::test]
++async fn an_empty_stack_memory_range_is_not_a_containment_failure() {
++    let mut f = Fixture::new();
++    f.raw.eip = 0x4000c7a5;
++    f.raw.esp = STACK_BASE as u32;
++    f.raw.ebp = STACK_BASE as u32;
++    let stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++
++    let s = f.walk(stack).await;
++
++    assert_eq!(s.termination, WalkTermination::NoStackMemory);
++    assert_eq!(s.info, CallStackInfo::Ok);
++    assert_eq!(s.degraded_frame_count(), 0);
++    assert!(!s.is_truncated());
++}
++
++#[tokio::test]
++async fn a_declared_end_is_surfaced_even_though_it_is_not_a_truncation() {
++    let (f, stack) = walk_with_cfi(".undef");
++    let s = f.walk(stack).await;
++    let text = printed(&s);
++
++    assert_eq!(s.termination, WalkTermination::EndOfStack);
++    assert!(!s.is_truncated());
++    assert!(text.contains(WalkTermination::EndOfStack.description()));
++    assert!(!text.contains("outside_stack_region"));
++}
++
++const AMD64_MODULE_BASE: u64 = 0x00007400c0000000;
++
++struct Amd64Fixture {
++    raw: CONTEXT_AMD64,
++    modules: MinidumpModuleList,
++    symbols: HashMap<String, String>,
++}
++
++impl Amd64Fixture {
++    fn new() -> Amd64Fixture {
++        Amd64Fixture {
++            raw: CONTEXT_AMD64::default(),
++            modules: MinidumpModuleList::from_modules(vec![MinidumpModule::new(
++                AMD64_MODULE_BASE,
++                0x10000,
++                "module1",
++            )]),
++            symbols: HashMap::new(),
++        }
++    }
++
++    async fn walk(&self, stack: Section) -> CallStack {
++        let context = MinidumpContext {
++            raw: MinidumpRawContext::Amd64(self.raw.clone()),
++            valid: MinidumpContextValidity::All,
++        };
++        let base = stack.start().value().unwrap();
++        let size = stack.size();
++        let bytes = stack.get_contents().unwrap();
++        let stack_memory = MinidumpMemory {
++            desc: Default::default(),
++            base_address: base,
++            size,
++            bytes: &bytes,
++            endian: scroll::LE,
++        };
++        let system_info = SystemInfo {
++            os: Os::Windows,
++            os_version: None,
++            os_build: None,
++            cpu: Cpu::X86_64,
++            cpu_info: None,
++            cpu_microcode_version: None,
++            cpu_count: 1,
++        };
++        let symbolizer = Symbolizer::new(string_symbol_supplier(self.symbols.clone()));
++        let mut stack = CallStack::with_context(context);
++        walk_stack(
++            0,
++            (),
++            &mut stack,
++            Some(UnifiedMemory::Memory(&stack_memory)),
++            &self.modules,
++            &system_info,
++            &symbolizer,
++        )
++        .await;
++        stack
++    }
++}
++
++#[tokio::test]
++async fn containment_applies_on_amd64_as_well() {
++    let mut f = Amd64Fixture::new();
++    let frame0_rbp = Label::new();
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack
++        .append_repeated(0, 16)
++        .mark(&frame0_rbp)
++        .D64(0)
++        .D64(AMD64_MODULE_BASE + 0x8679);
++    f.raw.rip = AMD64_MODULE_BASE + 0x4010;
++    f.raw.rsp = STACK_BASE;
++    f.raw.rbp = frame0_rbp.value().unwrap();
++
++    let s = f.walk(stack).await;
++
++    assert_eq!(s.frames.len(), 2);
++    let escaped = &s.frames[1];
++    assert!(escaped.trust_degraded);
++    assert_eq!(escaped.trust, FrameTrust::Scan);
++    assert_eq!(escaped.claimed_trust, FrameTrust::Scan);
++    assert_eq!(
++        escaped.degrade_reason,
++        Some(DegradeReason::OutsideStackRegion)
++    );
++    assert_eq!(s.degraded_frame_count(), 1);
++    assert_eq!(s.trusted_prefix_len(), 1);
++}
++
++const ARM64_MODULE_BASE: u64 = 0x40000000;
++
++struct Arm64Fixture {
++    raw: CONTEXT_ARM64,
++    modules: MinidumpModuleList,
++    symbols: HashMap<String, String>,
++}
++
++impl Arm64Fixture {
++    fn new() -> Arm64Fixture {
++        Arm64Fixture {
++            raw: CONTEXT_ARM64::default(),
++            modules: MinidumpModuleList::from_modules(vec![MinidumpModule::new(
++                ARM64_MODULE_BASE,
++                0x10000,
++                "module1",
++            )]),
++            symbols: HashMap::new(),
++        }
++    }
++
++    async fn walk(&self, stack: Section) -> CallStack {
++        let context = MinidumpContext {
++            raw: MinidumpRawContext::Arm64(self.raw.clone()),
++            valid: MinidumpContextValidity::All,
++        };
++        let base = stack.start().value().unwrap();
++        let size = stack.size();
++        let bytes = stack.get_contents().unwrap();
++        let stack_memory = MinidumpMemory {
++            desc: Default::default(),
++            base_address: base,
++            size,
++            bytes: &bytes,
++            endian: scroll::LE,
++        };
++        let system_info = SystemInfo {
++            os: Os::Windows,
++            os_version: None,
++            os_build: None,
++            cpu: Cpu::Arm64,
++            cpu_info: None,
++            cpu_microcode_version: None,
++            cpu_count: 1,
++        };
++        let symbolizer = Symbolizer::new(string_symbol_supplier(self.symbols.clone()));
++        let mut stack = CallStack::with_context(context);
++        walk_stack(
++            0,
++            (),
++            &mut stack,
++            Some(UnifiedMemory::Memory(&stack_memory)),
++            &self.modules,
++            &system_info,
++            &symbolizer,
++        )
++        .await;
++        stack
++    }
++}
++
++#[tokio::test]
++async fn containment_applies_on_arm64_as_well() {
++    let mut f = Arm64Fixture::new();
++    let frame0_fp = Label::new();
++    let mut stack = Section::new();
++    stack.start().set_const(STACK_BASE);
++    stack = stack
++        .append_repeated(0, 16)
++        .mark(&frame0_fp)
++        .D64(0)
++        .D64(ARM64_MODULE_BASE + 0x8679);
++    f.raw.set_register("pc", ARM64_MODULE_BASE + 0x4010);
++    f.raw.set_register("lr", 0);
++    f.raw.set_register("fp", frame0_fp.value().unwrap());
++    f.raw.set_register("sp", STACK_BASE);
++
++    let s = f.walk(stack).await;
++
++    assert_eq!(s.frames.len(), 2);
++    let escaped = &s.frames[1];
++    assert!(escaped.trust_degraded);
++    assert_eq!(escaped.trust, FrameTrust::Scan);
++    assert_eq!(escaped.claimed_trust, FrameTrust::FramePointer);
++    assert_eq!(
++        escaped.degrade_reason,
++        Some(DegradeReason::OutsideStackRegion)
++    );
++    assert_eq!(s.degraded_frame_count(), 1);
++    assert_eq!(s.trusted_prefix_len(), 1);
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..0b0a071
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,72 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++export CARGO_INCREMENTAL=0
++export RUSTC_BOOTSTRAP=1
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++NEW_TARGET="stack_containment_d57b13"
++NEW_TEST_FILE="minidump-unwind/tests/${NEW_TARGET}.rs"
++NEW_PROC_TARGET="walk_output_d57b13"
++NEW_PROC_FILE="minidump-processor/tests/${NEW_PROC_TARGET}.rs"
++TEST_JSON="$(mktemp)"
++TEST_ERR="$(mktemp)"
++STATUS=0
++
++run_target() {
++  # shellcheck disable=SC2086
++  cargo test $1 --offline --locked -- -Z unstable-options --format json --report-time \
++    >> "$TEST_JSON" 2>> "$TEST_ERR" || STATUS=1
++}
++
++if [ "$MODE" = "base" ]; then
++  run_target "--workspace --lib --bins"
++  run_target "-p minidump --test test_minidump"
++  run_target "-p minidump-processor --test test_processor"
++  run_target "-p minidump-stackwalk --test test-minidump-stackwalk"
++else
++  run_target "-p minidump-unwind --test $NEW_TARGET"
++  run_target "-p minidump-processor --test $NEW_PROC_TARGET"
++fi
++
++cat "$TEST_ERR" >&2
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  cargo2junit < "$TEST_JSON" > "$OUTPUT_PATH" 2>/dev/null || true
++  if ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++    # The suite did not build. Report every test in the target as failed, by name,
++    # so the result set matches the one a successful run produces.
++    sanitized=$( { cat "$TEST_ERR"; cat "$TEST_JSON"; } | tail -c 4000 | sed -e 's/]]>/]]]]><![CDATA[>/g' )
++    names=$(cat "$NEW_TEST_FILE" "$NEW_PROC_FILE" 2>/dev/null \
++      | grep -A 1 -E '^#\[(tokio::)?test\]' \
++      | grep -oE '^(async )?fn [a-z0-9_]+' \
++      | sed -e 's/^async fn //' -e 's/^fn //')
++    [ -z "$names" ] && names="compilation"
++    count=$(printf '%s\n' "$names" | wc -l)
++    {
++      # Mirror cargo2junit's shape exactly (empty classname, same suite naming) so the
++      # test identities match the ones a successful run reports.
++      printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n  <testsuite id="0" name="cargo test #0" package="testsuite/cargo test #0" tests="%s" errors="0" failures="%s">\n' "$count" "$count"
++      printf '%s\n' "$names" | while read -r n; do
++        [ -z "$n" ] && continue
++        printf '    <testcase name="%s" classname=""><failure message="build failed"><![CDATA[%s]]></failure></testcase>\n' "$n" "$sanitized"
++      done
++      printf '  </testsuite>\n</testsuites>\n'
++    } > "$OUTPUT_PATH"
++  fi
++fi
++
++rm -f "$TEST_JSON" "$TEST_ERR"
++exit $STATUS

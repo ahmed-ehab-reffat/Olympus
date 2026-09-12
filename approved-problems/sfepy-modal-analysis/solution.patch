@@ -1,0 +1,769 @@
+diff --git a/sfepy/discrete/__init__.py b/sfepy/discrete/__init__.py
+index 702a4bb..737b201 100644
+--- a/sfepy/discrete/__init__.py
++++ b/sfepy/discrete/__init__.py
+@@ -12,3 +12,5 @@ from .equations import Equations, Equation
+ from .integrals import Integrals, Integral
+ from .problem import Problem
+ from .evaluate import assemble_by_blocks
++from .modal import (ModalSolution, solve_modes, assemble_matrices,
++                    rayleigh_coefficients, rayleigh_damping_ratios)
+diff --git a/sfepy/discrete/modal.py b/sfepy/discrete/modal.py
+new file mode 100644
+index 0000000..314be23
+--- /dev/null
++++ b/sfepy/discrete/modal.py
+@@ -0,0 +1,727 @@
++"""
++Modal analysis of linear structural problems: natural frequencies, mode shapes
++and the quantities derived from them.
++"""
++import numpy as nm
++import scipy.sparse.linalg as spsla
++
++from sfepy.base.base import Struct
++from sfepy.solvers import Solver
++
++_NORMALIZATIONS = ['mass', 'stiffness', 'max', 'norm']
++_RULES = ['srss', 'cqc', 'abssum']
++_CORRECTIONS = ['none', 'static']
++
++_DENSE_LIMIT = 500
++
++
++def _get_state_variable(problem):
++    """
++    Get the single unknown variable of `problem`.
++    """
++    variables = problem.get_variables()
++    states = [var for var in variables.iter_state()]
++    if len(states) != 1:
++        raise ValueError('modal analysis needs exactly one unknown variable!'
++                         ' (%d given)' % len(states))
++
++    var = states[0]
++    dim = var.field.domain.shape.dim
++    if var.n_components != dim:
++        raise ValueError('modal analysis needs a vector field with %d'
++                         ' components! (%d given)' % (dim, var.n_components))
++
++    return var
++
++
++def assemble_matrices(problem, stiffness='stiffness', mass='mass'):
++    """
++    Assemble the two named equations of `problem` into sparse matrices in the
++    reduced DOF space given by the conditions set on the problem.
++
++    Returns
++    -------
++    mtx_k : sparse matrix
++    mtx_m : sparse matrix
++    """
++    equations = problem.equations
++    names = [eq.name for eq in equations]
++    for name in (stiffness, mass):
++        if name not in names:
++            raise ValueError('no equation named "%s"! (have %s)'
++                             % (name, ', '.join(names)))
++
++    if stiffness == mass:
++        raise ValueError('the stiffness and mass equations must differ!')
++
++    problem.update_materials()
++
++    mtx_k = problem.mtx_a.copy()
++    mtx_k.data[:] = 0.0
++    mtx_k = equations[stiffness].evaluate(mode='weak', dw_mode='matrix',
++                                          asm_obj=mtx_k)
++
++    mtx_m = problem.mtx_a.copy()
++    mtx_m.data[:] = 0.0
++    mtx_m = equations[mass].evaluate(mode='weak', dw_mode='matrix',
++                                     asm_obj=mtx_m)
++
++    mtx_k, mtx_m = mtx_k.tocsr(), mtx_m.tocsr()
++
++    variables = problem.get_variables()
++    if variables.has_lcbc:
++        operator = variables.mtx_lcbc
++        mtx_k = (operator.T @ mtx_k @ operator).tocsr()
++        mtx_m = (operator.T @ mtx_m @ operator).tocsr()
++
++    return mtx_k, mtx_m
++
++
++def _solve_evp(mtx_k, mtx_m, n_modes):
++    """
++    Solve `mtx_k phi = lambda mtx_m phi` for the `n_modes` smallest
++    eigenvalues.
++    """
++    n_active = mtx_k.shape[0]
++    if (n_active <= _DENSE_LIMIT) or (n_modes >= (n_active - 1)):
++        conf = Struct(name='modal_evp', kind='eig.scipy', method='eigh',
++                      which='SM')
++
++    else:
++        conf = Struct(name='modal_evp', kind='eig.scipy', method='eigsh',
++                      which='LM', sigma=0.0)
++
++    solver = Solver.any_from_conf(conf)
++    eigs, vecs = solver(mtx_k, mtx_m, n_modes, eigenvectors=True)
++
++    return nm.ascontiguousarray(eigs), nm.ascontiguousarray(vecs)
++
++
++def _fix_signs(svecs, vecs):
++    """
++    Scale each mode so that the full-space component of the largest magnitude
++    is positive. Ties are resolved by the lowest DOF index.
++    """
++    for im in range(vecs.shape[1]):
++        col = vecs[:, im]
++        ii = int(nm.argmax(nm.abs(col)))
++        if col[ii] < 0.0:
++            vecs[:, im] = -col
++            svecs[:, im] = -svecs[:, im]
++
++    return svecs, vecs
++
++
++def _active_indices(variables, var):
++    """
++    Full-space indices of the DOFs left active by the essential conditions.
++    """
++    return variables.di.indx[var.name].start + var.eq_map.eqi
++
++
++def solve_modes(problem, n_modes=6, stiffness='stiffness', mass='mass'):
++    """
++    Solve the generalized eigenvalue problem of `problem` and return the
++    `n_modes` lowest modes.
++    """
++    if n_modes < 1:
++        raise ValueError('n_modes must be positive! (%d given)' % n_modes)
++
++    var = _get_state_variable(problem)
++    mtx_k, mtx_m = assemble_matrices(problem, stiffness=stiffness, mass=mass)
++
++    n_active = mtx_k.shape[0]
++    if n_modes > n_active:
++        raise ValueError('n_modes is larger than the number of free DOFs!'
++                         ' (%d > %d)' % (n_modes, n_active))
++
++    eigs, svecs = _solve_evp(mtx_k, mtx_m, n_modes)
++
++    variables = problem.get_variables()
++    vecs = nm.empty((variables.di.n_dof_total, n_modes), dtype=nm.float64)
++    for im in range(n_modes):
++        vecs[:, im] = variables.make_full_vec(svecs[:, im], force_value=0.0)
++
++    svecs, vecs = _fix_signs(svecs, vecs)
++
++    return ModalSolution(problem, var, eigs, svecs, vecs, mtx_k, mtx_m)
++
++
++class ModalSolution(Struct):
++    """
++    The modes of a linear structural problem and the quantities derived from
++    them.
++    """
++
++    def __init__(self, problem, variable, eigenvalues, reduced_vectors,
++                 vectors, mtx_k, mtx_m):
++        self.problem = problem
++        self.variable = variable
++        self.eigenvalues = eigenvalues
++        self.reduced_vectors = reduced_vectors
++        self.vectors = vectors
++        self.mtx_k = mtx_k
++        self.mtx_m = mtx_m
++
++        self.n_modes = len(eigenvalues)
++        self.omegas = nm.sqrt(nm.clip(eigenvalues, 0.0, None))
++        self.frequencies = self.omegas / (2.0 * nm.pi)
++
++    def _like(self, eigs, svecs, vecs):
++        return ModalSolution(self.problem, self.variable, eigs, svecs, vecs,
++                             self.mtx_k, self.mtx_m)
++
++    def _variables(self):
++        return self.problem.get_variables()
++
++    def _dim(self):
++        return self.variable.field.domain.shape.dim
++
++    def modal_masses(self):
++        """
++        The modal masses `phi_i^T M phi_i`.
++        """
++        return nm.einsum('ij,ij->j', self.reduced_vectors,
++                         self.mtx_m @ self.reduced_vectors)
++
++    def modal_stiffnesses(self):
++        """
++        The modal stiffnesses `phi_i^T K phi_i`.
++        """
++        return nm.einsum('ij,ij->j', self.reduced_vectors,
++                         self.mtx_k @ self.reduced_vectors)
++
++    def normalize(self, kind='mass'):
++        """
++        Return the modes rescaled by the given normalization.
++        """
++        if kind not in _NORMALIZATIONS:
++            raise ValueError('unknown normalization! (%s, have %s)'
++                             % (kind, ', '.join(_NORMALIZATIONS)))
++
++        if kind == 'mass':
++            scales = nm.sqrt(self.modal_masses())
++
++        elif kind == 'stiffness':
++            scales = nm.sqrt(nm.abs(self.modal_stiffnesses()))
++
++        elif kind == 'max':
++            scales = nm.abs(self.vectors).max(axis=0)
++
++        else:
++            scales = nm.linalg.norm(self.vectors, axis=0)
++
++        if (scales == 0.0).any():
++            raise ValueError('cannot normalize a zero mode!')
++
++        svecs = self.reduced_vectors / scales
++        vecs = self.vectors / scales
++        svecs, vecs = _fix_signs(svecs, vecs)
++
++        return self._like(self.eigenvalues.copy(), svecs, vecs)
++
++    def expand(self, reduced_vec):
++        """
++        Expand a reduced DOF vector into the full DOF space, with the DOFs
++        fixed by essential conditions set to zero.
++        """
++        variables = self._variables()
++        if nm.iscomplexobj(reduced_vec):
++            real = variables.make_full_vec(nm.ascontiguousarray(
++                reduced_vec.real), force_value=0.0)
++            imag = variables.make_full_vec(nm.ascontiguousarray(
++                reduced_vec.imag), force_value=0.0)
++            return real + 1j * imag
++
++        return variables.make_full_vec(nm.ascontiguousarray(reduced_vec),
++                                       force_value=0.0)
++
++    def restrict(self, full_vec):
++        """
++        Take the entries of a full DOF vector at the DOFs left free by the
++        essential conditions.
++        """
++        variables = self._variables()
++        if full_vec.shape[0] != variables.di.n_dof_total:
++            raise ValueError('a full DOF vector has %d entries! (%d given)'
++                             % (variables.di.n_dof_total, full_vec.shape[0]))
++
++        if variables.has_lcbc:
++            raise ValueError('restriction is not defined for a problem with'
++                             ' linear combination conditions!')
++
++        return full_vec[_active_indices(variables, self.variable)]
++
++    def _restrict_load(self, full_vec):
++        """
++        Reduce a full DOF load vector, through the transpose of the linear
++        combination operator when the problem has one.
++        """
++        variables = self._variables()
++        if full_vec.shape[0] != variables.di.n_dof_total:
++            raise ValueError('a full DOF vector has %d entries! (%d given)'
++                             % (variables.di.n_dof_total, full_vec.shape[0]))
++
++        reduced = full_vec[_active_indices(variables, self.variable)]
++        if variables.has_lcbc:
++            reduced = variables.mtx_lcbc.T @ reduced
++
++        return reduced
++
++    def rigid_body_vectors(self, centre=None):
++        """
++        The rigid body displacement patterns in the full DOF space: the
++        translations followed by the rotations about `centre`.
++        """
++        dim = self._dim()
++        if dim not in (2, 3):
++            raise ValueError('rigid body vectors need a 2D or 3D problem!'
++                             ' (%dD given)' % dim)
++
++        coors = self.variable.field.get_coor()
++        n_nod = coors.shape[0]
++        variables = self._variables()
++        n_dof = variables.di.n_dof_total
++        if n_dof != (n_nod * dim):
++            raise ValueError('the field of the unknown variable must have one'
++                             ' DOF per component and node! (%d != %d)'
++                             % (n_dof, n_nod * dim))
++
++        if centre is None:
++            centre = nm.zeros(dim, dtype=nm.float64)
++
++        centre = nm.asarray(centre, dtype=nm.float64).ravel()
++        if centre.shape[0] != dim:
++            raise ValueError('centre must have %d components! (%d given)'
++                             % (dim, centre.shape[0]))
++
++        arms = coors - centre[None, :]
++
++        n_rigid = 3 if (dim == 2) else 6
++        out = nm.zeros((n_dof, n_rigid), dtype=nm.float64)
++        for ic in range(dim):
++            out[ic::dim, ic] = 1.0
++
++        if dim == 2:
++            out[0::2, 2] = -arms[:, 1]
++            out[1::2, 2] = arms[:, 0]
++
++        else:
++            axes = nm.eye(3)
++            for ir in range(3):
++                rot = nm.cross(axes[ir][None, :], arms)
++                for ic in range(3):
++                    out[ic::3, 3 + ir] = rot[:, ic]
++
++        return out
++
++    def _reduced_rigid(self, centre):
++        rigid = self.rigid_body_vectors(centre=centre)
++        variables = self._variables()
++        if variables.has_lcbc:
++            raise ValueError('participation quantities are not defined for a'
++                             ' problem with linear combination conditions!')
++
++        return rigid[_active_indices(variables, self.variable)]
++
++    def participation_factors(self, centre=None):
++        """
++        The factors `phi_i^T M r_j`, taken in the reduced DOF space.
++        """
++        rigid = self._reduced_rigid(centre)
++        return self.reduced_vectors.T @ (self.mtx_m @ rigid)
++
++    def effective_masses(self, centre=None):
++        """
++        The effective modal masses `Gamma_ij^2 / (phi_i^T M phi_i)`.
++        """
++        factors = self.participation_factors(centre=centre)
++        return (factors ** 2) / self.modal_masses()[:, None]
++
++    def mass_fractions(self, centre=None):
++        """
++        The effective masses divided by `r_j^T M r_j`.
++        """
++        rigid = self._reduced_rigid(centre)
++        totals = nm.einsum('ij,ij->j', rigid, self.mtx_m @ rigid)
++
++        out = nm.zeros((self.n_modes, rigid.shape[1]), dtype=nm.float64)
++        masses = self.effective_masses(centre=centre)
++        nonzero = totals != 0.0
++        out[:, nonzero] = masses[:, nonzero] / totals[nonzero]
++
++        return out
++
++    def cumulative_mass_fractions(self, centre=None):
++        """
++        The mass fractions accumulated over the modes.
++        """
++        return nm.cumsum(self.mass_fractions(centre=centre), axis=0)
++
++    def mac(self, other):
++        """
++        The modal assurance criterion of every mode against every mode of
++        `other`.
++        """
++        if other.vectors.shape[0] != self.vectors.shape[0]:
++            raise ValueError('the two solutions must have the same number of'
++                             ' DOFs! (%d != %d)'
++                             % (self.vectors.shape[0], other.vectors.shape[0]))
++
++        products = self.vectors.T @ other.vectors
++        norms1 = nm.einsum('ij,ij->j', self.vectors, self.vectors)
++        norms2 = nm.einsum('ij,ij->j', other.vectors, other.vectors)
++
++        return (products ** 2) / (norms1[:, None] * norms2[None, :])
++
++    def pair(self, other):
++        """
++        For each mode, the mode of `other` of the largest modal assurance
++        criterion, and that value.
++        """
++        if other.n_modes < 1:
++            raise ValueError('pairing needs a solution with at least one'
++                             ' mode!')
++
++        values = self.mac(other)
++        indices = nm.argmax(values, axis=1)
++
++        return indices.astype(nm.int32), values[nm.arange(self.n_modes),
++                                                indices]
++
++    def select(self, fmin=None, fmax=None, n_modes=None):
++        """
++        Keep the modes whose frequency lies in the given band, then the first
++        `n_modes` of them.
++        """
++        if (fmin is not None) and (fmax is not None) and (fmin > fmax):
++            raise ValueError('fmin must not exceed fmax! (%s > %s)'
++                             % (fmin, fmax))
++
++        mask = nm.ones(self.n_modes, dtype=bool)
++        if fmin is not None:
++            mask &= self.frequencies >= fmin
++        if fmax is not None:
++            mask &= self.frequencies <= fmax
++
++        indices = nm.where(mask)[0]
++        if n_modes is not None:
++            if n_modes < 1:
++                raise ValueError('n_modes must be positive! (%d given)'
++                                 % n_modes)
++            indices = indices[:n_modes]
++
++        return self._like(self.eigenvalues[indices].copy(),
++                          nm.ascontiguousarray(self.reduced_vectors[:,
++                                                                    indices]),
++                          nm.ascontiguousarray(self.vectors[:, indices]))
++
++    def _damping_ratios(self, damping):
++        ratios = nm.asarray(damping, dtype=nm.float64)
++        if ratios.ndim == 0:
++            ratios = nm.repeat(ratios[None], self.n_modes)
++
++        if ratios.shape != (self.n_modes,):
++            raise ValueError('damping must be a number or one ratio per mode!'
++                             ' (%d modes)' % self.n_modes)
++
++        if (ratios < 0.0).any():
++            raise ValueError('damping ratios must not be negative!')
++
++        return ratios
++
++    def _harmonic_sum(self, freqs, loads, ratios):
++        """
++        Sum the modal contributions to a harmonic load over the frequencies.
++        """
++        masses = self.modal_masses()
++        stiffnesses = self.modal_stiffnesses()
++
++        variables = self._variables()
++        out = nm.zeros((freqs.shape[0], variables.di.n_dof_total),
++                       dtype=nm.complex128)
++        for ii, freq in enumerate(freqs):
++            omega = 2.0 * nm.pi * freq
++            denominators = (stiffnesses - (omega ** 2) * masses
++                            + 2j * ratios * omega * self.omegas * masses)
++            if (denominators == 0.0).any():
++                raise ValueError('undamped resonance at %s Hz!' % freq)
++
++            out[ii] = self.expand(self.reduced_vectors
++                                  @ (loads / denominators))
++
++        return out
++
++    def _frequencies(self, freqs):
++        freqs = nm.asarray(freqs, dtype=nm.float64).ravel()
++        if (freqs < 0.0).any():
++            raise ValueError('frequencies must not be negative!')
++
++        return freqs
++
++    def static_correction(self, load):
++        """
++        The part of the static response to `load` that the modes do not carry,
++        in the full DOF space.
++        """
++        reduced = self._restrict_load(nm.asarray(load, dtype=nm.float64))
++        stiffnesses = self.modal_stiffnesses()
++        exact = spsla.spsolve(self.mtx_k.tocsc(), reduced)
++        modal = self.reduced_vectors @ ((self.reduced_vectors.T @ reduced)
++                                        / stiffnesses)
++
++        return self.expand(exact - modal)
++
++    def frequency_response(self, freqs, load, damping=0.0,
++                           correction='none'):
++        """
++        The steady state response to `load` harmonic in time, one full DOF
++        vector per frequency in Hz.
++        """
++        if correction not in _CORRECTIONS:
++            raise ValueError('unknown correction! (%s, have %s)'
++                             % (correction, ', '.join(_CORRECTIONS)))
++
++        freqs = self._frequencies(freqs)
++        ratios = self._damping_ratios(damping)
++        reduced = self._restrict_load(nm.asarray(load, dtype=nm.float64))
++        loads = self.reduced_vectors.T @ reduced
++
++        out = self._harmonic_sum(freqs, loads, ratios)
++
++        if correction == 'static':
++            out += self.static_correction(load)[None, :]
++
++        return out
++
++    def base_frequency_response(self, freqs, direction, damping=0.0,
++                                centre=None):
++        """
++        The steady state displacement relative to the base for a base
++        acceleration of unit amplitude harmonic in time.
++        """
++        freqs = self._frequencies(freqs)
++        factors = self.participation_factors(centre=centre)
++        n_rigid = factors.shape[1]
++        if not (0 <= direction < n_rigid):
++            raise ValueError('direction must be in [0, %d)! (%d given)'
++                             % (n_rigid, direction))
++
++        ratios = self._damping_ratios(damping)
++
++        return self._harmonic_sum(freqs, -factors[:, direction], ratios)
++
++    def project(self, full_vec):
++        """
++        The modal coordinates of a full DOF vector.
++        """
++        reduced = self.restrict(nm.asarray(full_vec, dtype=nm.float64))
++
++        return ((self.reduced_vectors.T @ (self.mtx_m @ reduced))
++                / self.modal_masses())
++
++    def transient_response(self, times, load, history, damping=0.0,
++                           displacement=None, velocity=None):
++        """
++        The response to `load` scaled in time by `history`, with the load
++        taken to vary linearly between consecutive samples and every modal
++        equation solved exactly for it.
++        """
++        times = nm.asarray(times, dtype=nm.float64).ravel()
++        if times.shape[0] < 2:
++            raise ValueError('at least two time samples are needed!')
++
++        steps = nm.diff(times)
++        if not nm.allclose(steps, steps[0]) or (steps[0] <= 0.0):
++            raise ValueError('the time samples must be equally spaced and'
++                             ' increasing!')
++
++        history = nm.asarray(history, dtype=nm.float64).ravel()
++        if history.shape != times.shape:
++            raise ValueError('history must hold one value per time sample!'
++                             ' (%d samples, %d given)'
++                             % (times.shape[0], history.shape[0]))
++
++        ratios = self._damping_ratios(damping)
++        if (ratios >= 1.0).any():
++            raise ValueError('the damping ratios must be below one!')
++
++        if (self.omegas == 0.0).any():
++            raise ValueError('a transient response needs every mode to have a'
++                             ' positive frequency!')
++
++        reduced = self._restrict_load(nm.asarray(load, dtype=nm.float64))
++        masses = self.modal_masses()
++        forces = self.reduced_vectors.T @ reduced
++
++        coors = nm.zeros(self.n_modes, dtype=nm.float64)
++        rates = nm.zeros(self.n_modes, dtype=nm.float64)
++        if displacement is not None:
++            coors = self.project(displacement)
++        if velocity is not None:
++            rates = self.project(velocity)
++
++        aa, bb, cc, dd, ap, bp, cp, dp = _duhamel_coefficients(
++            self.omegas, ratios, masses, steps[0])
++
++        variables = self._variables()
++        out = nm.zeros((times.shape[0], variables.di.n_dof_total),
++                       dtype=nm.float64)
++        out[0] = self.expand(self.reduced_vectors @ coors)
++        for it in range(times.shape[0] - 1):
++            p0 = forces * history[it]
++            p1 = forces * history[it + 1]
++            new_coors = aa * coors + bb * rates + cc * p0 + dd * p1
++            rates = ap * coors + bp * rates + cp * p0 + dp * p1
++            coors = new_coors
++            out[it + 1] = self.expand(self.reduced_vectors @ coors)
++
++        return out
++
++    def response_spectrum(self, spectrum, direction, damping=0.0,
++                          rule='srss', centre=None):
++        """
++        The peak response to a base acceleration given by `spectrum`, one
++        spectral acceleration per mode.
++        """
++        if rule not in _RULES:
++            raise ValueError('unknown combination rule! (%s, have %s)'
++                             % (rule, ', '.join(_RULES)))
++
++        factors = self.participation_factors(centre=centre)
++        n_rigid = factors.shape[1]
++        if not (0 <= direction < n_rigid):
++            raise ValueError('direction must be in [0, %d)! (%d given)'
++                             % (n_rigid, direction))
++
++        spectrum = nm.asarray(spectrum, dtype=nm.float64).ravel()
++        if spectrum.shape != (self.n_modes,):
++            raise ValueError('spectrum must hold one value per mode!'
++                             ' (%d modes, %d given)'
++                             % (self.n_modes, spectrum.shape[0]))
++
++        if (self.omegas == 0.0).any():
++            raise ValueError('a response spectrum needs every mode to have a'
++                             ' positive frequency!')
++
++        ratios = self._damping_ratios(damping)
++        peaks = (factors[:, direction] * spectrum
++                 / (self.modal_masses() * self.omegas ** 2))
++        responses = self.vectors * peaks[None, :]
++
++        if rule == 'abssum':
++            return nm.abs(responses).sum(axis=1)
++
++        if rule == 'srss':
++            return nm.sqrt((responses ** 2).sum(axis=1))
++
++        if self.n_modes < 1:
++            return nm.zeros(responses.shape[0], dtype=nm.float64)
++
++        if not nm.allclose(ratios, ratios[0]):
++            raise ValueError('the cqc rule needs the same damping ratio in'
++                             ' every mode!')
++
++        rho = _cqc_correlations(self.omegas, ratios[0])
++        squares = nm.einsum('ij,jk,ik->i', responses, rho, responses)
++
++        return nm.sqrt(nm.clip(squares, 0.0, None))
++
++    def create_output(self, name='mode'):
++        """
++        The mode shapes as output data, ready to be saved.
++        """
++        variables = self.problem.set_default_state()
++
++        out = {}
++        for im in range(self.n_modes):
++            variables.set_state(self.vectors[:, im], force=True)
++            aux = variables.create_output()
++            out['%s%03d' % (name, im)] = aux.popitem()[1]
++
++        return out
++
++
++def _duhamel_coefficients(omegas, ratios, masses, dt):
++    """
++    The recurrence coefficients of the exact solution of a single mode driven
++    by a load varying linearly over a step of length `dt`.
++    """
++    stiffnesses = masses * omegas ** 2
++    roots = nm.sqrt(1.0 - ratios ** 2)
++    damped = omegas * roots
++    decay = nm.exp(-ratios * omegas * dt)
++    sines = nm.sin(damped * dt)
++    cosines = nm.cos(damped * dt)
++
++    aa = decay * (ratios / roots * sines + cosines)
++    bb = decay * sines / damped
++    cc = (2.0 * ratios / (omegas * dt)
++          + decay * (((1.0 - 2.0 * ratios ** 2) / (damped * dt)
++                      - ratios / roots) * sines
++                     - (1.0 + 2.0 * ratios / (omegas * dt)) * cosines))
++    dd = (1.0 - 2.0 * ratios / (omegas * dt)
++          + decay * ((2.0 * ratios ** 2 - 1.0) / (damped * dt) * sines
++                     + 2.0 * ratios / (omegas * dt) * cosines))
++
++    ap = -decay * omegas / roots * sines
++    bp = decay * (cosines - ratios / roots * sines)
++    cp = (-1.0 / dt
++          + decay * ((omegas / roots + ratios / (dt * roots)) * sines
++                     + cosines / dt))
++    dp = (1.0 - decay * (ratios / roots * sines + cosines)) / dt
++
++    return (aa, bb, cc / stiffnesses, dd / stiffnesses,
++            ap, bp, cp / stiffnesses, dp / stiffnesses)
++
++
++def _cqc_correlations(omegas, ratio):
++    """
++    The complete quadratic combination correlation coefficients for a damping
++    ratio shared by every mode.
++    """
++    rr = omegas[:, None] / omegas[None, :]
++    top = 8.0 * (ratio ** 2) * (1.0 + rr) * (rr ** 1.5)
++    bottom = ((1.0 - rr ** 2) ** 2 + 4.0 * (ratio ** 2) * rr
++              * (1.0 + rr) ** 2)
++
++    out = nm.where(bottom != 0.0, top / nm.where(bottom != 0.0, bottom, 1.0),
++                   1.0)
++    nm.fill_diagonal(out, 1.0)
++
++    return out
++
++
++def rayleigh_coefficients(f1, f2, zeta1, zeta2):
++    """
++    The mass and stiffness proportional damping coefficients giving the two
++    damping ratios at the two frequencies in Hz.
++    """
++    if not (0.0 < f1 < f2):
++        raise ValueError('the frequencies must satisfy 0 < f1 < f2!'
++                         ' (%s, %s given)' % (f1, f2))
++
++    if (zeta1 < 0.0) or (zeta2 < 0.0):
++        raise ValueError('the damping ratios must not be negative!')
++
++    w1 = 2.0 * nm.pi * f1
++    w2 = 2.0 * nm.pi * f2
++    denominator = w2 ** 2 - w1 ** 2
++
++    alpha = 2.0 * w1 * w2 * (zeta1 * w2 - zeta2 * w1) / denominator
++    beta = 2.0 * (zeta2 * w2 - zeta1 * w1) / denominator
++
++    return alpha, beta
++
++
++def rayleigh_damping_ratios(alpha, beta, frequencies):
++    """
++    The damping ratios of proportional damping at the given frequencies in Hz.
++    """
++    freqs = nm.asarray(frequencies, dtype=nm.float64).ravel()
++    if (freqs <= 0.0).any():
++        raise ValueError('the frequencies must be positive!')
++
++    omegas = 2.0 * nm.pi * freqs
++
++    return 0.5 * (alpha / omegas + beta * omegas)
+diff --git a/sfepy/discrete/problem.py b/sfepy/discrete/problem.py
+index d80fe11..6146f14 100644
+--- a/sfepy/discrete/problem.py
++++ b/sfepy/discrete/problem.py
+@@ -1998,6 +1998,21 @@ class Problem(Struct):
+ 
+         return materials
+ 
++    def solve_modes(self, n_modes=6, stiffness='stiffness', mass='mass'):
++        """
++        Solve the generalized eigenvalue problem given by the two named
++        equations, honouring the conditions currently set on the problem.
++
++        Returns
++        -------
++        solution : ModalSolution
++            The lowest `n_modes` modes.
++        """
++        from sfepy.discrete.modal import solve_modes
++
++        return solve_modes(self, n_modes=n_modes, stiffness=stiffness,
++                           mass=mass)
++
+     def get_variables(self, auto_create=False):
+         if self.equations is not None:
+             variables = self.equations.variables

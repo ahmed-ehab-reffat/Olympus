@@ -1,0 +1,563 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..28d1805
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,46 @@
++#!/usr/bin/env bash
++set -uo pipefail
++export PATH="/root/.cargo/bin:$PATH"
++export CARGO_INCREMENTAL=0
++export RUSTC_BOOTSTRAP=1
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path) OUTPUT_PATH="$2"; shift 2 ;;
++    base|new) MODE="$1"; shift ;;
++    *) shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++TEST_JSON=$(mktemp)
++TEST_ERR=$(mktemp)
++
++case "$MODE" in
++  base)
++    cargo test -p lyon_tessellation --lib -- -Z unstable-options --format json --report-time \
++      > "$TEST_JSON" 2> "$TEST_ERR"
++    ;;
++  new)
++    cargo test -p lyon_tessellation --test stroke_to_fill_3f390e -- -Z unstable-options --format json --report-time \
++      > "$TEST_JSON" 2> "$TEST_ERR"
++    ;;
++esac
++STATUS=$?
++
++cat "$TEST_ERR" >&2
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  cargo2junit < "$TEST_JSON" > "$OUTPUT_PATH" 2>/dev/null || true
++  if ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++    sanitized=$( { cat "$TEST_ERR"; cat "$TEST_JSON"; } | tail -c 4000 | sed -e 's/]]>/]]]]><![CDATA[>/g')
++    printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n  <testsuite name="cargo-test" tests="1" failures="1" errors="0">\n    <testcase name="compilation" classname="cargo-test"><failure message="build failed"><![CDATA[%s]]></failure></testcase>\n  </testsuite>\n</testsuites>\n' "$sanitized" > "$OUTPUT_PATH"
++  fi
++fi
++
++rm -f "$TEST_JSON" "$TEST_ERR"
++exit $STATUS
+diff --git a/crates/tessellation/tests/stroke_to_fill_3f390e.rs b/crates/tessellation/tests/stroke_to_fill_3f390e.rs
+new file mode 100644
+index 0000000..38be070
+--- /dev/null
++++ b/crates/tessellation/tests/stroke_to_fill_3f390e.rs
+@@ -0,0 +1,505 @@
++use lyon_tessellation::math::{point, Point};
++use lyon_tessellation::path::Path;
++use lyon_tessellation::{LineCap, LineJoin, StrokeOptions, StrokeToFill};
++
++fn is_left(a: Point, b: Point, p: Point) -> f32 {
++    (b.x - a.x) * (p.y - a.y) - (p.x - a.x) * (b.y - a.y)
++}
++
++fn winding(path: &Path, p: Point) -> i32 {
++    use lyon_tessellation::path::PathEvent;
++    let mut wn = 0;
++    for evt in path.iter() {
++        let (a, b) = match evt {
++            PathEvent::Line { from, to } => (from, to),
++            PathEvent::End { last, first, close: true } => (last, first),
++            _ => continue,
++        };
++        if a.y <= p.y {
++            if b.y > p.y && is_left(a, b, p) > 0.0 {
++                wn += 1;
++            }
++        } else if b.y <= p.y && is_left(a, b, p) < 0.0 {
++            wn -= 1;
++        }
++    }
++    wn
++}
++
++fn filled(path: &Path, p: Point) -> bool {
++    winding(path, p) != 0
++}
++
++fn crossings(path: &Path, p: Point) -> u32 {
++    use lyon_tessellation::path::PathEvent;
++    let mut c = 0;
++    for evt in path.iter() {
++        let (a, b) = match evt {
++            PathEvent::Line { from, to } => (from, to),
++            PathEvent::End { last, first, close: true } => (last, first),
++            _ => continue,
++        };
++        if (a.y > p.y) != (b.y > p.y) {
++            let t = (p.y - a.y) / (b.y - a.y);
++            let x = a.x + t * (b.x - a.x);
++            if x > p.x {
++                c += 1;
++            }
++        }
++    }
++    c
++}
++
++fn evenodd(path: &Path, p: Point) -> bool {
++    crossings(path, p) % 2 == 1
++}
++
++fn evenodd_area(path: &Path, min: Point, max: Point, step: f32) -> f32 {
++    let mut count = 0u64;
++    let mut y = min.y + step * 0.5;
++    while y < max.y {
++        let mut x = min.x + step * 0.5;
++        while x < max.x {
++            if evenodd(path, point(x, y)) {
++                count += 1;
++            }
++            x += step;
++        }
++        y += step;
++    }
++    (count as f32) * step * step
++}
++
++fn grid_area(path: &Path, min: Point, max: Point, step: f32) -> f32 {
++    let mut count = 0u64;
++    let mut y = min.y + step * 0.5;
++    while y < max.y {
++        let mut x = min.x + step * 0.5;
++        while x < max.x {
++            if filled(path, point(x, y)) {
++                count += 1;
++            }
++            x += step;
++        }
++        y += step;
++    }
++    (count as f32) * step * step
++}
++
++fn open_path(pts: &[Point]) -> Path {
++    let mut b = Path::builder();
++    b.begin(pts[0]);
++    for p in &pts[1..] {
++        b.line_to(*p);
++    }
++    b.end(false);
++    b.build()
++}
++
++fn closed_path(pts: &[Point]) -> Path {
++    let mut b = Path::builder();
++    b.begin(pts[0]);
++    for p in &pts[1..] {
++        b.line_to(*p);
++    }
++    b.end(true);
++    b.build()
++}
++
++fn opts() -> StrokeOptions {
++    StrokeOptions::DEFAULT.with_line_width(2.0).with_tolerance(0.02)
++}
++
++// --- core coverage ---
++
++#[test]
++fn straight_segment_core_membership() {
++    let p = open_path(&[point(0.0, 0.0), point(10.0, 0.0)]);
++    let out = p.stroke_to_fill(&opts());
++    assert!(filled(&out, point(5.0, 0.0)));
++    assert!(filled(&out, point(0.5, 0.9)));
++    assert!(filled(&out, point(9.5, -0.9)));
++}
++
++#[test]
++fn straight_segment_outside_width() {
++    let p = open_path(&[point(0.0, 0.0), point(10.0, 0.0)]);
++    let out = p.stroke_to_fill(&opts());
++    assert!(!filled(&out, point(5.0, 1.5)));
++    assert!(!filled(&out, point(5.0, -1.5)));
++}
++
++#[test]
++fn path_slice_stroke_to_fill_matches_path() {
++    let p = open_path(&[point(0.0, 0.0), point(10.0, 0.0)]);
++    let via_path = p.stroke_to_fill(&opts());
++    let via_slice = p.as_slice().stroke_to_fill(&opts());
++    assert!(filled(&via_path, point(5.0, 0.0)));
++    assert!(filled(&via_slice, point(5.0, 0.0)));
++    assert!(!filled(&via_slice, point(5.0, 1.5)));
++}
++
++#[test]
++fn straight_segment_area() {
++    let p = open_path(&[point(0.0, 0.0), point(10.0, 0.0)]);
++    let out = p.stroke_to_fill(&opts());
++    let a = grid_area(&out, point(-2.0, -2.0), point(12.0, 2.0), 0.02);
++    assert!((a - 20.0).abs() < 0.5, "area {}", a);
++}
++
++// --- caps ---
++
++#[test]
++fn butt_cap_has_no_extension() {
++    let o = opts().with_line_cap(LineCap::Butt);
++    let out = open_path(&[point(0.0, 0.0), point(10.0, 0.0)]).stroke_to_fill(&o);
++    assert!(!filled(&out, point(-0.3, 0.0)));
++    assert!(!filled(&out, point(10.3, 0.0)));
++}
++
++#[test]
++fn square_cap_extends_half_width() {
++    let o = opts().with_line_cap(LineCap::Square);
++    let out = open_path(&[point(0.0, 0.0), point(10.0, 0.0)]).stroke_to_fill(&o);
++    assert!(filled(&out, point(-0.5, 0.0)));
++    assert!(filled(&out, point(10.5, 0.0)));
++    assert!(!filled(&out, point(-1.5, 0.0)));
++}
++
++#[test]
++fn round_cap_is_a_half_disc() {
++    let o = opts().with_line_cap(LineCap::Round);
++    let out = open_path(&[point(0.0, 0.0), point(10.0, 0.0)]).stroke_to_fill(&o);
++    assert!(filled(&out, point(-0.5, 0.0)));
++    assert!(!filled(&out, point(-0.8, 0.8)));
++}
++
++#[test]
++fn start_and_end_cap_are_independent() {
++    let o = opts().with_start_cap(LineCap::Square).with_end_cap(LineCap::Butt);
++    let out = open_path(&[point(0.0, 0.0), point(10.0, 0.0)]).stroke_to_fill(&o);
++    assert!(filled(&out, point(-0.5, 0.0)));
++    assert!(!filled(&out, point(10.3, 0.0)));
++}
++
++#[test]
++fn square_cap_larger_area_than_butt() {
++    let bx0 = point(-3.0, -3.0);
++    let bx1 = point(13.0, 3.0);
++    let butt = open_path(&[point(0.0, 0.0), point(10.0, 0.0)])
++        .stroke_to_fill(&opts().with_line_cap(LineCap::Butt));
++    let square = open_path(&[point(0.0, 0.0), point(10.0, 0.0)])
++        .stroke_to_fill(&opts().with_line_cap(LineCap::Square));
++    let round = open_path(&[point(0.0, 0.0), point(10.0, 0.0)])
++        .stroke_to_fill(&opts().with_line_cap(LineCap::Round));
++    let ab = grid_area(&butt, bx0, bx1, 0.02);
++    let as_ = grid_area(&square, bx0, bx1, 0.02);
++    let ar = grid_area(&round, bx0, bx1, 0.02);
++    assert!(as_ > ab + 3.0, "square {} butt {}", as_, ab);
++    assert!(as_ > ar, "square {} round {}", as_, ar);
++    assert!(ar > ab, "round {} butt {}", ar, ab);
++}
++
++// --- joins ---
++
++fn corner() -> [Point; 3] {
++    [point(0.0, 0.0), point(10.0, 0.0), point(10.0, 10.0)]
++}
++
++fn join_area(join: LineJoin, miter_limit: f32) -> f32 {
++    let mut o = opts().with_line_join(join);
++    o.miter_limit = miter_limit;
++    let out = open_path(&corner()).stroke_to_fill(&o);
++    grid_area(&out, point(-3.0, -3.0), point(13.0, 13.0), 0.02)
++}
++
++#[test]
++fn miter_join_larger_than_bevel() {
++    assert!(join_area(LineJoin::Miter, 10.0) > join_area(LineJoin::Bevel, 10.0) + 0.2);
++}
++
++#[test]
++fn round_join_between_bevel_and_miter() {
++    let bevel = join_area(LineJoin::Bevel, 10.0);
++    let round = join_area(LineJoin::Round, 10.0);
++    let miter = join_area(LineJoin::Miter, 10.0);
++    assert!(round > bevel + 0.05, "round {} bevel {}", round, bevel);
++    assert!(round < miter, "round {} miter {}", round, miter);
++}
++
++#[test]
++fn miter_over_limit_falls_back_to_bevel() {
++    let clamped = join_area(LineJoin::Miter, 1.1);
++    let bevel = join_area(LineJoin::Bevel, 10.0);
++    assert!((clamped - bevel).abs() < 0.15, "clamped {} bevel {}", clamped, bevel);
++}
++
++#[test]
++fn miter_clip_between_bevel_and_full_miter() {
++    let clip = join_area(LineJoin::MiterClip, 1.2);
++    let bevel = join_area(LineJoin::Bevel, 10.0);
++    let miter = join_area(LineJoin::Miter, 10.0);
++    assert!(clip > bevel, "clip {} bevel {}", clip, bevel);
++    assert!(clip < miter + 0.01, "clip {} miter {}", clip, miter);
++}
++
++#[test]
++fn miter_apex_point_membership() {
++    let mut o = opts().with_line_join(LineJoin::Miter);
++    o.miter_limit = 10.0;
++    let miter = open_path(&corner()).stroke_to_fill(&o);
++    let bevel = open_path(&corner()).stroke_to_fill(&opts().with_line_join(LineJoin::Bevel));
++    let apex = point(10.6, -0.6);
++    assert!(filled(&miter, apex), "miter should cover apex");
++    assert!(!filled(&bevel, apex), "bevel should not cover apex");
++}
++
++// --- closed subpath (annulus) ---
++
++fn square_loop() -> [Point; 4] {
++    [point(0.0, 0.0), point(20.0, 0.0), point(20.0, 20.0), point(0.0, 20.0)]
++}
++
++#[test]
++fn closed_loop_hole_is_empty() {
++    let out = closed_path(&square_loop()).stroke_to_fill(&opts());
++    assert!(!filled(&out, point(10.0, 10.0)));
++    assert!(!filled(&out, point(5.0, 5.0)));
++}
++
++#[test]
++fn closed_loop_band_is_filled() {
++    let out = closed_path(&square_loop()).stroke_to_fill(&opts());
++    assert!(filled(&out, point(0.0, 10.0)));
++    assert!(filled(&out, point(20.0, 10.0)));
++    assert!(filled(&out, point(10.0, 0.0)));
++}
++
++#[test]
++fn closed_loop_no_caps() {
++    let out = closed_path(&square_loop()).stroke_to_fill(&opts());
++    assert!(!filled(&out, point(-1.5, -1.5)) || filled(&out, point(-0.9, 0.0)));
++    assert!(filled(&out, point(-0.9, 10.0)));
++}
++
++// --- zero length ---
++
++#[test]
++fn zero_length_round_is_a_disc() {
++    let o = opts().with_line_width(4.0).with_line_cap(LineCap::Round);
++    let out = open_path(&[point(5.0, 5.0), point(5.0, 5.0)]).stroke_to_fill(&o);
++    assert!(filled(&out, point(5.0, 5.0)));
++    assert!(filled(&out, point(6.5, 5.0)));
++    assert!(!filled(&out, point(7.5, 5.0)));
++    let a = grid_area(&out, point(0.0, 0.0), point(10.0, 10.0), 0.02);
++    assert!((a - std::f32::consts::PI * 4.0).abs() < 0.6, "disc area {}", a);
++}
++
++#[test]
++fn zero_length_square_is_a_square() {
++    let o = opts().with_line_width(4.0).with_line_cap(LineCap::Square);
++    let out = open_path(&[point(5.0, 5.0), point(5.0, 5.0)]).stroke_to_fill(&o);
++    assert!(filled(&out, point(5.0, 5.0)));
++    assert!(filled(&out, point(6.9, 6.9)));
++    assert!(!filled(&out, point(7.5, 7.5)));
++    let a = grid_area(&out, point(0.0, 0.0), point(10.0, 10.0), 0.02);
++    assert!((a - 16.0).abs() < 0.5, "square area {}", a);
++}
++
++#[test]
++fn zero_length_butt_is_empty() {
++    let o = opts().with_line_cap(LineCap::Butt);
++    let out = open_path(&[point(5.0, 5.0), point(5.0, 5.0)]).stroke_to_fill(&o);
++    assert!(!filled(&out, point(5.0, 5.0)));
++}
++
++#[test]
++fn zero_line_width_yields_empty_path() {
++    let o = opts().with_line_width(0.0);
++    let out = open_path(&corner()).stroke_to_fill(&o);
++    assert_eq!(vertex_count(&out), 0);
++}
++
++#[test]
++fn negative_line_width_yields_empty_path() {
++    let o = opts().with_line_width(-2.0);
++    let out = open_path(&corner()).stroke_to_fill(&o);
++    assert_eq!(vertex_count(&out), 0);
++}
++
++#[test]
++fn nan_line_width_yields_empty_path() {
++    let o = opts().with_line_width(f32::NAN);
++    let out = open_path(&corner()).stroke_to_fill(&o);
++    assert_eq!(vertex_count(&out), 0);
++}
++
++#[test]
++fn infinite_line_width_yields_empty_path() {
++    let o = opts().with_line_width(f32::INFINITY);
++    let out = open_path(&corner()).stroke_to_fill(&o);
++    assert_eq!(vertex_count(&out), 0);
++}
++
++// --- interaction / robustness ---
++
++#[test]
++fn inner_corner_is_filled() {
++    let out = open_path(&corner()).stroke_to_fill(&opts());
++    assert!(filled(&out, point(9.3, 0.7)));
++}
++
++#[test]
++fn wider_stroke_covers_more() {
++    let narrow = open_path(&corner()).stroke_to_fill(&opts().with_line_width(2.0));
++    let wide = open_path(&corner()).stroke_to_fill(&opts().with_line_width(4.0));
++    let bx0 = point(-4.0, -4.0);
++    let bx1 = point(14.0, 14.0);
++    assert!(grid_area(&wide, bx0, bx1, 0.03) > grid_area(&narrow, bx0, bx1, 0.03) + 10.0);
++}
++
++#[test]
++fn multiple_subpaths_are_independent() {
++    let mut b = Path::builder();
++    b.begin(point(0.0, 0.0));
++    b.line_to(point(10.0, 0.0));
++    b.end(false);
++    b.begin(point(0.0, 10.0));
++    b.line_to(point(10.0, 10.0));
++    b.end(false);
++    let out = b.build().stroke_to_fill(&opts());
++    assert!(filled(&out, point(5.0, 0.0)));
++    assert!(filled(&out, point(5.0, 10.0)));
++    assert!(!filled(&out, point(5.0, 5.0)));
++}
++
++#[test]
++fn curved_segment_follows_the_curve() {
++    let mut b = Path::builder();
++    b.begin(point(0.0, 0.0));
++    b.quadratic_bezier_to(point(10.0, 0.0), point(10.0, 10.0));
++    b.end(false);
++    let out = b.build().stroke_to_fill(&opts().with_line_width(4.0));
++    assert!(filled(&out, point(7.5, 2.5)));
++    assert!(!filled(&out, point(2.0, 8.0)));
++}
++
++// --- output is a simple (non-self-intersecting) outline: even-odd == non-zero ---
++
++#[test]
++fn backtracking_path_has_no_even_odd_hole() {
++    let out = open_path(&[point(0.0, 0.0), point(10.0, 0.0), point(0.0, 0.0)]).stroke_to_fill(&opts());
++    assert!(filled(&out, point(5.0, 0.0)));
++    assert!(evenodd(&out, point(5.0, 0.0)));
++}
++
++#[test]
++fn self_crossing_paths_fill_the_intersection() {
++    let mut b = Path::builder();
++    b.begin(point(0.0, 0.0));
++    b.line_to(point(10.0, 10.0));
++    b.end(false);
++    b.begin(point(0.0, 10.0));
++    b.line_to(point(10.0, 0.0));
++    b.end(false);
++    let out = b.build().stroke_to_fill(&opts().with_line_width(3.0));
++    assert!(filled(&out, point(5.0, 5.0)));
++    assert!(evenodd(&out, point(5.0, 5.0)));
++}
++
++#[test]
++fn inner_corner_has_no_even_odd_hole() {
++    let out = open_path(&corner()).stroke_to_fill(&opts());
++    assert!(filled(&out, point(9.3, 0.7)));
++    assert!(evenodd(&out, point(9.3, 0.7)));
++}
++
++#[test]
++fn closed_loop_even_odd_matches_non_zero() {
++    let out = closed_path(&square_loop()).stroke_to_fill(&opts());
++    assert!(!evenodd(&out, point(10.0, 10.0)));
++    assert!(evenodd(&out, point(0.0, 10.0)));
++}
++
++#[test]
++fn even_odd_and_non_zero_areas_agree() {
++    let out = open_path(&corner()).stroke_to_fill(&opts());
++    let bx0 = point(-3.0, -3.0);
++    let bx1 = point(13.0, 13.0);
++    let nz = grid_area(&out, bx0, bx1, 0.03);
++    let eo = evenodd_area(&out, bx0, bx1, 0.03);
++    assert!((nz - eo).abs() < 0.2, "nz {} eo {}", nz, eo);
++}
++
++// --- additional edge cases ---
++
++#[test]
++fn deep_concave_notch_is_simple() {
++    let out = open_path(&[
++        point(0.0, 0.0),
++        point(10.0, 0.0),
++        point(5.0, 1.5),
++    ])
++    .stroke_to_fill(&opts().with_line_width(3.0));
++    let bx0 = point(-3.0, -3.0);
++    let bx1 = point(13.0, 6.0);
++    let nz = grid_area(&out, bx0, bx1, 0.03);
++    let eo = evenodd_area(&out, bx0, bx1, 0.03);
++    assert!((nz - eo).abs() < 0.3, "nz {} eo {}", nz, eo);
++}
++
++#[test]
++fn acute_spike_miter_is_clamped() {
++    let spike = [point(0.0, 0.0), point(10.0, 0.0), point(0.2, 0.4)];
++    let mut o = opts().with_line_join(LineJoin::Miter);
++    o.miter_limit = 2.0;
++    let out = open_path(&spike).stroke_to_fill(&o);
++    assert!(!filled(&out, point(30.0, 0.0)));
++}
++
++#[test]
++fn two_closed_loops_yield_two_holes() {
++    let mut b = Path::builder();
++    for &(ox, oy) in &[(0.0f32, 0.0f32), (30.0, 0.0)] {
++        b.begin(point(ox, oy));
++        b.line_to(point(ox + 10.0, oy));
++        b.line_to(point(ox + 10.0, oy + 10.0));
++        b.line_to(point(ox, oy + 10.0));
++        b.end(true);
++    }
++    let out = b.build().stroke_to_fill(&opts());
++    assert!(!filled(&out, point(5.0, 5.0)));
++    assert!(!filled(&out, point(35.0, 5.0)));
++    assert!(filled(&out, point(0.0, 5.0)));
++    assert!(filled(&out, point(30.0, 5.0)));
++}
++
++#[test]
++fn miter_limit_below_one_is_treated_as_one() {
++    let mut o = opts().with_line_join(LineJoin::Miter);
++    o.miter_limit = 0.2;
++    let low = open_path(&corner()).stroke_to_fill(&o);
++    let bevel = open_path(&corner()).stroke_to_fill(&opts().with_line_join(LineJoin::Bevel));
++    let bx0 = point(-3.0, -3.0);
++    let bx1 = point(13.0, 13.0);
++    assert!((grid_area(&low, bx0, bx1, 0.03) - grid_area(&bevel, bx0, bx1, 0.03)).abs() < 0.3);
++}
++
++fn vertex_count(path: &Path) -> usize {
++    use lyon_tessellation::path::PathEvent;
++    path.iter()
++        .filter(|e| matches!(e, PathEvent::Begin { .. } | PathEvent::Line { .. }))
++        .count()
++}
++
++#[test]
++fn degenerate_repeated_points_do_not_panic() {
++    let out = open_path(&[
++        point(0.0, 0.0),
++        point(0.0, 0.0),
++        point(10.0, 0.0),
++        point(10.0, 0.0),
++    ])
++    .stroke_to_fill(&opts());
++    assert!(filled(&out, point(5.0, 0.0)));
++}

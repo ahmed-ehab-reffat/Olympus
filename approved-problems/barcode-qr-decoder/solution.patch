@@ -1,0 +1,848 @@
+diff --git a/decode.go b/decode.go
+new file mode 100644
+index 0000000..b8ac420
+--- /dev/null
++++ b/decode.go
+@@ -0,0 +1,31 @@
++package barcode
++
++import (
++	"errors"
++	"image"
++)
++
++// DecoderFunc reads a barcode from an image, returning an error when the image
++// does not contain a barcode the decoder can read.
++type DecoderFunc func(img image.Image) (Barcode, error)
++
++var registeredDecoders []DecoderFunc
++
++// RegisterDecoder adds a decoder to the set tried by Decode. Barcode
++// sub-packages call it from an init function so their format becomes readable
++// through the package-level Decode.
++func RegisterDecoder(decoder DecoderFunc) {
++	registeredDecoders = append(registeredDecoders, decoder)
++}
++
++// Decode reads a barcode from img by trying each registered decoder in turn and
++// returning the first one that succeeds. It returns an error when no registered
++// decoder can read the image.
++func Decode(img image.Image) (Barcode, error) {
++	for _, decoder := range registeredDecoders {
++		if bc, err := decoder(img); err == nil {
++			return bc, nil
++		}
++	}
++	return nil, errors.New("barcode: no registered decoder could read the image")
++}
+diff --git a/qr/bitstream.go b/qr/bitstream.go
+new file mode 100644
+index 0000000..09a09dc
+--- /dev/null
++++ b/qr/bitstream.go
+@@ -0,0 +1,129 @@
++package qr
++
++import (
++	"errors"
++	"fmt"
++	"strconv"
++	"strings"
++)
++
++func deinterleave(cw []byte, vi *versionInfo) []*block {
++	nb1 := int(vi.NumberOfBlocksInGroup1)
++	nb2 := int(vi.NumberOfBlocksInGroup2)
++	d1 := int(vi.DataCodeWordsPerBlockInGroup1)
++	d2 := int(vi.DataCodeWordsPerBlockInGroup2)
++	ecc := int(vi.ErrorCorrectionCodewordsPerBlock)
++
++	blocks := make([]*block, nb1+nb2)
++	for b := 0; b < len(blocks); b++ {
++		dl := d1
++		if b >= nb1 {
++			dl = d2
++		}
++		blocks[b] = &block{data: make([]byte, dl), ecc: make([]byte, ecc)}
++	}
++
++	maxData := d1
++	if d2 > maxData {
++		maxData = d2
++	}
++
++	idx := 0
++	for i := 0; i < maxData; i++ {
++		for b := 0; b < len(blocks); b++ {
++			if i < len(blocks[b].data) && idx < len(cw) {
++				blocks[b].data[i] = cw[idx]
++				idx++
++			}
++		}
++	}
++	for i := 0; i < ecc; i++ {
++		for b := 0; b < len(blocks); b++ {
++			if idx < len(cw) {
++				blocks[b].ecc[i] = cw[idx]
++				idx++
++			}
++		}
++	}
++	return blocks
++}
++
++type bitReader struct {
++	data []byte
++	pos  int
++}
++
++func (r *bitReader) remaining() int {
++	return len(r.data)*8 - r.pos
++}
++
++func (r *bitReader) read(n int) int {
++	v := 0
++	for i := 0; i < n; i++ {
++		v <<= 1
++		if r.pos < len(r.data)*8 {
++			byteIdx := r.pos / 8
++			bit := (r.data[byteIdx] >> uint(7-(r.pos%8))) & 1
++			v |= int(bit)
++		}
++		r.pos++
++	}
++	return v
++}
++
++func parseSegments(data []byte, vi *versionInfo) (string, error) {
++	r := &bitReader{data: data}
++	var sb strings.Builder
++
++	for r.remaining() >= 4 {
++		mode := encodingMode(r.read(4))
++		if mode == 0 {
++			break
++		}
++		switch mode {
++		case numericMode:
++			count := r.read(int(vi.charCountBits(numericMode)))
++			for count > 0 {
++				var bits, digits int
++				switch {
++				case count >= 3:
++					bits, digits = 10, 3
++				case count == 2:
++					bits, digits = 7, 2
++				default:
++					bits, digits = 4, 1
++				}
++				value := r.read(bits)
++				s := strconv.Itoa(value)
++				for len(s) < digits {
++					s = "0" + s
++				}
++				sb.WriteString(s)
++				count -= digits
++			}
++		case alphaNumericMode:
++			count := r.read(int(vi.charCountBits(alphaNumericMode)))
++			for count >= 2 {
++				value := r.read(11)
++				sb.WriteByte(charSet[value/45])
++				sb.WriteByte(charSet[value%45])
++				count -= 2
++			}
++			if count == 1 {
++				sb.WriteByte(charSet[r.read(6)])
++			}
++		case byteMode:
++			count := r.read(int(vi.charCountBits(byteMode)))
++			for i := 0; i < count; i++ {
++				sb.WriteByte(byte(r.read(8)))
++			}
++		default:
++			return "", fmt.Errorf("qr: unsupported mode indicator %d", mode)
++		}
++	}
++
++	if sb.Len() == 0 {
++		return "", errors.New("qr: no decodable segments")
++	}
++	return sb.String(), nil
++}
+diff --git a/qr/decoder.go b/qr/decoder.go
+new file mode 100644
+index 0000000..5847394
+--- /dev/null
++++ b/qr/decoder.go
+@@ -0,0 +1,174 @@
++package qr
++
++import (
++	"errors"
++	"image"
++	"image/color"
++	"math"
++)
++
++// DecodeResult holds the data recovered from a QR code symbol together with the
++// symbol parameters that were read back from it.
++type DecodeResult struct {
++	Content string
++	Version byte
++	Level   ErrorCorrectionLevel
++	Mask    int
++}
++
++// Decode reads a QR code from an image, locating the symbol by its finder
++// patterns and tolerating a surrounding quiet zone and integer pixel scaling.
++// Reed-Solomon error correction is applied, so a limited number of damaged
++// modules are tolerated. It returns an error when no QR symbol can be located
++// or when the data cannot be recovered.
++func Decode(img image.Image) (*DecodeResult, error) {
++	matrix, dim, err := readMatrix(img)
++	if err != nil {
++		return nil, err
++	}
++	version := byte((dim-21)/4 + 1)
++
++	level, mask, err := decodeFormat(matrix, dim)
++	if err != nil {
++		return nil, err
++	}
++	vi := lookupVersionInfo(version, level)
++	if vi == nil {
++		return nil, errors.New("qr: unsupported version or level")
++	}
++
++	codewords := readCodewords(matrix, vi, mask)
++	blocks := deinterleave(codewords, vi)
++
++	data := make([]byte, 0, vi.totalDataBytes())
++	for _, blk := range blocks {
++		corrected, err := rsDecode(blk, int(vi.ErrorCorrectionCodewordsPerBlock))
++		if err != nil {
++			return nil, err
++		}
++		data = append(data, corrected...)
++	}
++
++	content, err := parseSegments(data, vi)
++	if err != nil {
++		return nil, err
++	}
++	return &DecodeResult{Content: content, Version: version, Level: level, Mask: mask}, nil
++}
++
++func lookupVersionInfo(version byte, level ErrorCorrectionLevel) *versionInfo {
++	for _, vi := range versionInfos {
++		if vi.Version == version && vi.Level == level {
++			return vi
++		}
++	}
++	return nil
++}
++
++func isDark(img image.Image, x, y int) bool {
++	g := color.GrayModel.Convert(img.At(x, y)).(color.Gray)
++	return g.Y < 128
++}
++
++func readMatrix(img image.Image) ([][]bool, int, error) {
++	originX, originY, moduleSize, dim, err := locateGrid(findFinderCenters(img))
++	if err != nil {
++		return nil, 0, err
++	}
++
++	b := img.Bounds()
++	clamp := func(v, lo, hi int) int {
++		if v < lo {
++			return lo
++		}
++		if v > hi {
++			return hi
++		}
++		return v
++	}
++
++	m := make([][]bool, dim)
++	for x := 0; x < dim; x++ {
++		m[x] = make([]bool, dim)
++		for y := 0; y < dim; y++ {
++			px := clamp(int(math.Round(originX+float64(x-3)*moduleSize)), b.Min.X, b.Max.X-1)
++			py := clamp(int(math.Round(originY+float64(y-3)*moduleSize)), b.Min.Y, b.Max.Y-1)
++			m[x][y] = isDark(img, px, py)
++		}
++	}
++	return m, dim, nil
++}
++
++func buildOccupied(vi *versionInfo) *qrcode {
++	dim := vi.modulWidth()
++	occupied := newBarcode(dim)
++	mark := func(x, y int, val bool) {
++		if x >= 0 && x < dim && y >= 0 && y < dim {
++			occupied.Set(x, y, true)
++		}
++	}
++	drawFinderPatterns(vi, mark)
++	drawAlignmentPatterns(occupied, vi, mark)
++	for i := 0; i < dim; i++ {
++		if !occupied.Get(i, 6) {
++			mark(i, 6, true)
++		}
++		if !occupied.Get(6, i) {
++			mark(6, i, true)
++		}
++	}
++	mark(8, dim-8, true)
++	drawVersionInfo(vi, mark)
++	drawFormatInfo(vi, -1, occupied.Set)
++	return occupied
++}
++
++func totalCodewords(vi *versionInfo) int {
++	ecc := int(vi.ErrorCorrectionCodewordsPerBlock)
++	g1 := int(vi.NumberOfBlocksInGroup1) * (int(vi.DataCodeWordsPerBlockInGroup1) + ecc)
++	g2 := int(vi.NumberOfBlocksInGroup2) * (int(vi.DataCodeWordsPerBlockInGroup2) + ecc)
++	return g1 + g2
++}
++
++func readCodewords(m [][]bool, vi *versionInfo, mask int) []byte {
++	occupied := buildOccupied(vi)
++	total := totalCodewords(vi)
++	bits := make([]bool, 0, total*8+8)
++	for pos := range iterateModules(occupied) {
++		bits = append(bits, unmaskBit(m[pos.X][pos.Y], pos.X, pos.Y, mask))
++	}
++	result := make([]byte, total)
++	for i := 0; i < total; i++ {
++		var b byte
++		for j := 0; j < 8; j++ {
++			if bits[i*8+j] {
++				b |= 1 << uint(7-j)
++			}
++		}
++		result[i] = b
++	}
++	return result
++}
++
++func unmaskBit(val bool, x, y, mask int) bool {
++	var cond bool
++	switch mask {
++	case 0:
++		cond = (y+x)%2 == 0
++	case 1:
++		cond = y%2 == 0
++	case 2:
++		cond = x%3 == 0
++	case 3:
++		cond = (y+x)%3 == 0
++	case 4:
++		cond = (y/2+x/3)%2 == 0
++	case 5:
++		cond = (y*x)%2+(y*x)%3 == 0
++	case 6:
++		cond = ((y*x)%2+(y*x)%3)%2 == 0
++	case 7:
++		cond = ((y+x)%2+(y*x)%3)%2 == 0
++	}
++	return val != cond
++}
+diff --git a/qr/detect.go b/qr/detect.go
+new file mode 100644
+index 0000000..d4854bb
+--- /dev/null
++++ b/qr/detect.go
+@@ -0,0 +1,211 @@
++package qr
++
++import (
++	"errors"
++	"image"
++	"math"
++)
++
++type finderCenter struct {
++	x, y       float64
++	moduleSize float64
++}
++
++func matchesFinderRatio(runs [5]int) bool {
++	total := 0
++	for _, r := range runs {
++		if r == 0 {
++			return false
++		}
++		total += r
++	}
++	if total < 7 {
++		return false
++	}
++	unit := float64(total) / 7.0
++	tol := unit / 2.0
++	want := [5]float64{unit, unit, 3 * unit, unit, unit}
++	for i := 0; i < 5; i++ {
++		if math.Abs(float64(runs[i])-want[i]) > tol {
++			return false
++		}
++	}
++	return true
++}
++
++func verticalRunCheck(dark func(x, y int) bool, cx, y0, minY, maxY int) (moduleSize, centerY float64, ok bool) {
++	if !dark(cx, y0) {
++		return 0, 0, false
++	}
++	top, bot := y0, y0
++	for top-1 >= minY && dark(cx, top-1) {
++		top--
++	}
++	for bot+1 <= maxY && dark(cx, bot+1) {
++		bot++
++	}
++	centerLen := bot - top + 1
++
++	light1, dark1 := 0, 0
++	y := top - 1
++	for y >= minY && !dark(cx, y) {
++		light1++
++		y--
++	}
++	for y >= minY && dark(cx, y) {
++		dark1++
++		y--
++	}
++	light2, dark2 := 0, 0
++	y = bot + 1
++	for y <= maxY && !dark(cx, y) {
++		light2++
++		y++
++	}
++	for y <= maxY && dark(cx, y) {
++		dark2++
++		y++
++	}
++
++	runs := [5]int{dark1, light1, centerLen, light2, dark2}
++	if !matchesFinderRatio(runs) {
++		return 0, 0, false
++	}
++	total := dark1 + light1 + centerLen + light2 + dark2
++	return float64(total) / 7.0, float64(top+bot) / 2.0, true
++}
++
++func findFinderCenters(img image.Image) []finderCenter {
++	b := img.Bounds()
++	dark := func(x, y int) bool { return isDark(img, x, y) }
++
++	var raw []finderCenter
++	for y := b.Min.Y; y < b.Max.Y; y++ {
++		runs := [5]int{}
++		colors := [5]bool{}
++		count := 0
++		x := b.Min.X
++		for x < b.Max.X {
++			c := dark(x, y)
++			start := x
++			for x < b.Max.X && dark(x, y) == c {
++				x++
++			}
++			length := x - start
++			for i := 0; i < 4; i++ {
++				runs[i] = runs[i+1]
++				colors[i] = colors[i+1]
++			}
++			runs[4] = length
++			colors[4] = c
++			if count < 5 {
++				count++
++			}
++			if count >= 5 && colors[0] && !colors[1] && colors[2] && !colors[3] && colors[4] {
++				if matchesFinderRatio(runs) {
++					cx := float64(start) - float64(runs[3]) - float64(runs[2])/2.0 - 0.5
++					cxi := int(math.Round(cx))
++					if ms, cy, ok := verticalRunCheck(dark, cxi, y, b.Min.Y, b.Max.Y-1); ok {
++						raw = append(raw, finderCenter{cx, cy, ms})
++					}
++				}
++			}
++		}
++	}
++	return clusterCenters(raw)
++}
++
++func clusterCenters(raw []finderCenter) []finderCenter {
++	var clusters []finderCenter
++	var counts []int
++	for _, c := range raw {
++		merged := false
++		for i := range clusters {
++			if math.Abs(clusters[i].x-c.x) <= clusters[i].moduleSize*3 &&
++				math.Abs(clusters[i].y-c.y) <= clusters[i].moduleSize*3 {
++				n := float64(counts[i])
++				clusters[i].x = (clusters[i].x*n + c.x) / (n + 1)
++				clusters[i].y = (clusters[i].y*n + c.y) / (n + 1)
++				clusters[i].moduleSize = (clusters[i].moduleSize*n + c.moduleSize) / (n + 1)
++				counts[i]++
++				merged = true
++				break
++			}
++		}
++		if !merged {
++			clusters = append(clusters, c)
++			counts = append(counts, 1)
++		}
++	}
++	var strong []finderCenter
++	for i, c := range clusters {
++		if counts[i] >= 2 {
++			strong = append(strong, c)
++		}
++	}
++	return strong
++}
++
++func dist(a, b finderCenter) float64 {
++	return math.Hypot(a.x-b.x, a.y-b.y)
++}
++
++func pickFinders(cands []finderCenter) (tl, tr, bl finderCenter, ok bool) {
++	if len(cands) < 3 {
++		return
++	}
++	bestScore := math.MaxFloat64
++	for i := 0; i < len(cands); i++ {
++		for j := i + 1; j < len(cands); j++ {
++			for k := j + 1; k < len(cands); k++ {
++				trip := []finderCenter{cands[i], cands[j], cands[k]}
++				for corner := 0; corner < 3; corner++ {
++					a := trip[corner]
++					b := trip[(corner+1)%3]
++					c := trip[(corner+2)%3]
++					d1 := dist(a, b)
++					d2 := dist(a, c)
++					if d1 == 0 || d2 == 0 {
++						continue
++					}
++					cos := ((b.x-a.x)*(c.x-a.x) + (b.y-a.y)*(c.y-a.y)) / (d1 * d2)
++					score := math.Abs(cos) + math.Abs(d1-d2)/math.Max(d1, d2)
++					if score < bestScore {
++						bestScore = score
++						tl = a
++						if math.Abs(b.y-a.y) <= math.Abs(c.y-a.y) {
++							tr, bl = b, c
++						} else {
++							tr, bl = c, b
++						}
++					}
++				}
++			}
++		}
++	}
++	return tl, tr, bl, bestScore < 0.3
++}
++
++func locateGrid(centers []finderCenter) (originX, originY, moduleSize float64, dim int, err error) {
++	tl, tr, bl, ok := pickFinders(centers)
++	if !ok {
++		return 0, 0, 0, 0, errors.New("qr: could not find three finder patterns")
++	}
++
++	moduleSize = median3(tl.moduleSize, tr.moduleSize, bl.moduleSize)
++	if moduleSize < 1 {
++		moduleSize = 1
++	}
++	span := (math.Abs(tr.x-tl.x) + math.Abs(bl.y-tl.y)) / 2
++
++	rawDim := span/moduleSize + 7
++	dim = int(math.Round((rawDim-21)/4))*4 + 21
++	if dim < 21 || dim > 177 || math.Abs(rawDim-float64(dim)) > 2 {
++		return 0, 0, 0, 0, errors.New("qr: invalid module dimension")
++	}
++	return tl.x, tl.y, moduleSize, dim, nil
++}
++
++func median3(a, b, c float64) float64 {
++	return math.Max(math.Min(a, b), math.Min(math.Max(a, b), c))
++}
+diff --git a/qr/formatdecode.go b/qr/formatdecode.go
+new file mode 100644
+index 0000000..b147173
+--- /dev/null
++++ b/qr/formatdecode.go
+@@ -0,0 +1,55 @@
++package qr
++
++import "errors"
++
++var formatBitPositions = [15][2]int{
++	{0, 8}, {1, 8}, {2, 8}, {3, 8}, {4, 8}, {5, 8}, {7, 8}, {8, 8},
++	{8, 7}, {8, 5}, {8, 4}, {8, 3}, {8, 2}, {8, 1}, {8, 0},
++}
++
++func secondFormatBitPositions(dim int) [15][2]int {
++	return [15][2]int{
++		{8, dim - 1}, {8, dim - 2}, {8, dim - 3}, {8, dim - 4}, {8, dim - 5}, {8, dim - 6}, {8, dim - 7},
++		{dim - 8, 8}, {dim - 7, 8}, {dim - 6, 8}, {dim - 5, 8}, {dim - 4, 8}, {dim - 3, 8}, {dim - 2, 8}, {dim - 1, 8},
++	}
++}
++
++func matchFormat(m [][]bool, coords [15][2]int) (ErrorCorrectionLevel, int, int) {
++	var read [15]bool
++	for i, c := range coords {
++		read[i] = m[c[0]][c[1]]
++	}
++	bestLevel := L
++	bestMask := -1
++	bestDist := 16
++	for level, masks := range formatInfos {
++		for mask, pattern := range masks {
++			dist := 0
++			for i := 0; i < 15; i++ {
++				if pattern[i] != read[i] {
++					dist++
++				}
++			}
++			if dist < bestDist {
++				bestDist = dist
++				bestLevel = level
++				bestMask = mask
++			}
++		}
++	}
++	return bestLevel, bestMask, bestDist
++}
++
++func decodeFormat(m [][]bool, dim int) (ErrorCorrectionLevel, int, error) {
++	l1, m1, d1 := matchFormat(m, formatBitPositions)
++	l2, m2, d2 := matchFormat(m, secondFormatBitPositions(dim))
++
++	level, mask, dist := l1, m1, d1
++	if d2 < d1 {
++		level, mask, dist = l2, m2, d2
++	}
++	if mask < 0 || dist > 3 {
++		return 0, 0, errors.New("qr: unreadable format information")
++	}
++	return level, mask, nil
++}
+diff --git a/qr/reedsolomon_decode.go b/qr/reedsolomon_decode.go
+new file mode 100644
+index 0000000..fd46207
+--- /dev/null
++++ b/qr/reedsolomon_decode.go
+@@ -0,0 +1,176 @@
++package qr
++
++import (
++	"errors"
++
++	"github.com/boombuler/barcode/utils"
++)
++
++var qrField = utils.NewGaloisField(285, 256, 0)
++
++func gfPow(k int) int {
++	k %= qrField.Size - 1
++	if k < 0 {
++		k += qrField.Size - 1
++	}
++	return qrField.ALogTbl[k]
++}
++
++func evalAsc(coeffs []int, x int) int {
++	res := 0
++	xp := 1
++	for i := 0; i < len(coeffs); i++ {
++		if coeffs[i] != 0 {
++			res = qrField.AddOrSub(res, qrField.Multiply(coeffs[i], xp))
++		}
++		xp = qrField.Multiply(xp, x)
++	}
++	return res
++}
++
++func formalDerivative(coeffs []int) []int {
++	if len(coeffs) <= 1 {
++		return []int{0}
++	}
++	d := make([]int, len(coeffs)-1)
++	for i := 1; i < len(coeffs); i++ {
++		if i%2 == 1 {
++			d[i-1] = coeffs[i]
++		}
++	}
++	return d
++}
++
++func polyMulTrunc(a, b []int, limit int) []int {
++	res := make([]int, limit)
++	for i := 0; i < len(a); i++ {
++		if a[i] == 0 {
++			continue
++		}
++		for j := 0; j < len(b) && i+j < limit; j++ {
++			if b[j] == 0 {
++				continue
++			}
++			res[i+j] = qrField.AddOrSub(res[i+j], qrField.Multiply(a[i], b[j]))
++		}
++	}
++	return res
++}
++
++func polyMinusShift(a, b []int, scale, shift int) []int {
++	size := len(a)
++	if len(b)+shift > size {
++		size = len(b) + shift
++	}
++	res := make([]int, size)
++	copy(res, a)
++	for i := 0; i < len(b); i++ {
++		if b[i] == 0 {
++			continue
++		}
++		res[i+shift] = qrField.AddOrSub(res[i+shift], qrField.Multiply(scale, b[i]))
++	}
++	for len(res) > 1 && res[len(res)-1] == 0 {
++		res = res[:len(res)-1]
++	}
++	return res
++}
++
++func syndromes(c []int, eccCount int) ([]int, bool) {
++	n := len(c)
++	s := make([]int, eccCount)
++	any := false
++	for j := 0; j < eccCount; j++ {
++		acc := 0
++		for i := 0; i < n; i++ {
++			if c[i] != 0 {
++				acc = qrField.AddOrSub(acc, qrField.Multiply(c[i], gfPow(j*(n-1-i))))
++			}
++		}
++		s[j] = acc
++		if acc != 0 {
++			any = true
++		}
++	}
++	return s, any
++}
++
++func rsDecode(blk *block, eccCount int) ([]byte, error) {
++	dataLen := len(blk.data)
++	n := dataLen + len(blk.ecc)
++	c := make([]int, n)
++	for i, v := range blk.data {
++		c[i] = int(v)
++	}
++	for i, v := range blk.ecc {
++		c[dataLen+i] = int(v)
++	}
++
++	synd, any := syndromes(c, eccCount)
++	if !any {
++		return append([]byte(nil), blk.data...), nil
++	}
++
++	lambda := []int{1}
++	bpoly := []int{1}
++	L, m, b := 0, 1, 1
++	for r := 0; r < eccCount; r++ {
++		delta := synd[r]
++		for i := 1; i <= L && i < len(lambda); i++ {
++			delta = qrField.AddOrSub(delta, qrField.Multiply(lambda[i], synd[r-i]))
++		}
++		if delta == 0 {
++			m++
++		} else if 2*L <= r {
++			t := append([]int(nil), lambda...)
++			scale := qrField.Multiply(delta, qrField.Invers(b))
++			lambda = polyMinusShift(lambda, bpoly, scale, m)
++			L = r + 1 - L
++			bpoly = t
++			b = delta
++			m = 1
++		} else {
++			scale := qrField.Multiply(delta, qrField.Invers(b))
++			lambda = polyMinusShift(lambda, bpoly, scale, m)
++			m++
++		}
++	}
++
++	numErrors := len(lambda) - 1
++	if numErrors == 0 || numErrors > eccCount/2 {
++		return nil, errors.New("qr: too many errors to correct")
++	}
++
++	var positions []int
++	for p := 0; p < n; p++ {
++		if evalAsc(lambda, gfPow(-p)) == 0 {
++			positions = append(positions, p)
++		}
++	}
++	if len(positions) != numErrors {
++		return nil, errors.New("qr: error locator degree mismatch")
++	}
++
++	omega := polyMulTrunc(synd, lambda, eccCount)
++	deriv := formalDerivative(lambda)
++	for _, p := range positions {
++		xInv := gfPow(-p)
++		num := evalAsc(omega, xInv)
++		den := evalAsc(deriv, xInv)
++		if den == 0 {
++			return nil, errors.New("qr: forney denominator is zero")
++		}
++		magnitude := qrField.Multiply(qrField.Multiply(num, qrField.Invers(den)), gfPow(p))
++		c[n-1-p] = qrField.AddOrSub(c[n-1-p], magnitude)
++	}
++
++	if _, stillWrong := syndromes(c, eccCount); stillWrong {
++		return nil, errors.New("qr: error correction failed")
++	}
++
++	out := make([]byte, dataLen)
++	for i := 0; i < dataLen; i++ {
++		out[i] = byte(c[i])
++	}
++	return out, nil
++}
+diff --git a/qr/register.go b/qr/register.go
+new file mode 100644
+index 0000000..e3844db
+--- /dev/null
++++ b/qr/register.go
+@@ -0,0 +1,30 @@
++package qr
++
++import (
++	"image"
++
++	"github.com/boombuler/barcode"
++)
++
++type decodedQR struct {
++	image.Image
++	content string
++}
++
++func (d *decodedQR) Content() string {
++	return d.content
++}
++
++func (d *decodedQR) Metadata() barcode.Metadata {
++	return barcode.Metadata{CodeKind: barcode.TypeQR, Dimensions: 2}
++}
++
++func init() {
++	barcode.RegisterDecoder(func(img image.Image) (barcode.Barcode, error) {
++		res, err := Decode(img)
++		if err != nil {
++			return nil, err
++		}
++		return &decodedQR{Image: img, content: res.Content}, nil
++	})
++}

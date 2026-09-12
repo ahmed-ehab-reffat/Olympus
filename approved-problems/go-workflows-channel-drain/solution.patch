@@ -1,0 +1,1039 @@
+diff --git a/internal/sync/channel.go b/internal/sync/channel.go
+index a886743..918ce17 100644
+--- a/internal/sync/channel.go
++++ b/internal/sync/channel.go
+@@ -5,6 +5,8 @@ type Channel[T any] interface {
+ 
+ 	SendNonblocking(v T) (ok bool)
+ 
++	SendAllNonblocking(values []T) (sent int)
++
+ 	Receive(ctx Context) (v T, ok bool)
+ 
+ 	ReceiveNonBlocking() (v T, ok bool)
+@@ -12,6 +14,26 @@ type Channel[T any] interface {
+ 	Close()
+ 
+ 	Len() int
++
++	Drain() []T
++
++	Peek() (v T, ok bool)
++
++	DroppedCount() int
++
++	PeekN(n int) []T
++
++	PeekAll() []T
++
++	Cap() int
++
++	IsFull() bool
++
++	CloseDraining() []T
++
++	Closed() bool
++
++	TryCloseDraining() ([]T, bool)
+ }
+ 
+ type Receiver[T any] struct {
+@@ -34,35 +56,108 @@ type ChannelInternal[T any] interface {
+ var _ ChannelInternal[struct{}] = (*channel[struct{}])(nil)
+ 
+ func NewChannel[T any]() Channel[T] {
+-	return &channel[T]{
+-		c: make([]T, 0),
+-	}
++	return &channel[T]{}
+ }
+ 
+ func NewBufferedChannel[T any](size int) Channel[T] {
+ 	return &channel[T]{
+-		c:    make([]T, 0),
+ 		size: size,
+ 	}
+ }
+ 
++func NewBufferedChannelWithPolicy[T any](size int, dropOldest bool) Channel[T] {
++	if size < 0 {
++		panic("buffered channel size must be >= 0")
++	}
++
++	return &channel[T]{
++		size:       size,
++		dropOldest: dropOldest,
++	}
++}
++
++type queueItem[T any] struct {
++	buffered bool
++	value    T
++	notify   func()
++}
++
++type sendWaiter struct {
++	notify func()
++}
++
++type receiveWaiter struct {
++	notify func()
++}
++
+ type channel[T any] struct {
+-	c         []T
+-	receivers []*Receiver[T]
+-	senders   []func() T
+-	closed    bool
+-	size      int
++	queue          []*queueItem[T]
++	bufferedN      int
++	receivers      []*Receiver[T]
++	sendWaiters    []*sendWaiter
++	receiveWaiters []*receiveWaiter
++	closed         bool
++	size           int
++	dropOldest     bool
++	dropped        int
++}
++
++func (c *channel[T]) addSendWaiter(w *sendWaiter) {
++	c.sendWaiters = append(c.sendWaiters, w)
++}
++
++func (c *channel[T]) removeSendWaiter(w *sendWaiter) {
++	for i, sw := range c.sendWaiters {
++		if sw == w {
++			c.sendWaiters = append(c.sendWaiters[:i], c.sendWaiters[i+1:]...)
++
++			return
++		}
++	}
++}
++
++func (c *channel[T]) notifySendWaiters() {
++	for _, w := range c.sendWaiters {
++		w.notify()
++	}
++}
++
++func (c *channel[T]) addReceiveWaiter(w *receiveWaiter) {
++	c.receiveWaiters = append(c.receiveWaiters, w)
++}
++
++func (c *channel[T]) removeReceiveWaiter(w *receiveWaiter) {
++	for i, rw := range c.receiveWaiters {
++		if rw == w {
++			c.receiveWaiters = append(c.receiveWaiters[:i], c.receiveWaiters[i+1:]...)
++
++			return
++		}
++	}
++}
++
++func (c *channel[T]) notifyReceiveWaiters() {
++	for _, w := range c.receiveWaiters {
++		w.notify()
++	}
++}
++
++func (c *channel[T]) hasBlockedSenders() bool {
++	return c.hasPending() || len(c.sendWaiters) > 0
+ }
+ 
+ func (c *channel[T]) Len() int {
+-	return len(c.c)
++	return c.bufferedN
+ }
+ 
+ func (c *channel[T]) Close() {
+ 	c.closed = true
++	c.notifyReceiveWaiters()
+ 
+-	// If there are still blocked senders, error
+-	if len(c.senders) > 0 {
++	// If there are still blocked senders, error. A coroutine parked in a Select send case counts
++	// too: closing would leave it polling a channel that can never accept its value again, so it
++	// has to be reported here rather than silently stranded.
++	if c.hasBlockedSenders() {
+ 		panic("send on closed channel")
+ 	}
+ 
+@@ -78,27 +173,51 @@ func (c *channel[T]) Close() {
+ 	}
+ }
+ 
++func (c *channel[T]) hasPending() bool {
++	return len(c.queue) > c.bufferedN
++}
++
+ func (c *channel[T]) Send(ctx Context, v T) {
+ 	cr := getCoState(ctx)
+ 
+-	addedSender := false
++	var item *queueItem[T]
+ 	sentValue := false
+ 
++	// A coroutine torn down by Scheduler.Exit leaves this function through runtime.Goexit, which
++	// runs deferred calls but never returns to the loop below. Drop the value again if it is still
++	// waiting for someone to take it, otherwise it lingers as a phantom blocked send: no coroutine
++	// holds it any more, yet Drain and Peek would keep reporting it and TryCloseDraining would keep
++	// refusing to close on its behalf. An item already flipped to buffered belongs to the channel
++	// rather than to this send, so it stays.
++	defer func() {
++		if item != nil && !item.buffered {
++			c.removeItem(item)
++		}
++	}()
++
+ 	for {
+-		if c.trySend(v) {
++		if item != nil {
++			// Already queued: try to resolve this exact item in place (handed straight to a
++			// waiting receiver, or flipped to buffered once there is room), never by appending a
++			// fresh item and removing this one, which would silently move it behind anything
++			// that arrived after it started waiting.
++			if c.tryResolvePending(item) {
++				cr.MadeProgress()
++				return
++			}
++		} else if c.trySend(v) {
+ 			cr.MadeProgress()
+ 			return
+ 		}
+ 
+-		if !addedSender {
+-			addedSender = true
+-
+-			cb := func() T {
+-				sentValue = true
+-				return v
++		if item == nil {
++			item = &queueItem[T]{
++				value:  v,
++				notify: func() { sentValue = true; cr.MadeProgress() },
+ 			}
+ 
+-			c.senders = append(c.senders, cb)
++			c.queue = append(c.queue, item)
++			c.notifyReceiveWaiters()
+ 		}
+ 
+ 		// No waiting receiver, yield
+@@ -112,8 +231,75 @@ func (c *channel[T]) Send(ctx Context, v T) {
+ 	}
+ }
+ 
++func (c *channel[T]) tryResolvePending(item *queueItem[T]) bool {
++	if c.closed {
++		panic("channel closed")
++	}
++
++	if len(c.receivers) > 0 {
++		r := c.receivers[0]
++		c.receivers[0] = nil
++		c.receivers = c.receivers[1:]
++
++		c.removeItem(item)
++		r.Receive(item.value, true)
++
++		return true
++	}
++
++	if c.hasCapacity() {
++		item.buffered = true
++		c.bufferedN++
++
++		return true
++	}
++
++	return false
++}
++
++func (c *channel[T]) removeItem(item *queueItem[T]) {
++	for i, q := range c.queue {
++		if q == item {
++			if q.buffered {
++				c.bufferedN--
++			}
++
++			c.queue = append(c.queue[:i], c.queue[i+1:]...)
++
++			return
++		}
++	}
++}
++
+ func (c *channel[T]) SendNonblocking(v T) bool {
+-	return c.trySend(v)
++	if c.trySend(v) {
++		return true
++	}
++
++	// A non-blocking send that could not be placed anywhere (no waiting receiver, no capacity,
++	// and not configured to evict) permanently loses the value: there is no caller left to retry
++	// it. Count it the same way as a drop-oldest eviction so callers can observe it either way.
++	c.dropped++
++
++	return false
++}
++
++func (c *channel[T]) SendAllNonblocking(values []T) int {
++	if len(values) == 0 {
++		return 0
++	}
++
++	sent := 0
++
++	for _, v := range values {
++		if !c.SendNonblocking(v) {
++			break
++		}
++
++		sent++
++	}
++
++	return sent
+ }
+ 
+ func (c *channel[T]) Receive(ctx Context) (v T, ok bool) {
+@@ -161,12 +347,8 @@ func (c *channel[T]) ReceiveNonBlocking() (T, bool) {
+ 	return *new(T), false
+ }
+ 
+-func (c *channel[T]) hasValue() bool {
+-	return len(c.c) > 0
+-}
+-
+ func (c *channel[T]) canReceive() bool {
+-	return c.hasValue() || len(c.senders) > 0 || c.closed
++	return len(c.queue) > 0 || c.closed
+ }
+ 
+ func (c *channel[T]) canSend() bool {
+@@ -174,7 +356,7 @@ func (c *channel[T]) canSend() bool {
+ 		return false
+ 	}
+ 
+-	return len(c.receivers) > 0 || c.hasCapacity()
++	return len(c.receivers) > 0 || c.hasCapacity() || c.hasHandoffRoom() || (c.dropOldest && c.size > 0)
+ }
+ 
+ func (c *channel[T]) trySend(v T) bool {
+@@ -195,9 +377,33 @@ func (c *channel[T]) trySend(v T) bool {
+ 		return true
+ 	}
+ 
+-	// No waiting receiver, if we have capacity try to add the value to the buffer
+-	if c.hasCapacity() {
+-		c.c = append(c.c, v)
++	// No waiting receiver, if we have capacity add the value to the queue as a buffered item,
++	// at the back, since it just became available now.
++	if c.hasCapacity() || c.hasHandoffRoom() {
++		c.queue = append(c.queue, &queueItem[T]{buffered: true, value: v})
++		c.bufferedN++
++		c.notifyReceiveWaiters()
++
++		return true
++	}
++
++	// No capacity left. If configured to drop the oldest buffered value instead of blocking,
++	// evict the oldest buffered item (never a still-pending one) to make room for the new one.
++	if c.dropOldest && c.size > 0 {
++		for i, item := range c.queue {
++			if item.buffered {
++				c.queue = append(c.queue[:i], c.queue[i+1:]...)
++				c.bufferedN--
++
++				break
++			}
++		}
++
++		c.queue = append(c.queue, &queueItem[T]{buffered: true, value: v})
++		c.bufferedN++
++		c.dropped++
++		c.notifyReceiveWaiters()
++
+ 		return true
+ 	}
+ 
+@@ -206,35 +412,104 @@ func (c *channel[T]) trySend(v T) bool {
+ }
+ 
+ func (c *channel[T]) tryReceive() (v T, ok bool, rok bool) {
+-	// If channel is buffered, return value if available
+-	if c.hasValue() {
+-		v = c.c[0]
+-		c.c = c.c[1:]
++	// The queue is arrival-ordered across both buffered and still-pending items, so the front
++	// entry is always whichever became available first, regardless of its kind.
++	if len(c.queue) > 0 {
++		item := c.queue[0]
++		c.queue = c.queue[1:]
++
++		if item.buffered {
++			c.bufferedN--
++			c.notifySendWaiters()
++		} else {
++			item.notify()
++		}
+ 
+-		return v, true, true
++		return item.value, true, true
+ 	}
+ 
+-	// If channel has been closed and no values in buffer (if buffered) return zero
+-	// element
++	// If channel has been closed and nothing left in the queue, return zero element
+ 	if c.closed {
+ 		return *new(T), false, true
+ 	}
+ 
+-	// Any blocked senders? If so, receive from the first one
+-	if len(c.senders) > 0 {
+-		s := c.senders[0]
+-		c.senders[0] = nil
+-		c.senders = c.senders[1:]
++	// Could not receive value
++	return v, ok, false
++}
+ 
+-		return s(), true, true
++func (c *channel[T]) Peek() (v T, ok bool) {
++	if len(c.queue) > 0 {
++		return c.queue[0].value, true
+ 	}
+ 
+-	// Could not receive value
+-	return v, ok, false
++	return v, false
++}
++
++func (c *channel[T]) PeekN(n int) []T {
++	if n <= 0 {
++		return nil
++	}
++
++	if n > len(c.queue) {
++		n = len(c.queue)
++	}
++
++	values := make([]T, 0, n)
++
++	for i := 0; i < n; i++ {
++		values = append(values, c.queue[i].value)
++	}
++
++	return values
++}
++
++func (c *channel[T]) PeekAll() []T {
++	return c.PeekN(len(c.queue))
++}
++
++func (c *channel[T]) Cap() int {
++	return c.size
++}
++
++func (c *channel[T]) IsFull() bool {
++	return !c.hasCapacity()
++}
++
++func (c *channel[T]) Drain() []T {
++	values := make([]T, 0, len(c.queue))
++
++	for {
++		v, ok, rok := c.tryReceive()
++		if !rok || !ok {
++			break
++		}
++
++		values = append(values, v)
++	}
++
++	return values
++}
++
++func (c *channel[T]) CloseDraining() []T {
++	values := c.Drain()
++	c.Close()
++	return values
++}
++
++func (c *channel[T]) TryCloseDraining() ([]T, bool) {
++	if c.hasBlockedSenders() {
++		return c.PeekAll(), false
++	}
++
++	return c.CloseDraining(), true
+ }
+ 
+ func (c *channel[T]) hasCapacity() bool {
+-	return len(c.c) < c.size
++	return c.bufferedN < c.size
++}
++
++func (c *channel[T]) hasHandoffRoom() bool {
++	return len(c.receiveWaiters) > 0 && c.bufferedN < c.size+len(c.receiveWaiters)
+ }
+ 
+ func (c *channel[T]) AddReceiveCallback(cb *Receiver[T]) {
+@@ -254,3 +529,7 @@ func (c *channel[T]) RemoveReceiveCallback(cb *Receiver[T]) {
+ func (c *channel[T]) Closed() bool {
+ 	return c.closed
+ }
++
++func (c *channel[T]) DroppedCount() int {
++	return c.dropped
++}
+diff --git a/internal/sync/scheduler.go b/internal/sync/scheduler.go
+index 0e84233..88ac833 100644
+--- a/internal/sync/scheduler.go
++++ b/internal/sync/scheduler.go
+@@ -41,10 +41,23 @@ func (s *Scheduler) Execute() error {
+ 					return err
+ 				}
+ 			} else {
+-				// Determine if coroutine made any progress or if it stayed blocked
++				// Determine if coroutine made any progress or if it stayed blocked.
+ 				allBlocked = allBlocked && !c.Progress()
+ 			}
+ 		}
++
++		if allBlocked {
++			// A coroutine can be credited with progress by a LATER coroutine in this same pass,
++			// for example when a direct Drain accepts the value a blocked sender was holding.
++			// That happens after this pass already read the sender's flag, so take a second look
++			// before concluding that nothing can advance.
++			for _, c := range s.coroutines {
++				if c.Progress() {
++					allBlocked = false
++					break
++				}
++			}
++		}
+ 	}
+ 
+ 	return nil
+diff --git a/internal/sync/selector.go b/internal/sync/selector.go
+index 6a5b242..4ff1880 100644
+--- a/internal/sync/selector.go
++++ b/internal/sync/selector.go
+@@ -33,6 +33,13 @@ func Default(handler func(ctx Context)) SelectCase {
+ 	}
+ }
+ 
++func Drain[T any](c Channel[T], handler func(ctx Context, values []T)) SelectCase {
++	return &channelDrainCase[T]{
++		c:  c.(*channel[T]),
++		fn: handler,
++	}
++}
++
+ func Select(ctx Context, cases ...SelectCase) {
+ 	cs := getCoState(ctx)
+ 
+@@ -46,7 +53,96 @@ func Select(ctx Context, cases ...SelectCase) {
+ 		}
+ 
+ 		// else, yield and wait for result
+-		cs.Yield()
++		yieldWaitingToSend(cs, cases)
++	}
++}
++
++type sendWaiterCase interface {
++	registerSendWaiter(cs *coState) func()
++}
++
++type receiveWaiterCase interface {
++	registerReceiveWaiter(cs *coState) func()
++}
++
++func yieldWaitingToSend(cs *coState, cases []SelectCase) {
++	unregisterSends := registerSendWaiters(cs, cases)
++	defer unregisterSends()
++
++	unregisterReceives := registerReceiveWaiters(cs, cases)
++	defer unregisterReceives()
++
++	cs.Yield()
++}
++
++func registerReceiveWaiters(cs *coState, cases []SelectCase) func() {
++	unregisters := make([]func(), 0, len(cases))
++
++	for _, c := range cases {
++		if rw, ok := c.(receiveWaiterCase); ok {
++			unregisters = append(unregisters, rw.registerReceiveWaiter(cs))
++		}
++	}
++
++	return func() {
++		for _, u := range unregisters {
++			u()
++		}
++	}
++}
++
++func registerSendWaiters(cs *coState, cases []SelectCase) func() {
++	unregisters := make([]func(), 0, len(cases))
++
++	for _, c := range cases {
++		if sw, ok := c.(sendWaiterCase); ok {
++			unregisters = append(unregisters, sw.registerSendWaiter(cs))
++		}
++	}
++
++	return func() {
++		for _, u := range unregisters {
++			u()
++		}
++	}
++}
++
++func SelectAll(ctx Context, cases ...SelectCase) int {
++	cs := getCoState(ctx)
++
++	for {
++		handled := 0
++
++		// A Default case is always ready, so it cannot be handled inline without pre-empting the
++		// non-default cases that come after it. Hold every default aside in its given order and
++		// fall back to the whole set only once nothing else turned out to be ready.
++		deferredDefaults := make([]SelectCase, 0, len(cases))
++
++		for _, c := range cases {
++			if _, isDefault := c.(*defaultCase); isDefault {
++				deferredDefaults = append(deferredDefaults, c)
++				continue
++			}
++
++			if c.Ready() {
++				c.Handle(ctx)
++				handled++
++			}
++		}
++
++		if handled > 0 {
++			return handled
++		}
++
++		if len(deferredDefaults) > 0 {
++			for _, c := range deferredDefaults {
++				c.Handle(ctx)
++			}
++
++			return len(deferredDefaults)
++		}
++
++		yieldWaitingToSend(cs, cases)
+ 	}
+ }
+ 
+@@ -92,6 +188,15 @@ func (csc *channelSendCase[T]) Handle(ctx Context) {
+ 	csc.fn(ctx)
+ }
+ 
++func (csc *channelSendCase[T]) registerSendWaiter(cs *coState) func() {
++	w := &sendWaiter{notify: cs.MadeProgress}
++	csc.c.addSendWaiter(w)
++
++	return func() {
++		csc.c.removeSendWaiter(w)
++	}
++}
++
+ type defaultCase struct {
+ 	fn func(Context)
+ }
+@@ -103,3 +208,30 @@ func (dc *defaultCase) Ready() bool {
+ func (dc *defaultCase) Handle(ctx Context) {
+ 	dc.fn(ctx)
+ }
++
++type channelDrainCase[T any] struct {
++	c  *channel[T]
++	fn func(Context, []T)
++}
++
++func (cdc *channelDrainCase[T]) Ready() bool {
++	return cdc.c.canReceive()
++}
++
++func (cdc *channelDrainCase[T]) registerReceiveWaiter(cs *coState) func() {
++	w := &receiveWaiter{notify: cs.MadeProgress}
++	cdc.c.addReceiveWaiter(w)
++
++	return func() { cdc.c.removeReceiveWaiter(w) }
++}
++
++func (cdc *channelDrainCase[T]) Handle(ctx Context) {
++	// Draining resolves every blocked sender it consumed from, exactly as Receive does, so the
++	// scheduler has to see progress here. Without it those senders never get another pass to
++	// return from Send and the workflow stalls with no event left to wake it.
++	values := cdc.c.Drain()
++
++	getCoState(ctx).MadeProgress()
++
++	cdc.fn(ctx, values)
++}
+diff --git a/internal/workflowstate/signalchannels.go b/internal/workflowstate/signalchannels.go
+index dfe8f27..474d128 100644
+--- a/internal/workflowstate/signalchannels.go
++++ b/internal/workflowstate/signalchannels.go
+@@ -6,11 +6,10 @@ import (
+ 	"github.com/cschleiden/go-workflows/internal/sync"
+ )
+ 
+-func ReceiveSignal(wf *WfState, name string, arg payload.Payload) {
++func ReceiveSignal(wf *WfState, name string, arg payload.Payload) bool {
+ 	sc, ok := wf.signalChannels[name]
+ 	if ok {
+-		sc.receive(arg)
+-		return
++		return sc.receive(arg)
+ 	}
+ 
+ 	ps, ok := wf.pendingSignals[name]
+@@ -20,23 +19,33 @@ func ReceiveSignal(wf *WfState, name string, arg payload.Payload) {
+ 	}
+ 
+ 	wf.pendingSignals[name] = append(ps, arg)
++
++	return true
+ }
+ 
+-func GetSignalChannel[T any](ctx sync.Context, wf *WfState, name string) sync.Channel[T] {
++// DefaultSignalChannelCapacity is the buffered capacity a signal channel is given when the caller
++// does not request a specific one.
++const DefaultSignalChannelCapacity = 100
++
++func GetSignalChannel[T any](ctx sync.Context, wf *WfState, name string, capacity int, dropOldest bool) sync.Channel[T] {
+ 	// Check for existing channel, if exists return
+ 	sc, ok := wf.signalChannels[name]
+ 	if ok {
+ 		return sc.channel.(sync.Channel[T])
+ 	}
+ 
++	if capacity < 0 {
++		panic("signal channel capacity must be >= 0")
++	}
++
+ 	// Otherwise, create new channel
+-	c := sync.NewBufferedChannel[T](100)
++	c := sync.NewBufferedChannelWithPolicy[T](capacity, dropOldest)
+ 
+ 	converter := contextvalue.Converter(ctx)
+ 
+ 	// Add channel to map
+ 	wf.signalChannels[name] = &signalChannel{
+-		receive: func(input payload.Payload) {
++		receive: func(input payload.Payload) bool {
+ 			var t T
+ 			if err := converter.From(input, &t); err != nil {
+ 				panic(err)
+@@ -44,23 +53,36 @@ func GetSignalChannel[T any](ctx sync.Context, wf *WfState, name string) sync.Ch
+ 
+ 			// Channel is buffered, so we can just send without waiting and potentially
+ 			// blocking on a Yield.
+-			c.SendNonblocking(t)
++			return c.SendNonblocking(t)
+ 		},
+ 		channel: c,
+ 	}
+ 
+-	// Check for any pending signals, if there are, send to the channel in reverse order
++	// Check for any pending signals; if there are, replay them into the channel in the order
++	// they were originally delivered. Materializing the backlog is nonblocking delivery, exactly
++	// like a live signal arriving: this call must be able to return the channel before the
++	// workflow has any chance to drain or receive from it, so a backlog larger than capacity is
++	// subject to the same overflow policy a live delivery would be, not a blocking wait.
+ 	pendingSignals, ok := wf.pendingSignals[name]
+ 	if ok {
+-		for i := len(pendingSignals) - 1; i >= 0; i-- {
+-			payload := pendingSignals[i]
++		droppedBefore := c.DroppedCount()
+ 
++		for _, payload := range pendingSignals {
+ 			var s T
+ 			if err := converter.From(payload, &s); err != nil {
+ 				panic(err)
+ 			}
+ 
+-			c.Send(ctx, s)
++			c.SendNonblocking(s)
++		}
++
++		if dropped := c.DroppedCount() - droppedBefore; dropped > 0 {
++			msg := "signal backlog exceeded channel capacity, newest signals dropped"
++			if dropOldest {
++				msg = "signal backlog exceeded channel capacity, oldest signals evicted"
++			}
++
++			wf.Logger().Warn(msg, "name", name, "dropped", dropped)
+ 		}
+ 
+ 		delete(wf.pendingSignals, name)
+diff --git a/internal/workflowstate/workflowstate.go b/internal/workflowstate/workflowstate.go
+index 5e6b0c7..3a98c95 100644
+--- a/internal/workflowstate/workflowstate.go
++++ b/internal/workflowstate/workflowstate.go
+@@ -3,6 +3,7 @@ package workflowstate
+ import (
+ 	"fmt"
+ 	"log/slog"
++	"sort"
+ 	"time"
+ 
+ 	"github.com/benbjohnson/clock"
+@@ -49,7 +50,7 @@ func AsDecodingSettable[T any](cv converter.Converter, name string, f sync.Setta
+ }
+ 
+ type signalChannel struct {
+-	receive func(payload.Payload)
++	receive func(payload.Payload) bool
+ 	channel interface{}
+ }
+ 
+@@ -173,6 +174,30 @@ func (wf *WfState) Logger() *slog.Logger {
+ 	return wf.logger
+ }
+ 
++func (wf *WfState) PendingSignalNames() []string {
++	names := make([]string, 0, len(wf.pendingSignals))
++	for name := range wf.pendingSignals {
++		names = append(names, name)
++	}
++
++	sort.Strings(names)
++
++	return names
++}
++
++func (wf *WfState) SignalChannelDroppedCount(name string) int {
++	sc, ok := wf.signalChannels[name]
++	if !ok {
++		return 0
++	}
++
++	if dc, ok := sc.channel.(interface{ DroppedCount() int }); ok {
++		return dc.DroppedCount()
++	}
++
++	return 0
++}
++
+ // UpdateLoggerWithSpan updates the logger to include trace_id and span_id attributes
+ // from the given span context.
+ func (wf *WfState) UpdateLoggerWithSpan(sc trace.SpanContext) {
+diff --git a/workflow/channel.go b/workflow/channel.go
+index b4a299c..cc6a6b8 100644
+--- a/workflow/channel.go
++++ b/workflow/channel.go
+@@ -10,6 +10,10 @@ type Channel[T any] interface {
+ 	// value could be sent. If the channel is closed, this will panic
+ 	SendNonblocking(v T) (ok bool)
+ 
++	// SendAllNonblocking sends as many of the given values as fit, in order, stopping at the first one that
++	// does not, and returns how many were sent.
++	SendAllNonblocking(values []T) (sent int)
++
+ 	// Receive receives a value from the channel.
+ 	Receive(ctx Context) (v T, ok bool)
+ 
+@@ -22,8 +26,52 @@ type Channel[T any] interface {
+ 
+ 	// Len returns the number of elements currently in the channel.
+ 	Len() int
++
++	// Drain removes and returns every value currently available from the channel, including values held by
++	// coroutines blocked sending to it, in the order they became available.
++	Drain() []T
++
++	// Peek returns the next value Drain would return, without removing it. The second return value is false
++	// if no value is currently available.
++	Peek() (v T, ok bool)
++
++	// DroppedCount returns the number of values the channel has lost to its overflow policy.
++	DroppedCount() int
++
++	// PeekN returns up to n of the next values Drain would return, without removing any of them.
++	PeekN(n int) []T
++
++	// PeekAll returns every value Drain would return, without removing any of them.
++	PeekAll() []T
++
++	// Cap returns the channel's buffered capacity. Unbuffered channels report 0.
++	Cap() int
++
++	// IsFull reports whether the channel's buffer is at capacity. Unbuffered channels are always full.
++	IsFull() bool
++
++	// CloseDraining closes the channel and returns every value that was still available.
++	CloseDraining() []T
++
++	// Closed reports whether the channel has been closed.
++	Closed() bool
++
++	// TryCloseDraining closes the channel and returns every remaining value plus true, unless a coroutine is
++	// still blocked sending, in which case it changes nothing and returns the remaining values plus false.
++	TryCloseDraining() ([]T, bool)
+ }
+ 
++// OverflowPolicy determines what happens when a value is sent to a buffered channel that is already full.
++type OverflowPolicy int
++
++const (
++	// OverflowBlock waits for room. Send blocks the calling coroutine; SendNonblocking fails and the value is lost.
++	OverflowBlock OverflowPolicy = iota
++
++	// OverflowDropOldest evicts the oldest buffered value to make room for the new one.
++	OverflowDropOldest
++)
++
+ // NewChannel creates a new channel.
+ func NewChannel[T any]() Channel[T] {
+ 	return sync.NewChannel[T]()
+@@ -33,3 +81,26 @@ func NewChannel[T any]() Channel[T] {
+ func NewBufferedChannel[T any](size int) Channel[T] {
+ 	return sync.NewBufferedChannel[T](size)
+ }
++
++// NewBufferedChannelWithPolicy creates a new buffered channel with the given size and overflow policy.
++func NewBufferedChannelWithPolicy[T any](size int, policy OverflowPolicy) Channel[T] {
++	return sync.NewBufferedChannelWithPolicy[T](size, policy == OverflowDropOldest)
++}
++
++// DrainAll drains every given channel in order and returns all values combined.
++func DrainAll[T any](channels ...Channel[T]) []T {
++	values := make([]T, 0, len(channels))
++	for _, c := range channels {
++		values = append(values, c.Drain()...)
++	}
++	return values
++}
++
++// PeekAllChannels returns every value DrainAll would return, without removing any of them.
++func PeekAllChannels[T any](channels ...Channel[T]) []T {
++	values := make([]T, 0, len(channels))
++	for _, c := range channels {
++		values = append(values, c.PeekAll()...)
++	}
++	return values
++}
+diff --git a/workflow/executor/executor.go b/workflow/executor/executor.go
+index 5441a89..8270fbb 100644
+--- a/workflow/executor/executor.go
++++ b/workflow/executor/executor.go
+@@ -717,7 +717,9 @@ func (e *executor) handleSubWorkflowCompleted(event *history.Event, a *history.S
+ 
+ func (e *executor) handleSignalReceived(event *history.Event, a *history.SignalReceivedAttributes) error {
+ 	// Send signal to workflow channel
+-	workflowstate.ReceiveSignal(e.workflowState, a.Name, a.Arg)
++	if delivered := workflowstate.ReceiveSignal(e.workflowState, a.Name, a.Arg); !delivered {
++		e.workflowState.Logger().Warn("signal channel at capacity, signal dropped", log.SignalNameKey, a.Name)
++	}
+ 
+ 	return e.workflow.Continue()
+ }
+diff --git a/workflow/select.go b/workflow/select.go
+index 725bce2..642f18d 100644
+--- a/workflow/select.go
++++ b/workflow/select.go
+@@ -31,3 +31,17 @@ func Send[T any](c Channel[T], value *T, handler func(ctx Context)) SelectCase {
+ func Default(handler func(Context)) SelectCase {
+ 	return sync.Default(handler)
+ }
++
++// Drain calls the provided handler with every value currently available from the channel. It is ready
++// under the same condition as Receive on the same channel.
++func Drain[T any](c Channel[T], handler func(ctx Context, values []T)) SelectCase {
++	return sync.Drain(c, func(ctx sync.Context, values []T) {
++		handler(ctx, values)
++	})
++}
++
++// SelectAll handles every case that is ready when it is reached, in the order the cases were given, and
++// returns how many were handled. Default cases fire only if none of the others were ready.
++func SelectAll(ctx Context, cases ...SelectCase) int {
++	return sync.SelectAll(ctx, cases...)
++}
+diff --git a/workflow/signal.go b/workflow/signal.go
+index fe06dcd..6dea68b 100644
+--- a/workflow/signal.go
++++ b/workflow/signal.go
+@@ -9,10 +9,71 @@ import (
+ 	"go.opentelemetry.io/otel/trace"
+ )
+ 
++// SignalChannelOption configures a signal channel created by NewSignalChannel.
++type SignalChannelOption func(*signalChannelOptions)
++
++type signalChannelOptions struct {
++	capacity    int
++	capacitySet bool
++	policy      OverflowPolicy
++}
++
++// WithSignalChannelCapacity sets the buffered capacity of the created signal channel. A capacity of 0
++// creates an unbuffered channel; omitting this option uses a default capacity.
++func WithSignalChannelCapacity(capacity int) SignalChannelOption {
++	return func(o *signalChannelOptions) {
++		o.capacity = capacity
++		o.capacitySet = true
++	}
++}
++
++// WithSignalChannelOverflowPolicy sets the overflow policy for a signal channel at capacity.
++// The default policy is OverflowBlock.
++func WithSignalChannelOverflowPolicy(policy OverflowPolicy) SignalChannelOption {
++	return func(o *signalChannelOptions) {
++		o.policy = policy
++	}
++}
++
+ // NewSignalChannel returns a new signal channel.
+-func NewSignalChannel[T any](ctx Context, name string) Channel[T] {
++func NewSignalChannel[T any](ctx Context, name string, opts ...SignalChannelOption) Channel[T] {
++	o := &signalChannelOptions{}
++	for _, opt := range opts {
++		opt(o)
++	}
++
++	capacity := o.capacity
++	if !o.capacitySet {
++		capacity = workflowstate.DefaultSignalChannelCapacity
++	}
++
+ 	wfState := workflowstate.WorkflowState(ctx)
+-	return workflowstate.GetSignalChannel[T](ctx, wfState, name)
++	return workflowstate.GetSignalChannel[T](ctx, wfState, name, capacity, o.policy == OverflowDropOldest)
++}
++
++// SignalChannelDroppedCount returns the number of signals dropped for the named signal channel, or 0 if
++// no such channel has been created yet.
++func SignalChannelDroppedCount(ctx Context, name string) int {
++	wfState := workflowstate.WorkflowState(ctx)
++	return wfState.SignalChannelDroppedCount(name)
++}
++
++// PendingSignalNames returns the names of signals delivered to this workflow with no channel created for
++// them yet.
++func PendingSignalNames(ctx Context) []string {
++	wfState := workflowstate.WorkflowState(ctx)
++	return wfState.PendingSignalNames()
++}
++
++// HasPendingSignal reports whether the given name is among PendingSignalNames.
++func HasPendingSignal(ctx Context, name string) bool {
++	for _, n := range PendingSignalNames(ctx) {
++		if n == name {
++			return true
++		}
++	}
++
++	return false
+ }
+ 
+ // SignalWorkflow sends a signal to another running workflow instance.

@@ -1,0 +1,1032 @@
+diff --git a/control/__init__.py b/control/__init__.py
+index d2929c79..95b26064 100644
+--- a/control/__init__.py
++++ b/control/__init__.py
+@@ -70,6 +70,7 @@ from .delay import *
+ from .descfcn import *
+ from .dtime import *
+ from .freqplot import *
++from .loopan import *
+ from .margins import *
+ from .mateqn import *
+ from .modelsimp import *
+diff --git a/control/loopan.py b/control/loopan.py
+new file mode 100644
+index 00000000..338bd875
+--- /dev/null
++++ b/control/loopan.py
+@@ -0,0 +1,782 @@
++# loopan.py - analysis points and loop transfer analysis
++#
++# Functions for breaking the loops of an interconnected system at named
++# analysis points and for computing the transfer functions that the opened
++# loops define.
++
++"""Analysis points and loop transfer analysis."""
++
++import numpy as np
++
++from . import config
++from .exception import ControlArgument
++
++__all__ = ['analysis_point', 'open_loop', 'close_loop', 'loop_transfer',
++           'sensitivity', 'complementary_sensitivity', 'io_transfer',
++           'replace_point']
++
++
++def analysis_point(name, size=1):
++    """Create a block that marks a location in a block diagram.
++
++    The block passes its input straight through to its output and carries
++    the same signal name on both sides, so that placing it in the system
++    list of an `interconnect` call declares an analysis point on the signal
++    it is named after.
++
++    Parameters
++    ----------
++    name : str
++        Name of the block, of the signal it carries, and of the analysis
++        point it declares.
++    size : int, optional
++        Number of channels the block carries.  The default is 1.
++
++    Returns
++    -------
++    StateSpace
++        Static system whose input and output are both named `name`.
++
++    See Also
++    --------
++    interconnect, open_loop, loop_transfer
++
++    """
++    from .statesp import StateSpace
++
++    if not isinstance(size, (int, np.integer)) or size < 1:
++        raise ControlArgument("size must be a positive integer")
++    labels = [name] if size == 1 else [f"{name}[{i}]" for i in range(size)]
++    block = StateSpace(
++        [], [], [], np.eye(size), None, inputs=list(labels),
++        outputs=list(labels), name=name)
++    block._analysis_point = True
++    return block
++
++
++def _points_of(sys):
++    """Return the analysis point dictionary of an interconnected system."""
++    from .nlsys import InterconnectedSystem
++
++    if not isinstance(sys, InterconnectedSystem):
++        raise TypeError(
++            "system must be an interconnected system with analysis points")
++    return sys.analysis_points
++
++
++def _channels(sys, points):
++    """Expand a point specification into channels.
++
++    Returns a list of tuples ``(name, offset, size, kind, index)`` where
++    `kind` is 'output' or 'input' and `index` is the index of the subsystem
++    signal of that kind carrying the channel.
++
++    """
++    available = _points_of(sys)
++    if points is None:
++        names = list(available.keys())
++    elif isinstance(points, (str, tuple)):
++        names = [points]
++    else:
++        names = list(points)
++
++    channels, seen = [], set()
++    for entry in names:
++        name = entry if isinstance(entry, str) else _canonical(sys, entry)
++        if name in seen:
++            raise ControlArgument(f"duplicate analysis point '{name}'")
++        seen.add(name)
++        if name in available:
++            kind, indices = available[name]
++        else:
++            kind, indices = _undeclared(sys, name)
++        for offset, index in enumerate(indices):
++            channels.append((name, offset, len(indices), kind, index))
++    return channels
++
++
++def _default_names(sys, points):
++    """Name the points explicitly, so a later call cannot widen the set."""
++    if points is None:
++        return list(_points_of(sys).keys())
++    if isinstance(points, (str, tuple)):
++        return [points]
++    return list(points)
++
++
++def _canonical(sys, spec):
++    """Spell a subsystem signal specification the way its string form reads."""
++    if isinstance(spec, str):
++        return spec
++    if not isinstance(spec, tuple) or len(spec) not in (2, 3):
++        raise ControlArgument(f"unrecognized analysis point '{spec}'")
++    if len(spec) == 3:
++        raise ControlArgument("gain not allowed in spec '%s'" % str(spec))
++    subsys, signal = spec
++    if isinstance(subsys, (int, np.integer)):
++        subsys = sys.syslist[int(subsys)].name
++    entry = sys.syslist[sys.syslist_index[subsys]]
++    if isinstance(signal, (int, np.integer)):
++        labels = entry.output_labels
++        if int(signal) >= len(labels):
++            labels = entry.input_labels
++        signal = labels[int(signal)]
++    return f"{subsys}.{signal}"
++
++
++def _undeclared(sys, name):
++    """Resolve a name that is a subsystem signal rather than a point."""
++    try:
++        kind, indices, _ = sys._parse_analysis_point_spec(name)
++    except (ValueError, TypeError, AttributeError):
++        raise ControlArgument(f"unknown analysis point '{name}'")
++    return kind, indices
++
++
++def _channel_label(name, offset, size, suffix):
++    """Build the signal label for one channel of an analysis point."""
++    name = name.replace('.', config.defaults['iosys.state_name_delim'])
++    if size == 1:
++        return name + suffix
++    return name + suffix + f"[{offset}]"
++
++
++def _rebuild(sys, connect_map, input_map, output_map, inputs, outputs,
++             name, points, syslist=None):
++    """Build an interconnected system from explicit connection maps."""
++    from .nlsys import InterconnectedSystem
++    from .statesp import LinearICSystem, StateSpace
++
++    newsys = InterconnectedSystem(
++        sys.syslist if syslist is None else syslist, connections=False,
++        inplist=[], outlist=[], inputs=inputs, outputs=outputs,
++        params=sys.params, name=name, dt=sys.dt)
++    newsys.connect_map = connect_map
++    newsys.input_map = input_map
++    newsys.output_map = output_map
++    newsys.analysis_points = points
++    newsys.connection_type = sys.connection_type
++
++    if isinstance(sys, StateSpace):
++        return LinearICSystem(newsys, connection_type=sys.connection_type)
++    return newsys
++
++
++def open_loop(sys, points=None, name=None):
++    """Break the loops of an interconnected system at analysis points.
++
++    Return a copy of `sys` in which every internal connection fed by the
++    signal of an opened analysis point has been removed.  The destinations
++    of those connections are driven instead by new injection inputs, added
++    after the inputs of `sys`, and the signal of each point is reported by
++    new measurement outputs, added after the outputs of `sys`.
++
++    Parameters
++    ----------
++    sys : InterconnectedSystem
++        System containing the analysis points, as returned by
++        `interconnect`.
++    points : str or list of str, optional
++        Names of the analysis points to open.  Defaults to every analysis
++        point of the system, in declaration order.
++    name : string, optional
++        Name of the returned system.
++
++    Returns
++    -------
++    InterconnectedSystem
++        Interconnection with the requested loops opened.  The type matches
++        the type of `sys`.
++
++    See Also
++    --------
++    interconnect, loop_transfer, io_transfer
++
++    """
++    channels = _channels(sys, points)
++    located = {(kind, index) for _, _, _, kind, index in channels}
++    if len(located) != len(channels):
++        raise ControlArgument(
++            "the same location was named by more than one analysis point")
++    return _open_channels(sys, channels, name)
++
++
++def _open_channels(sys, channels, name):
++    """Break the loops at already resolved channels.
++
++    Aliases of one location are legal until a caller asks to open them
++    together, so the check for that belongs to `open_loop` rather than here.
++
++    """
++    opened = {label for label, _, _, _, _ in channels}
++
++    connect_map = np.array(sys.connect_map, copy=True)
++    ninputs, noutputs = sys.ninputs, sys.noutputs
++    nsuboutputs = connect_map.shape[1]
++    nchannels = len(channels)
++
++    input_map = np.hstack(
++        [sys.input_map, np.zeros((sys.input_map.shape[0], nchannels))])
++    output_map = np.vstack(
++        [sys.output_map, np.zeros((nchannels, sys.output_map.shape[1]))])
++
++    inputs = list(sys.input_labels)
++    outputs = list(sys.output_labels)
++    declared = _points_of(sys)
++    reclose = {}
++
++    def owner_of(kind, index):
++        for name, (point_kind, indices) in declared.items():
++            if point_kind == kind and index in indices:
++                return name
++        return None
++
++    # Every point is resolved against the wiring as it was, so that opening
++    # one point cannot hide the connections another point is meant to break
++    origin = np.array(sys.connect_map, copy=True)
++
++    for column, (label, offset, size, kind, index) in enumerate(channels):
++        if kind == 'output':
++            for row in np.nonzero(origin[:, index])[0]:
++                input_map[row, ninputs + column] = origin[row, index]
++                connect_map[row, index] = 0
++            output_map[noutputs + column, index] = 1
++        else:
++            output_map[noutputs + column, :nsuboutputs] = origin[index]
++            connect_map[index] = 0
++            input_map[index, ninputs + column] = 1
++        inputs.append(_channel_label(label, offset, size, '_inj'))
++        outputs.append(_channel_label(label, offset, size, '_meas'))
++        reclose.setdefault(label, (kind, owner_of(kind, index), []))[2].append(
++            (ninputs + column, noutputs + column, index))
++
++    retired = opened | {owner for _, owner, _ in reclose.values()
++                        if owner is not None}
++    points = {key: value for key, value in declared.items()
++              if key not in retired}
++    result = _rebuild(sys, connect_map, input_map, output_map, inputs,
++                      outputs, name, points)
++    result.opened_points = reclose
++    return result
++
++
++def close_loop(sys, points=None, name=None):
++    """Reconnect the loops that `open_loop` broke.
++
++    Every injection input of a reconnected point is driven by the
++    measurement output it was taken from, both channels are dropped, and
++    the point is declared again on the signal it came from.
++
++    Parameters
++    ----------
++    sys : InterconnectedSystem
++        System returned by `open_loop`.
++    points : str or list of str, optional
++        Names of the points to reconnect.  Defaults to every point that
++        `open_loop` broke.
++    name : string, optional
++        Name of the returned system.
++
++    Returns
++    -------
++    InterconnectedSystem
++        Interconnection with those loops closed again.
++
++    See Also
++    --------
++    open_loop, interconnect
++
++    """
++    _points_of(sys)
++    available = getattr(sys, 'opened_points', {})
++    if points is None:
++        names = list(available.keys())
++    elif isinstance(points, (str, tuple)):
++        names = [points]
++    else:
++        names = list(points)
++    names = [name if isinstance(name, str) else _canonical(sys, name)
++             for name in names]
++    if len(set(names)) != len(names):
++        raise ControlArgument("an analysis point was named more than once")
++
++    connect_map = np.array(sys.connect_map, copy=True)
++    nsuboutputs = connect_map.shape[1]
++    dropped_in, dropped_out = [], []
++    points_out = dict(_points_of(sys))
++
++    for label in names:
++        if label not in available:
++            raise ControlArgument(f"'{label}' is not an opened point")
++        kind, owner, entries = available[label]
++        indices = []
++        for column, row, index in entries:
++            branches = np.nonzero(sys.input_map[:, column])[0]
++            if kind == 'output':
++                for branch in branches:
++                    connect_map[branch, index] = sys.input_map[branch, column]
++            else:
++                connect_map[index] = sys.output_map[row, :nsuboutputs]
++            dropped_in.append(column)
++            dropped_out.append(row)
++            indices.append(index)
++        if owner is not None:
++            points_out[owner] = (kind, indices)
++
++    keep_in = [i for i in range(sys.ninputs) if i not in dropped_in]
++    keep_out = [i for i in range(sys.noutputs) if i not in dropped_out]
++    result = _rebuild(
++        sys, connect_map, sys.input_map[:, keep_in],
++        sys.output_map[keep_out, :],
++        [sys.input_labels[i] for i in keep_in],
++        [sys.output_labels[i] for i in keep_out], name, points_out)
++    renumber_in = {old: new for new, old in enumerate(keep_in)}
++    renumber_out = {old: new for new, old in enumerate(keep_out)}
++    result.opened_points = {
++        key: (kind, owner,
++              [(renumber_in[column], renumber_out[row], index)
++               for column, row, index in entries])
++        for key, (kind, owner, entries) in available.items()
++        if key not in names}
++    return result
++
++
++def loop_transfer(sys, points=None, openings=None, name=None):
++    """Loop transfer function at one or more analysis points.
++
++    The loop transfer function is the transfer function from the injection
++    inputs to the measurement outputs of `open_loop`, taken with the
++    remaining loops closed and the inputs of `sys` held at zero.
++
++    Parameters
++    ----------
++    sys : InterconnectedSystem
++        Linear interconnection containing the analysis points.
++    points : str or list of str, optional
++        Names of the analysis points at which the loops are opened.
++        Defaults to every analysis point of the system.
++    openings : str or list of str, optional
++        Names of further analysis points whose loops are broken before the
++        transfer function is taken.  Defaults to leaving them closed.
++    name : string, optional
++        Name of the returned system.
++
++    Returns
++    -------
++    StateSpace
++        Square system whose inputs are the injection signals and whose
++        outputs are the measurement signals.
++
++    See Also
++    --------
++    open_loop, sensitivity, complementary_sensitivity
++
++    """
++    from .statesp import StateSpace
++
++    if not isinstance(sys, StateSpace):
++        raise TypeError("loop analysis requires a linear interconnection")
++
++    nchannels = len(_channels(sys, points))
++    base = sys if openings is None else open_loop(sys, openings)
++    opened = open_loop(base, _default_names(sys, points))
++    xfer = opened[base.noutputs:, base.ninputs:]
++    if name is not None:
++        xfer.name = name
++    if nchannels == 0:
++        return StateSpace(
++            np.zeros((0, 0)), np.zeros((0, 0)), np.zeros((0, 0)),
++            np.zeros((0, 0)), sys.dt, name=xfer.name)
++    return xfer
++
++
++def sensitivity(sys, points=None, openings=None, name=None):
++    """Sensitivity function at one or more analysis points.
++
++    The sensitivity function is ``S = (I - L)**-1``, where `L` is the loop
++    transfer function returned by `loop_transfer`.  The minus sign follows
++    from closing the loop, which sets the injection signal equal to the
++    measurement signal.
++
++    Parameters
++    ----------
++    sys : InterconnectedSystem
++        Linear interconnection containing the analysis points.
++    points : str or list of str, optional
++        Names of the analysis points at which the loops are opened.
++        Defaults to every analysis point of the system.
++    openings : str or list of str, optional
++        Names of further analysis points whose loops are broken before the
++        transfer function is taken.  Defaults to leaving them closed.
++    name : string, optional
++        Name of the returned system.
++
++    Returns
++    -------
++    StateSpace
++        Square system carrying the input and output labels of the loop
++        transfer function.
++
++    See Also
++    --------
++    loop_transfer, complementary_sensitivity
++
++    """
++    xfer = loop_transfer(sys, points, openings)
++    result = (np.eye(xfer.ninputs) - xfer)**-1
++    return _relabel(result, xfer, name)
++
++
++def complementary_sensitivity(sys, points=None, openings=None, name=None):
++    """Complementary sensitivity function at one or more analysis points.
++
++    The complementary sensitivity function is ``T = I - S``, where `S` is
++    the sensitivity function returned by `sensitivity`.
++
++    Parameters
++    ----------
++    sys : InterconnectedSystem
++        Linear interconnection containing the analysis points.
++    points : str or list of str, optional
++        Names of the analysis points at which the loops are opened.
++        Defaults to every analysis point of the system.
++    openings : str or list of str, optional
++        Names of further analysis points whose loops are broken before the
++        transfer function is taken.  Defaults to leaving them closed.
++    name : string, optional
++        Name of the returned system.
++
++    Returns
++    -------
++    StateSpace
++        Square system carrying the input and output labels of the loop
++        transfer function.
++
++    See Also
++    --------
++    loop_transfer, sensitivity
++
++    """
++    xfer = loop_transfer(sys, points, openings)
++    result = np.eye(xfer.ninputs) - (np.eye(xfer.ninputs) - xfer)**-1
++    return _relabel(result, xfer, name)
++
++
++def _relabel(result, xfer, name):
++    """Copy the labels of a loop transfer function onto a derived system."""
++    result.update_names(
++        inputs=list(xfer.input_labels), outputs=list(xfer.output_labels))
++    if name is not None:
++        result.name = name
++    return result
++
++
++def _resolve_signals(labels, spec, signame):
++    """Turn a signal selection into a list of indices."""
++    if spec is None:
++        return list(range(len(labels)))
++    if isinstance(spec, (str, int)):
++        spec = [spec]
++    indices = []
++    for entry in spec:
++        if isinstance(entry, (int, np.integer)):
++            if entry < -len(labels) or entry >= len(labels):
++                raise ControlArgument(
++                    f"{signame} index {entry} is out of range")
++            indices.append(int(entry) % len(labels))
++        elif isinstance(entry, str):
++            if entry not in labels:
++                raise ControlArgument(f"unknown {signame} '{entry}'")
++            indices.append(labels.index(entry))
++        else:
++            raise ControlArgument(
++                f"unrecognized {signame} specification '{entry}'")
++    return indices
++
++
++def io_transfer(sys, inputs=None, outputs=None, opened=None, name=None):
++    """Transfer function between the signals of an interconnected system.
++
++    Compute the transfer function from selected inputs of `sys` to selected
++    outputs of `sys`, with the loops at the analysis points listed in
++    `opened` broken and their injection signals held at zero.  The loops at
++    every other analysis point stay closed.
++
++    Parameters
++    ----------
++    sys : InterconnectedSystem
++        Linear interconnection containing the analysis points.
++    inputs : str, int, or list, optional
++        Inputs to use, given by label or by index, or the name of a
++        subsystem input, which then gains an external input adding to
++        whatever already drives it.  Defaults to every input of `sys`.
++    outputs : str, int, or list, optional
++        Outputs to use, given by label or by index, or the name of a
++        subsystem output, which is then reported as an extra output.
++        Defaults to every output of `sys`.
++    opened : str or list of str, optional
++        Names of the analysis points whose loops are broken.  Defaults to
++        leaving every loop closed.
++    name : string, optional
++        Name of the returned system.
++
++    Returns
++    -------
++    StateSpace
++        Transfer function between the selected signals.
++
++    See Also
++    --------
++    open_loop, loop_transfer
++
++    """
++    from .statesp import StateSpace
++
++    if not isinstance(sys, StateSpace):
++        raise TypeError("loop analysis requires a linear interconnection")
++
++    base = sys if opened is None else open_loop(sys, opened)
++    base, indx, outdx = _expose(base, inputs, outputs)
++
++    xfer = base[outdx, indx]
++    if name is not None:
++        xfer.name = name
++    return xfer
++
++
++def _expose(sys, inputs, outputs):
++    """Resolve signal selections, adding channels for subsystem signals.
++
++    Any entry that does not name a signal of the interconnection itself is
++    taken to name a subsystem signal.  A subsystem input gains an external
++    input that adds to whatever already drives it, and a subsystem output
++    gains an external output that reports it.
++
++    """
++    input_labels = list(sys.input_labels)
++    output_labels = list(sys.output_labels)
++    input_map = np.array(sys.input_map, copy=True)
++    output_map = np.array(sys.output_map, copy=True)
++    nsuboutputs = sys.connect_map.shape[1]
++    indx, outdx = [], []
++
++    for entry in _selection(inputs, input_labels):
++        if isinstance(entry, tuple):
++            entry = _canonical(sys, entry)
++        if isinstance(entry, str) and entry not in input_labels:
++            kind, indices, _ = sys._parse_analysis_point_spec(entry)
++            if kind != 'input':
++                raise ControlArgument(f"'{entry}' is not an input signal")
++            for index in indices:
++                column = np.zeros((input_map.shape[0], 1))
++                column[index, 0] = 1
++                input_map = np.hstack([input_map, column])
++                indx.append(len(input_labels))
++                input_labels.append(_exposed_label(entry, index, indices))
++        else:
++            indx.extend(_resolve_signals(input_labels, [entry], 'input'))
++
++    for entry in _selection(outputs, output_labels):
++        if isinstance(entry, tuple):
++            entry = _canonical(sys, entry)
++        if isinstance(entry, str) and entry not in output_labels:
++            kind, indices, _ = sys._parse_analysis_point_spec(entry)
++            if kind != 'output':
++                raise ControlArgument(f"'{entry}' is not an output signal")
++            for index in indices:
++                row = np.zeros((1, output_map.shape[1]))
++                row[0, index] = 1
++                output_map = np.vstack([output_map, row])
++                outdx.append(len(output_labels))
++                output_labels.append(_exposed_label(entry, index, indices))
++        else:
++            outdx.extend(_resolve_signals(output_labels, [entry], 'output'))
++
++    if len(input_labels) == sys.ninputs and len(output_labels) == sys.noutputs:
++        return sys, indx, outdx
++    if output_map.shape[1] < nsuboutputs + input_map.shape[0]:
++        output_map = np.hstack(
++            [output_map,
++             np.zeros((output_map.shape[0],
++                       nsuboutputs + input_map.shape[0]
++                       - output_map.shape[1]))])
++    grown = _rebuild(
++        sys, np.array(sys.connect_map, copy=True), input_map, output_map,
++        input_labels, output_labels, None, dict(_points_of(sys)))
++    return grown, indx, outdx
++
++
++def _exposed_label(entry, index, indices):
++    """Name an extra channel after the subsystem signal it carries."""
++    delim = config.defaults['iosys.state_name_delim']
++    label = entry.replace('.', delim)
++    return label if len(indices) == 1 else f"{label}[{indices.index(index)}]"
++
++
++def _selection(spec, labels):
++    """Turn a signal selection into a list of individual entries."""
++    if spec is None:
++        return list(range(len(labels)))
++    if isinstance(spec, (str, int, np.integer, tuple)):
++        return [spec]
++    return list(spec)
++
++
++def replace_point(sys, point, value=None, name=None):
++    """Insert a system or a gain at an analysis point.
++
++    Every internal connection fed by the signal of `point` is rerouted so
++    that it is driven by `value` applied to that signal.  A gain of zero
++    therefore leaves the loop permanently open, while a unit gain leaves the
++    interconnection unchanged.  The analysis point itself stays on the
++    original signal.
++
++    Parameters
++    ----------
++    sys : InterconnectedSystem
++        Linear interconnection containing the analysis point.
++    point : str or dict
++        Name of the analysis point, or a dictionary mapping several point
++        names to the values to insert at each of them.
++    value : scalar, array, or LTI system, optional
++        Gain or system to insert.  A square system or array must have as
++        many inputs and outputs as the point has channels.  Omitted when
++        `point` is a dictionary.
++    name : string, optional
++        Name of the returned system.
++
++    Returns
++    -------
++    InterconnectedSystem
++        Interconnection with `value` inserted at the point.
++
++    See Also
++    --------
++    interconnect, open_loop
++
++    """
++    from .lti import LTI
++    from .statesp import _convert_to_statespace
++
++    if isinstance(point, dict):
++        if value is not None:
++            raise ControlArgument(
++                "a value cannot be given alongside a dictionary of points")
++        result = sys
++        for label, entry in point.items():
++            result = replace_point(result, label, entry)
++        if name is not None:
++            result.name = name
++        return result
++    if not isinstance(point, (str, tuple)):
++        raise ControlArgument("a single analysis point name is required")
++    if value is None:
++        raise ControlArgument("a value to insert is required")
++    channels = _channels(sys, point)
++    kind = channels[0][3]
++    indices = [index for _, _, _, _, index in channels]
++    size = len(indices)
++
++    if isinstance(value, LTI):
++        block = _convert_to_statespace(value)
++        if block.ninputs != size or block.noutputs != size:
++            raise ControlArgument(
++                f"system inserted at '{point}' must have {size} inputs "
++                f"and {size} outputs")
++        return _insert_block(sys, kind, indices, block, name)
++
++    gain = np.atleast_2d(np.asarray(value, dtype=float))
++    if gain.shape == (1, 1):
++        gain = gain[0, 0] * np.eye(size)
++    if gain.shape != (size, size):
++        raise ControlArgument(
++            f"gain inserted at '{point}' must be scalar or {size} by {size}")
++
++    connect_map = np.array(sys.connect_map, copy=True)
++    if kind == 'output':
++        connect_map[:, indices] = sys.connect_map[:, indices] @ gain
++    else:
++        connect_map[indices, :] = gain @ sys.connect_map[indices, :]
++    return _rebuild(
++        sys, connect_map, np.array(sys.input_map, copy=True),
++        np.array(sys.output_map, copy=True), list(sys.input_labels),
++        list(sys.output_labels), name, dict(_points_of(sys)))
++
++
++def _insert_block(sys, kind, indices, block, name):
++    """Insert a state space system into the branches of an analysis point."""
++    size = len(indices)
++    nsubin, nsubout = sys.connect_map.shape
++
++    connect_map = np.zeros((nsubin + size, nsubout + size))
++    connect_map[:nsubin, :nsubout] = sys.connect_map
++    for offset, index in enumerate(indices):
++        if kind == 'output':
++            connect_map[nsubin + offset, index] = 1
++            connect_map[:nsubin, nsubout + offset] = sys.connect_map[:, index]
++            connect_map[:nsubin, index] = 0
++        else:
++            connect_map[nsubin + offset, :nsubout] = sys.connect_map[index]
++            connect_map[index, :] = 0
++            connect_map[index, nsubout + offset] = 1
++
++    input_map = np.vstack(
++        [sys.input_map, np.zeros((size, sys.input_map.shape[1]))])
++    output_map = np.zeros((sys.noutputs, nsubout + size + nsubin + size))
++    output_map[:, :nsubout] = sys.output_map[:, :nsubout]
++    output_map[:, nsubout + size:nsubout + size + nsubin] = \
++        sys.output_map[:, nsubout:]
++
++    return _rebuild(
++        sys, connect_map, input_map, output_map, list(sys.input_labels),
++        list(sys.output_labels), name, dict(_points_of(sys)),
++        syslist=list(sys.syslist) + [block])
++
++
++def _claim(points, label, entry):
++    """Record a contributed point, refusing a name already taken."""
++    if label in points:
++        raise ControlArgument(f"duplicate analysis point '{label}'")
++    points[label] = entry
++
++
++def _hoist_analysis_points(syslist):
++    """Expose the analysis points of the subsystems of an interconnection.
++
++    A subsystem carrying analysis points is replaced by a copy with those
++    loops opened, and the injection and measurement channels the copy grew
++    are reconnected to each other.  The point is then an ordinary
++    connection of the interconnection being built, addressed by the name of
++    the subsystem followed by the name of the point.
++
++    """
++    from .nlsys import InterconnectedSystem
++
++    syslist = list(syslist)
++    connections, points = [], {}
++    for index, sys in enumerate(syslist):
++        if getattr(sys, '_analysis_point', False):
++            _claim(points, sys.name, (index, list(range(sys.noutputs))))
++            continue
++        if not isinstance(sys, InterconnectedSystem) or not sys.analysis_points:
++            continue
++
++        delim = config.defaults['iosys.state_name_delim']
++        labels = list(sys.analysis_points.keys())
++        sizes = [len(sys.analysis_points[label][1]) for label in labels]
++        ninputs, noutputs = sys.ninputs, sys.noutputs
++        syslist[index] = _open_channels(
++            sys, _channels(sys, labels), sys.name)
++
++        offset = 0
++        for label, size in zip(labels, sizes):
++            channels = []
++            for channel in range(size):
++                connections.append(
++                    [(index, ninputs + offset + channel),
++                     (index, noutputs + offset + channel)])
++                channels.append(noutputs + offset + channel)
++            _claim(points, sys.name + delim + label, (index, channels))
++            offset += size
++
++    return syslist, connections, points
+diff --git a/control/nlsys.py b/control/nlsys.py
+index 04fda2e4..390fcb74 100644
+--- a/control/nlsys.py
++++ b/control/nlsys.py
+@@ -639,6 +639,12 @@ class InterconnectedSystem(NonlinearIOSystem):
+         system input, output, and state arrays.
+     syslist_index : dict
+         Index of the subsystem with key given by the name of the subsystem.
++    analysis_points : dict
++        The kind of subsystem signal each analysis point sits on and the
++        indices of the signals carrying it, with key given by the name of
++        the point.
++    analysis_point_labels : list of str
++        Names of the analysis points, in the order they were declared.
+ 
+     See Also
+     --------
+@@ -647,13 +653,21 @@ class InterconnectedSystem(NonlinearIOSystem):
+     """
+     def __init__(self, syslist, connections=None, inplist=None, outlist=None,
+                  params=None, warn_duplicate=None, connection_type=None,
+-                 **kwargs):
++                 analysis_points=None, **kwargs):
+         """Create an I/O system from a list of systems + connection info."""
++        from .loopan import _hoist_analysis_points
+         from .statesp import _convert_to_statespace
+         from .xferfcn import TransferFunction
+ 
+         self.connection_type = connection_type # explicit, implicit, or None
+ 
++        # Expose the analysis points of the subsystems before anything else,
++        # so that they are ordinary connections of this interconnection
++        syslist, hoisted_connections, hoisted_points = \
++            _hoist_analysis_points(syslist)
++        if hoisted_connections:
++            connections = list(connections or []) + hoisted_connections
++
+         # Convert input and output names to lists if they aren't already
+         if inplist is not None and not isinstance(inplist, list):
+             inplist = [inplist]
+@@ -829,6 +843,74 @@ class InterconnectedSystem(NonlinearIOSystem):
+                              index + "; combining with previous entries")
+                     self.output_map[index + j, ylist_index] += gain
+ 
++        # Resolve the analysis points against the subsystem outputs
++        self.analysis_points = {}
++        if isinstance(analysis_points, (str, tuple)):
++            analysis_points = [analysis_points]
++        specs = analysis_points.items() if isinstance(analysis_points, dict) \
++            else [(None, spec) for spec in analysis_points or []]
++        for label, spec in specs:
++            kind, indices, name = self._parse_analysis_point_spec(spec)
++            label = name if label is None else label
++            if label in self.analysis_points:
++                raise ValueError(f"duplicate analysis point '{label}'")
++            self.analysis_points[label] = (kind, indices)
++        for label, (sysidx, indices) in hoisted_points.items():
++            if label in self.analysis_points:
++                raise ValueError(f"duplicate analysis point '{label}'")
++            self.analysis_points[label] = ('output', [
++                self.output_offset[sysidx] + index for index in indices])
++
++    def _parse_analysis_point_spec(self, spec):
++        """Parse an analysis point specification.
++
++        Returns the kind of subsystem signal the point sits on, the indices
++        into the vector of signals of that kind, and the base name of the
++        signal that was named.
++
++        """
++        try:
++            subsys_index, signal_indices, gain = _parse_spec(
++                self.syslist, spec, 'output')
++            kind, offsets = 'output', self.output_offset
++        except ValueError:
++            subsys_index, signal_indices, gain = _parse_spec(
++                self.syslist, spec, 'input')
++            kind, offsets = 'input', self.input_offset
++        if gain != 1:
++            raise ValueError("gain not allowed in spec '%s'" % str(spec))
++        sys = self.syslist[subsys_index]
++        labels = sys.output_labels if kind == 'output' else sys.input_labels
++        named = [labels[index] for index in signal_indices]
++        name = named[0] if len(named) == 1 else named[0].split('[')[0]
++        indices = [offsets[subsys_index] + index for index in signal_indices]
++        return kind, indices, name
++
++    @property
++    def analysis_point_labels(self):
++        """List of labels for the analysis points of the system."""
++        return list(self.analysis_points.keys())
++
++    def find_analysis_point(self, name):
++        """Find the subsystem signals carrying a named analysis point.
++
++        Parameters
++        ----------
++        name : str
++            Name of the analysis point.
++
++        Returns
++        -------
++        tuple or None
++            The kind of subsystem signal the point sits on, either 'output'
++            or 'input', together with the indices into the vector of
++            subsystem signals of that kind.  None if no analysis point with
++            that name is present.
++
++        """
++        entry = self.analysis_points.get(name, None)
++        return None if entry is None else (entry[0], list(entry[1]))
++
+     def __str__(self):
+         import textwrap
+         out = InputOutputSystem.__str__(self)
+@@ -892,6 +974,15 @@ class InterconnectedSystem(NonlinearIOSystem):
+                     cxn, width=78, initial_indent=" * ",
+                     subsequent_indent="     "))
+ 
++        if self.analysis_points:
++            out += "\n\nAnalysis points:"
++            for label, (kind, indices) in self.analysis_points.items():
++                names = input_list if kind == 'input' else output_list
++                signals = ", ".join(names[index] for index in indices)
++                out += "\n" + "\n".join(textwrap.wrap(
++                    f"{label} @ {signals}", width=78, initial_indent=" * ",
++                    subsequent_indent="     "))
++
+         return out
+ 
+     def _update_params(self, params):
+@@ -954,7 +1045,7 @@ class InterconnectedSystem(NonlinearIOSystem):
+         # feedthrough elements to propagate.  For n systems, we could need to
+         # cycle through n+1 times before reaching steady state
+         # TODO (later): see if there is a more efficient way to compute
+-        cycle_count = len(self.syslist) + 1
++        cycle_count = self.connect_map.shape[0] + 1
+         while cycle_count > 0:
+             state_index, input_index, output_index = 0, 0, 0
+             for sys in self.syslist:
+@@ -2336,7 +2427,8 @@ def _find_size(sysval, vecval, name="system component"):
+ def interconnect(
+         syslist, connections=None, inplist=None, outlist=None, params=None,
+         check_unused=True, add_unused=False, ignore_inputs=None,
+-        ignore_outputs=None, warn_duplicate=None, debug=False, **kwargs):
++        ignore_outputs=None, warn_duplicate=None, debug=False,
++        analysis_points=None, **kwargs):
+     """Interconnect a set of input/output systems.
+ 
+     This function creates a new system that is an interconnection of a set of
+@@ -2427,6 +2519,16 @@ def interconnect(
+         If omitted, the output map can be specified using the
+         `InterconnectedSystem.set_output_map` method.
+ 
++    analysis_points : list or dict, optional
++        Locations at which the loops of the interconnection can be opened
++        for analysis.  Each entry names a subsystem output using the same
++        specification format as an output connection, without a gain.  A
++        list gives each point the base name of the signal it was declared
++        on; a dictionary maps the name of the point to the specification.
++        The points of a subsystem are exposed as points of the
++        interconnection, named '<subsys_name><delim><point_name>', where
++        <delim> is the value of `config.defaults['iosys.state_name_delim']`.
++
+     inputs : int, list of str or None, optional
+         Description of the system inputs.  This can be given as an integer
+         count or as a list of strings that name the individual signals.  If
+@@ -2605,14 +2707,30 @@ def interconnect(
+     # set up default connection list
+     if connections is None:
+         connection_type = 'implicit'
++        # An analysis point block taps the signal it is named after, so it
++        # becomes the only source other subsystems are connected to
++        taps = {}
++        for sys in syslist:
++            if getattr(sys, '_analysis_point', False):
++                for label in sys.output_labels:
++                    taps[label] = sys
++
+         # For each system input, look for outputs with the same name
+         connections = []
+         for input_sys in syslist:
+             for input_name in input_sys.input_labels:
+                 connect = [input_sys.name + "." + input_name]
++                tap = taps.get(input_name, None)
++                tap = None if tap is input_sys else tap
+                 for output_sys in syslist:
+-                    if input_name in output_sys.output_labels:
+-                        connect.append(output_sys.name + "." + input_name)
++                    if input_name not in output_sys.output_labels:
++                        continue
++                    if output_sys is input_sys and \
++                            getattr(output_sys, '_analysis_point', False):
++                        continue
++                    if tap is not None and output_sys is not tap:
++                        continue
++                    connect.append(output_sys.name + "." + input_name)
+                 if len(connect) > 1:
+                     connections.append(connect)
+ 
+@@ -2878,7 +2996,8 @@ def interconnect(
+         syslist, connections=connections, inplist=inplist,
+         outlist=outlist, inputs=inputs, outputs=outputs, states=states,
+         params=params, dt=dt, name=name, warn_duplicate=warn_duplicate,
+-        connection_type=connection_type, **kwargs)
++        connection_type=connection_type, analysis_points=analysis_points,
++        **kwargs)
+ 
+     # See if we should add any signals
+     if add_unused:
+@@ -2899,7 +3018,8 @@ def interconnect(
+             syslist, connections=connections, inplist=inplist,
+             outlist=outlist, inputs=inputs, outputs=outputs, states=states,
+             params=params, dt=dt, name=name, warn_duplicate=warn_duplicate,
+-            connection_type=connection_type, **kwargs)
++            connection_type=connection_type, analysis_points=analysis_points,
++        **kwargs)
+ 
+     # check for implicitly dropped signals
+     if check_unused:
+diff --git a/control/statesp.py b/control/statesp.py
+index 16981e62..fa032e54 100644
+--- a/control/statesp.py
++++ b/control/statesp.py
+@@ -1566,6 +1566,7 @@ class LinearICSystem(InterconnectedSystem, StateSpace):
+         self.connect_map = io_sys.connect_map
+         self.input_map = io_sys.input_map
+         self.output_map = io_sys.output_map
++        self.analysis_points = io_sys.analysis_points
+         self.params = io_sys.params
+         self.connection_type = connection_type
+ 

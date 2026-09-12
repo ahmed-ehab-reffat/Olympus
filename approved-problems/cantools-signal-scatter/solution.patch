@@ -1,0 +1,943 @@
+diff --git a/src/cantools/database/__init__.py b/src/cantools/database/__init__.py
+index 5f67ab6..f33c350 100644
+--- a/src/cantools/database/__init__.py
++++ b/src/cantools/database/__init__.py
+@@ -1,5 +1,6 @@
+-__all__ = ["Bus", "Database", "DecodeError", "EncodeError", "Message",
+-           "Node", "Signal", "dump_file", "load", "load_file", "load_string"]
++__all__ = ["Bus", "Database", "DecodeError", "EncodeError", "EncodedFrame",
++           "Message", "Node", "Signal", "dump_file", "load", "load_file",
++           "load_string"]
+ 
+ import os
+ import warnings
+@@ -16,6 +17,7 @@ from ..typechecking import StringPathLike
+ from . import can, diagnostics, utils
+ from .can.bus import Bus
+ from .can.database import Database
++from .can.frame_set import EncodedFrame
+ from .can.message import Message
+ from .can.node import Node
+ from .can.signal import Signal
+diff --git a/src/cantools/database/can/database.py b/src/cantools/database/can/database.py
+index b742cab..d90f775 100644
+--- a/src/cantools/database/can/database.py
++++ b/src/cantools/database/can/database.py
+@@ -1,14 +1,24 @@
+ import logging
+ from collections import OrderedDict
++from collections.abc import Sequence
+ from typing import (
+     Any,
+     TextIO,
++    cast,
+ )
+ 
+-from ...typechecking import DecodeResultType, EncodeInputType, StringPathLike
+-from ..errors import DecodeError
++from ...typechecking import (
++    ContainerDecodeResultType,
++    DecodeResultType,
++    EncodeInputType,
++    SignalDictType,
++    SignalMappingType,
++    StringPathLike,
++)
++from ..errors import DecodeError, EncodeError
+ from ..utils import (
+     SORT_SIGNALS_DEFAULT,
++    format_or,
+     sort_signals_by_start_bit,
+     type_sort_attributes,
+     type_sort_choices,
+@@ -18,6 +28,7 @@ from .bus import Bus
+ from .formats import arxml, dbc, kcd, sym
+ from .formats.arxml import AutosarDatabaseSpecifics
+ from .formats.dbc import DbcSpecifics
++from .frame_set import EncodedFrame, FrameSpecType, split_frame, split_key
+ from .internal_database import InternalDatabase
+ from .message import Message
+ from .node import Node
+@@ -634,6 +645,209 @@ class Database:
+                               scaling,
+                               allow_truncated=allow_truncated)
+ 
++    def _assert_signal_names_known(self,
++                                   signal_values: SignalMappingType) -> None:
++        unknown = self._unknown_signal_names(signal_values)
++
++        if not unknown:
++            return
++
++        names = cast('list[int | str]', [f'"{name}"' for name in unknown])
++
++        raise EncodeError(f'No message carries the signal '
++                          f'{format_or(names)}.')
++
++    def _unknown_signal_names(self,
++                              signal_values: SignalMappingType) -> list[str]:
++        anywhere: set[str] = set()
++        by_message: dict[str, set[str]] = {}
++
++        for message in self._messages:
++            anywhere |= message.carried_signal_names()
++
++            for target in (message, *message.contained_messages):
++                names = target.carried_signal_names(include_contained=False)
++                by_message.setdefault(target.name, set()).update(names)
++
++        unknown = set()
++
++        for key in signal_values:
++            owner, signal_name = split_key(key)
++
++            if owner is None:
++                if signal_name not in anywhere:
++                    unknown.add(key)
++            elif signal_name not in by_message.get(owner, set()):
++                unknown.add(key)
++
++        return sorted(unknown)
++
++    def encode_signals(self,
++                       signal_values: SignalMappingType,
++                       scaling: bool = True,
++                       padding: bool = False,
++                       ) -> list[EncodedFrame]:
++
++        """Encode the signal name to value mapping `signal_values` into every
++        frame which carries one of the named signals.
++
++        A message is encoded once per combination of multiplexer values its
++        named signals ask for, and a signal several messages carry is encoded
++        into each of them. Signals a produced frame carries but which
++        `signal_values` does not name are encoded with their initial value, or
++        with the value their raw zero stands for when they have none.
++
++        If `scaling` is ``False`` no scaling of signals is performed.
++
++        If `padding` is ``True`` unused bits are encoded with the unused bit
++        pattern of their message, and every frame is filled up to the smallest
++        CAN data length which holds it.
++
++        """
++
++        self._assert_signal_names_known(signal_values)
++
++        ordered: list[tuple[int, int, EncodedFrame]] = []
++
++        for index, message in enumerate(self._messages):
++            for data in message.encode_signals(signal_values,
++                                               scaling,
++                                               padding):
++                ordered.append((message.frame_id,
++                                index,
++                                EncodedFrame(message, message.frame_id, data)))
++
++        ordered.sort(key=lambda item: (item[0], item[1]))
++
++        return [item[2] for item in ordered]
++
++    def reencode_frames(self,
++                        frames: Sequence[FrameSpecType],
++                        signal_values: SignalMappingType,
++                        scaling: bool = True,
++                        padding: bool = False,
++                        ) -> list[EncodedFrame]:
++
++        """Encode the given frames again with the signals of `signal_values`
++        changed, keeping every other signal the value its frame gave it.
++
++        A key which names no signal is rejected as by `encode_signals`. A frame
++        whose message carries none of the named signals comes back with
++        its data untouched. Every other frame is decoded and encoded again,
++        once per combination of multiplexer values its named signals ask for. A
++        container frame is encoded again from exactly what it held, an entry it
++        cannot place kept as it is.
++
++        If `scaling` is ``False`` no scaling of signals is performed.
++
++        If `padding` is ``True`` unused bits are encoded with the unused bit
++        pattern of their message.
++
++        """
++
++        self._assert_signal_names_known(signal_values)
++
++        result: list[EncodedFrame] = []
++
++        for frame in frames:
++            message, frame_id, data = split_frame(frame)
++
++            if message is None:
++                message = self._message_by_frame_id(frame_id)
++
++            held = None
++
++            if message.is_container:
++                held = message.unpack_container(data)
++                touched = any(contained.carries_any(signal_values)
++                              for contained, _ in held
++                              if isinstance(contained, Message))
++            else:
++                touched = message.carries_any(signal_values)
++
++            if not touched:
++                result.append(EncodedFrame(message, frame_id, data))
++                continue
++
++            fallback = None
++
++            if held is None:
++                fallback = self.decode_frames([EncodedFrame(message,
++                                                            frame_id,
++                                                            data)],
++                                              decode_choices=False,
++                                              scaling=scaling)
++
++            for payload in message.encode_signals(signal_values,
++                                                  scaling,
++                                                  padding,
++                                                  fallback,
++                                                  held):
++                result.append(EncodedFrame(message, frame_id, payload))
++
++        return result
++
++    def _message_by_frame_id(self, frame_id: int) -> Message:
++        for force_extended_id in (False, True):
++            try:
++                return self.get_message_by_frame_id(frame_id, force_extended_id)
++            except KeyError:
++                continue
++
++        raise DecodeError(f'Unknown frame id 0x{frame_id:x}.')
++
++    def decode_frames(self,
++                      frames: Sequence[FrameSpecType],
++                      decode_choices: bool = True,
++                      scaling: bool = True,
++                      ) -> SignalDictType:
++
++        """Decode the given frames and merge their signals into one signal
++        name to value mapping.
++
++        Every frame is either an :class:`EncodedFrame` or a frame id and data
++        pair. A frame contributes the signals it carries, which for a
++        multiplexed message are the multiplexers and the signals their values
++        select, and for a container message are the signals of every message it
++        holds that this database knows. A signal a later frame carries replaces
++        the value an earlier one gave it.
++
++        If `decode_choices` is ``False`` scaled values are not converted to
++        choice strings (if available).
++
++        If `scaling` is ``False`` no scaling of signals is performed.
++
++        """
++
++        result: SignalDictType = {}
++
++        for frame in frames:
++            message, frame_id, data = split_frame(frame)
++
++            if message is None:
++                message = self._message_by_frame_id(frame_id)
++
++            if not message.is_container:
++                result.update(cast('SignalDictType',
++                                   message.decode(data,
++                                                  decode_choices,
++                                                  scaling)))
++                continue
++
++            contained_frames = cast('ContainerDecodeResultType',
++                                    message.decode(data,
++                                                   decode_choices,
++                                                   scaling,
++                                                   decode_containers=True))
++
++            for _, contained_values in contained_frames:
++                if isinstance(contained_values, bytes):
++                    continue
++
++                result.update(contained_values)
++
++        return result
++
+     def refresh(self) -> None:
+         """Refresh the internal database state.
+ 
+diff --git a/src/cantools/database/can/frame_set.py b/src/cantools/database/can/frame_set.py
+new file mode 100644
+index 0000000..13f6346
+--- /dev/null
++++ b/src/cantools/database/can/frame_set.py
+@@ -0,0 +1,284 @@
++# Scattering flat signal dictionaries over the frames which carry them.
++
++from collections.abc import Mapping, Sequence
++from typing import TYPE_CHECKING, NamedTuple, Optional, Union, cast
++
++from ...typechecking import (
++    Codec,
++    SignalDictType,
++    SignalMappingType,
++    SignalValueType,
++)
++from ..errors import DecodeError, EncodeError
++
++if TYPE_CHECKING:
++    from .message import Message
++    from .signal import Signal
++
++
++class EncodedFrame(NamedTuple):
++    """A CAN frame produced by :meth:`can.Database.encode_signals`."""
++
++    message: "Message"
++    frame_id: int
++    data: bytes
++
++
++FrameSpecType = EncodedFrame | tuple[int, bytes]
++SelectionType = dict[str, int]
++
++CONTAINED_HEADER_SIZE = 4
++CAN_DATA_LENGTHS = (0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64)
++
++
++def split_key(key: str) -> tuple[str | None, str]:
++    """The message a key names, if it names one, and the signal it names."""
++
++    message_name, dot, signal_name = key.partition('.')
++
++    if not dot:
++        return None, key
++
++    return message_name, signal_name
++
++
++def message_values(message_name: str,
++                   signal_values: SignalMappingType) -> SignalDictType:
++    """The part of `signal_values` which applies to the named message, with
++    the keys naming a message stripped of it."""
++
++    values: SignalDictType = {}
++    qualified: SignalDictType = {}
++
++    for key, value in signal_values.items():
++        owner, signal_name = split_key(key)
++
++        if owner is None:
++            values[signal_name] = value
++        elif owner == message_name:
++            qualified[signal_name] = value
++
++    values.update(qualified)
++
++    return values
++
++
++def codec_signal_names(codec: Codec | None) -> set[str]:
++    """The names of every signal at or below the given codec node."""
++
++    if codec is None:
++        return set()
++
++    names = {signal.name for signal in codec['signals']}
++
++    for mux_nodes in codec['multiplexers'].values():
++        for mux_codec in mux_nodes.values():
++            names |= codec_signal_names(cast('Codec', mux_codec))
++
++    return names
++
++
++def multiplexer_value(message: "Message",
++                      mux_name: str,
++                      mux_nodes: Mapping[int, Codec],
++                      signal_values: SignalMappingType,
++                      scaling: bool) -> int:
++    """The value a multiplexer was explicitly given, as a raw number."""
++
++    signal = message.get_signal_by_name(mux_name)
++    value = signal_values[mux_name]
++
++    if isinstance(value, (int, float)):
++        if scaling:
++            value = signal.conversion.numeric_scaled_to_raw(value)
++
++        number = int(value)
++    else:
++        number = signal.conversion.choice_to_number(str(value))
++
++    if number not in mux_nodes:
++        raise EncodeError(f'The multiplexer "{mux_name}" of message '
++                          f'"{message.name}" cannot take the value {number}.')
++
++    return number
++
++
++def required_selections(message: "Message",
++                        codec: Codec,
++                        signal_values: SignalMappingType,
++                        scaling: bool) -> list[SelectionType]:
++    """The multiplexer selections needed to carry every named signal below the
++    given codec node.
++
++    One selection is produced per combination of the values the named signals
++    ask for. Multiplexers are taken in the order their signals appear in the
++    message, so the first one varies the slowest.
++    """
++
++    selections: list[SelectionType] = [{}]
++
++    for mux_name, mux_nodes in codec['multiplexers'].items():
++        nodes = cast('Mapping[int, Codec]', mux_nodes)
++        wanted = sorted(
++            mux_value
++            for mux_value, mux_codec in nodes.items()
++            if codec_signal_names(mux_codec) & signal_values.keys()
++        )
++
++        if not wanted:
++            if mux_name in signal_values:
++                wanted = [multiplexer_value(message,
++                                            mux_name,
++                                            nodes,
++                                            signal_values,
++                                            scaling)]
++            else:
++                wanted = [min(nodes)]
++
++        combined: list[SelectionType] = []
++
++        for selection in selections:
++            for mux_value in wanted:
++                for nested in required_selections(message,
++                                                  nodes[mux_value],
++                                                  signal_values,
++                                                  scaling):
++                    combined.append({**selection,
++                                     mux_name: mux_value,
++                                     **nested})
++
++        selections = combined
++
++    return selections
++
++
++def selected_signals(codec: Codec,
++                     selection: SelectionType) -> list["Signal"]:
++    """Every signal a frame using the given selection carries."""
++
++    signals = list(codec['signals'])
++
++    for mux_name, mux_nodes in codec['multiplexers'].items():
++        mux_codec = cast('Codec', mux_nodes[selection[mux_name]])
++        signals += selected_signals(mux_codec, selection)
++
++    return signals
++
++
++def default_value(signal: "Signal", scaling: bool) -> SignalValueType:
++    """The value an unnamed signal is written with."""
++
++    raw = signal.raw_initial if signal.raw_initial is not None else 0
++
++    if not scaling:
++        return raw
++
++    return signal.conversion.raw_to_scaled(raw, decode_choices=False)
++
++
++def selection_values(message: "Message",
++                     codec: Codec,
++                     selection: SelectionType,
++                     signal_values: SignalMappingType,
++                     scaling: bool,
++                     fallback: SignalMappingType | None = None,
++                     ) -> tuple[SignalDictType, SignalDictType]:
++    """The complete signal dictionary of one frame, and the part of it which
++    the caller supplied."""
++
++    values: SignalDictType = {}
++    named: SignalDictType = {}
++
++    for signal in selected_signals(codec, selection):
++        name = signal.name
++
++        if name in selection:
++            raw = selection[name]
++            values[name] = (
++                signal.conversion.raw_to_scaled(raw, decode_choices=False)
++                if scaling
++                else raw
++            )
++        elif name in signal_values:
++            values[name] = signal_values[name]
++            named[name] = signal_values[name]
++        elif fallback is not None and name in fallback:
++            values[name] = fallback[name]
++        else:
++            values[name] = default_value(signal, scaling)
++
++    return values, named
++
++
++def pad_frame_data(data: bytes) -> bytes:
++    """Fill a frame with zeros up to the smallest CAN data length which holds
++    it."""
++
++    for length in CAN_DATA_LENGTHS:
++        if length >= len(data):
++            return data.ljust(length, b'\x00')
++
++    return data
++
++
++ContainedEntryType = tuple[Union["Message", int], "SignalDictType | bytes", int]
++
++
++def entry_size(contained: Union["Message", int],
++               value: "SignalDictType | bytes") -> int:
++    """The room a contained message takes in a container frame."""
++
++    if isinstance(value, bytes):
++        return CONTAINED_HEADER_SIZE + len(value)
++
++    return CONTAINED_HEADER_SIZE + cast('Message', contained).length
++
++
++def pack_container(container: "Message",
++                   entries: Sequence[ContainedEntryType]) \
++    -> list[list[tuple[Union["Message", int], "SignalDictType | bytes"]]]:
++    """Split contained messages into as few container frames as their order
++    allows."""
++
++    groups: list[list[tuple[Message | int, SignalDictType | bytes]]] = []
++    group: list[tuple[Message | int, SignalDictType | bytes]] = []
++    used = 0
++
++    for contained, value, size in entries:
++        if size > container.length:
++            name = f'0x{contained:x}' if isinstance(value, bytes) \
++                else cast('Message', contained).name
++
++            raise EncodeError(f'The contained message "{name}" does '
++                              f'not fit into the container message '
++                              f'"{container.name}".')
++
++        if group and used + size > container.length:
++            groups.append(group)
++            group = []
++            used = 0
++
++        group.append((contained, value))
++        used += size
++
++    if group:
++        groups.append(group)
++
++    return groups
++
++
++def split_frame(frame: FrameSpecType) \
++    -> tuple[Optional["Message"], int, bytes]:
++    """The message, identifier and data of a frame given as either an
++    :class:`EncodedFrame` or a pair. A pair names no message."""
++
++    try:
++        if isinstance(frame, EncodedFrame):
++            return frame.message, frame.frame_id, bytes(frame.data)
++
++        frame_id, data = frame
++
++        return None, int(frame_id), bytes(data)
++    except (TypeError, ValueError):
++        raise DecodeError(f'Expected a frame or an identifier and data pair, '
++                          f'but got {frame!r}.') from None
+diff --git a/src/cantools/database/can/message.py b/src/cantools/database/can/message.py
+index 478d2b7..82b32ef 100644
+--- a/src/cantools/database/can/message.py
++++ b/src/cantools/database/can/message.py
+@@ -38,6 +38,16 @@ from ..utils import (
+     type_sort_signals,
+ )
+ from .formats.arxml.message_specifics import AutosarMessageSpecifics
++from .frame_set import (
++    ContainedEntryType,
++    codec_signal_names,
++    entry_size,
++    message_values,
++    pack_container,
++    pad_frame_data,
++    required_selections,
++    selection_values,
++)
+ from .signal import Signal
+ from .signal_group import SignalGroup
+ 
+@@ -952,6 +962,185 @@ class Message:
+ 
+         return encoded.to_bytes(self._length, "big")
+ 
++    def _frame_value_sets(self,
++                          signal_values: SignalMappingType,
++                          scaling: bool,
++                          fallback: SignalMappingType | None = None,
++                          ) -> list[SignalDictType]:
++        if self._codecs is None:
++            raise ValueError('Codec is not initialized.')
++
++        value_sets = []
++
++        for selection in required_selections(self,
++                                             self._codecs,
++                                             signal_values,
++                                             scaling):
++            values, named = selection_values(self,
++                                             self._codecs,
++                                             selection,
++                                             signal_values,
++                                             scaling,
++                                             fallback)
++            self._assert_choices_known(named)
++            self._assert_signal_values_valid(named, scaling)
++            value_sets.append(values)
++
++        return value_sets
++
++    def _assert_choices_known(self, named: SignalMappingType) -> None:
++        for name, value in named.items():
++            if not isinstance(value, (str, NamedSignalValue)):
++                continue
++
++            signal = self.get_signal_by_name(name)
++
++            try:
++                signal.conversion.choice_to_number(str(value))
++            except KeyError:
++                raise EncodeError(f'The signal "{name}" of message '
++                                  f'"{self._name}" has no value '
++                                  f'"{value}".') from None
++
++    def carried_signal_names(self, include_contained: bool = True) -> set[str]:
++        """The names of all signals of this message, including the ones behind
++        every multiplexer value and, unless `include_contained` is ``False``,
++        the ones of the messages a container message features.
++
++        """
++
++        names = codec_signal_names(self._codecs)
++
++        if include_contained:
++            for contained in self._contained_messages:
++                names |= codec_signal_names(contained._codecs)
++
++        return names
++
++    def _contained_entries(self,
++                           contained: 'Message',
++                           signal_values: SignalMappingType,
++                           scaling: bool,
++                           fallback: SignalMappingType | None) \
++        -> list[ContainedEntryType]:
++        contained_values = message_values(contained.name, signal_values)
++
++        return [
++            (contained, values, entry_size(contained, values))
++            for values in contained._frame_value_sets(contained_values,
++                                                      scaling,
++                                                      fallback)
++        ]
++
++    def carries_any(self, signal_values: SignalMappingType) -> bool:
++        """Whether this message, or a message it features, carries any of the
++        signals `signal_values` names.
++
++        """
++
++        for target in (self, *self._contained_messages):
++            values = message_values(target.name, signal_values)
++
++            if codec_signal_names(target._codecs) & values.keys():
++                return True
++
++        return False
++
++    def encode_signals(self,
++                       signal_values: SignalMappingType,
++                       scaling: bool = True,
++                       padding: bool = False,
++                       fallback: SignalMappingType | None = None,
++                       held: ContainerUnpackResultType | None = None,
++                       ) -> list[bytes]:
++
++        """Encode the signals of `signal_values` which this message carries
++        into the frames needed to hold them.
++
++        A key of `signal_values` names a signal, or a message and one of its
++        signals separated by a dot. Signals which this message does not carry
++        are ignored, and an empty list is returned if it carries none of them.
++        Signals which the message carries but `signal_values` does not name
++        take their value from `fallback`, or, when that does not name them
++        either, their initial value, or the value their raw zero stands for
++        when they have none.
++
++        A container message features the messages which carry a named signal,
++        or, when `held` is given, exactly what it lists, keeping an entry which
++        is raw data as it is.
++
++        """
++
++        if self.is_container:
++            entries: list[ContainedEntryType] = []
++
++            if held is not None:
++                for contained, raw in held:
++                    if not isinstance(contained, Message):
++                        entries.append((contained,
++                                        bytes(raw),
++                                        entry_size(contained, bytes(raw))))
++                        continue
++
++                    try:
++                        held_values = contained.decode(bytes(raw),
++                                                       decode_choices=False,
++                                                       scaling=scaling)
++                    except DecodeError:
++                        header_id = contained.header_id or 0
++                        entries.append((header_id,
++                                        bytes(raw),
++                                        entry_size(header_id, bytes(raw))))
++                        continue
++
++                    entries += self._contained_entries(
++                        contained,
++                        signal_values,
++                        scaling,
++                        cast('SignalMappingType', held_values))
++            else:
++                for contained in self._contained_messages:
++                    contained_values = message_values(contained.name,
++                                                      signal_values)
++
++                    if not codec_signal_names(contained._codecs) & contained_values.keys():
++                        continue
++
++                    entries += self._contained_entries(contained,
++                                                       signal_values,
++                                                       scaling,
++                                                       fallback)
++
++            if not entries:
++                return []
++
++            frames = []
++
++            for group in pack_container(self, entries):
++                frames.append(self.encode(list(group),
++                                          scaling,
++                                          padding,
++                                          strict=False))
++
++            return frames
++
++        own_values = message_values(self.name, signal_values)
++
++        if not codec_signal_names(self._codecs) & own_values.keys():
++            return []
++
++        frames = [
++            self.encode(values, scaling, padding, strict=False)
++            for values in self._frame_value_sets(own_values,
++                                                 scaling,
++                                                 fallback)
++        ]
++
++        if padding:
++            frames = [pad_frame_data(data) for data in frames]
++
++        return frames
++
+     def _decode(self,
+                 node: Codec,
+                 data: bytes,
+@@ -1028,7 +1217,9 @@ class Message:
+                             f'{pos}. Ignoring.')
+                 return result
+ 
+-            contained_id = int.from_bytes(data[pos:pos+3], 'big')
++            contained_id = int.from_bytes(
++                data[pos:pos+3],
++                'big' if self._header_byte_order == 'big_endian' else 'little')
+             contained_len = data[pos+3]
+ 
+             if pos + 4 + contained_len > len(data):
+diff --git a/src/cantools/subparsers/encode.py b/src/cantools/subparsers/encode.py
+new file mode 100644
+index 0000000..62ccef5
+--- /dev/null
++++ b/src/cantools/subparsers/encode.py
+@@ -0,0 +1,159 @@
++import argparse
++import logging
++import re
++import sys
++
++from argparse_addons import Integer  # type: ignore
++
++from .. import database, logreader
++from ..database.errors import EncodeError
++from ..typechecking import SignalValueType
++
++logging.basicConfig(level=logging.WARNING)
++
++
++def _parse_value(text: str) -> SignalValueType:
++    try:
++        return int(text, 0)
++    except ValueError:
++        pass
++
++    try:
++        return float(text)
++    except ValueError:
++        pass
++
++    return text
++
++
++_FRAME_RE = re.compile(r'\s*(?P<frame_id>[0-9A-Fa-f]{3,8})#'
++                       r'(?P<data>([0-9A-Fa-f]{2})*)\s*')
++
++
++def _parse_frame(line: str) -> tuple[int, bytes] | None:
++    match = _FRAME_RE.fullmatch(line)
++
++    if match is None:
++        return None
++
++    return (int(match.group('frame_id'), 16),
++            bytes.fromhex(match.group('data')))
++
++
++def _parse_line(line: str) -> dict[str, SignalValueType]:
++    signal_values: dict[str, SignalValueType] = {}
++
++    for item in line.split():
++        name, separator, value = item.partition('=')
++
++        if not separator or not name or not value or '=' in value:
++            raise EncodeError(f'Expected a "Name=Value" pair, but got '
++                              f'"{item}".')
++
++        signal_values[name] = _parse_value(value)
++
++    return signal_values
++
++
++def _format_frame(frame: database.EncodedFrame) -> str:
++    if frame.message.is_extended_frame:
++        frame_id = f'{frame.frame_id:08X}'
++    else:
++        frame_id = f'{frame.frame_id:03X}'
++
++    return f'{frame_id}#{frame.data.hex().upper()}'
++
++
++def _update_frames(dbase, args):
++    signal_values: dict[str, SignalValueType] = {}
++
++    for item in args.set:
++        signal_values.update(_parse_line(item))
++
++    parser = logreader.Parser(sys.stdin)
++    frames = []
++
++    for line, frame in parser.iterlines(keep_unknowns=True):
++        if frame is not None:
++            frames.append((frame.frame_id, frame.data))
++            continue
++
++        printed = _parse_frame(line)
++
++        if printed is not None:
++            frames.append(printed)
++        elif line.strip():
++            raise EncodeError(f'Expected a CAN frame, but got "{line}".')
++
++    return dbase.reencode_frames(frames,
++                                 signal_values,
++                                 padding=args.padding)
++
++
++def _do_encode(args):
++    dbase = database.load_file(args.database,
++                               encoding=args.encoding,
++                               frame_id_mask=args.frame_id_mask,
++                               prune_choices=args.prune,
++                               strict=not args.no_strict)
++
++    if args.update:
++        for frame in _update_frames(dbase, args):
++            print(_format_frame(frame))
++
++        return
++
++    for line in sys.stdin:
++        signal_values = _parse_line(line)
++
++        if not signal_values:
++            continue
++
++        for frame in dbase.encode_signals(signal_values,
++                                          padding=args.padding):
++            print(_format_frame(frame))
++
++
++def add_subparser(subparsers):
++    encode_parser = subparsers.add_parser(
++        'encode',
++        description=('Encode "Name=Value" signal pairs read from standard '
++                     'input and print the resulting CAN frames in the '
++                     '"candump" format.'),
++        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
++    encode_parser.add_argument(
++        '-p', '--padding',
++        action='store_true',
++        help='Encode unused bits with the unused bit pattern of their message.')
++    encode_parser.add_argument(
++        '-u', '--update',
++        action='store_true',
++        help=('Read "candump" CAN frames from standard input and encode them '
++              'again with the signals given by --set changed.'))
++    encode_parser.add_argument(
++        '-s', '--set',
++        action='append',
++        default=[],
++        metavar='NAME=VALUE',
++        help='A signal to change when --update is given.')
++    encode_parser.add_argument(
++        '-e', '--encoding',
++        help='File encoding.')
++    encode_parser.add_argument(
++        '--prune',
++        action='store_true',
++        help='Try to shorten the names of named signal choices.')
++    encode_parser.add_argument(
++        '--no-strict',
++        action='store_true',
++        help='Skip database consistency checks.')
++    encode_parser.add_argument(
++        '-m', '--frame-id-mask',
++        type=Integer(0),
++        help=('Only compare selected frame id bits to find the message in the '
++              'database. By default the candump and database frame ids must '
++              'be equal for a match.'))
++    encode_parser.add_argument(
++        'database',
++        help='Database file.')
++    encode_parser.set_defaults(func=_do_encode)

@@ -1,0 +1,478 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 4f29310..3d7afff 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -31,7 +31,7 @@ dependencies = [
+ zed = ['pyzed']
+ 
+ [tool.setuptools]
+-packages = ['kapture', 'tools']
++packages = ['kapture', 'kapture.algo', 'tools']
+ 
+ 
+ [project.scripts]
+@@ -74,3 +74,4 @@ kapture_upgrade_1_0_to_1_1_orphan_features="tools.kapture_upgrade_1_0_to_1_1_orp
+ kapture_merge="tools.kapture_merge:merge_command_line"
+ kapture_print="tools.kapture_print:print_command_line"
+ kapture_rename_features="tools.kapture_rename_features:rename_features_command_line"
++kapture_subset="tools.kapture_subset:subset_command_line"
+diff --git a/kapture/algo/subset.py b/kapture/algo/subset.py
+new file mode 100644
+index 0000000..d1a1c80
+--- /dev/null
++++ b/kapture/algo/subset.py
+@@ -0,0 +1,420 @@
++# Copyright 2020-present NAVER Corp. Under BSD 3-clause license
++
++"""Dependency-closed pruning for kapture datasets."""
++
++import copy
++import os
++import os.path as path
++import shutil
++import tempfile
++from dataclasses import dataclass
++from typing import Dict, Iterable, Iterator, Optional, Set, Tuple, Type
++
++import numpy as np
++
++import kapture
++import kapture.io.features
++from kapture.io.csv import (CSV_FILENAMES, FEATURES_CSV_FILENAMES,
++                            get_all_tar_handlers, get_feature_csv_fullpath,
++                            kapture_from_dir, kapture_to_dir)
++from kapture.io.records import get_record_fullpath
++from kapture.io.tar import (TarCollection, TarHandler, get_feature_tar_fullpath,
++                            retrieve_tar_handler_from_collection)
++
++
++RECORD_ATTRIBUTES = (
++    'records_camera', 'records_depth', 'records_lidar', 'records_wifi',
++    'records_bluetooth', 'records_gnss', 'records_accelerometer',
++    'records_gyroscope', 'records_magnetic',
++)
++FILE_RECORD_ATTRIBUTES = ('records_camera', 'records_depth', 'records_lidar')
++COLLECTION_TYPES = {
++    'keypoints': kapture.Keypoints,
++    'descriptors': kapture.Descriptors,
++    'global_features': kapture.GlobalFeatures,
++    'matches': kapture.Matches,
++}
++
++
++@dataclass(frozen=True)
++class PayloadJob:
++    data_type: Type
++    feature_type: str
++    key: object
++    metadata: object
++
++
++def _record_selected(timestamp: int,
++                     sensor_id: str,
++                     start_timestamp: Optional[int],
++                     end_timestamp: Optional[int],
++                     sensor_ids: Optional[Set[str]]) -> bool:
++    if start_timestamp is not None and timestamp < start_timestamp:
++        return False
++    if end_timestamp is not None and timestamp > end_timestamp:
++        return False
++    return sensor_ids is None or sensor_id in sensor_ids
++
++
++def _drop_empty(result: kapture.Kapture, attribute: str) -> None:
++    value = getattr(result, attribute)
++    if value is not None and not value:
++        setattr(result, attribute, None)
++
++
++def _prune_records(result: kapture.Kapture,
++                   start_timestamp: Optional[int],
++                   end_timestamp: Optional[int],
++                   sensor_ids: Optional[Set[str]],
++                   allowed_timestamps: Optional[Set[int]],
++                   image_ids: Optional[Set[str]]) -> Tuple[Set[str], Set[int]]:
++    retained_sensors = set()
++    retained_timestamps = set()
++    for attribute in RECORD_ATTRIBUTES:
++        records = getattr(result, attribute)
++        if records is None:
++            continue
++        for timestamp, sensor_id in list(records.key_pairs()):
++            selected = _record_selected(
++                timestamp, sensor_id, start_timestamp, end_timestamp, sensor_ids)
++            if allowed_timestamps is not None and timestamp not in allowed_timestamps:
++                selected = False
++            if attribute == 'records_camera' and image_ids is not None:
++                selected = selected and records[timestamp, sensor_id] in image_ids
++            if not selected:
++                del records[timestamp, sensor_id]
++        if records:
++            retained_sensors.update(records.sensors_ids)
++            retained_timestamps.update(records.keys())
++        else:
++            setattr(result, attribute, None)
++    return retained_sensors, retained_timestamps
++
++
++def _prune_sensor_graph(result: kapture.Kapture,
++                        sensor_ids: Set[str],
++                        timestamps: Set[int]) -> None:
++    if result.sensors is not None:
++        for sensor_id in list(result.sensors):
++            if sensor_id not in sensor_ids:
++                del result.sensors[sensor_id]
++
++    retained_rigs = set()
++    if result.rigs is not None:
++        required_nodes = set(sensor_ids)
++        changed = True
++        while changed:
++            changed = False
++            for rig_id, rig in result.rigs.items():
++                if rig_id not in required_nodes and any(member_id in required_nodes for member_id in rig):
++                    required_nodes.add(rig_id)
++                    retained_rigs.add(rig_id)
++                    changed = True
++        for rig_id in list(result.rigs):
++            if rig_id not in retained_rigs:
++                del result.rigs[rig_id]
++                continue
++            for member_id in list(result.rigs[rig_id]):
++                if member_id not in required_nodes:
++                    del result.rigs[rig_id][member_id]
++        _drop_empty(result, 'rigs')
++
++    if result.trajectories is not None:
++        allowed_ids = sensor_ids | retained_rigs
++        for timestamp, sensor_or_rig_id in list(result.trajectories.key_pairs()):
++            if timestamp not in timestamps or sensor_or_rig_id not in allowed_ids:
++                del result.trajectories[timestamp, sensor_or_rig_id]
++        _drop_empty(result, 'trajectories')
++
++
++def _prune_image_relations(result: kapture.Kapture, retained_images: Set[str]) -> None:
++    for attribute in ('keypoints', 'descriptors', 'global_features'):
++        collection = getattr(result, attribute)
++        if collection is None:
++            continue
++        for feature_type in list(collection):
++            collection[feature_type].intersection_update(retained_images)
++            if not collection[feature_type]:
++                del collection[feature_type]
++        _drop_empty(result, attribute)
++
++    if result.matches is not None:
++        for feature_type in list(result.matches):
++            rejected = {pair for pair in result.matches[feature_type]
++                        if pair[0] not in retained_images or pair[1] not in retained_images}
++            result.matches[feature_type].difference_update(rejected)
++            if not result.matches[feature_type]:
++                del result.matches[feature_type]
++        _drop_empty(result, 'matches')
++
++
++def _compact_reconstruction(result: kapture.Kapture, retained_images: Set[str]) -> None:
++    if result.points3d is None or result.observations is None:
++        result.points3d = None
++        result.observations = None
++        return
++    retained_keypoint_types = set(result.keypoints or {})
++    source_points = result.points3d
++    source_observations = result.observations
++    retained = []
++    for old_point_id in range(len(source_points)):
++        per_type = {}
++        for feature_type, observations in source_observations.get(old_point_id, {}).items():
++            if feature_type not in retained_keypoint_types:
++                continue
++            values = [(image_id, keypoint_id) for image_id, keypoint_id in observations
++                      if image_id in retained_images]
++            if values:
++                per_type[feature_type] = values
++        if per_type:
++            retained.append((old_point_id, per_type))
++
++    if not retained:
++        result.points3d = None
++        result.observations = None
++        return
++    indices = np.fromiter((old_id for old_id, _ in retained), dtype=np.int64)
++    result.points3d = kapture.Points3d(np.array(source_points[indices], copy=True))
++    observations = kapture.Observations()
++    for new_point_id, (_, per_type) in enumerate(retained):
++        for feature_type, values in per_type.items():
++            for image_id, keypoint_id in values:
++                observations.add(new_point_id, feature_type, image_id, keypoint_id)
++    result.observations = observations
++
++
++def subset_kapture(kapture_data: kapture.Kapture,
++                   start_timestamp: Optional[int] = None,
++                   end_timestamp: Optional[int] = None,
++                   sensor_ids: Optional[Iterable[str]] = None,
++                   image_ids: Optional[Iterable[str]] = None) -> kapture.Kapture:
++    """Deep-copy and prune a kapture model to the requested inclusive bounds."""
++    if start_timestamp is not None and end_timestamp is not None and start_timestamp > end_timestamp:
++        raise ValueError('start_timestamp must not exceed end_timestamp')
++    selected_sensors = (None if sensor_ids is None else
++                        ({sensor_ids} if isinstance(sensor_ids, str) else set(sensor_ids)))
++    selected_images = (None if image_ids is None else
++                       ({image_ids} if isinstance(image_ids, str) else set(image_ids)))
++    unknown = set() if selected_sensors is None else selected_sensors - set(kapture_data.sensors or {})
++    if unknown:
++        raise ValueError(f'unknown sensor identifiers: {sorted(unknown)}')
++    available_images = set(kapture_data.records_camera.data_list()) if kapture_data.records_camera else set()
++    unknown_images = set() if selected_images is None else selected_images - available_images
++    if unknown_images:
++        raise ValueError(f'unknown image identifiers: {sorted(unknown_images)}')
++
++    result = copy.deepcopy(kapture_data)
++    if (start_timestamp is None and end_timestamp is None
++            and selected_sensors is None and selected_images is None):
++        return result
++    image_timestamps = None
++    if selected_images is not None:
++        image_timestamps = set()
++        if kapture_data.records_camera is not None:
++            for timestamp, sensor_id in kapture_data.records_camera.key_pairs():
++                if (_record_selected(timestamp, sensor_id, start_timestamp,
++                                     end_timestamp, selected_sensors)
++                        and kapture_data.records_camera[timestamp, sensor_id] in selected_images):
++                    image_timestamps.add(timestamp)
++    retained_sensors, timestamps = _prune_records(
++        result, start_timestamp, end_timestamp, selected_sensors,
++        image_timestamps, selected_images)
++    _prune_sensor_graph(result, retained_sensors, timestamps)
++    retained_images = set(result.records_camera.data_list()) if result.records_camera is not None else set()
++    _prune_image_relations(result, retained_images)
++    _compact_reconstruction(result, retained_images)
++    return result
++
++
++def _payload_jobs(result: kapture.Kapture) -> Iterator[PayloadJob]:
++    for attribute, data_type in COLLECTION_TYPES.items():
++        collection = getattr(result, attribute)
++        if collection is None:
++            continue
++        for feature_type, entries in collection.items():
++            for key in entries:
++                yield PayloadJob(data_type, feature_type, key, entries)
++
++
++def _feature_path(job: PayloadJob, root: str, handler: Optional[TarHandler]):
++    if job.data_type == kapture.Matches:
++        return kapture.io.features.get_matches_fullpath(job.key, job.feature_type, root, handler)
++    return kapture.io.features.get_features_fullpath(job.data_type, job.feature_type, root, job.key, handler)
++
++
++def _read_payload(job: PayloadJob, filepath):
++    if job.data_type == kapture.Matches:
++        return kapture.io.features.image_matches_from_file(filepath)
++    if isinstance(filepath, str):
++        return np.fromfile(filepath, dtype=job.metadata.dtype).reshape((-1, job.metadata.dsize))
++    return filepath[1].get_array_from_tar(filepath[0], job.metadata.dtype, job.metadata.dsize)
++
++
++def _write_payload(job: PayloadJob, filepath, values) -> None:
++    if job.data_type == kapture.Matches:
++        kapture.io.features.image_matches_to_file(filepath, values)
++    elif isinstance(filepath, str):
++        os.makedirs(path.dirname(filepath), exist_ok=True)
++        values.tofile(filepath)
++    else:
++        filepath[1].add_array_to_tar(filepath[0], values)
++
++
++def _copy_record_files(source_path: str, output_path: str, result: kapture.Kapture) -> None:
++    source_root = get_record_fullpath(source_path)
++    output_root = get_record_fullpath(output_path)
++    filenames = {
++        filename
++        for attribute in FILE_RECORD_ATTRIBUTES
++        if getattr(result, attribute) is not None
++        for filename in getattr(result, attribute).data_list()
++    }
++    for filename in sorted(filenames):
++        destination = path.join(output_root, filename)
++        os.makedirs(path.dirname(destination), exist_ok=True)
++        shutil.copy2(path.join(source_root, filename), destination)
++
++
++def _copy_feature_files(source_path: str,
++                        output_path: str,
++                        result: kapture.Kapture,
++                        source_tars: TarCollection) -> None:
++    output_tars: Dict[Tuple[Type, str], TarHandler] = {}
++    try:
++        for job in _payload_jobs(result):
++            source_handler = retrieve_tar_handler_from_collection(
++                job.data_type, job.feature_type, source_tars)
++            output_handler = None
++            if source_handler is not None:
++                key = (job.data_type, job.feature_type)
++                if key not in output_tars:
++                    tar_path = get_feature_tar_fullpath(job.data_type, job.feature_type, output_path)
++                    os.makedirs(path.dirname(tar_path), exist_ok=True)
++                    output_tars[key] = TarHandler(tar_path, 'a')
++                output_handler = output_tars[key]
++            values = _read_payload(job, _feature_path(job, source_path, source_handler))
++            _write_payload(job, _feature_path(job, output_path, output_handler), values)
++    finally:
++        for handler in output_tars.values():
++            handler.close()
++
++
++def _handler_map(data_type: Type, handlers: TarCollection):
++    return {
++        kapture.Keypoints: handlers.keypoints,
++        kapture.Descriptors: handlers.descriptors,
++        kapture.GlobalFeatures: handlers.global_features,
++        kapture.Matches: handlers.matches,
++    }[data_type]
++
++
++def _owned_paths(root: str, data: kapture.Kapture, handlers: TarCollection) -> Set[str]:
++    owned = {
++        path.normpath(filename)
++        for filename in CSV_FILENAMES.values()
++        if path.lexists(path.join(root, filename))
++    }
++    for attribute in FILE_RECORD_ATTRIBUTES:
++        records = getattr(data, attribute)
++        if records is None:
++            continue
++        for filename in records.data_list():
++            relative = get_record_fullpath('', filename)
++            if path.lexists(path.join(root, relative)):
++                owned.add(path.normpath(relative))
++
++    for attribute, data_type in COLLECTION_TYPES.items():
++        collection = getattr(data, attribute) or {}
++        tar_map = _handler_map(data_type, handlers)
++        for feature_type in set(collection) | set(tar_map):
++            if data_type in FEATURES_CSV_FILENAMES:
++                config = get_feature_csv_fullpath(data_type, feature_type)
++                if path.lexists(path.join(root, config)):
++                    owned.add(path.normpath(config))
++            if feature_type in tar_map:
++                archive = get_feature_tar_fullpath(data_type, feature_type)
++                if path.lexists(path.join(root, archive)):
++                    owned.add(path.normpath(archive))
++                continue
++            entries = collection.get(feature_type)
++            if entries is None:
++                continue
++            for key in entries:
++                relative = _feature_path(
++                    PayloadJob(data_type, feature_type, key, entries), '', None)
++                if path.lexists(path.join(root, relative)):
++                    owned.add(path.normpath(relative))
++    return owned
++
++
++def _copy_unowned_files(source_root: str,
++                        destination_root: str,
++                        owned: Set[str]) -> None:
++    for directory, _, filenames in os.walk(source_root):
++        for filename in filenames:
++            source = path.join(directory, filename)
++            relative = path.normpath(path.relpath(source, source_root))
++            if relative in owned:
++                continue
++            destination = path.join(destination_root, relative)
++            if path.lexists(destination):
++                continue
++            os.makedirs(path.dirname(destination), exist_ok=True)
++            shutil.copy2(source, destination, follow_symlinks=False)
++
++
++def subset_kapture_from_dir(source_path: str,
++                            output_path: str,
++                            start_timestamp: Optional[int] = None,
++                            end_timestamp: Optional[int] = None,
++                            sensor_ids: Optional[Iterable[str]] = None,
++                            image_ids: Optional[Iterable[str]] = None,
++                            force: bool = False) -> kapture.Kapture:
++    """Save a self-contained subset, preserving directory/tar producer modes."""
++    source_path = path.realpath(path.abspath(source_path))
++    output_path = path.realpath(path.abspath(output_path))
++    if source_path == output_path:
++        raise ValueError('source and output paths must be different')
++    if path.lexists(output_path) and not path.isdir(output_path):
++        raise ValueError('output path must be a directory')
++
++    output_parent = path.dirname(output_path)
++    os.makedirs(output_parent, exist_ok=True)
++    transaction_root = tempfile.mkdtemp(prefix='.kapture-subset-', dir=output_parent)
++    staged_path = path.join(transaction_root, 'staged')
++    candidate_path = path.join(transaction_root, 'candidate')
++    backup_path = path.join(transaction_root, 'backup')
++    output_existed = path.isdir(output_path)
++    try:
++        old_owned = set()
++        if output_existed:
++            with get_all_tar_handlers(output_path) as output_tars:
++                old_data = kapture_from_dir(output_path, tar_handlers=output_tars)
++                old_owned = _owned_paths(output_path, old_data, output_tars)
++            if old_owned and not force:
++                raise ValueError('output already contains kapture data; use force to replace it')
++
++        with get_all_tar_handlers(source_path) as source_tars:
++            source = kapture_from_dir(source_path, tar_handlers=source_tars)
++            result = subset_kapture(source, start_timestamp, end_timestamp,
++                                    sensor_ids, image_ids)
++            kapture_to_dir(staged_path, result)
++            _copy_record_files(source_path, staged_path, result)
++            _copy_feature_files(source_path, staged_path, result, source_tars)
++
++        if not output_existed:
++            os.replace(staged_path, output_path)
++            return result
++
++        shutil.copytree(staged_path, candidate_path, symlinks=True)
++        _copy_unowned_files(output_path, candidate_path, old_owned)
++        os.replace(output_path, backup_path)
++        try:
++            os.replace(candidate_path, output_path)
++        except Exception:
++            os.replace(backup_path, output_path)
++            raise
++        shutil.rmtree(backup_path, ignore_errors=True)
++        return result
++    finally:
++        shutil.rmtree(transaction_root, ignore_errors=True)
+diff --git a/tools/kapture_subset.py b/tools/kapture_subset.py
+new file mode 100644
+index 0000000..e66aa55
+--- /dev/null
++++ b/tools/kapture_subset.py
+@@ -0,0 +1,27 @@
++#!/usr/bin/env python3
++# Copyright 2020-present NAVER Corp. Under BSD 3-clause license
++
++import argparse
++
++from kapture.algo.subset import subset_kapture_from_dir
++
++
++def subset_command_line() -> None:
++    parser = argparse.ArgumentParser(description='create a self-contained subset of a kapture dataset')
++    parser.add_argument('-i', '--input', required=True)
++    parser.add_argument('-o', '--output', required=True)
++    parser.add_argument('--start-timestamp', type=int)
++    parser.add_argument('--end-timestamp', type=int)
++    parser.add_argument('--sensor', dest='sensors', action='append')
++    parser.add_argument('--image', dest='images', action='append')
++    parser.add_argument('-f', '-y', '--force', action='store_true')
++    arguments = parser.parse_args()
++    subset_kapture_from_dir(
++        arguments.input, arguments.output,
++        arguments.start_timestamp, arguments.end_timestamp,
++        arguments.sensors, arguments.images, arguments.force,
++    )
++
++
++if __name__ == '__main__':
++    subset_command_line()
+

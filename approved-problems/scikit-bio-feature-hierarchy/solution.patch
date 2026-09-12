@@ -1,0 +1,967 @@
+diff --git a/skbio/metadata/__init__.py b/skbio/metadata/__init__.py
+index 89c9abf72..c1591c2fe 100644
+--- a/skbio/metadata/__init__.py
++++ b/skbio/metadata/__init__.py
+@@ -41,6 +41,16 @@ Interval metadata
+    IntervalMetadata
+ 
+ 
++Feature hierarchy
++-----------------
++
++.. autosummary::
++   :toctree: generated/
++
++   Feature
++   FeatureModel
++
++
+ Abstract classes
+ ----------------
+ 
+@@ -67,6 +77,7 @@ from ._metadata import (
+     NumericMetadataColumn,
+     CategoricalMetadataColumn,
+ )
++from ._feature import Feature, FeatureModel
+ from ._interval import Interval, IntervalMetadata
+ from ._mixin import (
+     MetadataMixin,
+@@ -81,6 +92,8 @@ __all__ = [
+     "CategoricalMetadataColumn",
+     "Interval",
+     "IntervalMetadata",
++    "Feature",
++    "FeatureModel",
+     "MetadataMixin",
+     "PositionalMetadataMixin",
+     "IntervalMetadataMixin",
+diff --git a/skbio/metadata/_feature.py b/skbio/metadata/_feature.py
+new file mode 100644
+index 000000000..5adf2dc59
+--- /dev/null
++++ b/skbio/metadata/_feature.py
+@@ -0,0 +1,847 @@
++# ----------------------------------------------------------------------------
++# Copyright (c) 2013--, scikit-bio development team.
++#
++# Distributed under the terms of the Modified BSD License.
++#
++# The full license is in the file LICENSE.txt, distributed with this software.
++# ----------------------------------------------------------------------------
++
++from __future__ import annotations
++
++import pandas as pd
++
++from .._base import SkbioObject
++
++
++def _merge_bounds(bounds):
++    """Reduce bounds to ascending, maximal, non-overlapping spans."""
++    merged = []
++    for start, end in sorted(bounds):
++        if merged and start <= merged[-1][1]:
++            if end > merged[-1][1]:
++                merged[-1][1] = end
++        else:
++            merged.append([start, end])
++    return tuple((start, end) for start, end in merged)
++
++
++def _merge_fuzzy(bounds, sources):
++    """Carry the openness of the source bounds onto the merged spans."""
++    return tuple(
++        (
++            any(fuzzy[0] for bound, fuzzy in sources if bound[0] == start),
++            any(fuzzy[1] for bound, fuzzy in sources if bound[1] == end),
++        )
++        for start, end in bounds
++    )
++
++
++class Feature(SkbioObject):
++    r"""A single annotated feature of a sequence.
++
++    A feature is built from the ``Interval`` objects that share an identifier,
++    and it is linked to the features that name it as their parent. Features
++    are not constructed directly; they are obtained from a ``FeatureModel``.
++
++    See Also
++    --------
++    FeatureModel
++    skbio.metadata.IntervalMetadata.hierarchy
++
++    """
++
++    def __init__(self, id, type, strand, bounds, phase, fuzzy, stated, model):
++        self._model = model
++        self._id = id
++        self._type = type
++        self._strand = strand
++        self._bounds = bounds
++        self._phase = phase
++        self._fuzzy = fuzzy
++        self._stated = stated
++        self._parents = ()
++        self._children = ()
++
++    @property
++    def id(self):
++        r"""Identifier of the feature, or ``None`` if it has none."""
++        return self._id
++
++    @property
++    def type(self):
++        r"""Type of the feature, such as "gene", "exon" or "CDS"."""
++        return self._type
++
++    @property
++    def strand(self):
++        r"""Strand the feature is annotated on, "+" or "-"."""
++        return self._strand
++
++    @property
++    def phase(self):
++        r"""Number of bases skipped at the 5' end before translation."""
++        return self._phase
++
++    @property
++    def bounds(self):
++        r"""Own coordinates of the feature, ascending and non-overlapping."""
++        return self._bounds
++
++    @property
++    def partial(self):
++        r"""Whether the 5' and the 3' end of the feature are unknown."""
++        lower, upper = self._fuzzy[0][0], self._fuzzy[-1][1]
++        return (upper, lower) if self._strand == "-" else (lower, upper)
++
++    @property
++    def parents(self):
++        r"""Features that this feature names as its parent."""
++        return self._parents
++
++    @property
++    def children(self):
++        r"""Features that name this feature as their parent."""
++        return self._children
++
++    @property
++    def spans(self):
++        r"""Coordinates that the feature covers.
++
++        These are the bounds of its children when it has any, and its own
++        bounds otherwise, reduced to ascending, non-overlapping spans.
++
++        """
++        if not self._children:
++            return self._bounds
++        return _merge_bounds(
++            [bound for child in self._children for bound in child.bounds]
++        )
++
++    @property
++    def length(self):
++        r"""Total number of positions that the feature covers."""
++        return sum(end - start for start, end in self.spans)
++
++    @property
++    def introns(self):
++        r"""Gaps between the consecutive spans of the feature."""
++        spans = self.spans
++        return tuple((spans[i][1], spans[i + 1][0]) for i in range(len(spans) - 1))
++
++    @property
++    def utrs(self):
++        r"""Spans of the feature that flank its coding part.
++
++        Returns
++        -------
++        tuple of tuple
++            The spans that precede and the spans that follow the coding part
++            of the feature, each ascending.
++
++        """
++        coding = []
++        for descendant in self._descendants():
++            if descendant.type == "CDS":
++                coding.extend(descendant.bounds)
++        offsets = []
++        for coding_start, coding_end in _merge_bounds(coding):
++            for start, end in self.spans:
++                lower = max(coding_start, start)
++                upper = min(coding_end, end)
++                if lower < upper:
++                    offsets.append(self.position(lower))
++                    offsets.append(self.position(upper - 1))
++        if not offsets:
++            return ((), ())
++        return (
++            self._offset_slice(0, min(offsets)),
++            self._offset_slice(max(offsets) + 1, self.length),
++        )
++
++    @property
++    def parts(self):
++        r"""Spans of the feature with the phase of each of them.
++
++        Returns
++        -------
++        tuple of tuple
++            The spans in transcription order, each followed by the number of
++            bases that separate its start from the first codon that begins
++            within it.
++
++        """
++        parts = []
++        preceding = 0
++        for start, end in self._ordered_spans():
++            parts.append((start, end, (self._phase - preceding) % 3))
++            preceding += end - start
++        return tuple(parts)
++
++    def codon(self, index):
++        r"""Locate the bases of a codon of the feature.
++
++        Parameters
++        ----------
++        index : int
++            Index of the codon within the feature.
++
++        Returns
++        -------
++        tuple of int
++            Coordinates of the three bases of the codon, in transcription
++            order.
++
++        Raises
++        ------
++        IndexError
++            If the feature does not hold a complete codon at that index.
++
++        See Also
++        --------
++        residue
++
++        """
++        offset = self._phase + 3 * index
++        if index < 0 or offset + 3 > self.length:
++            raise IndexError(
++                "Codon %r falls outside a feature of length %r."
++                % (index, self.length)
++            )
++        return tuple(self.coordinate(offset + shift) for shift in range(3))
++
++    def residue(self, coordinate):
++        r"""Locate the codon that a coordinate contributes to.
++
++        Parameters
++        ----------
++        coordinate : int
++            Coordinate on the annotated sequence.
++
++        Returns
++        -------
++        tuple of int or None
++            Index of the codon and the offset of the coordinate within it, or
++            ``None`` if the coordinate is not part of a complete codon.
++
++        See Also
++        --------
++        codon
++
++        """
++        offset = self.position(coordinate)
++        if offset is None or offset < self._phase:
++            return None
++        offset -= self._phase
++        if offset >= (self.length - self._phase) // 3 * 3:
++            return None
++        return (offset // 3, offset % 3)
++
++    def _descendants(self):
++        """Yield every feature below this one."""
++        pending = list(self._children)
++        while pending:
++            feature = pending.pop(0)
++            yield feature
++            pending.extend(feature.children)
++
++    def _ordered_spans(self):
++        """Return the spans of the feature in transcription order."""
++        spans = self.spans
++        if self._strand == "-":
++            return tuple(reversed(spans))
++        return spans
++
++    def _offset_slice(self, start, stop):
++        """Convert a range of offsets into ascending coordinates."""
++        if start >= stop:
++            return ()
++        sliced = []
++        offset = 0
++        for span_start, span_end in self._ordered_spans():
++            size = span_end - span_start
++            lower = max(start, offset) - offset
++            upper = min(stop, offset + size) - offset
++            if lower < upper:
++                if self._strand == "-":
++                    sliced.append((span_end - upper, span_end - lower))
++                else:
++                    sliced.append((span_start + lower, span_start + upper))
++            offset += size
++        return tuple(sorted(sliced))
++
++    def position(self, coordinate):
++        r"""Convert a coordinate into an offset within the feature.
++
++        Parameters
++        ----------
++        coordinate : int
++            Coordinate on the annotated sequence.
++
++        Returns
++        -------
++        int or None
++            Offset of the coordinate within the feature, or ``None`` if the
++            feature does not cover the coordinate.
++
++        See Also
++        --------
++        coordinate
++
++        """
++        offset = 0
++        for start, end in self._ordered_spans():
++            if start <= coordinate < end:
++                if self._strand == "-":
++                    return offset + end - 1 - coordinate
++                return offset + coordinate - start
++            offset += end - start
++        return None
++
++    def coordinate(self, position):
++        r"""Convert an offset within the feature into a coordinate.
++
++        Parameters
++        ----------
++        position : int
++            Offset within the feature.
++
++        Returns
++        -------
++        int
++            Coordinate on the annotated sequence.
++
++        Raises
++        ------
++        IndexError
++            If the offset falls outside the feature.
++
++        See Also
++        --------
++        position
++
++        """
++        if position >= 0:
++            offset = position
++            for start, end in self._ordered_spans():
++                size = end - start
++                if offset < size:
++                    if self._strand == "-":
++                        return end - 1 - offset
++                    return start + offset
++                offset -= size
++        raise IndexError(
++            "Position %r falls outside a feature of length %r."
++            % (position, self.length)
++        )
++
++    def spliced(self, sequence=None):
++        r"""Extract the sequence of the feature.
++
++        Parameters
++        ----------
++        sequence : Sequence, optional
++            The annotated sequence. Defaults to the sequence the model was
++            built from.
++
++        Returns
++        -------
++        Sequence
++            The spans of the feature joined in transcription order.
++
++        Raises
++        ------
++        ValueError
++            If no sequence is given and the model has none.
++
++        """
++        sequence = self._model._resolve(sequence)
++        parts = [sequence[start:end] for start, end in self.spans]
++        joined = type(sequence).concat(parts)
++        if self._strand == "-":
++            return joined.reverse_complement()
++        return joined
++
++    def protein(self, sequence=None, genetic_code=1):
++        r"""Translate the sequence of the feature.
++
++        Parameters
++        ----------
++        sequence : Sequence, optional
++            The annotated sequence. Defaults to the sequence the model was
++            built from.
++        genetic_code : int, optional
++            Table ID of the NCBI genetic code to translate with.
++
++        Returns
++        -------
++        Protein
++            The translated sequence of the feature.
++
++        See Also
++        --------
++        spliced
++
++        """
++        return self.spliced(sequence)[self._phase :].translate(genetic_code)
++
++    def __str__(self):
++        return "%s %s" % (self._type, "." if self._id is None else self._id)
++
++    def __repr__(self):
++        spans = ", ".join("%d-%d" % span for span in self.spans)
++        return "<Feature: %s (%s) %s>" % (self.__str__(), self._strand, spans)
++
++
++class FeatureModel(SkbioObject):
++    r"""A hierarchy of the features annotated on a sequence.
++
++    Parameters
++    ----------
++    interval_metadata : IntervalMetadata
++        Interval metadata to build the hierarchy from.
++
++    See Also
++    --------
++    Feature
++    skbio.metadata.IntervalMetadata.hierarchy
++
++    """
++
++    def __init__(self, interval_metadata, sequence=None):
++        self._upper_bound = interval_metadata.upper_bound
++        self._sequence = sequence
++        grouped = {}
++        anonymous = []
++        for interval in interval_metadata.query():
++            identifier = interval.metadata.get("ID")
++            if identifier is None:
++                anonymous.append([interval])
++            else:
++                grouped.setdefault(identifier, []).append(interval)
++
++        self._features = {}
++        parented = []
++        for intervals in list(grouped.values()) + anonymous:
++            feature = self._build(intervals)
++            parented.append((feature, self._parents_of(intervals)))
++            if feature.id is not None:
++                self._features[feature.id] = feature
++
++        children = {identifier: [] for identifier in self._features}
++        for feature, names in parented:
++            resolved = []
++            for name in names:
++                if name not in self._features:
++                    raise ValueError(
++                        "Feature %r names an unknown parent %r." % (feature.id, name)
++                    )
++                resolved.append(self._features[name])
++                children[name].append(feature)
++            feature._parents = tuple(resolved)
++        for feature, _ in parented:
++            if feature.id is not None:
++                feature._children = tuple(children[feature.id])
++
++        self._check_cycles([feature for feature, _ in parented])
++        for feature, _ in parented:
++            feature._parents = self._sorted(feature.parents)
++            feature._children = self._sorted(feature.children)
++        self._ordered = self._sorted(feature for feature, _ in parented)
++
++    @staticmethod
++    def _sorted(features):
++        """Order features by coordinate and then by identifier."""
++        return tuple(
++            sorted(
++                features,
++                key=lambda feature: (
++                    feature.spans[0][0],
++                    feature.spans[-1][1],
++                    feature.id or "",
++                ),
++            )
++        )
++
++    @staticmethod
++    def _parents_of(intervals):
++        """Collect the parents named by intervals sharing an identifier."""
++        names = []
++        for interval in intervals:
++            value = interval.metadata.get("Parent")
++            if value is None:
++                continue
++            for name in value.split(","):
++                if name not in names:
++                    names.append(name)
++        return names
++
++    def _build(self, intervals):
++        """Turn the intervals that share an identifier into one feature."""
++        identifier = intervals[0].metadata.get("ID")
++        types = {interval.metadata.get("type") for interval in intervals}
++        strands = {
++            "-" if interval.metadata.get("strand") == "-" else "+"
++            for interval in intervals
++        }
++        if len(types) > 1 or len(strands) > 1:
++            raise ValueError(
++                "Feature %r is described by intervals that disagree on their "
++                "type or strand." % identifier
++            )
++        strand = strands.pop()
++        bounds = _merge_bounds(
++            [bound for interval in intervals for bound in interval.bounds]
++        )
++        if strand == "-":
++            first = max(intervals, key=lambda interval: interval.bounds[-1][1])
++        else:
++            first = min(intervals, key=lambda interval: interval.bounds[0][0])
++        phase = first.metadata.get("phase")
++        if not isinstance(phase, int):
++            phase = 0
++        fuzzy = _merge_fuzzy(
++            bounds,
++            [
++                (bound, openness)
++                for interval in intervals
++                for bound, openness in zip(interval.bounds, interval.fuzzy)
++            ],
++        )
++        stated = {}
++        for interval in intervals:
++            value = interval.metadata.get("phase")
++            if isinstance(value, int):
++                for bound in interval.bounds:
++                    stated[bound] = value
++        return Feature(
++            identifier, types.pop(), strand, bounds, phase, fuzzy, stated, self
++        )
++
++    @staticmethod
++    def _check_cycles(features):
++        """Reject a feature that is its own ancestor."""
++        state = {}
++        for root in features:
++            if state.get(id(root)):
++                continue
++            state[id(root)] = 1
++            stack = [(root, iter(root.children))]
++            while stack:
++                feature, remaining = stack[-1]
++                child = next(remaining, None)
++                if child is None:
++                    state[id(feature)] = 2
++                    stack.pop()
++                elif state.get(id(child)) == 1:
++                    raise ValueError("Feature %r is its own ancestor." % child.id)
++                elif state.get(id(child)) != 2:
++                    state[id(child)] = 1
++                    stack.append((child, iter(child.children)))
++
++    @property
++    def roots(self):
++        r"""Features that name no parent."""
++        return tuple(feature for feature in self._ordered if not feature.parents)
++
++    def summary(self):
++        r"""Describe every feature of the model.
++
++        Returns
++        -------
++        pd.DataFrame
++            One row per feature, ordered by coordinate.
++
++        """
++        rows = []
++        for feature in self._ordered:
++            spans = feature.spans
++            if feature.type == "CDS":
++                coding = feature.bounds
++            else:
++                coding = _merge_bounds(
++                    [
++                        bound
++                        for descendant in feature._descendants()
++                        if descendant.type == "CDS"
++                        for bound in descendant.bounds
++                    ]
++                )
++            rows.append(
++                {
++                    "id": feature.id,
++                    "type": feature.type,
++                    "strand": feature.strand,
++                    "start": spans[0][0],
++                    "end": spans[-1][1],
++                    "spans": len(spans),
++                    "length": feature.length,
++                    "coding": sum(end - start for start, end in coding),
++                    "parents": ",".join(
++                        sorted(parent.id for parent in feature.parents)
++                    ),
++                    "children": len(feature.children),
++                }
++            )
++        return pd.DataFrame(
++            rows,
++            columns=[
++                "id",
++                "type",
++                "strand",
++                "start",
++                "end",
++                "spans",
++                "length",
++                "coding",
++                "parents",
++                "children",
++            ],
++        )
++
++    def check(self):
++        r"""Report the structural problems of the model.
++
++        Returns
++        -------
++        pd.DataFrame
++            One row per problem, ordered by feature and then by problem.
++
++        """
++        rows = []
++        for feature in self._ordered:
++            problems = set()
++            for parent in feature.parents:
++                if feature.strand != parent.strand:
++                    problems.add("strand")
++                for start, end in feature.bounds:
++                    if not any(
++                        outer <= start and end <= upper
++                        for outer, upper in parent.bounds
++                    ):
++                        problems.add("parent_span")
++            if feature.type == "CDS":
++                if not any(feature.partial) and (feature.length - feature.phase) % 3:
++                    problems.add("codon_length")
++                if not self._within_exons(feature):
++                    problems.add("cds_outside_exon")
++                for start, end, phase in feature.parts:
++                    if feature._stated.get((start, end), phase) != phase:
++                        problems.add("phase_conflict")
++            if self._overlaps_sibling(feature):
++                problems.add("sibling_overlap")
++            for problem in sorted(problems):
++                rows.append({"id": feature.id, "problem": problem})
++        return pd.DataFrame(rows, columns=["id", "problem"])
++
++    @staticmethod
++    def _within_exons(feature):
++        """Tell whether a coding feature stays inside the exons beside it."""
++        exons = []
++        for parent in feature.parents:
++            for sibling in parent.children:
++                if sibling.type == "exon":
++                    exons.extend(sibling.bounds)
++        if not exons:
++            return True
++        exons = _merge_bounds(exons)
++        return all(
++            any(lower <= start and end <= upper for lower, upper in exons)
++            for start, end in feature.bounds
++        )
++
++    def _overlaps_sibling(self, feature):
++        """Tell whether a feature overlaps a sibling of the same type."""
++        for parent in feature.parents:
++            for sibling in parent.children:
++                if sibling is feature or sibling.type != feature.type:
++                    continue
++                for start, end in feature.bounds:
++                    for other_start, other_end in sibling.bounds:
++                        if start < other_end and other_start < end:
++                            return True
++        return False
++
++    def _resolve(self, sequence):
++        """Fall back on the sequence that the model was built from."""
++        if sequence is None:
++            sequence = self._sequence
++        if sequence is None:
++            raise ValueError("This model was not built from a sequence.")
++        return sequence
++
++    def extract(self, start, end):
++        r"""Restrict the model to a region of the annotated sequence.
++
++        Parameters
++        ----------
++        start, end : int
++            Coordinates delimiting the region.
++
++        Returns
++        -------
++        IntervalMetadata
++            Interval features of the region, with their coordinates measured
++            from its start.
++
++        Raises
++        ------
++        ValueError
++            If the region is empty or reaches outside the annotated sequence.
++
++        """
++        from ._interval import IntervalMetadata
++
++        if start < 0 or start >= end:
++            raise ValueError("Cannot extract the region (%r, %r)." % (start, end))
++        if self._upper_bound is not None and end > self._upper_bound:
++            raise ValueError(
++                "The region (%r, %r) reaches beyond the upper bound %r."
++                % (start, end, self._upper_bound)
++            )
++        kept = {
++            feature.id
++            for feature in self._ordered
++            if feature.id is not None
++            and any(lower < end and start < upper for lower, upper in feature.bounds)
++        }
++        extracted = IntervalMetadata(end - start)
++        for feature in self._ordered:
++            phases = dict(
++                ((part[0], part[1]), part[2])
++                for part in (feature.parts if feature.type == "CDS" else ())
++            )
++            for (lower, upper), openness in zip(feature.bounds, feature._fuzzy):
++                if upper <= start or end <= lower:
++                    continue
++                clipped = (max(lower, start), min(upper, end))
++                metadata = self._describe(feature, kept)
++                if (lower, upper) in phases:
++                    if feature.strand == "-":
++                        removed = upper - clipped[1]
++                    else:
++                        removed = clipped[0] - lower
++                    metadata["phase"] = (phases[(lower, upper)] - removed) % 3
++                extracted.add(
++                    [(clipped[0] - start, clipped[1] - start)],
++                    fuzzy=[
++                        (
++                            openness[0] or clipped[0] > lower,
++                            openness[1] or clipped[1] < upper,
++                        )
++                    ],
++                    metadata=metadata,
++                )
++        return extracted
++
++    def reverse(self):
++        r"""Describe the model on the reverse complement of the sequence.
++
++        Returns
++        -------
++        IntervalMetadata
++            Interval features with mirrored coordinates and flipped strands.
++
++        Raises
++        ------
++        ValueError
++            If the length of the annotated sequence is unknown.
++
++        """
++        from ._interval import IntervalMetadata
++
++        if self._upper_bound is None:
++            raise ValueError("Cannot reverse a model of unknown length.")
++        reversed_ = IntervalMetadata(self._upper_bound)
++        for feature in self._ordered:
++            phases = dict(
++                ((part[0], part[1]), part[2])
++                for part in (feature.parts if feature.type == "CDS" else ())
++            )
++            for (start, end), openness in zip(feature.bounds, feature._fuzzy):
++                metadata = self._describe(feature)
++                metadata["strand"] = "-" if feature.strand == "+" else "+"
++                if (start, end) in phases:
++                    metadata["phase"] = phases[(start, end)]
++                reversed_.add(
++                    [(self._upper_bound - end, self._upper_bound - start)],
++                    fuzzy=[(openness[1], openness[0])],
++                    metadata=metadata,
++                )
++        return reversed_
++
++    @staticmethod
++    def _describe(feature, kept=None):
++        """Build the metadata that describes a feature."""
++        metadata = {"type": feature.type, "strand": feature.strand}
++        if feature.id is not None:
++            metadata["ID"] = feature.id
++        parents = sorted(
++            parent.id
++            for parent in feature.parents
++            if kept is None or parent.id in kept
++        )
++        if parents:
++            metadata["Parent"] = ",".join(parents)
++        return metadata
++
++    def to_interval_metadata(self, derived=False):
++        r"""Convert the model back into interval metadata.
++
++        Parameters
++        ----------
++        derived : bool, optional
++            Whether to also describe the introns and the untranslated regions
++            of every identified feature.
++
++        Returns
++        -------
++        IntervalMetadata
++            One interval feature per bound of every feature of the model.
++
++        """
++        from ._interval import IntervalMetadata
++
++        converted = IntervalMetadata(self._upper_bound)
++        for feature in self._ordered:
++            phases = {(start, end): phase for start, end, phase in feature.parts}
++            for (start, end), openness in zip(feature.bounds, feature._fuzzy):
++                metadata = self._describe(feature)
++                if feature.type == "CDS" and (start, end) in phases:
++                    metadata["phase"] = phases[(start, end)]
++                converted.add([(start, end)], fuzzy=[openness], metadata=metadata)
++        if derived:
++            for feature in self._ordered:
++                if feature.id is None:
++                    continue
++                for bound in feature.introns:
++                    self._add_derived(converted, feature, bound, "intron")
++                five, three = feature.utrs
++                for bound in five:
++                    self._add_derived(converted, feature, bound, "five_prime_UTR")
++                for bound in three:
++                    self._add_derived(converted, feature, bound, "three_prime_UTR")
++        return converted
++
++    @staticmethod
++    def _add_derived(converted, feature, bound, type):
++        """Add an interval feature that describes part of another feature."""
++        converted.add(
++            [bound],
++            metadata={
++                "type": type,
++                "strand": feature.strand,
++                "Parent": feature.id,
++            },
++        )
++
++    def __getitem__(self, identifier):
++        return self._features[identifier]
++
++    def __len__(self):
++        return len(self._ordered)
++
++    def __str__(self):
++        return "%d features" % len(self._ordered)
++
++    def __repr__(self):
++        return "<FeatureModel: %s>" % self.__str__()
+diff --git a/skbio/metadata/_interval.py b/skbio/metadata/_interval.py
+index 3cbfe0505..850b48d11 100644
+--- a/skbio/metadata/_interval.py
++++ b/skbio/metadata/_interval.py
+@@ -13,6 +13,7 @@ import copy
+ import functools
+ from typing import TYPE_CHECKING
+ 
++from ._feature import FeatureModel
+ from ._intersection import IntervalTree
+ from skbio.util._decorator import classonlymethod
+ from skbio.io.descriptors import Read, Write
+@@ -714,6 +715,25 @@ fuzzy=[(True, True)], metadata={'gene': 'sagB'})
+         for intvl in other._intervals:
+             self.add(intvl.bounds, intvl.fuzzy, intvl.metadata)
+ 
++    def hierarchy(self):
++        """Build a hierarchy of the interval features.
++
++        Interval features that share an identifier become one feature, and a
++        feature is linked to every feature it names as its parent.
++
++        Returns
++        -------
++        FeatureModel
++            The hierarchy of the interval features.
++
++        See Also
++        --------
++        skbio.metadata.Feature
++        skbio.metadata.FeatureModel
++
++        """
++        return FeatureModel(self)
++
+     def sort(self, ascending=True):
+         """Sort interval features by their coordinates.
+ 
+diff --git a/skbio/metadata/_mixin.py b/skbio/metadata/_mixin.py
+index 468da341f..141c0f4ae 100644
+--- a/skbio/metadata/_mixin.py
++++ b/skbio/metadata/_mixin.py
+@@ -11,7 +11,7 @@ from copy import copy, deepcopy
+ 
+ import pandas as pd
+ 
+-from skbio.metadata import IntervalMetadata
++from skbio.metadata import FeatureModel, IntervalMetadata
+ 
+ 
+ class MetadataMixin(metaclass=ABCMeta):
+@@ -513,6 +513,24 @@ class IntervalMetadataMixin(metaclass=ABCMeta):
+             and self.interval_metadata.num_interval_features > 0
+         )
+ 
++    def hierarchy(self):
++        """Build a hierarchy of the interval features of this object.
++
++        The object itself becomes the sequence that the features of the
++        hierarchy are read from.
++
++        Returns
++        -------
++        FeatureModel
++            The hierarchy of the interval features.
++
++        See Also
++        --------
++        skbio.metadata.IntervalMetadata.hierarchy
++
++        """
++        return FeatureModel(self.interval_metadata, sequence=self)
++
+     @abstractmethod
+     def __eq__(self, other):
+         raise NotImplementedError

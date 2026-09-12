@@ -1,0 +1,675 @@
+diff --git a/internal/compile/compile.go b/internal/compile/compile.go
+index 31f3f12..6b93984 100644
+--- a/internal/compile/compile.go
++++ b/internal/compile/compile.go
+@@ -46,7 +46,7 @@ var Disassemble = false
+ const debug = false // make code generation verbose, for debugging the compiler
+ 
+ // Increment this to force recompilation of saved bytecode files.
+-const Version = 14
++const Version = 15
+ 
+ type Opcode uint8
+ 
+@@ -104,6 +104,9 @@ const (
+ 	NOT          //          value NOT          bool
+ 	RETURN       //          value RETURN       -
+ 	SETINDEX     //        a i new SETINDEX     -
++	SETSLICE     // y x lo hi step SETSLICE     -      x[lo:hi:step] = y
++	DELINDEX     //            x i DELINDEX     -      del x[i]
++	DELSLICE     //   x lo hi step DELSLICE     -      del x[lo:hi:step]
+ 	INDEX        //            a i INDEX        elem
+ 	SETDICT      // dict key value SETDICT      -
+ 	SETDICTUNIQ  // dict key value SETDICTUNIQ  -
+@@ -163,6 +166,8 @@ var opcodeNames = [...]string{
+ 	CIRCUMFLEX:   "circumflex",
+ 	CJMP:         "cjmp",
+ 	CONSTANT:     "constant",
++	DELINDEX:     "delindex",
++	DELSLICE:     "delslice",
+ 	DUP2:         "dup2",
+ 	DUP:          "dup",
+ 	EQL:          "eql",
+@@ -209,6 +214,7 @@ var opcodeNames = [...]string{
+ 	SETFIELD:     "setfield",
+ 	SETGLOBAL:    "setglobal",
+ 	SETINDEX:     "setindex",
++	SETSLICE:     "setslice",
+ 	SETLOCAL:     "setlocal",
+ 	SETLOCALCELL: "setlocalcell",
+ 	SLASH:        "slash",
+@@ -238,6 +244,8 @@ var stackEffect = [...]int8{
+ 	CIRCUMFLEX:   -1,
+ 	CJMP:         -1,
+ 	CONSTANT:     +1,
++	DELINDEX:     -2,
++	DELSLICE:     -4,
+ 	DUP2:         +2,
+ 	DUP:          +1,
+ 	EQL:          -1,
+@@ -284,6 +292,7 @@ var stackEffect = [...]int8{
+ 	SETFIELD:     -2,
+ 	SETGLOBAL:    -1,
+ 	SETINDEX:     -3,
++	SETSLICE:     -5,
+ 	SETLOCAL:     -1,
+ 	SLASH:        -1,
+ 	SLASHSLASH:   -1,
+@@ -1090,6 +1099,11 @@ func (fcomp *fcomp) stmt(stmt syntax.Stmt) {
+ 
+ 		fcomp.block = done
+ 
++	case *syntax.DelStmt:
++		for _, target := range stmt.Targets {
++			fcomp.del(target)
++		}
++
+ 	case *syntax.AssignStmt:
+ 		switch stmt.Op {
+ 		case syntax.EQ:
+@@ -1278,11 +1292,59 @@ func (fcomp *fcomp) assign(pos syntax.Position, lhs syntax.Expr) {
+ 		fcomp.setPos(lhs.Dot)
+ 		fcomp.emit1(SETFIELD, fcomp.pcomp.nameIndex(lhs.Name.Name))
+ 
++	case *syntax.SliceExpr:
++		// x[lo:hi:step] = rhs (rhs is already on the stack)
++		fcomp.expr(lhs.X)
++		fcomp.sliceBounds(lhs.Lo, lhs.Hi, lhs.Step)
++		fcomp.setPos(lhs.Lbrack)
++		fcomp.emit(SETSLICE)
++
+ 	default:
+ 		panic(lhs)
+ 	}
+ }
+ 
++// sliceBounds emits code that pushes the lo, hi, and step operands of a slice,
++// substituting None for any that is absent.
++func (fcomp *fcomp) sliceBounds(lo, hi, step syntax.Expr) {
++	if lo != nil {
++		fcomp.expr(lo)
++	} else {
++		fcomp.emit(NONE)
++	}
++	if hi != nil {
++		fcomp.expr(hi)
++	} else {
++		fcomp.emit(NONE)
++	}
++	if step != nil {
++		fcomp.expr(step)
++	} else {
++		fcomp.emit(NONE)
++	}
++}
++
++// del emits code to delete a single target of a del statement. The resolver
++// guarantees the target is an index or slice expression.
++func (fcomp *fcomp) del(target syntax.Expr) {
++	switch e := unparen(target).(type) {
++	case *syntax.IndexExpr:
++		fcomp.expr(e.X)
++		fcomp.expr(e.Y)
++		fcomp.setPos(e.Lbrack)
++		fcomp.emit(DELINDEX)
++
++	case *syntax.SliceExpr:
++		fcomp.expr(e.X)
++		fcomp.sliceBounds(e.Lo, e.Hi, e.Step)
++		fcomp.setPos(e.Lbrack)
++		fcomp.emit(DELSLICE)
++
++	default:
++		panic(e)
++	}
++}
++
+ func (fcomp *fcomp) assignSequence(pos syntax.Position, lhs []syntax.Expr) {
+ 	fcomp.setPos(pos)
+ 	fcomp.emit1(UNPACK, uint32(len(lhs)))
+diff --git a/resolve/resolve.go b/resolve/resolve.go
+index 4d046b3..4cfc846 100644
+--- a/resolve/resolve.go
++++ b/resolve/resolve.go
+@@ -527,6 +527,11 @@ func (r *resolver) stmt(stmt syntax.Stmt) {
+ 		isAugmented := stmt.Op != syntax.EQ
+ 		r.assign(stmt.LHS, isAugmented)
+ 
++	case *syntax.DelStmt:
++		for _, target := range stmt.Targets {
++			r.del(target)
++		}
++
+ 	case *syntax.DefStmt:
+ 		r.bind(stmt.Name)
+ 		fn := &Function{
+@@ -619,6 +624,22 @@ func (r *resolver) assign(lhs syntax.Expr, isAugmented bool) {
+ 		// x.f = ...
+ 		r.expr(lhs.X)
+ 
++	case *syntax.SliceExpr:
++		// x[i:j] = ...
++		if isAugmented {
++			r.errorf(syntax.Start(lhs), "can't use slice expression in augmented assignment")
++		}
++		r.expr(lhs.X)
++		if lhs.Lo != nil {
++			r.expr(lhs.Lo)
++		}
++		if lhs.Hi != nil {
++			r.expr(lhs.Hi)
++		}
++		if lhs.Step != nil {
++			r.expr(lhs.Step)
++		}
++
+ 	case *syntax.TupleExpr:
+ 		// (x, y) = ...
+ 		if isAugmented {
+@@ -646,6 +667,41 @@ func (r *resolver) assign(lhs syntax.Expr, isAugmented bool) {
+ 	}
+ }
+ 
++// del resolves a single target of a del statement. Only index and slice
++// targets are deletable; a bare variable or field is rejected.
++func (r *resolver) del(target syntax.Expr) {
++	switch e := target.(type) {
++	case *syntax.ParenExpr:
++		r.del(e.X)
++
++	case *syntax.IndexExpr:
++		r.expr(e.X)
++		r.expr(e.Y)
++
++	case *syntax.SliceExpr:
++		r.expr(e.X)
++		if e.Lo != nil {
++			r.expr(e.Lo)
++		}
++		if e.Hi != nil {
++			r.expr(e.Hi)
++		}
++		if e.Step != nil {
++			r.expr(e.Step)
++		}
++
++	case *syntax.Ident:
++		r.errorf(e.NamePos, "cannot delete variable %s", e.Name)
++
++	case *syntax.DotExpr:
++		r.errorf(syntax.Start(e), "cannot delete field %s", e.Name.Name)
++
++	default:
++		name := strings.ToLower(strings.TrimPrefix(fmt.Sprintf("%T", e), "*syntax."))
++		r.errorf(syntax.Start(e), "cannot delete %s", name)
++	}
++}
++
+ func (r *resolver) expr(e syntax.Expr) {
+ 	switch e := e.(type) {
+ 	case *syntax.Ident:
+diff --git a/starlark/eval.go b/starlark/eval.go
+index c50f079..4ddc6eb 100644
+--- a/starlark/eval.go
++++ b/starlark/eval.go
+@@ -1256,29 +1256,36 @@ func slice(x, lo, hi, step_ Value) (Value, error) {
+ 		return nil, fmt.Errorf("invalid slice operand %s", x.Type())
+ 	}
+ 
+-	n := sliceable.Len()
+-	step := 1
++	// TODO(adonovan): opt: preallocate result array.
++
++	start, end, step, err := sliceIndices(sliceable.Len(), lo, hi, step_)
++	if err != nil {
++		return nil, err
++	}
++	return sliceable.Slice(start, end, step), nil
++}
++
++// sliceIndices resolves the bounds of the slice [lo:hi:step] against a sequence
++// of length n, applying the same negative-index handling, clamping, empty-slice
++// normalization, and zero-step rejection as the slice read path.
++func sliceIndices(n int, lo, hi, step_ Value) (start, end, step int, err error) {
++	step = 1
+ 	if step_ != None {
+-		var err error
+ 		step, err = AsInt32(step_)
+ 		if err != nil {
+-			return nil, fmt.Errorf("invalid slice step: %s", err)
++			return 0, 0, 0, fmt.Errorf("invalid slice step: %s", err)
+ 		}
+ 		if step == 0 {
+-			return nil, fmt.Errorf("zero is not a valid slice step")
++			return 0, 0, 0, fmt.Errorf("zero is not a valid slice step")
+ 		}
+ 	}
+ 
+-	// TODO(adonovan): opt: preallocate result array.
+-
+-	var start, end int
+ 	if step > 0 {
+ 		// positive stride
+ 		// default indices are [0:n].
+-		var err error
+ 		start, end, err = indices(lo, hi, n)
+ 		if err != nil {
+-			return nil, err
++			return 0, 0, 0, err
+ 		}
+ 
+ 		if end < start {
+@@ -1291,7 +1298,7 @@ func slice(x, lo, hi, step_ Value) (Value, error) {
+ 		// [n-1:-1-n:-1] because of the treatment of -ve values.
+ 		start = n - 1
+ 		if err := asIndex(lo, n, &start); err != nil {
+-			return nil, fmt.Errorf("invalid start index: %s", err)
++			return 0, 0, 0, fmt.Errorf("invalid start index: %s", err)
+ 		}
+ 		if start >= n {
+ 			start = n - 1
+@@ -1299,7 +1306,7 @@ func slice(x, lo, hi, step_ Value) (Value, error) {
+ 
+ 		end = -1
+ 		if err := asIndex(hi, n, &end); err != nil {
+-			return nil, fmt.Errorf("invalid end index: %s", err)
++			return 0, 0, 0, fmt.Errorf("invalid end index: %s", err)
+ 		}
+ 		if end < -1 {
+ 			end = -1
+@@ -1310,7 +1317,86 @@ func slice(x, lo, hi, step_ Value) (Value, error) {
+ 		}
+ 	}
+ 
+-	return sliceable.Slice(start, end, step), nil
++	return start, end, step, nil
++}
++
++// setSlice implements slice assignment x[lo:hi:step] = y, where x must be a
++// mutable list and y is any iterable whose elements replace the selected slice.
++func setSlice(x, lo, hi, step, y Value) error {
++	list, ok := x.(*List)
++	if !ok {
++		return fmt.Errorf("can only assign to a slice of a list, not %s", x.Type())
++	}
++	rhs, err := iterableToSlice(y)
++	if err != nil {
++		return err
++	}
++	return list.SetSlice(lo, hi, step, rhs)
++}
++
++// delIndex implements del x[i]: it removes the element at index i of a list
++// (shifting later elements down) or the key i of a dict.
++func delIndex(x, y Value) error {
++	switch x := x.(type) {
++	case *List:
++		n := x.Len()
++		i, err := AsInt32(y)
++		if err != nil {
++			return fmt.Errorf("%s index: %s", x.Type(), err)
++		}
++		origI := i
++		if i < 0 {
++			i += n
++		}
++		if i < 0 || i >= n {
++			return outOfRange(origI, n, x)
++		}
++		return x.DelIndex(i)
++
++	case *Dict:
++		_, found, err := x.Delete(y)
++		if err != nil {
++			return err
++		}
++		if !found {
++			return fmt.Errorf("key %v not in dict", y)
++		}
++		return nil
++	}
++	return fmt.Errorf("cannot delete from %s", x.Type())
++}
++
++// delSlice implements del x[lo:hi:step], removing the selected elements of a
++// mutable list.
++func delSlice(x, lo, hi, step Value) error {
++	list, ok := x.(*List)
++	if !ok {
++		return fmt.Errorf("can only delete a slice of a list, not %s", x.Type())
++	}
++	return list.DelSlice(lo, hi, step)
++}
++
++// iterableToSlice buffers the elements of an iterable into a slice, falling
++// back to index access for non-iterable indexable values such as strings.
++func iterableToSlice(y Value) ([]Value, error) {
++	if iter := Iterate(y); iter != nil {
++		defer iter.Done()
++		var elems []Value
++		var x Value
++		for iter.Next(&x) {
++			elems = append(elems, x)
++		}
++		return elems, nil
++	}
++	if seq, ok := y.(Indexable); ok {
++		n := seq.Len()
++		elems := make([]Value, n)
++		for i := 0; i < n; i++ {
++			elems[i] = seq.Index(i)
++		}
++		return elems, nil
++	}
++	return nil, fmt.Errorf("can only assign an iterable to a slice, not %s", y.Type())
+ }
+ 
+ // From Hacker's Delight, section 2.8.
+diff --git a/starlark/interp.go b/starlark/interp.go
+index 0a1e63c..55bcf1d 100644
+--- a/starlark/interp.go
++++ b/starlark/interp.go
+@@ -424,6 +424,35 @@ loop:
+ 				break loop
+ 			}
+ 
++		case compile.SETSLICE:
++			step := stack[sp-1]
++			hi := stack[sp-2]
++			lo := stack[sp-3]
++			x := stack[sp-4]
++			y := stack[sp-5]
++			sp -= 5
++			if err = setSlice(x, lo, hi, step, y); err != nil {
++				break loop
++			}
++
++		case compile.DELINDEX:
++			i := stack[sp-1]
++			x := stack[sp-2]
++			sp -= 2
++			if err = delIndex(x, i); err != nil {
++				break loop
++			}
++
++		case compile.DELSLICE:
++			step := stack[sp-1]
++			hi := stack[sp-2]
++			lo := stack[sp-3]
++			x := stack[sp-4]
++			sp -= 4
++			if err = delSlice(x, lo, hi, step); err != nil {
++				break loop
++			}
++
+ 		case compile.INDEX:
+ 			y := stack[sp-1]
+ 			x := stack[sp-2]
+diff --git a/starlark/library.go b/starlark/library.go
+index bad18af..b3a03c9 100644
+--- a/starlark/library.go
++++ b/starlark/library.go
+@@ -93,13 +93,15 @@ var (
+ 	}
+ 
+ 	listMethods = map[string]*Builtin{
+-		"append": NewBuiltin("append", list_append),
+-		"clear":  NewBuiltin("clear", list_clear),
+-		"extend": NewBuiltin("extend", list_extend),
+-		"index":  NewBuiltin("index", list_index),
+-		"insert": NewBuiltin("insert", list_insert),
+-		"pop":    NewBuiltin("pop", list_pop),
+-		"remove": NewBuiltin("remove", list_remove),
++		"append":  NewBuiltin("append", list_append),
++		"clear":   NewBuiltin("clear", list_clear),
++		"extend":  NewBuiltin("extend", list_extend),
++		"index":   NewBuiltin("index", list_index),
++		"insert":  NewBuiltin("insert", list_insert),
++		"pop":     NewBuiltin("pop", list_pop),
++		"remove":  NewBuiltin("remove", list_remove),
++		"reverse": NewBuiltin("reverse", list_reverse),
++		"sort":    NewBuiltin("sort", list_sort),
+ 	}
+ 
+ 	stringMethods = map[string]*Builtin{
+@@ -1087,6 +1089,63 @@ func (s *sortSlice) Swap(i, j int) {
+ 	s.values[i], s.values[j] = s.values[j], s.values[i]
+ }
+ 
++// https://github.com/google/starlark-go/blob/master/doc/spec.md#list·sort
++func list_sort(thread *Thread, b *Builtin, args Tuple, kwargs []Tuple) (Value, error) {
++	var key Callable
++	var reverse bool
++	if err := UnpackArgs(b.Name(), args, kwargs,
++		"key?", &key,
++		"reverse?", &reverse,
++	); err != nil {
++		return nil, err
++	}
++	recv := b.Receiver().(*List)
++	if err := recv.checkMutable("sort"); err != nil {
++		return nil, nameErr(b, err)
++	}
++
++	// Derive keys from the receiver's elements by applying the key function.
++	var keys []Value
++	if key != nil {
++		keys = make([]Value, len(recv.elems))
++		for i, v := range recv.elems {
++			k, err := Call(thread, key, Tuple{v}, nil)
++			if err != nil {
++				return nil, err // to preserve backtrace, don't modify error
++			}
++			keys[i] = k
++		}
++	}
++
++	// Sort the receiver's element slice in place, keeping it stable.
++	slice := &sortSlice{keys: keys, values: recv.elems}
++	if reverse {
++		sort.Stable(sort.Reverse(slice))
++	} else {
++		sort.Stable(slice)
++	}
++	if slice.err != nil {
++		return nil, nameErr(b, slice.err)
++	}
++	return None, nil
++}
++
++// https://github.com/google/starlark-go/blob/master/doc/spec.md#list·reverse
++func list_reverse(_ *Thread, b *Builtin, args Tuple, kwargs []Tuple) (Value, error) {
++	if err := UnpackPositionalArgs(b.Name(), args, kwargs, 0); err != nil {
++		return nil, err
++	}
++	recv := b.Receiver().(*List)
++	if err := recv.checkMutable("reverse"); err != nil {
++		return nil, nameErr(b, err)
++	}
++	elems := recv.elems
++	for i, j := 0, len(elems)-1; i < j; i, j = i+1, j-1 {
++		elems[i], elems[j] = elems[j], elems[i]
++	}
++	return None, nil
++}
++
+ // https://github.com/google/starlark-go/blob/master/doc/spec.md#str
+ func str(thread *Thread, _ *Builtin, args Tuple, kwargs []Tuple) (Value, error) {
+ 	if len(kwargs) > 0 {
+diff --git a/starlark/value.go b/starlark/value.go
+index 027c60f..443234e 100644
+--- a/starlark/value.go
++++ b/starlark/value.go
+@@ -1082,6 +1082,87 @@ func (l *List) SetIndex(i int, v Value) error {
+ 	return nil
+ }
+ 
++// SetSlice replaces the elements selected by the slice [lo:hi:step] with the
++// values of rhs. When step is 1 the list grows or shrinks to fit; for any
++// other step the number of rhs values must equal the number of selected
++// elements.
++func (l *List) SetSlice(lo, hi, step_ Value, rhs []Value) error {
++	if err := l.checkMutable("assign to slice of"); err != nil {
++		return err
++	}
++	start, end, step, err := sliceIndices(len(l.elems), lo, hi, step_)
++	if err != nil {
++		return err
++	}
++
++	if step == 1 {
++		elems := make([]Value, 0, start+len(rhs)+len(l.elems)-end)
++		elems = append(elems, l.elems[:start]...)
++		elems = append(elems, rhs...)
++		elems = append(elems, l.elems[end:]...)
++		l.elems = elems
++		return nil
++	}
++
++	sign := signum(step)
++	var idx []int
++	for i := start; signum(end-i) == sign; i += step {
++		idx = append(idx, i)
++	}
++	if len(idx) != len(rhs) {
++		return fmt.Errorf("attempt to assign sequence of size %d to extended slice of size %d", len(rhs), len(idx))
++	}
++	for j, i := range idx {
++		l.elems[i] = rhs[j]
++	}
++	return nil
++}
++
++// DelIndex removes the element at index i of the list.
++func (l *List) DelIndex(i int) error {
++	if err := l.checkMutable("delete from"); err != nil {
++		return err
++	}
++	copy(l.elems[i:], l.elems[i+1:])
++	l.elems[len(l.elems)-1] = nil // aid GC
++	l.elems = l.elems[:len(l.elems)-1]
++	return nil
++}
++
++// DelSlice removes the elements selected by the slice [lo:hi:step] from the
++// list.
++func (l *List) DelSlice(lo, hi, step_ Value) error {
++	if err := l.checkMutable("delete from"); err != nil {
++		return err
++	}
++	start, end, step, err := sliceIndices(len(l.elems), lo, hi, step_)
++	if err != nil {
++		return err
++	}
++
++	if step == 1 {
++		elems := make([]Value, 0, start+len(l.elems)-end)
++		elems = append(elems, l.elems[:start]...)
++		elems = append(elems, l.elems[end:]...)
++		l.elems = elems
++		return nil
++	}
++
++	sign := signum(step)
++	del := make(map[int]bool)
++	for i := start; signum(end-i) == sign; i += step {
++		del[i] = true
++	}
++	elems := make([]Value, 0, len(l.elems)-len(del))
++	for i, v := range l.elems {
++		if !del[i] {
++			elems = append(elems, v)
++		}
++	}
++	l.elems = elems
++	return nil
++}
++
+ func (l *List) Append(v Value) error {
+ 	if err := l.checkMutable("append to"); err != nil {
+ 		return err
+diff --git a/syntax/parse.go b/syntax/parse.go
+index e115393..d07b75d 100644
+--- a/syntax/parse.go
++++ b/syntax/parse.go
+@@ -345,6 +345,9 @@ func (p *parser) parseSmallStmt() Stmt {
+ 
+ 	case LOAD:
+ 		return p.parseLoadStmt()
++
++	case DEL:
++		return p.parseDelStmt()
+ 	}
+ 
+ 	// Assignment
+@@ -361,6 +364,20 @@ func (p *parser) parseSmallStmt() Stmt {
+ 	return &ExprStmt{X: x}
+ }
+ 
++// del_stmt = DEL target {',' target} ','?
++func (p *parser) parseDelStmt() Stmt {
++	pos := p.nextToken() // consume DEL
++	targets := []Expr{p.parseTest()}
++	for p.tok == COMMA {
++		p.nextToken()
++		if terminatesExprList(p.tok) {
++			break
++		}
++		targets = append(targets, p.parseTest())
++	}
++	return &DelStmt{Del: pos, Targets: targets}
++}
++
+ // stmt = LOAD '(' STRING {',' (IDENT '=')? STRING} [','] ')'
+ func (p *parser) parseLoadStmt() *LoadStmt {
+ 	loadPos := p.nextToken() // consume LOAD
+diff --git a/syntax/syntax.go b/syntax/syntax.go
+index 57983b4..3e6060d 100644
+--- a/syntax/syntax.go
++++ b/syntax/syntax.go
+@@ -92,6 +92,7 @@ type Stmt interface {
+ func (*AssignStmt) stmt() {}
+ func (*BranchStmt) stmt() {}
+ func (*DefStmt) stmt()    {}
++func (*DelStmt) stmt()    {}
+ func (*ExprStmt) stmt()   {}
+ func (*ForStmt) stmt()    {}
+ func (*WhileStmt) stmt()  {}
+@@ -118,6 +119,21 @@ func (x *AssignStmt) Span() (start, end Position) {
+ 	return
+ }
+ 
++// A DelStmt represents a deletion statement: del x[i], y[j:k].
++type DelStmt struct {
++	commentsRef
++	Del     Position
++	Targets []Expr
++}
++
++func (x *DelStmt) Span() (start, end Position) {
++	end = x.Del.add("del")
++	if n := len(x.Targets); n > 0 {
++		_, end = x.Targets[n-1].Span()
++	}
++	return x.Del, end
++}
++
+ // A DefStmt represents a function definition.
+ type DefStmt struct {
+ 	commentsRef
+diff --git a/syntax/walk.go b/syntax/walk.go
+index 65f6808..6ec5276 100644
+--- a/syntax/walk.go
++++ b/syntax/walk.go
+@@ -37,6 +37,11 @@ func Walk(n Node, f func(Node) bool) {
+ 		Walk(n.LHS, f)
+ 		Walk(n.RHS, f)
+ 
++	case *DelStmt:
++		for _, target := range n.Targets {
++			Walk(target, f)
++		}
++
+ 	case *DefStmt:
+ 		Walk(n.Name, f)
+ 		for _, param := range n.Params {

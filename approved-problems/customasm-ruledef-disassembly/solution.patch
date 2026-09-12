@@ -1,0 +1,960 @@
+diff --git a/src/asm/disasm/analyze.rs b/src/asm/disasm/analyze.rs
+new file mode 100644
+index 0000000..ce29e38
+--- /dev/null
++++ b/src/asm/disasm/analyze.rs
+@@ -0,0 +1,314 @@
++use crate::*;
++
++
++pub struct RuleDecoding
++{
++    pub ruledef_ref: util::ItemRef<asm::Ruledef>,
++    pub rule_ref: util::ItemRef<asm::Rule>,
++    pub constant_bits: usize,
++    pub terms: Vec<DecodingTerm>,
++}
++
++
++pub enum DecodingTerm
++{
++    Constant
++    {
++        value: util::BigInt,
++        width: usize,
++    },
++
++    Parameter
++    {
++        index: usize,
++        width: Option<usize>,
++    },
++}
++
++
++pub fn analyze_ruledef(
++    ruledef: &asm::Ruledef,
++    ruledef_ref: util::ItemRef<asm::Ruledef>)
++    -> Vec<RuleDecoding>
++{
++    let mut decodings = Vec::new();
++
++    for (index, rule) in ruledef.rules.iter().enumerate()
++    {
++        let rule_ref = util::ItemRef::new(index);
++
++        if let Some(decoding) = analyze_rule(rule, ruledef_ref, rule_ref)
++        {
++            decodings.push(decoding);
++        }
++    }
++
++    decodings
++}
++
++
++fn analyze_rule(
++    rule: &asm::Rule,
++    ruledef_ref: util::ItemRef<asm::Ruledef>,
++    rule_ref: util::ItemRef<asm::Rule>)
++    -> Option<RuleDecoding>
++{
++    let mut flattened = Vec::new();
++    flatten_concat(&rule.expr, &mut flattened);
++
++    let mut terms = Vec::new();
++    let mut used_parameters = vec![false; rule.parameters.len()];
++    let mut constant_bits = 0;
++
++    for expr in flattened
++    {
++        let term = classify_term(expr, rule)?;
++
++        match term
++        {
++            DecodingTerm::Constant { width: term_width, .. } =>
++                constant_bits += term_width,
++
++            DecodingTerm::Parameter { index, .. } =>
++            {
++                if used_parameters[index]
++                {
++                    return None;
++                }
++
++                used_parameters[index] = true;
++            }
++        }
++
++        terms.push(term);
++    }
++
++    if used_parameters.iter().any(|used| !used)
++    {
++        return None;
++    }
++
++    if terms.is_empty()
++    {
++        return None;
++    }
++
++    if constant_bits == 0 && terms.len() == 1 && is_ruledef_term(&terms[0], rule)
++    {
++        return None;
++    }
++
++    Some(RuleDecoding {
++        ruledef_ref,
++        rule_ref,
++        constant_bits,
++        terms,
++    })
++}
++
++
++fn flatten_concat<'expr>(
++    expr: &'expr expr::Expr,
++    out: &mut Vec<&'expr expr::Expr>)
++{
++    if let expr::Expr::BinaryOp(_, _, expr::BinaryOp::Concat, lhs, rhs) = expr
++    {
++        flatten_concat(lhs, out);
++        flatten_concat(rhs, out);
++        return;
++    }
++
++    out.push(expr);
++}
++
++
++fn classify_term(
++    expr: &expr::Expr,
++    rule: &asm::Rule)
++    -> Option<DecodingTerm>
++{
++    if let Some(term) = classify_constant(expr)
++    {
++        return Some(term);
++    }
++
++    if let Some(term) = classify_parameter(expr, rule)
++    {
++        return Some(term);
++    }
++
++    if let Some(term) = classify_sized_parameter(expr, rule)
++    {
++        return Some(term);
++    }
++
++    classify_ranged_parameter(expr, rule)
++}
++
++
++fn classify_constant(
++    expr: &expr::Expr)
++    -> Option<DecodingTerm>
++{
++    let expr::Expr::Literal(_, expr::Value::Integer(_, bigint)) = expr
++        else { return None };
++
++    let width = bigint.size?;
++
++    Some(DecodingTerm::Constant {
++        value: bigint.clone(),
++        width,
++    })
++}
++
++
++fn classify_parameter(
++    expr: &expr::Expr,
++    rule: &asm::Rule)
++    -> Option<DecodingTerm>
++{
++    let expr::Expr::Variable(_, name) = expr
++        else { return None };
++
++    let index = parameter_index(rule, name)?;
++
++    Some(DecodingTerm::Parameter {
++        index,
++        width: parameter_width(&rule.parameters[index].typ),
++    })
++}
++
++
++fn classify_sized_parameter(
++    expr: &expr::Expr,
++    rule: &asm::Rule)
++    -> Option<DecodingTerm>
++{
++    let expr::Expr::SliceShort(_, _, size_expr, inner_expr) = expr
++        else { return None };
++
++    let expr::Expr::Literal(_, expr::Value::Integer(_, size_bigint)) = &**size_expr
++        else { return None };
++
++    let width = size_bigint.maybe_into::<usize>()?;
++
++    let expr::Expr::Variable(_, name) = &**inner_expr
++        else { return None };
++
++    let index = parameter_index(rule, name)?;
++
++    check_declared_width(&rule.parameters[index].typ, width)?;
++
++    Some(DecodingTerm::Parameter {
++        index,
++        width: Some(width),
++    })
++}
++
++
++fn check_declared_width(
++    typ: &asm::RuleParameterType,
++    width: usize)
++    -> Option<()>
++{
++    if matches!(typ, asm::RuleParameterType::RuledefRef(_))
++    {
++        return Some(());
++    }
++
++    if parameter_width(typ)? != width
++    {
++        return None;
++    }
++
++    Some(())
++}
++
++
++fn classify_ranged_parameter(
++    expr: &expr::Expr,
++    rule: &asm::Rule)
++    -> Option<DecodingTerm>
++{
++    let expr::Expr::Slice(_, _, left_expr, right_expr, inner_expr) = expr
++        else { return None };
++
++    let left = literal_usize(left_expr)?;
++    let right = literal_usize(right_expr)?;
++
++    if left < right
++    {
++        return None;
++    }
++
++    let width = left - right + 1;
++
++    let expr::Expr::Variable(_, name) = &**inner_expr
++        else { return None };
++
++    let index = parameter_index(rule, name)?;
++
++    if right != 0
++    {
++        return None;
++    }
++
++    check_declared_width(&rule.parameters[index].typ, width)?;
++
++    Some(DecodingTerm::Parameter {
++        index,
++        width: Some(width),
++    })
++}
++
++
++fn literal_usize(
++    expr: &expr::Expr)
++    -> Option<usize>
++{
++    let expr::Expr::Literal(_, expr::Value::Integer(_, bigint)) = expr
++        else { return None };
++
++    bigint.maybe_into::<usize>()
++}
++
++
++fn is_ruledef_term(
++    term: &DecodingTerm,
++    rule: &asm::Rule)
++    -> bool
++{
++    let DecodingTerm::Parameter { index, .. } = term
++        else { return false };
++
++    matches!(
++        rule.parameters[*index].typ,
++        asm::RuleParameterType::RuledefRef(_))
++}
++
++
++fn parameter_index(
++    rule: &asm::Rule,
++    name: &str)
++    -> Option<usize>
++{
++    rule.parameters
++        .iter()
++        .position(|param| param.name == name)
++}
++
++
++fn parameter_width(
++    typ: &asm::RuleParameterType)
++    -> Option<usize>
++{
++    match typ
++    {
++        asm::RuleParameterType::Unsigned(width) |
++        asm::RuleParameterType::Signed(width) |
++        asm::RuleParameterType::Integer(width) => Some(*width),
++
++        asm::RuleParameterType::RuledefRef(_) |
++        asm::RuleParameterType::Unspecified => None,
++    }
++}
+diff --git a/src/asm/disasm/decode.rs b/src/asm/disasm/decode.rs
+new file mode 100644
+index 0000000..b32d5d4
+--- /dev/null
++++ b/src/asm/disasm/decode.rs
+@@ -0,0 +1,507 @@
++use crate::*;
++
++
++pub struct DecodedInstruction
++{
++    pub offset: usize,
++    pub width: usize,
++    pub text: String,
++}
++
++
++struct DecodeAttempt
++{
++    width: usize,
++    constant_bits: usize,
++    operands: Vec<String>,
++    ambiguous_at: Option<usize>,
++}
++
++
++struct NestedDecoding
++{
++    width: usize,
++    text: String,
++    constant_bits: usize,
++    rule_ref: util::ItemRef<asm::Rule>,
++    ambiguous_at: Option<usize>,
++}
++
++
++pub struct DecodeTable
++{
++    per_ruledef: Vec<Vec<asm::RuleDecoding>>,
++}
++
++
++impl DecodeTable
++{
++    pub fn build(defs: &asm::ItemDefs) -> DecodeTable
++    {
++        let mut per_ruledef = Vec::new();
++
++        for index in 0..defs.ruledefs.len()
++        {
++            let ruledef_ref = util::ItemRef::<asm::Ruledef>::new(index);
++            let ruledef = defs.ruledefs.get(ruledef_ref);
++
++            per_ruledef.push(asm::analyze_ruledef(ruledef, ruledef_ref));
++        }
++
++        DecodeTable { per_ruledef }
++    }
++
++
++    fn decodings_for(
++        &self,
++        ruledef_ref: util::ItemRef<asm::Ruledef>)
++        -> &Vec<asm::RuleDecoding>
++    {
++        &self.per_ruledef[ruledef_ref.0]
++    }
++}
++
++
++fn output_addr_unit(
++    defs: &asm::ItemDefs)
++    -> usize
++{
++    for index in (0..defs.bankdefs.len()).rev()
++    {
++        let bankdef = defs.bankdefs.get(
++            util::ItemRef::<asm::Bankdef>::new(index));
++
++        if bankdef.output_offset.is_some()
++        {
++            return bankdef.addr_unit;
++        }
++    }
++
++    8
++}
++
++
++pub fn disassemble(
++    report: &mut diagn::Report,
++    defs: &asm::ItemDefs,
++    bits: &util::BitVec)
++    -> Result<Vec<DecodedInstruction>, ()>
++{
++    let table = DecodeTable::build(defs);
++
++    let mut result = Vec::new();
++    let mut offset = 0;
++    let addr_unit = output_addr_unit(defs);
++
++    while offset < bits.len()
++    {
++        let attempt = decode_top_level(
++            &table,
++            defs,
++            bits,
++            offset);
++
++        let Some((attempt, ruledef_ref, rule_ref)) = attempt
++            else
++            {
++                report.error(
++                    format!(
++                        "no rule decodes the bits at position {}",
++                        offset));
++
++                return Err(());
++            };
++
++        if let Some(position) = attempt.ambiguous_at
++        {
++            report.error(
++                format!(
++                    "ambiguous decoding at position {}",
++                    position));
++
++            return Err(());
++        }
++
++        let ruledef = defs.ruledefs.get(ruledef_ref);
++        let rule = &ruledef.rules[rule_ref.0];
++
++        result.push(DecodedInstruction {
++            offset: offset / addr_unit,
++            width: attempt.width,
++            text: render_rule(rule, &attempt.operands),
++        });
++
++        offset += attempt.width;
++    }
++
++    Ok(result)
++}
++
++
++fn decode_top_level(
++    table: &DecodeTable,
++    defs: &asm::ItemDefs,
++    bits: &util::BitVec,
++    offset: usize)
++    -> Option<(DecodeAttempt, util::ItemRef<asm::Ruledef>, util::ItemRef<asm::Rule>)>
++{
++    let mut best: Option<(DecodeAttempt, util::ItemRef<asm::Ruledef>, util::ItemRef<asm::Rule>)> = None;
++
++    for index in 0..defs.ruledefs.len()
++    {
++        let ruledef_ref = util::ItemRef::<asm::Ruledef>::new(index);
++
++        if defs.ruledefs.get(ruledef_ref).is_subruledef
++        {
++            continue;
++        }
++
++        for decoding in table.decodings_for(ruledef_ref)
++        {
++            let Some(attempt) = try_decoding(table, defs, bits, offset, decoding, None)
++                else { continue };
++
++            best = match best
++            {
++                None => Some((attempt, ruledef_ref, decoding.rule_ref)),
++
++                Some(mut current) =>
++                {
++                    if attempt.constant_bits > current.0.constant_bits
++                    {
++                        Some((attempt, ruledef_ref, decoding.rule_ref))
++                    }
++                    else if attempt.constant_bits == current.0.constant_bits &&
++                        differs(&attempt, &current.0, decoding.rule_ref, current.2, ruledef_ref, current.1)
++                    {
++                        current.0.ambiguous_at = Some(offset);
++                        Some(current)
++                    }
++                    else
++                    {
++                        Some(current)
++                    }
++                }
++            };
++        }
++    }
++
++    best
++}
++
++
++fn try_decoding(
++    table: &DecodeTable,
++    defs: &asm::ItemDefs,
++    bits: &util::BitVec,
++    offset: usize,
++    decoding: &asm::RuleDecoding,
++    target_end: Option<usize>)
++    -> Option<DecodeAttempt>
++{
++    let ruledef = defs.ruledefs.get(decoding.ruledef_ref);
++    let rule = &ruledef.rules[decoding.rule_ref.0];
++
++    let mut operands = vec![String::new(); rule.parameters.len()];
++
++    let walk = decode_terms(
++        table,
++        defs,
++        bits,
++        rule,
++        &decoding.terms,
++        offset,
++        &mut operands,
++        target_end)?;
++
++    Some(DecodeAttempt {
++        width: walk.end - offset,
++        constant_bits: decoding.constant_bits + walk.nested_bits,
++        operands,
++        ambiguous_at: walk.ambiguous_at,
++    })
++}
++
++
++struct TermsWalk
++{
++    end: usize,
++    nested_bits: usize,
++    ambiguous_at: Option<usize>,
++}
++
++
++fn decode_terms(
++    table: &DecodeTable,
++    defs: &asm::ItemDefs,
++    bits: &util::BitVec,
++    rule: &asm::Rule,
++    terms: &[asm::DecodingTerm],
++    cursor: usize,
++    operands: &mut Vec<String>,
++    target_end: Option<usize>)
++    -> Option<TermsWalk>
++{
++    let Some((term, rest)) = terms.split_first()
++        else
++        {
++            if let Some(target_end) = target_end
++            {
++                if cursor != target_end
++                {
++                    return None;
++                }
++            }
++
++            return Some(TermsWalk {
++                end: cursor,
++                nested_bits: 0,
++                ambiguous_at: None,
++            });
++        };
++
++    match term
++    {
++        asm::DecodingTerm::Constant { value, width } =>
++        {
++            if !constant_matches(bits, cursor, value, *width)
++            {
++                return None;
++            }
++
++            decode_terms(table, defs, bits, rule, rest, cursor + width, operands, target_end)
++        }
++
++        asm::DecodingTerm::Parameter { index, width } =>
++        {
++            let param = &rule.parameters[*index];
++
++            let asm::RuleParameterType::RuledefRef(inner_ref) = param.typ
++                else
++                {
++                    let width = (*width)?;
++
++                    if cursor + width > bits.len()
++                    {
++                        return None;
++                    }
++
++                    operands[*index] = render_integer_field(
++                        bits,
++                        cursor,
++                        width,
++                        &param.typ);
++
++                    return decode_terms(table, defs, bits, rule, rest, cursor + width, operands, target_end);
++                };
++
++            if let Some(width) = width
++            {
++                if cursor + width > bits.len()
++                {
++                    return None;
++                }
++            }
++
++            let candidates = nested_candidates(
++                table,
++                defs,
++                bits,
++                cursor,
++                inner_ref,
++                *width);
++
++            let mut viable = Vec::new();
++
++            for candidate in candidates
++            {
++                let mut trial = operands.clone();
++                trial[*index] = candidate.text.clone();
++
++                if let Some(walk) = decode_terms(
++                    table,
++                    defs,
++                    bits,
++                    rule,
++                    rest,
++                    cursor + candidate.width,
++                    &mut trial,
++                    target_end)
++                {
++                    viable.push((candidate, walk, trial));
++                }
++            }
++
++            let best_bits = viable
++                .iter()
++                .map(|entry| entry.0.constant_bits)
++                .max()?;
++
++            viable.retain(|entry| entry.0.constant_bits == best_bits);
++
++            let tied = viable
++                .iter()
++                .skip(1)
++                .any(|entry|
++                    entry.0.width != viable[0].0.width ||
++                    entry.0.text != viable[0].0.text ||
++                    entry.0.rule_ref.0 != viable[0].0.rule_ref.0);
++
++            let (candidate, walk, trial) = viable.remove(0);
++
++            *operands = trial;
++
++            let tie_here = {
++                if tied { Some(cursor) } else { None }
++            };
++
++            Some(TermsWalk {
++                end: walk.end,
++                nested_bits: walk.nested_bits + candidate.constant_bits,
++                ambiguous_at: candidate.ambiguous_at
++                    .or(tie_here)
++                    .or(walk.ambiguous_at),
++            })
++        }
++    }
++}
++
++
++fn nested_candidates(
++    table: &DecodeTable,
++    defs: &asm::ItemDefs,
++    bits: &util::BitVec,
++    offset: usize,
++    ruledef_ref: util::ItemRef<asm::Ruledef>,
++    field_width: Option<usize>)
++    -> Vec<NestedDecoding>
++{
++    let mut found = Vec::new();
++
++    for decoding in table.decodings_for(ruledef_ref)
++    {
++        let target_end = field_width.map(|width| offset + width);
++
++        let Some(attempt) = try_decoding(table, defs, bits, offset, decoding, target_end)
++            else { continue };
++
++        let ruledef = defs.ruledefs.get(ruledef_ref);
++        let rule = &ruledef.rules[decoding.rule_ref.0];
++
++        found.push(NestedDecoding {
++            width: attempt.width,
++            text: render_rule(rule, &attempt.operands),
++            constant_bits: attempt.constant_bits,
++            rule_ref: decoding.rule_ref,
++            ambiguous_at: attempt.ambiguous_at,
++        });
++    }
++
++    found.sort_by(|a, b| b.constant_bits.cmp(&a.constant_bits));
++
++    found
++}
++
++
++fn differs(
++    attempt: &DecodeAttempt,
++    current: &DecodeAttempt,
++    rule_ref: util::ItemRef<asm::Rule>,
++    current_rule_ref: util::ItemRef<asm::Rule>,
++    ruledef_ref: util::ItemRef<asm::Ruledef>,
++    current_ruledef_ref: util::ItemRef<asm::Ruledef>)
++    -> bool
++{
++    attempt.width != current.width ||
++        attempt.operands != current.operands ||
++        rule_ref.0 != current_rule_ref.0 ||
++        ruledef_ref.0 != current_ruledef_ref.0
++}
++
++
++fn constant_matches(
++    bits: &util::BitVec,
++    offset: usize,
++    value: &util::BigInt,
++    width: usize)
++    -> bool
++{
++    if offset + width > bits.len()
++    {
++        return false;
++    }
++
++    for index in 0..width
++    {
++        let expected = value.get_bit(width - 1 - index);
++
++        if bits.read_bit(offset + index) != expected
++        {
++            return false;
++        }
++    }
++
++    true
++}
++
++
++fn render_integer_field(
++    bits: &util::BitVec,
++    offset: usize,
++    width: usize,
++    typ: &asm::RuleParameterType)
++    -> String
++{
++    let mut value = util::BigInt::from(0);
++
++    for index in 0..width
++    {
++        value.set_bit(
++            width - 1 - index,
++            bits.read_bit(offset + index));
++    }
++
++    if is_signed(typ) && width > 0 && bits.read_bit(offset)
++    {
++        let mut modulus = util::BigInt::from(0);
++        modulus.set_bit(width, true);
++
++        if let Some(magnitude) = modulus.maybe_sub(&value)
++        {
++            return format!("-0x{:x}", magnitude);
++        }
++    }
++
++    format!("0x{:x}", value)
++}
++
++
++fn is_signed(
++    typ: &asm::RuleParameterType)
++    -> bool
++{
++    matches!(typ, asm::RuleParameterType::Signed(_))
++}
++
++
++fn render_rule(
++    rule: &asm::Rule,
++    operands: &Vec<String>)
++    -> String
++{
++    let mut result = String::new();
++
++    for part in &rule.pattern
++    {
++        match part
++        {
++            asm::RulePatternPart::Whitespace => result.push(' '),
++            asm::RulePatternPart::Exact(c) => result.push(*c),
++
++            asm::RulePatternPart::ParameterIndex(index) =>
++                result.push_str(&operands[*index]),
++        }
++    }
++
++    result
++}
+diff --git a/src/asm/disasm/mod.rs b/src/asm/disasm/mod.rs
+new file mode 100644
+index 0000000..9cedab2
+--- /dev/null
++++ b/src/asm/disasm/mod.rs
+@@ -0,0 +1,13 @@
++mod analyze;
++pub use analyze::{
++    RuleDecoding,
++    DecodingTerm,
++    analyze_ruledef,
++};
++
++mod decode;
++pub use decode::{
++    DecodeTable,
++    DecodedInstruction,
++    disassemble,
++};
+diff --git a/src/asm/mod.rs b/src/asm/mod.rs
+index 6a91848..a29e8e8 100644
+--- a/src/asm/mod.rs
++++ b/src/asm/mod.rs
+@@ -75,6 +75,16 @@ pub use resolver::{
+     ResolverNode,
+ };
+ 
++pub mod disasm;
++pub use disasm::{
++    RuleDecoding,
++    DecodingTerm,
++    DecodeTable,
++    DecodedInstruction,
++    analyze_ruledef,
++    disassemble,
++};
++
+ pub mod output;
+ 
+ 
+diff --git a/src/driver.rs b/src/driver.rs
+index 15bab39..831af64 100644
+--- a/src/driver.rs
++++ b/src/driver.rs
+@@ -24,6 +24,7 @@ pub struct CommandOutput
+ pub enum OutputFormat
+ {
+ 	Binary,
++	Disassembly,
+ 	Annotated(util::FormatAnnotatedOptions),
+ 	BinStr,
+ 	HexStr,
+@@ -735,6 +736,7 @@ pub fn parse_output_format(
+ 			}),
+ 
+ 			"binstr" => OutputFormat::BinStr,
++			"disasm" => OutputFormat::Disassembly,
+ 			"hexstr" => OutputFormat::HexStr,
+ 
+ 			"bindump" => OutputFormat::BinDump,
+@@ -917,6 +919,9 @@ pub fn format_output(
+ 			OutputFormat::Binary =>
+ 				return output.format_binary(report),
+ 
++			OutputFormat::Disassembly =>
++				format_disassembly(report, defs, output),
++
+ 			OutputFormat::Annotated(opts) =>
+ 				output.format_annotated(fileserver, opts),
+ 
+@@ -1044,4 +1049,27 @@ fn print_version_full()
+ {
+ 	print_version_short();
+ 	println!("https://github.com/hlorenzi/customasm");
+-}
+\ No newline at end of file
++}
++
++
++fn format_disassembly(
++	report: &mut diagn::Report,
++	defs: &asm::ItemDefs,
++	output: &util::BitVec)
++	-> String
++{
++	let Ok(instructions) = asm::disassemble(report, defs, output)
++		else { return String::new() };
++
++	let mut result = String::new();
++
++	for instruction in instructions
++	{
++		result.push_str(&format!(
++			"{:04x}: {}\n",
++			instruction.offset,
++			instruction.text));
++	}
++
++	result
++}
+diff --git a/src/usage_help.md b/src/usage_help.md
+index 67b0e32..17cc8d5 100644
+--- a/src/usage_help.md
++++ b/src/usage_help.md
+@@ -80,6 +80,10 @@ Examples:
+ * `annotatedbin`  
+     Same as: `annotated,base:2,group:8`  
+ 
++* `disasm`  
++    Instructions decoded back from the output
++    using the ruledefs.
++
+ * `binstr`  
+     Uninterrupted string of binary digits.
+ * `hexstr`  
+diff --git a/web/index.html b/web/index.html
+index e3828f9..7d32c50 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -119,6 +119,7 @@
+ 					<option value="annotated,base:2,group:8,addr_base:2">Annotated Bin + Addr Bin</option>
+ 					<option value="hexdump">Hex Dump</option>
+ 					<option value="bindump">Bin Dump</option>
++					<option value="disasm">Disassembly</option>
+ 					<option value="hexstr">Hex String</option>
+ 					<option value="binstr">Bin String</option>
+ 					<option value="mif">MIF</option>

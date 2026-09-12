@@ -1,0 +1,878 @@
+diff --git a/.config/nextest.toml b/.config/nextest.toml
+new file mode 100644
+index 0000000..76fd74b
+--- /dev/null
++++ b/.config/nextest.toml
+@@ -0,0 +1,2 @@
++[profile.ci.junit]
++path = "junit.xml"
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..4501be6
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,59 @@
++#!/usr/bin/env bash
++set -uo pipefail
++export PATH="/opt/cargo/bin:/usr/local/bin:${PATH}"
++export CARGO_NET_OFFLINE=true
++
++# Position-independent argument parsing. The platform invokes:
++#   ./test.sh --output_path <path> base|new
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++    case "$1" in
++        --output_path)
++            OUTPUT_PATH="$2"
++            shift 2
++            ;;
++        base | new)
++            MODE="$1"
++            shift
++            ;;
++        *)
++            echo "Usage: $0 --output_path <path> base|new" >&2
++            exit 1
++            ;;
++    esac
++done
++
++if [ -z "$MODE" ] || [ -z "$OUTPUT_PATH" ]; then
++    echo "Usage: $0 --output_path <path> base|new" >&2
++    exit 1
++fi
++
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++# cargo-nextest emits native JUnit (one <testcase> per test, build failures reported as process
++# errors) per the [profile.ci.junit] section in .config/nextest.toml -- no stdout regex parsing.
++# base = pass-to-pass regression suite (the aggregation subsystem the feature lives in).
++# new  = fail-to-pass feature suite (the new pipeline-aggregation integration test).
++JUNIT_SRC="target/nextest/ci/junit.xml"
++rm -f "$JUNIT_SRC"
++
++run_cell() {
++    local exit_code=0
++    # --no-fail-fast so every test runs (and is recorded) even when earlier ones fail; otherwise the
++    # base run, where every feature test fails, would cancel the remainder and emit a partial JUnit.
++    cargo nextest run --profile ci --no-fail-fast "$@" || exit_code=$?
++    if [ -f "$JUNIT_SRC" ]; then
++        cp "$JUNIT_SRC" "$OUTPUT_PATH"
++    fi
++    return "$exit_code"
++}
++
++case "$MODE" in
++    base)
++        run_cell -p tantivy --lib aggregation
++        ;;
++    new)
++        run_cell -p tantivy --test agg_postfinalize_pipeline_checks
++        ;;
++esac
+diff --git a/tests/agg_postfinalize_pipeline_checks.rs b/tests/agg_postfinalize_pipeline_checks.rs
+new file mode 100644
+index 0000000..74444f2
+--- /dev/null
++++ b/tests/agg_postfinalize_pipeline_checks.rs
+@@ -0,0 +1,799 @@
++use serde_json::{json, Value};
++use tantivy::aggregation::agg_req::Aggregations;
++use tantivy::aggregation::agg_result::AggregationResults;
++use tantivy::aggregation::{AggContextParams, AggregationCollector};
++use tantivy::query::AllQuery;
++use tantivy::schema::{Schema, FAST, STRING};
++use tantivy::{doc, Index, IndexWriter};
++
++fn idx() -> Index {
++    let mut schema_builder = Schema::builder();
++    let price = schema_builder.add_u64_field("price", FAST);
++    let category = schema_builder.add_text_field("category", STRING | FAST);
++    let schema = schema_builder.build();
++    let index = Index::create_in_ram(schema);
++    let mut writer: IndexWriter = index.writer(50_000_000).unwrap();
++    let docs: &[(u64, &str)] = &[
++        (2, "a"),
++        (4, "a"),
++        (6, "b"),
++        (22, "a"),
++        (24, "b"),
++        (26, "b"),
++        (28, "b"),
++    ];
++    for (p, cat) in docs {
++        writer.add_document(doc!(price => *p, category => *cat)).unwrap();
++    }
++    writer.commit().unwrap();
++    index
++}
++
++fn run(index: &Index, agg_json: Value) -> tantivy::Result<Value> {
++    let agg: Aggregations = serde_json::from_value(agg_json).unwrap();
++    let collector = AggregationCollector::from_aggs(agg, AggContextParams::default());
++    let searcher = index.reader()?.searcher();
++    let res: AggregationResults = searcher.search(&AllQuery, &collector)?;
++    Ok(serde_json::to_value(res).unwrap())
++}
++
++fn dense_histogram(extra: Value) -> Value {
++    let mut req = json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": { "avg_price": { "avg": { "field": "price" } } }
++        }
++    });
++    let obj = req.as_object_mut().unwrap();
++    for (key, value) in extra.as_object().unwrap() {
++        obj.insert(key.clone(), value.clone());
++    }
++    req
++}
++
++fn ok(agg_json: Value) -> Value {
++    run(&idx(), agg_json).unwrap()
++}
++
++fn err(agg_json: Value) -> bool {
++    run(&idx(), agg_json).is_err()
++}
++
++#[test]
++fn avg_bucket_reduces_sibling_metric() {
++    let res = ok(dense_histogram(
++        json!({ "avg_b": { "avg_bucket": { "buckets_path": "histo>avg_price" } } }),
++    ));
++    assert_eq!(res["avg_b"], json!({ "value": 14.5 }));
++}
++
++#[test]
++fn sum_bucket_reduces_sibling_metric() {
++    let res = ok(dense_histogram(
++        json!({ "sum_b": { "sum_bucket": { "buckets_path": "histo>avg_price" } } }),
++    ));
++    assert_eq!(res["sum_b"], json!({ "value": 29.0 }));
++}
++
++#[test]
++fn min_bucket_reduces_sibling_metric() {
++    let res = ok(dense_histogram(
++        json!({ "min_b": { "min_bucket": { "buckets_path": "histo>avg_price" } } }),
++    ));
++    assert_eq!(res["min_b"], json!({ "value": 4.0 }));
++}
++
++#[test]
++fn max_bucket_reduces_sibling_metric() {
++    let res = ok(dense_histogram(
++        json!({ "max_b": { "max_bucket": { "buckets_path": "histo>avg_price" } } }),
++    ));
++    assert_eq!(res["max_b"], json!({ "value": 25.0 }));
++}
++
++#[test]
++fn stats_bucket_reports_full_statistics() {
++    let res = ok(dense_histogram(
++        json!({ "stats_b": { "stats_bucket": { "buckets_path": "histo>avg_price" } } }),
++    ));
++    assert_eq!(
++        res["stats_b"],
++        json!({ "count": 2, "sum": 29.0, "min": 4.0, "max": 25.0, "avg": 14.5 })
++    );
++}
++
++#[test]
++fn sibling_pipeline_over_count_special() {
++    let res = ok(dense_histogram(
++        json!({ "avg_count": { "avg_bucket": { "buckets_path": "histo>_count" } } }),
++    ));
++    assert_eq!(res["avg_count"], json!({ "value": 3.5 }));
++}
++
++#[test]
++fn sibling_pipeline_over_key_special() {
++    let res = ok(dense_histogram(
++        json!({ "avg_key": { "avg_bucket": { "buckets_path": "histo>_key" } } }),
++    ));
++    assert_eq!(res["avg_key"], json!({ "value": 10.0 }));
++}
++
++#[test]
++fn sibling_pipeline_over_terms_count() {
++    let res = ok(json!({
++        "by_cat": { "terms": { "field": "category" } },
++        "sum_count": { "sum_bucket": { "buckets_path": "by_cat>_count" } }
++    }));
++    assert_eq!(res["sum_count"], json!({ "value": 7.0 }));
++}
++
++#[test]
++fn sibling_pipeline_over_range_count() {
++    let res = ok(json!({
++        "by_range": {
++            "range": { "field": "price", "ranges": [ { "to": 10.0 }, { "from": 10.0, "to": 20.0 }, { "from": 20.0 } ] }
++        },
++        "sum_count": { "sum_bucket": { "buckets_path": "by_range>_count" } }
++    }));
++    assert_eq!(res["sum_count"], json!({ "value": 7.0 }));
++}
++
++#[test]
++fn cumulative_sum_runs_a_total() {
++    let res = ok(dense_histogram(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "cumsum": { "cumulative_sum": { "buckets_path": "avg_price" } }
++            }
++        }
++    })));
++    assert_eq!(res["histo"]["buckets"][0]["cumsum"], json!({ "value": 4.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["cumsum"], json!({ "value": 29.0 }));
++}
++
++#[test]
++fn cumulative_sum_over_count() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": { "cumsum": { "cumulative_sum": { "buckets_path": "_count" } } }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["cumsum"], json!({ "value": 3.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["cumsum"], json!({ "value": 7.0 }));
++}
++
++#[test]
++fn derivative_skips_first_bucket() {
++    let res = ok(dense_histogram(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "deriv": { "derivative": { "buckets_path": "avg_price" } }
++            }
++        }
++    })));
++    assert_eq!(res["histo"]["buckets"][0]["deriv"], json!(null));
++    assert_eq!(res["histo"]["buckets"][1]["deriv"], json!({ "value": 21.0 }));
++}
++
++#[test]
++fn derivative_over_count() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": { "deriv": { "derivative": { "buckets_path": "_count" } } }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["deriv"], json!(null));
++    assert_eq!(res["histo"]["buckets"][1]["deriv"], json!({ "value": 1.0 }));
++}
++
++#[test]
++fn moving_avg_trailing_window_two() {
++    let res = ok(dense_histogram(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "ma": { "moving_avg": { "buckets_path": "avg_price", "window": 2 } }
++            }
++        }
++    })));
++    assert_eq!(res["histo"]["buckets"][0]["ma"], json!({ "value": 4.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["ma"], json!({ "value": 14.5 }));
++}
++
++#[test]
++fn moving_avg_window_one_is_identity() {
++    let res = ok(dense_histogram(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "ma": { "moving_avg": { "buckets_path": "avg_price", "window": 1 } }
++            }
++        }
++    })));
++    assert_eq!(res["histo"]["buckets"][0]["ma"], json!({ "value": 4.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["ma"], json!({ "value": 25.0 }));
++}
++
++fn script_histo(script_aggs: Value) -> Value {
++    let mut aggs = json!({ "avg_price": { "avg": { "field": "price" } } });
++    let obj = aggs.as_object_mut().unwrap();
++    for (key, value) in script_aggs.as_object().unwrap() {
++        obj.insert(key.clone(), value.clone());
++    }
++    json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": aggs
++        }
++    })
++}
++
++#[test]
++fn bucket_script_multiplies_values() {
++    let res = ok(script_histo(json!({
++        "s": { "bucket_script": { "buckets_path": { "a": "avg_price", "c": "_count" }, "script": "a * c" } }
++    })));
++    assert_eq!(res["histo"]["buckets"][0]["s"], json!({ "value": 12.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["s"], json!({ "value": 100.0 }));
++}
++
++#[test]
++fn bucket_script_respects_precedence() {
++    let res = ok(script_histo(json!({
++        "s": { "bucket_script": { "buckets_path": { "a": "avg_price", "c": "_count" }, "script": "a + c * 2" } }
++    })));
++    assert_eq!(res["histo"]["buckets"][0]["s"], json!({ "value": 10.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["s"], json!({ "value": 33.0 }));
++}
++
++#[test]
++fn bucket_script_respects_parentheses() {
++    let res = ok(script_histo(json!({
++        "s": { "bucket_script": { "buckets_path": { "a": "avg_price", "c": "_count" }, "script": "(a + c) * 2" } }
++    })));
++    assert_eq!(res["histo"]["buckets"][0]["s"], json!({ "value": 14.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["s"], json!({ "value": 58.0 }));
++}
++
++#[test]
++fn bucket_script_unary_minus() {
++    let res = ok(script_histo(json!({
++        "s": { "bucket_script": { "buckets_path": { "a": "avg_price" }, "script": "-a" } }
++    })));
++    assert_eq!(res["histo"]["buckets"][0]["s"], json!({ "value": -4.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["s"], json!({ "value": -25.0 }));
++}
++
++#[test]
++fn bucket_script_modulo() {
++    let res = ok(script_histo(json!({
++        "s": { "bucket_script": { "buckets_path": { "a": "avg_price", "c": "_count" }, "script": "a % c" } }
++    })));
++    assert_eq!(res["histo"]["buckets"][0]["s"], json!({ "value": 1.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["s"], json!({ "value": 1.0 }));
++}
++
++#[test]
++fn bucket_script_comparison_yields_boolean() {
++    let res = ok(script_histo(json!({
++        "s": { "bucket_script": { "buckets_path": { "a": "avg_price" }, "script": "a > 10" } }
++    })));
++    assert_eq!(res["histo"]["buckets"][0]["s"], json!({ "value": 0.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["s"], json!({ "value": 1.0 }));
++}
++
++#[test]
++fn bucket_script_subtraction() {
++    let res = ok(script_histo(json!({
++        "s": { "bucket_script": { "buckets_path": { "a": "avg_price", "c": "_count" }, "script": "a - c" } }
++    })));
++    assert_eq!(res["histo"]["buckets"][0]["s"], json!({ "value": 1.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["s"], json!({ "value": 21.0 }));
++}
++
++#[test]
++fn bucket_script_division() {
++    let res = ok(script_histo(json!({
++        "s": { "bucket_script": { "buckets_path": { "a": "avg_price", "c": "_count" }, "script": "a / c" } }
++    })));
++    assert_eq!(res["histo"]["buckets"][0]["s"], json!({ "value": 1.3333333333333333 }));
++    assert_eq!(res["histo"]["buckets"][1]["s"], json!({ "value": 6.25 }));
++}
++
++fn selector_keys(script: &str) -> Vec<Value> {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": { "keep": { "bucket_selector": { "buckets_path": { "c": "_count" }, "script": script } } }
++        }
++    }));
++    res["histo"]["buckets"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|bucket| bucket["key"].clone())
++        .collect()
++}
++
++#[test]
++fn bucket_selector_equality() {
++    assert_eq!(selector_keys("c == 3"), vec![json!(0.0)]);
++}
++
++#[test]
++fn bucket_selector_inequality() {
++    assert_eq!(selector_keys("c != 3"), vec![json!(20.0)]);
++}
++
++#[test]
++fn bucket_selector_less_than() {
++    assert_eq!(selector_keys("c < 4"), vec![json!(0.0)]);
++}
++
++#[test]
++fn bucket_selector_less_equal() {
++    assert_eq!(selector_keys("c <= 3"), vec![json!(0.0)]);
++}
++
++#[test]
++fn bucket_selector_boolean_or() {
++    assert_eq!(selector_keys("c == 3 || c == 4"), vec![json!(0.0), json!(20.0)]);
++}
++
++#[test]
++fn bucket_selector_keeps_matching_buckets() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": { "keep": { "bucket_selector": { "buckets_path": { "c": "_count" }, "script": "c >= 4" } } }
++        }
++    }));
++    let buckets = res["histo"]["buckets"].as_array().unwrap();
++    assert_eq!(buckets.len(), 1);
++    assert_eq!(buckets[0]["key"], json!(20.0));
++}
++
++#[test]
++fn bucket_selector_supports_boolean_predicate() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": { "keep": { "bucket_selector": { "buckets_path": { "c": "_count" }, "script": "c > 2 && c < 4" } } }
++        }
++    }));
++    let buckets = res["histo"]["buckets"].as_array().unwrap();
++    assert_eq!(buckets.len(), 1);
++    assert_eq!(buckets[0]["key"], json!(0.0));
++}
++
++#[test]
++fn bucket_selector_removes_before_sibling_reduction() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": { "keep": { "bucket_selector": { "buckets_path": { "c": "_count" }, "script": "c >= 4" } } }
++        },
++        "sum_count": { "sum_bucket": { "buckets_path": "histo>_count" } }
++    }));
++    let buckets = res["histo"]["buckets"].as_array().unwrap();
++    assert_eq!(buckets.len(), 1);
++    assert_eq!(buckets[0]["key"], json!(20.0));
++    assert_eq!(res["sum_count"], json!({ "value": 4.0 }));
++}
++
++#[test]
++fn cumulative_sum_computed_before_bucket_selector_removal() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "cumsum": { "cumulative_sum": { "buckets_path": "avg_price" } },
++                "keep": { "bucket_selector": { "buckets_path": { "c": "_count" }, "script": "c >= 4" } }
++            }
++        }
++    }));
++    let buckets = res["histo"]["buckets"].as_array().unwrap();
++    assert_eq!(buckets.len(), 1);
++    assert_eq!(buckets[0]["key"], json!(20.0));
++    assert_eq!(buckets[0]["cumsum"], json!({ "value": 29.0 }));
++}
++
++#[test]
++fn derivative_over_count_gap_histogram() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 0 },
++            "aggs": { "deriv": { "derivative": { "buckets_path": "_count" } } }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["deriv"], json!(null));
++    assert_eq!(res["histo"]["buckets"][1]["deriv"], json!({ "value": -3.0 }));
++    assert_eq!(res["histo"]["buckets"][2]["deriv"], json!({ "value": 4.0 }));
++}
++
++#[test]
++fn bucket_script_depends_on_earlier_pipeline() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "cumsum": { "cumulative_sum": { "buckets_path": "avg_price" } },
++                "doubled": { "bucket_script": { "buckets_path": { "cs": "cumsum" }, "script": "cs * 2" } }
++            }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["doubled"], json!({ "value": 8.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["doubled"], json!({ "value": 58.0 }));
++}
++
++#[test]
++fn sibling_pipeline_reduces_per_bucket_pipeline_output() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "cumsum": { "cumulative_sum": { "buckets_path": "avg_price" } }
++            }
++        },
++        "avg_cumsum": { "avg_bucket": { "buckets_path": "histo>cumsum" } }
++    }));
++    assert_eq!(res["avg_cumsum"], json!({ "value": 16.5 }));
++}
++
++#[test]
++fn gap_skip_excludes_missing_values() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 0 },
++            "aggs": { "avg_price": { "avg": { "field": "price" } } }
++        },
++        "avg_b": { "avg_bucket": { "buckets_path": "histo>avg_price" } }
++    }));
++    assert_eq!(res["avg_b"], json!({ "value": 14.5 }));
++}
++
++#[test]
++fn gap_insert_zeros_counts_missing_as_zero() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 0 },
++            "aggs": { "avg_price": { "avg": { "field": "price" } } }
++        },
++        "avg_b": { "avg_bucket": { "buckets_path": "histo>avg_price", "gap_policy": "insert_zeros" } }
++    }));
++    assert_eq!(res["avg_b"], json!({ "value": 9.666666666666666 }));
++}
++
++#[test]
++fn cumulative_sum_treats_gap_as_zero() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 0 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "cumsum": { "cumulative_sum": { "buckets_path": "avg_price" } }
++            }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["cumsum"], json!({ "value": 4.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["cumsum"], json!({ "value": 4.0 }));
++    assert_eq!(res["histo"]["buckets"][2]["cumsum"], json!({ "value": 29.0 }));
++}
++
++#[test]
++fn derivative_insert_zeros_over_gap() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 0 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "deriv": { "derivative": { "buckets_path": "avg_price", "gap_policy": "insert_zeros" } }
++            }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["deriv"], json!(null));
++    assert_eq!(res["histo"]["buckets"][1]["deriv"], json!({ "value": -4.0 }));
++    assert_eq!(res["histo"]["buckets"][2]["deriv"], json!({ "value": 25.0 }));
++}
++
++#[test]
++fn moving_avg_skip_window_over_gap() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 0 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "ma": { "moving_avg": { "buckets_path": "avg_price", "window": 2 } }
++            }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["ma"], json!({ "value": 4.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["ma"], json!({ "value": 4.0 }));
++    assert_eq!(res["histo"]["buckets"][2]["ma"], json!({ "value": 25.0 }));
++}
++
++#[test]
++fn moving_avg_insert_zeros_window_over_gap() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 0 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "ma": { "moving_avg": { "buckets_path": "avg_price", "window": 2, "gap_policy": "insert_zeros" } }
++            }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["ma"], json!({ "value": 4.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["ma"], json!({ "value": 2.0 }));
++    assert_eq!(res["histo"]["buckets"][2]["ma"], json!({ "value": 12.5 }));
++}
++
++#[test]
++fn bucket_script_skips_gap_bucket() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 0 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "plus": { "bucket_script": { "buckets_path": { "a": "avg_price" }, "script": "a + 1" } }
++            }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["plus"], json!({ "value": 5.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["plus"], json!(null));
++    assert_eq!(res["histo"]["buckets"][2]["plus"], json!({ "value": 26.0 }));
++}
++
++#[test]
++fn bucket_script_insert_zeros_fills_gap_bucket() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 0 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "plus": { "bucket_script": { "buckets_path": { "a": "avg_price" }, "script": "a + 1", "gap_policy": "insert_zeros" } }
++            }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["plus"], json!({ "value": 5.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["plus"], json!({ "value": 1.0 }));
++    assert_eq!(res["histo"]["buckets"][2]["plus"], json!({ "value": 26.0 }));
++}
++
++#[test]
++fn min_max_bucket_skip_gaps() {
++    let base = json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 0 },
++            "aggs": { "avg_price": { "avg": { "field": "price" } } }
++        }
++    });
++    let mut with_min = base.clone();
++    with_min.as_object_mut().unwrap().insert(
++        "min_b".to_string(),
++        json!({ "min_bucket": { "buckets_path": "histo>avg_price" } }),
++    );
++    assert_eq!(ok(with_min)["min_b"], json!({ "value": 4.0 }));
++    let mut with_max = base;
++    with_max.as_object_mut().unwrap().insert(
++        "max_b".to_string(),
++        json!({ "max_bucket": { "buckets_path": "histo>avg_price" } }),
++    );
++    assert_eq!(ok(with_max)["max_b"], json!({ "value": 25.0 }));
++}
++
++#[test]
++fn stats_bucket_over_skipped_gaps() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 0 },
++            "aggs": { "avg_price": { "avg": { "field": "price" } } }
++        },
++        "stats_b": { "stats_bucket": { "buckets_path": "histo>avg_price" } }
++    }));
++    assert_eq!(
++        res["stats_b"],
++        json!({ "count": 2, "sum": 29.0, "min": 4.0, "max": 25.0, "avg": 14.5 })
++    );
++}
++
++#[test]
++fn serial_on_keyed_parent_errors() {
++    assert!(err(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1, "keyed": true },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "cumsum": { "cumulative_sum": { "buckets_path": "avg_price" } }
++            }
++        }
++    })));
++}
++
++#[test]
++fn pipeline_dependency_cycle_errors() {
++    assert!(err(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": {
++                "x": { "bucket_script": { "buckets_path": { "v": "y" }, "script": "v + 1" } },
++                "y": { "bucket_script": { "buckets_path": { "v": "x" }, "script": "v + 1" } }
++            }
++        }
++    })));
++}
++
++#[test]
++fn bucket_script_over_derivative_gap() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "deriv": { "derivative": { "buckets_path": "avg_price" } },
++                "s": { "bucket_script": { "buckets_path": { "v": "deriv" }, "script": "v * 2" } }
++            }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["s"], json!(null));
++    assert_eq!(res["histo"]["buckets"][1]["s"], json!({ "value": 42.0 }));
++}
++
++#[test]
++fn sibling_avg_bucket_over_derivative_gap() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "deriv": { "derivative": { "buckets_path": "avg_price" } }
++            }
++        },
++        "avg_deriv": { "avg_bucket": { "buckets_path": "histo>deriv" } }
++    }));
++    assert_eq!(res["avg_deriv"], json!({ "value": 21.0 }));
++}
++
++#[test]
++fn cumulative_sum_over_derivative_gap() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "deriv": { "derivative": { "buckets_path": "avg_price" } },
++                "cs2": { "cumulative_sum": { "buckets_path": "deriv" } }
++            }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["cs2"], json!({ "value": 0.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["cs2"], json!({ "value": 21.0 }));
++}
++
++#[test]
++fn moving_avg_window_three_skip_interior_gap() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 0 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "ma": { "moving_avg": { "buckets_path": "avg_price", "window": 3 } }
++            }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["ma"], json!({ "value": 4.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["ma"], json!({ "value": 4.0 }));
++    assert_eq!(res["histo"]["buckets"][2]["ma"], json!({ "value": 14.5 }));
++}
++
++#[test]
++fn bucket_selector_removing_all_then_sibling_empty() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": { "keep": { "bucket_selector": { "buckets_path": { "c": "_count" }, "script": "c >= 100" } } }
++        },
++        "sum_count": { "sum_bucket": { "buckets_path": "histo>_count" } },
++        "avg_count": { "avg_bucket": { "buckets_path": "histo>_count" } }
++    }));
++    assert_eq!(res["histo"]["buckets"].as_array().unwrap().len(), 0);
++    assert_eq!(res["sum_count"], json!({ "value": 0.0 }));
++    assert_eq!(res["avg_count"], json!({ "value": null }));
++}
++
++#[test]
++fn three_level_dependency_chain() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "cumsum": { "cumulative_sum": { "buckets_path": "avg_price" } },
++                "s1": { "bucket_script": { "buckets_path": { "x": "cumsum" }, "script": "x * 2" } },
++                "s2": { "bucket_script": { "buckets_path": { "y": "s1" }, "script": "y + 1" } }
++            }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["s2"], json!({ "value": 9.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["s2"], json!({ "value": 59.0 }));
++}
++
++#[test]
++fn moving_avg_window_larger_than_bucket_count() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": {
++                "avg_price": { "avg": { "field": "price" } },
++                "ma": { "moving_avg": { "buckets_path": "avg_price", "window": 5 } }
++            }
++        }
++    }));
++    assert_eq!(res["histo"]["buckets"][0]["ma"], json!({ "value": 4.0 }));
++    assert_eq!(res["histo"]["buckets"][1]["ma"], json!({ "value": 14.5 }));
++}
++
++#[test]
++fn bucket_script_and_binds_tighter_than_or() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": { "keep": { "bucket_selector": { "buckets_path": { "c": "_count" }, "script": "c == 3 || c == 4 && c > 100" } } }
++        }
++    }));
++    let buckets = res["histo"]["buckets"].as_array().unwrap();
++    assert_eq!(buckets.len(), 1);
++    assert_eq!(buckets[0]["key"], json!(0.0));
++}
++
++#[test]
++fn per_bucket_pipeline_at_request_root_errors() {
++    assert!(err(json!({
++        "cs": { "cumulative_sum": { "buckets_path": "_count" } }
++    })));
++}
++
++#[test]
++fn per_bucket_pipeline_under_metric_parent_errors() {
++    assert!(err(json!({
++        "m": {
++            "avg": { "field": "price" },
++            "aggs": { "cs": { "cumulative_sum": { "buckets_path": "_count" } } }
++        }
++    })));
++}
++
++#[test]
++fn pipeline_does_not_require_a_fast_field() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": { "avg_price": { "avg": { "field": "price" } } }
++        },
++        "max_b": { "max_bucket": { "buckets_path": "histo>avg_price" } }
++    }));
++    assert_eq!(res["max_b"], json!({ "value": 25.0 }));
++}
++
++#[test]
++fn metric_subproperty_reference_in_sibling() {
++    let res = ok(json!({
++        "histo": {
++            "histogram": { "field": "price", "interval": 10.0, "min_doc_count": 1 },
++            "aggs": { "s": { "stats": { "field": "price" } } }
++        },
++        "avg_of_max": { "avg_bucket": { "buckets_path": "histo>s.max" } }
++    }));
++    assert_eq!(res["avg_of_max"], json!({ "value": 17.0 }));
++}

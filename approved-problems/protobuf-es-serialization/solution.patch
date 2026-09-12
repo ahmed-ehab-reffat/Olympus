@@ -1,0 +1,2895 @@
+diff --git a/packages/protobuf-conformance/src/conformance.ts b/packages/protobuf-conformance/src/conformance.ts
+index 9e396ce4..fa831078 100644
+--- a/packages/protobuf-conformance/src/conformance.ts
++++ b/packages/protobuf-conformance/src/conformance.ts
+@@ -25,7 +25,9 @@ import {
+   toJsonString,
+   createRegistry,
+   protoInt64,
++  SerializationError,
+ } from "@bufbuild/protobuf";
++import { pathToString } from "@bufbuild/protobuf/reflect";
+ import { fromText, toText } from "@bufbuild/protobuf/txtpb";
+ import {
+   type ConformanceRequest,
+@@ -159,7 +161,7 @@ function test(request: ConformanceRequest): ConformanceResponse["result"] {
+     // >
+     // > Setting this string does not necessarily mean the testee failed the
+     // > test.  Some of the test cases are intentionally invalid input.
+-    return { case: "parseError", value: String(err) };
++    return { case: "parseError", value: reportError(err) };
+   }
+ 
+   try {
+@@ -208,10 +210,26 @@ function test(request: ConformanceRequest): ConformanceResponse["result"] {
+     // > If the input was successfully parsed but errors occurred when
+     // > serializing it to the requested output format, set the error message in
+     // > this field.
+-    return { case: "serializeError", value: String(err) };
++    return { case: "serializeError", value: reportError(err) };
+   }
+ }
+ 
++function reportError(error: unknown): string {
++  if (!(error instanceof SerializationError)) {
++    return String(error);
++  }
++  const path = pathToString(error.path);
++  const context = [
++    error.format,
++    error.operation,
++    error.schema.typeName,
++    path,
++  ]
++    .filter((part) => part.length > 0)
++    .join(" ");
++  return `${context}: ${String(error)}`;
++}
++
+ // Reads length-prefixed messages from a stream.
+ async function* readMessages<Desc extends DescMessage>(
+   stream: AsyncIterable<Uint8Array>,
+diff --git a/packages/protobuf/src/clone.ts b/packages/protobuf/src/clone.ts
+index 8e6a2ad2..72a447a3 100644
+--- a/packages/protobuf/src/clone.ts
++++ b/packages/protobuf/src/clone.ts
+@@ -28,7 +28,10 @@ export function clone<Desc extends DescMessage>(
+   return cloneReflect(reflect(schema, message)).message as MessageShape<Desc>;
+ }
+ 
+-function cloneReflect(i: ReflectMessage): ReflectMessage {
++/**
++ * @private Only exported for merge-into-existing decode paths
++ */
++export function cloneReflect(i: ReflectMessage): ReflectMessage {
+   const o = reflect(i.desc);
+   for (const f of i.fields) {
+     if (!i.isSet(f)) {
+diff --git a/packages/protobuf/src/from-binary.ts b/packages/protobuf/src/from-binary.ts
+index 203c986e..dee0bef8 100644
+--- a/packages/protobuf/src/from-binary.ts
++++ b/packages/protobuf/src/from-binary.ts
+@@ -12,16 +12,24 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++import { cloneReflect } from "./clone.js";
+ import { type DescField, type DescMessage, ScalarType } from "./descriptors.js";
+-import type { MessageShape } from "./types.js";
++import { transactionalMerge } from "./merge.js";
+ import type {
+   ReflectList,
+   ReflectMap,
+   ReflectMessage,
+ } from "./reflect/index.js";
++import type { Path } from "./reflect/path.js";
++import { reflect } from "./reflect/reflect.js";
+ import { scalarZeroValue } from "./reflect/scalar.js";
+ import type { ScalarValue } from "./reflect/scalar.js";
+-import { reflect } from "./reflect/reflect.js";
++import {
++  type SerializationContext,
++  makeSerializationContext,
++  withSerializationError,
++} from "./serialization-error.js";
++import type { MessageShape } from "./types.js";
+ import { BinaryReader, WireType } from "./wire/binary-encoding.js";
+ import { varint32write } from "./wire/varint.js";
+ 
+@@ -48,6 +56,7 @@ export interface BinaryReadOptions {
+ interface BinaryReadContext extends BinaryReadOptions {
+   // Recursion depth, guarded by recursionLimit.
+   depth: number;
++  serialization?: SerializationContext | undefined;
+ }
+ 
+ /**
+@@ -55,8 +64,15 @@ interface BinaryReadContext extends BinaryReadOptions {
+  */
+ export function makeReadContext(
+   options?: Partial<BinaryReadOptions>,
++  serialization?: SerializationContext,
+ ): BinaryReadContext {
+-  return { readUnknownFields: true, recursionLimit: 100, ...options, depth: 0 };
++  return {
++    readUnknownFields: true,
++    recursionLimit: 100,
++    ...options,
++    depth: 0,
++    serialization,
++  };
+ }
+ 
+ /**
+@@ -67,15 +83,19 @@ export function fromBinary<Desc extends DescMessage>(
+   bytes: Uint8Array,
+   options?: Partial<BinaryReadOptions>,
+ ): MessageShape<Desc> {
+-  const msg = reflect(schema, undefined, false);
+-  readMessage(
+-    msg,
+-    new BinaryReader(bytes),
+-    makeReadContext(options),
+-    false,
+-    bytes.byteLength,
+-  );
+-  return msg.message as MessageShape<Desc>;
++  const serialization = makeSerializationContext("binary", "read", schema);
++  return withSerializationError(serialization, [], () => {
++    const msg = reflect(schema, undefined, false);
++    readMessage(
++      msg,
++      new BinaryReader(bytes),
++      makeReadContext(options, serialization),
++      false,
++      bytes.byteLength,
++      [],
++    );
++    return msg.message as MessageShape<Desc>;
++  });
+ }
+ 
+ /**
+@@ -93,14 +113,19 @@ export function mergeFromBinary<Desc extends DescMessage>(
+   bytes: Uint8Array,
+   options?: Partial<BinaryReadOptions>,
+ ): MessageShape<Desc> {
+-  readMessage(
+-    reflect(schema, target, false),
+-    new BinaryReader(bytes),
+-    makeReadContext(options),
+-    false,
+-    bytes.byteLength,
++  const serialization = makeSerializationContext("binary", "read", schema);
++  return withSerializationError(serialization, [], () =>
++    transactionalMerge(schema, target, (draft) => {
++      readMessage(
++        reflect(schema, draft, false),
++        new BinaryReader(bytes),
++        makeReadContext(options, serialization),
++        false,
++        bytes.byteLength,
++        [],
++      );
++    }),
+   );
+-  return target;
+ }
+ 
+ /**
+@@ -117,42 +142,48 @@ function readMessage(
+   ctx: BinaryReadContext,
+   delimited: boolean,
+   lengthOrDelimitedFieldNo: number,
++  path: Path,
+ ): void {
+-  if (++ctx.depth > ctx.recursionLimit) {
+-    throw new Error(
+-      `cannot decode ${message.desc} from binary: maximum recursion depth of ${ctx.recursionLimit} reached`,
+-    );
+-  }
+-  const end = delimited ? reader.len : reader.pos + lengthOrDelimitedFieldNo;
+-  let fieldNo: number | undefined;
+-  let wireType: WireType | undefined;
+-  const unknownFields = message.getUnknown() ?? [];
+-  while (reader.pos < end) {
+-    [fieldNo, wireType] = reader.tag();
+-    if (delimited && wireType == WireType.EndGroup) {
+-      break;
++  readAt(ctx, path, () => {
++    if (++ctx.depth > ctx.recursionLimit) {
++      throw new Error(
++        `cannot decode ${message.desc} from binary: maximum recursion depth of ${ctx.recursionLimit} reached`,
++      );
+     }
+-    const field = message.findNumber(fieldNo);
+-    if (!field) {
+-      // Use remaining recursion budget for skipping nested groups
+-      const recursionLimit = ctx.recursionLimit - ctx.depth;
+-      const data = reader.skip(wireType, fieldNo, recursionLimit);
+-      if (ctx.readUnknownFields) {
+-        unknownFields.push({ no: fieldNo, wireType, data });
++    const end = delimited ? reader.len : reader.pos + lengthOrDelimitedFieldNo;
++    let fieldNo: number | undefined;
++    let wireType: WireType | undefined;
++    const unknownFields = message.getUnknown() ?? [];
++    while (reader.pos < end) {
++      [fieldNo, wireType] = reader.tag();
++      if (delimited && wireType == WireType.EndGroup) {
++        break;
++      }
++      const field = message.findNumber(fieldNo);
++      if (!field) {
++        // Use remaining recursion budget for skipping nested groups
++        const recursionLimit = ctx.recursionLimit - ctx.depth;
++        const data = reader.skip(wireType, fieldNo, recursionLimit);
++        if (ctx.readUnknownFields) {
++          unknownFields.push({ no: fieldNo, wireType, data });
++        }
++        continue;
+       }
+-      continue;
++      readField(message, reader, field, wireType, ctx, path.concat(field));
+     }
+-    readField(message, reader, field, wireType, ctx);
+-  }
+-  if (delimited) {
+-    if (wireType != WireType.EndGroup || fieldNo !== lengthOrDelimitedFieldNo) {
+-      throw new Error("invalid end group tag");
++    if (delimited) {
++      if (
++        wireType != WireType.EndGroup ||
++        fieldNo !== lengthOrDelimitedFieldNo
++      ) {
++        throw new Error("invalid end group tag");
++      }
+     }
+-  }
+-  if (unknownFields.length > 0) {
+-    message.setUnknown(unknownFields);
+-  }
+-  ctx.depth--;
++    if (unknownFields.length > 0) {
++      message.setUnknown(unknownFields);
++    }
++    ctx.depth--;
++  });
+ }
+ 
+ /**
+@@ -164,48 +195,60 @@ export function readField(
+   field: DescField,
+   wireType: WireType,
+   ctx: BinaryReadContext,
++  path: Path = [],
+ ) {
+-  switch (field.fieldKind) {
+-    case "scalar":
+-      message.set(
+-        field,
+-        readScalar(reader, field.scalar, field.utf8Validation),
+-      );
+-      break;
+-    case "enum":
+-      const val = readScalar(reader, ScalarType.INT32);
+-      if (field.enum.open) {
+-        message.set(field, val);
+-      } else {
+-        const ok = field.enum.values.some((v) => v.number === val);
+-        if (ok) {
++  readAt(ctx, path, () => {
++    switch (field.fieldKind) {
++      case "scalar":
++        message.set(
++          field,
++          readScalar(reader, field.scalar, field.utf8Validation),
++        );
++        break;
++      case "enum": {
++        const val = readScalar(reader, ScalarType.INT32);
++        if (field.enum.open) {
+           message.set(field, val);
+-        } else if (ctx.readUnknownFields) {
+-          const bytes: number[] = [];
+-          varint32write(val as number, bytes);
+-          const unknownFields = message.getUnknown() ?? [];
+-          unknownFields.push({
+-            no: field.number,
+-            wireType,
+-            data: new Uint8Array(bytes),
+-          });
+-          message.setUnknown(unknownFields);
++        } else {
++          const ok = field.enum.values.some((v) => v.number === val);
++          if (ok) {
++            message.set(field, val);
++          } else if (ctx.readUnknownFields) {
++            const bytes: number[] = [];
++            varint32write(val as number, bytes);
++            const unknownFields = message.getUnknown() ?? [];
++            unknownFields.push({
++              no: field.number,
++              wireType,
++              data: new Uint8Array(bytes),
++            });
++            message.setUnknown(unknownFields);
++          }
+         }
++        break;
+       }
+-      break;
+-    case "message":
+-      message.set(
+-        field,
+-        readMessageField(reader, ctx, field, message.get(field)),
+-      );
+-      break;
+-    case "list":
+-      readListField(reader, wireType, message.get(field), ctx);
+-      break;
+-    case "map":
+-      readMapEntry(reader, message.get(field), ctx);
+-      break;
+-  }
++      case "message": {
++        const existing = message.get(field);
++        message.set(
++          field,
++          readMessageField(
++            reader,
++            ctx,
++            field,
++            path,
++            existing ? cloneReflect(existing) : undefined,
++          ),
++        );
++        break;
++      }
++      case "list":
++        readListField(reader, wireType, message.get(field), ctx, path);
++        break;
++      case "map":
++        readMapEntry(reader, message.get(field), ctx, path);
++        break;
++    }
++  });
+ }
+ 
+ // Read a map field, expecting key field = 1, value field = 2
+@@ -213,6 +256,7 @@ function readMapEntry(
+   reader: BinaryReader,
+   map: ReflectMap,
+   ctx: BinaryReadContext,
++  path: Path,
+ ): void {
+   const field = map.field();
+   let key: ScalarValue | undefined;
+@@ -229,17 +273,21 @@ function readMapEntry(
+         key = readScalar(reader, field.mapKey, field.utf8Validation);
+         break;
+       case 2:
+-        switch (field.mapKind) {
+-          case "scalar":
+-            val = readScalar(reader, field.scalar, field.utf8Validation);
+-            break;
+-          case "enum":
+-            val = reader.int32();
+-            break;
+-          case "message":
+-            val = readMessageField(reader, ctx, field);
+-            break;
+-        }
++        val = readAt(ctx, mapEntryPath(path, key), () => {
++          switch (field.mapKind) {
++            case "scalar":
++              return readScalar(reader, field.scalar, field.utf8Validation);
++            case "enum":
++              return reader.int32();
++            case "message":
++              return readMessageField(
++                reader,
++                ctx,
++                field,
++                mapEntryPath(path, key),
++              );
++          }
++        });
+         break;
+     }
+   }
+@@ -259,7 +307,7 @@ function readMapEntry(
+         break;
+     }
+   }
+-  map.set(key, val);
++  readAt(ctx, mapEntryPath(path, key), () => map.set(key, val));
+ }
+ 
+ function readListField(
+@@ -267,10 +315,14 @@ function readListField(
+   wireType: WireType,
+   list: ReflectList,
+   ctx: BinaryReadContext,
++  path: Path,
+ ) {
+   const field = list.field();
+   if (field.listKind === "message") {
+-    list.add(readMessageField(reader, ctx, field));
++    const itemPath = path.concat({ kind: "list_sub", index: list.size });
++    readAt(ctx, itemPath, () =>
++      list.add(readMessageField(reader, ctx, field, itemPath)),
++    );
+     return;
+   }
+   const scalarType = field.scalar ?? ScalarType.INT32;
+@@ -279,12 +331,18 @@ function readListField(
+     scalarType != ScalarType.STRING &&
+     scalarType != ScalarType.BYTES;
+   if (!packed) {
+-    list.add(readScalar(reader, scalarType, field.utf8Validation));
++    const itemPath = path.concat({ kind: "list_sub", index: list.size });
++    readAt(ctx, itemPath, () =>
++      list.add(readScalar(reader, scalarType, field.utf8Validation)),
++    );
+     return;
+   }
+   const e = reader.uint32() + reader.pos;
+   while (reader.pos < e) {
+-    list.add(readScalar(reader, scalarType, field.utf8Validation));
++    const itemPath = path.concat({ kind: "list_sub", index: list.size });
++    readAt(ctx, itemPath, () =>
++      list.add(readScalar(reader, scalarType, field.utf8Validation)),
++    );
+   }
+ }
+ 
+@@ -292,6 +350,7 @@ function readMessageField(
+   reader: BinaryReader,
+   ctx: BinaryReadContext,
+   field: DescField & { message: DescMessage },
++  path: Path,
+   mergeMessage?: ReflectMessage,
+ ): ReflectMessage {
+   const delimited = field.delimitedEncoding;
+@@ -302,10 +361,23 @@ function readMessageField(
+     ctx,
+     delimited,
+     delimited ? field.number : reader.uint32(),
++    path,
+   );
+   return message;
+ }
+ 
++function readAt<T>(ctx: BinaryReadContext, path: Path, run: () => T): T {
++  return ctx.serialization
++    ? withSerializationError(ctx.serialization, path, run)
++    : run();
++}
++
++function mapEntryPath(path: Path, key: ScalarValue | undefined): Path {
++  return key === undefined || key instanceof Uint8Array
++    ? path
++    : path.concat({ kind: "map_sub", key });
++}
++
+ function readScalar(
+   reader: BinaryReader,
+   type: ScalarType,
+diff --git a/packages/protobuf/src/from-json.ts b/packages/protobuf/src/from-json.ts
+index 705cc38f..6771b2fd 100644
+--- a/packages/protobuf/src/from-json.ts
++++ b/packages/protobuf/src/from-json.ts
+@@ -12,6 +12,8 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++import { cloneReflect } from "./clone.js";
++import { create } from "./create.js";
+ import {
+   type DescEnum,
+   type DescExtension,
+@@ -20,20 +22,27 @@ import {
+   type DescOneof,
+   ScalarType,
+ } from "./descriptors.js";
++import { createExtensionContainer, setExtension } from "./extensions.js";
+ import type { JsonValue } from "./json-value.js";
++import { transactionalMerge } from "./merge.js";
+ import { protoInt64 } from "./proto-int64.js";
+-import { create } from "./create.js";
+-import type { Registry } from "./registry.js";
++import { FieldError, isFieldError } from "./reflect/error.js";
++import { protoSnakeCase } from "./reflect/names.js";
++import type { Path } from "./reflect/path.js";
++import { formatVal } from "./reflect/reflect-check.js";
+ import type {
+   ReflectList,
+   ReflectMap,
+   ReflectMessage,
+ } from "./reflect/reflect-types.js";
+ import { reflect } from "./reflect/reflect.js";
+-import { FieldError, isFieldError } from "./reflect/error.js";
+-import { formatVal } from "./reflect/reflect-check.js";
+-import { protoSnakeCase } from "./reflect/names.js";
+ import type { ScalarValue } from "./reflect/scalar.js";
++import type { Registry } from "./registry.js";
++import {
++  type SerializationContext,
++  makeSerializationContext,
++  withSerializationError,
++} from "./serialization-error.js";
+ import type { EnumJsonType, EnumShape, MessageShape } from "./types.js";
+ import { base64Decode } from "./wire/base64-encoding.js";
+ import type {
+@@ -46,15 +55,14 @@ import type {
+   Value,
+ } from "./wkt/index.js";
+ import {
+-  hasCustomJsonRepresentation,
+-  isWrapperDesc,
+-  anyPack,
+   ListValueSchema,
+   NullValue,
+   StructSchema,
+   ValueSchema,
++  anyPack,
++  hasCustomJsonRepresentation,
++  isWrapperDesc,
+ } from "./wkt/index.js";
+-import { createExtensionContainer, setExtension } from "./extensions.js";
+ 
+ /**
+  * Options for parsing JSON data.
+@@ -84,14 +92,19 @@ export interface JsonReadOptions {
+ interface JsonReadContext extends JsonReadOptions {
+   // Recursion depth, guarded by recursionLimit.
+   depth: number;
++  serialization: SerializationContext;
+ }
+ 
+-function makeReadContext(options?: Partial<JsonReadOptions>): JsonReadContext {
++function makeReadContext(
++  schema: DescMessage,
++  options?: Partial<JsonReadOptions>,
++): JsonReadContext {
+   return {
+     ignoreUnknownFields: false,
+     recursionLimit: 100,
+     ...options,
+     depth: 0,
++    serialization: makeSerializationContext("json", "read", schema),
+   };
+ }
+ 
+@@ -105,7 +118,10 @@ export function fromJsonString<Desc extends DescMessage>(
+   json: string,
+   options?: Partial<JsonReadOptions>,
+ ): MessageShape<Desc> {
+-  return fromJson(schema, parseJsonString(json, schema.typeName), options);
++  const serialization = makeSerializationContext("json", "read", schema);
++  return withSerializationError(serialization, [], () =>
++    fromJson(schema, parseJsonString(json, schema.typeName), options),
++  );
+ }
+ 
+ /**
+@@ -125,11 +141,14 @@ export function mergeFromJsonString<Desc extends DescMessage>(
+   json: string,
+   options?: Partial<JsonReadOptions>,
+ ): MessageShape<Desc> {
+-  return mergeFromJson(
+-    schema,
+-    target,
+-    parseJsonString(json, schema.typeName),
+-    options,
++  const serialization = makeSerializationContext("json", "read", schema);
++  return withSerializationError(serialization, [], () =>
++    mergeFromJson(
++      schema,
++      target,
++      parseJsonString(json, schema.typeName),
++      options,
++    ),
+   );
+ }
+ 
+@@ -145,19 +164,12 @@ export function fromJson<Desc extends DescMessage>(
+   json: JsonValue,
+   options?: Partial<JsonReadOptions>,
+ ): MessageShape<Desc> {
++  const ctx = makeReadContext(schema, options);
+   const msg = reflect(schema);
+-  try {
+-    readMessage(msg, json, makeReadContext(options));
+-  } catch (e) {
+-    if (isFieldError(e)) {
+-      // @ts-expect-error we use the ES2022 error CTOR option "cause" for better stack traces
+-      throw new Error(`cannot decode ${e.field()} from JSON: ${e.message}`, {
+-        cause: e,
+-      });
+-    }
+-    throw e;
+-  }
+-  return msg.message as MessageShape<Desc>;
++  return readAt(ctx, [], () => {
++    readMessage(msg, json, ctx, []);
++    return msg.message as MessageShape<Desc>;
++  });
+ }
+ 
+ /**
+@@ -178,18 +190,12 @@ export function mergeFromJson<Desc extends DescMessage>(
+   json: JsonValue,
+   options?: Partial<JsonReadOptions>,
+ ): MessageShape<Desc> {
+-  try {
+-    readMessage(reflect(schema, target), json, makeReadContext(options));
+-  } catch (e) {
+-    if (isFieldError(e)) {
+-      // @ts-expect-error we use the ES2022 error CTOR option "cause" for better stack traces
+-      throw new Error(`cannot decode ${e.field()} from JSON: ${e.message}`, {
+-        cause: e,
+-      });
+-    }
+-    throw e;
+-  }
+-  return target;
++  const ctx = makeReadContext(schema, options);
++  return readAt(ctx, [], () =>
++    transactionalMerge(schema, target, (draft) =>
++      readMessage(reflect(schema, draft), json, ctx, []),
++    ),
++  );
+ }
+ 
+ /**
+@@ -229,69 +235,88 @@ function readMessage(
+   msg: ReflectMessage,
+   json: JsonValue,
+   ctx: JsonReadContext,
++  path: Path,
+ ) {
+-  if (++ctx.depth > ctx.recursionLimit) {
+-    throw new Error(
+-      `cannot decode ${msg.desc} from JSON: maximum recursion depth of ${ctx.recursionLimit} reached`,
+-    );
+-  }
+-  if (tryWktFromJson(msg, json, ctx)) {
+-    ctx.depth--;
+-    return;
+-  }
+-  if (json == null || Array.isArray(json) || typeof json != "object") {
+-    throw new Error(`cannot decode ${msg.desc} from JSON: ${formatVal(json)}`);
+-  }
+-  const oneofSeen = new Map<DescOneof, DescField>();
+-  const fieldSeen = new Set<DescField>();
+-  for (const [jsonKey, jsonValue] of Object.entries(json)) {
+-    const field = getJsonField(msg.desc, jsonKey);
+-    if (field) {
+-      if (fieldSeen.has(field)) {
+-        // The same field may be set by its proto name and its JSON name, or by
+-        // a duplicate or unicode-escaped key that JSON.parse already collapsed.
+-        // Checked before the null-skip below so that a null entry still counts.
+-        throw new FieldError(field, "set multiple times");
+-      }
+-      fieldSeen.add(field);
+-      if (field.oneof && jsonValue === null && field.fieldKind == "scalar") {
+-        // see conformance test Required.Proto3.JsonInput.OneofFieldNull{First,Second}
+-        continue;
+-      }
+-      if (field.oneof) {
+-        const seen = oneofSeen.get(field.oneof);
+-        if (seen !== undefined) {
+-          throw new FieldError(
+-            field.oneof,
+-            `oneof set multiple times by ${seen.name} and ${field.name}`,
+-          );
+-        }
+-        oneofSeen.set(field.oneof, field);
+-      }
+-      readField(msg, field, jsonValue, ctx);
+-    } else {
+-      let extension: DescExtension | undefined = undefined;
+-      if (
+-        jsonKey.startsWith("[") &&
+-        jsonKey.endsWith("]") &&
+-        // biome-ignore lint/suspicious/noAssignInExpressions: no
+-        (extension = ctx.registry?.getExtension(
+-          jsonKey.substring(1, jsonKey.length - 1),
+-        )) &&
+-        extension.extendee.typeName === msg.desc.typeName
+-      ) {
+-        const [container, field, get] = createExtensionContainer(extension);
+-        readField(container, field, jsonValue, ctx);
+-        setExtension(msg.message, extension, get());
++  readAt(ctx, path, () => {
++    if (++ctx.depth > ctx.recursionLimit) {
++      throw new Error(
++        `cannot decode ${msg.desc} from JSON: maximum recursion depth of ${ctx.recursionLimit} reached`,
++      );
++    }
++    try {
++      if (tryWktFromJson(msg, json, ctx, path)) {
++        return;
+       }
+-      if (!extension && !ctx.ignoreUnknownFields) {
++      if (json == null || Array.isArray(json) || typeof json != "object") {
+         throw new Error(
+-          `cannot decode ${msg.desc} from JSON: key "${jsonKey}" is unknown`,
++          `cannot decode ${msg.desc} from JSON: ${formatVal(json)}`,
+         );
+       }
++      const oneofSeen = new Map<DescOneof, DescField>();
++      const fieldSeen = new Set<DescField>();
++      for (const [jsonKey, jsonValue] of Object.entries(json)) {
++        const field = getJsonField(msg.desc, jsonKey);
++        if (field) {
++          const fieldPath = path.concat(field);
++          readAt(ctx, fieldPath, () => {
++            if (fieldSeen.has(field)) {
++              // The same field may be set by its proto name and its JSON name, or by
++              // a duplicate or unicode-escaped key that JSON.parse already collapsed.
++              // Checked before the null-skip below so that a null entry still counts.
++              throw new FieldError(field, "set multiple times");
++            }
++            fieldSeen.add(field);
++            if (
++              field.oneof &&
++              jsonValue === null &&
++              field.fieldKind == "scalar"
++            ) {
++              // see conformance test Required.Proto3.JsonInput.OneofFieldNull{First,Second}
++              return;
++            }
++            if (field.oneof) {
++              const seen = oneofSeen.get(field.oneof);
++              if (seen !== undefined) {
++                throw new FieldError(
++                  field.oneof,
++                  `oneof set multiple times by ${seen.name} and ${field.name}`,
++                );
++              }
++              oneofSeen.set(field.oneof, field);
++            }
++            readField(msg, field, jsonValue, ctx, fieldPath);
++          });
++        } else {
++          let extension: DescExtension | undefined = undefined;
++          if (
++            jsonKey.startsWith("[") &&
++            jsonKey.endsWith("]") &&
++            // biome-ignore lint/suspicious/noAssignInExpressions: no
++            (extension = ctx.registry?.getExtension(
++              jsonKey.substring(1, jsonKey.length - 1),
++            )) &&
++            extension.extendee.typeName === msg.desc.typeName
++          ) {
++            const foundExtension = extension;
++            const extensionPath = path.concat(foundExtension);
++            readAt(ctx, extensionPath, () => {
++              const [container, field, get] =
++                createExtensionContainer(foundExtension);
++              readField(container, field, jsonValue, ctx, extensionPath);
++              setExtension(msg.message, foundExtension, get());
++            });
++          }
++          if (!extension && !ctx.ignoreUnknownFields) {
++            throw new Error(
++              `cannot decode ${msg.desc} from JSON: key "${jsonKey}" is unknown`,
++            );
++          }
++        }
++      }
++    } finally {
++      ctx.depth--;
+     }
+-  }
+-  ctx.depth--;
++  });
+ }
+ 
+ function readField(
+@@ -299,37 +324,41 @@ function readField(
+   field: DescField,
+   json: JsonValue,
+   ctx: JsonReadContext,
++  path: Path,
+ ) {
+-  switch (field.fieldKind) {
+-    case "scalar":
+-      readScalarField(msg, field, json);
+-      break;
+-    case "enum":
+-      readEnumField(msg, field, json, ctx);
+-      break;
+-    case "message":
+-      readMessageField(msg, field, json, ctx);
+-      break;
+-    case "list":
+-      readListField(msg.get(field), json, ctx);
+-      break;
+-    case "map":
+-      readMapField(msg.get(field), json, ctx);
+-      break;
+-  }
++  readAt(ctx, path, () => {
++    switch (field.fieldKind) {
++      case "scalar":
++        readScalarField(msg, field, json);
++        break;
++      case "enum":
++        readEnumField(msg, field, json, ctx);
++        break;
++      case "message":
++        readMessageField(msg, field, json, ctx, path);
++        break;
++      case "list":
++        readListField(msg.get(field), json, ctx, path);
++        break;
++      case "map":
++        readMapField(msg.get(field), json, ctx, path);
++        break;
++    }
++  });
+ }
+ 
+ function readListOrMapItem(
+   field: DescField & { fieldKind: "map" | "list" },
+   json: JsonValue,
+   ctx: JsonReadContext,
++  path: Path,
+ ) {
+   if (field.scalar && json !== null) {
+     return scalarFromJson(field, json);
+   }
+   if (field.message && !isResetSentinelNullValue(field, json)) {
+     const msgValue = reflect(field.message);
+-    readMessage(msgValue, json, ctx);
++    readMessage(msgValue, json, ctx, path);
+ 
+     return msgValue;
+   }
+@@ -343,7 +372,12 @@ function readListOrMapItem(
+   );
+ }
+ 
+-function readMapField(map: ReflectMap, json: JsonValue, ctx: JsonReadContext) {
++function readMapField(
++  map: ReflectMap,
++  json: JsonValue,
++  ctx: JsonReadContext,
++  path: Path,
++) {
+   if (json === null) {
+     return;
+   }
+@@ -354,14 +388,17 @@ function readMapField(map: ReflectMap, json: JsonValue, ctx: JsonReadContext) {
+   const seen = new Set<unknown>();
+   for (const [jsonMapKey, jsonMapValue] of Object.entries(json)) {
+     const key = mapKeyFromJson(field.mapKey, jsonMapKey);
+-    if (seen.has(key)) {
+-      throw new FieldError(field, `duplicate map key "${jsonMapKey}"`);
+-    }
+-    seen.add(key);
+-    const value = readListOrMapItem(field, jsonMapValue, ctx);
+-    if (value !== tokenIgnoredUnknownEnum) {
+-      map.set(key, value);
+-    }
++    const entryPath = mapEntryPath(path, key);
++    readAt(ctx, entryPath, () => {
++      if (seen.has(key)) {
++        throw new FieldError(field, `duplicate map key "${jsonMapKey}"`);
++      }
++      seen.add(key);
++      const value = readListOrMapItem(field, jsonMapValue, ctx, entryPath);
++      if (value !== tokenIgnoredUnknownEnum) {
++        map.set(key, value);
++      }
++    });
+   }
+ }
+ 
+@@ -369,6 +406,7 @@ function readListField(
+   list: ReflectList,
+   json: JsonValue,
+   ctx: JsonReadContext,
++  path: Path,
+ ) {
+   if (json === null) {
+     return;
+@@ -377,11 +415,14 @@ function readListField(
+   if (!Array.isArray(json)) {
+     throw new FieldError(field, "expected Array, got " + formatVal(json));
+   }
+-  for (const jsonItem of json) {
+-    const value = readListOrMapItem(field, jsonItem, ctx);
+-    if (value !== tokenIgnoredUnknownEnum) {
+-      list.add(value);
+-    }
++  for (let index = 0; index < json.length; index++) {
++    const itemPath = path.concat({ kind: "list_sub", index });
++    readAt(ctx, itemPath, () => {
++      const value = readListOrMapItem(field, json[index], ctx, itemPath);
++      if (value !== tokenIgnoredUnknownEnum) {
++        list.add(value);
++      }
++    });
+   }
+ }
+ 
+@@ -390,13 +431,16 @@ function readMessageField(
+   field: DescField & { fieldKind: "message" },
+   json: JsonValue,
+   ctx: JsonReadContext,
++  path: Path,
+ ) {
+   if (isResetSentinelNullValue(field, json)) {
+     msg.clear(field);
+     return;
+   }
+-  const msgValue = msg.isSet(field) ? msg.get(field) : reflect(field.message);
+-  readMessage(msgValue, json, ctx);
++  const msgValue = msg.isSet(field)
++    ? cloneReflect(msg.get(field))
++    : reflect(field.message);
++  readMessage(msgValue, json, ctx, path);
+   msg.set(field, msgValue);
+ }
+ 
+@@ -738,13 +782,14 @@ function tryWktFromJson(
+   msg: ReflectMessage,
+   jsonValue: JsonValue,
+   ctx: JsonReadContext,
++  path: Path,
+ ): boolean {
+   if (!msg.desc.typeName.startsWith("google.protobuf.")) {
+     return false;
+   }
+   switch (msg.desc.typeName) {
+     case "google.protobuf.Any":
+-      anyFromJson(msg.message as Any, jsonValue, ctx);
++      anyFromJson(msg.message as Any, jsonValue, ctx, path);
+       return true;
+     case "google.protobuf.Timestamp":
+       timestampFromJson(msg.message as Timestamp, jsonValue);
+@@ -778,7 +823,12 @@ function tryWktFromJson(
+   }
+ }
+ 
+-function anyFromJson(any: Any, json: JsonValue, ctx: JsonReadContext) {
++function anyFromJson(
++  any: Any,
++  json: JsonValue,
++  ctx: JsonReadContext,
++  path: Path,
++) {
+   if (json === null || Array.isArray(json) || typeof json != "object") {
+     throw new Error(
+       `cannot decode message ${any.$typeName} from JSON: expected object but got ${formatVal(json)}`,
+@@ -808,19 +858,53 @@ function anyFromJson(any: Any, json: JsonValue, ctx: JsonReadContext) {
+     );
+   }
+   const msg = reflect(desc);
++  const nested = nestedReadContext(ctx, desc);
+   if (
+     hasCustomJsonRepresentation(desc) &&
+     Object.prototype.hasOwnProperty.call(json, "value")
+   ) {
+     const value = json.value;
+-    readMessage(msg, value, ctx);
++    readMessage(msg, value, nested, []);
+   } else {
+     const copy = Object.assign({}, json);
+     // biome-ignore lint/performance/noDelete: <explanation>
+     delete copy["@type"];
+-    readMessage(msg, copy, ctx);
++    readMessage(msg, copy, nested, []);
++  }
++  readAt(ctx, path, () => anyPack(msg.desc, msg.message, any));
++}
++
++function nestedReadContext(
++  parent: JsonReadContext,
++  schema: DescMessage,
++): JsonReadContext {
++  return {
++    ignoreUnknownFields: parent.ignoreUnknownFields,
++    recursionLimit: parent.recursionLimit,
++    registry: parent.registry,
++    depth: parent.depth,
++    serialization: makeSerializationContext("json", "read", schema),
++  };
++}
++
++function readAt<T>(ctx: JsonReadContext, path: Path, run: () => T): T {
++  return withSerializationError(ctx.serialization, path, run, (cause) =>
++    isFieldError(cause)
++      ? `cannot decode ${cause.field()} from JSON: ${cause.message}`
++      : undefined,
++  );
++}
++
++function mapEntryPath(path: Path, key: unknown): Path {
++  switch (typeof key) {
++    case "string":
++    case "number":
++    case "bigint":
++    case "boolean":
++      return path.concat({ kind: "map_sub", key });
++    default:
++      return path;
+   }
+-  anyPack(msg.desc, msg.message, any);
+ }
+ 
+ function timestampFromJson(timestamp: Timestamp, json: JsonValue) {
+diff --git a/packages/protobuf/src/index.ts b/packages/protobuf/src/index.ts
+index 9930a144..91873049 100644
+--- a/packages/protobuf/src/index.ts
++++ b/packages/protobuf/src/index.ts
+@@ -27,7 +27,7 @@ export { fromBinary, mergeFromBinary } from "./from-binary.js";
+ export type { BinaryReadOptions } from "./from-binary.js";
+ export * from "./to-json.js";
+ export * from "./from-json.js";
+-export * from "./merge.js";
++export { merge } from "./merge.js";
+ export {
+   hasExtension,
+   getExtension,
+@@ -38,3 +38,4 @@ export {
+ } from "./extensions.js";
+ export * from "./proto-int64.js";
+ export * from "./unknown-enum.js";
++export * from "./serialization-error.js";
+diff --git a/packages/protobuf/src/merge.ts b/packages/protobuf/src/merge.ts
+index 98a1df8c..36a7569e 100644
+--- a/packages/protobuf/src/merge.ts
++++ b/packages/protobuf/src/merge.ts
+@@ -12,10 +12,11 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-import type { MessageShape } from "./types.js";
++import { clone } from "./clone.js";
+ import type { DescMessage } from "./descriptors.js";
+-import { reflect } from "./reflect/reflect.js";
+ import type { ReflectMessage } from "./reflect/reflect-types.js";
++import { reflect } from "./reflect/reflect.js";
++import type { MessageShape } from "./types.js";
+ 
+ /**
+  * Merge message `source` into message `target`, following Protobuf semantics.
+@@ -35,6 +36,46 @@ export function merge<Desc extends DescMessage>(
+   reflectMerge(reflect(schema, target), reflect(schema, source));
+ }
+ 
++export function transactionalMerge<Desc extends DescMessage>(
++  schema: Desc,
++  target: MessageShape<Desc>,
++  apply: (draft: MessageShape<Desc>) => void,
++): MessageShape<Desc> {
++  const backup = clone(schema, target);
++  // clone() drops an explicitly present but empty $unknown array, so its
++  // presence must be captured separately to roll back exactly on failure.
++  const originalUnknown = reflect(schema, target).message.$unknown;
++  const unknownBackup =
++    originalUnknown === undefined ? undefined : [...originalUnknown];
++  try {
++    apply(target);
++  } catch (e) {
++    const targetReflect = reflect(schema, target);
++    reflectReplace(targetReflect, reflect(schema, backup));
++    if (unknownBackup === undefined) {
++      // biome-ignore lint/performance/noDelete: an undefined assignment would leave an own property clone() never produces, breaking equality checks against a freshly created message
++      delete targetReflect.message.$unknown;
++    } else {
++      targetReflect.message.$unknown = unknownBackup;
++    }
++    throw e;
++  }
++  return target;
++}
++
++function reflectReplace(target: ReflectMessage, source: ReflectMessage): void {
++  for (const field of target.fields) {
++    target.clear(field);
++  }
++  if (source.message.$unknown === undefined) {
++    // biome-ignore lint/performance/noDelete: an undefined assignment would leave an own property clone() never produces, breaking equality checks against a freshly created message
++    delete target.message.$unknown;
++  } else {
++    target.message.$unknown = undefined;
++  }
++  reflectMerge(target, source);
++}
++
+ function reflectMerge(target: ReflectMessage, source: ReflectMessage): void {
+   const sourceUnknown = source.message.$unknown;
+   if (sourceUnknown !== undefined && sourceUnknown.length > 0) {
+diff --git a/packages/protobuf/src/reflect/path.ts b/packages/protobuf/src/reflect/path.ts
+index 984f8fab..da7dd9aa 100644
+--- a/packages/protobuf/src/reflect/path.ts
++++ b/packages/protobuf/src/reflect/path.ts
+@@ -99,6 +99,7 @@ export type PathBuilder = {
+   getLeft():
+     | DescMessage
+     | (DescField & { fieldKind: "list" })
++    | (DescExtension & { fieldKind: "list" })
+     | (DescField & { fieldKind: "map" })
+     | undefined;
+ };
+@@ -149,11 +150,17 @@ export function parsePath(
+     } else if ("val" in token) {
+       // list or map
+       right =
+-        left?.kind == "field" &&
++        (left?.kind == "field" || left?.kind == "extension") &&
+         left.fieldKind == "list" &&
+         typeof token.val == "bigint"
+           ? { kind: "list_sub", index: Number(token.val) }
+-          : { kind: "map_sub", key: token.val };
++          : {
++              kind: "map_sub",
++              key:
++                left?.kind == "field" && left.fieldKind == "map"
++                  ? normalizeMapKey(token.val, left.mapKey)
++                  : token.val,
++            };
+     } else if ("err" in token) {
+       throw err(token.err, token.i);
+     }
+@@ -236,6 +243,7 @@ class PathBuilderImpl implements PathBuilder {
+     private left:
+       | DescMessage
+       | (DescField & { fieldKind: "list" })
++      | (DescExtension & { fieldKind: "list" })
+       | (DescField & { fieldKind: "map" })
+       | undefined,
+     private readonly path: Path,
+@@ -244,6 +252,7 @@ class PathBuilderImpl implements PathBuilder {
+   getLeft():
+     | DescMessage
+     | (DescField & { fieldKind: "list" })
++    | (DescExtension & { fieldKind: "list" })
+     | (DescField & { fieldKind: "map" })
+     | undefined {
+     return this.left;
+@@ -332,12 +341,17 @@ class PathBuilderImpl implements PathBuilder {
+           throw this.err("extension access");
+         }
+         this.path.push(ele);
+-        this.left = ele.fieldKind == "message" ? ele.message : undefined;
++        this.left =
++          ele.fieldKind == "message"
++            ? ele.message
++            : ele.fieldKind == "list"
++              ? ele
++              : undefined;
+         return this;
+       case "list_sub":
+         if (
+           !this.left ||
+-          this.left.kind != "field" ||
++          (this.left.kind != "field" && this.left.kind != "extension") ||
+           this.left.fieldKind != "list"
+         ) {
+           throw this.err("list access");
+@@ -372,6 +386,25 @@ class PathBuilderImpl implements PathBuilder {
+   }
+ }
+ 
++function normalizeMapKey(
++  key: string | bigint | boolean,
++  type: (DescField & { fieldKind: "map" })["mapKey"],
++): string | number | bigint | boolean {
++  if (typeof key != "bigint") {
++    return key;
++  }
++  switch (type) {
++    case ScalarType.INT32:
++    case ScalarType.UINT32:
++    case ScalarType.SINT32:
++    case ScalarType.SFIXED32:
++    case ScalarType.FIXED32:
++      return Number(key);
++    default:
++      return key;
++  }
++}
++
+ function checkKeyType(
+   key: string | number | bigint | boolean,
+   type: (DescField & { fieldKind: "map" })["mapKey"],
+@@ -451,9 +484,15 @@ function nextToken(
+         i++;
+       }
+       token = { val };
+-    } else if (path[i].match(/\d/)) {
+-      // integer literal
++    } else if (
++      path[i].match(/\d/) ||
++      (path[i] == "-" && /\d/.test(path[i + 1] ?? ""))
++    ) {
++      // integer literal, optionally negative
+       const start = i;
++      if (path[i] == "-") {
++        i++;
++      }
+       while (i < path.length && /\d/.test(path[i])) {
+         i++;
+       }
+diff --git a/packages/protobuf/src/serialization-error.ts b/packages/protobuf/src/serialization-error.ts
+new file mode 100644
+index 00000000..6807cc37
+--- /dev/null
++++ b/packages/protobuf/src/serialization-error.ts
+@@ -0,0 +1,100 @@
++// Copyright 2021-2026 Buf Technologies, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++import type { DescMessage } from "./descriptors.js";
++import type { Path } from "./reflect/path.js";
++
++export type SerializationFormat = "binary" | "json" | "text";
++
++export type SerializationOperation = "read" | "write";
++
++export class SerializationError extends Error {
++  readonly format: SerializationFormat;
++  readonly operation: SerializationOperation;
++  readonly schema: DescMessage;
++  readonly path: Path;
++  readonly cause: unknown;
++
++  constructor(
++    format: SerializationFormat,
++    operation: SerializationOperation,
++    schema: DescMessage,
++    path: Path,
++    cause: unknown,
++    message?: string,
++  ) {
++    super(message ?? errorMessage(cause));
++    this.format = format;
++    this.operation = operation;
++    this.schema = schema;
++    this.path = path.concat();
++    this.cause = cause;
++    Object.setPrototypeOf(this, new.target.prototype);
++  }
++}
++
++export type SerializationContext = Readonly<{
++  format: SerializationFormat;
++  operation: SerializationOperation;
++  schema: DescMessage;
++}>;
++
++export function makeSerializationContext(
++  format: SerializationFormat,
++  operation: SerializationOperation,
++  schema: DescMessage,
++): SerializationContext {
++  return { format, operation, schema };
++}
++
++export function withSerializationError<T>(
++  context: SerializationContext,
++  path: Path,
++  run: () => T,
++  message?: (cause: unknown) => string | undefined,
++): T {
++  try {
++    return run();
++  } catch (cause) {
++    rethrowSerializationError(context, path, cause, message?.(cause));
++  }
++}
++
++export function rethrowSerializationError(
++  context: SerializationContext,
++  path: Path,
++  cause: unknown,
++  message?: string,
++): never {
++  if (
++    cause instanceof SerializationError &&
++    cause.format === context.format &&
++    cause.operation === context.operation &&
++    cause.schema === context.schema
++  ) {
++    throw cause;
++  }
++  throw new SerializationError(
++    context.format,
++    context.operation,
++    context.schema,
++    path,
++    cause,
++    message,
++  );
++}
++
++function errorMessage(cause: unknown): string {
++  return cause instanceof Error ? cause.message : String(cause);
++}
+diff --git a/packages/protobuf/src/to-binary.ts b/packages/protobuf/src/to-binary.ts
+index 7369b7ec..338197e2 100644
+--- a/packages/protobuf/src/to-binary.ts
++++ b/packages/protobuf/src/to-binary.ts
+@@ -12,12 +12,18 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-import type { MessageShape } from "./types.js";
+-import { reflect } from "./reflect/reflect.js";
+-import { BinaryWriter, WireType } from "./wire/binary-encoding.js";
+-import type { ScalarValue } from "./reflect/scalar.js";
+ import { type DescField, type DescMessage, ScalarType } from "./descriptors.js";
+ import type { ReflectList, ReflectMessage } from "./reflect/index.js";
++import type { Path } from "./reflect/path.js";
++import { reflect } from "./reflect/reflect.js";
++import type { ScalarValue } from "./reflect/scalar.js";
++import {
++  type SerializationContext,
++  makeSerializationContext,
++  withSerializationError,
++} from "./serialization-error.js";
++import type { MessageShape } from "./types.js";
++import { BinaryWriter, WireType } from "./wire/binary-encoding.js";
+ 
+ // bootstrap-inject google.protobuf.FeatureSet.FieldPresence.LEGACY_REQUIRED: const $name = $number;
+ const LEGACY_REQUIRED = 3;
+@@ -54,26 +60,38 @@ export function toBinary<Desc extends DescMessage>(
+   message: MessageShape<Desc>,
+   options?: Partial<BinaryWriteOptions>,
+ ): Uint8Array<ArrayBuffer> {
+-  return writeFields(
+-    new BinaryWriter(),
+-    makeWriteOptions(options),
+-    reflect(schema, message),
+-  ).finish();
++  const serialization = makeSerializationContext("binary", "write", schema);
++  return withSerializationError(serialization, [], () =>
++    writeFields(
++      new BinaryWriter(),
++      makeWriteOptions(options),
++      reflect(schema, message),
++      serialization,
++      [],
++    ).finish(),
++  );
+ }
+ 
+ function writeFields(
+   writer: BinaryWriter,
+   opts: BinaryWriteOptions,
+   msg: ReflectMessage,
++  serialization?: SerializationContext,
++  path: Path = [],
+ ): BinaryWriter {
+   for (const f of msg.sortedFields) {
+-    if (!msg.isSet(f)) {
+-      if (f.presence == LEGACY_REQUIRED) {
+-        throw new Error(`cannot encode ${f} to binary: required field not set`);
++    const fieldPath = path.concat(f);
++    writeAt(serialization, fieldPath, () => {
++      if (!msg.isSet(f)) {
++        if (f.presence == LEGACY_REQUIRED) {
++          throw new Error(
++            `cannot encode ${f} to binary: required field not set`,
++          );
++        }
++        return;
+       }
+-      continue;
+-    }
+-    writeField(writer, opts, msg, f);
++      writeField(writer, opts, msg, f, serialization, fieldPath);
++    });
+   }
+   if (opts.writeUnknownFields) {
+     for (const { no, wireType, data } of msg.getUnknown() ?? []) {
+@@ -91,31 +109,60 @@ export function writeField(
+   opts: BinaryWriteOptions,
+   msg: ReflectMessage,
+   field: DescField,
++  serialization?: SerializationContext,
++  path: Path = [],
+ ) {
+-  switch (field.fieldKind) {
+-    case "scalar":
+-    case "enum":
+-      writeScalar(
+-        writer,
+-        msg.desc.typeName,
+-        field.name,
+-        field.scalar ?? ScalarType.INT32,
+-        field.number,
+-        msg.get(field),
+-      );
+-      break;
+-    case "list":
+-      writeListField(writer, opts, field, msg.get(field));
+-      break;
+-    case "message":
+-      writeMessageField(writer, opts, field, msg.get(field));
+-      break;
+-    case "map":
+-      for (const [key, val] of msg.get(field)) {
+-        writeMapEntry(writer, opts, field, key, val);
+-      }
+-      break;
+-  }
++  writeAt(serialization, path, () => {
++    switch (field.fieldKind) {
++      case "scalar":
++      case "enum":
++        writeScalar(
++          writer,
++          msg.desc.typeName,
++          field.name,
++          field.scalar ?? ScalarType.INT32,
++          field.number,
++          msg.get(field),
++        );
++        break;
++      case "list":
++        writeListField(
++          writer,
++          opts,
++          field,
++          msg.get(field),
++          serialization,
++          path,
++        );
++        break;
++      case "message":
++        writeMessageField(
++          writer,
++          opts,
++          field,
++          msg.get(field),
++          serialization,
++          path,
++        );
++        break;
++      case "map":
++        for (const [key, val] of msg.get(field)) {
++          const entryPath = mapEntryPath(path, key);
++          writeAt(serialization, entryPath, () =>
++            writeMapEntry(
++              writer,
++              opts,
++              field,
++              key,
++              val,
++              serialization,
++              entryPath,
++            ),
++          );
++        }
++        break;
++    }
++  });
+ }
+ 
+ function writeScalar(
+@@ -141,18 +188,24 @@ function writeMessageField(
+   field: DescField &
+     ({ fieldKind: "message" } | { fieldKind: "list"; listKind: "message" }),
+   message: ReflectMessage,
++  serialization?: SerializationContext,
++  path: Path = [],
+ ) {
+   if (field.delimitedEncoding) {
+     writeFields(
+       writer.tag(field.number, WireType.StartGroup),
+       opts,
+       message,
++      serialization,
++      path,
+     ).tag(field.number, WireType.EndGroup);
+   } else {
+     writeFields(
+       writer.tag(field.number, WireType.LengthDelimited).fork(),
+       opts,
+       message,
++      serialization,
++      path,
+     ).join();
+   }
+ }
+@@ -162,10 +215,24 @@ function writeListField(
+   opts: BinaryWriteOptions,
+   field: DescField & { fieldKind: "list" },
+   list: ReflectList,
++  serialization?: SerializationContext,
++  path: Path = [],
+ ) {
+   if (field.listKind == "message") {
++    let index = 0;
+     for (const item of list) {
+-      writeMessageField(writer, opts, field, item as ReflectMessage);
++      const itemPath = path.concat({ kind: "list_sub", index });
++      writeAt(serialization, itemPath, () => {
++        writeMessageField(
++          writer,
++          opts,
++          field,
++          item as ReflectMessage,
++          serialization,
++          itemPath,
++        );
++      });
++      index++;
+     }
+     return;
+   }
+@@ -175,27 +242,37 @@ function writeListField(
+       return;
+     }
+     writer.tag(field.number, WireType.LengthDelimited).fork();
++    let index = 0;
+     for (const item of list) {
+-      writeScalarValue(
+-        writer,
+-        field.parent.typeName,
+-        field.name,
+-        scalarType,
+-        item as ScalarValue,
+-      );
++      const itemPath = path.concat({ kind: "list_sub", index });
++      writeAt(serialization, itemPath, () => {
++        writeScalarValue(
++          writer,
++          field.parent.typeName,
++          field.name,
++          scalarType,
++          item as ScalarValue,
++        );
++      });
++      index++;
+     }
+     writer.join();
+     return;
+   }
++  let index = 0;
+   for (const item of list) {
+-    writeScalar(
+-      writer,
+-      field.parent.typeName,
+-      field.name,
+-      scalarType,
+-      field.number,
+-      item,
+-    );
++    const itemPath = path.concat({ kind: "list_sub", index });
++    writeAt(serialization, itemPath, () => {
++      writeScalar(
++        writer,
++        field.parent.typeName,
++        field.name,
++        scalarType,
++        field.number,
++        item,
++      );
++    });
++    index++;
+   }
+ }
+ 
+@@ -205,6 +282,8 @@ function writeMapEntry(
+   field: DescField & { fieldKind: "map" },
+   key: unknown,
+   value: unknown,
++  serialization?: SerializationContext,
++  path: Path = [],
+ ) {
+   writer.tag(field.number, WireType.LengthDelimited).fork();
+ 
+@@ -229,12 +308,36 @@ function writeMapEntry(
+         writer.tag(2, WireType.LengthDelimited).fork(),
+         opts,
+         value as ReflectMessage,
++        serialization,
++        path,
+       ).join();
+       break;
+   }
+   writer.join();
+ }
+ 
++function writeAt<T>(
++  serialization: SerializationContext | undefined,
++  path: Path,
++  run: () => T,
++): T {
++  return serialization
++    ? withSerializationError(serialization, path, run)
++    : run();
++}
++
++function mapEntryPath(path: Path, key: unknown): Path {
++  switch (typeof key) {
++    case "string":
++    case "number":
++    case "bigint":
++    case "boolean":
++      return path.concat({ kind: "map_sub", key });
++    default:
++      return path;
++  }
++}
++
+ function writeScalarValue(
+   writer: BinaryWriter,
+   msgName: string,
+diff --git a/packages/protobuf/src/to-json.ts b/packages/protobuf/src/to-json.ts
+index b23de4cb..ed8c5de7 100644
+--- a/packages/protobuf/src/to-json.ts
++++ b/packages/protobuf/src/to-json.ts
+@@ -19,15 +19,23 @@ import {
+   type DescMessage,
+   ScalarType,
+ } from "./descriptors.js";
++import { createExtensionContainer, getExtension } from "./extensions.js";
+ import type { JsonObject, JsonValue } from "./json-value.js";
+ import { protoCamelCase, protoSnakeCase } from "./reflect/names.js";
+-import { reflect } from "./reflect/reflect.js";
+-import type { Registry } from "./registry.js";
++import type { Path } from "./reflect/path.js";
++import { checkField, formatVal } from "./reflect/reflect-check.js";
+ import type {
+   ReflectList,
+   ReflectMap,
+   ReflectMessage,
+ } from "./reflect/reflect-types.js";
++import { reflect } from "./reflect/reflect.js";
++import type { Registry } from "./registry.js";
++import {
++  type SerializationContext,
++  makeSerializationContext,
++  withSerializationError,
++} from "./serialization-error.js";
+ import type {
+   EnumJsonType,
+   EnumShape,
+@@ -35,6 +43,7 @@ import type {
+   MessageJsonType,
+   MessageShape,
+ } from "./types.js";
++import { base64Encode } from "./wire/index.js";
+ import type {
+   Any,
+   Duration,
+@@ -46,9 +55,6 @@ import type {
+ } from "./wkt/index.js";
+ import { anyUnpack } from "./wkt/index.js";
+ import { hasCustomJsonRepresentation, isWrapperDesc } from "./wkt/wrappers.js";
+-import { base64Encode } from "./wire/index.js";
+-import { createExtensionContainer, getExtension } from "./extensions.js";
+-import { checkField, formatVal } from "./reflect/reflect-check.js";
+ 
+ // bootstrap-inject google.protobuf.FeatureSet.FieldPresence.LEGACY_REQUIRED: const $name = $number;
+ const LEGACY_REQUIRED = 3;
+@@ -130,9 +136,14 @@ export function toJson<
+   message: MessageShape<Desc>,
+   options?: Opts,
+ ): ToJson<Desc, Opts> {
+-  return reflectToJson(
+-    reflect(schema, message),
+-    makeWriteOptions(options),
++  const serialization = makeSerializationContext("json", "write", schema);
++  return withSerializationError(serialization, [], () =>
++    reflectToJson(
++      reflect(schema, message),
++      makeWriteOptions(options),
++      serialization,
++      [],
++    ),
+   ) as ToJson<Desc, Opts>;
+ }
+ 
+@@ -159,8 +170,11 @@ export function toJsonString<Desc extends DescMessage>(
+   message: MessageShape<Desc>,
+   options?: Partial<JsonWriteStringOptions>,
+ ): string {
+-  const jsonValue = toJson(schema, message, options);
+-  return JSON.stringify(jsonValue, null, options?.prettySpaces ?? 0);
++  const serialization = makeSerializationContext("json", "write", schema);
++  return withSerializationError(serialization, [], () => {
++    const jsonValue = toJson(schema, message, options);
++    return JSON.stringify(jsonValue, null, options?.prettySpaces ?? 0);
++  });
+ }
+ 
+ /**
+@@ -180,112 +194,194 @@ export function enumToJson<Desc extends DescEnum>(
+   return name as EnumJsonType<Desc>;
+ }
+ 
+-function reflectToJson(msg: ReflectMessage, opts: JsonWriteOptions): JsonValue {
+-  const wktJson = tryWktToJson(msg, opts);
+-  if (wktJson !== undefined) return wktJson;
+-  const json: JsonObject = {};
+-  for (const f of msg.sortedFields) {
+-    if (!msg.isSet(f)) {
+-      if (f.presence == LEGACY_REQUIRED) {
+-        throw new Error(`cannot encode ${f} to JSON: required field not set`);
+-      }
+-      if (!opts.alwaysEmitImplicit || f.presence !== IMPLICIT) {
+-        // Fields with implicit presence omit zero values (e.g. empty string) by default
+-        continue;
+-      }
+-    }
+-    const jsonValue = fieldToJson(f, msg.get(f), opts);
+-    if (jsonValue !== undefined) {
+-      json[jsonName(f, opts)] = jsonValue;
+-    }
+-  }
+-  if (opts.registry) {
+-    const tagSeen = new Set<number>();
+-    for (const { no } of msg.getUnknown() ?? []) {
+-      // Same tag can appear multiple times, so we
+-      // keep track and skip identical ones.
+-      if (!tagSeen.has(no)) {
+-        tagSeen.add(no);
+-        const extension = opts.registry.getExtensionFor(msg.desc, no);
+-        if (!extension) {
+-          continue;
++function reflectToJson(
++  msg: ReflectMessage,
++  opts: JsonWriteOptions,
++  serialization: SerializationContext,
++  path: Path,
++): JsonValue {
++  return writeAt(serialization, path, () => {
++    const wktJson = tryWktToJson(msg, opts, serialization, path);
++    if (wktJson !== undefined) return wktJson;
++    const json: JsonObject = {};
++    for (const f of msg.sortedFields) {
++      const fieldPath = path.concat(f);
++      writeAt(serialization, fieldPath, () => {
++        if (!msg.isSet(f)) {
++          if (f.presence == LEGACY_REQUIRED) {
++            throw new Error(
++              `cannot encode ${f} to JSON: required field not set`,
++            );
++          }
++          if (!opts.alwaysEmitImplicit || f.presence !== IMPLICIT) {
++            // Fields with implicit presence omit zero values (e.g. empty string) by default
++            return;
++          }
+         }
+-        const value = getExtension(msg.message, extension);
+-        const [container, field] = createExtensionContainer(extension, value);
+-        const jsonValue = fieldToJson(field, container.get(field), opts);
++        const jsonValue = fieldToJson(
++          f,
++          msg.get(f),
++          opts,
++          serialization,
++          fieldPath,
++        );
+         if (jsonValue !== undefined) {
+-          json[extension.jsonName] = jsonValue;
++          json[jsonName(f, opts)] = jsonValue;
++        }
++      });
++    }
++    if (opts.registry) {
++      const tagSeen = new Set<number>();
++      for (const { no } of msg.getUnknown() ?? []) {
++        // Same tag can appear multiple times, so we
++        // keep track and skip identical ones.
++        if (!tagSeen.has(no)) {
++          tagSeen.add(no);
++          const extension = opts.registry.getExtensionFor(msg.desc, no);
++          if (!extension) {
++            continue;
++          }
++          const extensionPath = path.concat(extension);
++          writeAt(serialization, extensionPath, () => {
++            const value = getExtension(msg.message, extension);
++            const [container, field] = createExtensionContainer(
++              extension,
++              value,
++            );
++            const jsonValue = fieldToJson(
++              field,
++              container.get(field),
++              opts,
++              serialization,
++              extensionPath,
++            );
++            if (jsonValue !== undefined) {
++              json[extension.jsonName] = jsonValue;
++            }
++          });
+         }
+       }
+     }
+-  }
+-  return json;
++    return json;
++  });
+ }
+ 
+-function fieldToJson(f: DescField, val: unknown, opts: JsonWriteOptions) {
++function fieldToJson(
++  f: DescField,
++  val: unknown,
++  opts: JsonWriteOptions,
++  serialization: SerializationContext,
++  path: Path,
++) {
+   switch (f.fieldKind) {
+     case "scalar":
+       return scalarToJson(f, val);
+     case "message":
+-      return reflectToJson(val as ReflectMessage, opts);
++      return reflectToJson(val as ReflectMessage, opts, serialization, path);
+     case "enum":
+       return enumToJsonInternal(f.enum, val, opts.enumAsInteger);
+     case "list":
+-      return listToJson(val as ReflectList, opts);
++      return listToJson(val as ReflectList, opts, serialization, path);
+     case "map":
+-      return mapToJson(val as ReflectMap, opts);
++      return mapToJson(val as ReflectMap, opts, serialization, path);
+   }
+ }
+ 
+-function mapToJson(map: ReflectMap, opts: JsonWriteOptions) {
++function mapToJson(
++  map: ReflectMap,
++  opts: JsonWriteOptions,
++  serialization: SerializationContext,
++  path: Path,
++) {
+   const f = map.field();
+   const jsonObj: JsonObject = {};
+   switch (f.mapKind) {
+     case "scalar":
+       for (const [entryKey, entryValue] of map) {
+-        jsonObj[entryKey as keyof object] = scalarToJson(f, entryValue);
++        const entryPath = mapEntryPath(path, entryKey);
++        writeAt(serialization, entryPath, () => {
++          jsonObj[entryKey as keyof object] = scalarToJson(f, entryValue);
++        });
+       }
+       break;
+     case "message":
+       for (const [entryKey, entryValue] of map) {
+-        jsonObj[entryKey as keyof object] = reflectToJson(
+-          entryValue as ReflectMessage,
+-          opts,
+-        );
++        const entryPath = mapEntryPath(path, entryKey);
++        writeAt(serialization, entryPath, () => {
++          jsonObj[entryKey as keyof object] = reflectToJson(
++            entryValue as ReflectMessage,
++            opts,
++            serialization,
++            entryPath,
++          );
++        });
+       }
+       break;
+     case "enum":
+       for (const [entryKey, entryValue] of map) {
+-        jsonObj[entryKey as keyof object] = enumToJsonInternal(
+-          f.enum,
+-          entryValue,
+-          opts.enumAsInteger,
+-        );
++        const entryPath = mapEntryPath(path, entryKey);
++        writeAt(serialization, entryPath, () => {
++          jsonObj[entryKey as keyof object] = enumToJsonInternal(
++            f.enum,
++            entryValue,
++            opts.enumAsInteger,
++          );
++        });
+       }
+       break;
+   }
+   return opts.alwaysEmitImplicit || map.size > 0 ? jsonObj : undefined;
+ }
+ 
+-function listToJson(list: ReflectList, opts: JsonWriteOptions) {
++function listToJson(
++  list: ReflectList,
++  opts: JsonWriteOptions,
++  serialization: SerializationContext,
++  path: Path,
++) {
+   const f = list.field();
+   const jsonArr: JsonValue[] = [];
+   switch (f.listKind) {
+     case "scalar":
+       for (const item of list) {
+-        jsonArr.push(scalarToJson(f, item) as JsonValue);
++        const itemPath = path.concat({
++          kind: "list_sub",
++          index: jsonArr.length,
++        });
++        writeAt(serialization, itemPath, () =>
++          jsonArr.push(scalarToJson(f, item) as JsonValue),
++        );
+       }
+       break;
+     case "enum":
+       for (const item of list) {
+-        jsonArr.push(
+-          enumToJsonInternal(f.enum, item, opts.enumAsInteger) as JsonValue,
++        const itemPath = path.concat({
++          kind: "list_sub",
++          index: jsonArr.length,
++        });
++        writeAt(serialization, itemPath, () =>
++          jsonArr.push(
++            enumToJsonInternal(f.enum, item, opts.enumAsInteger) as JsonValue,
++          ),
+         );
+       }
+       break;
+     case "message":
+       for (const item of list) {
+-        jsonArr.push(reflectToJson(item as ReflectMessage, opts));
++        const itemPath = path.concat({
++          kind: "list_sub",
++          index: jsonArr.length,
++        });
++        writeAt(serialization, itemPath, () =>
++          jsonArr.push(
++            reflectToJson(
++              item as ReflectMessage,
++              opts,
++              serialization,
++              itemPath,
++            ),
++          ),
++        );
+       }
+       break;
+   }
+@@ -399,13 +495,15 @@ function jsonName(f: DescField, opts: JsonWriteOptions) {
+ function tryWktToJson(
+   msg: ReflectMessage,
+   opts: JsonWriteOptions,
++  serialization: SerializationContext,
++  path: Path,
+ ): JsonValue | undefined {
+   if (!msg.desc.typeName.startsWith("google.protobuf.")) {
+     return undefined;
+   }
+   switch (msg.desc.typeName) {
+     case "google.protobuf.Any":
+-      return anyToJson(msg.message as Any, opts);
++      return anyToJson(msg.message as Any, opts, serialization, path);
+     case "google.protobuf.Timestamp":
+       return timestampToJson(msg.message as Timestamp);
+     case "google.protobuf.Duration":
+@@ -427,7 +525,12 @@ function tryWktToJson(
+   }
+ }
+ 
+-function anyToJson(val: Any, opts: JsonWriteOptions): JsonValue {
++function anyToJson(
++  val: Any,
++  opts: JsonWriteOptions,
++  serialization: SerializationContext,
++  path: Path,
++): JsonValue {
+   if (val.typeUrl === "") {
+     return {};
+   }
+@@ -446,13 +549,38 @@ function anyToJson(val: Any, opts: JsonWriteOptions): JsonValue {
+     );
+   }
+   const reflected = reflect(desc, message);
++  const nestedSerialization = makeSerializationContext("json", "write", desc);
+   const json: JsonObject = hasCustomJsonRepresentation(desc)
+-    ? { value: tryWktToJson(reflected, opts) as JsonValue }
+-    : (reflectToJson(reflected, opts) as JsonObject);
++    ? {
++        value: writeAt(serialization, path, () =>
++          tryWktToJson(reflected, opts, nestedSerialization, []),
++        ) as JsonValue,
++      }
++    : (reflectToJson(reflected, opts, nestedSerialization, []) as JsonObject);
+   json["@type"] = val.typeUrl;
+   return json;
+ }
+ 
++function writeAt<T>(
++  serialization: SerializationContext,
++  path: Path,
++  run: () => T,
++): T {
++  return withSerializationError(serialization, path, run);
++}
++
++function mapEntryPath(path: Path, key: unknown): Path {
++  switch (typeof key) {
++    case "string":
++    case "number":
++    case "bigint":
++    case "boolean":
++      return path.concat({ kind: "map_sub", key });
++    default:
++      return path;
++  }
++}
++
+ function durationToJson(val: Duration) {
+   const seconds = Number(val.seconds);
+   const nanos = val.nanos;
+diff --git a/packages/protobuf/src/txtpb/from-text.ts b/packages/protobuf/src/txtpb/from-text.ts
+index db7b8dc9..aa5c3d72 100644
+--- a/packages/protobuf/src/txtpb/from-text.ts
++++ b/packages/protobuf/src/txtpb/from-text.ts
+@@ -12,6 +12,7 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++import { cloneReflect } from "../clone.js";
+ import {
+   type DescEnum,
+   type DescExtension,
+@@ -20,28 +21,35 @@ import {
+   type DescOneof,
+   ScalarType,
+ } from "../descriptors.js";
++import {
++  createExtensionContainer,
++  getExtension,
++  hasExtension,
++  setExtension,
++} from "../extensions.js";
++import { transactionalMerge } from "../merge.js";
+ import { protoInt64 } from "../proto-int64.js";
+-import { reflect } from "../reflect/reflect.js";
++import { isFieldError } from "../reflect/error.js";
++import type { Path } from "../reflect/path.js";
+ import type {
+   ReflectList,
+   ReflectMap,
+   ReflectMessage,
+ } from "../reflect/reflect-types.js";
+-import { isFieldError } from "../reflect/error.js";
++import { reflect } from "../reflect/reflect.js";
+ import { scalarZeroValue } from "../reflect/scalar.js";
+ import type { Registry } from "../registry.js";
+-import type { MessageShape } from "../types.js";
+-import type { Any } from "../wkt/index.js";
+-import { toBinary } from "../to-binary.js";
+ import {
+-  createExtensionContainer,
+-  getExtension,
+-  hasExtension,
+-  setExtension,
+-} from "../extensions.js";
++  type SerializationContext,
++  makeSerializationContext,
++  withSerializationError,
++} from "../serialization-error.js";
++import { toBinary } from "../to-binary.js";
++import type { MessageShape } from "../types.js";
+ import { getTextEncoding } from "../wire/text-encoding.js";
+-import { Reader, type Token } from "./reader.js";
++import type { Any } from "../wkt/index.js";
+ import { isGroupLike } from "./is-group-like.js";
++import { Reader, type Token } from "./reader.js";
+ 
+ /**
+  * Options for parsing the protobuf text format.
+@@ -65,13 +73,21 @@ interface TextReadContext extends TextReadOptions {
+   readonly reader: Reader;
+   // Recursion depth, guarded by recursionLimit.
+   depth: number;
++  readonly serialization: SerializationContext;
+ }
+ 
+ function makeReadContext(
++  schema: DescMessage,
+   reader: Reader,
+   options?: Partial<TextReadOptions>,
+ ): TextReadContext {
+-  return { recursionLimit: 100, ...options, reader, depth: 0 };
++  return {
++    recursionLimit: 100,
++    ...options,
++    reader,
++    depth: 0,
++    serialization: makeSerializationContext("text", "read", schema),
++  };
+ }
+ 
+ type CloseToken = "}" | ">" | "eof";
+@@ -87,8 +103,11 @@ export function fromText<Desc extends DescMessage>(
+   options?: Partial<TextReadOptions>,
+ ): MessageShape<Desc> {
+   const msg = reflect(schema);
+-  parseText(msg, text, options);
+-  return msg.message as MessageShape<Desc>;
++  const ctx = makeReadContext(schema, new Reader(text), options);
++  return readAt(ctx, [], () => {
++    parseText(msg, ctx);
++    return msg.message as MessageShape<Desc>;
++  });
+ }
+ 
+ /**
+@@ -106,33 +125,21 @@ export function mergeFromText<Desc extends DescMessage>(
+   text: string,
+   options?: Partial<TextReadOptions>,
+ ): MessageShape<Desc> {
+-  parseText(reflect(schema, target), text, options);
+-  return target;
++  const ctx = makeReadContext(schema, new Reader(text), options);
++  return readAt(ctx, [], () =>
++    transactionalMerge(schema, target, (draft) =>
++      parseText(reflect(schema, draft), ctx),
++    ),
++  );
+ }
+ 
+-function parseText(
+-  msg: ReflectMessage,
+-  text: string,
+-  options?: Partial<TextReadOptions>,
+-): void {
++function parseText(msg: ReflectMessage, ctx: TextReadContext): void {
+   if (!protoInt64.supported) {
+     throw new Error(
+       "the protobuf text format requires BigInt, which is unavailable in this environment",
+     );
+   }
+-  const ctx = makeReadContext(new Reader(text), options);
+-  try {
+-    readMessageBody(msg, ctx, "eof");
+-  } catch (e) {
+-    if (isFieldError(e)) {
+-      throw new Error(
+-        `cannot decode ${e.field()} from text format: ${e.message}`,
+-        // @ts-expect-error we use the ES2022 error CTOR option "cause" for better stack traces
+-        { cause: e },
+-      );
+-    }
+-    throw e;
+-  }
++  readMessageBody(msg, ctx, "eof", []);
+ }
+ 
+ // Tracks the fields and oneofs seen in a single message body, so a non-repeated
+@@ -152,14 +159,20 @@ function readMessageBody(
+   msg: ReflectMessage,
+   ctx: TextReadContext,
+   close: CloseToken,
++  path: Path,
+ ): void {
+-  if (++ctx.depth > ctx.recursionLimit) {
+-    throw new Error(
+-      `recursion limit of ${ctx.recursionLimit} reached decoding ${msg.desc}`,
+-    );
+-  }
+-  readFields(msg, ctx, close);
+-  ctx.depth--;
++  readAt(ctx, path, () => {
++    if (++ctx.depth > ctx.recursionLimit) {
++      throw new Error(
++        `recursion limit of ${ctx.recursionLimit} reached decoding ${msg.desc}`,
++      );
++    }
++    try {
++      readFields(msg, ctx, close, path);
++    } finally {
++      ctx.depth--;
++    }
++  });
+ }
+ 
+ /**
+@@ -170,6 +183,7 @@ function readFields(
+   msg: ReflectMessage,
+   ctx: TextReadContext,
+   close: CloseToken,
++  path: Path,
+ ): void {
+   const seen: Seen = { fields: new Set(), oneofs: new Set() };
+   for (;;) {
+@@ -184,7 +198,7 @@ function readFields(
+       ctx.reader.next();
+       return;
+     }
+-    readField(msg, ctx, seen);
++    readField(msg, ctx, seen, path);
+     // A single optional "," or ";" may follow a field. Because the next
+     // iteration treats a separator as a field name and rejects it, a doubled
+     // separator is an error, while a single trailing one is allowed.
+@@ -196,13 +210,17 @@ function readField(
+   msg: ReflectMessage,
+   ctx: TextReadContext,
+   seen: Seen,
++  path: Path,
+ ): void {
+   const nameTok = ctx.reader.next();
+   if (nameTok.type === "identifier") {
+     const field = fieldByTextName(msg.desc, nameTok.value);
+     if (field !== undefined) {
+-      checkSeen(field, seen);
+-      readFieldValue(msg, field, ctx);
++      const fieldPath = path.concat(field);
++      readAt(ctx, fieldPath, () => {
++        checkSeen(field, seen);
++        readFieldValue(msg, field, ctx, fieldPath);
++      });
+       return;
+     }
+     // Reserved field names are silently skipped; any other unknown name is an
+@@ -218,13 +236,16 @@ function readField(
+     // Inside google.protobuf.Any, a bracketed name is always a type URL; in any
+     // other message it is an extension name.
+     if (msg.desc.typeName === "google.protobuf.Any") {
+-      readExpandedAny(msg, ctx, name, seen);
++      readExpandedAny(msg, ctx, name, seen, path);
+       return;
+     }
+     const ext = ctx.registry?.getExtension(name);
+     if (ext !== undefined && ext.extendee.typeName === msg.desc.typeName) {
+-      checkSeen(ext, seen);
+-      readExtensionField(msg, ext, ctx);
++      const extensionPath = path.concat(ext);
++      readAt(ctx, extensionPath, () => {
++        checkSeen(ext, seen);
++        readExtensionField(msg, ext, ctx, extensionPath);
++      });
+       return;
+     }
+     throw new Error(`unknown extension "[${name}]" for ${msg.desc}`);
+@@ -263,6 +284,7 @@ function readFieldValue(
+   target: ReflectMessage,
+   field: DescField,
+   ctx: TextReadContext,
++  path: Path,
+ ): void {
+   // The ":" separator is optional before a message, group, or map value, but
+   // required for scalars, enums, and lists of them.
+@@ -279,17 +301,17 @@ function readFieldValue(
+       break;
+     case "message": {
+       const sub = target.isSet(field)
+-        ? target.get(field)
++        ? cloneReflect(target.get(field))
+         : reflect(field.message);
+-      readMessageValue(sub, ctx);
++      readMessageValue(sub, ctx, path);
+       target.set(field, sub);
+       break;
+     }
+     case "list":
+-      readListField(field, target.get(field), ctx);
++      readListField(field, target.get(field), ctx, path);
+       break;
+     case "map":
+-      readMapField(field, target.get(field), ctx);
++      readMapField(field, target.get(field), ctx, path);
+       break;
+   }
+ }
+@@ -298,6 +320,7 @@ function readExtensionField(
+   msg: ReflectMessage,
+   ext: DescExtension,
+   ctx: TextReadContext,
++  path: Path,
+ ): void {
+   // Extensions live in the unknown-field set. We read the new value into a
+   // container seeded with any existing value, so a repeated extension appends.
+@@ -305,7 +328,7 @@ function readExtensionField(
+     ? getExtension(msg.message, ext)
+     : undefined;
+   const [container, field, get] = createExtensionContainer(ext, existing);
+-  readFieldValue(container, field, ctx);
++  readFieldValue(container, field, ctx, path);
+   setExtension(msg.message, ext, get());
+ }
+ 
+@@ -320,8 +343,12 @@ function colonOptional(field: DescField): boolean {
+ /**
+  * Read a "{ ... }" or "< ... >" block into the given message.
+  */
+-function readMessageValue(msg: ReflectMessage, ctx: TextReadContext): void {
+-  readMessageBody(msg, ctx, readMessageOpen(ctx));
++function readMessageValue(
++  msg: ReflectMessage,
++  ctx: TextReadContext,
++  path: Path,
++): void {
++  readMessageBody(msg, ctx, readMessageOpen(ctx), path);
+ }
+ 
+ function readMessageOpen(ctx: TextReadContext): "}" | ">" {
+@@ -370,13 +397,18 @@ function readListField(
+   field: DescField & { fieldKind: "list" },
+   list: ReflectList,
+   ctx: TextReadContext,
++  path: Path,
+ ): void {
+-  readBracketedList(ctx, () => list.add(readListItem(field, ctx)));
++  readBracketedList(ctx, () => {
++    const itemPath = path.concat({ kind: "list_sub", index: list.size });
++    readAt(ctx, itemPath, () => list.add(readListItem(field, ctx, itemPath)));
++  });
+ }
+ 
+ function readListItem(
+   field: DescField & { fieldKind: "list" },
+   ctx: TextReadContext,
++  path: Path,
+ ): unknown {
+   switch (field.listKind) {
+     case "scalar":
+@@ -385,7 +417,7 @@ function readListItem(
+       return readEnumValue(field.enum, ctx);
+     case "message": {
+       const sub = reflect(field.message);
+-      readMessageValue(sub, ctx);
++      readMessageValue(sub, ctx, path);
+       return sub;
+     }
+   }
+@@ -395,8 +427,9 @@ function readMapField(
+   field: DescField & { fieldKind: "map" },
+   map: ReflectMap,
+   ctx: TextReadContext,
++  path: Path,
+ ): void {
+-  readBracketedList(ctx, () => readMapEntry(field, map, ctx));
++  readBracketedList(ctx, () => readMapEntry(field, map, ctx, path));
+ }
+ 
+ /**
+@@ -409,6 +442,7 @@ function readMapEntry(
+   field: DescField & { fieldKind: "map" },
+   map: ReflectMap,
+   ctx: TextReadContext,
++  path: Path,
+ ): void {
+   if (++ctx.depth > ctx.recursionLimit) {
+     throw new Error(
+@@ -445,19 +479,21 @@ function readMapEntry(
+         throw new Error('map entry "value" is already set');
+       }
+       valueSeen = true;
+-      value = readMapValue(field, ctx);
++      const entryPath = keySeen ? mapEntryPath(path, key) : path;
++      value = readAt(ctx, entryPath, () => readMapValue(field, ctx, entryPath));
+     } else {
+       throw new Error(`unknown field "${nameTok.value}" in map entry`);
+     }
+     consumeSeparator(ctx);
+   }
+   ctx.depth--;
+-  map.set(key, value);
++  readAt(ctx, mapEntryPath(path, key), () => map.set(key, value));
+ }
+ 
+ function readMapValue(
+   field: DescField & { fieldKind: "map" },
+   ctx: TextReadContext,
++  path: Path,
+ ): unknown {
+   switch (field.mapKind) {
+     case "scalar":
+@@ -469,7 +505,7 @@ function readMapValue(
+     case "message": {
+       consumeColon(ctx);
+       const sub = reflect(field.message);
+-      readMessageValue(sub, ctx);
++      readMessageValue(sub, ctx, path);
+       return sub;
+     }
+   }
+@@ -500,6 +536,7 @@ function readExpandedAny(
+   ctx: TextReadContext,
+   typeUrl: string,
+   seen: Seen,
++  path: Path,
+ ): void {
+   if (seen.fields.has(1) || seen.fields.has(2)) {
+     throw new Error(
+@@ -514,15 +551,49 @@ function readExpandedAny(
+   }
+   consumeColon(ctx);
+   const unpacked = reflect(desc);
+-  readMessageValue(unpacked, ctx);
++  const nested = nestedReadContext(ctx, desc);
++  readMessageValue(unpacked, nested, []);
+   const any = msg.message as Any;
+   // Preserve the exact type URL, including any custom domain prefix.
+   any.typeUrl = typeUrl;
+-  any.value = toBinary(desc, unpacked.message);
++  any.value = readAt(ctx, path, () => toBinary(desc, unpacked.message));
+   seen.fields.add(1);
+   seen.fields.add(2);
+ }
+ 
++function nestedReadContext(
++  parent: TextReadContext,
++  schema: DescMessage,
++): TextReadContext {
++  return {
++    recursionLimit: parent.recursionLimit,
++    registry: parent.registry,
++    reader: parent.reader,
++    depth: parent.depth,
++    serialization: makeSerializationContext("text", "read", schema),
++  };
++}
++
++function readAt<T>(ctx: TextReadContext, path: Path, run: () => T): T {
++  return withSerializationError(ctx.serialization, path, run, (cause) =>
++    isFieldError(cause)
++      ? `cannot decode ${cause.field()} from text format: ${cause.message}`
++      : undefined,
++  );
++}
++
++function mapEntryPath(path: Path, key: unknown): Path {
++  switch (typeof key) {
++    case "string":
++    case "number":
++    case "bigint":
++    case "boolean":
++      return path.concat({ kind: "map_sub", key });
++    default:
++      return path;
++  }
++}
++
+ // Consume an optional leading "-" sign and report whether one was present.
+ // This sees a sign token only before a number (the scanner glues a sign onto an
+ // identifier as in "-inf"), and whitespace and comments between the sign and the
+diff --git a/packages/protobuf/src/txtpb/to-text.ts b/packages/protobuf/src/txtpb/to-text.ts
+index e2a17ab5..201d3906 100644
+--- a/packages/protobuf/src/txtpb/to-text.ts
++++ b/packages/protobuf/src/txtpb/to-text.ts
+@@ -19,21 +19,27 @@ import {
+   type DescMessage,
+   ScalarType,
+ } from "../descriptors.js";
++import { createExtensionContainer, getExtension } from "../extensions.js";
+ import { protoInt64 } from "../proto-int64.js";
+-import { reflect } from "../reflect/reflect.js";
++import type { Path } from "../reflect/path.js";
+ import type {
+   ReflectList,
+   ReflectMap,
+   ReflectMessage,
+ } from "../reflect/reflect-types.js";
++import { reflect } from "../reflect/reflect.js";
+ import type { Registry } from "../registry.js";
++import {
++  type SerializationContext,
++  makeSerializationContext,
++  withSerializationError,
++} from "../serialization-error.js";
+ import type { MessageShape, UnknownField } from "../types.js";
+-import { createExtensionContainer, getExtension } from "../extensions.js";
+ import { BinaryReader, WireType } from "../wire/index.js";
+ import type { Any } from "../wkt/index.js";
+ import { anyUnpack } from "../wkt/index.js";
+ import { isGroupLike } from "./is-group-like.js";
+-import { quoteBytes, quoteString, Writer } from "./writer.js";
++import { Writer, quoteBytes, quoteString } from "./writer.js";
+ 
+ /**
+  * Options for serializing to the protobuf text format.
+@@ -88,14 +94,23 @@ export function toText<Desc extends DescMessage>(
+   message: MessageShape<Desc>,
+   options?: Partial<TextWriteOptions>,
+ ): string {
+-  if (!protoInt64.supported) {
+-    throw new Error(
+-      "the protobuf text format requires BigInt, which is unavailable in this environment",
++  const serialization = makeSerializationContext("text", "write", schema);
++  return writeAt(serialization, [], () => {
++    if (!protoInt64.supported) {
++      throw new Error(
++        "the protobuf text format requires BigInt, which is unavailable in this environment",
++      );
++    }
++    const writer = new Writer();
++    writeMessage(
++      writer,
++      reflect(schema, message),
++      makeWriteOptions(options),
++      serialization,
++      [],
+     );
+-  }
+-  const writer = new Writer();
+-  writeMessage(writer, reflect(schema, message), makeWriteOptions(options));
+-  return writer.toString();
++    return writer.toString();
++  });
+ }
+ 
+ /**
+@@ -108,25 +123,46 @@ function writeMessage(
+   writer: Writer,
+   msg: ReflectMessage,
+   opts: Readonly<TextWriteOptions>,
++  serialization: SerializationContext,
++  path: Path,
+ ): void {
+-  if (writeAny(writer, msg, opts)) {
+-    return;
+-  }
+-  for (const field of msg.fields) {
+-    // Unset fields are omitted, including unset required fields; like
+-    // protobuf-go, we do not validate required fields when serializing.
+-    if (msg.isSet(field)) {
+-      writeField(writer, fieldTextName(field), field, msg, opts);
++  writeAt(serialization, path, () => {
++    if (writeAny(writer, msg, opts, serialization, path)) {
++      return;
+     }
+-  }
+-  const extensionNumbers = writeExtensions(writer, msg, opts);
+-  if (opts.printUnknownFields) {
+-    for (const field of msg.getUnknown() ?? []) {
+-      if (!extensionNumbers.has(field.no)) {
+-        writeUnknownField(writer, field, 0);
++    for (const field of msg.fields) {
++      // Unset fields are omitted, including unset required fields; like
++      // protobuf-go, we do not validate required fields when serializing.
++      if (msg.isSet(field)) {
++        const fieldPath = path.concat(field);
++        writeAt(serialization, fieldPath, () => {
++          writeField(
++            writer,
++            fieldTextName(field),
++            field,
++            msg,
++            opts,
++            serialization,
++            fieldPath,
++          );
++        });
+       }
+     }
+-  }
++    const extensionNumbers = writeExtensions(
++      writer,
++      msg,
++      opts,
++      serialization,
++      path,
++    );
++    if (opts.printUnknownFields) {
++      for (const field of msg.getUnknown() ?? []) {
++        if (!extensionNumbers.has(field.no)) {
++          writeUnknownField(writer, field, 0);
++        }
++      }
++    }
++  });
+ }
+ 
+ function writeField(
+@@ -135,6 +171,8 @@ function writeField(
+   field: DescField,
+   msg: ReflectMessage,
+   opts: Readonly<TextWriteOptions>,
++  serialization: SerializationContext,
++  path: Path,
+ ): void {
+   // Narrowing on fieldKind lets msg.get(field) return the precise reflect type
+   // for each case — ReflectMessage, ReflectList, ReflectMap, number, or a scalar
+@@ -147,13 +185,20 @@ function writeField(
+       writer.scalar(name, enumToText(field.enum, msg.get(field)));
+       break;
+     case "message":
+-      writeMessageValue(writer, name, msg.get(field), opts);
++      writeMessageValue(
++        writer,
++        name,
++        msg.get(field),
++        opts,
++        serialization,
++        path,
++      );
+       break;
+     case "list":
+-      writeList(writer, name, field, msg.get(field), opts);
++      writeList(writer, name, field, msg.get(field), opts, serialization, path);
+       break;
+     case "map":
+-      writeMap(writer, name, field, msg.get(field), opts);
++      writeMap(writer, name, field, msg.get(field), opts, serialization, path);
+       break;
+   }
+ }
+@@ -167,10 +212,12 @@ function writeMessageValue(
+   name: string,
+   msg: ReflectMessage,
+   opts: Readonly<TextWriteOptions>,
++  serialization: SerializationContext,
++  path: Path,
+ ): void {
+   const mark = writer.mark();
+   writer.openMessage(name);
+-  writeMessage(writer, msg, opts);
++  writeMessage(writer, msg, opts, serialization, path);
+   if (writer.writesSince(mark) === 1) {
+     // Only the opener was written, so the message is empty.
+     writer.reset(mark);
+@@ -186,21 +233,43 @@ function writeList(
+   field: DescField & { fieldKind: "list" },
+   list: ReflectList,
+   opts: Readonly<TextWriteOptions>,
++  serialization: SerializationContext,
++  path: Path,
+ ): void {
++  let listIndex = 0;
+   switch (field.listKind) {
+     case "scalar":
+       for (const item of list) {
+-        writer.scalar(name, scalarToText(field.scalar, item));
++        const itemPath = path.concat({ kind: "list_sub", index: listIndex });
++        writeAt(serialization, itemPath, () => {
++          writer.scalar(name, scalarToText(field.scalar, item));
++        });
++        listIndex++;
+       }
+       break;
+     case "enum":
+       for (const item of list) {
+-        writer.scalar(name, enumToText(field.enum, item as number));
++        const itemPath = path.concat({ kind: "list_sub", index: listIndex });
++        writeAt(serialization, itemPath, () => {
++          writer.scalar(name, enumToText(field.enum, item as number));
++        });
++        listIndex++;
+       }
+       break;
+     case "message":
+       for (const item of list) {
+-        writeMessageValue(writer, name, item as ReflectMessage, opts);
++        const itemPath = path.concat({ kind: "list_sub", index: listIndex });
++        writeAt(serialization, itemPath, () => {
++          writeMessageValue(
++            writer,
++            name,
++            item as ReflectMessage,
++            opts,
++            serialization,
++            itemPath,
++          );
++        });
++        listIndex++;
+       }
+       break;
+   }
+@@ -212,24 +281,36 @@ function writeMap(
+   field: DescField & { fieldKind: "map" },
+   map: ReflectMap,
+   opts: Readonly<TextWriteOptions>,
++  serialization: SerializationContext,
++  path: Path,
+ ): void {
+   // Map entries are emitted in iteration (insertion) order; unlike protobuf-go,
+   // we deliberately do not sort them.
+   for (const [key, value] of map) {
+-    writer.openMessage(name);
+-    writer.scalar("key", scalarToText(field.mapKey, key));
+-    switch (field.mapKind) {
+-      case "scalar":
+-        writer.scalar("value", scalarToText(field.scalar, value));
+-        break;
+-      case "enum":
+-        writer.scalar("value", enumToText(field.enum, value as number));
+-        break;
+-      case "message":
+-        writeMessageValue(writer, "value", value as ReflectMessage, opts);
+-        break;
+-    }
+-    writer.end();
++    const entryPath = mapEntryPath(path, key);
++    writeAt(serialization, entryPath, () => {
++      writer.openMessage(name);
++      writer.scalar("key", scalarToText(field.mapKey, key));
++      switch (field.mapKind) {
++        case "scalar":
++          writer.scalar("value", scalarToText(field.scalar, value));
++          break;
++        case "enum":
++          writer.scalar("value", enumToText(field.enum, value as number));
++          break;
++        case "message":
++          writeMessageValue(
++            writer,
++            "value",
++            value as ReflectMessage,
++            opts,
++            serialization,
++            entryPath,
++          );
++          break;
++      }
++      writer.end();
++    });
+   }
+ }
+ 
+@@ -242,6 +323,8 @@ function writeAny(
+   writer: Writer,
+   msg: ReflectMessage,
+   opts: Readonly<TextWriteOptions>,
++  serialization: SerializationContext,
++  path: Path,
+ ): boolean {
+   if (
+     msg.desc.typeName !== "google.protobuf.Any" ||
+@@ -261,12 +344,17 @@ function writeAny(
+   if (desc === undefined) {
+     return false;
+   }
++  const nestedSerialization = makeSerializationContext("text", "write", desc);
+   // The bracketed name preserves the exact type URL, including a custom domain.
+-  writeMessageValue(
+-    writer,
+-    "[" + any.typeUrl + "]",
+-    reflect(desc, unpacked),
+-    opts,
++  writeAt(serialization, path, () =>
++    writeMessageValue(
++      writer,
++      "[" + any.typeUrl + "]",
++      reflect(desc, unpacked),
++      opts,
++      nestedSerialization,
++      [],
++    ),
+   );
+   return true;
+ }
+@@ -279,6 +367,8 @@ function writeExtensions(
+   writer: Writer,
+   msg: ReflectMessage,
+   opts: Readonly<TextWriteOptions>,
++  serialization: SerializationContext,
++  path: Path,
+ ): Set<number> {
+   const numbers = new Set<number>();
+   const unknown = msg.getUnknown();
+@@ -300,13 +390,44 @@ function writeExtensions(
+     a.typeName < b.typeName ? -1 : a.typeName > b.typeName ? 1 : 0,
+   );
+   for (const extension of extensions) {
+-    const value = getExtension(msg.message, extension);
+-    const [container, field] = createExtensionContainer(extension, value);
+-    writeField(writer, "[" + extension.typeName + "]", field, container, opts);
++    const extensionPath = path.concat(extension);
++    writeAt(serialization, extensionPath, () => {
++      const value = getExtension(msg.message, extension);
++      const [container, field] = createExtensionContainer(extension, value);
++      writeField(
++        writer,
++        "[" + extension.typeName + "]",
++        field,
++        container,
++        opts,
++        serialization,
++        extensionPath,
++      );
++    });
+   }
+   return numbers;
+ }
+ 
++function writeAt<T>(
++  serialization: SerializationContext,
++  path: Path,
++  run: () => T,
++): T {
++  return withSerializationError(serialization, path, run);
++}
++
++function mapEntryPath(path: Path, key: unknown): Path {
++  switch (typeof key) {
++    case "string":
++    case "number":
++    case "bigint":
++    case "boolean":
++      return path.concat({ kind: "map_sub", key });
++    default:
++      return path;
++  }
++}
++
+ /**
+  * Write an unknown field by its field number, mirroring protobuf-go: varints as
+  * decimal, fixed-width values as hexadecimal, length-delimited data as a nested
+diff --git a/packages/protobuf/src/wire/size-delimited.ts b/packages/protobuf/src/wire/size-delimited.ts
+index 7f812316..ea28623f 100644
+--- a/packages/protobuf/src/wire/size-delimited.ts
++++ b/packages/protobuf/src/wire/size-delimited.ts
+@@ -13,12 +13,16 @@
+ // limitations under the License.
+ 
+ import type { DescMessage } from "../descriptors.js";
++import type { BinaryReadOptions } from "../from-binary.js";
++import { fromBinary } from "../from-binary.js";
++import {
++  makeSerializationContext,
++  rethrowSerializationError,
++} from "../serialization-error.js";
+ import type { BinaryWriteOptions } from "../to-binary.js";
+ import { toBinary } from "../to-binary.js";
+ import type { MessageShape } from "../types.js";
+ import { BinaryReader, BinaryWriter } from "./binary-encoding.js";
+-import type { BinaryReadOptions } from "../from-binary.js";
+-import { fromBinary } from "../from-binary.js";
+ 
+ /**
+  * Serialize a message, prefixing it with its size.
+@@ -106,6 +110,7 @@ export async function* sizeDelimitedDecodeStream<Desc extends DescMessage>(
+   options?: Partial<SizeDelimitedDecodeOptions>,
+ ): AsyncIterableIterator<MessageShape<Desc>> {
+   const readMaxBytes = options?.readMaxBytes ?? defaultReadMaxBytes;
++  const serialization = makeSerializationContext("binary", "read", messageDesc);
+   let buffer = new ByteBuffer();
+ 
+   for await (const chunk of iterable) {
+@@ -114,14 +119,23 @@ export async function* sizeDelimitedDecodeStream<Desc extends DescMessage>(
+     let offset = 0;
+ 
+     for (;;) {
+-      const size = sizeDelimitedPeek(bytes.subarray(offset));
++      let size: ReturnType<typeof sizeDelimitedPeek>;
++      try {
++        size = sizeDelimitedPeek(bytes.subarray(offset));
++      } catch (cause) {
++        rethrowSerializationError(serialization, [], cause);
++      }
+       if (size.eof) {
+         // size is incomplete, buffer more data
+         break;
+       }
+       if (size.size > readMaxBytes) {
+-        throw new Error(
+-          `message size ${size.size} is larger than configured readMaxBytes ${readMaxBytes}`,
++        rethrowSerializationError(
++          serialization,
++          [],
++          new Error(
++            `message size ${size.size} is larger than configured readMaxBytes ${readMaxBytes}`,
++          ),
+         );
+       }
+       const messageStart = offset + size.offset;
+@@ -143,7 +157,7 @@ export async function* sizeDelimitedDecodeStream<Desc extends DescMessage>(
+     }
+   }
+   if (buffer.byteLength > 0) {
+-    throw new Error("incomplete data");
++    rethrowSerializationError(serialization, [], new Error("incomplete data"));
+   }
+ }
+ 

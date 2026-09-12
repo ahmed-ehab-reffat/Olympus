@@ -1,0 +1,3218 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 6fadb94c..fca824fc 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -370,6 +370,7 @@ dependencies = [
+  "itertools 0.14.0",
+  "log",
+  "serde",
++ "serde_json",
+ ]
+ 
+ [[package]]
+diff --git a/Cargo.toml b/Cargo.toml
+index 2781d494..b399ecc9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -151,6 +151,7 @@ criterion = { version = "0.3", features = ["html_reports"] }
+ calyx-ir = { path = "calyx/ir" }
+ calyx-opt = { path = "calyx/opt" }
+ calyx-frontend = { path = "calyx/frontend" }
++serde_json = "1.0.79"
+ 
+ [[bench]]
+ name = "component-sharing"
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..071ab763
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,116 @@
++#!/usr/bin/env bash
++set -u
++
++export PATH="/root/.cargo/bin:$PATH"
++export CARGO_INCREMENTAL=0
++export RUSTC_BOOTSTRAP=1
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++if [ -n "$OUTPUT_PATH" ]; then mkdir -p "$(dirname "$OUTPUT_PATH")"; fi
++
++cd "$(dirname "$0")" || exit 1
++
++NEW_TARGET="port_elim_21f11a"
++WORK="$(mktemp -d)"
++trap 'rm -rf "$WORK"' EXIT
++
++xml_escape() {
++  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
++}
++
++# Run a cargo test target and convert the libtest json stream into JUnit
++# testsuite elements on stdout.
++cargo_suites() {
++  local json="$WORK/cargo.json" err="$WORK/cargo.err" xml="$WORK/cargo.xml"
++  cargo test --offline "$@" -- -Z unstable-options --format json --report-time \
++    > "$json" 2> "$err"
++  printf %s "$?" > "$WORK/cargo.status"
++  cat "$err" >&2
++  cargo2junit < "$json" > "$xml" 2>/dev/null
++  if grep -q '<testcase' "$xml"; then
++    sed -n '/<testsuite /,/<\/testsuite>/p' "$xml"
++  else
++    local detail
++    detail=$( { cat "$err"; cat "$json"; } | tail -c 4000 | sed -e 's/]]>/]]]]><![CDATA[>/g')
++    printf '<testsuite name="cargo-build" tests="1" failures="1" errors="0">\n'
++    printf '<testcase name="compilation" classname="cargo-build"><failure message="build failed"><![CDATA[%s]]></failure></testcase>\n' "$detail"
++    printf '</testsuite>\n'
++    printf 1 > "$WORK/cargo.status"
++  fi
++}
++
++# Replay the golden compilation tests the way the repository's runt
++# configuration does and report each file as its own testcase.
++golden_suite() {
++  local total=0 failed=0 body="" f e flags out err code actual
++  for f in $(find tests/passes -name '*.futil' | sort); do
++    e="${f%.futil}.expect"
++    [ -f "$e" ] || continue
++    total=$((total + 1))
++    flags="$(head -n 1 "$f" | cut -c 3-)"
++    out=$(./target/debug/calyx "$f" $flags -m file -l . 2>"$WORK/err" \
++      | sed "s|extern \"$PWD/|extern \"<ROOT>/calyx/|")
++    code=$?
++    err=$(cat "$WORK/err")
++    actual=""
++    [ -n "$out" ] && actual="$out"
++    if [ -n "$err" ]; then
++      [ -n "$actual" ] && actual="$actual
++"
++      actual="$actual---STDERR---
++$err"
++    fi
++    if [ "$code" -ne 0 ]; then
++      [ -n "$actual" ] && actual="$actual
++"
++      actual="$actual---CODE---
++$code"
++    fi
++    if [ "$actual" = "$(cat "$e")" ]; then
++      body="$body<testcase name=\"$(printf '%s' "$f" | xml_escape)\" classname=\"golden\"/>
++"
++    else
++      failed=$((failed + 1))
++      body="$body<testcase name=\"$(printf '%s' "$f" | xml_escape)\" classname=\"golden\"><failure message=\"output does not match $e\"/></testcase>
++"
++    fi
++  done
++  printf '<testsuite name="golden" tests="%s" failures="%s" errors="0">\n%s</testsuite>\n' \
++    "$total" "$failed" "$body"
++  printf %s "$failed" > "$WORK/golden.failed"
++}
++
++STATUS=0
++SUITES=""
++
++if [ "$MODE" = "new" ]; then
++  SUITES=$(cargo_suites --test "$NEW_TARGET")
++  STATUS=$(cat "$WORK/cargo.status")
++else
++  cargo build --offline -p calyx >&2
++  SUITES=$(golden_suite)
++  [ "$(cat "$WORK/golden.failed")" -eq 0 ] || STATUS=1
++  SUITES="$SUITES
++$(cargo_suites --lib -p calyx-utils -p calyx-frontend)"
++  [ "$(cat "$WORK/cargo.status")" -eq 0 ] || STATUS=1
++fi
++
++if [ -n "$OUTPUT_PATH" ]; then
++  {
++    printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n'
++    printf '%s\n' "$SUITES"
++    printf '</testsuites>\n'
++  } > "$OUTPUT_PATH"
++fi
++
++exit $STATUS
+diff --git a/tests/port_elim_21f11a.rs b/tests/port_elim_21f11a.rs
+new file mode 100644
+index 00000000..1c982fcb
+--- /dev/null
++++ b/tests/port_elim_21f11a.rs
+@@ -0,0 +1,3066 @@
++use calyx_frontend as frontend;
++use calyx_ir as ir;
++use calyx_opt::pass_manager::PassManager;
++use std::collections::{HashMap, HashSet};
++use std::path::PathBuf;
++
++fn compile(label: &str, src: &str, opts: &[String]) -> ir::Context {
++    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
++    let path = std::env::temp_dir().join(format!("calyx_dpe_{label}.futil"));
++    std::fs::write(&path, src).unwrap();
++    let ws = frontend::Workspace::construct(&Some(path.clone()), &[root])
++        .expect("failed to build workspace");
++    let mut ctx = ir::from_ast::ast_to_ir(
++        ws,
++        ir::from_ast::AstConversionConfig::default(),
++    )
++    .expect("failed to build ir");
++    ctx.extra_opts = opts.to_vec();
++    let pm = PassManager::default_passes().unwrap();
++    pm.execute_plan(
++        &mut ctx,
++        &["dead-port-elimination".to_string()],
++        &[],
++        &[],
++        false,
++    )
++    .expect("failed to run dead-port-elimination");
++    std::fs::remove_file(&path).ok();
++    ctx
++}
++
++fn build(label: &str, src: &str, opts: &[String]) -> String {
++    let ctx = compile(label, src, opts);
++    let mut buf = Vec::new();
++    for comp in &ctx.components {
++        ir::Printer::write_component(comp, &mut buf).unwrap();
++        buf.push(b'\n');
++    }
++    String::from_utf8(buf).unwrap()
++}
++
++fn run(label: &str, src: &str) -> String {
++    build(label, src, &[])
++}
++
++/// Run the pass and then the repository's own well-formedness checker. Returns
++/// true when the rewritten program is still structurally valid, which fails if
++/// the pass removed a port whose value some surviving construct still needs.
++fn stays_well_formed(label: &str, src: &str) -> bool {
++    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
++    let path = std::env::temp_dir().join(format!("calyx_dpe_wf_{label}.futil"));
++    std::fs::write(&path, src).unwrap();
++    let ws = frontend::Workspace::construct(&Some(path.clone()), &[root])
++        .expect("failed to build workspace");
++    let mut ctx = ir::from_ast::ast_to_ir(
++        ws,
++        ir::from_ast::AstConversionConfig::default(),
++    )
++    .expect("failed to build ir");
++    let pm = PassManager::default_passes().unwrap();
++    let result = pm.execute_plan(
++        &mut ctx,
++        &[
++            "dead-port-elimination".to_string(),
++            "well-formed".to_string(),
++        ],
++        &[],
++        &[],
++        false,
++    );
++    std::fs::remove_file(&path).ok();
++    result.is_ok()
++}
++
++fn report(label: &str, src: &str) -> serde_json::Value {
++    let path = std::env::temp_dir().join(format!("calyx_dpe_{label}.json"));
++    let opt = format!("dead-port-elimination:dump={}", path.display());
++    build(label, src, &[opt]);
++    let out = std::fs::read_to_string(&path).expect("no report was written");
++    std::fs::remove_file(&path).ok();
++    serde_json::from_str(&out).expect("report is not valid json")
++}
++
++fn signature(out: &str, comp: &str) -> String {
++    let needle = format!("component {comp}");
++    out.lines()
++        .find(|line| {
++            let trimmed = line.trim_start();
++            trimmed.starts_with(&needle)
++                && trimmed[needle.len()..].starts_with(['(', '<'])
++        })
++        .unwrap_or_else(|| panic!("component `{comp}` not found in:\n{out}"))
++        .trim()
++        .trim_end_matches('{')
++        .trim()
++        .to_string()
++}
++
++fn body_has(out: &str, text: &str) -> bool {
++    out.lines().any(|line| line.trim() == text)
++}
++
++fn binding_present(out: &str, text: &str) -> bool {
++    out.lines()
++        .any(|line| line.trim().trim_end_matches(',') == text)
++}
++
++const PREAMBLE: &str = concat!(
++    "import \"primitives/core.futil\";\n",
++    "import \"primitives/memories/comb.futil\";\n"
++);
++
++fn program(body: &str) -> String {
++    format!("{PREAMBLE}{body}")
++}
++
++#[test]
++fn unread_output_port_is_removed() {
++    let out = run(
++        "unread_output",
++        &program(
++            r#"
++component leaf(a: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++    r = reg0.out;
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++}
++
++#[test]
++fn removing_output_drops_its_driver_assignment() {
++    let out = run(
++        "output_driver",
++        &program(
++            r#"
++component leaf(a: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++    r = reg0.out;
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert!(!body_has(&out, "r = reg0.out;"));
++    assert!(body_has(&out, "reg0.in = a;"));
++}
++
++#[test]
++fn read_output_port_survives() {
++    let out = run(
++        "read_output",
++        &program(
++            r#"
++component leaf() -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = 32'd1; reg0.write_en = 1'd1; g[done] = reg0.done; }
++    r = reg0.out;
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); dst = std_reg(32); }
++  wires { dst.in = l.r; }
++  control { invoke l()(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++}
++
++#[test]
++fn output_read_by_only_one_of_two_instances_survives() {
++    let out = run(
++        "two_instances",
++        &program(
++            r#"
++component leaf() -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = 32'd1; reg0.write_en = 1'd1; g[done] = reg0.done; }
++    r = reg0.out;
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l0 = leaf(); l1 = leaf(); dst = std_reg(32); }
++  wires { dst.in = l1.r; }
++  control { seq { invoke l0()(); invoke l1()(); } }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++}
++
++#[test]
++fn input_port_unread_in_body_is_removed() {
++    let out = run(
++        "unread_input",
++        &program(
++            r#"
++component leaf(a: 32, b: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out, b = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++}
++
++#[test]
++fn removing_input_drops_its_invoke_binding() {
++    let out = run(
++        "invoke_binding",
++        &program(
++            r#"
++component leaf(a: 32, b: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out, b = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert!(binding_present(&out, "a = src.out"));
++    assert!(!binding_present(&out, "b = src.out"));
++}
++
++#[test]
++fn removing_input_drops_structural_write_at_instance() {
++    let out = run(
++        "structural_write",
++        &program(
++            r#"
++component leaf(a: 32, b: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { l.b = src.out; }
++  control { invoke l(a = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert!(!body_has(&out, "l.b = src.out;"));
++}
++
++#[test]
++fn removal_cascades_across_two_levels() {
++    let out = run(
++        "cascade_two_levels",
++        &program(
++            r#"
++component leaf(a: 32, b: 32) -> (r: 32, s: 32) {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++    r = reg0.out;
++    s = b;
++  }
++  control { g; }
++}
++component mid(x: 32) -> (y: 32) {
++  cells { l = leaf(); r0 = std_reg(32); }
++  wires {
++    group g2 { r0.in = l.r; r0.write_en = 1'd1; g2[done] = r0.done; }
++    y = r0.out;
++  }
++  control { seq { invoke l(a = x, b = x)(); g2; } }
++}
++component main() -> () {
++  cells { m = mid(); src = std_reg(32); }
++  wires { }
++  control { invoke m(x = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "mid"),
++        "component mid(x: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++    assert!(!binding_present(&out, "b = x"));
++    assert!(!body_has(&out, "s = b;"));
++}
++
++#[test]
++fn cascade_stops_at_a_live_read() {
++    let out = run(
++        "cascade_stops",
++        &program(
++            r#"
++component leaf(a: 32, b: 32) -> (r: 32, s: 32) {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++    r = reg0.out;
++    s = b;
++  }
++  control { g; }
++}
++component mid(x: 32) -> (y: 32) {
++  cells { l = leaf(); r0 = std_reg(32); }
++  wires {
++    group g2 { r0.in = l.s; r0.write_en = 1'd1; g2[done] = r0.done; }
++    y = r0.out;
++  }
++  control { seq { invoke l(a = x, b = x)(); g2; } }
++}
++component main() -> () {
++  cells { m = mid(); dst = std_reg(32); src = std_reg(32); }
++  wires { dst.in = m.y; }
++  control { invoke m(x = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, b: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (s: 32, @done done: 1)"
++    );
++    assert_eq!(
++        signature(&out, "mid"),
++        "component mid(x: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (y: 32, @done done: 1)"
++    );
++}
++
++#[test]
++fn entrypoint_signature_is_untouched() {
++    let out = run(
++        "entrypoint",
++        &program(
++            r#"
++component main(unused: 32) -> (never_read: 32) {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = 32'd1; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "main"),
++        "component main(unused: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (never_read: 32, @done done: 1)"
++    );
++}
++
++#[test]
++fn a_toplevel_entrypoint_not_named_main_is_untouched() {
++    let out = run(
++        "toplevel_entrypoint",
++        &program(
++            r#"
++component driver<"toplevel"=1>(unused: 32) -> (never_read: 32) {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = 32'd1; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { reg1 = std_reg(32); }
++  wires { }
++  control { }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "driver"),
++        "component driver<\"toplevel\"=1>(unused: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (never_read: 32, @done done: 1)"
++    );
++}
++
++#[test]
++fn static_invoke_bindings_are_pruned() {
++    let out = run(
++        "static_invoke",
++        &program(
++            r#"
++static<1> component leaf(a: 32, b: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    static<1> group g { reg0.in = a; reg0.write_en = 1'd1; }
++  }
++  control { static seq { g; } }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { static invoke l(a = src.out, b = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert!(out.contains(
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    ));
++    assert!(binding_present(&out, "a = src.out"));
++    assert!(!binding_present(&out, "b = src.out"));
++}
++
++#[test]
++fn interface_ports_survive_on_a_fully_unused_component() {
++    let out = run(
++        "interface_ports",
++        &program(
++            r#"
++component leaf(a: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = 32'd1; reg0.write_en = 1'd1; g[done] = reg0.done; }
++    r = reg0.out;
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { reg1 = std_reg(32); }
++  wires { }
++  control { }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++}
++
++#[test]
++fn port_read_only_inside_a_guard_survives() {
++    let out = run(
++        "guard_read",
++        &program(
++            r#"
++component leaf(a: 32, cond: 1) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = cond ? a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); flag = std_reg(1); }
++  wires { }
++  control { invoke l(a = src.out, cond = flag.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, cond: 1, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++}
++
++#[test]
++fn port_read_only_in_a_comparison_guard_survives() {
++    let out = run(
++        "comparison_guard",
++        &program(
++            r#"
++component leaf(a: 32, limit: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a > limit ? a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out, limit = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, limit: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++}
++
++#[test]
++fn output_read_only_as_a_while_condition_survives() {
++    let out = run(
++        "while_condition",
++        &program(
++            r#"
++component leaf() -> (flag: 1) {
++  cells { reg0 = std_reg(1); }
++  wires {
++    group g { reg0.in = 1'd0; reg0.write_en = 1'd1; g[done] = reg0.done; }
++    flag = reg0.out;
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); reg1 = std_reg(32); }
++  wires {
++    group g2 { reg1.in = 32'd1; reg1.write_en = 1'd1; g2[done] = reg1.done; }
++  }
++  control { while l.flag { g2; } }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (flag: 1, @done done: 1)"
++    );
++}
++
++#[test]
++fn output_read_only_as_an_if_condition_survives() {
++    let out = run(
++        "if_condition",
++        &program(
++            r#"
++component leaf() -> (flag: 1) {
++  cells { reg0 = std_reg(1); }
++  wires {
++    group g { reg0.in = 1'd0; reg0.write_en = 1'd1; g[done] = reg0.done; }
++    flag = reg0.out;
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); reg1 = std_reg(32); }
++  wires {
++    group g2 { reg1.in = 32'd1; reg1.write_en = 1'd1; g2[done] = reg1.done; }
++  }
++  control { if l.flag { g2; } }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (flag: 1, @done done: 1)"
++    );
++}
++
++#[test]
++fn output_read_only_by_an_invoke_output_binding_survives() {
++    let out = run(
++        "invoke_output_binding",
++        &program(
++            r#"
++component leaf() -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = 32'd1; reg0.write_en = 1'd1; g[done] = reg0.done; }
++    r = reg0.out;
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); dst = std_reg(32); }
++  wires { }
++  control { invoke l()(r = dst.in); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++}
++
++#[test]
++fn port_read_only_from_a_continuous_assignment_survives() {
++    let out = run(
++        "continuous_read",
++        &program(
++            r#"
++component leaf(a: 32) -> (r: 32) {
++  cells { }
++  wires { r = a; }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); dst = std_reg(32); }
++  wires { l.a = src.out; dst.in = l.r; }
++  control { }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++}
++
++#[test]
++fn port_read_only_from_a_comb_group_survives() {
++    let out = run(
++        "comb_group_read",
++        &program(
++            r#"
++component leaf() -> (flag: 1) {
++  cells { reg0 = std_reg(1); }
++  wires {
++    group g { reg0.in = 1'd0; reg0.write_en = 1'd1; g[done] = reg0.done; }
++    flag = reg0.out;
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); cmp = std_eq(1); reg1 = std_reg(32); }
++  wires {
++    comb group c { cmp.left = l.flag; cmp.right = 1'd1; }
++    group g2 { reg1.in = 32'd1; reg1.write_en = 1'd1; g2[done] = reg1.done; }
++  }
++  control { if cmp.out with c { g2; } }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (flag: 1, @done done: 1)"
++    );
++}
++
++#[test]
++fn invoke_output_binding_to_a_removed_port_is_dropped() {
++    let out = run(
++        "invoke_output_dead",
++        &program(
++            r#"
++component sink(w: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = 32'd1; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component producer() -> (r: 32) {
++  cells { reg1 = std_reg(32); }
++  wires {
++    group g { reg1.in = 32'd1; reg1.write_en = 1'd1; g[done] = reg1.done; }
++    r = reg1.out;
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { s = sink(); p = producer(); }
++  wires { }
++  control { seq { invoke p()(r = s.w); invoke s(w = 32'd0)(); } }
++}
++"#,
++        ),
++    );
++    assert!(!binding_present(&out, "r = s.w"));
++    assert_eq!(
++        signature(&out, "producer"),
++        "component producer(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++}
++
++#[test]
++fn a_ref_cell_used_only_as_an_if_condition_survives() {
++    let out = run(
++        "ref_if_condition",
++        &program(
++            r#"
++component user() -> () {
++  cells { ref flag = std_reg(1); r0 = std_reg(32); }
++  wires { group g { r0.in = 32'd1; r0.write_en = 1'd1; g[done] = r0.done; } }
++  control { if flag.out { g; } }
++}
++component main() -> () {
++  cells { f = std_reg(1); u = user(); }
++  wires { }
++  control { invoke u[flag = f]()(); }
++}
++"#,
++        ),
++    );
++    assert!(out.contains("ref flag"));
++    assert!(out.contains("flag = f"));
++}
++
++#[test]
++fn a_ref_cell_used_only_as_a_while_condition_survives() {
++    let out = run(
++        "ref_while_condition",
++        &program(
++            r#"
++component user() -> () {
++  cells { ref flag = std_reg(1); r0 = std_reg(32); }
++  wires { group g { r0.in = 32'd1; r0.write_en = 1'd1; g[done] = r0.done; } }
++  control { while flag.out { g; } }
++}
++component main() -> () {
++  cells { f = std_reg(1); u = user(); }
++  wires { }
++  control { invoke u[flag = f]()(); }
++}
++"#,
++        ),
++    );
++    assert!(out.contains("ref flag"));
++    assert!(out.contains("flag = f"));
++}
++
++#[test]
++fn port_read_only_from_static_control_survives() {
++    let out = run(
++        "static_read",
++        &program(
++            r#"
++component leaf(a: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    static<1> group g { reg0.in = a; reg0.write_en = 1'd1; }
++  }
++  control { static seq { g; } }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++}
++
++#[test]
++fn a_port_feeding_only_a_dead_combinational_wire_is_removed() {
++    let out = run(
++        "comb_dead",
++        &program(
++            r#"
++component leaf(a: 32, b: 32) -> () {
++  cells { w = std_wire(32); reg0 = std_reg(32); }
++  wires {
++    group g { w.in = a; reg0.in = b; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out, b = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(b: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(!body_has(&out, "w.in = a;"));
++    assert!(body_has(&out, "reg0.in = b;"));
++}
++
++#[test]
++fn a_port_reaching_a_stateful_cell_through_combinational_logic_survives() {
++    let out = run(
++        "comb_to_stateful",
++        &program(
++            r#"
++component leaf(a: 32) -> () {
++  cells { w1 = std_wire(32); w2 = std_wire(32); reg0 = std_reg(32); }
++  wires {
++    group g { w1.in = a; w2.in = w1.out; reg0.in = w2.out; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(stays_well_formed(
++        "comb_to_stateful_wf",
++        &program(
++            r#"
++component leaf(a: 32) -> () {
++  cells { w1 = std_wire(32); w2 = std_wire(32); reg0 = std_reg(32); }
++  wires {
++    group g { w1.in = a; w2.in = w1.out; reg0.in = w2.out; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out)(); }
++}
++"#,
++        )
++    ));
++}
++
++#[test]
++fn a_port_reaching_a_dead_end_through_a_combinational_chain_is_removed() {
++    let out = run(
++        "comb_chain_dead",
++        &program(
++            r#"
++component leaf(a: 32) -> () {
++  cells { w1 = std_wire(32); w2 = std_wire(32); reg0 = std_reg(32); }
++  wires {
++    group g { w1.in = a; w2.in = w1.out; reg0.in = 32'd0; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++}
++
++#[test]
++fn a_port_with_one_dead_and_one_live_combinational_reader_survives() {
++    let src = program(
++        r#"
++component leaf(a: 32) -> () {
++  cells { w = std_wire(32); reg0 = std_reg(32); }
++  wires {
++    group g { w.in = a; reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out)(); }
++}
++"#,
++    );
++    let out = run("split_fanout", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = a;"));
++    assert!(stays_well_formed("split_fanout_wf", &src));
++}
++
++#[test]
++fn a_port_read_only_through_a_dead_comb_output_survives_via_the_output() {
++    let out = run(
++        "comb_output_read",
++        &program(
++            r#"
++component leaf(a: 32, b: 32) -> (r: 32) {
++  cells { adder = std_add(32); }
++  wires {
++    r = adder.out;
++    adder.left = a;
++    adder.right = b;
++  }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); dst = std_reg(32); }
++  wires { dst.in = l.r; }
++  control { invoke l(a = src.out, b = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, b: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++}
++
++#[test]
++fn a_combinational_input_becomes_dead_once_its_output_port_is_removed() {
++    let out = run(
++        "comb_output_removed",
++        &program(
++            r#"
++component leaf(a: 32, b: 32) -> (r: 32) {
++  cells { adder = std_add(32); }
++  wires {
++    r = adder.out;
++    adder.left = a;
++    adder.right = b;
++  }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out, b = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(!body_has(&out, "adder.left = a;"));
++}
++
++#[test]
++fn a_port_read_only_into_a_ref_cell_survives() {
++    let out = run(
++        "ref_read",
++        &program(
++            r#"
++component writer(v: 32) -> (o: 32) {
++  cells { ref mem = comb_mem_d1(32, 4, 3); tmp = std_reg(32); }
++  wires {
++    group w { mem.addr0 = 3'd0; mem.write_data = v; mem.write_en = 1'd1; w[done] = mem.done; }
++    o = tmp.out;
++  }
++  control { w; }
++}
++component main() -> () {
++  cells { m0 = comb_mem_d1(32, 4, 3); wr = writer(); src = std_reg(32); }
++  wires { }
++  control { invoke wr[mem = m0](v = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "writer"),
++        "component writer(v: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++}
++
++#[test]
++fn unmentioned_ref_cell_is_removed_from_signature_and_invokes() {
++    let out = run(
++        "unused_ref",
++        &program(
++            r#"
++component writer(v: 32) -> () {
++  cells { ref mem = comb_mem_d1(32, 4, 3); ref spare = comb_mem_d1(32, 4, 3); }
++  wires {
++    group w { mem.addr0 = 3'd0; mem.write_data = v; mem.write_en = 1'd1; w[done] = mem.done; }
++  }
++  control { w; }
++}
++component main() -> () {
++  cells { m0 = comb_mem_d1(32, 4, 3); m1 = comb_mem_d1(32, 4, 3); wr = writer(); src = std_reg(32); }
++  wires { }
++  control { invoke wr[mem = m0, spare = m1](v = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert!(!out.contains("ref spare"));
++    assert!(out.contains("ref mem"));
++    assert!(out.contains("wr[mem = m0]"));
++    assert!(!out.contains("spare = m1"));
++}
++
++#[test]
++fn ref_cell_passed_onward_to_a_nested_invoke_survives() {
++    let out = run(
++        "ref_forwarded",
++        &program(
++            r#"
++component inner(v: 32) -> () {
++  cells { ref mem = comb_mem_d1(32, 4, 3); }
++  wires {
++    group w { mem.addr0 = 3'd0; mem.write_data = v; mem.write_en = 1'd1; w[done] = mem.done; }
++  }
++  control { w; }
++}
++component outer(v: 32) -> () {
++  cells { ref mem = comb_mem_d1(32, 4, 3); i = inner(); }
++  wires { }
++  control { invoke i[mem = mem](v = v)(); }
++}
++component main() -> () {
++  cells { m0 = comb_mem_d1(32, 4, 3); o = outer(); src = std_reg(32); }
++  wires { }
++  control { invoke o[mem = m0](v = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(out.matches("ref mem").count(), 2);
++    assert!(out.contains("i[mem = mem]"));
++    assert!(out.contains("o[mem = m0]"));
++}
++
++#[test]
++fn fixed_signature_component_keeps_every_port() {
++    let out = run(
++        "fixed_signature",
++        &program(
++            r#"
++component leaf<"fixed_signature"=1>(a: 32, b: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++    r = reg0.out;
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out, b = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert!(signature(&out, "leaf").contains("a: 32, b: 32,"));
++    assert!(signature(&out, "leaf").contains("-> (r: 32, @done done: 1)"));
++}
++
++#[test]
++fn fixed_signature_component_keeps_unused_ref_cells() {
++    let out = run(
++        "fixed_signature_ref",
++        &program(
++            r#"
++component writer<"fixed_signature"=1>(v: 32) -> () {
++  cells { ref spare = comb_mem_d1(32, 4, 3); reg0 = std_reg(32); }
++  wires {
++    group w { reg0.in = v; reg0.write_en = 1'd1; w[done] = reg0.done; }
++  }
++  control { w; }
++}
++component main() -> () {
++  cells { m1 = comb_mem_d1(32, 4, 3); wr = writer(); src = std_reg(32); }
++  wires { }
++  control { invoke wr[spare = m1](v = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert!(out.contains("ref spare"));
++    assert!(out.contains("spare = m1"));
++}
++
++#[test]
++fn a_component_can_lose_every_data_port() {
++    let out = run(
++        "empty_signature",
++        &program(
++            r#"
++component leaf(a: 32) -> (r: 32) {
++  cells { }
++  wires { r = a; }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); }
++  wires { }
++  control { }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(!body_has(&out, "r = a;"));
++}
++
++#[test]
++fn a_port_read_only_to_guard_a_dead_combinational_write_is_removed() {
++    let src = program(
++        r#"
++component leaf(a: 32, cond: 1) -> () {
++  cells { deadw = std_wire(32); cmp = std_eq(32); reg0 = std_reg(32); }
++  wires {
++    group g { deadw.in = cmp.out ? a; cmp.left = a; cmp.right = 32'd5; reg0.in = 32'd0; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); f = std_reg(1); }
++  wires { }
++  control { invoke l(a = src.out, cond = f.out)(); }
++}
++"#,
++    );
++    let out = run("guard_dead_comb", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(stays_well_formed("guard_dead_comb_wf", &src));
++}
++
++#[test]
++fn a_port_read_only_to_guard_a_live_write_survives() {
++    let out = run(
++        "guard_live_write",
++        &program(
++            r#"
++component leaf(a: 32) -> () {
++  cells { cmp = std_eq(32); reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = cmp.out ? 32'd7; cmp.left = a; cmp.right = 32'd5; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++}
++
++#[test]
++fn a_port_reaching_a_ref_cell_through_combinational_logic_survives() {
++    let src = program(
++        r#"
++component leaf(a: 32) -> () {
++  cells { ref m0 = comb_mem_d1(32, 4, 3); adder = std_add(32); }
++  wires {
++    group g { adder.left = a; adder.right = 32'd1; m0.addr0 = 3'd0; m0.write_data = adder.out; m0.write_en = 1'd1; g[done] = m0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { mm = comb_mem_d1(32, 4, 3); l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l[m0 = mm](a = src.out)(); }
++}
++"#,
++    );
++    let out = run("comb_to_ref", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(stays_well_formed("comb_to_ref_wf", &src));
++}
++
++#[test]
++fn a_port_reaching_a_stateful_cell_through_reconvergent_paths_survives() {
++    let src = program(
++        r#"
++component leaf(a: 32) -> () {
++  cells { w1 = std_wire(32); w2 = std_wire(32); w3 = std_add(32); reg0 = std_reg(32); }
++  wires {
++    group g { w1.in = a; w2.in = a; w3.left = w1.out; w3.right = w2.out; reg0.in = w3.out; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out)(); }
++}
++"#,
++    );
++    let out = run("reconvergent", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(stays_well_formed("reconvergent_wf", &src));
++}
++
++#[test]
++fn a_combinational_component_loses_its_dead_ports() {
++    let out = run(
++        "comb_component",
++        &program(
++            r#"
++comb component cadder(x: 32, unusedin: 32) -> (s: 32, dead: 32) {
++  cells { a = std_add(32); w = std_wire(32); }
++  wires { a.left = x; a.right = 32'd1; s = a.out; w.in = unusedin; dead = w.out; }
++}
++component main() -> () {
++  cells { ad = cadder(); src = std_reg(32); dst = std_reg(32); }
++  wires { ad.x = src.out; ad.unusedin = src.out; dst.in = ad.s; }
++  control { }
++}
++"#,
++        ),
++    );
++    assert!(out.contains("comb component cadder(x: 32) -> (s: 32)"));
++    assert!(!body_has(&out, "w.in = unusedin;"));
++    assert!(!body_has(&out, "dead = w.out;"));
++}
++
++#[test]
++fn a_uniformly_constant_input_is_removed_and_inlined() {
++    let src = program(
++        r#"
++component leaf(p: 32, q: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } r = reg0.out; }
++  control { g; }
++}
++component main() -> () {
++  cells { l0 = leaf(); l1 = leaf(); dst = std_reg(32); src = std_reg(32); }
++  wires { dst.in = l0.r; }
++  control { seq { invoke l0(p = 32'd5, q = src.out)(); invoke l1(p = 32'd5, q = 32'd9)(); } }
++}
++"#,
++    );
++    let out = run("const_input", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = 32'd5;"));
++    assert!(!binding_present(&out, "p = 32'd5"));
++    assert!(stays_well_formed("const_input_wf", &src));
++}
++
++#[test]
++fn an_input_driven_with_differing_constants_survives() {
++    let out = run(
++        "const_disagree",
++        &program(
++            r#"
++component leaf(p: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } r = reg0.out; }
++  control { g; }
++}
++component main() -> () {
++  cells { l0 = leaf(); l1 = leaf(); dst = std_reg(32); }
++  wires { dst.in = l0.r; }
++  control { seq { invoke l0(p = 32'd5)(); invoke l1(p = 32'd6)(); } }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(p: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = p;"));
++}
++
++#[test]
++fn an_input_driven_non_constant_at_one_instance_survives() {
++    let out = run(
++        "const_one_nonconst",
++        &program(
++            r#"
++component leaf(p: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } r = reg0.out; }
++  control { g; }
++}
++component main() -> () {
++  cells { l0 = leaf(); l1 = leaf(); dst = std_reg(32); src = std_reg(32); }
++  wires { dst.in = l0.r; }
++  control { seq { invoke l0(p = 32'd5)(); invoke l1(p = src.out)(); } }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(p: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++}
++
++#[test]
++fn an_input_driven_by_a_guarded_constant_survives() {
++    let out = run(
++        "const_guarded",
++        &program(
++            r#"
++component leaf(p: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires { reg0.in = p; reg0.write_en = 1'd1; r = reg0.out; }
++  control { }
++}
++component main() -> () {
++  cells { l0 = leaf(); flag = std_reg(1); dst = std_reg(32); }
++  wires { l0.p = flag.out ? 32'd5; dst.in = l0.r; l0.go = 1'd1; }
++  control { }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(p: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++}
++
++#[test]
++fn a_constant_input_read_in_a_guard_is_inlined() {
++    let src = program(
++        r#"
++component leaf(p: 1) -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p ? 32'd1; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { l0 = leaf(); l1 = leaf(); }
++  wires { }
++  control { seq { invoke l0(p = 1'd1)(); invoke l1(p = 1'd1)(); } }
++}
++"#,
++    );
++    let out = run("const_guard_inline", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(
++        body_has(&out, "reg0.in = 1'd1 ? 32'd1;")
++            || body_has(&out, "reg0.in = 1'b1 ? 32'd1;")
++            || body_has(&out, "reg0.in = 32'd1;"),
++        "{out}"
++    );
++    assert!(stays_well_formed("const_guard_inline_wf", &src));
++}
++
++#[test]
++fn a_uniformly_constant_input_driven_structurally_is_removed() {
++    let src = program(
++        r#"
++component leaf(p: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires { reg0.in = p; reg0.write_en = 1'd1; r = reg0.out; }
++  control { }
++}
++component main() -> () {
++  cells { l0 = leaf(); l1 = leaf(); dst = std_reg(32); }
++  wires { l0.p = 32'd8; l1.p = 32'd8; dst.in = l0.r; l0.go = 1'd1; l1.go = 1'd1; }
++  control { }
++}
++"#,
++    );
++    let out = run("const_structural", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = 32'd8;"));
++    assert!(!body_has(&out, "l0.p = 32'd8;"));
++    assert!(stays_well_formed("const_structural_wf", &src));
++}
++
++#[test]
++fn a_uniformly_constant_input_through_static_invokes_is_removed() {
++    let src = program(
++        r#"
++static<1> component sleaf(p: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires { static<1> group g { reg0.in = p; reg0.write_en = 1'd1; } r = reg0.out; }
++  control { static seq { g; } }
++}
++component main() -> () {
++  cells { l0 = sleaf(); l1 = sleaf(); dst = std_reg(32); }
++  wires { dst.in = l0.r; }
++  control { static seq { static invoke l0(p = 32'd5)(); static invoke l1(p = 32'd5)(); } }
++}
++"#,
++    );
++    let out = run("const_static_invoke", &src);
++    assert!(out.contains(
++        "component sleaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    ));
++    assert!(body_has(&out, "reg0.in = 32'd5;"));
++    assert!(stays_well_formed("const_static_invoke_wf", &src));
++}
++
++#[test]
++fn an_input_driven_with_the_same_constant_at_two_sites_is_removed() {
++    let src = program(
++        r#"
++component leaf(p: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } r = reg0.out; }
++  control { g; }
++}
++component main() -> () {
++  cells { l0 = leaf(); dst = std_reg(32); }
++  wires { dst.in = l0.r; }
++  control { seq { invoke l0(p = 32'd5)(); invoke l0(p = 32'd5)(); } }
++}
++"#,
++    );
++    let out = run("const_two_sites", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = 32'd5;"));
++    assert!(stays_well_formed("const_two_sites_wf", &src));
++}
++
++#[test]
++fn an_input_left_undriven_at_one_instance_survives() {
++    let out = run(
++        "const_undriven",
++        &program(
++            r#"
++component leaf(p: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } r = reg0.out; }
++  control { g; }
++}
++component main() -> () {
++  cells { l0 = leaf(); l1 = leaf(); dst = std_reg(32); }
++  wires { dst.in = l0.r; }
++  control { seq { invoke l0(p = 32'd5)(); invoke l1()(); } }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(p: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = p;"));
++}
++
++#[test]
++fn a_constant_output_is_propagated_to_readers_and_removed() {
++    let src = program(
++        r#"
++component leaf() -> (r: 32) {
++  cells { }
++  wires { r = 32'd7; }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); dst = std_reg(32); }
++  wires { dst.in = l.r; dst.write_en = 1'd1; }
++  control { }
++}
++"#,
++    );
++    let out = run("const_output", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "dst.in = 32'd7;"));
++    assert!(!body_has(&out, "dst.in = l.r;"));
++    assert!(stays_well_formed("const_output_wf", &src));
++}
++
++#[test]
++fn an_output_driven_by_a_register_survives() {
++    let out = run(
++        "output_register",
++        &program(
++            r#"
++component leaf() -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = 32'd7; reg0.write_en = 1'd1; g[done] = reg0.done; } r = reg0.out; }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); dst = std_reg(32); }
++  wires { dst.in = l.r; dst.write_en = 1'd1; }
++  control { invoke l()(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++}
++
++#[test]
++fn an_output_driven_by_a_constant_only_inside_a_group_survives() {
++    let out = run(
++        "output_group_const",
++        &program(
++            r#"
++component leaf() -> (r: 32) {
++  cells { sig = std_reg(1); }
++  wires { group g { sig.in = 1'd1; sig.write_en = 1'd1; r = 32'd7; g[done] = sig.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); dst = std_reg(32); }
++  wires { dst.in = l.r; dst.write_en = 1'd1; }
++  control { invoke l()(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++}
++
++#[test]
++fn a_constant_output_read_in_a_guard_is_propagated() {
++    let src = program(
++        r#"
++component leaf() -> (r: 1) {
++  cells { }
++  wires { r = 1'd1; }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); dst = std_reg(32); }
++  wires { dst.in = l.r ? 32'd5; dst.write_en = 1'd1; }
++  control { }
++}
++"#,
++    );
++    let out = run("output_const_guard", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(
++        body_has(&out, "dst.in = 1'd1 ? 32'd5;")
++            || body_has(&out, "dst.in = 1'b1 ? 32'd5;")
++            || body_has(&out, "dst.in = 32'd5;"),
++        "{out}"
++    );
++    assert!(stays_well_formed("output_const_guard_wf", &src));
++}
++
++#[test]
++fn a_port_reaching_an_external_memory_through_a_ref_survives() {
++    let src = program(
++        r#"
++component leaf(a: 32) -> () {
++  cells { ref m0 = comb_mem_d1(32, 4, 3); adder = std_add(32); }
++  wires { group g { adder.left = a; adder.right = 32'd1; m0.addr0 = 3'd0; m0.write_data = adder.out; m0.write_en = 1'd1; g[done] = m0.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { @external mm = comb_mem_d1(32, 4, 3); l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l[m0 = mm](a = src.out)(); }
++}
++"#,
++    );
++    let out = run("ext_through_ref", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(stays_well_formed("ext_through_ref_wf", &src));
++}
++
++#[test]
++fn differing_constants_at_two_invokes_of_one_instance_keep_input() {
++    let out = run(
++        "const_disagree_same_instance",
++        &program(
++            r#"
++component leaf(p: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } r = reg0.out; }
++  control { g; }
++}
++component main() -> () {
++  cells { l0 = leaf(); dst = std_reg(32); }
++  wires { dst.in = l0.r; }
++  control { seq { invoke l0(p = 32'd5)(); invoke l0(p = 32'd6)(); } }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(p: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = p;"));
++}
++
++#[test]
++fn input_written_directly_into_local_memory_survives() {
++    let src = program(
++        r#"
++component leaf(a: 32) -> () {
++  cells { mem = comb_mem_d1(32, 4, 3); }
++  wires { group g { mem.addr0 = 3'd0; mem.write_data = a; mem.write_en = 1'd1; g[done] = mem.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out)(); }
++}
++"#,
++    );
++    let out = run("local_memory_sink", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "mem.write_data = a;"));
++    assert!(stays_well_formed("local_memory_sink_wf", &src));
++}
++
++#[test]
++fn ref_cell_mentioned_only_as_assignment_source_survives() {
++    let src = program(
++        r#"
++component reader() -> () {
++  cells { ref rr = std_reg(32); sink = std_reg(32); }
++  wires { group g { sink.in = rr.out; sink.write_en = 1'd1; g[done] = sink.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { actual = std_reg(32); rd = reader(); }
++  wires { }
++  control { invoke rd[rr = actual]()(); }
++}
++"#,
++    );
++    let out = run("ref_source_only", &src);
++    assert!(body_has(&out, "ref rr = std_reg(32);"));
++    assert!(out.contains("rr = actual"));
++    assert!(stays_well_formed("ref_source_only_wf", &src));
++}
++
++#[test]
++fn constant_input_used_as_control_condition_is_rewritten() {
++    let src = program(
++        r#"
++component leaf(flag: 1) -> () {
++  cells { dst = std_reg(32); }
++  wires { group g { dst.in = 32'd1; dst.write_en = 1'd1; g[done] = dst.done; } }
++  control { if flag { g; } }
++}
++component main() -> () {
++  cells { l0 = leaf(); l1 = leaf(); }
++  wires { }
++  control { seq { invoke l0(flag = 1'd1)(); invoke l1(flag = 1'd1)(); } }
++}
++"#,
++    );
++    let out = run("const_input_control", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(!out.contains("flag"), "{out}");
++    assert!(out.contains("g;"), "{out}");
++    assert!(stays_well_formed("const_input_control_wf", &src));
++}
++
++#[test]
++fn constant_output_used_as_control_condition_is_rewritten() {
++    let src = program(
++        r#"
++component leaf() -> (flag: 1) {
++  cells { }
++  wires { flag = 1'd1; }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); dst = std_reg(32); }
++  wires { group g { dst.in = 32'd1; dst.write_en = 1'd1; g[done] = dst.done; } }
++  control { if l.flag { g; } }
++}
++"#,
++    );
++    let out = run("const_output_control", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(!out.contains("flag"), "{out}");
++    assert!(out.contains("g;"), "{out}");
++    assert!(stays_well_formed("const_output_control_wf", &src));
++}
++
++#[test]
++fn guarded_constant_output_is_not_constant_every_cycle() {
++    let src = program(
++        r#"
++component leaf() -> (r: 32) {
++  cells { flag = std_reg(1); }
++  wires { r = flag.out ? 32'd7; }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); dst = std_reg(32); }
++  wires { dst.in = l.r; dst.write_en = 1'd1; }
++  control { }
++}
++"#,
++    );
++    let out = run("guarded_constant_output", &src);
++    assert!(signature(&out, "leaf").contains("r: 32"), "{out}");
++    assert!(body_has(&out, "dst.in = l.r;"), "{out}");
++}
++
++#[test]
++fn attributed_interface_ports_are_kept_regardless_of_name() {
++    let src = program(
++        r#"
++component leaf(@go launch: 1, @clk clock: 1, @reset rst: 1) -> (@done finish: 1) {
++  cells { }
++  wires { }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); }
++  wires { }
++  control { }
++}
++"#,
++    );
++    let out = run("attributed_interface", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go launch: 1, @clk clock: 1, @reset rst: 1) -> (@done finish: 1)"
++    );
++}
++
++#[test]
++fn unused_ref_binding_is_pruned_from_static_invoke() {
++    let src = program(
++        r#"
++static<1> component user() -> () {
++  cells { ref spare = std_reg(32); sink = std_reg(32); }
++  wires { static<1> group g { sink.in = 32'd1; sink.write_en = 1'd1; } }
++  control { static seq { g; } }
++}
++component main() -> () {
++  cells { actual = std_reg(32); u = user(); }
++  wires { }
++  control { static invoke u[spare = actual]()(); }
++}
++"#,
++    );
++    let out = run("static_ref_prune", &src);
++    assert!(!out.contains("ref spare"), "{out}");
++    assert!(!out.contains("spare = actual"), "{out}");
++    assert!(stays_well_formed("static_ref_prune_wf", &src));
++}
++
++#[test]
++fn a_caller_input_feeding_only_a_dead_callee_input_is_removed() {
++    let src = program(
++        r#"
++component leaf(used: 32, dead_in: 32) -> () {
++  cells { r = std_reg(32); }
++  wires { group g { r.in = used; r.write_en = 1'd1; g[done] = r.done; } }
++  control { g; }
++}
++component m(x: 32) -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(used = src.out, dead_in = x)(); }
++}
++component main() -> () {
++  cells { mm = m(); src2 = std_reg(32); }
++  wires { }
++  control { invoke mm(x = src2.out)(); }
++}
++"#,
++    );
++    let out = run("caller_input_dead_callee", &src);
++    assert_eq!(
++        signature(&out, "m"),
++        "component m(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(!out.contains("dead_in"), "{out}");
++    assert!(!out.contains("x = src2"), "{out}");
++    assert!(stays_well_formed("caller_input_dead_callee_wf", &src));
++}
++
++#[test]
++fn fixed_signature_component_keeps_a_constant_input() {
++    let src = program(
++        r#"
++component leaf<"fixed_signature"=1>(p: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } r = reg0.out; }
++  control { g; }
++}
++component main() -> () {
++  cells { l0 = leaf(); l1 = leaf(); dst = std_reg(32); }
++  wires { dst.in = l0.r; }
++  control { seq { invoke l0(p = 32'd5)(); invoke l1(p = 32'd5)(); } }
++}
++"#,
++    );
++    let out = run("fixed_const_input", &src);
++    assert!(signature(&out, "leaf").contains("p: 32"), "{out}");
++    assert!(stays_well_formed("fixed_const_input_wf", &src));
++}
++
++#[test]
++fn invoke_output_binding_to_a_removed_caller_port_is_dropped() {
++    let src = program(
++        r#"
++component prod() -> (o: 32) {
++  cells { r = std_reg(32); }
++  wires { group g { r.in = 32'd1; r.write_en = 1'd1; g[done] = r.done; } o = r.out; }
++  control { g; }
++}
++component m() -> (y: 32, z: 32) {
++  cells { p = prod(); }
++  wires { z = p.o; }
++  control { invoke p()(o = y); }
++}
++component main() -> () {
++  cells { mm = m(); dst = std_reg(32); }
++  wires { dst.in = mm.z; dst.write_en = 1'd1; }
++  control { invoke mm()(); }
++}
++"#,
++    );
++    let out = run("caller_output_binding", &src);
++    assert_eq!(
++        signature(&out, "m"),
++        "component m(@go go: 1, @clk clk: 1, @reset reset: 1) -> (z: 32, @done done: 1)"
++    );
++    assert!(!out.contains("o = y"), "{out}");
++    assert!(body_has(&out, "z = p.o;"), "{out}");
++    assert!(stays_well_formed("caller_output_binding_wf", &src));
++}
++
++#[test]
++fn a_constant_output_cascades_across_two_levels() {
++    let src = program(
++        r#"
++component leaf() -> (r: 32) {
++  cells { }
++  wires { r = 32'd9; }
++  control { }
++}
++component mid() -> (y: 32) {
++  cells { l = leaf(); }
++  wires { y = l.r; }
++  control { }
++}
++component main() -> () {
++  cells { m = mid(); dst = std_reg(32); }
++  wires { dst.in = m.y; dst.write_en = 1'd1; }
++  control { }
++}
++"#,
++    );
++    let out = run("const_output_cascade", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert_eq!(
++        signature(&out, "mid"),
++        "component mid(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "dst.in = 32'd9;"), "{out}");
++    assert!(stays_well_formed("const_output_cascade_wf", &src));
++}
++
++#[test]
++fn report_lists_removals_sorted_by_component_and_name() {
++    let out = report(
++        "report_sorted",
++        &program(
++            r#"
++component alpha(y: 32, x: 32) -> () {
++  cells { r = std_reg(32); }
++  wires { group g { r.in = 32'd0; r.write_en = 1'd1; g[done] = r.done; } }
++  control { g; }
++}
++component beta(q: 32, p: 32) -> () {
++  cells { r = std_reg(32); }
++  wires { group g { r.in = 32'd0; r.write_en = 1'd1; g[done] = r.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { a = alpha(); b = beta(); src = std_reg(32); }
++  wires { }
++  control { seq { invoke a(y = src.out, x = src.out)(); invoke b(q = src.out, p = src.out)(); } }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        out,
++        serde_json::json!([
++            {"component": "alpha", "ports": ["x", "y"], "ref_cells": []},
++            {"component": "beta", "ports": ["p", "q"], "ref_cells": []}
++        ])
++    );
++}
++
++#[test]
++fn report_excludes_kept_entrypoint_and_fixed_signature_ports() {
++    let out = report(
++        "report_keep_rules",
++        &program(
++            r#"
++component fixed_c<"fixed_signature"=1>(kept_dead: 32) -> () {
++  cells { r = std_reg(32); }
++  wires { group g { r.in = 32'd0; r.write_en = 1'd1; g[done] = r.done; } }
++  control { g; }
++}
++component normal(gone: 32) -> () {
++  cells { r = std_reg(32); }
++  wires { group g { r.in = 32'd0; r.write_en = 1'd1; g[done] = r.done; } }
++  control { g; }
++}
++component main(mport: 32) -> () {
++  cells { f = fixed_c(); n = normal(); src = std_reg(32); }
++  wires { }
++  control { seq { invoke f(kept_dead = src.out)(); invoke n(gone = src.out)(); } }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        out,
++        serde_json::json!([
++            {"component": "normal", "ports": ["gone"], "ref_cells": []}
++        ])
++    );
++}
++
++#[test]
++fn an_input_driven_by_a_constant_only_inside_a_group_survives() {
++    let out = run(
++        "const_input_group",
++        &program(
++            r#"
++component leaf(p: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); sig = std_reg(1); }
++  wires { group drive { l.p = 32'd5; sig.in = 1'd1; sig.write_en = 1'd1; drive[done] = sig.done; } }
++  control { seq { drive; invoke l()(); } }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(p: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "l.p = 32'd5;"), "{out}");
++}
++
++#[test]
++fn report_lists_removed_ref_cells_sorted() {
++    let out = report(
++        "report_refs",
++        &program(
++            r#"
++component leaf(dead: 32) -> () {
++  cells { ref spare = comb_mem_d1(32, 4, 3); ref mem = comb_mem_d1(32, 4, 3); reg0 = std_reg(32); }
++  wires { group g { reg0.in = 32'd1; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { m0 = comb_mem_d1(32, 4, 3); m1 = comb_mem_d1(32, 4, 3); l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l[spare = m0, mem = m1](dead = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        out,
++        serde_json::json!([
++            {"component": "leaf", "ports": ["dead"], "ref_cells": ["mem", "spare"]}
++        ])
++    );
++}
++
++#[test]
++fn an_input_driven_by_a_guarded_constant_inside_a_group_survives() {
++    let out = run(
++        "guarded_group_const_input",
++        &program(
++            r#"
++component leaf(p: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { l0 = leaf(); flag = std_reg(1); s = std_reg(1); }
++  wires { group drv { l0.p = flag.out ? 32'd5; s.in = 1'd1; s.write_en = 1'd1; drv[done] = s.done; } }
++  control { seq { drv; invoke l0()(); } }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(p: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = p;"), "{out}");
++    assert!(body_has(&out, "l0.p = flag.out ? 32'd5;"), "{out}");
++}
++
++#[test]
++fn an_input_unbound_at_a_second_invoke_of_one_instance_survives() {
++    let out = run(
++        "unbound_second_invoke",
++        &program(
++            r#"
++component leaf(p: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); }
++  wires { }
++  control { seq { invoke l(p = 32'd5)(); invoke l()(); } }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(p: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = p;"), "{out}");
++    assert!(binding_present(&out, "p = 32'd5"), "{out}");
++}
++
++#[test]
++fn a_ref_cell_read_only_by_an_invoke_input_binding_survives() {
++    let out = run(
++        "ref_in_invoke_input",
++        &program(
++            r#"
++component inner(a: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component outer() -> () {
++  cells { ref rr = std_reg(32); i = inner(); }
++  wires { }
++  control { invoke i(a = rr.out)(); }
++}
++component main() -> () {
++  cells { m = std_reg(32); o = outer(); }
++  wires { }
++  control { invoke o[rr = m]()(); }
++}
++"#,
++        ),
++    );
++    assert!(body_has(&out, "ref rr = std_reg(32);"), "{out}");
++    assert!(binding_present(&out, "a = rr.out"), "{out}");
++    assert!(out.contains("rr = m"), "{out}");
++    assert!(stays_well_formed(
++        "ref_in_invoke_input_wf",
++        &program(
++            r#"
++component inner(a: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component outer() -> () {
++  cells { ref rr = std_reg(32); i = inner(); }
++  wires { }
++  control { invoke i(a = rr.out)(); }
++}
++component main() -> () {
++  cells { m = std_reg(32); o = outer(); }
++  wires { }
++  control { invoke o[rr = m]()(); }
++}
++"#,
++        )
++    ));
++}
++
++#[test]
++fn a_ref_cell_written_only_by_an_invoke_output_binding_survives() {
++    let out = run(
++        "ref_in_invoke_output",
++        &program(
++            r#"
++component prod() -> (o: 32) {
++  cells { reg0 = std_reg(32); }
++  wires { o = reg0.out; group g { reg0.in = 32'd3; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component outer() -> () {
++  cells { ref rr = std_reg(32); p = prod(); }
++  wires { }
++  control { invoke p()(o = rr.in); }
++}
++component main() -> () {
++  cells { m = std_reg(32); o = outer(); }
++  wires { }
++  control { invoke o[rr = m]()(); }
++}
++"#,
++        ),
++    );
++    assert!(body_has(&out, "ref rr = std_reg(32);"), "{out}");
++    assert!(binding_present(&out, "o = rr.in"), "{out}");
++    assert!(out.contains("rr = m"), "{out}");
++}
++
++#[test]
++fn a_constant_output_bound_to_an_invoke_destination_survives() {
++    let src = program(
++        r#"
++component leaf() -> (r: 32) {
++  cells { }
++  wires { r = 32'd7; }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); dst = std_reg(32); }
++  wires { }
++  control { invoke l()(r = dst.in); }
++}
++"#,
++    );
++    let out = run("const_output_invoke_binding", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (r: 32, @done done: 1)"
++    );
++    assert!(body_has(&out, "r = 32'd7;"), "{out}");
++    assert!(binding_present(&out, "r = dst.in"), "{out}");
++    assert!(stays_well_formed("const_output_invoke_binding_wf", &src));
++}
++
++#[test]
++fn report_lists_a_component_that_lost_only_ref_cells() {
++    let out = report(
++        "report_refs_only",
++        &program(
++            r#"
++component leaf(a: 32) -> () {
++  cells { ref spare = comb_mem_d1(32, 4, 3); ref extra = comb_mem_d1(32, 4, 3); reg0 = std_reg(32); }
++  wires { group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { m0 = comb_mem_d1(32, 4, 3); m1 = comb_mem_d1(32, 4, 3); l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l[spare = m0, extra = m1](a = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        out,
++        serde_json::json!([
++            {"component": "leaf", "ports": [], "ref_cells": ["extra", "spare"]}
++        ])
++    );
++}
++
++#[test]
++fn an_input_read_only_by_an_fsm_assignment_survives() {
++    let src = program(
++        r#"
++component leaf(a: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    fsm my_fsm {
++      0: { reg0.in = a; reg0.write_en = 1'd1; } => 1,
++      1: { } => 1,
++    }
++  }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out)(); }
++}
++"#,
++    );
++    let out = run("fsm_assign_read", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = a;"), "{out}");
++    assert!(binding_present(&out, "a = src.out"), "{out}");
++    assert!(stays_well_formed("fsm_assign_read_wf", &src));
++}
++
++#[test]
++fn an_input_read_only_by_an_fsm_transition_guard_survives() {
++    let src = program(
++        r#"
++component leaf(c: 1) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    fsm my_fsm {
++      0: { reg0.in = 32'd1; reg0.write_en = 1'd1; } => { c -> 1, default -> 0, },
++      1: { } => 1,
++    }
++  }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); f = std_reg(1); }
++  wires { }
++  control { invoke l(c = f.out)(); }
++}
++"#,
++    );
++    let out = run("fsm_transition_guard", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(c: 1, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(binding_present(&out, "c = f.out"), "{out}");
++    assert!(stays_well_formed("fsm_transition_guard_wf", &src));
++}
++
++#[test]
++fn an_input_driven_by_a_constant_only_inside_an_fsm_survives() {
++    let src = program(
++        r#"
++component leaf(p: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); }
++  wires {
++    fsm drv {
++      0: { l.p = 32'd5; } => 1,
++      1: { } => 1,
++    }
++  }
++  control { invoke l()(); }
++}
++"#,
++    );
++    let out = run("fsm_const_input", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(p: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = p;"), "{out}");
++    assert!(body_has(&out, "l.p = 32'd5;"), "{out}");
++    assert!(stays_well_formed("fsm_const_input_wf", &src));
++}
++
++#[test]
++fn a_ref_cell_used_only_by_an_fsm_survives() {
++    let src = program(
++        r#"
++component outer() -> () {
++  cells { ref rr = std_reg(32); }
++  wires {
++    fsm my_fsm {
++      0: { rr.in = 32'd3; rr.write_en = 1'd1; } => 1,
++      1: { } => 1,
++    }
++  }
++  control { }
++}
++component main() -> () {
++  cells { m = std_reg(32); o = outer(); }
++  wires { }
++  control { invoke o[rr = m]()(); }
++}
++"#,
++    );
++    let out = run("fsm_ref_cell", &src);
++    assert!(body_has(&out, "ref rr = std_reg(32);"), "{out}");
++    assert!(body_has(&out, "rr.in = 32'd3;"), "{out}");
++    assert!(out.contains("rr = m"), "{out}");
++    assert!(stays_well_formed("fsm_ref_cell_wf", &src));
++}
++
++#[test]
++fn a_constant_input_read_by_a_primitive_invoke_binding_is_inlined() {
++    let src = program(
++        r#"
++component leaf(a: 32) -> () {
++  cells { r = std_reg(32); }
++  wires { }
++  control { invoke r(in = a, write_en = 1'd1)(); }
++}
++component main() -> () {
++  cells { l = leaf(); }
++  wires { }
++  control { invoke l(a = 32'd5)(); }
++}
++"#,
++    );
++    let out = run("primitive_invoke_const", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(@go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(binding_present(&out, "in = 32'd5"), "{out}");
++    assert!(!out.contains("in = a"), "{out}");
++    assert!(stays_well_formed("primitive_invoke_const_wf", &src));
++}
++
++#[test]
++fn an_input_driving_a_sub_instance_go_survives() {
++    let src = program(
++        r#"
++component leaf() -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = 32'd7; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component mid(trigger: 1) -> () {
++  cells { l = leaf(); }
++  wires { l.go = trigger; }
++  control { }
++}
++component main() -> () {
++  cells { m = mid(); t = std_reg(1); }
++  wires { }
++  control { invoke m(trigger = t.out)(); }
++}
++"#,
++    );
++    let out = run("go_driver", &src);
++    assert_eq!(
++        signature(&out, "mid"),
++        "component mid(trigger: 1, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "l.go = trigger;"), "{out}");
++    assert!(binding_present(&out, "trigger = t.out"), "{out}");
++    assert!(stays_well_formed("go_driver_wf", &src));
++}
++
++#[test]
++fn a_ref_primitive_invoked_directly_survives() {
++    let src = program(
++        r#"
++component outer() -> () {
++  cells { ref rr = std_reg(32); }
++  wires { }
++  control { invoke rr(in = 32'd5, write_en = 1'd1)(); }
++}
++component main() -> () {
++  cells { m = std_reg(32); o = outer(); }
++  wires { }
++  control { invoke o[rr = m]()(); }
++}
++"#,
++    );
++    let out = run("ref_primitive_invoked", &src);
++    assert!(body_has(&out, "ref rr = std_reg(32);"), "{out}");
++    assert!(out.contains("invoke rr("), "{out}");
++    assert!(out.contains("rr = m"), "{out}");
++    assert!(stays_well_formed("ref_primitive_invoked_wf", &src));
++}
++
++#[test]
++fn a_constant_invoke_binding_with_a_separate_go_drive_survives() {
++    let src = program(
++        r#"
++component leaf(p: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); t = std_reg(1); }
++  wires { l.go = t.out; }
++  control { invoke l(p = 32'd5)(); }
++}
++"#,
++    );
++    let out = run("go_drive_and_invoke_const", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(p: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = p;"), "{out}");
++    assert!(binding_present(&out, "p = 32'd5"), "{out}");
++    assert!(stays_well_formed("go_drive_and_invoke_const_wf", &src));
++}
++
++#[test]
++fn an_fsm_assignment_to_a_removed_port_is_dropped() {
++    let src = program(
++        r#"
++component leaf(dead: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires { }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); r0 = std_reg(1); src = std_reg(32); }
++  wires {
++    fsm f {
++      0: { l.dead = src.out; r0.in = 1'd1; r0.write_en = 1'd1; } => { r0.out -> 1, default -> 0, },
++      1: { } => 1,
++    }
++  }
++  control { }
++}
++"#,
++    );
++    let out = run("fsm_prune_removed_port", &src);
++    assert!(!out.contains("l.dead"), "{out}");
++    assert!(body_has(&out, "r0.in = 1'd1;"), "{out}");
++    assert!(body_has(&out, "r0.out -> 1,"), "{out}");
++    assert!(body_has(&out, "default -> 0,"), "{out}");
++    assert!(stays_well_formed("fsm_prune_removed_port_wf", &src));
++}
++
++#[test]
++fn a_constant_port_read_in_an_fsm_transition_guard_is_replaced() {
++    let src = program(
++        r#"
++component leaf() -> (flag: 1) {
++  cells { }
++  wires { flag = 1'd1; }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); r0 = std_reg(1); }
++  wires {
++    fsm f {
++      0: { r0.in = 1'd1; r0.write_en = 1'd1; } => { l.flag -> 1, default -> 0, },
++      1: { } => 1,
++    }
++  }
++  control { }
++}
++"#,
++    );
++    let out = run("fsm_guard_const_rewrite", &src);
++    assert!(!out.contains("l.flag"), "{out}");
++    assert!(
++        body_has(&out, "1'd1 -> 1,") || body_has(&out, "1'b1 -> 1,"),
++        "{out}"
++    );
++    assert!(body_has(&out, "default -> 0,"), "{out}");
++    assert!(stays_well_formed("fsm_guard_const_rewrite_wf", &src));
++}
++
++#[test]
++fn a_ref_primitive_invoked_by_a_static_invoke_survives() {
++    let src = program(
++        r#"
++component outer() -> () {
++  cells { ref rr = std_reg(32); }
++  wires { }
++  control { static invoke rr(in = 32'd5, write_en = 1'd1)(); }
++}
++component main() -> () {
++  cells { m = std_reg(32); o = outer(); }
++  wires { }
++  control { invoke o[rr = m]()(); }
++}
++"#,
++    );
++    let out = run("ref_primitive_static_invoke", &src);
++    assert!(body_has(&out, "ref rr = std_reg(32);"), "{out}");
++    assert!(out.contains("invoke rr("), "{out}");
++    assert!(out.contains("rr = m"), "{out}");
++    assert!(stays_well_formed("ref_primitive_static_invoke_wf", &src));
++}
++
++#[test]
++fn an_input_driving_a_sub_instance_reset_survives() {
++    let src = program(
++        r#"
++component leaf() -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = 32'd7; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component mid(rst: 1) -> () {
++  cells { l = leaf(); }
++  wires { l.reset = rst; }
++  control { }
++}
++component main() -> () {
++  cells { m = mid(); t = std_reg(1); }
++  wires { }
++  control { invoke m(rst = t.out)(); }
++}
++"#,
++    );
++    let out = run("reset_driver", &src);
++    assert_eq!(
++        signature(&out, "mid"),
++        "component mid(rst: 1, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "l.reset = rst;"), "{out}");
++    assert!(binding_present(&out, "rst = t.out"), "{out}");
++    assert!(stays_well_formed("reset_driver_wf", &src));
++}
++
++#[test]
++fn an_input_constant_at_an_invoke_but_started_by_a_group_go_drive_survives() {
++    let src = program(
++        r#"
++component leaf(p: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); s = std_reg(1); }
++  wires {
++    group start { l.go = 1'd1; s.in = 1'd1; s.write_en = 1'd1; start[done] = s.done; }
++  }
++  control { seq { start; invoke l(p = 32'd5)(); } }
++}
++"#,
++    );
++    let out = run("group_go_drive_const", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(p: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = p;"), "{out}");
++    assert!(binding_present(&out, "p = 32'd5"), "{out}");
++    assert!(stays_well_formed("group_go_drive_const_wf", &src));
++}
++
++#[test]
++fn an_input_constant_at_an_invoke_but_started_by_a_renamed_go_drive_survives() {
++    let src = program(
++        r#"
++component leaf(p: 32, @go launch: 1, @clk clk: 1, @reset reset: 1) -> (@done fin: 1) {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } fin = reg0.done; }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); t = std_reg(1); }
++  wires { l.launch = t.out; }
++  control { invoke l(p = 32'd5)(); }
++}
++"#,
++    );
++    let out = run("renamed_go_drive_const", &src);
++    assert!(signature(&out, "leaf").contains("p: 32"), "{out}");
++    assert!(body_has(&out, "reg0.in = p;"), "{out}");
++    assert!(body_has(&out, "l.launch = t.out;"), "{out}");
++    assert!(binding_present(&out, "p = 32'd5"), "{out}");
++    assert!(stays_well_formed("renamed_go_drive_const_wf", &src));
++}
++
++#[test]
++fn an_input_constant_at_an_invoke_started_by_an_invoke_output_survives() {
++    let src = program(
++        r#"
++component producer() -> (out: 1) {
++  cells { r = std_reg(1); }
++  wires { out = r.out; group g { r.in = 1'd1; r.write_en = 1'd1; g[done] = r.done; } }
++  control { g; }
++}
++component leaf(p: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { pr = producer(); l = leaf(); }
++  wires { }
++  control { seq { invoke pr()(out = l.go); invoke l(p = 32'd5)(); } }
++}
++"#,
++    );
++    let out = run("invoke_output_go_const", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(p: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = p;"), "{out}");
++    assert!(binding_present(&out, "p = 32'd5"), "{out}");
++    assert!(stays_well_formed("invoke_output_go_const_wf", &src));
++}
++
++#[test]
++fn a_caller_ref_bound_only_to_an_unused_callee_ref_is_removed() {
++    let src = program(
++        r#"
++component callee(v: 32) -> () {
++  cells { ref spare = comb_mem_d1(32, 4, 3); reg0 = std_reg(32); }
++  wires { group g { reg0.in = v; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component mid() -> () {
++  cells { ref my_ref = comb_mem_d1(32, 4, 3); c = callee(); }
++  wires { }
++  control { invoke c[spare = my_ref](v = 32'd1)(); }
++}
++component main() -> () {
++  cells { m = comb_mem_d1(32, 4, 3); md = mid(); }
++  wires { }
++  control { invoke md[my_ref = m]()(); }
++}
++"#,
++    );
++    let out = run("ref_cascade", &src);
++    assert!(!out.contains("ref spare"), "{out}");
++    assert!(!out.contains("ref my_ref"), "{out}");
++    assert!(!out.contains("spare = my_ref"), "{out}");
++    assert!(!out.contains("my_ref = m"), "{out}");
++    assert!(stays_well_formed("ref_cascade_wf", &src));
++}
++
++#[test]
++fn an_input_feeding_only_a_dead_memory_read_address_survives() {
++    let src = program(
++        r#"
++component leaf(a: 3) -> () {
++  cells { mem = comb_mem_d1(32, 4, 3); }
++  wires { mem.addr0 = a; }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(3); }
++  wires { }
++  control { invoke l(a = src.out)(); }
++}
++"#,
++    );
++    let out = run("dead_read_address", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 3, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "mem.addr0 = a;"), "{out}");
++    assert!(binding_present(&out, "a = src.out"), "{out}");
++    assert!(stays_well_formed("dead_read_address_wf", &src));
++}
++
++#[test]
++fn an_input_driving_a_sub_instance_clk_survives() {
++    let src = program(
++        r#"
++component leaf() -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = 32'd7; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component mid(tick: 1) -> () {
++  cells { l = leaf(); }
++  wires { l.clk = tick; }
++  control { }
++}
++component main() -> () {
++  cells { m = mid(); t = std_reg(1); }
++  wires { }
++  control { invoke m(tick = t.out)(); }
++}
++"#,
++    );
++    let out = run("clk_driver", &src);
++    assert_eq!(
++        signature(&out, "mid"),
++        "component mid(tick: 1, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "l.clk = tick;"), "{out}");
++    assert!(binding_present(&out, "tick = t.out"), "{out}");
++    assert!(stays_well_formed("clk_driver_wf", &src));
++}
++
++#[test]
++fn an_unmentioned_ref_cell_on_the_entrypoint_survives() {
++    let src = program(
++        r#"
++component main() -> () {
++  cells { ref spare = comb_mem_d1(32, 4, 3); r = std_reg(32); }
++  wires { group g { r.in = 32'd1; r.write_en = 1'd1; g[done] = r.done; } }
++  control { g; }
++}
++"#,
++    );
++    let out = run("entrypoint_ref", &src);
++    assert!(
++        body_has(&out, "ref spare = comb_mem_d1(32, 4, 3);"),
++        "{out}"
++    );
++    assert!(stays_well_formed("entrypoint_ref_wf", &src));
++    assert_eq!(report("entrypoint_ref_dump", &src), serde_json::json!([]));
++}
++
++#[test]
++fn an_input_constant_at_an_invoke_started_by_an_fsm_go_drive_survives() {
++    let src = program(
++        r#"
++component leaf(p: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires { group g { reg0.in = p; reg0.write_en = 1'd1; g[done] = reg0.done; } }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); }
++  wires { fsm f { 0: { l.go = 1'd1; } => 1, 1: { } => 1, } }
++  control { invoke l(p = 32'd5)(); }
++}
++"#,
++    );
++    let out = run("fsm_go_drive_const", &src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(p: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "reg0.in = p;"), "{out}");
++    assert!(body_has(&out, "l.go = 1'd1;"), "{out}");
++    assert!(binding_present(&out, "p = 32'd5"), "{out}");
++    assert!(stays_well_formed("fsm_go_drive_const_wf", &src));
++}
++
++#[test]
++fn an_input_feeding_an_unread_stateful_pipe_survives() {
++    let src = concat!(
++        "import \"primitives/core.futil\";\n",
++        "import \"primitives/binary_operators.futil\";\n",
++        r#"
++component leaf(a: 32) -> () {
++  cells { m = std_mult_pipe(32); }
++  wires { m.left = a; m.right = 32'd2; }
++  control { }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out)(); }
++}
++"#
++    );
++    let out = run("stateful_pipe", src);
++    assert_eq!(
++        signature(&out, "leaf"),
++        "component leaf(a: 32, @go go: 1, @clk clk: 1, @reset reset: 1) -> (@done done: 1)"
++    );
++    assert!(body_has(&out, "m.left = a;"), "{out}");
++    assert!(binding_present(&out, "a = src.out"), "{out}");
++    assert!(stays_well_formed("stateful_pipe_wf", src));
++}
++
++#[test]
++fn report_omits_components_that_lost_nothing() {
++    let out = report(
++        "report_omits",
++        &program(
++            r#"
++component keeper(a: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component loser(b: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = 32'd1; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { k = keeper(); l = loser(); src = std_reg(32); }
++  wires { }
++  control { seq { invoke k(a = src.out)(); invoke l(b = src.out)(); } }
++}
++"#,
++        ),
++    );
++    assert_eq!(
++        out,
++        serde_json::json!([
++            {"component": "loser", "ports": ["b"], "ref_cells": []}
++        ])
++    );
++}
++
++#[test]
++fn report_is_an_empty_array_when_nothing_is_removed() {
++    let out = report(
++        "report_empty",
++        &program(
++            r#"
++component keeper(a: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { k = keeper(); src = std_reg(32); }
++  wires { }
++  control { invoke k(a = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert_eq!(out, serde_json::json!([]));
++}
++
++#[test]
++fn removing_a_port_drops_a_write_inside_a_group() {
++    let out = run(
++        "group_write",
++        &program(
++            r#"
++component leaf(a: 32, b: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); r0 = std_reg(32); }
++  wires {
++    group g2 { l.b = src.out; r0.in = 32'd1; r0.write_en = 1'd1; g2[done] = r0.done; }
++  }
++  control { seq { g2; invoke l(a = src.out)(); } }
++}
++"#,
++        ),
++    );
++    assert!(!body_has(&out, "l.b = src.out;"));
++    assert!(body_has(&out, "r0.in = 32'd1;"));
++}
++
++#[test]
++fn removing_a_port_drops_a_write_inside_a_static_group() {
++    let out = run(
++        "static_group_write",
++        &program(
++            r#"
++component leaf(a: 32, b: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); r0 = std_reg(32); }
++  wires {
++    static<1> group sg { l.b = src.out; r0.in = 32'd1; r0.write_en = 1'd1; }
++  }
++  control { seq { static seq { sg; } invoke l(a = src.out)(); } }
++}
++"#,
++        ),
++    );
++    assert!(!body_has(&out, "l.b = src.out;"));
++    assert!(body_has(&out, "r0.in = 32'd1;"));
++}
++
++#[test]
++fn removing_a_port_drops_a_write_inside_a_comb_group() {
++    let out = run(
++        "comb_group_write",
++        &program(
++            r#"
++component leaf(a: 32, b: 32) -> () {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); cmp = std_eq(1); r0 = std_reg(32); }
++  wires {
++    comb group c { l.b = src.out; cmp.left = 1'd1; cmp.right = 1'd1; }
++    group g2 { r0.in = 32'd1; r0.write_en = 1'd1; g2[done] = r0.done; }
++  }
++  control { seq { if cmp.out with c { g2; } invoke l(a = src.out)(); } }
++}
++"#,
++        ),
++    );
++    assert!(!body_has(&out, "l.b = src.out;"));
++    assert!(body_has(&out, "cmp.left = 1'd1;"));
++}
++
++#[test]
++fn a_component_drops_a_write_to_its_own_removed_output() {
++    let out = run(
++        "self_output_write",
++        &program(
++            r#"
++component leaf(a: 32) -> (r: 32) {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; r = reg0.out; g[done] = reg0.done; }
++  }
++  control { g; }
++}
++component main() -> () {
++  cells { l = leaf(); src = std_reg(32); }
++  wires { }
++  control { invoke l(a = src.out)(); }
++}
++"#,
++        ),
++    );
++    assert!(!body_has(&out, "r = reg0.out;"));
++    assert!(body_has(&out, "reg0.in = a;"));
++}
++
++#[test]
++fn every_instance_keeps_exactly_the_ports_its_component_declares() {
++    let ctx = compile(
++        "instance_ports",
++        &program(
++            r#"
++component leaf(a: 32, b: 32) -> (r: 32, s: 32) {
++  cells { reg0 = std_reg(32); }
++  wires {
++    group g { reg0.in = a; reg0.write_en = 1'd1; g[done] = reg0.done; }
++    r = reg0.out;
++    s = b;
++  }
++  control { g; }
++}
++component mid(x: 32) -> (y: 32) {
++  cells { l = leaf(); r0 = std_reg(32); }
++  wires {
++    group g2 { r0.in = l.r; r0.write_en = 1'd1; g2[done] = r0.done; }
++    y = r0.out;
++  }
++  control { seq { invoke l(a = x, b = x)(); g2; } }
++}
++component main() -> () {
++  cells { m = mid(); src = std_reg(32); }
++  wires { }
++  control { invoke m(x = src.out)(); }
++}
++"#,
++        ),
++        &[],
++    );
++    let declared: HashMap<ir::Id, HashSet<ir::Id>> = ctx
++        .components
++        .iter()
++        .map(|comp| {
++            let ports = comp
++                .signature
++                .borrow()
++                .ports
++                .iter()
++                .map(|port| port.borrow().name)
++                .collect();
++            (comp.name, ports)
++        })
++        .collect();
++    for comp in &ctx.components {
++        for cell in comp.cells.iter() {
++            let cell = cell.borrow();
++            let ir::CellType::Component { name } = &cell.prototype else {
++                continue;
++            };
++            let actual: HashSet<ir::Id> =
++                cell.ports.iter().map(|port| port.borrow().name).collect();
++            assert_eq!(
++                actual,
++                declared[name],
++                "instance `{}` of `{}` disagrees with the component signature",
++                cell.name(),
++                name
++            );
++        }
++    }
++}

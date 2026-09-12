@@ -1,0 +1,697 @@
+diff --git a/amaranth/lib/stream.py b/amaranth/lib/stream.py
+index a24f25b..7c078bd 100644
+--- a/amaranth/lib/stream.py
++++ b/amaranth/lib/stream.py
+@@ -1,9 +1,29 @@
+ from ..hdl import *
+ from .._utils import final
+-from . import wiring
++from . import wiring, data
+ from .wiring import In, Out
+ 
+ 
++__all__ = ["Signature", "Interface", "framed_input_layout", "framed_output_layout", "WidthDownConverter", "WidthUpConverter", "Gearbox", "SkidBuffer", "Arbiter", "Demux", "Fork", "Join", "FramedGearbox"]
++
++
++def framed_input_layout(width):
++    """The input payload layout of a :class:`FramedGearbox`: a `width`-bit ``data`` field and a
++    one-bit ``last`` field marking the final word of a packet."""
++    return data.StructLayout({"data": unsigned(width), "last": unsigned(1)})
++
++
++def framed_output_layout(width):
++    """The output payload layout of a :class:`FramedGearbox`: a `width`-bit ``data`` field, a
++    one-bit ``last`` field, and a ``valid`` field giving the number of valid low-order bits of
++    ``data`` (always `width` except on the final, possibly partial, word of a packet)."""
++    return data.StructLayout({
++        "data": unsigned(width),
++        "last": unsigned(1),
++        "valid": unsigned(max(1, width.bit_length())),
++    })
++
++
+ @final
+ class Signature(wiring.Signature):
+     """Signature of a unidirectional data stream.
+@@ -123,3 +143,626 @@ class Interface:
+     def __repr__(self):
+         return (f"stream.Interface(payload={self.payload!r}, valid={self.valid!r}, "
+                 f"ready={self.ready!r})")
++
++
++class WidthDownConverter(wiring.Component):
++    """Converts a stream of wide payloads into a stream of narrow payloads.
++
++    Each input payload of ``width`` bits is split into ``factor`` output payloads of
++    ``width // factor`` bits each, least-significant slice first. The bit sequence carried by the
++    stream is preserved exactly: concatenating every output payload (in order, each in its own bit
++    positions) reproduces the concatenation of every input payload. No payload is ever dropped or
++    duplicated regardless of when the sink deasserts ``ready`` or the source deasserts ``valid``,
++    and the converter sustains one output transfer per cycle when both peers keep the stream moving.
++
++    Parameters
++    ----------
++    width : int
++        Bit width of the input payload. Must be a positive multiple of ``factor``.
++    factor : int
++        Number of output payloads produced per input payload. Must be at least 1.
++    """
++    def __init__(self, width, factor):
++        if factor < 1:
++            raise ValueError(f"Conversion factor must be a positive integer, not {factor!r}")
++        if width < 1 or width % factor != 0:
++            raise ValueError(f"Input width must be a positive multiple of the conversion factor "
++                             f"{factor}, not {width!r}")
++        self._width = width
++        self._factor = factor
++        self._part = width // factor
++        super().__init__({
++            "i_stream": In(Signature(width)),
++            "o_stream": Out(Signature(width // factor)),
++        })
++
++    @property
++    def width(self):
++        return self._width
++
++    @property
++    def factor(self):
++        return self._factor
++
++    def elaborate(self, platform):
++        m = Module()
++
++        shreg = Signal(self._width)
++        count = Signal(range(self._factor + 1))
++
++        do_recv = Signal()
++        do_send = Signal()
++        m.d.comb += [
++            do_send.eq(self.o_stream.valid & self.o_stream.ready),
++            do_recv.eq(self.i_stream.valid & self.i_stream.ready),
++        ]
++
++        m.d.comb += [
++            self.o_stream.valid.eq(count != 0),
++            self.o_stream.payload.eq(shreg[:self._part]),
++            # Accept a new word when the shift register is empty, or on the very cycle its last
++            # slice is being taken, so back-to-back words flow without a bubble.
++            self.i_stream.ready.eq((count == 0) | ((count == 1) & self.o_stream.ready)),
++        ]
++
++        with m.If(do_recv):
++            m.d.sync += shreg.eq(self.i_stream.payload)
++            m.d.sync += count.eq(self._factor)
++        with m.Elif(do_send):
++            m.d.sync += shreg.eq(shreg[self._part:])
++            m.d.sync += count.eq(count - 1)
++
++        return m
++
++
++class WidthUpConverter(wiring.Component):
++    """Converts a stream of narrow payloads into a stream of wide payloads.
++
++    Each group of ``factor`` input payloads of ``width // factor`` bits is packed into one output
++    payload of ``width`` bits, least-significant slice first. The bit sequence carried by the stream
++    is preserved exactly: concatenating every output payload reproduces the concatenation of every
++    input payload. No payload is ever dropped or duplicated regardless of the ``valid``/``ready``
++    timing, and the converter sustains one input transfer per cycle when the stream keeps moving.
++
++    Parameters
++    ----------
++    width : int
++        Bit width of the output payload. Must be a positive multiple of ``factor``.
++    factor : int
++        Number of input payloads consumed per output payload. Must be at least 1.
++    """
++    def __init__(self, width, factor):
++        if factor < 1:
++            raise ValueError(f"Conversion factor must be a positive integer, not {factor!r}")
++        if width < 1 or width % factor != 0:
++            raise ValueError(f"Output width must be a positive multiple of the conversion factor "
++                             f"{factor}, not {width!r}")
++        self._width = width
++        self._factor = factor
++        self._part = width // factor
++        super().__init__({
++            "i_stream": In(Signature(width // factor)),
++            "o_stream": Out(Signature(width)),
++        })
++
++    @property
++    def width(self):
++        return self._width
++
++    @property
++    def factor(self):
++        return self._factor
++
++    def elaborate(self, platform):
++        m = Module()
++
++        shreg = Signal(self._width)
++        count = Signal(range(self._factor + 1))
++
++        do_recv = Signal()
++        do_send = Signal()
++        m.d.comb += [
++            do_send.eq(self.o_stream.valid & self.o_stream.ready),
++            do_recv.eq(self.i_stream.valid & self.i_stream.ready),
++        ]
++
++        m.d.comb += [
++            self.o_stream.valid.eq(count == self._factor),
++            self.o_stream.payload.eq(shreg),
++            # Accept a new word while the accumulator is not full, or on the very cycle the full
++            # word is being taken, so back-to-back groups flow without a bubble.
++            self.i_stream.ready.eq((count != self._factor) | self.o_stream.ready),
++        ]
++
++        # Latch the just-emitted state so that a receive coinciding with a send starts a fresh group.
++        emitted = Signal()
++        m.d.comb += emitted.eq(do_send)
++
++        with m.If(do_recv):
++            with m.If(emitted):
++                m.d.sync += shreg.eq(self.i_stream.payload)
++                m.d.sync += count.eq(1)
++            with m.Else():
++                m.d.sync += shreg.eq(shreg | (self.i_stream.payload.as_unsigned() << (count * self._part)))
++                m.d.sync += count.eq(count + 1)
++        with m.Elif(do_send):
++            m.d.sync += shreg.eq(0)
++            m.d.sync += count.eq(0)
++
++        return m
++
++
++class Gearbox(wiring.Component):
++    """Converts between arbitrary payload widths while preserving the bit stream.
++
++    The concatenation of every input payload (least-significant bit first) equals the concatenation
++    of every output payload. Input words of ``i_width`` bits are buffered and repacked into output
++    words of ``o_width`` bits; the two widths need not divide one another. No bit is ever dropped or
++    duplicated regardless of the ``valid``/``ready`` timing, and the gearbox sustains full throughput
++    on whichever side is narrower.
++
++    Parameters
++    ----------
++    i_width : int
++        Bit width of the input payload. Must be at least 1.
++    o_width : int
++        Bit width of the output payload. Must be at least 1.
++    """
++    def __init__(self, i_width, o_width):
++        if i_width < 1 or o_width < 1:
++            raise ValueError(f"Widths must be positive integers, not {i_width!r} and {o_width!r}")
++        self._iw = i_width
++        self._ow = o_width
++        self._cap = i_width + o_width
++        super().__init__({
++            "i_stream": In(Signature(i_width)),
++            "o_stream": Out(Signature(o_width)),
++        })
++
++    @property
++    def i_width(self):
++        return self._iw
++
++    @property
++    def o_width(self):
++        return self._ow
++
++    def elaborate(self, platform):
++        m = Module()
++        cap = self._cap
++
++        buf = Signal(cap)
++        level = Signal(range(cap + 1))
++
++        do_send = Signal()
++        do_recv = Signal()
++        m.d.comb += [
++            self.o_stream.valid.eq(level >= self._ow),
++            self.o_stream.payload.eq(buf[:self._ow]),
++            do_send.eq(self.o_stream.valid & self.o_stream.ready),
++        ]
++        # Room to accept, accounting for a slice leaving this same cycle.
++        level_after_send = Signal(range(cap + 1))
++        m.d.comb += level_after_send.eq(level - Mux(do_send, self._ow, 0))
++        m.d.comb += self.i_stream.ready.eq(level_after_send <= cap - self._iw)
++        m.d.comb += do_recv.eq(self.i_stream.valid & self.i_stream.ready)
++
++        shifted = Signal(cap)
++        m.d.comb += shifted.eq(Mux(do_send, buf >> self._ow, buf))
++        with m.If(do_recv):
++            m.d.sync += buf.eq(shifted | (self.i_stream.payload.as_unsigned() << level_after_send))
++            m.d.sync += level.eq(level_after_send + self._iw)
++        with m.Elif(do_send):
++            m.d.sync += buf.eq(shifted)
++            m.d.sync += level.eq(level_after_send)
++
++        return m
++
++
++def _check_payload_shape(payload_shape):
++    if isinstance(payload_shape, int) and payload_shape < 1:
++        raise ValueError(f"Payload width must be a positive integer, not {payload_shape!r}")
++
++
++class SkidBuffer(wiring.Component):
++    """A two-slot elastic buffer that registers its outputs without losing throughput.
++
++    Every payload arriving on the input stream appears, in order, on the output stream. The output
++    ``payload``, ``valid`` and input ``ready`` are all driven from registers, breaking the
++    combinational path between the two peers, yet the buffer still accepts and emits one payload per
++    cycle when the stream keeps moving. When the sink deasserts ``ready`` while a payload is already
++    latched, the next arriving payload is captured in the skid slot instead of being lost.
++
++    Parameters
++    ----------
++    payload_shape : :class:`~.hdl.ShapeLike`
++        Shape of the payload member.
++    """
++    def __init__(self, payload_shape):
++        _check_payload_shape(payload_shape)
++        self._payload_shape = payload_shape
++        super().__init__({
++            "i_stream": In(Signature(payload_shape)),
++            "o_stream": Out(Signature(payload_shape)),
++        })
++
++    def elaborate(self, platform):
++        m = Module()
++
++        skid = Signal.like(self.o_stream.payload)
++        skid_valid = Signal()
++
++        m.d.comb += self.i_stream.ready.eq(~skid_valid)
++        do_recv = Signal()
++        m.d.comb += do_recv.eq(self.i_stream.valid & self.i_stream.ready)
++
++        with m.If(self.o_stream.ready | ~self.o_stream.valid):
++            with m.If(skid_valid):
++                m.d.sync += self.o_stream.payload.eq(skid)
++                m.d.sync += self.o_stream.valid.eq(1)
++                m.d.sync += skid_valid.eq(0)
++            with m.Elif(do_recv):
++                m.d.sync += self.o_stream.payload.eq(self.i_stream.payload)
++                m.d.sync += self.o_stream.valid.eq(1)
++            with m.Else():
++                m.d.sync += self.o_stream.valid.eq(0)
++        with m.Elif(do_recv):
++            m.d.sync += skid.eq(self.i_stream.payload)
++            m.d.sync += skid_valid.eq(1)
++
++        return m
++
++
++class Arbiter(wiring.Component):
++    """Merges several input streams into one output stream using round-robin arbitration.
++
++    Every cycle the arbiter serves one input whose payload is available, starting the search from
++    the input just after the one served last so that no input is starved (work-conserving round
++    robin). The payloads of each input appear on the output in that input's original order, every
++    input payload appears exactly once, and none is dropped or duplicated regardless of the
++    ``valid``/``ready`` timing.
++
++    Parameters
++    ----------
++    payload_shape : :class:`~.hdl.ShapeLike`
++        Shape of the payload member.
++    count : int
++        Number of input streams. Must be at least 1.
++    """
++    def __init__(self, payload_shape, count):
++        _check_payload_shape(payload_shape)
++        if count < 1:
++            raise ValueError(f"Input count must be a positive integer, not {count!r}")
++        self._payload_shape = payload_shape
++        self._count = count
++        super().__init__({
++            "i_streams": In(Signature(payload_shape)).array(count),
++            "o_stream": Out(Signature(payload_shape)),
++        })
++
++    @property
++    def count(self):
++        return self._count
++
++    def elaborate(self, platform):
++        m = Module()
++        count = self._count
++
++        grant = Signal(range(count))
++        valids = Array([s.valid for s in self.i_streams])
++        payloads = Array([Value.cast(s.payload) for s in self.i_streams])
++
++        sel = Signal(range(count))
++        any_valid = Signal()
++        m.d.comb += [sel.eq(grant), any_valid.eq(0)]
++        # Assign in decreasing offset order so the smallest offset from `grant` wins.
++        for offset in reversed(range(count)):
++            cand = Signal(range(count), name=f"cand{offset}")
++            raw = grant + offset
++            m.d.comb += cand.eq(Mux(raw >= count, raw - count, raw))
++            with m.If(valids[cand]):
++                m.d.comb += sel.eq(cand)
++                m.d.comb += any_valid.eq(1)
++
++        m.d.comb += [
++            self.o_stream.valid.eq(any_valid),
++            Value.cast(self.o_stream.payload).eq(payloads[sel]),
++        ]
++        for k in range(count):
++            m.d.comb += self.i_streams[k].ready.eq((sel == k) & any_valid & self.o_stream.ready)
++
++        with m.If(any_valid & self.o_stream.ready):
++            m.d.sync += grant.eq(Mux(sel == count - 1, 0, sel + 1))
++
++        return m
++
++
++class Demux(wiring.Component):
++    """Routes one input stream to one of several output streams selected by ``select``.
++
++    Each input payload is delivered to the output stream indicated by ``select`` at the time the
++    payload is accepted, and to no other output. Backpressure comes only from the selected output:
++    the input is accepted exactly when the selected output is ready. Payloads routed to a given
++    output appear there in the order they were accepted, and none is dropped or duplicated.
++
++    Parameters
++    ----------
++    payload_shape : :class:`~.hdl.ShapeLike`
++        Shape of the payload member.
++    count : int
++        Number of output streams. Must be at least 1.
++    """
++    def __init__(self, payload_shape, count):
++        _check_payload_shape(payload_shape)
++        if count < 1:
++            raise ValueError(f"Output count must be a positive integer, not {count!r}")
++        self._payload_shape = payload_shape
++        self._count = count
++        super().__init__({
++            "i_stream": In(Signature(payload_shape)),
++            "select": In(range(count)),
++            "o_streams": Out(Signature(payload_shape)).array(count),
++        })
++
++    @property
++    def count(self):
++        return self._count
++
++    def elaborate(self, platform):
++        m = Module()
++
++        readies = Array([s.ready for s in self.o_streams])
++        for k in range(self._count):
++            m.d.comb += [
++                self.o_streams[k].payload.eq(self.i_stream.payload),
++                self.o_streams[k].valid.eq(self.i_stream.valid & (self.select == k)),
++            ]
++        m.d.comb += self.i_stream.ready.eq(readies[self.select])
++
++        return m
++
++
++class Fork(wiring.Component):
++    """Broadcasts one input stream to several output streams.
++
++    Every input payload is delivered to all outputs. Each output applies backpressure
++    independently: an output that is ready accepts the current payload immediately, while the input
++    is not accepted (and the payload not advanced) until every output has accepted it. An output
++    already served does not receive the payload again while slower outputs catch up. Every output
++    therefore observes exactly the input sequence, in order, with no payload dropped or duplicated.
++
++    Parameters
++    ----------
++    payload_shape : :class:`~.hdl.ShapeLike`
++        Shape of the payload member.
++    count : int
++        Number of output streams. Must be at least 1.
++    """
++    def __init__(self, payload_shape, count):
++        _check_payload_shape(payload_shape)
++        if count < 1:
++            raise ValueError(f"Output count must be a positive integer, not {count!r}")
++        self._payload_shape = payload_shape
++        self._count = count
++        super().__init__({
++            "i_stream": In(Signature(payload_shape)),
++            "o_streams": Out(Signature(payload_shape)).array(count),
++        })
++
++    @property
++    def count(self):
++        return self._count
++
++    def elaborate(self, platform):
++        m = Module()
++        count = self._count
++
++        sent = Signal(count)
++        accept_now = Signal(count)
++        for k in range(count):
++            m.d.comb += [
++                self.o_streams[k].payload.eq(self.i_stream.payload),
++                self.o_streams[k].valid.eq(self.i_stream.valid & ~sent[k]),
++                accept_now[k].eq(self.o_streams[k].valid & self.o_streams[k].ready),
++            ]
++
++        served = Signal(count)
++        m.d.comb += served.eq(sent | accept_now)
++        m.d.comb += self.i_stream.ready.eq(served.all())
++
++        with m.If(self.i_stream.valid & self.i_stream.ready):
++            m.d.sync += sent.eq(0)
++        with m.Else():
++            m.d.sync += sent.eq(served)
++
++        return m
++
++
++class Join(wiring.Component):
++    """Combines several input streams into one output stream carrying all their payloads.
++
++    Each output payload is the concatenation of one payload taken from every input, the first input
++    occupying the least-significant bits. Each input is accepted independently as soon as it is
++    available; once an input has been gathered it is not accepted again until the combined payload
++    has been emitted. The output becomes available only when every input has contributed. Every
++    input's payloads are consumed in order, one per output, with none dropped or duplicated.
++
++    Parameters
++    ----------
++    payload_shape : :class:`~.hdl.ShapeLike`
++        Shape of each input payload.
++    count : int
++        Number of input streams. Must be at least 1.
++    """
++    def __init__(self, payload_shape, count):
++        _check_payload_shape(payload_shape)
++        if count < 1:
++            raise ValueError(f"Input count must be a positive integer, not {count!r}")
++        self._payload_shape = payload_shape
++        self._width = Shape.cast(payload_shape).width
++        self._count = count
++        super().__init__({
++            "i_streams": In(Signature(payload_shape)).array(count),
++            "o_stream": Out(Signature(unsigned(self._width * count))),
++        })
++
++    @property
++    def count(self):
++        return self._count
++
++    def elaborate(self, platform):
++        m = Module()
++        count = self._count
++        width = self._width
++
++        got = Signal(count)
++        data = [Signal(width, name=f"data{k}") for k in range(count)]
++
++        gather_now = Signal(count)
++        slots = []
++        for k in range(count):
++            m.d.comb += [
++                self.i_streams[k].ready.eq(~got[k]),
++                gather_now[k].eq(self.i_streams[k].valid & self.i_streams[k].ready),
++            ]
++            slots.append(Mux(got[k], data[k], Value.cast(self.i_streams[k].payload)))
++
++        have = Signal(count)
++        m.d.comb += have.eq(got | gather_now)
++        m.d.comb += [
++            self.o_stream.valid.eq(have.all()),
++            self.o_stream.payload.eq(Cat(*slots)),
++        ]
++
++        with m.If(self.o_stream.valid & self.o_stream.ready):
++            m.d.sync += got.eq(0)
++        with m.Else():
++            m.d.sync += got.eq(have)
++            for k in range(count):
++                with m.If(gather_now[k]):
++                    m.d.sync += data[k].eq(Value.cast(self.i_streams[k].payload))
++
++        return m
++
++
++class FramedGearbox(wiring.Component):
++    """Converts a stream of packet-framed words between arbitrary bit widths.
++
++    The input stream carries payloads of :func:`framed_input_layout` (a ``data`` word of `i_width`
++    bits and a ``last`` flag marking the final word of a packet). Within a packet, the concatenated
++    bits of its input words (least-significant word first, least-significant bit first) are repacked
++    into output words of `o_width` bits, and the output stream carries payloads of
++    :func:`framed_output_layout`. Every output word before the final one of a packet has
++    ``valid == o_width``; the final output word of each packet has ``last`` set and ``valid`` equal
++    to the number of remaining bits, between 1 and `o_width`. The bit stream of one packet never
++    shares an output word with another: a partial final word is flushed at the packet boundary, and
++    the next packet begins in a fresh output word. No bit is dropped, duplicated, or reordered, and
++    ``last``/``valid`` are placed exactly, for any sequence of ``valid`` and ``ready``.
++
++    Parameters
++    ----------
++    i_width : int
++        Bit width of the input ``data``. Must be at least 1.
++    o_width : int
++        Bit width of the output ``data``. Must be at least 1.
++    """
++    def __init__(self, i_width, o_width):
++        if i_width < 1 or o_width < 1:
++            raise ValueError(f"Widths must be positive integers, not {i_width!r} and {o_width!r}")
++        self._iw = i_width
++        self._ow = o_width
++        self._cap = i_width + 2 * o_width
++        super().__init__({
++            "i_stream": In(Signature(framed_input_layout(i_width))),
++            "o_stream": Out(Signature(framed_output_layout(o_width))),
++        })
++
++    @property
++    def i_width(self):
++        return self._iw
++
++    @property
++    def o_width(self):
++        return self._ow
++
++    def elaborate(self, platform):
++        m = Module()
++        iw, ow, cap = self._iw, self._ow, self._cap
++
++        # Two independent packet lanes form a depth-2 pipeline: while one lane drains the bits of a
++        # closing packet (whose partial final word must not merge with the next packet), the other
++        # lane already accepts the next packet's words, so a boundary adds no idle input cycle on the
++        # narrower side. Lanes are used first-in-first-out; when only one packet is in flight the same
++        # lane both fills and drains.
++        buf = [Signal(cap, name=f"buf{i}") for i in range(2)]
++        level = [Signal(range(cap + 1), name=f"level{i}") for i in range(2)]
++        occ = [Signal(name=f"occ{i}") for i in range(2)]
++        closed = [Signal(name=f"closed{i}") for i in range(2)]
++        head = Signal()
++        tail = Signal()
++
++        open_lane = [Signal(name=f"open{i}") for i in range(2)]
++        for i in range(2):
++            m.d.comb += open_lane[i].eq(occ[i] & ~closed[i])
++        any_open = Signal()
++        open_idx = Signal()
++        m.d.comb += [any_open.eq(open_lane[0] | open_lane[1]), open_idx.eq(open_lane[1])]
++
++        def pick(sigs, idx):
++            return Mux(idx, sigs[1], sigs[0])
++
++        dl_level = pick(level, head)
++        dl_buf = pick(buf, head)
++        is_last = Signal()
++        m.d.comb += is_last.eq(pick(occ, head) & pick(closed, head) & (dl_level > 0) & (dl_level <= ow))
++        m.d.comb += [
++            self.o_stream.valid.eq(pick(occ, head) & ((dl_level >= ow) | (pick(closed, head) & (dl_level > 0)))),
++            self.o_stream.payload.data.eq(dl_buf[:ow]),
++            self.o_stream.payload.last.eq(is_last),
++            self.o_stream.payload.valid.eq(Mux(is_last, dl_level, ow)),
++        ]
++        do_send = Signal()
++        emit = Signal(range(cap + 1))
++        m.d.comb += do_send.eq(self.o_stream.valid & self.o_stream.ready)
++        m.d.comb += emit.eq(Mux(is_last, dl_level, ow))
++
++        fill = Signal()
++        m.d.comb += fill.eq(Mux(any_open, open_idx, tail))
++        fl_level = pick(level, fill)
++        fl_after = Signal(range(cap + 1))
++        m.d.comb += fl_after.eq(fl_level - Mux(do_send & (head == fill), emit, 0))
++        has_room = Signal()
++        m.d.comb += has_room.eq(fl_after + iw <= cap)
++        m.d.comb += self.i_stream.ready.eq(has_room & Mux(any_open, 1, ~pick(occ, fill)))
++        do_recv = Signal()
++        recv_last = Signal()
++        m.d.comb += do_recv.eq(self.i_stream.valid & self.i_stream.ready)
++        m.d.comb += recv_last.eq(do_recv & self.i_stream.payload.last)
++
++        for i in range(2):
++            sending = Signal(name=f"send{i}")
++            m.d.comb += sending.eq(do_send & (head == i))
++            after = Signal(range(cap + 1), name=f"after{i}")
++            m.d.comb += after.eq(level[i] - Mux(sending, emit, 0))
++            shifted = Signal(cap, name=f"shift{i}")
++            m.d.comb += shifted.eq(Mux(sending, buf[i] >> emit, buf[i]))
++            recv_i = Signal(name=f"recv{i}")
++            m.d.comb += recv_i.eq(do_recv & (fill == i))
++            with m.If(recv_i):
++                m.d.sync += buf[i].eq(shifted | (self.i_stream.payload.data.as_unsigned() << after))
++                m.d.sync += level[i].eq(after + iw)
++                m.d.sync += occ[i].eq(1)
++                m.d.sync += closed[i].eq(self.i_stream.payload.last)
++            with m.Elif(sending):
++                m.d.sync += buf[i].eq(shifted)
++                m.d.sync += level[i].eq(after)
++                with m.If(is_last):
++                    m.d.sync += occ[i].eq(0)
++                    m.d.sync += closed[i].eq(0)
++
++        with m.If(recv_last):
++            m.d.sync += tail.eq(~tail)
++        with m.If(do_send & is_last):
++            m.d.sync += head.eq(~head)
++
++        return m
+diff --git a/docs/stdlib/stream.rst b/docs/stdlib/stream.rst
+index 391a638..964b977 100644
+--- a/docs/stdlib/stream.rst
++++ b/docs/stdlib/stream.rst
+@@ -414,3 +414,30 @@ Components that communicate using streams must not only use a :class:`stream.Int
+ .. autoclass:: Signature
+ 
+ .. autoclass:: Interface
++
++Stream processing components
++============================
++
++These components transform, buffer, and route streams while following the :ref:`data transfer rules <stream-rules>`.
++
++.. autoclass:: WidthDownConverter
++
++.. autoclass:: WidthUpConverter
++
++.. autoclass:: Gearbox
++
++.. autoclass:: SkidBuffer
++
++.. autoclass:: Arbiter
++
++.. autoclass:: Demux
++
++.. autoclass:: Fork
++
++.. autoclass:: Join
++
++.. autofunction:: framed_input_layout
++
++.. autofunction:: framed_output_layout
++
++.. autoclass:: FramedGearbox

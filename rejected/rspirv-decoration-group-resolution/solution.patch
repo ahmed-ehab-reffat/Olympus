@@ -1,0 +1,418 @@
+diff --git a/rspirv/binary/disassemble.rs b/rspirv/binary/disassemble.rs
+index 884bb4a..68e1bdd 100644
+--- a/rspirv/binary/disassemble.rs
++++ b/rspirv/binary/disassemble.rs
+@@ -262,6 +262,52 @@ fn disas_ext_inst(
+     }
+ }
+ 
++/// Renders `module`'s resolved decorations (direct plus group-expanded, per
++/// [`dr::Module::resolve_decorations`]) as readable text, one line per decorated target and one
++/// per decorated target member, each decoration joined by `" | "`. Targets and members are
++/// listed in ascending id order; this does not affect the default `disassemble()` output, which
++/// still shows the raw, unresolved `OpDecorate`/`OpGroupDecorate` instructions as written.
++pub fn disassemble_decorations(module: &dr::Module) -> String {
++    let resolved = module.resolve_decorations();
++    let mut lines = Vec::new();
++    for target in resolved.decorated_targets() {
++        let entries = resolved.for_target(target);
++        lines.push(format!("%{}: {}", target, disas_join(entries, " | ")));
++    }
++    for (target, member) in resolved.decorated_members() {
++        let entries = resolved.for_member(target, member);
++        lines.push(format!(
++            "%{}.{}: {}",
++            target,
++            member,
++            disas_join(entries, " | ")
++        ));
++    }
++    for reference in resolved.unresolved() {
++        lines.push(format!("; unresolved: {}", disas_unresolved(reference)));
++    }
++    lines.join("\n")
++}
++
++fn disas_unresolved(reference: &dr::UnresolvedReference) -> String {
++    match reference {
++        dr::UnresolvedReference::UnknownGroup { group } => {
++            format!("group %{} is not a declared decoration group", group)
++        }
++        dr::UnresolvedReference::UnknownTarget { group, target } => {
++            format!("group %{} references undefined target %{}", group, target)
++        }
++        dr::UnresolvedReference::UnknownMemberTarget {
++            group,
++            target,
++            member,
++        } => format!(
++            "group %{} references undefined member %{}.{}",
++            group, target, member
++        ),
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use crate::binary::Disassemble;
+diff --git a/rspirv/binary/mod.rs b/rspirv/binary/mod.rs
+index 3684b4b..6dd54d9 100644
+--- a/rspirv/binary/mod.rs
++++ b/rspirv/binary/mod.rs
+@@ -18,7 +18,7 @@ pub use self::parser::State as ParseState;
+ pub use self::parser::{parse_bytes, parse_words, Consumer, Parser};
+ 
+ pub use self::assemble::Assemble;
+-pub use self::disassemble::Disassemble;
++pub use self::disassemble::{disassemble_decorations, Disassemble};
+ 
+ mod assemble;
+ mod autogen_error;
+diff --git a/rspirv/dr/constructs.rs b/rspirv/dr/constructs.rs
+index a169071..e6cbc85 100644
+--- a/rspirv/dr/constructs.rs
++++ b/rspirv/dr/constructs.rs
+@@ -192,6 +192,12 @@ impl Module {
+                     .flat_map(|f| f.all_inst_iter_mut()),
+             )
+     }
++
++    /// Expands every decoration group indirection in this module into a queryable,
++    /// fully-resolved view of every decoration applying to every target.
++    pub fn resolve_decorations(&self) -> super::decoration::ResolvedDecorations {
++        super::decoration::resolve_decorations(self)
++    }
+ }
+ 
+ impl ModuleHeader {
+diff --git a/rspirv/dr/decoration.rs b/rspirv/dr/decoration.rs
+new file mode 100644
+index 0000000..270ce8a
+--- /dev/null
++++ b/rspirv/dr/decoration.rs
+@@ -0,0 +1,308 @@
++//! Resolution of decoration groups into concrete per-target decorations.
++
++use std::collections::{HashMap, HashSet};
++
++use crate::spirv;
++
++use super::constructs::{Instruction, Module, Operand};
++
++/// A group-apply reference (`OpGroupDecorate` or `OpGroupMemberDecorate` entry) that could
++/// not be resolved.
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++pub enum UnresolvedReference {
++    /// The group operand does not name a declared `OpDecorationGroup`.
++    UnknownGroup { group: spirv::Word },
++    /// The group is declared, but the target id is not defined anywhere in the module.
++    UnknownTarget {
++        group: spirv::Word,
++        target: spirv::Word,
++    },
++    /// The group is declared, but the target id of a member pair is not defined anywhere
++    /// in the module.
++    UnknownMemberTarget {
++        group: spirv::Word,
++        target: spirv::Word,
++        member: u32,
++    },
++}
++
++/// The result of expanding every decoration group indirection in a module into concrete,
++/// per-target and per-member decoration lists.
++#[derive(Clone, Debug, Default)]
++pub struct ResolvedDecorations {
++    direct: HashMap<spirv::Word, Vec<Instruction>>,
++    member: HashMap<(spirv::Word, u32), Vec<Instruction>>,
++    unresolved: Vec<UnresolvedReference>,
++    direct_contributors: HashMap<spirv::Word, Vec<spirv::Word>>,
++    member_contributors: HashMap<(spirv::Word, u32), Vec<spirv::Word>>,
++}
++
++impl ResolvedDecorations {
++    /// Returns every decoration applying to `id`, direct decorations first in module order,
++    /// followed by decorations contributed through group references.
++    pub fn for_target(&self, id: spirv::Word) -> &[Instruction] {
++        self.direct.get(&id).map(Vec::as_slice).unwrap_or(&[])
++    }
++
++    /// Returns every decoration applying to member `member` of `id`, direct decorations
++    /// first, followed by decorations contributed through group references.
++    pub fn for_member(&self, id: spirv::Word, member: u32) -> &[Instruction] {
++        self.member
++            .get(&(id, member))
++            .map(Vec::as_slice)
++            .unwrap_or(&[])
++    }
++
++    /// Returns every group-apply reference that could not be resolved.
++    pub fn unresolved(&self) -> &[UnresolvedReference] {
++        &self.unresolved
++    }
++
++    /// Returns the ids of every declared decoration group that contributed at least one
++    /// decoration to `id` through a group-apply instruction, one entry per contributing
++    /// instruction (a group referenced by two separate group-apply instructions appears
++    /// twice, consistent with `for_target`'s no-dedup rule). Direct decorations do not
++    /// contribute an entry here.
++    pub fn groups_contributing_to(&self, id: spirv::Word) -> &[spirv::Word] {
++        self.direct_contributors
++            .get(&id)
++            .map(Vec::as_slice)
++            .unwrap_or(&[])
++    }
++
++    /// Returns the ids of every declared decoration group that contributed at least one
++    /// decoration to member `member` of `id` through a group-apply instruction, with the
++    /// same one-entry-per-contributing-instruction rule as `groups_contributing_to`.
++    pub fn groups_contributing_to_member(&self, id: spirv::Word, member: u32) -> &[spirv::Word] {
++        self.member_contributors
++            .get(&(id, member))
++            .map(Vec::as_slice)
++            .unwrap_or(&[])
++    }
++
++    /// Returns every id with at least one resolved whole-object decoration, in ascending
++    /// numeric order (independent of internal hash map iteration).
++    pub fn decorated_targets(&self) -> Vec<spirv::Word> {
++        let mut ids: Vec<spirv::Word> = self.direct.keys().copied().collect();
++        ids.sort_unstable();
++        ids
++    }
++
++    /// Returns every `(id, member)` pair with at least one resolved member decoration, sorted
++    /// by id then member.
++    pub fn decorated_members(&self) -> Vec<(spirv::Word, u32)> {
++        let mut pairs: Vec<(spirv::Word, u32)> = self.member.keys().copied().collect();
++        pairs.sort_unstable();
++        pairs
++    }
++
++    /// Returns the decorations applying to `id`, in the same order as `for_target`, but with
++    /// exact duplicates (identical opcode and operands) collapsed to their first occurrence.
++    /// A duplicate collapsed here is not the same thing as a conflict: `conflicts` reports
++    /// disagreements, this collapses agreements.
++    pub fn unique_for_target(&self, id: spirv::Word) -> Vec<Instruction> {
++        dedup_preserving_order(self.for_target(id))
++    }
++
++    /// Returns the decorations applying to member `member` of `id`, in the same order as
++    /// `for_member`, but with exact duplicates collapsed to their first occurrence.
++    pub fn unique_for_member(&self, id: spirv::Word, member: u32) -> Vec<Instruction> {
++        dedup_preserving_order(self.for_member(id, member))
++    }
++
++    /// Returns every pair of resolved decorations that share the same decoration kind on the
++    /// same target (or the same target member) but disagree on their extra parameters.
++    ///
++    /// Two decorations of the same kind with identical parameters are duplicates, not a
++    /// conflict, and are not reported here. Results are sorted by target, then member, then
++    /// decoration kind, so the order does not depend on internal hash map iteration.
++    pub fn conflicts(&self) -> Vec<DecorationConflict> {
++        let mut out = Vec::new();
++        for (&target, entries) in &self.direct {
++            collect_conflicts(entries, target, None, &mut out);
++        }
++        for (&(target, member), entries) in &self.member {
++            collect_conflicts(entries, target, Some(member), &mut out);
++        }
++        out.sort_by_key(|c| (c.target, c.member, decoration_kind(&c.first)));
++        out
++    }
++}
++
++/// A pair of resolved decorations of the same kind, applying to the same target (or target
++/// member), whose extra parameters disagree.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct DecorationConflict {
++    pub target: spirv::Word,
++    pub member: Option<u32>,
++    pub first: Instruction,
++    pub second: Instruction,
++}
++
++/// Maps a whole-object decoration opcode to the member-decoration opcode carrying the same
++/// extra-parameter form (literal, id, or string), so a group's decorations keep their original
++/// form when expanded onto a `(target, member)` pair by `OpGroupMemberDecorate`.
++fn member_form_of(opcode: spirv::Op) -> spirv::Op {
++    match opcode {
++        spirv::Op::DecorateString => spirv::Op::MemberDecorateString,
++        spirv::Op::DecorateId => spirv::Op::MemberDecorateIdEXT,
++        _ => spirv::Op::MemberDecorate,
++    }
++}
++
++fn dedup_preserving_order(entries: &[Instruction]) -> Vec<Instruction> {
++    let mut seen: HashSet<&Instruction> = HashSet::new();
++    let mut out = Vec::new();
++    for entry in entries {
++        if seen.insert(entry) {
++            out.push(entry.clone());
++        }
++    }
++    out
++}
++
++fn decoration_kind(inst: &Instruction) -> Option<spirv::Decoration> {
++    inst.operands.iter().find_map(|op| match op {
++        Operand::Decoration(d) => Some(*d),
++        _ => None,
++    })
++}
++
++fn collect_conflicts(
++    entries: &[Instruction],
++    target: spirv::Word,
++    member: Option<u32>,
++    out: &mut Vec<DecorationConflict>,
++) {
++    for i in 0..entries.len() {
++        for j in (i + 1)..entries.len() {
++            let (first, second) = (&entries[i], &entries[j]);
++            let same_kind = decoration_kind(first).is_some()
++                && decoration_kind(first) == decoration_kind(second);
++            if same_kind && first.operands != second.operands {
++                out.push(DecorationConflict {
++                    target,
++                    member,
++                    first: first.clone(),
++                    second: second.clone(),
++                });
++            }
++        }
++    }
++}
++
++/// Expands every `OpGroupDecorate` and `OpGroupMemberDecorate` instruction in `module` against
++/// the direct `OpDecorate`/`OpMemberDecorate` instructions it finds, producing a queryable,
++/// fully-resolved view of every decoration applying to every target.
++pub fn resolve_decorations(module: &Module) -> ResolvedDecorations {
++    let defined_ids: HashSet<spirv::Word> = module
++        .all_inst_iter()
++        .filter_map(|inst| inst.result_id)
++        .collect();
++
++    let group_ids: HashSet<spirv::Word> = module
++        .annotations
++        .iter()
++        .filter(|inst| inst.class.opcode == spirv::Op::DecorationGroup)
++        .filter_map(|inst| inst.result_id)
++        .collect();
++
++    let mut direct: HashMap<spirv::Word, Vec<Instruction>> = HashMap::new();
++    let mut member: HashMap<(spirv::Word, u32), Vec<Instruction>> = HashMap::new();
++
++    for inst in &module.annotations {
++        match inst.class.opcode {
++            spirv::Op::Decorate | spirv::Op::DecorateId | spirv::Op::DecorateString => {
++                let target = inst.operands[0].unwrap_id_ref();
++                direct.entry(target).or_default().push(inst.clone());
++            }
++            spirv::Op::MemberDecorate
++            | spirv::Op::MemberDecorateString
++            | spirv::Op::MemberDecorateIdEXT => {
++                let target = inst.operands[0].unwrap_id_ref();
++                let index = inst.operands[1].unwrap_literal_bit32();
++                member.entry((target, index)).or_default().push(inst.clone());
++            }
++            _ => {}
++        }
++    }
++
++    let mut unresolved = Vec::new();
++    let mut direct_contributors: HashMap<spirv::Word, Vec<spirv::Word>> = HashMap::new();
++    let mut member_contributors: HashMap<(spirv::Word, u32), Vec<spirv::Word>> = HashMap::new();
++
++    for inst in &module.annotations {
++        match inst.class.opcode {
++            spirv::Op::GroupDecorate => {
++                let group = inst.operands[0].unwrap_id_ref();
++                if !group_ids.contains(&group) {
++                    unresolved.push(UnresolvedReference::UnknownGroup { group });
++                    continue;
++                }
++                let entries = direct.get(&group).cloned().unwrap_or_default();
++                for target_operand in &inst.operands[1..] {
++                    let target = target_operand.unwrap_id_ref();
++                    if !defined_ids.contains(&target) {
++                        unresolved.push(UnresolvedReference::UnknownTarget { group, target });
++                        continue;
++                    }
++                    if entries.is_empty() {
++                        continue;
++                    }
++                    for entry in &entries {
++                        let mut expanded = entry.clone();
++                        expanded.operands[0] = Operand::IdRef(target);
++                        direct.entry(target).or_default().push(expanded);
++                    }
++                    direct_contributors.entry(target).or_default().push(group);
++                }
++            }
++            spirv::Op::GroupMemberDecorate => {
++                let group = inst.operands[0].unwrap_id_ref();
++                if !group_ids.contains(&group) {
++                    unresolved.push(UnresolvedReference::UnknownGroup { group });
++                    continue;
++                }
++                let entries = direct.get(&group).cloned().unwrap_or_default();
++                for pair in inst.operands[1..].chunks(2) {
++                    let target = pair[0].unwrap_id_ref();
++                    let index = pair[1].unwrap_literal_bit32();
++                    if !defined_ids.contains(&target) {
++                        unresolved.push(UnresolvedReference::UnknownMemberTarget {
++                            group,
++                            target,
++                            member: index,
++                        });
++                        continue;
++                    }
++                    if entries.is_empty() {
++                        continue;
++                    }
++                    for entry in &entries {
++                        let mut operands = vec![
++                            Operand::IdRef(target),
++                            Operand::LiteralBit32(index),
++                        ];
++                        operands.extend(entry.operands[1..].iter().cloned());
++                        let expanded =
++                            Instruction::new(member_form_of(entry.class.opcode), None, None, operands);
++                        member.entry((target, index)).or_default().push(expanded);
++                    }
++                    member_contributors
++                        .entry((target, index))
++                        .or_default()
++                        .push(group);
++                }
++            }
++            _ => {}
++        }
++    }
++
++    ResolvedDecorations {
++        direct,
++        member,
++        unresolved,
++        direct_contributors,
++        member_contributors,
++    }
++}
+diff --git a/rspirv/dr/mod.rs b/rspirv/dr/mod.rs
+index fa9f416..71bf75d 100644
+--- a/rspirv/dr/mod.rs
++++ b/rspirv/dr/mod.rs
+@@ -23,8 +23,12 @@
+ pub use self::build::{Builder, InsertPoint};
+ pub use self::constructs::{Block, Function, Instruction};
+ pub use self::constructs::{Module, ModuleHeader, Operand};
++pub use self::decoration::{
++    resolve_decorations, DecorationConflict, ResolvedDecorations, UnresolvedReference,
++};
+ pub use self::loader::{load_bytes, load_words, Error, Loader};
+ 
+ mod build;
+ mod constructs;
++mod decoration;
+ mod loader;

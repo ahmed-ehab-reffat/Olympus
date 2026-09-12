@@ -1,0 +1,13 @@
+# Implement sleep modes and power management for the AVR CPU
+
+Add an `AVRPower` peripheral, `new AVRPower(cpu)` or with a device configuration. Export `powerConfig` for the ATmega328p and `attinyPowerConfig` for the ATtiny85. Each holds the sleep control register `SMCR` (0x53 and 0x35) and the power reduction register `PRR` (0x64 and 0x20). The CPU gains a `sleeping` flag and a `wakeUp()` that ends the sleep and does nothing when already awake. `AVRPower` itself exposes `mode`, null while awake and otherwise the selection below, and `asynchronous`, true only when bit 5 of ASSR at 0xb6 is set and false on the ATtiny, which has none.
+
+`SLEEP` does nothing unless the sleep enable bit is set, bit 0 on the ATmega and bit 5 on the ATtiny. Otherwise the CPU stops executing and enters the mode in bits 3 to 1, or 4 and 3 on the ATtiny. The selections are 0 idle, 1 ADC noise reduction, 2 power-down, 3 power-save, 6 standby and 7 extended standby; the ATtiny has only the first three. Any other selection is reserved and does not sleep. The ATmega keeps the low four bits of that register, the ATtiny all eight.
+
+A clock stops the instant its mode is entered, so work due on that cycle does not run. While asleep the cycle counter advances to the next event of a running clock, or by one when none is. Idle stops nothing. Every other mode stops timers 0, 1 and 2, the SPI, USART0 and the EEPROM, and the watchdog runs in every mode.
+
+ADC noise reduction leaves the ADC running, so a conversion already under way finishes, and entering it starts one, which ADCSRA then reports as running, when the ADC is enabled and its clock runs; deeper modes stop the ADC too. Power-save and extended standby also leave timer 2 running, but only while it is asynchronous.
+
+A queued interrupt wakes the CPU whether or not the global interrupt flag is set. With the flag set the CPU takes the vector; with it clear the CPU carries on after `SLEEP` and the interrupt stays pending. The stopped clocks restart as the CPU wakes. Edge and change triggered external interrupts need the I/O clock and are lost while it is stopped; low level and pin change ones still fire. A reset wakes the CPU too.
+
+On the ATmega power reduction bit 0 stops the ADC, 1 USART0, 2 the SPI, 3 timer 1, 5 timer 0, 6 timer 2 and 7 the TWI, and bit 4 always reads zero. On the ATtiny bit 0 stops the ADC, 2 timer 0 and 3 timer 1, and only the low four bits are kept. A peripheral stopped by either gate keeps its registers, neither counts nor raises interrupts, and accepts rather than refuses work given while stopped, so it waits. Once its clock returns it carries on with the time it owed.

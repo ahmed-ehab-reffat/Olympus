@@ -1,0 +1,1237 @@
+diff --git a/src/aggregation/agg_data.rs b/src/aggregation/agg_data.rs
+index 113915c..5e3bd46 100644
+--- a/src/aggregation/agg_data.rs
++++ b/src/aggregation/agg_data.rs
+@@ -675,6 +675,18 @@ fn build_nodes(
+                 children,
+             }])
+         }
++        // Pipeline aggregations are computed in the post-finalization pass; they collect nothing
++        // from segments and add no collector node.
++        AggregationVariants::AvgBucket(_)
++        | AggregationVariants::SumBucket(_)
++        | AggregationVariants::MinBucket(_)
++        | AggregationVariants::MaxBucket(_)
++        | AggregationVariants::StatsBucket(_)
++        | AggregationVariants::CumulativeSum(_)
++        | AggregationVariants::Derivative(_)
++        | AggregationVariants::MovingAvg(_)
++        | AggregationVariants::BucketScript(_)
++        | AggregationVariants::BucketSelector(_) => Ok(vec![]),
+     }
+ }
+ 
+diff --git a/src/aggregation/agg_req.rs b/src/aggregation/agg_req.rs
+index c6b3121..810ad8d 100644
+--- a/src/aggregation/agg_req.rs
++++ b/src/aggregation/agg_req.rs
+@@ -180,6 +180,86 @@ pub fn validate_aggregation_fields_exist(
+     Ok(())
+ }
+ 
++/// How a pipeline aggregation treats a bucket whose referenced value is missing (a gap).
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum GapPolicy {
++    /// Exclude the gap from the computation. This is the default.
++    #[default]
++    Skip,
++    /// Replace the gap with zero.
++    InsertZeros,
++}
++
++/// Request for a sibling pipeline aggregation (`avg_bucket`, `sum_bucket`, `min_bucket`,
++/// `max_bucket`, `stats_bucket`). It reduces the buckets of a sibling multi-bucket aggregation,
++/// addressed by `buckets_path`, into a single metric.
++#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
++pub struct SiblingPipelineAggregation {
++    /// Path to the source values, e.g. `"sales_per_month>sales"`.
++    pub buckets_path: String,
++    /// How to treat buckets with a missing value.
++    #[serde(default)]
++    pub gap_policy: GapPolicy,
++}
++
++/// Request for a `cumulative_sum` pipeline aggregation. It walks the buckets of its parent
++/// multi-bucket aggregation in order, reading the relative `buckets_path` value. It always treats a
++/// gap as zero, so it takes no `gap_policy`; supplying one is a request error.
++#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct CumulativeSumAggregation {
++    /// Relative path to the source value in each bucket, e.g. `"sales"`.
++    pub buckets_path: String,
++}
++
++/// Request for a `derivative` pipeline aggregation. It walks the buckets of its parent multi-bucket
++/// aggregation in order, reading the relative `buckets_path` value.
++#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
++pub struct SerialPipelineAggregation {
++    /// Relative path to the source value in each bucket, e.g. `"sales"`.
++    pub buckets_path: String,
++    /// How to treat buckets with a missing value.
++    #[serde(default)]
++    pub gap_policy: GapPolicy,
++}
++
++fn deserialize_positive_window<'de, D>(deserializer: D) -> Result<usize, D::Error>
++where D: serde::Deserializer<'de> {
++    let window = usize::deserialize(deserializer)?;
++    if window == 0 {
++        return Err(serde::de::Error::custom("moving_avg window must be at least 1"));
++    }
++    Ok(window)
++}
++
++/// Request for a `moving_avg` pipeline aggregation: the trailing-window mean over the parent
++/// buckets in order.
++#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
++pub struct MovingAvgAggregation {
++    /// Relative path to the source value in each bucket.
++    pub buckets_path: String,
++    /// The number of most recent buckets (including the current one) averaged at each step.
++    #[serde(deserialize_with = "deserialize_positive_window")]
++    pub window: usize,
++    /// How to treat buckets with a missing value.
++    #[serde(default)]
++    pub gap_policy: GapPolicy,
++}
++
++/// Request for a `bucket_script` or `bucket_selector` pipeline aggregation. The `script` is
++/// evaluated for each parent bucket over the values named by `buckets_path`.
++#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
++pub struct ScriptPipelineAggregation {
++    /// Map of variable name to the relative path of its value in each bucket.
++    pub buckets_path: rustc_hash::FxHashMap<String, String>,
++    /// The arithmetic expression evaluated for each bucket.
++    pub script: String,
++    /// How to treat buckets with a missing value.
++    #[serde(default)]
++    pub gap_policy: GapPolicy,
++}
++
+ #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+ /// All aggregation types.
+ pub enum AggregationVariants {
+@@ -237,6 +317,39 @@ pub enum AggregationVariants {
+     /// Computes an estimate of the number of unique values
+     #[serde(rename = "cardinality")]
+     Cardinality(CardinalityAggregationReq),
++
++    // Pipeline aggregation types. These do not read fast fields; they are computed in a
++    // post-finalization pass over the assembled bucket tree.
++    /// Average of a sibling aggregation's bucket values.
++    #[serde(rename = "avg_bucket")]
++    AvgBucket(SiblingPipelineAggregation),
++    /// Sum of a sibling aggregation's bucket values.
++    #[serde(rename = "sum_bucket")]
++    SumBucket(SiblingPipelineAggregation),
++    /// Minimum of a sibling aggregation's bucket values.
++    #[serde(rename = "min_bucket")]
++    MinBucket(SiblingPipelineAggregation),
++    /// Maximum of a sibling aggregation's bucket values.
++    #[serde(rename = "max_bucket")]
++    MaxBucket(SiblingPipelineAggregation),
++    /// Statistics over a sibling aggregation's bucket values.
++    #[serde(rename = "stats_bucket")]
++    StatsBucket(SiblingPipelineAggregation),
++    /// Running total over the parent buckets in order.
++    #[serde(rename = "cumulative_sum")]
++    CumulativeSum(CumulativeSumAggregation),
++    /// Difference between the current and previous parent bucket value.
++    #[serde(rename = "derivative")]
++    Derivative(SerialPipelineAggregation),
++    /// Trailing-window mean over the parent buckets in order.
++    #[serde(rename = "moving_avg")]
++    MovingAvg(MovingAvgAggregation),
++    /// Per-bucket value computed from a script over named bucket values.
++    #[serde(rename = "bucket_script")]
++    BucketScript(ScriptPipelineAggregation),
++    /// Keeps parent buckets whose script predicate is truthy.
++    #[serde(rename = "bucket_selector")]
++    BucketSelector(ScriptPipelineAggregation),
+ }
+ 
+ impl AggregationVariants {
+@@ -263,9 +376,38 @@ impl AggregationVariants {
+             AggregationVariants::Percentiles(per) => vec![per.field_name()],
+             AggregationVariants::TopHits(top_hits) => top_hits.field_names(),
+             AggregationVariants::Cardinality(per) => vec![per.field_name()],
++            // Pipeline aggregations reference a buckets_path, not a fast field.
++            AggregationVariants::AvgBucket(_)
++            | AggregationVariants::SumBucket(_)
++            | AggregationVariants::MinBucket(_)
++            | AggregationVariants::MaxBucket(_)
++            | AggregationVariants::StatsBucket(_)
++            | AggregationVariants::CumulativeSum(_)
++            | AggregationVariants::Derivative(_)
++            | AggregationVariants::MovingAvg(_)
++            | AggregationVariants::BucketScript(_)
++            | AggregationVariants::BucketSelector(_) => vec![],
+         }
+     }
+ 
++    /// Returns true for pipeline aggregations, which are computed in a post-finalization pass and
++    /// never collected from segments.
++    pub(crate) fn is_pipeline(&self) -> bool {
++        matches!(
++            self,
++            AggregationVariants::AvgBucket(_)
++                | AggregationVariants::SumBucket(_)
++                | AggregationVariants::MinBucket(_)
++                | AggregationVariants::MaxBucket(_)
++                | AggregationVariants::StatsBucket(_)
++                | AggregationVariants::CumulativeSum(_)
++                | AggregationVariants::Derivative(_)
++                | AggregationVariants::MovingAvg(_)
++                | AggregationVariants::BucketScript(_)
++                | AggregationVariants::BucketSelector(_)
++        )
++    }
++
+     pub(crate) fn as_range(&self) -> Option<&RangeAggregation> {
+         match &self {
+             AggregationVariants::Range(range) => Some(range),
+diff --git a/src/aggregation/agg_result.rs b/src/aggregation/agg_result.rs
+index 7755fe3..d15948f 100644
+--- a/src/aggregation/agg_result.rs
++++ b/src/aggregation/agg_result.rs
+@@ -103,6 +103,17 @@ pub enum MetricResult {
+     TopHits(TopHitsMetricResult),
+     /// Cardinality metric result
+     Cardinality(SingleMetricResult),
++    /// Single-value pipeline aggregation result. Uses a distinct wrapper type so the untagged enum
++    /// does not gain another variant structurally identical to the metric variants above.
++    Pipeline(PipelineMetricResult),
++}
++
++/// Result of a single-value pipeline aggregation (`avg_bucket`, `cumulative_sum`, `bucket_script`,
++/// and the other single-value pipelines). Serializes as `{ "value": <number|null> }`.
++#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
++pub struct PipelineMetricResult {
++    /// The computed pipeline value.
++    pub value: Option<f64>,
+ }
+ 
+ impl MetricResult {
+@@ -122,6 +133,7 @@ impl MetricResult {
+                 AggregationError::InvalidRequest("top_hits can't be used to order".to_string()),
+             )),
+             MetricResult::Cardinality(card) => Ok(card.value),
++            MetricResult::Pipeline(pipeline) => Ok(pipeline.value),
+         }
+     }
+ }
+diff --git a/src/aggregation/intermediate_agg_result.rs b/src/aggregation/intermediate_agg_result.rs
+index f639cdb..e1fe18a 100644
+--- a/src/aggregation/intermediate_agg_result.rs
++++ b/src/aggregation/intermediate_agg_result.rs
+@@ -155,6 +155,7 @@ impl IntermediateAggregationResults {
+         req: Aggregations,
+         mut limits: AggregationLimitsGuard,
+     ) -> crate::Result<AggregationResults> {
++        crate::aggregation::pipeline::reject_root_pipelines(&req)?;
+         let res = self.into_final_result_internal(&req, &mut limits)?;
+         let bucket_count = res.get_bucket_count() as u32;
+         if bucket_count > limits.get_bucket_limit() {
+@@ -186,9 +187,13 @@ impl IntermediateAggregationResults {
+             });
+             results.insert(key, agg_res.into_final_result(req, limits)?);
+         }
+-        // Handle empty results
++        // Handle empty results. Pipeline aggregations carry no intermediate result; they are
++        // filled by the post-finalization pass below, so they are skipped here.
+         if results.len() != req.len() {
+             for (key, req) in req.iter() {
++                if req.agg.is_pipeline() {
++                    continue;
++                }
+                 if !results.contains_key(key) {
+                     let empty_res = empty_from_req(req);
+                     results.insert(key.to_string(), empty_res.into_final_result(req, limits)?);
+@@ -196,12 +201,17 @@ impl IntermediateAggregationResults {
+             }
+         }
+ 
+-        Ok(AggregationResults(results))
++        let mut results = AggregationResults(results);
++        crate::aggregation::pipeline::apply_level_pipelines(&mut results, req)?;
++        Ok(results)
+     }
+ 
+     pub(crate) fn empty_from_req(req: &Aggregations) -> Self {
+         let mut aggs_res: FxHashMap<String, IntermediateAggregationResult> = FxHashMap::default();
+         for (key, req) in req.iter() {
++            if req.agg.is_pipeline() {
++                continue;
++            }
+             let empty_res = empty_from_req(req);
+             aggs_res.insert(key.to_string(), empty_res);
+         }
+@@ -286,6 +296,10 @@ pub(crate) fn empty_from_req(req: &Aggregation) -> IntermediateAggregationResult
+                 buckets: IntermediateCompositeBucketResult::default(),
+             })
+         }
++        AvgBucket(_) | SumBucket(_) | MinBucket(_) | MaxBucket(_) | StatsBucket(_)
++        | CumulativeSum(_) | Derivative(_) | MovingAvg(_) | BucketScript(_) | BucketSelector(_) => {
++            unreachable!("pipeline aggregations are computed in the post-finalization pass")
++        }
+     }
+ }
+ 
+diff --git a/src/aggregation/mod.rs b/src/aggregation/mod.rs
+index 66d439e..b9b246a 100644
+--- a/src/aggregation/mod.rs
++++ b/src/aggregation/mod.rs
+@@ -139,6 +139,7 @@ mod date;
+ mod error;
+ pub mod intermediate_agg_result;
+ pub mod metric;
++mod pipeline;
+ 
+ mod segment_agg_result;
+ use std::fmt::Display;
+diff --git a/src/aggregation/pipeline/compute.rs b/src/aggregation/pipeline/compute.rs
+new file mode 100644
+index 0000000..eb494af
+--- /dev/null
++++ b/src/aggregation/pipeline/compute.rs
+@@ -0,0 +1,521 @@
++//! Computation primitives for pipeline aggregations: resolving `buckets_path` values out of the
++//! assembled bucket tree, applying the gap policy, the sibling reductions, the serial transforms,
++//! and the script drivers.
++
++use rustc_hash::{FxHashMap, FxHashSet};
++
++use super::expr::Expr;
++use crate::aggregation::agg_req::{
++    AggregationVariants, Aggregations, GapPolicy, ScriptPipelineAggregation,
++    SiblingPipelineAggregation,
++};
++use crate::aggregation::agg_result::{
++    AggregationResult, AggregationResults, BucketEntries, BucketEntry, BucketResult, MetricResult,
++    PipelineMetricResult, RangeBucketEntry,
++};
++use crate::aggregation::metric::Stats;
++use crate::aggregation::{AggregationError, Key};
++use crate::TantivyError;
++
++fn err(msg: impl Into<String>) -> TantivyError {
++    TantivyError::AggregationError(AggregationError::InvalidRequest(msg.into()))
++}
++
++/// Which reduction a sibling pipeline performs over a sibling aggregation's bucket values.
++#[derive(Clone, Copy, Debug)]
++pub(crate) enum SiblingOp {
++    Avg,
++    Sum,
++    Min,
++    Max,
++    Stats,
++}
++
++/// A bucket entry whose value a pipeline can read or into which it can write a result.
++pub(crate) trait PipelineBucket {
++    fn key_as_f64(&self) -> Option<f64>;
++    fn doc_count(&self) -> u64;
++    fn sub(&self) -> &AggregationResults;
++    fn sub_mut(&mut self) -> &mut AggregationResults;
++}
++
++fn key_to_f64(key: &Key) -> Option<f64> {
++    match key {
++        Key::F64(value) => Some(*value),
++        Key::U64(value) => Some(*value as f64),
++        Key::I64(value) => Some(*value as f64),
++        Key::Str(_) => None,
++    }
++}
++
++impl PipelineBucket for BucketEntry {
++    fn key_as_f64(&self) -> Option<f64> {
++        key_to_f64(&self.key)
++    }
++    fn doc_count(&self) -> u64 {
++        self.doc_count
++    }
++    fn sub(&self) -> &AggregationResults {
++        &self.sub_aggregation
++    }
++    fn sub_mut(&mut self) -> &mut AggregationResults {
++        &mut self.sub_aggregation
++    }
++}
++
++impl PipelineBucket for RangeBucketEntry {
++    fn key_as_f64(&self) -> Option<f64> {
++        key_to_f64(&self.key)
++    }
++    fn doc_count(&self) -> u64 {
++        self.doc_count
++    }
++    fn sub(&self) -> &AggregationResults {
++        &self.sub_aggregation
++    }
++    fn sub_mut(&mut self) -> &mut AggregationResults {
++        &mut self.sub_aggregation
++    }
++}
++
++/// The leading name of a `buckets_path` value reference, or `None` for the `_count`/`_key` specials.
++fn ref_name(value_ref: &str) -> Option<&str> {
++    if value_ref == "_count" || value_ref == "_key" {
++        return None;
++    }
++    Some(value_ref.split('.').next().unwrap_or(value_ref))
++}
++
++fn validate_ref(value_ref: &str, sub_req: &Aggregations) -> crate::Result<()> {
++    match ref_name(value_ref) {
++        None => Ok(()),
++        Some(name) if sub_req.contains_key(name) => Ok(()),
++        Some(_) => Err(err(format!(
++            "buckets_path {value_ref:?} does not match a sub-aggregation"
++        ))),
++    }
++}
++
++/// Reads the value named by `value_ref` from a single bucket. Returns `Ok(None)` when the value is
++/// absent in this bucket (a gap).
++fn resolve_value<B: PipelineBucket + ?Sized>(
++    bucket: &B,
++    value_ref: &str,
++) -> crate::Result<Option<f64>> {
++    if value_ref == "_count" {
++        return Ok(Some(bucket.doc_count() as f64));
++    }
++    if value_ref == "_key" {
++        return Ok(bucket.key_as_f64());
++    }
++    let (name, property) = match value_ref.split_once('.') {
++        Some((name, property)) => (name, property),
++        None => (value_ref, "value"),
++    };
++    match bucket.sub().0.get(name) {
++        Some(agg_res) => agg_res.get_value_from_aggregation(name, property),
++        None => Ok(None),
++    }
++}
++
++fn apply_gap(value: Option<f64>, gap_policy: GapPolicy) -> Option<f64> {
++    match (value, gap_policy) {
++        (Some(value), _) => Some(value),
++        (None, GapPolicy::InsertZeros) => Some(0.0),
++        (None, GapPolicy::Skip) => None,
++    }
++}
++
++fn mean(values: &[f64]) -> Option<f64> {
++    if values.is_empty() {
++        None
++    } else {
++        Some(values.iter().sum::<f64>() / values.len() as f64)
++    }
++}
++
++fn min_value(values: &[f64]) -> Option<f64> {
++    values.iter().copied().reduce(f64::min)
++}
++
++fn max_value(values: &[f64]) -> Option<f64> {
++    values.iter().copied().reduce(f64::max)
++}
++
++fn reduce_sibling(op: SiblingOp, values: &[f64]) -> MetricResult {
++    match op {
++        SiblingOp::Avg => MetricResult::Pipeline(PipelineMetricResult { value: mean(values) }),
++        SiblingOp::Sum => MetricResult::Pipeline(PipelineMetricResult {
++            value: Some(values.iter().sum()),
++        }),
++        SiblingOp::Min => MetricResult::Pipeline(PipelineMetricResult {
++            value: min_value(values),
++        }),
++        SiblingOp::Max => MetricResult::Pipeline(PipelineMetricResult {
++            value: max_value(values),
++        }),
++        SiblingOp::Stats => MetricResult::Stats(Stats {
++            count: values.len() as u64,
++            sum: values.iter().sum(),
++            min: min_value(values),
++            max: max_value(values),
++            avg: mean(values),
++        }),
++    }
++}
++
++fn push_value<B: PipelineBucket>(
++    bucket: &B,
++    value_ref: &str,
++    gap_policy: GapPolicy,
++    out: &mut Vec<f64>,
++) -> crate::Result<()> {
++    if let Some(value) = apply_gap(resolve_value(bucket, value_ref)?, gap_policy) {
++        out.push(value);
++    }
++    Ok(())
++}
++
++/// Collects, in any order, the leaf values of a sibling bucket aggregation for a sibling pipeline.
++fn collect_sibling_values(
++    bucket_result: &BucketResult,
++    leaf: &str,
++    gap_policy: GapPolicy,
++) -> crate::Result<Vec<f64>> {
++    let mut values = Vec::new();
++    match bucket_result {
++        BucketResult::Histogram { buckets } => {
++            for bucket in buckets.iter() {
++                push_value(bucket, leaf, gap_policy, &mut values)?;
++            }
++        }
++        BucketResult::Range { buckets } => {
++            for bucket in buckets.iter() {
++                push_value(bucket, leaf, gap_policy, &mut values)?;
++            }
++        }
++        BucketResult::Terms { buckets, .. } => {
++            for bucket in buckets {
++                push_value(bucket, leaf, gap_policy, &mut values)?;
++            }
++        }
++        _ => {
++            return Err(err(
++                "sibling buckets_path must reference a histogram, date_histogram, range, or terms \
++                 aggregation",
++            ))
++        }
++    }
++    Ok(values)
++}
++
++pub(crate) fn compute_sibling(
++    op: SiblingOp,
++    req: &SiblingPipelineAggregation,
++    level_results: &AggregationResults,
++    level_req: &Aggregations,
++) -> crate::Result<MetricResult> {
++    let (head, leaf) = req.buckets_path.split_once('>').ok_or_else(|| {
++        err(format!(
++            "sibling buckets_path {:?} must have the form \"aggregation>value\"",
++            req.buckets_path
++        ))
++    })?;
++    let head_req = level_req
++        .get(head)
++        .ok_or_else(|| err(format!("buckets_path head {head:?} not found")))?;
++    validate_ref(leaf, head_req.sub_aggregation())?;
++    let head_res = level_results
++        .0
++        .get(head)
++        .ok_or_else(|| err(format!("buckets_path head {head:?} not found")))?;
++    let bucket_result = match head_res {
++        AggregationResult::BucketResult(bucket_result) => bucket_result,
++        AggregationResult::MetricResult(_) => {
++            return Err(err(format!(
++                "buckets_path head {head:?} is not a bucket aggregation"
++            )))
++        }
++    };
++    let values = collect_sibling_values(bucket_result, leaf, req.gap_policy)?;
++    Ok(reduce_sibling(op, &values))
++}
++
++fn cumulative_sum(values: &[Option<f64>]) -> Vec<Option<f64>> {
++    let mut running = 0.0;
++    values
++        .iter()
++        .map(|value| {
++            running += value.unwrap_or(0.0);
++            Some(running)
++        })
++        .collect()
++}
++
++fn derivative(values: &[Option<f64>], gap_policy: GapPolicy) -> Vec<Option<f64>> {
++    let mut out = Vec::with_capacity(values.len());
++    for index in 0..values.len() {
++        if index == 0 {
++            out.push(None);
++            continue;
++        }
++        let current = apply_gap(values[index], gap_policy);
++        let previous = apply_gap(values[index - 1], gap_policy);
++        match (current, previous) {
++            (Some(current), Some(previous)) => out.push(Some(current - previous)),
++            _ => out.push(None),
++        }
++    }
++    out
++}
++
++fn moving_avg(values: &[Option<f64>], window: usize, gap_policy: GapPolicy) -> Vec<Option<f64>> {
++    let mut out = Vec::with_capacity(values.len());
++    for index in 0..values.len() {
++        let start = index + 1 - window.min(index + 1);
++        let mut sum = 0.0;
++        let mut count = 0u64;
++        for value in &values[start..=index] {
++            if let Some(value) = apply_gap(*value, gap_policy) {
++                sum += value;
++                count += 1;
++            }
++        }
++        out.push(if count == 0 {
++            None
++        } else {
++            Some(sum / count as f64)
++        });
++    }
++    out
++}
++
++fn collect_inputs<B: PipelineBucket>(
++    buckets: &[B],
++    value_ref: &str,
++    sub_req: &Aggregations,
++) -> crate::Result<Vec<Option<f64>>> {
++    validate_ref(value_ref, sub_req)?;
++    buckets
++        .iter()
++        .map(|bucket| resolve_value(bucket, value_ref))
++        .collect()
++}
++
++fn write_outputs<B: PipelineBucket>(buckets: &mut [B], name: &str, outputs: &[Option<f64>]) {
++    for (bucket, output) in buckets.iter_mut().zip(outputs) {
++        if let Some(value) = output {
++            bucket.sub_mut().0.insert(
++                name.to_string(),
++                AggregationResult::MetricResult(MetricResult::Pipeline(PipelineMetricResult {
++                    value: Some(*value),
++                })),
++            );
++        }
++    }
++}
++
++fn build_vars<B: PipelineBucket>(
++    bucket: &B,
++    req: &ScriptPipelineAggregation,
++) -> crate::Result<Option<FxHashMap<String, f64>>> {
++    let mut vars = FxHashMap::default();
++    for (variable, value_ref) in &req.buckets_path {
++        match apply_gap(resolve_value(bucket, value_ref)?, req.gap_policy) {
++            Some(value) => {
++                vars.insert(variable.clone(), value);
++            }
++            None => return Ok(None),
++        }
++    }
++    Ok(Some(vars))
++}
++
++fn eval_script<B: PipelineBucket>(
++    buckets: &[B],
++    req: &ScriptPipelineAggregation,
++    sub_req: &Aggregations,
++) -> crate::Result<Vec<Option<f64>>> {
++    let expr = Expr::parse(&req.script)?;
++    for value_ref in req.buckets_path.values() {
++        validate_ref(value_ref, sub_req)?;
++    }
++    let mut out = Vec::with_capacity(buckets.len());
++    for bucket in buckets {
++        match build_vars(bucket, req)? {
++            Some(vars) => out.push(Some(expr.eval(&vars)?)),
++            None => out.push(None),
++        }
++    }
++    Ok(out)
++}
++
++fn eval_selector<B: PipelineBucket>(
++    buckets: &[B],
++    req: &ScriptPipelineAggregation,
++    sub_req: &Aggregations,
++) -> crate::Result<Vec<bool>> {
++    let expr = Expr::parse(&req.script)?;
++    for value_ref in req.buckets_path.values() {
++        validate_ref(value_ref, sub_req)?;
++    }
++    let mut keep = Vec::with_capacity(buckets.len());
++    for bucket in buckets {
++        match build_vars(bucket, req)? {
++            Some(vars) => {
++                let value = expr.eval(&vars)?;
++                keep.push(value != 0.0 && !value.is_nan());
++            }
++            None => keep.push(false),
++        }
++    }
++    Ok(keep)
++}
++
++fn process_vec<B: PipelineBucket>(
++    buckets: &mut Vec<B>,
++    sub_req: &Aggregations,
++    ordered: &[String],
++) -> crate::Result<()> {
++    for name in ordered {
++        match &sub_req[name].agg {
++            AggregationVariants::CumulativeSum(req) => {
++                let inputs = collect_inputs(buckets, &req.buckets_path, sub_req)?;
++                let outputs = cumulative_sum(&inputs);
++                write_outputs(buckets, name, &outputs);
++            }
++            AggregationVariants::Derivative(req) => {
++                let inputs = collect_inputs(buckets, &req.buckets_path, sub_req)?;
++                let outputs = derivative(&inputs, req.gap_policy);
++                write_outputs(buckets, name, &outputs);
++            }
++            AggregationVariants::MovingAvg(req) => {
++                let inputs = collect_inputs(buckets, &req.buckets_path, sub_req)?;
++                let outputs = moving_avg(&inputs, req.window, req.gap_policy);
++                write_outputs(buckets, name, &outputs);
++            }
++            AggregationVariants::BucketScript(req) => {
++                let outputs = eval_script(buckets, req, sub_req)?;
++                write_outputs(buckets, name, &outputs);
++            }
++            AggregationVariants::BucketSelector(req) => {
++                let keep = eval_selector(buckets, req, sub_req)?;
++                let mut keep = keep.into_iter();
++                buckets.retain(|_| keep.next().unwrap_or(true));
++            }
++            _ => {}
++        }
++    }
++    Ok(())
++}
++
++fn buckets_vec_mut<T>(buckets: &mut BucketEntries<T>) -> crate::Result<&mut Vec<T>> {
++    match buckets {
++        BucketEntries::Vec(vec) => Ok(vec),
++        BucketEntries::HashMap(_) => Err(err(
++            "per-bucket pipelines (serial, moving_avg, bucket_script, bucket_selector) require a \
++             non-keyed parent",
++        )),
++    }
++}
++
++/// Computes every per-bucket pipeline declared in `sub_req` over the parent's buckets, in
++/// dependency order.
++pub(crate) fn apply_per_bucket(
++    bucket_result: &mut BucketResult,
++    sub_req: &Aggregations,
++) -> crate::Result<()> {
++    let ordered = order_per_bucket(sub_req)?;
++    if ordered.is_empty() {
++        return Ok(());
++    }
++    match bucket_result {
++        BucketResult::Histogram { buckets } => {
++            process_vec(buckets_vec_mut(buckets)?, sub_req, &ordered)
++        }
++        BucketResult::Range { buckets } => {
++            process_vec(buckets_vec_mut(buckets)?, sub_req, &ordered)
++        }
++        BucketResult::Terms { buckets, .. } => process_vec(buckets, sub_req, &ordered),
++        _ => Err(err(
++            "per-bucket pipelines require a histogram, date_histogram, range, or terms parent",
++        )),
++    }
++}
++
++fn value_refs(agg: &AggregationVariants) -> Vec<&str> {
++    match agg {
++        AggregationVariants::CumulativeSum(req) => vec![req.buckets_path.as_str()],
++        AggregationVariants::Derivative(req) => vec![req.buckets_path.as_str()],
++        AggregationVariants::MovingAvg(req) => vec![req.buckets_path.as_str()],
++        AggregationVariants::BucketScript(req) | AggregationVariants::BucketSelector(req) => {
++            req.buckets_path.values().map(|s| s.as_str()).collect()
++        }
++        _ => vec![],
++    }
++}
++
++fn is_per_bucket(agg: &AggregationVariants) -> bool {
++    matches!(
++        agg,
++        AggregationVariants::CumulativeSum(_)
++            | AggregationVariants::Derivative(_)
++            | AggregationVariants::MovingAvg(_)
++            | AggregationVariants::BucketScript(_)
++            | AggregationVariants::BucketSelector(_)
++    )
++}
++
++/// Returns the per-bucket pipeline names of `sub_req` ordered so that a pipeline reading another
++/// pipeline's output is computed after it. Uses an iterative worklist (Kahn's algorithm) rather than
++/// host-stack recursion, so a long pipeline chain cannot overflow the stack. Errors on a cycle.
++fn order_per_bucket(sub_req: &Aggregations) -> crate::Result<Vec<String>> {
++    let mut names: Vec<String> = sub_req
++        .iter()
++        .filter(|(_, agg)| is_per_bucket(&agg.agg))
++        .map(|(name, _)| name.clone())
++        .collect();
++    names.sort();
++    let name_set: FxHashSet<&str> = names.iter().map(|name| name.as_str()).collect();
++    let mut in_degree: FxHashMap<&str, usize> =
++        names.iter().map(|name| (name.as_str(), 0usize)).collect();
++    let mut dependents: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
++    for name in &names {
++        for value_ref in value_refs(&sub_req[name].agg) {
++            if let Some(target) = ref_name(value_ref) {
++                if target != name.as_str() && name_set.contains(target) {
++                    *in_degree.get_mut(name.as_str()).unwrap() += 1;
++                    dependents.entry(target).or_default().push(name.as_str());
++                }
++            }
++        }
++    }
++    let mut queue: Vec<&str> = names
++        .iter()
++        .map(|name| name.as_str())
++        .filter(|name| in_degree[name] == 0)
++        .collect();
++    let mut ordered: Vec<String> = Vec::with_capacity(names.len());
++    let mut head = 0;
++    while head < queue.len() {
++        let node = queue[head];
++        head += 1;
++        ordered.push(node.to_string());
++        if let Some(node_dependents) = dependents.get(node) {
++            for &dependent in node_dependents {
++                let degree = in_degree.get_mut(dependent).unwrap();
++                *degree -= 1;
++                if *degree == 0 {
++                    queue.push(dependent);
++                }
++            }
++        }
++    }
++    if ordered.len() != names.len() {
++        return Err(err("pipeline buckets_path forms a dependency cycle"));
++    }
++    // A bucket_selector removes buckets, so it runs after every value-producing per-bucket pipeline.
++    // The stable sort keeps the dependency order among the value producers.
++    ordered.sort_by_key(|name| matches!(sub_req[name].agg, AggregationVariants::BucketSelector(_)));
++    Ok(ordered)
++}
+diff --git a/src/aggregation/pipeline/expr.rs b/src/aggregation/pipeline/expr.rs
+new file mode 100644
+index 0000000..b826ec5
+--- /dev/null
++++ b/src/aggregation/pipeline/expr.rs
+@@ -0,0 +1,284 @@
++//! A small arithmetic expression language used by the `bucket_script` and `bucket_selector`
++//! pipeline aggregations.
++//!
++//! The grammar supports decimal numeric literals, variable identifiers (the keys of the
++//! `buckets_path` map), the binary operators `+ - * / %`, unary minus, parentheses, the comparison
++//! operators `== != < <= > >=`, and the boolean operators `&&` and `||`. Comparisons and boolean
++//! operators evaluate to `1.0` (true) or `0.0` (false). Precedence, from tightest to loosest:
++//! unary minus, then `* / %`, then `+ -`, then comparisons, then `&&`, then `||`.
++
++use rustc_hash::FxHashMap;
++
++use crate::aggregation::AggregationError;
++use crate::TantivyError;
++
++fn err(msg: impl Into<String>) -> TantivyError {
++    TantivyError::AggregationError(AggregationError::InvalidRequest(msg.into()))
++}
++
++#[derive(Clone, Copy, Debug)]
++pub(crate) enum BinOp {
++    Add,
++    Sub,
++    Mul,
++    Div,
++    Rem,
++    Eq,
++    Ne,
++    Lt,
++    Le,
++    Gt,
++    Ge,
++    And,
++    Or,
++}
++
++#[derive(Clone, Debug)]
++pub(crate) enum Expr {
++    Num(f64),
++    Var(String),
++    Neg(Box<Expr>),
++    Bin(BinOp, Box<Expr>, Box<Expr>),
++}
++
++#[derive(Clone, Debug, PartialEq)]
++enum Tok {
++    Num(f64),
++    Ident(String),
++    Plus,
++    Minus,
++    Star,
++    Slash,
++    Percent,
++    LParen,
++    RParen,
++    EqEq,
++    Ne,
++    Lt,
++    Le,
++    Gt,
++    Ge,
++    And,
++    Or,
++}
++
++fn tokenize(src: &str) -> crate::Result<Vec<Tok>> {
++    let chars: Vec<char> = src.chars().collect();
++    let mut toks = Vec::new();
++    let mut i = 0;
++    while i < chars.len() {
++        let c = chars[i];
++        if c.is_whitespace() {
++            i += 1;
++        } else if c.is_ascii_digit() || c == '.' {
++            let start = i;
++            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
++                i += 1;
++            }
++            let text: String = chars[start..i].iter().collect();
++            let value = text
++                .parse::<f64>()
++                .map_err(|_| err(format!("invalid number {text:?} in script")))?;
++            toks.push(Tok::Num(value));
++        } else if c.is_alphabetic() || c == '_' {
++            let start = i;
++            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
++                i += 1;
++            }
++            toks.push(Tok::Ident(chars[start..i].iter().collect()));
++        } else {
++            let two = |a: char| i + 1 < chars.len() && chars[i + 1] == a;
++            let tok = match c {
++                '+' => Tok::Plus,
++                '-' => Tok::Minus,
++                '*' => Tok::Star,
++                '/' => Tok::Slash,
++                '%' => Tok::Percent,
++                '(' => Tok::LParen,
++                ')' => Tok::RParen,
++                '=' if two('=') => {
++                    i += 1;
++                    Tok::EqEq
++                }
++                '!' if two('=') => {
++                    i += 1;
++                    Tok::Ne
++                }
++                '<' if two('=') => {
++                    i += 1;
++                    Tok::Le
++                }
++                '>' if two('=') => {
++                    i += 1;
++                    Tok::Ge
++                }
++                '<' => Tok::Lt,
++                '>' => Tok::Gt,
++                '&' if two('&') => {
++                    i += 1;
++                    Tok::And
++                }
++                '|' if two('|') => {
++                    i += 1;
++                    Tok::Or
++                }
++                other => return Err(err(format!("unexpected character {other:?} in script"))),
++            };
++            toks.push(tok);
++            i += 1;
++        }
++    }
++    Ok(toks)
++}
++
++struct Parser {
++    toks: Vec<Tok>,
++    pos: usize,
++}
++
++impl Parser {
++    fn peek(&self) -> Option<&Tok> {
++        self.toks.get(self.pos)
++    }
++
++    fn bump(&mut self) -> Option<Tok> {
++        let tok = self.toks.get(self.pos).cloned();
++        self.pos += 1;
++        tok
++    }
++
++    fn parse_or(&mut self) -> crate::Result<Expr> {
++        let mut left = self.parse_and()?;
++        while matches!(self.peek(), Some(Tok::Or)) {
++            self.bump();
++            let right = self.parse_and()?;
++            left = Expr::Bin(BinOp::Or, Box::new(left), Box::new(right));
++        }
++        Ok(left)
++    }
++
++    fn parse_and(&mut self) -> crate::Result<Expr> {
++        let mut left = self.parse_cmp()?;
++        while matches!(self.peek(), Some(Tok::And)) {
++            self.bump();
++            let right = self.parse_cmp()?;
++            left = Expr::Bin(BinOp::And, Box::new(left), Box::new(right));
++        }
++        Ok(left)
++    }
++
++    fn parse_cmp(&mut self) -> crate::Result<Expr> {
++        let mut left = self.parse_add()?;
++        loop {
++            let op = match self.peek() {
++                Some(Tok::EqEq) => BinOp::Eq,
++                Some(Tok::Ne) => BinOp::Ne,
++                Some(Tok::Lt) => BinOp::Lt,
++                Some(Tok::Le) => BinOp::Le,
++                Some(Tok::Gt) => BinOp::Gt,
++                Some(Tok::Ge) => BinOp::Ge,
++                _ => break,
++            };
++            self.bump();
++            let right = self.parse_add()?;
++            left = Expr::Bin(op, Box::new(left), Box::new(right));
++        }
++        Ok(left)
++    }
++
++    fn parse_add(&mut self) -> crate::Result<Expr> {
++        let mut left = self.parse_mul()?;
++        loop {
++            let op = match self.peek() {
++                Some(Tok::Plus) => BinOp::Add,
++                Some(Tok::Minus) => BinOp::Sub,
++                _ => break,
++            };
++            self.bump();
++            let right = self.parse_mul()?;
++            left = Expr::Bin(op, Box::new(left), Box::new(right));
++        }
++        Ok(left)
++    }
++
++    fn parse_mul(&mut self) -> crate::Result<Expr> {
++        let mut left = self.parse_unary()?;
++        loop {
++            let op = match self.peek() {
++                Some(Tok::Star) => BinOp::Mul,
++                Some(Tok::Slash) => BinOp::Div,
++                Some(Tok::Percent) => BinOp::Rem,
++                _ => break,
++            };
++            self.bump();
++            let right = self.parse_unary()?;
++            left = Expr::Bin(op, Box::new(left), Box::new(right));
++        }
++        Ok(left)
++    }
++
++    fn parse_unary(&mut self) -> crate::Result<Expr> {
++        if matches!(self.peek(), Some(Tok::Minus)) {
++            self.bump();
++            return Ok(Expr::Neg(Box::new(self.parse_unary()?)));
++        }
++        self.parse_primary()
++    }
++
++    fn parse_primary(&mut self) -> crate::Result<Expr> {
++        match self.bump() {
++            Some(Tok::Num(n)) => Ok(Expr::Num(n)),
++            Some(Tok::Ident(name)) => Ok(Expr::Var(name)),
++            Some(Tok::LParen) => {
++                let inner = self.parse_or()?;
++                match self.bump() {
++                    Some(Tok::RParen) => Ok(inner),
++                    _ => Err(err("missing closing parenthesis in script")),
++                }
++            }
++            other => Err(err(format!("unexpected token {other:?} in script"))),
++        }
++    }
++}
++
++impl Expr {
++    pub(crate) fn parse(src: &str) -> crate::Result<Expr> {
++        let toks = tokenize(src)?;
++        let mut parser = Parser { toks, pos: 0 };
++        let expr = parser.parse_or()?;
++        if parser.pos != parser.toks.len() {
++            return Err(err("trailing tokens in script"));
++        }
++        Ok(expr)
++    }
++
++    pub(crate) fn eval(&self, vars: &FxHashMap<String, f64>) -> crate::Result<f64> {
++        let bool_to_f = |t: bool| if t { 1.0 } else { 0.0 };
++        Ok(match self {
++            Expr::Num(n) => *n,
++            Expr::Var(name) => *vars
++                .get(name)
++                .ok_or_else(|| err(format!("unknown script variable {name:?}")))?,
++            Expr::Neg(inner) => -inner.eval(vars)?,
++            Expr::Bin(op, lhs, rhs) => {
++                let left = lhs.eval(vars)?;
++                let right = rhs.eval(vars)?;
++                match op {
++                    BinOp::Add => left + right,
++                    BinOp::Sub => left - right,
++                    BinOp::Mul => left * right,
++                    BinOp::Div => left / right,
++                    BinOp::Rem => left % right,
++                    BinOp::Eq => bool_to_f(left == right),
++                    BinOp::Ne => bool_to_f(left != right),
++                    BinOp::Lt => bool_to_f(left < right),
++                    BinOp::Le => bool_to_f(left <= right),
++                    BinOp::Gt => bool_to_f(left > right),
++                    BinOp::Ge => bool_to_f(left >= right),
++                    BinOp::And => bool_to_f(left != 0.0 && right != 0.0),
++                    BinOp::Or => bool_to_f(left != 0.0 || right != 0.0),
++                }
++            }
++        })
++    }
++}
+diff --git a/src/aggregation/pipeline/mod.rs b/src/aggregation/pipeline/mod.rs
+new file mode 100644
+index 0000000..27f2217
+--- /dev/null
++++ b/src/aggregation/pipeline/mod.rs
+@@ -0,0 +1,122 @@
++//! Pipeline aggregations, computed in a post-finalization pass over the assembled bucket tree.
++//!
++//! Unlike metric and bucket aggregations, pipeline aggregations read no fast field. They consume the
++//! output of other aggregations addressed by a `buckets_path`. There are three families:
++//!
++//! - sibling pipelines (`avg_bucket`, `sum_bucket`, `min_bucket`, `max_bucket`, `stats_bucket`)
++//!   reduce the buckets of a sibling multi-bucket aggregation into a single metric placed beside it;
++//! - serial pipelines (`cumulative_sum`, `derivative`, `moving_avg`) walk the buckets of their parent
++//!   multi-bucket aggregation in order, writing a value into each bucket;
++//! - calculated pipelines (`bucket_script`, `bucket_selector`) evaluate a script over named values in
++//!   each parent bucket, either writing the result or dropping the bucket.
++
++mod compute;
++mod expr;
++
++use compute::SiblingOp;
++use crate::aggregation::agg_req::{AggregationVariants, Aggregations};
++use crate::aggregation::agg_result::{AggregationResult, AggregationResults};
++use crate::aggregation::AggregationError;
++use crate::TantivyError;
++
++fn err(msg: impl Into<String>) -> TantivyError {
++    TantivyError::AggregationError(AggregationError::InvalidRequest(msg.into()))
++}
++
++fn is_sibling(agg: &AggregationVariants) -> bool {
++    matches!(
++        agg,
++        AggregationVariants::AvgBucket(_)
++            | AggregationVariants::SumBucket(_)
++            | AggregationVariants::MinBucket(_)
++            | AggregationVariants::MaxBucket(_)
++            | AggregationVariants::StatsBucket(_)
++    )
++}
++
++fn is_per_bucket(agg: &AggregationVariants) -> bool {
++    matches!(
++        agg,
++        AggregationVariants::CumulativeSum(_)
++            | AggregationVariants::Derivative(_)
++            | AggregationVariants::MovingAvg(_)
++            | AggregationVariants::BucketScript(_)
++            | AggregationVariants::BucketSelector(_)
++    )
++}
++
++fn has_per_bucket_pipeline(sub_req: &Aggregations) -> bool {
++    sub_req.values().any(|agg| is_per_bucket(&agg.agg))
++}
++
++/// A per-bucket pipeline (`cumulative_sum`, `derivative`, `moving_avg`, `bucket_script`,
++/// `bucket_selector`) must be declared inside a multi-bucket aggregation whose buckets it walks. One
++/// placed at the request root, where there is no such parent, is a request error rather than a
++/// silent no-op. Called for each level entered through the public `into_final_result`.
++pub(crate) fn reject_root_pipelines(req: &Aggregations) -> crate::Result<()> {
++    for (name, agg) in req.iter() {
++        if is_per_bucket(&agg.agg) {
++            return Err(err(format!(
++                "pipeline aggregation {name:?} requires a multi-bucket parent (histogram, \
++                 date_histogram, range, or terms); it cannot be declared without one"
++            )));
++        }
++    }
++    Ok(())
++}
++
++/// Runs the pipeline aggregations declared at one level of the result tree, after that level and all
++/// of its sub-aggregations have been finalized.
++///
++/// Per-bucket pipelines are computed first so that a sibling pipeline may reduce a per-bucket
++/// pipeline's output.
++pub(crate) fn apply_level_pipelines(
++    results: &mut AggregationResults,
++    req: &Aggregations,
++) -> crate::Result<()> {
++    for (name, agg) in req.iter() {
++        if agg.agg.is_pipeline() || !has_per_bucket_pipeline(agg.sub_aggregation()) {
++            continue;
++        }
++        match results.0.get_mut(name) {
++            Some(AggregationResult::BucketResult(bucket_result)) => {
++                compute::apply_per_bucket(bucket_result, agg.sub_aggregation())?;
++            }
++            _ => {
++                return Err(err(format!(
++                    "per-bucket pipeline under {name:?} requires a multi-bucket parent, but \
++                     {name:?} is not a bucket aggregation"
++                )));
++            }
++        }
++    }
++
++    let mut siblings: Vec<String> = req
++        .iter()
++        .filter(|(_, agg)| is_sibling(&agg.agg))
++        .map(|(name, _)| name.clone())
++        .collect();
++    siblings.sort();
++    for name in siblings {
++        let metric = match &req[&name].agg {
++            AggregationVariants::AvgBucket(sib) => {
++                compute::compute_sibling(SiblingOp::Avg, sib, results, req)?
++            }
++            AggregationVariants::SumBucket(sib) => {
++                compute::compute_sibling(SiblingOp::Sum, sib, results, req)?
++            }
++            AggregationVariants::MinBucket(sib) => {
++                compute::compute_sibling(SiblingOp::Min, sib, results, req)?
++            }
++            AggregationVariants::MaxBucket(sib) => {
++                compute::compute_sibling(SiblingOp::Max, sib, results, req)?
++            }
++            AggregationVariants::StatsBucket(sib) => {
++                compute::compute_sibling(SiblingOp::Stats, sib, results, req)?
++            }
++            _ => continue,
++        };
++        results.0.insert(name, AggregationResult::MetricResult(metric));
++    }
++    Ok(())
++}

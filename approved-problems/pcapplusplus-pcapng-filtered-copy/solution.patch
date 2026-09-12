@@ -1,0 +1,290 @@
+diff --git a/Pcap++/header/PcapFileDevice.h b/Pcap++/header/PcapFileDevice.h
+index f23a891b..1a4e8b4b 100644
+--- a/Pcap++/header/PcapFileDevice.h
++++ b/Pcap++/header/PcapFileDevice.h
+@@ -408,6 +408,14 @@ namespace pcpp
+ 		/// error log will be printed) or if reached end-of-file
+ 		bool getNextPacket(RawPacket& rawPacket) override;
+ 
++		/// Copy this pcap-ng file while retaining only packets that match the filter configured on this device.
++		/// Non-packet blocks are preserved byte-for-byte except custom blocks marked "do not copy"; interfaces remain
++		/// in their original section, so retained packet interface IDs do not change.
++		/// This operation is independent of the device's open state and does not change its current read position.
++		/// @param[in] outputFileName The path of the filtered pcap-ng file to create or overwrite
++		/// @return True if the input was valid and the filtered file was written successfully, false otherwise
++		bool copyFiltered(const std::string& outputFileName) const;
++
+ 		/// Open the file name which path was specified in the constructor in a read-only mode
+ 		/// @return True if file was opened successfully or if file is already opened. False if opening the file failed
+ 		/// for some reason (for example: file path does not exist)
+diff --git a/Pcap++/src/PcapFileDevice.cpp b/Pcap++/src/PcapFileDevice.cpp
+index 459dc042..d1197a4c 100644
+--- a/Pcap++/src/PcapFileDevice.cpp
++++ b/Pcap++/src/PcapFileDevice.cpp
+@@ -11,6 +11,7 @@
+ #include <cstdint>
+ #include <istream>
+ #include <iterator>
++#include <utility>
+ 
+ #include "AssertionUtils.h"
+ 
+@@ -48,6 +49,83 @@ namespace pcpp
+ 			return N;
+ 		}
+ 
++		enum class PcapNgByteOrder
++		{
++			Little,
++			Big
++		};
++
++		template <typename T> T readPcapNg(const uint8_t* data, PcapNgByteOrder order)
++		{
++			T result = 0;
++			for (size_t index = 0; index < sizeof(T); ++index)
++				result |= static_cast<T>(data[index])
++				          << (order == PcapNgByteOrder::Little ? index * 8 : (sizeof(T) - index - 1) * 8);
++			return result;
++		}
++
++		template <typename T> void writePcapNg(uint8_t* data, T value, PcapNgByteOrder order)
++		{
++			for (size_t index = 0; index < sizeof(T); ++index)
++				data[index] = static_cast<uint8_t>(
++				    value >> (order == PcapNgByteOrder::Little ? index * 8 : (sizeof(T) - index - 1) * 8));
++		}
++
++		bool advancePcapNgField(size_t& offset, uint16_t valueLength, size_t end)
++		{
++			const size_t paddedLength = (static_cast<size_t>(valueLength) + 3) & ~size_t(3);
++			if (offset > end || paddedLength > end - offset)
++				return false;
++			offset += paddedLength;
++			return true;
++		}
++
++		bool validatePcapNgOptions(const uint8_t* block, uint32_t blockLength, size_t optionsOffset,
++		                           PcapNgByteOrder order)
++		{
++			const size_t optionsEnd = blockLength - 4;
++			if (optionsOffset > optionsEnd)
++				return false;
++			while (optionsOffset < optionsEnd)
++			{
++				if (optionsEnd - optionsOffset < 4)
++					return false;
++				const uint16_t optionType = readPcapNg<uint16_t>(block + optionsOffset, order);
++				const uint16_t optionLength = readPcapNg<uint16_t>(block + optionsOffset + 2, order);
++				optionsOffset += 4;
++				if (!advancePcapNgField(optionsOffset, optionLength, optionsEnd))
++					return false;
++				if (optionType == 0)
++					return optionLength == 0 && optionsOffset == optionsEnd;
++			}
++			return true;
++		}
++
++		bool findPcapNgNameResolutionOptions(const uint8_t* block, uint32_t blockLength, PcapNgByteOrder order,
++		                                     size_t& optionsOffset)
++		{
++			const size_t recordsEnd = blockLength - 4;
++			size_t recordOffset = 8;
++			while (recordOffset < recordsEnd)
++			{
++				if (recordsEnd - recordOffset < 4)
++					return false;
++				const uint16_t recordType = readPcapNg<uint16_t>(block + recordOffset, order);
++				const uint16_t recordLength = readPcapNg<uint16_t>(block + recordOffset + 2, order);
++				recordOffset += 4;
++				if (!advancePcapNgField(recordOffset, recordLength, recordsEnd))
++					return false;
++				if (recordType == 0)
++				{
++					if (recordLength != 0)
++						return false;
++					optionsOffset = recordOffset;
++					return true;
++				}
++			}
++			return false;
++		}
++
+ 		// Magic numbers for different pcap formats
+ 		// Regular pcap format. Microsecond precision.
+ 		constexpr uint32_t TCPDUMP_MAGIC = 0xa1b2c3d4;
+@@ -1185,6 +1263,174 @@ namespace pcpp
+ 		return getNextPacketInternal(rawPacket, nullptr);
+ 	}
+ 
++	bool PcapNgFileReaderDevice::copyFiltered(const std::string& outputFileName) const
++	{
++		constexpr uint32_t SectionHeader = 0x0a0d0d0a;
++		constexpr uint32_t InterfaceDescription = 1, ObsoletePacket = 2, SimplePacket = 3, NameResolution = 4;
++		constexpr uint32_t InterfaceStatistics = 5, EnhancedPacket = 6;
++		constexpr uint32_t DecryptionSecrets = 10, DoNotCopyCustom = 0x40000bad;
++
++		auto fail = [this](const char* reason) {
++			PCPP_LOG_ERROR("Cannot copy pcapng file '" << m_FileName << "': " << reason);
++			return false;
++		};
++		std::ifstream inputFile(m_FileName, std::ios::binary);
++		const std::vector<uint8_t> input{ std::istreambuf_iterator<char>(inputFile), std::istreambuf_iterator<char>() };
++		if (!inputFile || inputFile.bad() || input.empty())
++			return fail("cannot read input");
++
++		std::vector<std::pair<uint16_t, uint32_t>> interfaces;
++		std::vector<uint8_t> output;
++		output.reserve(input.size());
++		PcapNgByteOrder order = PcapNgByteOrder::Little;
++		bool haveSection = false;
++		bool sectionIsFinite = false;
++		size_t inputSectionEnd = 0;
++		size_t outputSectionHeader = 0;
++		size_t outputSectionContent = 0;
++
++		auto finishOutputSection = [&]() {
++			if (sectionIsFinite)
++				writePcapNg(output.data() + outputSectionHeader + 16,
++				            static_cast<uint64_t>(output.size() - outputSectionContent), order);
++		};
++
++		for (size_t offset = 0; offset < input.size();)
++		{
++			if (input.size() - offset < 12)
++				return fail("truncated block header");
++			const uint8_t* block = input.data() + offset;
++			const bool isSection = block[0] == 0x0a && block[1] == 0x0d && block[2] == 0x0d && block[3] == 0x0a;
++			if (isSection)
++			{
++				if (sectionIsFinite && offset != inputSectionEnd)
++					return fail("incorrect finite section length");
++				if (input.size() - offset < 28)
++					return fail("truncated section header");
++				finishOutputSection();
++				if (block[8] == 0x4d && block[9] == 0x3c && block[10] == 0x2b && block[11] == 0x1a)
++					order = PcapNgByteOrder::Little;
++				else if (block[8] == 0x1a && block[9] == 0x2b && block[10] == 0x3c && block[11] == 0x4d)
++					order = PcapNgByteOrder::Big;
++				else
++					return fail("invalid byte-order magic");
++				haveSection = true;
++				interfaces.clear();
++			}
++			else if (!haveSection)
++				return fail("block before first section");
++
++			const uint32_t blockType = readPcapNg<uint32_t>(block, order);
++			const uint32_t blockLength = readPcapNg<uint32_t>(block + 4, order);
++			if (blockLength < 12 || blockLength % 4 != 0 || blockLength > input.size() - offset ||
++			    readPcapNg<uint32_t>(block + blockLength - 4, order) != blockLength)
++				return fail("invalid block length");
++			if (sectionIsFinite && !isSection && offset + blockLength > inputSectionEnd)
++				return fail("block exceeds finite section");
++
++			bool keep = true;
++			if (blockType == SectionHeader)
++			{
++				if (!isSection || blockLength < 28 || readPcapNg<uint16_t>(block + 12, order) != 1 ||
++				    !validatePcapNgOptions(block, blockLength, 24, order))
++					return fail("unsupported section header");
++				const uint64_t declaredLength = readPcapNg<uint64_t>(block + 16, order);
++				sectionIsFinite = declaredLength != UINT64_MAX;
++				if (sectionIsFinite)
++				{
++					if (declaredLength > input.size() - offset - blockLength)
++						return fail("finite section exceeds input");
++					inputSectionEnd = offset + blockLength + static_cast<size_t>(declaredLength);
++				}
++				outputSectionHeader = output.size();
++			}
++			else if (blockType == InterfaceDescription)
++			{
++				if (blockLength < 20 || !validatePcapNgOptions(block, blockLength, 16, order))
++					return fail("short interface description");
++				interfaces.emplace_back(readPcapNg<uint16_t>(block + 8, order),
++				                        readPcapNg<uint32_t>(block + 12, order));
++			}
++			else if (blockType == EnhancedPacket)
++			{
++				if (blockLength < 32)
++					return fail("short enhanced packet");
++				const uint32_t interfaceId = readPcapNg<uint32_t>(block + 8, order);
++				const uint32_t capturedLength = readPcapNg<uint32_t>(block + 20, order);
++				const uint32_t originalLength = readPcapNg<uint32_t>(block + 24, order);
++				const size_t paddedLength = (static_cast<size_t>(capturedLength) + 3) & ~size_t(3);
++				if (interfaceId >= interfaces.size() || capturedLength > originalLength ||
++				    32 + paddedLength > blockLength)
++					return fail("invalid enhanced packet");
++				timespec timestamp = {};
++				keep = m_BpfWrapper.matches(block + 28, capturedLength, timestamp, interfaces[interfaceId].first);
++				if (keep && !validatePcapNgOptions(block, blockLength, 28 + paddedLength, order))
++					return fail("invalid enhanced packet options");
++			}
++			else if (blockType == SimplePacket)
++			{
++				if (interfaces.empty() || blockLength < 16)
++					return fail("invalid simple packet");
++				const uint32_t originalLength = readPcapNg<uint32_t>(block + 8, order);
++				const uint32_t capturedLength =
++				    interfaces[0].second == 0 ? originalLength : std::min(originalLength, interfaces[0].second);
++				const size_t paddedLength = (static_cast<size_t>(capturedLength) + 3) & ~size_t(3);
++				if (16 + paddedLength != blockLength)
++					return fail("invalid simple packet length");
++				timespec timestamp = {};
++				keep = m_BpfWrapper.matches(block + 12, capturedLength, timestamp, interfaces[0].first);
++			}
++			else if (blockType == ObsoletePacket)
++				return fail("obsolete packet blocks are unsupported");
++			else if (blockType == InterfaceStatistics)
++			{
++				if (blockLength < 24 || readPcapNg<uint32_t>(block + 8, order) >= interfaces.size() ||
++				    !validatePcapNgOptions(block, blockLength, 20, order))
++					return fail("invalid interface statistics");
++			}
++			else if (blockType == NameResolution)
++			{
++				size_t optionsOffset = 0;
++				if (!findPcapNgNameResolutionOptions(block, blockLength, order, optionsOffset) ||
++				    !validatePcapNgOptions(block, blockLength, optionsOffset, order))
++					return fail("invalid name resolution");
++			}
++			else if (blockType == DecryptionSecrets)
++			{
++				if (blockLength < 20)
++					return fail("short decryption secrets");
++				const uint32_t secretsLength = readPcapNg<uint32_t>(block + 12, order);
++				const size_t paddedLength = (static_cast<size_t>(secretsLength) + 3) & ~size_t(3);
++				if (20 + paddedLength > blockLength ||
++				    !validatePcapNgOptions(block, blockLength, 16 + paddedLength, order))
++					return fail("invalid decryption secrets");
++			}
++			else if (blockType == DoNotCopyCustom)
++				keep = false;
++
++			if (keep)
++			{
++				output.insert(output.end(), block, block + blockLength);
++				if (blockType == SectionHeader)
++					outputSectionContent = output.size();
++			}
++			offset += blockLength;
++		}
++		if (sectionIsFinite && inputSectionEnd != input.size())
++			return fail("incorrect final section length");
++		finishOutputSection();
++
++		std::ofstream outputFile(outputFileName, std::ios::binary | std::ios::trunc);
++		if (outputFile)
++			outputFile.write(reinterpret_cast<const char*>(output.data()), static_cast<std::streamsize>(output.size()));
++		if (!outputFile)
++		{
++			PCPP_LOG_ERROR("Cannot write pcapng output file '" << outputFileName << "'");
++			return false;
++		}
++		return true;
++	}
++
+ 	bool PcapNgFileReaderDevice::getNextPacketInternal(RawPacket& rawPacket, std::string* packetComment)
+ 	{
+ 		if (m_LightPcapNg == nullptr)

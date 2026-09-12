@@ -1,0 +1,406 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..c6aefed
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,74 @@
++#!/usr/bin/env bash
++set -uo pipefail
++export PATH="/opt/cargo/bin:${PATH}"
++
++# Parse arguments position-independently. The platform invokes:
++#   ./test.sh --output_path <path> base|new
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++    case "$1" in
++        --output_path) OUTPUT_PATH="$2"; shift 2 ;;
++        base|new) MODE="$1"; shift ;;
++        *) echo "Usage: $0 --output_path <path> base|new"; exit 1 ;;
++    esac
++done
++
++if [ -z "$MODE" ] || [ -z "$OUTPUT_PATH" ]; then
++    echo "Usage: $0 --output_path <path> base|new"
++    exit 1
++fi
++
++# Runs a cargo test command, parses its libtest output, and emits JUnit XML.
++# Includes a build-failure fallback so a compilation error still produces a
++# non-empty report instead of "no test suite results were found".
++run_and_produce_junit() {
++    local output_path="$1"; shift
++    local test_output exit_code=0
++    test_output=$("$@" 2>&1) || exit_code=$?
++    echo "$test_output"
++
++    local passed=0 failed=0 testcases=""
++    while IFS= read -r line; do
++        if [[ "$line" =~ ^test\ (.+)\ \.\.\.\ ok$ ]]; then
++            testcases+="    <testcase name=\"${BASH_REMATCH[1]}\" classname=\"toydb-test\" />"$'\n'
++            ((passed++)) || true
++        elif [[ "$line" =~ ^test\ (.+)\ \.\.\.\ FAILED$ ]]; then
++            testcases+="    <testcase name=\"${BASH_REMATCH[1]}\" classname=\"toydb-test\"><failure message=\"test failed\"/></testcase>"$'\n'
++            ((failed++)) || true
++        fi
++    done <<< "$test_output"
++
++    # Build-failure fallback: cargo crashed before any test ran.
++    if [ $((passed + failed)) -eq 0 ] && [ $exit_code -ne 0 ]; then
++        local sanitized
++        sanitized=$(printf '%s' "$test_output" | tail -c 4000 \
++            | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g')
++        testcases="    <testcase name=\"compilation\" classname=\"toydb-test\"><failure message=\"build failed\"><![CDATA[${sanitized}]]></failure></testcase>"$'\n'
++        failed=1
++    fi
++
++    mkdir -p "$(dirname "$output_path")"
++    cat > "$output_path" <<XMLEOF
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites>
++  <testsuite name="toydb-test" tests="$((passed + failed))" failures="${failed}" errors="0">
++${testcases}  </testsuite>
++</testsuites>
++XMLEOF
++    return $exit_code
++}
++
++case "$MODE" in
++    # Base mode runs the full library test suite: every SQL (parser, planner,
++    # optimizer, executor) and storage/MVCC testscript, the regression surface
++    # for this change. The tests/ end-to-end cluster scripts are networked Raft
++    # e2e tests orthogonal to the SQL engine and are not run here.
++    base)
++        run_and_produce_junit "$OUTPUT_PATH" cargo test --lib
++        ;;
++    # New mode runs only the new subquery integration test.
++    new)
++        run_and_produce_junit "$OUTPUT_PATH" cargo test --test predicate_resolution_suite
++        ;;
++esac
+diff --git a/tests/predicate_resolution_suite.rs b/tests/predicate_resolution_suite.rs
+new file mode 100644
+index 0000000..f45b7e8
+--- /dev/null
++++ b/tests/predicate_resolution_suite.rs
+@@ -0,0 +1,320 @@
++// Generated against duckdb as the oracle; see authoring notes. Do not edit by hand.
++use toydb::sql::engine::{Engine, Local};
++use toydb::sql::execution::StatementResult;
++use toydb::sql::types::Value;
++use toydb::storage::Memory;
++
++fn db() -> Local<Memory> {
++    let db = Local::new(Memory::new());
++    exec(&db, "CREATE TABLE products (id INTEGER PRIMARY KEY, name STRING, category INTEGER, price INTEGER)");
++    exec(&db, "INSERT INTO products VALUES (1, 'apple', 1, 10), (2, 'banana', 1, 20), (3, 'carrot', 2, 30), (4, 'date', 2, NULL), (5, 'egg', NULL, 15)");
++    exec(&db, "CREATE TABLE orders (id INTEGER PRIMARY KEY, product INTEGER, qty INTEGER)");
++    exec(&db, "INSERT INTO orders VALUES (1, 1, 5), (2, 2, 3), (3, 2, 7), (4, NULL, 2)");
++    db
++}
++
++fn exec(db: &Local<Memory>, sql: &str) {
++    db.session().execute(sql).unwrap_or_else(|e| panic!("error on `{sql}`: {e}"));
++}
++
++fn query(db: &Local<Memory>, sql: &str) -> Vec<Vec<Value>> {
++    match db.session().execute(sql).unwrap_or_else(|e| panic!("error on `{sql}`: {e}")) {
++        StatementResult::Select { rows, .. } => rows,
++        _ => panic!("expected a SELECT result for `{sql}`"),
++    }
++}
++
++fn expect_error(db: &Local<Memory>, sql: &str) {
++    if db.session().execute(sql).is_ok() {
++        panic!("expected an error for `{sql}`");
++    }
++}
++
++fn i(n: i64) -> Value {
++    Value::Integer(n)
++}
++fn b(v: bool) -> Value {
++    Value::Boolean(v)
++}
++fn s(v: &str) -> Value {
++    Value::String(v.to_string())
++}
++fn null() -> Value {
++    Value::Null
++}
++
++#[test]
++fn scalar_aggregate() {
++    assert_eq!(query(&db(), "SELECT (SELECT MAX(price) FROM products)"), vec![vec![i(30)]]);
++}
++
++#[test]
++fn scalar_null_value() {
++    assert_eq!(query(&db(), "SELECT (SELECT price FROM products WHERE id = 4)"), vec![vec![null()]]);
++}
++
++#[test]
++fn scalar_zero_rows_is_null() {
++    assert_eq!(query(&db(), "SELECT (SELECT price FROM products WHERE id = 99)"), vec![vec![null()]]);
++}
++
++#[test]
++fn scalar_in_where() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE price = (SELECT MAX(price) FROM products) ORDER BY id"), vec![vec![i(3)]]);
++}
++
++#[test]
++fn scalar_correlated_in_select() {
++    assert_eq!(query(&db(), "SELECT orders.id, (SELECT name FROM products WHERE products.id = orders.product) FROM orders ORDER BY orders.id"), vec![vec![i(1), s("apple")], vec![i(2), s("banana")], vec![i(3), s("banana")], vec![i(4), null()]]);
++}
++
++#[test]
++fn scalar_correlated_aggregate() {
++    assert_eq!(query(&db(), "SELECT id, (SELECT MAX(qty) FROM orders WHERE orders.product = products.id) FROM products ORDER BY id"), vec![vec![i(1), i(5)], vec![i(2), i(7)], vec![i(3), null()], vec![i(4), null()], vec![i(5), null()]]);
++}
++
++#[test]
++fn in_list() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE category IN (1, 2) ORDER BY id"), vec![vec![i(1)], vec![i(2)], vec![i(3)], vec![i(4)]]);
++}
++
++#[test]
++fn in_list_with_null() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE category IN (1, NULL) ORDER BY id"), vec![vec![i(1)], vec![i(2)]]);
++}
++
++#[test]
++fn not_in_list() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE price NOT IN (10, 20) ORDER BY id"), vec![vec![i(3)], vec![i(5)]]);
++}
++
++#[test]
++fn not_in_list_with_null() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE price NOT IN (10, NULL) ORDER BY id"), Vec::<Vec<Value>>::new());
++}
++
++#[test]
++fn in_subquery() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE id IN (SELECT product FROM orders) ORDER BY id"), vec![vec![i(1)], vec![i(2)]]);
++}
++
++#[test]
++fn not_in_subquery_with_null() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE id NOT IN (SELECT product FROM orders) ORDER BY id"), Vec::<Vec<Value>>::new());
++}
++
++#[test]
++fn in_subquery_no_null() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE id IN (SELECT product FROM orders WHERE product IS NOT NULL) ORDER BY id"), vec![vec![i(1)], vec![i(2)]]);
++}
++
++#[test]
++fn not_in_subquery_no_null() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE id NOT IN (SELECT product FROM orders WHERE product IS NOT NULL) ORDER BY id"), vec![vec![i(3)], vec![i(4)], vec![i(5)]]);
++}
++
++#[test]
++fn exists_correlated() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE EXISTS (SELECT 1 FROM orders WHERE orders.product = products.id) ORDER BY id"), vec![vec![i(1)], vec![i(2)]]);
++}
++
++#[test]
++fn not_exists_correlated() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.product = products.id) ORDER BY id"), vec![vec![i(3)], vec![i(4)], vec![i(5)]]);
++}
++
++#[test]
++fn exists_null_row_counts() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE EXISTS (SELECT NULL FROM orders WHERE orders.product = products.id) ORDER BY id"), vec![vec![i(1)], vec![i(2)]]);
++}
++
++#[test]
++fn exists_uncorrelated_nonempty() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE EXISTS (SELECT 1 FROM orders) ORDER BY id"), vec![vec![i(1)], vec![i(2)], vec![i(3)], vec![i(4)], vec![i(5)]]);
++}
++
++#[test]
++fn not_exists_empty() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE NOT EXISTS (SELECT 1 FROM orders WHERE qty > 100) ORDER BY id"), vec![vec![i(1)], vec![i(2)], vec![i(3)], vec![i(4)], vec![i(5)]]);
++}
++
++#[test]
++fn eq_any_equals_in() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE id = ANY (SELECT product FROM orders) ORDER BY id"), vec![vec![i(1)], vec![i(2)]]);
++}
++
++#[test]
++fn ne_all_equals_not_in() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE id != ALL (SELECT product FROM orders) ORDER BY id"), Vec::<Vec<Value>>::new());
++}
++
++#[test]
++fn gt_any() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE price > ANY (SELECT qty FROM orders) ORDER BY id"), vec![vec![i(1)], vec![i(2)], vec![i(3)], vec![i(5)]]);
++}
++
++#[test]
++fn ge_all() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE price >= ALL (SELECT qty FROM orders) ORDER BY id"), vec![vec![i(1)], vec![i(2)], vec![i(3)], vec![i(5)]]);
++}
++
++#[test]
++fn lt_some() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE price < SOME (SELECT qty FROM orders) ORDER BY id"), Vec::<Vec<Value>>::new());
++}
++
++#[test]
++fn gt_all_empty() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE price > ALL (SELECT qty FROM orders WHERE qty > 100) ORDER BY id"), vec![vec![i(1)], vec![i(2)], vec![i(3)], vec![i(4)], vec![i(5)]]);
++}
++
++#[test]
++fn gt_any_empty() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE price > ANY (SELECT qty FROM orders WHERE qty > 100) ORDER BY id"), Vec::<Vec<Value>>::new());
++}
++
++#[test]
++fn gt_all_with_null() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE price > ALL (SELECT price FROM products) ORDER BY id"), Vec::<Vec<Value>>::new());
++}
++
++#[test]
++fn gt_any_with_null() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE 25 > ANY (SELECT price FROM products) ORDER BY id"), vec![vec![i(1)], vec![i(2)], vec![i(3)], vec![i(4)], vec![i(5)]]);
++}
++
++#[test]
++fn correlated_quantified() {
++    assert_eq!(query(&db(), "SELECT id FROM orders WHERE qty >= ALL (SELECT qty FROM orders o2 WHERE o2.product = orders.product) ORDER BY id"), vec![vec![i(1)], vec![i(3)], vec![i(4)]]);
++}
++
++#[test]
++fn subquery_with_or() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE category = 1 OR id IN (SELECT product FROM orders) ORDER BY id"), vec![vec![i(1)], vec![i(2)]]);
++}
++
++#[test]
++fn subquery_with_and() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE price > 12 AND EXISTS (SELECT 1 FROM orders WHERE orders.product = products.id) ORDER BY id"), vec![vec![i(2)]]);
++}
++
++#[test]
++fn not_wrapping_in_subquery() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE NOT (id IN (SELECT product FROM orders WHERE product IS NOT NULL)) ORDER BY id"), vec![vec![i(3)], vec![i(4)], vec![i(5)]]);
++}
++
++#[test]
++fn scalar_compare_correlated() {
++    assert_eq!(query(&db(), "SELECT id FROM orders WHERE qty = (SELECT MAX(qty) FROM orders o2 WHERE o2.product = orders.product) ORDER BY id"), vec![vec![i(1)], vec![i(3)]]);
++}
++
++#[test]
++fn derived_table_filter() {
++    assert_eq!(query(&db(), "SELECT id FROM (SELECT id FROM products WHERE price > 12) AS sub ORDER BY id"), vec![vec![i(2)], vec![i(3)], vec![i(5)]]);
++}
++
++#[test]
++fn derived_table_qualified_column() {
++    assert_eq!(query(&db(), "SELECT sub.name FROM (SELECT name FROM products WHERE category = 1) AS sub ORDER BY sub.name"), vec![vec![s("apple")], vec![s("banana")]]);
++}
++
++#[test]
++fn derived_table_aliased_column() {
++    assert_eq!(query(&db(), "SELECT id, hi FROM (SELECT id, price AS hi FROM products WHERE price IS NOT NULL) AS sub WHERE hi > 15 ORDER BY id"), vec![vec![i(2), i(20)], vec![i(3), i(30)]]);
++}
++
++#[test]
++fn derived_table_joined() {
++    assert_eq!(query(&db(), "SELECT products.id FROM products, (SELECT product FROM orders) AS o WHERE products.id = o.product ORDER BY products.id"), vec![vec![i(1)], vec![i(2)], vec![i(2)]]);
++}
++
++#[test]
++fn derived_table_with_aggregate() {
++    assert_eq!(query(&db(), "SELECT cnt FROM (SELECT COUNT(*) AS cnt FROM orders) AS sub"), vec![vec![i(4)]]);
++}
++
++#[test]
++fn derived_table_containing_subquery() {
++    assert_eq!(query(&db(), "SELECT id FROM (SELECT id FROM products WHERE id IN (SELECT product FROM orders)) AS sub ORDER BY id"), vec![vec![i(1)], vec![i(2)]]);
++}
++
++#[test]
++fn order_by_correlated_subquery() {
++    assert_eq!(query(&db(), "SELECT id FROM products ORDER BY (SELECT COUNT(*) FROM orders WHERE orders.product = products.id), id"), vec![vec![i(3)], vec![i(4)], vec![i(5)], vec![i(1)], vec![i(2)]]);
++}
++
++#[test]
++fn correlated_inside_aggregate_arg() {
++    assert_eq!(query(&db(), "SELECT id, (SELECT MAX(orders.qty + products.id) FROM orders) FROM products ORDER BY id"), vec![vec![i(1), i(8)], vec![i(2), i(9)], vec![i(3), i(10)], vec![i(4), i(11)], vec![i(5), i(12)]]);
++}
++
++#[test]
++fn multi_level_correlation() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE id IN (SELECT product FROM orders o WHERE EXISTS (SELECT 1 FROM products p2 WHERE p2.id = o.product AND p2.category = products.category)) ORDER BY id"), vec![vec![i(1)], vec![i(2)]]);
++}
++
++#[test]
++fn scalar_many_rows_errors() {
++    assert_eq!(query(&db(), "SELECT (SELECT price FROM products WHERE id = 2)"), vec![vec![i(20)]]);
++    expect_error(&db(), "SELECT (SELECT price FROM products)");
++}
++
++#[test]
++fn scalar_two_columns_errors() {
++    assert_eq!(query(&db(), "SELECT (SELECT name FROM products WHERE id = 3)"), vec![vec![s("carrot")]]);
++    expect_error(&db(), "SELECT (SELECT id, price FROM products WHERE id = 1)");
++}
++
++#[test]
++fn in_subquery_two_columns_errors() {
++    assert_eq!(query(&db(), "SELECT id FROM products WHERE id IN (SELECT id FROM orders) ORDER BY id"), vec![vec![i(1)], vec![i(2)], vec![i(3)], vec![i(4)]]);
++    expect_error(&db(), "SELECT id FROM products WHERE id IN (SELECT id, price FROM orders)");
++}
++
++#[test]
++fn quantified_subquery_two_columns_errors() {
++    assert_eq!(query(&db(), "SELECT 25 > ALL (SELECT qty FROM orders)"), vec![vec![b(true)]]);
++    expect_error(&db(), "SELECT 1 > ALL (SELECT id, price FROM products)");
++}
++
++#[test]
++fn delete_where_in_subquery() {
++    let db = db();
++    exec(&db, "DELETE FROM products WHERE id IN (SELECT product FROM orders WHERE product IS NOT NULL)");
++    assert_eq!(query(&db, "SELECT id FROM products ORDER BY id"), vec![vec![i(3)], vec![i(4)], vec![i(5)]]);
++}
++
++#[test]
++fn delete_where_not_exists() {
++    let db = db();
++    exec(&db, "DELETE FROM products WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.product = products.id)");
++    assert_eq!(query(&db, "SELECT id FROM products ORDER BY id"), vec![vec![i(1)], vec![i(2)]]);
++}
++
++#[test]
++fn update_set_scalar_subquery() {
++    let db = db();
++    exec(&db, "UPDATE products SET price = (SELECT MAX(qty) FROM orders) WHERE category = 1");
++    assert_eq!(query(&db, "SELECT id, price FROM products ORDER BY id"), vec![vec![i(1), i(7)], vec![i(2), i(7)], vec![i(3), i(30)], vec![i(4), null()], vec![i(5), i(15)]]);
++}
++
++#[test]
++fn update_set_correlated_subquery() {
++    let db = db();
++    exec(&db, "UPDATE products SET price = (SELECT COUNT(*) FROM orders WHERE orders.product = products.id)");
++    assert_eq!(query(&db, "SELECT id, price FROM products ORDER BY id"), vec![vec![i(1), i(1)], vec![i(2), i(2)], vec![i(3), i(0)], vec![i(4), i(0)], vec![i(5), i(0)]]);
++}
++
++#[test]
++fn update_where_in_subquery() {
++    let db = db();
++    exec(&db, "UPDATE products SET category = 9 WHERE id IN (SELECT product FROM orders)");
++    assert_eq!(query(&db, "SELECT id, category FROM products ORDER BY id"), vec![vec![i(1), i(9)], vec![i(2), i(9)], vec![i(3), i(2)], vec![i(4), i(2)], vec![i(5), null()]]);
++}
++
++#[test]
++fn insert_values_subquery() {
++    let db = db();
++    exec(&db, "INSERT INTO products VALUES (99, 'new', (SELECT COUNT(*) FROM orders), 0)");
++    assert_eq!(query(&db, "SELECT category FROM products WHERE id = 99"), vec![vec![i(4)]]);
++}

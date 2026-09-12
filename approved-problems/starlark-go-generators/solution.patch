@@ -1,0 +1,1187 @@
+diff --git a/internal/compile/compile.go b/internal/compile/compile.go
+index 31f3f12..cc03ce2 100644
+--- a/internal/compile/compile.go
++++ b/internal/compile/compile.go
+@@ -46,7 +46,7 @@ var Disassemble = false
+ const debug = false // make code generation verbose, for debugging the compiler
+ 
+ // Increment this to force recompilation of saved bytecode files.
+-const Version = 14
++const Version = 15
+ 
+ type Opcode uint8
+ 
+@@ -103,6 +103,7 @@ const (
+ 	ITERPOP      //              - ITERPOP      -    [pops the iterator stack]
+ 	NOT          //          value NOT          bool
+ 	RETURN       //          value RETURN       -
++	YIELD        //          value YIELD        -   [suspends a generator]
+ 	SETINDEX     //        a i new SETINDEX     -
+ 	INDEX        //            a i INDEX        elem
+ 	SETDICT      // dict key value SETDICT      -
+@@ -204,6 +205,7 @@ var opcodeNames = [...]string{
+ 	POP:          "pop",
+ 	PREDECLARED:  "predeclared",
+ 	RETURN:       "return",
++	YIELD:        "yield",
+ 	SETDICT:      "setdict",
+ 	SETDICTUNIQ:  "setdictuniq",
+ 	SETFIELD:     "setfield",
+@@ -278,6 +280,7 @@ var stackEffect = [...]int8{
+ 	POP:          -1,
+ 	PREDECLARED:  +1,
+ 	RETURN:       -1,
++	YIELD:        -1,
+ 	SETLOCALCELL: -1,
+ 	SETDICT:      -3,
+ 	SETDICTUNIQ:  -3,
+@@ -340,6 +343,7 @@ type Funcode struct {
+ 	NumParams             int
+ 	NumKwonlyParams       int
+ 	HasVarargs, HasKwargs bool
++	Generator             bool // function suspends at YIELD and produces a generator when called
+ 
+ 	// -- transient state --
+ 
+@@ -1220,6 +1224,37 @@ func (fcomp *fcomp) stmt(stmt syntax.Stmt) {
+ 		fcomp.emit(RETURN)
+ 		fcomp.block = fcomp.newBlock() // dead code
+ 
++	case *syntax.YieldStmt:
++		if stmt.Delegate {
++			head := fcomp.newBlock()
++			body := fcomp.newBlock()
++			tail := fcomp.newBlock()
++
++			fcomp.expr(stmt.Result)
++			fcomp.setPos(stmt.From)
++			fcomp.emit(ITERPUSH)
++			fcomp.jump(head)
++
++			fcomp.block = head
++			fcomp.condjump(ITERJMP, tail, body)
++
++			fcomp.block = body
++			fcomp.setPos(stmt.Yield)
++			fcomp.emit(YIELD)
++			fcomp.jump(head)
++
++			fcomp.block = tail
++			fcomp.emit(ITERPOP)
++			break
++		}
++		if stmt.Result != nil {
++			fcomp.expr(stmt.Result)
++		} else {
++			fcomp.emit(NONE)
++		}
++		fcomp.setPos(stmt.Yield)
++		fcomp.emit(YIELD)
++
+ 	case *syntax.LoadStmt:
+ 		for i := range stmt.From {
+ 			fcomp.string(stmt.From[i].Name)
+@@ -1358,6 +1393,16 @@ func (fcomp *fcomp) expr(e syntax.Expr) {
+ 		fcomp.emit(SLICE)
+ 
+ 	case *syntax.Comprehension:
++		if e.Gen {
++			// A generator expression is a call of its implicit generator
++			// function on the sequence of its first clause, which is therefore
++			// evaluated here rather than when the generator is advanced.
++			fcomp.function(e.Function.(*resolve.Function))
++			fcomp.expr(e.Clauses[0].(*syntax.ForClause).X)
++			fcomp.setPos(e.Lbrack)
++			fcomp.emit1(CALL, 1<<8)
++			break
++		}
+ 		if e.Curly {
+ 			fcomp.emit(MAKEDICT)
+ 		} else {
+@@ -1868,6 +1913,7 @@ func (fcomp *fcomp) function(f *resolve.Function) {
+ 	funcode.NumKwonlyParams = f.NumKwonlyParams
+ 	funcode.HasVarargs = f.HasVarargs
+ 	funcode.HasKwargs = f.HasKwargs
++	funcode.Generator = f.IsGenerator
+ 	fcomp.emit1(MAKEFUNC, fcomp.pcomp.functionIndex(funcode))
+ }
+ 
+diff --git a/internal/compile/serial.go b/internal/compile/serial.go
+index adb93b1..39945c4 100644
+--- a/internal/compile/serial.go
++++ b/internal/compile/serial.go
+@@ -202,6 +202,7 @@ func (e *encoder) function(fn *Funcode) {
+ 	e.int(fn.NumKwonlyParams)
+ 	e.int(b2i(fn.HasVarargs))
+ 	e.int(b2i(fn.HasKwargs))
++	e.int(b2i(fn.Generator))
+ }
+ 
+ func b2i(b bool) int {
+@@ -373,6 +374,7 @@ func (d *decoder) function() *Funcode {
+ 	numKwonlyParams := d.int()
+ 	hasVarargs := d.int() != 0
+ 	hasKwargs := d.int() != 0
++	generator := d.int() != 0
+ 	return &Funcode{
+ 		// Prog is filled in later.
+ 		Pos:             id.Pos,
+@@ -388,5 +390,6 @@ func (d *decoder) function() *Funcode {
+ 		NumKwonlyParams: numKwonlyParams,
+ 		HasVarargs:      hasVarargs,
+ 		HasKwargs:       hasKwargs,
++		Generator:       generator,
+ 	}
+ }
+diff --git a/resolve/binding.go b/resolve/binding.go
+index 8507e64..4dcaee1 100644
+--- a/resolve/binding.go
++++ b/resolve/binding.go
+@@ -66,6 +66,7 @@ type Function struct {
+ 	Params []syntax.Expr   // param = ident | ident=expr | * | *ident | **ident
+ 	Body   []syntax.Stmt   // contains synthetic 'return expr' for lambda
+ 
++	IsGenerator     bool       // whether the body contains a yield statement
+ 	HasVarargs      bool       // whether params includes *args (convenience)
+ 	HasKwargs       bool       // whether params includes **kwargs (convenience)
+ 	NumKwonlyParams int        // number of keyword-only optional parameters
+diff --git a/resolve/resolve.go b/resolve/resolve.go
+index 4d046b3..e57051c 100644
+--- a/resolve/resolve.go
++++ b/resolve/resolve.go
+@@ -239,6 +239,11 @@ type resolver struct {
+ 	loops   int // number of enclosing for/while loops in current function (or file, if top-level)
+ 	ifstmts int // number of enclosing if statements loops
+ 
++	// valueReturns records the position of each 'return expr' statement of the
++	// function being resolved, so that a function that turns out to be a
++	// generator can reject them once its whole body has been seen.
++	valueReturns []syntax.Position
++
+ 	errors ErrorList
+ }
+ 
+@@ -565,6 +570,21 @@ func (r *resolver) stmt(stmt syntax.Stmt) {
+ 		if r.container().function == nil {
+ 			r.errorf(stmt.Return, "return statement not within a function")
+ 		}
++		if stmt.Result != nil {
++			r.valueReturns = append(r.valueReturns, stmt.Return)
++			r.expr(stmt.Result)
++		}
++
++	case *syntax.YieldStmt:
++		if !r.options.Generators {
++			r.errorf(stmt.Yield, doesnt+"support generator functions")
++		}
++		fn := r.container().function
++		if fn == nil {
++			r.errorf(stmt.Yield, "yield statement not within a function")
++		} else {
++			fn.IsGenerator = true
++		}
+ 		if stmt.Result != nil {
+ 			r.expr(stmt.Result)
+ 		}
+@@ -689,6 +709,26 @@ func (r *resolver) expr(e syntax.Expr) {
+ 		clause := e.Clauses[0].(*syntax.ForClause)
+ 		r.expr(clause.X)
+ 
++		if e.Gen {
++			if !r.options.Generators {
++				r.errorf(e.Lbrack, doesnt+"support generator expressions")
++			}
++			// A generator expression denotes an implicit generator function of
++			// one parameter, applied to the sequence of its first clause. Its
++			// body is the loops and conditions of the clauses, innermost of
++			// which yields the element expression.
++			fn := &Function{
++				Name:   "genexpr",
++				Pos:    e.Lbrack,
++				Params: []syntax.Expr{genexprParam(e.Lbrack)},
++				Body:   genexprBody(e),
++			}
++			fn.IsGenerator = true
++			e.Function = fn
++			r.function(fn, e.Lbrack)
++			return
++		}
++
+ 		// A list/dict comprehension defines a new lexical block.
+ 		// Locals defined within the block will be allotted
+ 		// distinct slots in the locals array of the innermost
+@@ -832,6 +872,10 @@ func (r *resolver) function(function *Function, pos syntax.Position) {
+ 	outerLoops := r.loops
+ 	r.loops = 0
+ 
++	// Value returns are recorded per function; a generator may not use them.
++	outerValueReturns := r.valueReturns
++	r.valueReturns = nil
++
+ 	var seenOptional bool
+ 	var star *syntax.UnaryExpr // * or *args param
+ 	var starStar *syntax.Ident // **kwargs ident
+@@ -908,6 +952,13 @@ func (r *resolver) function(function *Function, pos syntax.Position) {
+ 	function.NumKwonlyParams = numKwonlyParams
+ 	r.stmts(function.Body)
+ 
++	if function.IsGenerator {
++		for _, pos := range r.valueReturns {
++			r.errorf(pos, "return statement with a value within a generator function")
++		}
++	}
++	r.valueReturns = outerValueReturns
++
+ 	// Resolve all uses of this function's local vars,
+ 	// and keep just the remaining uses of free/global vars.
+ 	b.resolveLocalUses()
+@@ -922,6 +973,37 @@ func (r *resolver) function(function *Function, pos syntax.Position) {
+ 	// resolved until the end of the module.
+ }
+ 
++// genexprParamName is the name of the implicit parameter of a generator
++// expression's function. It is not a legal Starlark identifier, so it cannot
++// collide with, or be referenced by, a name in the program.
++const genexprParamName = ".seq"
++
++func genexprParam(pos syntax.Position) *syntax.Ident {
++	return &syntax.Ident{Name: genexprParamName, NamePos: pos}
++}
++
++// genexprBody builds the body of the implicit function of a generator
++// expression: the clauses become nested loops and conditions whose innermost
++// statement yields the element expression. The sequence of the first clause is
++// the function's parameter, so it is evaluated once, where the expression
++// appears, rather than when the generator is first advanced.
++func genexprBody(e *syntax.Comprehension) []syntax.Stmt {
++	stmt := syntax.Stmt(&syntax.YieldStmt{Yield: e.Lbrack, Result: e.Body})
++	for i := len(e.Clauses) - 1; i >= 0; i-- {
++		switch clause := e.Clauses[i].(type) {
++		case *syntax.IfClause:
++			stmt = &syntax.IfStmt{If: clause.If, Cond: clause.Cond, True: []syntax.Stmt{stmt}}
++		case *syntax.ForClause:
++			x := clause.X
++			if i == 0 {
++				x = genexprParam(e.Lbrack)
++			}
++			stmt = &syntax.ForStmt{For: clause.For, Vars: clause.Vars, X: x, Body: []syntax.Stmt{stmt}}
++		}
++	}
++	return []syntax.Stmt{stmt}
++}
++
+ func (r *resolver) resolveNonLocalUses(b *block) {
+ 	// First resolve inner blocks.
+ 	for _, child := range b.children {
+diff --git a/starlark/eval.go b/starlark/eval.go
+index c50f079..b02b184 100644
+--- a/starlark/eval.go
++++ b/starlark/eval.go
+@@ -618,18 +618,19 @@ func makeExprFunc(opts *syntax.FileOptions, expr syntax.Expr, env StringDict) (*
+ // The following functions are primitive operations of the byte code interpreter.
+ 
+ // list += iterable
+-func listExtend(x *List, y Iterable) {
++func listExtend(x *List, y Iterable) error {
+ 	if ylist, ok := y.(*List); ok {
+ 		// fast path: list += list
+ 		x.elems = append(x.elems, ylist.elems...)
+-	} else {
+-		iter := y.Iterate()
+-		defer iter.Done()
+-		var z Value
+-		for iter.Next(&z) {
+-			x.elems = append(x.elems, z)
+-		}
++		return nil
+ 	}
++	iter := y.Iterate()
++	defer iter.Done()
++	var z Value
++	for iter.Next(&z) {
++		x.elems = append(x.elems, z)
++	}
++	return iterErr(iter)
+ }
+ 
+ // getAttr implements x.dot.
+@@ -1197,7 +1198,32 @@ func Call(thread *Thread, fn Value, args Tuple, kwargs []Tuple) (Value, error) {
+ 		return nil, fmt.Errorf("invalid call of non-function (%s)", fn.Type())
+ 	}
+ 
+-	// Allocate and push a new frame.
++	fr := thread.pushFrame(c)
++
++	// Use defer to ensure that panics from built-ins
++	// pass through the interpreter without leaving
++	// it in a bad state.
++	defer thread.popFrame(fr)
++
++	result, err := c.CallInternal(thread, args, kwargs)
++
++	// Sanity check: nil is not a valid Starlark value.
++	if result == nil && err == nil {
++		err = fmt.Errorf("internal error: nil (not None) returned from %s", fn)
++	}
++
++	// Always return an EvalError with an accurate frame.
++	if err != nil && !is[*EvalError](err) {
++		err = thread.evalError(err)
++	}
++
++	return result, err
++}
++
++// pushFrame allocates and pushes a frame for a call to c.
++// Every activation of c, including each resumption of a suspended
++// generator, runs beneath a frame of its own.
++func (thread *Thread) pushFrame(c Callable) *frame {
+ 	var fr *frame
+ 	// Optimization: use slack portion of thread.stack
+ 	// slice as a freelist of empty frames.
+@@ -1221,33 +1247,19 @@ func Call(thread *Thread, fn Value, args Tuple, kwargs []Tuple) (Value, error) {
+ 
+ 	thread.beginProfSpan()
+ 
+-	// Use defer to ensure that panics from built-ins
+-	// pass through the interpreter without leaving
+-	// it in a bad state.
+-	defer func() {
+-		thread.endProfSpan()
+-
+-		// clear out any references
+-		// TODO(adonovan): opt: zero fr.Locals and
+-		// reuse it if it is large enough.
+-		*fr = frame{}
+-
+-		thread.stack = thread.stack[:len(thread.stack)-1] // pop
+-	}()
+-
+-	result, err := c.CallInternal(thread, args, kwargs)
++	return fr
++}
+ 
+-	// Sanity check: nil is not a valid Starlark value.
+-	if result == nil && err == nil {
+-		err = fmt.Errorf("internal error: nil (not None) returned from %s", fn)
+-	}
++// popFrame pops the frame most recently pushed by pushFrame.
++func (thread *Thread) popFrame(fr *frame) {
++	thread.endProfSpan()
+ 
+-	// Always return an EvalError with an accurate frame.
+-	if err != nil && !is[*EvalError](err) {
+-		err = thread.evalError(err)
+-	}
++	// clear out any references
++	// TODO(adonovan): opt: zero fr.Locals and
++	// reuse it if it is large enough.
++	*fr = frame{}
+ 
+-	return result, err
++	thread.stack = thread.stack[:len(thread.stack)-1] // pop
+ }
+ 
+ func slice(x, lo, hi, step_ Value) (Value, error) {
+diff --git a/starlark/generator.go b/starlark/generator.go
+new file mode 100644
+index 0000000..f0904d8
+--- /dev/null
++++ b/starlark/generator.go
+@@ -0,0 +1,175 @@
++// Copyright 2026 The Bazel Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package starlark
++
++import "fmt"
++
++// A Generator is the suspended activation of a generator function, that is, of
++// a function whose body contains a yield statement.
++//
++// Calling a generator function binds its arguments and returns a Generator
++// without executing any of the body. Iterating the Generator runs the body
++// until the next yield, whose operand is the element; the sequence ends when
++// the body returns. A Generator is consumed as it is iterated: iterating it
++// again continues from the point at which the previous iteration stopped.
++type Generator struct {
++	fn      *Function
++	thread  *Thread
++	state   *frameState
++	running bool // an iterator is currently inside the body
++	done    bool // the body has returned or failed
++	frozen  bool
++}
++
++var (
++	_ Value    = (*Generator)(nil)
++	_ Iterable = (*Generator)(nil)
++	_ HasAttrs = (*Generator)(nil)
++)
++
++// Function returns the generator function of which g is an activation.
++func (g *Generator) Function() *Function { return g.fn }
++
++func (g *Generator) Name() string   { return g.fn.Name() }
++func (g *Generator) String() string { return fmt.Sprintf("<generator %s>", g.fn.Name()) }
++func (g *Generator) Type() string   { return "generator" }
++func (g *Generator) Truth() Bool    { return True }
++
++func (g *Generator) Hash() (uint32, error) {
++	return 0, fmt.Errorf("unhashable type: generator")
++}
++
++// Freeze makes g, and every value held by its suspended activation, immutable.
++// A frozen generator cannot be advanced, since running the body would mutate
++// the activation.
++func (g *Generator) Freeze() {
++	if g.frozen {
++		return
++	}
++	g.frozen = true
++	g.fn.Freeze()
++	if g.state != nil {
++		for _, v := range g.state.space {
++			if v != nil {
++				v.Freeze()
++			}
++		}
++	}
++}
++
++func (g *Generator) Attr(name string) (Value, error) {
++	return builtinAttr(g, name, generatorMethods)
++}
++
++func (g *Generator) AttrNames() []string { return builtinAttrNames(generatorMethods) }
++
++// close abandons a suspended activation: the body is not resumed again, and
++// every container the body was iterating is released.
++func (g *Generator) close() error {
++	if g.running {
++		return fmt.Errorf("generator %s is already running", g.fn.Name())
++	}
++	if g.frozen {
++		return fmt.Errorf("cannot close frozen generator %s", g.fn.Name())
++	}
++	if !g.done {
++		g.done = true
++		state := g.state
++		g.state = nil
++		if state != nil {
++			for _, iter := range state.iterstack {
++				if sub, ok := iter.(*generatorIterator); ok {
++					if err := sub.g.close(); err != nil {
++						return err
++					}
++					continue
++				}
++				iter.Done()
++			}
++		}
++	}
++	return nil
++}
++
++func (g *Generator) Iterate() Iterator { return &generatorIterator{g: g} }
++
++// next advances the body to its next yield.
++// It reports whether a value was produced; a false result with a nil error
++// means the body has finished.
++func (g *Generator) next() (Value, bool, error) {
++	if g.done {
++		return nil, false, nil
++	}
++	if g.running {
++		return nil, false, fmt.Errorf("generator %s is already running", g.fn.Name())
++	}
++	if g.frozen {
++		return nil, false, fmt.Errorf("cannot advance frozen generator %s", g.fn.Name())
++	}
++
++	g.running = true
++	fr := g.thread.pushFrame(g.fn)
++	defer func() {
++		g.thread.popFrame(fr)
++		g.running = false
++	}()
++
++	v, yielded, err := g.fn.run(g.thread, g.state)
++	if err != nil {
++		g.done = true
++		g.state = nil
++		if !is[*EvalError](err) {
++			err = g.thread.evalError(err)
++		}
++		return nil, false, err
++	}
++	if !yielded {
++		g.done = true
++		g.state = nil
++		return nil, false, nil
++	}
++	return v, true, nil
++}
++
++// A generatorIterator iterates the elements a generator produces.
++// Unlike the iterators of the built-in sequences it can fail, since advancing
++// it runs Starlark code; Err reports the failure to the consumer.
++type generatorIterator struct {
++	g   *Generator
++	err error
++}
++
++var _ Iterator = (*generatorIterator)(nil)
++
++func (it *generatorIterator) Next(p *Value) bool {
++	if it.err != nil {
++		return false
++	}
++	v, ok, err := it.g.next()
++	if err != nil {
++		it.err = err
++		return false
++	}
++	if !ok {
++		return false
++	}
++	*p = v
++	return true
++}
++
++func (it *generatorIterator) Done() {}
++
++func (it *generatorIterator) Err() error { return it.err }
++
++// iterErr reports the error, if any, that stopped an iterator.
++// The iterators of the built-in sequences never fail, but advancing a
++// generator runs arbitrary Starlark code, so every consumer of an iterator
++// must report the failure instead of treating it as the end of the sequence.
++func iterErr(iter Iterator) error {
++	if e, ok := iter.(interface{ Err() error }); ok {
++		return e.Err()
++	}
++	return nil
++}
+diff --git a/starlark/interp.go b/starlark/interp.go
+index 0a1e63c..f1d1a29 100644
+--- a/starlark/interp.go
++++ b/starlark/interp.go
+@@ -18,6 +18,48 @@ const vmdebug = false // TODO(adonovan): use a bitfield of specific kinds of err
+ // - optimize position table.
+ // - opt: record MaxIterStack during compilation and preallocate the stack.
+ 
++// A frameState holds the resumable execution state of one function activation:
++// its local variables, operand stack, iterator stack, and program counter.
++// An ordinary call discards it when the function returns; a generator retains it
++// across a suspension so that the body continues where its yield left off.
++type frameState struct {
++	space     []Value    // backing array of locals and stack
++	locals    []Value    // local variables, parameters first
++	stack     []Value    // operand stack
++	iterstack []Iterator // stack of active iterators
++	sp        int        // operand stack pointer
++	pc        uint32     // program counter
++}
++
++// newFrameState binds the arguments of a call to a fresh activation of fn.
++func newFrameState(thread *Thread, fn *Function, args Tuple, kwargs []Tuple) (*frameState, error) {
++	f := fn.funcode
++
++	// Allocate space for stack and locals.
++	// Logically these do not escape from this frame
++	// (See https://github.com/golang/go/issues/20533.)
++	nlocals := len(f.Locals)
++	space := make([]Value, nlocals+f.MaxStack)
++	st := &frameState{
++		space:  space,
++		locals: space[:nlocals:nlocals],
++		stack:  space[nlocals:],
++	}
++
++	// Digest arguments and set parameters.
++	if err := setArgs(st.locals, fn, args, kwargs); err != nil {
++		return nil, thread.evalError(err)
++	}
++
++	// Spill indicated locals to cells.
++	// Each cell is a separate alloc to avoid spurious liveness.
++	for _, index := range f.Cells {
++		st.locals[index] = &cell{st.locals[index]}
++	}
++
++	return st, nil
++}
++
+ func (fn *Function) CallInternal(thread *Thread, args Tuple, kwargs []Tuple) (Value, error) {
+ 	// Postcondition: args is not mutated. This is stricter than required by Callable,
+ 	// but allows CALL to avoid a copy.
+@@ -45,30 +87,32 @@ func (fn *Function) CallInternal(thread *Thread, args Tuple, kwargs []Tuple) (Va
+ 		}
+ 	}
+ 
+-	fr := thread.frameAt(0)
+-
+-	// Allocate space for stack and locals.
+-	// Logically these do not escape from this frame
+-	// (See https://github.com/golang/go/issues/20533.)
+-	//
+-	// This heap allocation looks expensive, but I was unable to get
+-	// more than 1% real time improvement in a large alloc-heavy
+-	// benchmark (in which this alloc was 8% of alloc-bytes)
+-	// by allocating space for 8 Values in each frame, or
+-	// by allocating stack by slicing an array held by the Thread
+-	// that is expanded in chunks of min(k, nspace), for k=256 or 1024.
+-	nlocals := len(f.Locals)
+-	nspace := nlocals + f.MaxStack
+-	space := make([]Value, nspace)
+-	locals := space[:nlocals:nlocals] // local variables, starting with parameters
+-	stack := space[nlocals:]          // operand stack
+-
+-	// Digest arguments and set parameters.
+-	err := setArgs(locals, fn, args, kwargs)
++	st, err := newFrameState(thread, fn, args, kwargs)
+ 	if err != nil {
+-		return nil, thread.evalError(err)
++		return nil, err
++	}
++
++	// A generator function binds its arguments but runs no part of its body;
++	// the body runs only as the resulting generator is advanced.
++	if f.Generator {
++		return &Generator{fn: fn, thread: thread, state: st}, nil
+ 	}
+ 
++	result, _, err := fn.run(thread, st)
++	return result, err
++}
++
++// run executes the activation st of fn until the body returns, suspends at a
++// yield, or fails. A suspension retains the operand and iterator stacks in st,
++// so a later call resumes the body at the instruction after the yield.
++func (fn *Function) run(thread *Thread, st *frameState) (result Value, yielded bool, err error) {
++	f := fn.funcode
++	fr := thread.frameAt(0)
++
++	locals := st.locals
++	stack := st.stack
++	iterstack := st.iterstack
++
+ 	fr.locals = locals
+ 
+ 	if vmdebug {
+@@ -77,33 +121,37 @@ func (fn *Function) CallInternal(thread *Thread, args Tuple, kwargs []Tuple) (Va
+ 		defer fmt.Println("Leaving ", f.Name)
+ 	}
+ 
+-	// Spill indicated locals to cells.
+-	// Each cell is a separate alloc to avoid spurious liveness.
+-	for _, index := range f.Cells {
+-		locals[index] = &cell{locals[index]}
+-	}
+-
+ 	// TODO(adonovan): add static check that beneath this point
+ 	// - there is exactly one return statement
+ 	// - there is no redefinition of 'err'.
+ 
+-	var iterstack []Iterator // stack of active iterators
+-
+ 	// Use defer so that application panics can pass through
+ 	// interpreter without leaving thread in a bad state.
+ 	defer func() {
++		if yielded {
++			// The activation is suspended, not finished: keep the operand and
++			// iterator stacks so that the next advance resumes where it stopped.
++			st.iterstack = iterstack
++			fr.locals = nil
++			return
++		}
++
+ 		// ITERPOP the rest of the iterator stack.
+ 		for _, iter := range iterstack {
+ 			iter.Done()
+ 		}
++		st.iterstack = nil
+ 
+ 		fr.locals = nil
+ 	}()
+ 
+-	sp := 0
+-	var pc uint32
+-	var result Value
++	sp := st.sp
++	pc := st.pc
+ 	code := f.Code
++	defer func() {
++		st.sp = sp
++		st.pc = pc
++	}()
+ loop:
+ 	for {
+ 		thread.Steps++
+@@ -229,7 +277,9 @@ loop:
+ 					if err = xlist.checkMutable("apply += to"); err != nil {
+ 						break loop
+ 					}
+-					listExtend(xlist, yiter)
++					if err = listExtend(xlist, yiter); err != nil {
++						break loop
++					}
+ 					z = xlist
+ 				}
+ 			}
+@@ -363,6 +413,9 @@ loop:
+ 					positional = append(positional, elem)
+ 				}
+ 				iter.Done()
++				if err = iterErr(iter); err != nil {
++					break loop
++				}
+ 			}
+ 
+ 			function := stack[sp-1]
+@@ -399,6 +452,9 @@ loop:
+ 			if iter.Next(&stack[sp]) {
+ 				sp++
+ 			} else {
++				if err = iterErr(iter); err != nil {
++					break loop
++				}
+ 				pc = arg
+ 			}
+ 
+@@ -414,6 +470,12 @@ loop:
+ 			result = stack[sp-1]
+ 			break loop
+ 
++		case compile.YIELD:
++			result = stack[sp-1]
++			sp--
++			yielded = true
++			break loop
++
+ 		case compile.SETINDEX:
+ 			z := stack[sp-1]
+ 			y := stack[sp-2]
+@@ -509,6 +571,10 @@ loop:
+ 			for i < n && iter.Next(&stack[sp-1-i]) {
+ 				i++
+ 			}
++			if err = iterErr(iter); err != nil {
++				iter.Done()
++				break loop
++			}
+ 			var dummy Value
+ 			if iter.Next(&dummy) {
+ 				// NB: Len may return -1 here in obscure cases.
+@@ -666,7 +732,7 @@ loop:
+ 		}
+ 	}
+ 	// (deferred cleanup runs here)
+-	return result, err
++	return result, yielded, err
+ }
+ 
+ type wrappedError struct {
+diff --git a/starlark/library.go b/starlark/library.go
+index bad18af..f06f630 100644
+--- a/starlark/library.go
++++ b/starlark/library.go
+@@ -56,6 +56,7 @@ func init() {
+ 		"hash":      NewBuiltin("hash", hash),
+ 		"int":       NewBuiltin("int", int_),
+ 		"len":       NewBuiltin("len", len_),
++		"next":      NewBuiltin("next", next_),
+ 		"list":      NewBuiltin("list", list),
+ 		"max":       NewBuiltin("max", minmax),
+ 		"min":       NewBuiltin("min", minmax),
+@@ -92,6 +93,10 @@ var (
+ 		"values":     NewBuiltin("values", dict_values),
+ 	}
+ 
++	generatorMethods = map[string]*Builtin{
++		"close": NewBuiltin("close", generator_close),
++	}
++
+ 	listMethods = map[string]*Builtin{
+ 		"append": NewBuiltin("append", list_append),
+ 		"clear":  NewBuiltin("clear", list_clear),
+@@ -208,6 +213,9 @@ func all(thread *Thread, _ *Builtin, args Tuple, kwargs []Tuple) (Value, error)
+ 			return False, nil
+ 		}
+ 	}
++	if err := iterErr(iter); err != nil {
++		return nil, err
++	}
+ 	return True, nil
+ }
+ 
+@@ -225,6 +233,9 @@ func any_(thread *Thread, _ *Builtin, args Tuple, kwargs []Tuple) (Value, error)
+ 			return True, nil
+ 		}
+ 	}
++	if err := iterErr(iter); err != nil {
++		return nil, err
++	}
+ 	return False, nil
+ }
+ 
+@@ -268,6 +279,9 @@ func bytes_(thread *Thread, _ *Builtin, args Tuple, kwargs []Tuple) (Value, erro
+ 			}
+ 			buf.WriteByte(b)
+ 		}
++		if err := iterErr(iter); err != nil {
++			return nil, err
++		}
+ 		return Bytes(buf.String()), nil
+ 
+ 	default:
+@@ -362,6 +376,9 @@ func enumerate(thread *Thread, _ *Builtin, args Tuple, kwargs []Tuple) (Value, e
+ 			pairs = append(pairs, pair)
+ 		}
+ 	}
++	if err := iterErr(iter); err != nil {
++		return nil, err
++	}
+ 
+ 	return NewList(pairs), nil
+ }
+@@ -692,6 +709,9 @@ func list(thread *Thread, _ *Builtin, args Tuple, kwargs []Tuple) (Value, error)
+ 		for iter.Next(&x) {
+ 			elems = append(elems, x)
+ 		}
++		if err := iterErr(iter); err != nil {
++			return nil, err
++		}
+ 	}
+ 	return NewList(elems), nil
+ }
+@@ -724,6 +744,9 @@ func minmax(thread *Thread, b *Builtin, args Tuple, kwargs []Tuple) (Value, erro
+ 	defer iter.Done()
+ 	var extremum Value
+ 	if !iter.Next(&extremum) {
++		if err := iterErr(iter); err != nil {
++			return nil, err
++		}
+ 		return nil, nameErr(b, "argument is an empty sequence")
+ 	}
+ 
+@@ -761,9 +784,49 @@ func minmax(thread *Thread, b *Builtin, args Tuple, kwargs []Tuple) (Value, erro
+ 			extremeKey = key
+ 		}
+ 	}
++	if err := iterErr(iter); err != nil {
++		return nil, err
++	}
+ 	return extremum, nil
+ }
+ 
++// next(g) advances a generator and returns the value it produces.
++// If the generator is exhausted it returns the default, if one was supplied,
++// and is an error otherwise.
++func next_(thread *Thread, b *Builtin, args Tuple, kwargs []Tuple) (Value, error) {
++	var x Value
++	var dflt Value
++	if err := unpackPositionalArgsNoEscape("next", args, kwargs, 1, &x, &dflt); err != nil {
++		return nil, err
++	}
++	g, ok := x.(*Generator)
++	if !ok {
++		return nil, fmt.Errorf("next: got %s, want generator", x.Type())
++	}
++	v, ok, err := g.next()
++	if err != nil {
++		return nil, err
++	}
++	if !ok {
++		if dflt != nil {
++			return dflt, nil
++		}
++		return nil, fmt.Errorf("next: generator %s is exhausted", g.Name())
++	}
++	return v, nil
++}
++
++// generator·close abandons a suspended generator.
++func generator_close(_ *Thread, b *Builtin, args Tuple, kwargs []Tuple) (Value, error) {
++	if err := UnpackPositionalArgs(b.Name(), args, kwargs, 0); err != nil {
++		return nil, err
++	}
++	if err := b.Receiver().(*Generator).close(); err != nil {
++		return nil, nameErr(b, err)
++	}
++	return None, nil
++}
++
+ // https://github.com/google/starlark-go/blob/master/doc/spec.md#ord
+ func ord(thread *Thread, _ *Builtin, args Tuple, kwargs []Tuple) (Value, error) {
+ 	if len(kwargs) > 0 {
+@@ -988,6 +1051,9 @@ func reversed(thread *Thread, _ *Builtin, args Tuple, kwargs []Tuple) (Value, er
+ 	for iter.Next(&x) {
+ 		elems = append(elems, x)
+ 	}
++	if err := iterErr(iter); err != nil {
++		return nil, err
++	}
+ 	n := len(elems)
+ 	for i := 0; i < n>>1; i++ {
+ 		elems[i], elems[n-1-i] = elems[n-1-i], elems[i]
+@@ -1011,6 +1077,9 @@ func set(thread *Thread, b *Builtin, args Tuple, kwargs []Tuple) (Value, error)
+ 				return nil, nameErr(b, err)
+ 			}
+ 		}
++		if err := iterErr(iter); err != nil {
++			return nil, err
++		}
+ 	}
+ 	return set, nil
+ }
+@@ -1039,6 +1108,9 @@ func sorted(thread *Thread, _ *Builtin, args Tuple, kwargs []Tuple) (Value, erro
+ 	for iter.Next(&x) {
+ 		values = append(values, x)
+ 	}
++	if err := iterErr(iter); err != nil {
++		return nil, err
++	}
+ 
+ 	// Derive keys from values by applying key function.
+ 	var keys []Value
+@@ -1139,6 +1211,9 @@ func tuple(thread *Thread, _ *Builtin, args Tuple, kwargs []Tuple) (Value, error
+ 	for iter.Next(&x) {
+ 		elems = append(elems, x)
+ 	}
++	if err := iterErr(iter); err != nil {
++		return nil, err
++	}
+ 	return elems, nil
+ }
+ 
+@@ -1188,6 +1263,9 @@ func zip(thread *Thread, _ *Builtin, args Tuple, kwargs []Tuple) (Value, error)
+ 			array = array[cols:]
+ 			for j, iter := range iters {
+ 				iter.Next(&tuple[j])
++				if err := iterErr(iter); err != nil {
++					return nil, err
++				}
+ 			}
+ 			result[i] = tuple
+ 		}
+@@ -1198,6 +1276,9 @@ func zip(thread *Thread, _ *Builtin, args Tuple, kwargs []Tuple) (Value, error)
+ 			tuple := make(Tuple, cols)
+ 			for i, iter := range iters {
+ 				if !iter.Next(&tuple[i]) {
++					if err := iterErr(iter); err != nil {
++						return nil, err
++					}
+ 					break outer
+ 				}
+ 			}
+@@ -1364,7 +1445,9 @@ func list_extend(_ *Thread, b *Builtin, args Tuple, kwargs []Tuple) (Value, erro
+ 	if err := recv.checkMutable("extend"); err != nil {
+ 		return nil, nameErr(b, err)
+ 	}
+-	listExtend(recv, iterable)
++	if err := listExtend(recv, iterable); err != nil {
++		return nil, err
++	}
+ 	return None, nil
+ }
+ 
+@@ -1870,6 +1953,9 @@ func string_join(_ *Thread, b *Builtin, args Tuple, kwargs []Tuple) (Value, erro
+ 		}
+ 		buf.WriteString(s)
+ 	}
++	if err := iterErr(iter); err != nil {
++		return nil, err
++	}
+ 	return String(buf.String()), nil
+ }
+ 
+@@ -2237,6 +2323,9 @@ func set_difference(_ *Thread, b *Builtin, args Tuple, kwargs []Tuple) (Value, e
+ 	if err != nil {
+ 		return nil, nameErr(b, err)
+ 	}
++	if err := iterErr(iter); err != nil {
++		return nil, err
++	}
+ 	return diff, nil
+ }
+ 
+@@ -2253,6 +2342,9 @@ func set_intersection(_ *Thread, b *Builtin, args Tuple, kwargs []Tuple) (Value,
+ 	if err != nil {
+ 		return nil, nameErr(b, err)
+ 	}
++	if err := iterErr(iter); err != nil {
++		return nil, err
++	}
+ 	return diff, nil
+ }
+ 
+@@ -2352,6 +2444,9 @@ func set_symmetric_difference(_ *Thread, b *Builtin, args Tuple, kwargs []Tuple)
+ 	if err != nil {
+ 		return nil, nameErr(b, err)
+ 	}
++	if err := iterErr(iter); err != nil {
++		return nil, err
++	}
+ 	return diff, nil
+ }
+ 
+@@ -2445,6 +2540,9 @@ func updateDict(dict *Dict, updates Tuple, kwargs []Tuple) error {
+ 					return err
+ 				}
+ 			}
++			if err := iterErr(iter); err != nil {
++				return err
++			}
+ 		}
+ 	}
+ 
+@@ -2484,7 +2582,10 @@ func setUpdate(s *Set, args Tuple, kwargs []Tuple) error {
+ 		if err := func() error {
+ 			iter := iterable.Iterate()
+ 			defer iter.Done()
+-			return s.InsertAll(iter)
++			if err := s.InsertAll(iter); err != nil {
++				return err
++			}
++			return iterErr(iter)
+ 		}(); err != nil {
+ 			return err
+ 		}
+diff --git a/syntax/options.go b/syntax/options.go
+index 109aaf6..7528667 100644
+--- a/syntax/options.go
++++ b/syntax/options.go
+@@ -27,6 +27,7 @@ type FileOptions struct {
+ 	TopLevelControl   bool // allow if/for/while statements at top-level
+ 	GlobalReassign    bool // allow reassignment to top-level names
+ 	LoadBindsGlobally bool // load creates global not file-local bindings (deprecated)
++	Generators        bool // allow generator functions and the 'yield' statement
+ 
+ 	// compiler
+ 	Recursion bool // disable recursion check for functions in this file
+diff --git a/syntax/parse.go b/syntax/parse.go
+index e115393..86733e6 100644
+--- a/syntax/parse.go
++++ b/syntax/parse.go
+@@ -324,6 +324,7 @@ func (p *parser) parseSimpleStmt(stmts []Stmt, consumeNL bool) []Stmt {
+ 
+ // small_stmt = RETURN expr?
+ //
++//	| YIELD FROM? expr?
+ //	| PASS | BREAK | CONTINUE
+ //	| LOAD ...
+ //	| expr ('=' | '+=' | '-=' | '*=' | '/=' | '%=' | '&=' | '|=' | '^=' | '<<=' | '>>=') expr   // assign
+@@ -338,6 +339,23 @@ func (p *parser) parseSmallStmt() Stmt {
+ 		}
+ 		return &ReturnStmt{Return: pos, Result: result}
+ 
++	case YIELD:
++		pos := p.nextToken() // consume YIELD
++		var frompos Position
++		var delegate bool
++		if p.tok == FROM {
++			frompos = p.nextToken() // consume FROM
++			delegate = true
++		}
++		var result Expr
++		if p.tok != EOF && p.tok != NEWLINE && p.tok != SEMI {
++			result = p.parseExpr(false)
++		}
++		if delegate && result == nil {
++			p.in.errorf(frompos, "yield from requires an operand")
++		}
++		return &YieldStmt{Yield: pos, From: frompos, Delegate: delegate, Result: result}
++
+ 	case BREAK, CONTINUE, PASS:
+ 		tok := p.tok
+ 		pos := p.nextToken() // consume it
+@@ -879,6 +897,10 @@ func (p *parser) parsePrimary() Expr {
+ 			return &TupleExpr{Lparen: lparen, Rparen: rparen}
+ 		}
+ 		e := p.parseExpr(true) // allow trailing comma
++		if p.tok == FOR {
++			// generator expression
++			return p.parseComprehensionSuffix(lparen, e, RPAREN)
++		}
+ 		rparen := p.consume(RPAREN)
+ 		return &ParenExpr{
+ 			Lparen: lparen,
+@@ -1005,6 +1027,7 @@ func (p *parser) parseComprehensionSuffix(lbrace Position, body Expr, endBrace T
+ 
+ 	return &Comprehension{
+ 		Curly:   endBrace == RBRACE,
++		Gen:     endBrace == RPAREN,
+ 		Lbrack:  lbrace,
+ 		Body:    body,
+ 		Clauses: clauses,
+diff --git a/syntax/syntax.go b/syntax/syntax.go
+index 57983b4..08e92e3 100644
+--- a/syntax/syntax.go
++++ b/syntax/syntax.go
+@@ -90,6 +90,7 @@ type Stmt interface {
+ }
+ 
+ func (*AssignStmt) stmt() {}
++func (*YieldStmt) stmt()  {}
+ func (*BranchStmt) stmt() {}
+ func (*DefStmt) stmt()    {}
+ func (*ExprStmt) stmt()   {}
+@@ -216,6 +217,23 @@ func (x *ReturnStmt) Span() (start, end Position) {
+ 	return x.Return, end
+ }
+ 
++// A YieldStmt suspends a generator function and produces a value to its consumer.
++type YieldStmt struct {
++	commentsRef
++	Yield    Position
++	From     Position // of 'from' keyword; invalid if the statement does not delegate
++	Delegate bool     // yield from: produce each element of Result in turn
++	Result   Expr     // may be nil, unless Delegate
++}
++
++func (x *YieldStmt) Span() (start, end Position) {
++	if x.Result == nil {
++		return x.Yield, x.Yield.add("yield")
++	}
++	_, end = x.Result.Span()
++	return x.Yield, end
++}
++
+ // An Expr is a Starlark expression.
+ type Expr interface {
+ 	Node
+@@ -311,10 +329,15 @@ func (x *DotExpr) Span() (start, end Position) {
+ type Comprehension struct {
+ 	commentsRef
+ 	Curly   bool // {x:y for ...} or {x for ...}, not [x for ...]
++	Gen     bool // (x for ...): a generator expression, not a list or dict
+ 	Lbrack  Position
+ 	Body    Expr
+ 	Clauses []Node // = *ForClause | *IfClause
+ 	Rbrack  Position
++
++	// Function is the generator function a generator expression denotes,
++	// set by the resolver; a *resolve.Function.
++	Function interface{}
+ }
+ 
+ func (x *Comprehension) Span() (start, end Position) {
+diff --git a/syntax/walk.go b/syntax/walk.go
+index 65f6808..eb91135 100644
+--- a/syntax/walk.go
++++ b/syntax/walk.go
+@@ -58,6 +58,11 @@ func Walk(n Node, f func(Node) bool) {
+ 			Walk(n.Result, f)
+ 		}
+ 
++	case *YieldStmt:
++		if n.Result != nil {
++			Walk(n.Result, f)
++		}
++
+ 	case *LoadStmt:
+ 		Walk(n.Module, f)
+ 		for _, from := range n.From {

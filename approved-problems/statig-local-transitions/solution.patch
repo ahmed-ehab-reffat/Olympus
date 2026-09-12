@@ -1,0 +1,541 @@
+diff --git a/README.md b/README.md
+index dd3fbc0..49a8d89 100644
+--- a/README.md
++++ b/README.md
+@@ -25,6 +25,7 @@ Hierarchical state machines for designing event-driven systems.
+ - [Concepts](#concepts)
+     - [States](#states)
+     - [Superstates](#superstates)
++    - [Transition kinds](#transition-kinds)
+     - [Actions](#actions)
+     - [Shared storage](#shared-storage)
+     - [State-local storage](#state-local-storage)
+@@ -123,10 +124,12 @@ fn led_on(event: &Event) -> Outcome<State> {
+ }
+ ```
+ 
+-Every state must return an `Outcome`. An `Outcome` can be one of three things:
++Every state must return an `Outcome`. An `Outcome` can be one of five things:
+ 
+ - `Handled`: The event has been handled.
+-- `Transition`: Transition to another state.
++- `Transition`: Transition to another state using the existing shortest-path behavior.
++- `LocalTransition`: Transition while retaining the deepest boundary shared by the active and target states.
++- `ExternalTransition`: Transition while re-entering the superstate handler that accepted the event when the target is in its subtree.
+ - `Super`: Defer the event to the parent superstate.
+ 
+ ### Superstates
+@@ -153,6 +156,14 @@ fn blinking(event: &Event) -> Outcome<State> {
+ 
+ Superstates can themselves also have superstates.
+ 
++### Transition kinds
++
++`Transition`, `LocalTransition`, and `ExternalTransition` select which states are exited and entered. `Transition` keeps Statig's existing behavior: different leaf states use the shortest path through their deepest common ancestor, and a transition to the active leaf exits and re-enters that leaf.
++
++A `LocalTransition` between different leaves also uses their deepest common ancestor, regardless of which handler returns it. A local self-transition runs no exit or entry action, but the target value still replaces the active value, including any new state-local storage.
++
++An `ExternalTransition` returned by a superstate exits and re-enters that superstate when the target remains in its subtree. For example, suppose `LedOn` and `LedOff` are children of `Blinking`, `LedOn` defers an event, and the `Blinking` handler returns `ExternalTransition(State::led_off())`. Statig exits `LedOn` and `Blinking`, then enters `Blinking` and `LedOff`. Returning `LocalTransition(State::led_off())` instead exits only `LedOn` and enters only `LedOff`. If the target is outside `Blinking`, both kinds use the ordinary common-ancestor path. An external transition returned directly by a leaf behaves like `Transition`, including exit and re-entry for a self-transition.
++
+ ### Actions
+ 
+ Actions run when entering or leaving states during a transition.
+@@ -459,7 +470,7 @@ impl<'sub> statig::Superstate<Blinky> for Superstate<'sub> {
+ 
+ When an event arrives, `statig` will first dispatch it to the current leaf state. If this state returns a `Super` outcome, it will then be dispatched to that state's superstate, which in turn returns its own outcome. Every time an event is deferred to a superstate, `statig` will traverse upwards in the graph until it reaches the `Top` state. This is an implicit superstate that will consider every event as handled.
+ 
+-In case the returned outcome is a `Transition`, `statig` will perform a transition sequence by traversing the graph from the current source state to the target state by taking the shortest possible path. When this path is going upwards from the source state, every state that is passed will have its **exit action** executed. And then similarly when going downward, every state that is passed will have its **entry action** executed.
++In case the returned outcome is a `Transition`, `statig` will perform a transition sequence by traversing the graph from the current source state to the target state by taking the shortest possible path. `LocalTransition` follows the same common-ancestor path for different leaf states but preserves a local self-transition. `ExternalTransition` may widen the path to exit and re-enter the superstate handler that accepted a deferred event when the target remains in that handler's subtree. When a path goes upwards from the source state, every state that is passed will have its **exit action** executed. Similarly, when going downward, every state that is passed will have its **entry action** executed.
+ 
+ For example when transitioning from the `LedOn` state to the `NotBlinking` state the transition sequence looks like this:
+ 
+diff --git a/statig/src/awaitable/inner.rs b/statig/src/awaitable/inner.rs
+index a0b0d0f..bb24fed 100644
+--- a/statig/src/awaitable/inner.rs
++++ b/statig/src/awaitable/inner.rs
+@@ -1,5 +1,5 @@
+ use crate::awaitable::{IntoStateMachine, State, StateExt, Superstate};
+-use crate::Outcome;
++use crate::{DispatchResult, Outcome, StateOrSuperstate, TransitionKind};
+ 
+ /// Private internal representation of a state machine that is used for the public types.
+ pub(crate) struct Inner<M>
+@@ -28,23 +28,114 @@ where
+         event: &M::Event<'_>,
+         context: &mut M::Context<'_>,
+     ) {
++        let result = self.dispatch(event, context).await;
++        match result.outcome {
++            Outcome::Super => {}
++            Outcome::Handled => {}
++            Outcome::Transition(state) => {
++                self.transition(state, TransitionKind::Legacy, result.handler_depth, context)
++                    .await
++            }
++            Outcome::LocalTransition(state) => {
++                self.transition(state, TransitionKind::Local, result.handler_depth, context)
++                    .await
++            }
++            Outcome::ExternalTransition(state) => {
++                self.transition(
++                    state,
++                    TransitionKind::External,
++                    result.handler_depth,
++                    context,
++                )
++                .await
++            }
++        }
++    }
++
++    async fn dispatch(
++        &mut self,
++        event: &M::Event<'_>,
++        context: &mut M::Context<'_>,
++    ) -> DispatchResult<M::State> {
++        M::before_dispatch(
++            &mut self.shared_storage,
++            StateOrSuperstate::State(&self.state),
++            event,
++            context,
++        )
++        .await;
++
+         let outcome = self
+             .state
+-            .handle(&mut self.shared_storage, event, context)
++            .call_handler(&mut self.shared_storage, event, context)
+             .await;
++
++        M::after_dispatch(
++            &mut self.shared_storage,
++            StateOrSuperstate::State(&self.state),
++            event,
++            context,
++        )
++        .await;
++
+         match outcome {
+-            Outcome::Super => {}
+-            Outcome::Handled => {}
+-            Outcome::Transition(state) => self.transition(state, context).await,
++            Outcome::Super => match self.state.superstate() {
++                Some(mut superstate) => {
++                    let mut handler_depth = 1;
++                    loop {
++                        M::before_dispatch(
++                            &mut self.shared_storage,
++                            StateOrSuperstate::Superstate(&superstate),
++                            event,
++                            context,
++                        )
++                        .await;
++
++                        let outcome = superstate
++                            .call_handler(&mut self.shared_storage, event, context)
++                            .await;
++
++                        M::after_dispatch(
++                            &mut self.shared_storage,
++                            StateOrSuperstate::Superstate(&superstate),
++                            event,
++                            context,
++                        )
++                        .await;
++
++                        match outcome {
++                            Outcome::Handled => {
++                                break DispatchResult::new(Outcome::Handled, handler_depth)
++                            }
++                            Outcome::Super => match superstate.superstate() {
++                                Some(parent) => {
++                                    superstate = parent;
++                                    handler_depth += 1;
++                                }
++                                None => break DispatchResult::new(Outcome::Handled, handler_depth),
++                            },
++                            outcome => break DispatchResult::new(outcome, handler_depth),
++                        }
++                    }
++                }
++                None => DispatchResult::new(Outcome::Super, 0),
++            },
++            outcome => DispatchResult::new(outcome, 0),
+         }
+     }
+ 
+     /// Transition from the current state to the given target state.
+-    pub(crate) async fn transition(&mut self, mut target: M::State, context: &mut M::Context<'_>) {
++    pub(crate) async fn transition(
++        &mut self,
++        mut target: M::State,
++        kind: TransitionKind,
++        handler_depth: usize,
++        context: &mut M::Context<'_>,
++    ) {
+         M::before_transition(&mut self.shared_storage, &self.state, &target, context).await;
+ 
+         // Get the transition path we need to perform from one state to the next.
+-        let (exit_levels, enter_levels) = self.state.transition_path(&mut target);
++        let (exit_levels, enter_levels) = self.transition_path(&mut target, kind, handler_depth);
+ 
+         // Perform the exit from the previous state towards the common ancestor state.
+         self.state
+@@ -61,6 +152,35 @@ where
+ 
+         M::after_transition(&mut self.shared_storage, &target, &self.state, context).await;
+     }
++
++    fn transition_path(
++        &mut self,
++        target: &mut M::State,
++        kind: TransitionKind,
++        handler_depth: usize,
++    ) -> (usize, usize) {
++        match kind {
++            TransitionKind::Legacy => self.state.transition_path(target),
++            TransitionKind::Local => {
++                if M::State::same_state(&self.state, target) {
++                    (0, 0)
++                } else {
++                    self.state.transition_path(target)
++                }
++            }
++            TransitionKind::External => {
++                let source_depth = self.state.depth();
++                let target_depth = target.depth();
++                let handler_tree_depth = source_depth
++                    .checked_sub(handler_depth)
++                    .expect("transition handler must be active");
++                let boundary_depth = handler_tree_depth.saturating_sub(1);
++                let common_depth =
++                    M::State::common_ancestor_depth(&mut self.state, target).min(boundary_depth);
++                (source_depth - common_depth, target_depth - common_depth)
++            }
++        }
++    }
+ }
+ 
+ impl<M> Clone for Inner<M>
+diff --git a/statig/src/awaitable/state.rs b/statig/src/awaitable/state.rs
+index 3955e83..ef9c382 100644
+--- a/statig/src/awaitable/state.rs
++++ b/statig/src/awaitable/state.rs
+@@ -157,12 +157,16 @@ where
+                                 }
+                                 None => break Outcome::Handled,
+                             },
+-                            Outcome::Transition(state) => break Outcome::Transition(state),
++                            outcome @ (Outcome::Transition(_)
++                            | Outcome::LocalTransition(_)
++                            | Outcome::ExternalTransition(_)) => break outcome,
+                         }
+                     },
+                     None => Outcome::Super,
+                 },
+-                Outcome::Transition(state) => Outcome::Transition(state),
++                outcome @ (Outcome::Transition(_)
++                | Outcome::LocalTransition(_)
++                | Outcome::ExternalTransition(_)) => outcome,
+             }
+         }
+     }
+diff --git a/statig/src/blocking/inner.rs b/statig/src/blocking/inner.rs
+index 3d3ada1..c3e18a4 100644
+--- a/statig/src/blocking/inner.rs
++++ b/statig/src/blocking/inner.rs
+@@ -1,5 +1,5 @@
+ use crate::blocking::{IntoStateMachine, State, StateExt, Superstate};
+-use crate::Outcome;
++use crate::{DispatchResult, Outcome, StateOrSuperstate, TransitionKind};
+ 
+ /// Private internal representation of a state machine that is used for the public types.
+ pub(crate) struct Inner<M>
+@@ -29,20 +29,130 @@ where
+         event: &M::Event<'_>,
+         context: &mut M::Context<'_>,
+     ) {
+-        let outcome = self.state.handle(&mut self.shared_storage, event, context);
+-        match outcome {
++        let result = self.dispatch(event, context);
++        match result.outcome {
+             Outcome::Super => {}
+             Outcome::Handled => {}
+-            Outcome::Transition(state) => self.transition(state, context),
++            Outcome::Transition(state) => {
++                self.transition(state, TransitionKind::Legacy, result.handler_depth, context)
++            }
++            Outcome::LocalTransition(state) => {
++                self.transition(state, TransitionKind::Local, result.handler_depth, context)
++            }
++            Outcome::ExternalTransition(state) => self.transition(
++                state,
++                TransitionKind::External,
++                result.handler_depth,
++                context,
++            ),
++        }
++    }
++
++    fn dispatch(
++        &mut self,
++        event: &M::Event<'_>,
++        context: &mut M::Context<'_>,
++    ) -> DispatchResult<M::State> {
++        M::before_dispatch(
++            &mut self.shared_storage,
++            StateOrSuperstate::State(&self.state),
++            event,
++            context,
++        );
++
++        let outcome = self
++            .state
++            .call_handler(&mut self.shared_storage, event, context);
++
++        M::after_dispatch(
++            &mut self.shared_storage,
++            StateOrSuperstate::State(&self.state),
++            event,
++            context,
++        );
++
++        match outcome {
++            Outcome::Super => match self.state.superstate() {
++                Some(mut superstate) => {
++                    M::before_dispatch(
++                        &mut self.shared_storage,
++                        StateOrSuperstate::Superstate(&superstate),
++                        event,
++                        context,
++                    );
++
++                    let mut result = Self::dispatch_superstate(
++                        &mut self.shared_storage,
++                        &mut superstate,
++                        event,
++                        context,
++                    );
++
++                    M::after_dispatch(
++                        &mut self.shared_storage,
++                        StateOrSuperstate::Superstate(&superstate),
++                        event,
++                        context,
++                    );
++
++                    result.handler_depth += 1;
++                    result
++                }
++                None => DispatchResult::new(Outcome::Super, 0),
++            },
++            outcome => DispatchResult::new(outcome, 0),
++        }
++    }
++
++    fn dispatch_superstate(
++        shared_storage: &mut M,
++        superstate: &mut M::Superstate<'_>,
++        event: &M::Event<'_>,
++        context: &mut M::Context<'_>,
++    ) -> DispatchResult<M::State> {
++        let outcome = superstate.call_handler(shared_storage, event, context);
++
++        match outcome {
++            Outcome::Super => match superstate.superstate() {
++                Some(mut parent) => {
++                    M::before_dispatch(
++                        shared_storage,
++                        StateOrSuperstate::Superstate(&parent),
++                        event,
++                        context,
++                    );
++
++                    let mut result =
++                        Self::dispatch_superstate(shared_storage, &mut parent, event, context);
++
++                    M::after_dispatch(
++                        shared_storage,
++                        StateOrSuperstate::Superstate(&parent),
++                        event,
++                        context,
++                    );
++
++                    result.handler_depth += 1;
++                    result
++                }
++                None => DispatchResult::new(Outcome::Super, 0),
++            },
++            outcome => DispatchResult::new(outcome, 0),
+         }
+     }
+ 
+     /// Transition from the current state to the given target state.
+-    pub(crate) fn transition(&mut self, mut target: M::State, context: &mut M::Context<'_>) {
++    pub(crate) fn transition(
++        &mut self,
++        mut target: M::State,
++        kind: TransitionKind,
++        handler_depth: usize,
++        context: &mut M::Context<'_>,
++    ) {
+         M::before_transition(&mut self.shared_storage, &self.state, &target, context);
+ 
+         // Get the transition path we need to perform from one state to the next.
+-        let (exit_levels, enter_levels) = self.state.transition_path(&mut target);
++        let (exit_levels, enter_levels) = self.transition_path(&mut target, kind, handler_depth);
+ 
+         // Perform the exit from the previous state towards the common ancestor state.
+         self.state
+@@ -57,6 +167,35 @@ where
+ 
+         M::after_transition(&mut self.shared_storage, &target, &self.state, context);
+     }
++
++    fn transition_path(
++        &mut self,
++        target: &mut M::State,
++        kind: TransitionKind,
++        handler_depth: usize,
++    ) -> (usize, usize) {
++        match kind {
++            TransitionKind::Legacy => self.state.transition_path(target),
++            TransitionKind::Local => {
++                if M::State::same_state(&self.state, target) {
++                    (0, 0)
++                } else {
++                    self.state.transition_path(target)
++                }
++            }
++            TransitionKind::External => {
++                let source_depth = self.state.depth();
++                let target_depth = target.depth();
++                let handler_tree_depth = source_depth
++                    .checked_sub(handler_depth)
++                    .expect("transition handler must be active");
++                let boundary_depth = handler_tree_depth.saturating_sub(1);
++                let common_depth =
++                    M::State::common_ancestor_depth(&mut self.state, target).min(boundary_depth);
++                (source_depth - common_depth, target_depth - common_depth)
++            }
++        }
++    }
+ }
+ 
+ impl<M> Clone for Inner<M>
+diff --git a/statig/src/blocking/state.rs b/statig/src/blocking/state.rs
+index 1907ec0..3641199 100644
+--- a/statig/src/blocking/state.rs
++++ b/statig/src/blocking/state.rs
+@@ -133,7 +133,9 @@ where
+                 }
+                 None => Outcome::Super,
+             },
+-            Outcome::Transition(state) => Outcome::Transition(state),
++            outcome @ (Outcome::Transition(_)
++            | Outcome::LocalTransition(_)
++            | Outcome::ExternalTransition(_)) => outcome,
+         }
+     }
+ 
+diff --git a/statig/src/blocking/superstate.rs b/statig/src/blocking/superstate.rs
+index 469774d..058feec 100644
+--- a/statig/src/blocking/superstate.rs
++++ b/statig/src/blocking/superstate.rs
+@@ -106,7 +106,7 @@ where
+                         shared_storage,
+                         StateOrSuperstate::Superstate(&superstate),
+                         event,
+-                        context
++                        context,
+                     );
+ 
+                     let outcome = superstate.handle(shared_storage, event, context);
+@@ -115,14 +115,16 @@ where
+                         shared_storage,
+                         StateOrSuperstate::Superstate(&superstate),
+                         event,
+-                        context
++                        context,
+                     );
+ 
+                     outcome
+                 }
+                 None => Outcome::Super,
+             },
+-            Outcome::Transition(state) => Outcome::Transition(state),
++            outcome @ (Outcome::Transition(_)
++            | Outcome::LocalTransition(_)
++            | Outcome::ExternalTransition(_)) => outcome,
+         }
+     }
+ 
+diff --git a/statig/src/outcome.rs b/statig/src/outcome.rs
+index 1625a78..5b74b49 100644
+--- a/statig/src/outcome.rs
++++ b/statig/src/outcome.rs
+@@ -8,6 +8,40 @@ pub enum Outcome<S> {
+     Super,
+     /// Transition to the given state.
+     Transition(S),
++    /// Perform a local transition to the given state.
++    ///
++    /// Entry and exit actions are only run below the deepest ancestor shared
++    /// by the active and target states. A local self-transition replaces the
++    /// active state's local storage without running entry or exit actions.
++    LocalTransition(S),
++    /// Perform an external transition to the given state.
++    ///
++    /// When a superstate handles an event deferred by a child, that
++    /// superstate is exited and entered again if the target remains inside
++    /// its subtree. Transitions outside the subtree still follow the normal
++    /// path through the lowest common ancestor.
++    ExternalTransition(S),
++}
++
++#[derive(Clone, Copy)]
++pub(crate) enum TransitionKind {
++    Legacy,
++    Local,
++    External,
++}
++
++pub(crate) struct DispatchResult<S> {
++    pub outcome: Outcome<S>,
++    pub handler_depth: usize,
++}
++
++impl<S> DispatchResult<S> {
++    pub fn new(outcome: Outcome<S>, handler_depth: usize) -> Self {
++        Self {
++            outcome,
++            handler_depth,
++        }
++    }
+ }
+ 
+ /// Type alias that will be removed in some future release. Use `Outcome` instead.
+@@ -23,6 +57,8 @@ where
+             (Self::Handled, Self::Handled) => true,
+             (Self::Super, Self::Super) => true,
+             (Self::Transition(s), Self::Transition(o)) => s == o,
++            (Self::LocalTransition(s), Self::LocalTransition(o)) => s == o,
++            (Self::ExternalTransition(s), Self::ExternalTransition(o)) => s == o,
+             _ => false,
+         }
+     }
+@@ -42,6 +78,14 @@ where
+                 .debug_tuple("Transition")
+                 .field(state as &dyn Debug)
+                 .finish(),
++            Self::LocalTransition(state) => f
++                .debug_tuple("LocalTransition")
++                .field(state as &dyn Debug)
++                .finish(),
++            Self::ExternalTransition(state) => f
++                .debug_tuple("ExternalTransition")
++                .field(state as &dyn Debug)
++                .finish(),
+         }
+     }
+ }

@@ -1,0 +1,463 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..4688baa2
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,39 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++output_path="results.xml"
++if [ "${1:-}" = "--output_path" ]; then
++    output_path="$2"
++    shift 2
++fi
++
++case "${1:-}" in
++    base)
++        test_file="tests/test_wrap.py"
++        ;;
++    new)
++        test_file="tests/test_jax_to_drjit_7f31c2.py"
++        ;;
++    *)
++        echo "usage: $0 [--output_path PATH] {base|new}" >&2
++        exit 2
++        ;;
++esac
++
++source_root="$(pwd)"
++run_root="$(mktemp -d /tmp/drjit-eval.XXXXXX)"
++runtime_root="$run_root/runtime"
++
++cleanup() {
++    rm -rf -- "$run_root"
++}
++trap cleanup EXIT
++
++mkdir -p "$runtime_root" "$(dirname "$output_path")"
++cp -a /opt/drjit-runtime/. "$runtime_root/"
++cp -a "$source_root/drjit/." "$runtime_root/drjit/"
++
++cd /tmp
++PYTHONPATH="$runtime_root:/usr/local/lib/python3.12/site-packages" \
++    python -S -P -m pytest \
++    "$source_root/$test_file" -q --rootdir=/tmp --junitxml="$output_path"
+diff --git a/tests/test_jax_to_drjit_7f31c2.py b/tests/test_jax_to_drjit_7f31c2.py
+new file mode 100644
+index 00000000..a4c91b3b
+--- /dev/null
++++ b/tests/test_jax_to_drjit_7f31c2.py
+@@ -0,0 +1,412 @@
++import drjit as dr
++import jax
++import jax.numpy as jnp
++import numpy as np
++import pytest
++
++
++jax.config.update("jax_enable_x64", True)
++
++
++def assert_close(actual, expected, *, rtol=1e-6, atol=1e-6):
++    np.testing.assert_allclose(
++        np.asarray(actual), np.asarray(expected), rtol=rtol, atol=atol
++    )
++
++
++def test_primal_nested_pytrees_kwargs_multiple_outputs_and_constants():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(payload, *, bias):
++        x = payload["left"][0]
++        y = payload["right"]
++        assert dr.is_array_v(x) and dr.is_array_v(y) and dr.is_array_v(bias)
++        return {
++            "computed": [x * y + bias, x + 2 * y],
++            "constant": 9.0,
++        }
++
++    x = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
++    y = jnp.array([4.0, 5.0, 6.0], dtype=jnp.float64)
++    bias = jnp.array([0.5], dtype=jnp.float64)
++    result = operation({"left": (x,), "right": y}, bias=bias)
++
++    assert isinstance(result, dict)
++    assert isinstance(result["computed"], list)
++    assert result["constant"] == 9.0
++    assert_close(result["computed"][0], x * y + bias)
++    assert_close(result["computed"][1], x + 2 * y)
++
++
++def test_reverse_mode_uses_all_multi_output_cotangents():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(x, y):
++        return x * x * y + dr.sin(x), x + y * y
++
++    x = jnp.array([0.2, -0.4, 0.7], dtype=jnp.float64)
++    y = jnp.array([1.5, 0.5, -2.0], dtype=jnp.float64)
++    c0 = jnp.array([2.0, -3.0, 4.0], dtype=jnp.float64)
++    c1 = jnp.array([-1.0, 5.0, 0.25], dtype=jnp.float64)
++
++    output, pullback = jax.vjp(operation, x, y)
++    dx, dy = pullback((c0, c1))
++
++    assert_close(output[0], x * x * y + jnp.sin(x))
++    assert_close(output[1], x + y * y)
++    assert_close(dx, c0 * (2 * x * y + jnp.cos(x)) + c1)
++    assert_close(dy, c0 * x * x + c1 * 2 * y)
++
++
++def test_reverse_mode_accumulates_cotangents_for_aliased_output_leaves():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(x):
++        shared = x * x + dr.sin(x)
++        return shared, {"again": shared}
++
++    x = jnp.array([0.2, -0.7, 1.5], dtype=jnp.float64)
++    c0 = jnp.array([2.0, -3.0, 4.0], dtype=x.dtype)
++    c1 = jnp.array([-5.0, 0.25, 1.5], dtype=x.dtype)
++    output, pullback = jax.vjp(operation, x)
++    (gradient,) = pullback((c0, {"again": c1}))
++
++    derivative = 2 * x + jnp.cos(x)
++    assert_close(output[0], x * x + jnp.sin(x))
++    assert_close(output[1]["again"], output[0])
++    assert_close(gradient, (c0 + c1) * derivative)
++
++
++def test_forward_mode_combines_distinct_tangents():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(x, y):
++        return x * x * y + dr.cos(y), x * y
++
++    x = jnp.array([0.5, 1.5, -2.0], dtype=jnp.float64)
++    y = jnp.array([3.0, -0.25, 0.75], dtype=jnp.float64)
++    tx = jnp.array([2.0, -1.0, 4.0], dtype=jnp.float64)
++    ty = jnp.array([-3.0, 5.0, 0.5], dtype=jnp.float64)
++
++    primal, tangent = jax.jvp(operation, (x, y), (tx, ty))
++    assert_close(primal[0], x * x * y + jnp.cos(y))
++    assert_close(primal[1], x * y)
++    assert_close(tangent[0], tx * 2 * x * y + ty * (x * x - jnp.sin(y)))
++    assert_close(tangent[1], tx * y + x * ty)
++
++
++def test_reverse_mode_handles_integer_and_unused_inputs():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(x, indices, unused, offset, stride):
++        return {
++            "value": x * (indices + stride) + offset,
++            "indices": indices + 2,
++            "literal": 7,
++        }
++
++    x = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
++    indices = jnp.array([0, 2, 4], dtype=jnp.int32)
++    unused = jnp.array([10.0, 20.0, 30.0], dtype=jnp.float32)
++
++    dx, dunused = jax.grad(
++        lambda a, u: jnp.sum(operation(a, indices, u, 2.5, 1)["value"]),
++        argnums=(0, 1),
++    )(x, unused)
++    result = operation(x, indices, unused, 2.5, 1)
++    _, tangent = jax.jvp(
++        lambda a: operation(a, indices, unused, 2.5, 1),
++        (x,),
++        (jnp.ones_like(x),),
++    )
++
++    assert_close(dx, indices + 1)
++    assert_close(dunused, jnp.zeros_like(unused))
++    assert_close(result["value"], x * (indices + 1) + 2.5)
++    assert_close(tangent["value"], indices + 1)
++    assert np.asarray(tangent["indices"]).dtype == np.dtype(jax.float0)
++    assert np.asarray(tangent["literal"]).dtype == np.dtype(jax.float0)
++    np.testing.assert_array_equal(
++        np.asarray(result["indices"]), np.asarray(indices + 2)
++    )
++    assert result["literal"] == 7
++
++
++def test_nested_keywords_participate_in_reverse_and_forward_mode():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(payload, *, scale):
++        x = payload[0]["x"]
++        offset = payload[1]
++        return {"value": x * scale + offset}
++
++    x = jnp.array([1.0, 2.0, 4.0], dtype=jnp.float64)
++    offset = jnp.array([3.0, 5.0, 7.0], dtype=jnp.float64)
++    scale = jnp.array(2.5, dtype=jnp.float64)
++
++    dx, ds = jax.grad(
++        lambda a, s: jnp.sum(
++            operation([{"x": a}, offset], scale=s)["value"]
++        ),
++        argnums=(0, 1),
++    )(x, scale)
++    _, tangent = jax.jvp(
++        lambda a, s: operation([{"x": a}, offset], scale=s)["value"],
++        (x, scale),
++        (jnp.array([0.5, 1.0, -2.0]), jnp.array(3.0)),
++    )
++
++    assert_close(dx, jnp.full_like(x, scale))
++    assert_close(ds, jnp.sum(x))
++    assert_close(tangent, jnp.array([4.25, 8.5, 7.0]))
++
++
++def test_broadcast_scalar_cotangent_is_reduced_to_input_shape():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(x, scale):
++        return x * scale + 2
++
++    x = jnp.array([1.0, 3.0, 5.0, 7.0], dtype=jnp.float64)
++    scale = jnp.array([2.0], dtype=jnp.float64)
++    dx, dscale = jax.grad(
++        lambda a, s: jnp.sum(operation(a, s)), argnums=(0, 1)
++    )(x, scale)
++
++    assert_close(dx, jnp.full_like(x, 2.0))
++    assert dscale.shape == (1,)
++    assert_close(dscale, jnp.array([16.0]))
++
++
++def test_repeated_eager_calls_keep_derivative_state_local():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(x):
++        return x * x + 3 * x
++
++    for size in (2, 5, 3, 2):
++        x = jnp.arange(size, dtype=jnp.float64) - 1.0
++        grad = jax.grad(lambda value: jnp.sum(operation(value)))(x)
++        _, tangent = jax.jvp(
++            operation, (x,), (jnp.full_like(x, 4.0),)
++        )
++        assert_close(grad, 2 * x + 3)
++        assert_close(tangent, 4 * (2 * x + 3))
++
++
++def test_vmap_primal_preserves_mixed_axes_and_nested_pytrees():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(payload, scale):
++        x = payload["x"]
++        y = payload["y"][0]
++        return {
++            "sum": [x * scale + y],
++            "pair": (x - y, x * y),
++            "constant": 9.0,
++        }
++
++    x = jnp.arange(24.0, dtype=jnp.float64).reshape(2, 3, 4) / 10
++    y = jnp.arange(24.0, dtype=jnp.float64).reshape(3, 2, 4) / 7
++    scale = jnp.array(1.5, dtype=jnp.float64)
++    result = jax.vmap(
++        operation,
++        in_axes=({"x": -2, "y": (0,)}, None),
++        out_axes={"sum": [1], "pair": (0, 0), "constant": 0},
++    )({"x": x, "y": (y,)}, scale)
++
++    x_front = jnp.moveaxis(x, 1, 0)
++    assert_close(result["sum"][0], x * scale + jnp.moveaxis(y, 0, 1))
++    assert_close(result["pair"][0], x_front - y)
++    assert_close(result["pair"][1], x_front * y)
++    assert_close(result["constant"], jnp.full((3,), 9.0))
++
++
++def test_vmap_composes_with_forward_mode_inside_the_batch():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(x, scale):
++        return x * x * scale + dr.sin(x), x + scale
++
++    x = jnp.arange(12.0, dtype=jnp.float64).reshape(4, 3) / 5
++    scale = jnp.array([1.0, -2.0, 0.5], dtype=jnp.float64)
++    tx = jnp.arange(12.0, dtype=jnp.float64).reshape(4, 3) / 9
++    ts = jnp.array([0.25, 3.0, -1.5], dtype=jnp.float64)
++
++    primal, tangent = jax.vmap(
++        lambda a, s, da, ds: jax.jvp(operation, (a, s), (da, ds)),
++        in_axes=(1, 0, 1, 0),
++    )(x, scale, tx, ts)
++
++    x_front = jnp.moveaxis(x, 1, 0)
++    tx_front = jnp.moveaxis(tx, 1, 0)
++    expected_primal = x_front * x_front * scale[:, None] + jnp.sin(x_front)
++    expected_tangent = (
++        tx_front * (2 * x_front * scale[:, None] + jnp.cos(x_front))
++        + ts[:, None] * x_front * x_front
++    )
++    assert_close(primal[0], expected_primal)
++    assert_close(primal[1], x_front + scale[:, None])
++    assert_close(tangent[0], expected_tangent)
++    assert_close(tangent[1], tx_front + ts[:, None])
++
++    _, outer_tangent = jax.jvp(
++        lambda a, s: jax.vmap(operation, in_axes=(1, 0))(a, s),
++        (x, scale),
++        (tx, ts),
++    )
++    assert_close(outer_tangent[0], expected_tangent)
++    assert_close(outer_tangent[1], tx_front + ts[:, None])
++
++
++def test_vmap_reverse_mode_zeros_inputs_disconnected_from_selected_output():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(x, other):
++        return x * x + dr.sin(x), other * other + dr.cos(other)
++
++    x = jnp.arange(12.0, dtype=jnp.float64).reshape(3, 4) / 5
++    other = jnp.arange(12.0, dtype=jnp.float64).reshape(4, 3) / 7
++    cotangent = jnp.arange(12.0, dtype=jnp.float64).reshape(4, 3) / 9
++
++    def pullback_selected(a, b, seed):
++        _, pullback = jax.vjp(operation, a, b)
++        return pullback((seed, jnp.zeros_like(b)))
++
++    dx, dother = jax.vmap(
++        pullback_selected, in_axes=(1, 0, 0)
++    )(x, other, cotangent)
++
++    x_front = jnp.moveaxis(x, 1, 0)
++    assert_close(dx, cotangent * (2 * x_front + jnp.cos(x_front)))
++    assert_close(dother, jnp.zeros_like(other))
++
++
++def test_reverse_mode_composes_outside_vmap_and_handles_empty_batches():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(x):
++        return {"value": x * x * x + dr.cos(x), "shifted": x + 2}
++
++    x = jnp.arange(12.0, dtype=jnp.float64).reshape(3, 4) / 6
++    objective = lambda value: jnp.sum(jax.vmap(operation)(value)["value"])
++    gradient = jax.grad(objective)(x)
++    assert_close(gradient, 3 * x * x - jnp.sin(x))
++
++    empty = jnp.empty((0, 4), dtype=jnp.float64)
++    result = jax.vmap(operation)(empty)
++    assert result["value"].shape == (0, 4)
++    assert result["value"].dtype == empty.dtype
++    assert result["shifted"].shape == (0, 4)
++
++
++@pytest.mark.parametrize(
++    ("source", "target"),
++    [(jax, "drjit"), ("jax", dr)],
++    ids=["module-source", "module-target"],
++)
++def test_mixed_string_and_module_decorator_arguments(source, target):
++    @dr.wrap(source=source, target=target)
++    def operation(x):
++        return x * x + 1
++
++    x = jnp.array([1.0, -2.0, 3.5], dtype=jnp.float32)
++    value = operation(x)
++    grad = jax.grad(lambda a: jnp.sum(operation(a)))(x)
++
++    assert_close(value, x * x + 1)
++    assert_close(grad, 2 * x)
++
++
++@pytest.mark.parametrize("dtype", [jnp.float16, jnp.float32, jnp.float64])
++def test_supported_float_dtype_rank_and_module_form_are_preserved(dtype):
++    @dr.wrap(source=jax, target=dr)
++    def operation(x):
++        return x * x
++
++    x = jnp.array([[1.25, -2.5], [0.5, 3.0]], dtype=dtype)
++    value = operation(x)
++    grad = jax.grad(lambda a: jnp.sum(operation(a)))(x)
++
++    assert value.dtype == dtype
++    assert grad.dtype == dtype
++    assert value.shape == x.shape
++    tolerance = 2e-3 if dtype == jnp.float16 else 1e-6
++    assert_close(value, x * x, rtol=tolerance, atol=tolerance)
++    assert_close(grad, 2 * x, rtol=tolerance, atol=tolerance)
++
++
++def test_vmap_primal_maps_values_independent_of_ad_connectivity():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(value, index):
++        return {
++            "floored": dr.floor(value),
++            "from_integer": index * 1.5,
++        }
++
++    value = jnp.array([0.3, 1.7, 2.2, 3.9], dtype=jnp.float64)
++    index = jnp.array([2, 5, 9, 1], dtype=jnp.int32)
++    result = jax.vmap(operation)(value, index)
++
++    assert_close(result["floored"], jnp.floor(value))
++    assert_close(result["from_integer"], index * 1.5)
++
++
++def test_direct_python_numeric_primals_work_with_jvp_and_vjp():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(value, scale):
++        return value * scale
++
++    value = jnp.array([1.0, -2.0, 4.0], dtype=jnp.float64)
++    direction = jnp.array([0.5, 3.0, -1.0], dtype=jnp.float64)
++    primal, tangent = jax.jvp(
++        operation, (value, 2.0), (direction, 0.0)
++    )
++    output, pullback = jax.vjp(operation, value, 2.0)
++    dvalue, dscale = pullback(jnp.ones_like(output))
++
++    assert_close(primal, value * 2.0)
++    assert_close(tangent, direction * 2.0)
++    assert_close(dvalue, jnp.full_like(value, 2.0))
++    assert_close(dscale, jnp.sum(value))
++
++
++def test_zero_sized_vmap_forward_mode_preserves_float0_tangents():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(value):
++        return {"value": value * value + dr.sin(value), "integer": 3}
++
++    empty = jnp.empty((0, 4), dtype=jnp.float64)
++    tangent = jnp.empty_like(empty)
++    primal, derivative = jax.vmap(
++        lambda value, direction: jax.jvp(
++            operation, (value,), (direction,)
++        )
++    )(empty, tangent)
++
++    assert primal["value"].shape == (0, 4)
++    assert derivative["value"].shape == (0, 4)
++    assert primal["integer"].shape == (0,)
++    assert derivative["integer"].shape == (0,)
++    assert np.asarray(derivative["integer"]).dtype == np.dtype(jax.float0)
++
++
++def test_zero_sized_vmap_reverse_mode_uses_input_avals():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(x, y):
++        return dr.sum(x * x) + dr.sum(y * y)
++
++    x = jnp.empty((0, 4), dtype=jnp.float64)
++    y = jnp.empty((0, 2), dtype=jnp.float64)
++    dx, dy = jax.vmap(jax.grad(operation, argnums=(0, 1)))(x, y)
++
++    assert dx.shape == (0, 4)
++    assert dy.shape == (0, 2)
++    assert dx.dtype == x.dtype
++    assert dy.dtype == y.dtype
++
++
++def test_int64_arrays_cross_boundary_without_narrowing():
++    @dr.wrap(source="jax", target="drjit")
++    def operation(value, index):
++        return value * (index + 2), index + 1
++
++    value = jnp.array([1.0, 2.0, -3.0], dtype=jnp.float64)
++    index = jnp.array([2**40, -(2**40), 7], dtype=jnp.int64)
++    result, shifted = operation(value, index)
++    gradient = jax.grad(
++        lambda argument: jnp.sum(operation(argument, index)[0])
++    )(value)
++
++    assert shifted.dtype == jnp.int64
++    np.testing.assert_array_equal(np.asarray(shifted), np.asarray(index + 1))
++    assert_close(result, value * (index + 2))
++    assert_close(gradient, index + 2)

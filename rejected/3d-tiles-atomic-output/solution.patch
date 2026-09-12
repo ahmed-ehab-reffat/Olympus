@@ -1,0 +1,512 @@
+diff --git a/src/tools/pipelines/PipelineExecutor.ts b/src/tools/pipelines/PipelineExecutor.ts
+index daaceaa..8ec9892 100644
+--- a/src/tools/pipelines/PipelineExecutor.ts
++++ b/src/tools/pipelines/PipelineExecutor.ts
+@@ -3,35 +3,42 @@ import os from "os";
+ import path from "path";
+ 
+ import { Pipeline } from "./Pipeline";
++import { PipelineError } from "./PipelineError";
+ import { TilesetStageExecutor } from "./TilesetStageExecutor";
+ 
+ import { Loggers } from "../../base";
+ const logger = Loggers.get("pipeline");
+ 
++interface OutputDescription {
++  destination: string;
++  extension: string;
++  isJson: boolean;
++  isPackage: boolean;
++  requestedJsonName: string;
++}
++
++interface Publication {
++  destination: string;
++  workspace: string;
++  candidate: string;
++  backup: string;
++  createdParents: string[];
++  committed: boolean;
++  retainWorkspace: boolean;
++}
++
+ /**
+  * Methods to execute `Pipeline` objects.
+  *
+  * @internal
+  */
+ export class PipelineExecutor {
+-  /**
+-   * The directory to store temporary files in.
+-   *
+-   * If this is `undefined`, then a directory in the
+-   * default system temp directory will be used.
+-   */
+   private static tempBaseDirectory: string | undefined;
+ 
+   /**
+    * Set the directory to store temporary files in.
+    *
+-   * If this is `undefined`, then a directory in the
+-   * default system temp directory will be used.
+-   *
+-   * This is primarily intended for testing, demos, and
+-   * debugging.
+-   *
+-   * @param directory - The directory
++   * @param directory - The directory, or `undefined` to use the system temp
+    */
+   static setTempBaseDirectory(directory: string | undefined) {
+     PipelineExecutor.tempBaseDirectory = directory;
+@@ -41,56 +48,413 @@ export class PipelineExecutor {
+    * Executes the given `Pipeline`.
+    *
+    * @param pipeline - The `Pipeline` object
+-   * @param overwrite - Whether outputs should be overwritten if
+-   * they already exist
++   * @param overwrite - Whether outputs should be overwritten if they exist
+    * @returns A promise that resolves when the process is finished
+-   * @throws PipelineError If one of the processing steps causes
+-   * an error.
++   * @throws PipelineError If execution or publication fails
+    */
+   static async executePipeline(pipeline: Pipeline, overwrite: boolean) {
+-    let currentInput = pipeline.input;
+-    let currentOutput: string | undefined = undefined;
+-    let currentOverwrite = true;
+-
+-    const tilesetStages = pipeline.tilesetStages;
+-
+-    // Create a temporary directory for the intermediate
+-    // processing steps (if there are more than one)
+-    // TODO: This is not cleaned up at the end...
+-    let tempBasePath = PipelineExecutor.tempBaseDirectory;
+-    if (!tempBasePath) {
+-      if (tilesetStages.length > 1) {
+-        tempBasePath = fs.mkdtempSync(
+-          path.join(os.tmpdir(), "3d-tiles-tools-pipeline-")
++    if (pipeline.tilesetStages.length === 0) {
++      return;
++    }
++
++    let executionWorkspace: string | undefined;
++    let publication: Publication | undefined;
++    let failure: unknown;
++
++    try {
++      const output = PipelineExecutor.describeOutput(pipeline.output);
++      executionWorkspace = PipelineExecutor.createExecutionWorkspace();
++      const stagedOutput = PipelineExecutor.computeStagedOutput(
++        executionWorkspace,
++        output
++      );
++
++      let currentInput = pipeline.input;
++      for (let i = 0; i < pipeline.tilesetStages.length; i++) {
++        const stage = pipeline.tilesetStages[i];
++        const isFinal = i === pipeline.tilesetStages.length - 1;
++        const currentOutput = isFinal
++          ? stagedOutput
++          : path.join(
++              executionWorkspace,
++              `tilesetStage-${i}-${stage.name.replace(/[^\w\s]/gi, "")}`
++            );
++        await TilesetStageExecutor.executeTilesetStage(
++          stage,
++          currentInput,
++          currentOutput,
++          true
+         );
++        currentInput = currentOutput;
++      }
++
++      publication = PipelineExecutor.preparePublication(
++        stagedOutput,
++        output,
++        overwrite,
++        executionWorkspace
++      );
++
++      const cleanupError = PipelineExecutor.tryRemovePath(
++        executionWorkspace,
++        false
++      );
++      if (cleanupError) {
++        throw cleanupError;
++      }
++      executionWorkspace = undefined;
++
++      PipelineExecutor.commitPublication(publication);
++    } catch (error) {
++      failure = error;
++    } finally {
++      const executionCleanupError = PipelineExecutor.tryRemovePath(
++        executionWorkspace,
++        failure !== undefined
++      );
++      if (failure === undefined && executionCleanupError) {
++        failure = executionCleanupError;
++      }
++
++      if (publication) {
++        const publicationCleanupError = publication.retainWorkspace
++          ? undefined
++          : PipelineExecutor.tryRemovePath(
++              publication.workspace,
++              failure !== undefined
++            );
++        if (failure === undefined && publicationCleanupError) {
++          failure = publicationCleanupError;
++        }
++        if (!publication.committed) {
++          PipelineExecutor.removeCreatedParents(publication.createdParents);
++        }
+       }
+     }
+ 
+-    // Execute each `TilesetStage`
+-    for (let t = 0; t < tilesetStages.length; t++) {
+-      const tilesetStage = tilesetStages[t];
++    if (failure !== undefined) {
++      throw PipelineExecutor.toPipelineError(failure);
++    }
++  }
+ 
+-      const message =
+-        `  Executing tilesetStage ${t} of ` +
+-        `${tilesetStages.length}: ${tilesetStage.name}`;
+-      logger.debug(message);
++  private static describeOutput(outputName: string): OutputDescription {
++    const resolved = path.resolve(outputName);
++    const originalExtension = path.extname(resolved);
++    const extension = originalExtension.toLowerCase();
++    const isJson = extension === ".json";
++    const isPackage = extension === ".3tz" || extension === ".3dtiles";
++    return {
++      destination: isJson ? path.dirname(resolved) : resolved,
++      extension: isPackage ? originalExtension : "",
++      isJson,
++      isPackage,
++      requestedJsonName: isJson ? path.basename(resolved) : "tileset.json",
++    };
++  }
+ 
+-      if (t == tilesetStages.length - 1) {
+-        currentOutput = pipeline.output;
+-        currentOverwrite = overwrite;
+-      } else {
+-        const nameSuffix = tilesetStage.name.replace(/[^\w\s]/gi, "");
+-        currentOutput = `${tempBasePath}/tilesetStage-${t}-${nameSuffix}`;
+-        currentOverwrite = true;
++  private static createExecutionWorkspace(): string {
++    const base = path.resolve(
++      PipelineExecutor.tempBaseDirectory ?? os.tmpdir()
++    );
++    if (fs.existsSync(base)) {
++      if (!fs.statSync(base).isDirectory()) {
++        throw new Error(`Temporary base is not a directory: ${base}`);
++      }
++    } else {
++      fs.mkdirSync(base, { recursive: true });
++    }
++    return fs.mkdtempSync(path.join(base, "3d-tiles-tools-pipeline-"));
++  }
++
++  private static computeStagedOutput(
++    workspace: string,
++    output: OutputDescription
++  ): string {
++    if (output.isPackage) {
++      return path.join(workspace, `staged${output.extension}`);
++    }
++    const stagedStorage = path.join(workspace, "staged");
++    return output.isJson
++      ? path.join(stagedStorage, output.requestedJsonName)
++      : stagedStorage;
++  }
++
++  private static preparePublication(
++    stagedOutput: string,
++    output: OutputDescription,
++    overwrite: boolean,
++    executionWorkspace: string
++  ): Publication {
++    const owner = PipelineExecutor.findNearestExistingDirectory(
++      path.dirname(output.destination)
++    );
++    const workspace = fs.mkdtempSync(
++      path.join(owner, ".3d-tiles-tools-publication-")
++    );
++    const candidate = path.join(
++      workspace,
++      output.isPackage ? `candidate${output.extension}` : "candidate"
++    );
++    const backup = path.join(
++      workspace,
++      output.isPackage ? `backup${output.extension}` : "backup"
++    );
++    const publication: Publication = {
++      destination: output.destination,
++      workspace,
++      candidate,
++      backup,
++      createdParents: [],
++      committed: false,
++      retainWorkspace: false,
++    };
++
++    try {
++      if (output.isPackage) {
++        if (!overwrite && fs.existsSync(output.destination)) {
++          throw new PipelineError(
++            `Output already exists: ${output.destination}`
++          );
++        }
++        fs.copyFileSync(stagedOutput, candidate);
++        return publication;
+       }
+ 
+-      await TilesetStageExecutor.executeTilesetStage(
+-        tilesetStage,
+-        currentInput,
+-        currentOutput,
+-        currentOverwrite
++      const stagedStorage = output.isJson
++        ? path.dirname(stagedOutput)
++        : stagedOutput;
++      PipelineExecutor.prepareDirectoryCandidate(
++        stagedStorage,
++        publication,
++        overwrite,
++        executionWorkspace
+       );
+-      currentInput = currentOutput;
++      return publication;
++    } catch (error) {
++      PipelineExecutor.tryRemovePath(workspace, true);
++      throw error;
++    }
++  }
++
++  private static prepareDirectoryCandidate(
++    stagedStorage: string,
++    publication: Publication,
++    overwrite: boolean,
++    executionWorkspace: string
++  ) {
++    const destinationExists = fs.existsSync(publication.destination);
++    if (
++      destinationExists &&
++      !fs.statSync(publication.destination).isDirectory()
++    ) {
++      if (!overwrite) {
++        throw new PipelineError(
++          `Output already exists: ${publication.destination}`
++        );
++      }
++    } else if (
++      destinationExists &&
++      !overwrite &&
++      PipelineExecutor.hasCollision(stagedStorage, publication.destination)
++    ) {
++      throw new PipelineError(
++        `Output entry already exists in ${publication.destination}`
++      );
++    }
++
++    fs.mkdirSync(publication.candidate);
++    if (
++      destinationExists &&
++      fs.statSync(publication.destination).isDirectory()
++    ) {
++      PipelineExecutor.copyTree(
++        publication.destination,
++        publication.candidate,
++        path.resolve(executionWorkspace)
++      );
++    }
++    PipelineExecutor.overlayTree(stagedStorage, publication.candidate);
++  }
++
++  private static hasCollision(source: string, destination: string): boolean {
++    for (const name of fs.readdirSync(source)) {
++      const sourceEntry = path.join(source, name);
++      const destinationEntry = path.join(destination, name);
++      const sourceStat = fs.lstatSync(sourceEntry);
++      if (!fs.existsSync(destinationEntry)) {
++        continue;
++      }
++      const destinationStat = fs.lstatSync(destinationEntry);
++      if (sourceStat.isDirectory() && destinationStat.isDirectory()) {
++        if (PipelineExecutor.hasCollision(sourceEntry, destinationEntry)) {
++          return true;
++        }
++      } else {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  private static copyTree(
++    source: string,
++    destination: string,
++    excludedPath: string
++  ) {
++    for (const name of fs.readdirSync(source)) {
++      const sourceEntry = path.join(source, name);
++      if (path.resolve(sourceEntry) === excludedPath) {
++        continue;
++      }
++      const destinationEntry = path.join(destination, name);
++      const stat = fs.lstatSync(sourceEntry);
++      if (stat.isDirectory()) {
++        fs.mkdirSync(destinationEntry);
++        PipelineExecutor.copyTree(sourceEntry, destinationEntry, excludedPath);
++      } else if (stat.isSymbolicLink()) {
++        fs.symlinkSync(fs.readlinkSync(sourceEntry), destinationEntry);
++      } else {
++        fs.copyFileSync(sourceEntry, destinationEntry);
++      }
++    }
++  }
++
++  private static overlayTree(source: string, destination: string) {
++    for (const name of fs.readdirSync(source)) {
++      const sourceEntry = path.join(source, name);
++      const destinationEntry = path.join(destination, name);
++      const stat = fs.lstatSync(sourceEntry);
++
++      if (stat.isDirectory()) {
++        if (
++          fs.existsSync(destinationEntry) &&
++          !fs.lstatSync(destinationEntry).isDirectory()
++        ) {
++          fs.rmSync(destinationEntry, { recursive: true, force: true });
++        }
++        fs.mkdirSync(destinationEntry, { recursive: true });
++        PipelineExecutor.overlayTree(sourceEntry, destinationEntry);
++      } else {
++        if (fs.existsSync(destinationEntry)) {
++          fs.rmSync(destinationEntry, { recursive: true, force: true });
++        }
++        if (stat.isSymbolicLink()) {
++          fs.symlinkSync(fs.readlinkSync(sourceEntry), destinationEntry);
++        } else {
++          fs.copyFileSync(sourceEntry, destinationEntry);
++        }
++      }
++    }
++  }
++
++  private static commitPublication(publication: Publication) {
++    PipelineExecutor.createDestinationParents(publication);
++    const destinationExisted = fs.existsSync(publication.destination);
++    let originalMoved = false;
++    let candidateMoved = false;
++
++    try {
++      if (destinationExisted) {
++        fs.renameSync(publication.destination, publication.backup);
++        originalMoved = true;
++      }
++      fs.renameSync(publication.candidate, publication.destination);
++      candidateMoved = true;
++      if (originalMoved) {
++        fs.rmSync(publication.backup, { recursive: true, force: true });
++        originalMoved = false;
++      }
++      publication.committed = true;
++    } catch (publicationError) {
++      if (candidateMoved && fs.existsSync(publication.destination)) {
++        try {
++          fs.renameSync(publication.destination, publication.candidate);
++          candidateMoved = false;
++        } catch (rollbackError) {
++          publication.retainWorkspace = true;
++          logger.error(
++            `Could not remove failed publication ${publication.destination}: ${rollbackError}`
++          );
++        }
++      }
++      if (originalMoved && fs.existsSync(publication.backup)) {
++        try {
++          fs.renameSync(publication.backup, publication.destination);
++          originalMoved = false;
++        } catch (rollbackError) {
++          publication.retainWorkspace = true;
++          logger.error(
++            `Could not restore ${publication.destination}: ${rollbackError}`
++          );
++        }
++      }
++      throw publicationError;
++    }
++  }
++
++  private static createDestinationParents(publication: Publication) {
++    const missing: string[] = [];
++    let current = path.dirname(publication.destination);
++    while (!fs.existsSync(current)) {
++      missing.push(current);
++      current = path.dirname(current);
++    }
++    if (!fs.statSync(current).isDirectory()) {
++      throw new Error(`Output parent is not a directory: ${current}`);
++    }
++    for (const directory of missing.reverse()) {
++      fs.mkdirSync(directory);
++      publication.createdParents.push(directory);
++    }
++  }
++
++  private static findNearestExistingDirectory(start: string): string {
++    let current = start;
++    while (!fs.existsSync(current) || !fs.statSync(current).isDirectory()) {
++      const parent = path.dirname(current);
++      if (parent === current) {
++        throw new Error(`Could not find a directory above ${start}`);
++      }
++      current = parent;
++    }
++    return current;
++  }
++
++  private static removeCreatedParents(createdParents: string[]) {
++    for (const directory of [...createdParents].reverse()) {
++      try {
++        fs.rmdirSync(directory);
++      } catch (error) {
++        logger.warn(`Could not remove output parent ${directory}: ${error}`);
++      }
++    }
++  }
++
++  private static tryRemovePath(
++    target: string | undefined,
++    preservePrimaryError: boolean
++  ): unknown {
++    if (!target || !fs.existsSync(target)) {
++      return undefined;
++    }
++    try {
++      fs.rmSync(target, { recursive: true, force: true });
++      return undefined;
++    } catch (error) {
++      if (preservePrimaryError) {
++        logger.warn(`Could not remove temporary path ${target}: ${error}`);
++      }
++      return error;
++    }
++  }
++
++  private static toPipelineError(error: unknown): PipelineError {
++    if (error instanceof PipelineError) {
++      return error;
++    }
++    if (error instanceof Error) {
++      return new PipelineError(error.message);
+     }
++    return new PipelineError(`${error}`);
+   }
+ }

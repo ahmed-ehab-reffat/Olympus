@@ -1,0 +1,1330 @@
+diff --git a/src/lib/OpenEXRUtil/ImfImageIO.cpp b/src/lib/OpenEXRUtil/ImfImageIO.cpp
+index a19887fe..398311aa 100644
+--- a/src/lib/OpenEXRUtil/ImfImageIO.cpp
++++ b/src/lib/OpenEXRUtil/ImfImageIO.cpp
+@@ -13,10 +13,29 @@
+ #include "ImfDeepImageIO.h"
+ #include "ImfFlatImageIO.h"
+ #include "Iex.h"
++#include "ImfChannelList.h"
++#include "ImfDeepScanLineInputPart.h"
++#include "ImfDeepScanLineOutputPart.h"
++#include "ImfDeepTiledInputPart.h"
++#include "ImfDeepTiledOutputPart.h"
+ #include "ImfHeader.h"
++#include "ImfInputFile.h"
++#include "ImfInputPart.h"
+ #include "ImfMultiPartInputFile.h"
++#include "ImfMultiPartOutputFile.h"
++#include "ImfOutputFile.h"
++#include "ImfOutputPart.h"
+ #include "ImfPartType.h"
++#include "ImfStdIO.h"
+ #include "ImfTestFile.h"
++#include "ImfTiledInputFile.h"
++#include "ImfTiledInputPart.h"
++#include "ImfTiledOutputFile.h"
++#include "ImfTiledOutputPart.h"
++#include <algorithm>
++#include <cassert>
++#include <cstring>
++#include <set>
+ 
+ using namespace IMATH_NAMESPACE;
+ using namespace IEX_NAMESPACE;
+@@ -133,4 +152,1157 @@ loadImage (const string& fileName)
+     return loadImage (fileName, hdr);
+ }
+ 
++namespace
++{
++
++Header
++headerForPart (const ImagePart& part, DataWindowSource dws)
++{
++    if (!part.image)
++        throw ArgExc ("Cannot save an image part without an image.");
++
++    const Image& img = *part.image;
++    Header       hdr;
++
++    for (Header::ConstIterator i = part.header.begin ();
++         i != part.header.end ();
++         ++i)
++    {
++        if (strcmp (i.name (), "channels") &&
++            strcmp (i.name (), "dataWindow") && strcmp (i.name (), "tiles") &&
++            strcmp (i.name (), "type"))
++        {
++            hdr.insert (i.name (), i.attribute ());
++        }
++    }
++
++    hdr.dataWindow () = dataWindowForFile (part.header, img, dws);
++
++    const bool tiled = img.levelMode () != ONE_LEVEL ||
++                       part.header.hasTileDescription ();
++
++    if (tiled)
++    {
++        if (part.header.hasTileDescription ())
++        {
++            hdr.setTileDescription (TileDescription (
++                part.header.tileDescription ().xSize,
++                part.header.tileDescription ().ySize,
++                img.levelMode (),
++                img.levelRoundingMode ()));
++        }
++        else
++        {
++            hdr.setTileDescription (TileDescription (
++                64, 64, img.levelMode (), img.levelRoundingMode ()));
++        }
++    }
++
++    if (const FlatImage* fimg = dynamic_cast<const FlatImage*> (&img))
++    {
++        const FlatImageLevel& level = fimg->level (0, 0);
++        for (FlatImageLevel::ConstIterator i = level.begin ();
++             i != level.end ();
++             ++i)
++            hdr.channels ().insert (i.name (), i.channel ().channel ());
++
++        hdr.setType (tiled ? TILEDIMAGE : SCANLINEIMAGE);
++    }
++    else if (const DeepImage* dimg = dynamic_cast<const DeepImage*> (&img))
++    {
++        const DeepImageLevel& level = dimg->level (0, 0);
++        for (DeepImageLevel::ConstIterator i = level.begin ();
++             i != level.end ();
++             ++i)
++            hdr.channels ().insert (i.name (), i.channel ().channel ());
++
++        hdr.compression () = ZIPS_COMPRESSION;
++        hdr.setType (tiled ? DEEPTILE : DEEPSCANLINE);
++    }
++    else
++    {
++        throw ArgExc ("Cannot save an unsupported image type.");
++    }
++
++    return hdr;
++}
++
++void
++saveFlatScanLinePart (
++    MultiPartOutputFile& out, int partNumber, const FlatImage& img)
++{
++    const FlatImageLevel& level = img.level ();
++    FrameBuffer           fb;
++
++    for (FlatImageLevel::ConstIterator i = level.begin (); i != level.end ();
++         ++i)
++        fb.insert (i.name (), i.channel ().slice ());
++
++    OutputPart part (out, partNumber);
++    part.setFrameBuffer (fb);
++    const Box2i& dw = out.header (partNumber).dataWindow ();
++    part.writePixels (dw.max.y - dw.min.y + 1);
++}
++
++void
++saveFlatTiledLevel (TiledOutputPart& out, const FlatImage& img, int x, int y)
++{
++    const FlatImageLevel& level = img.level (x, y);
++    FrameBuffer           fb;
++
++    for (FlatImageLevel::ConstIterator i = level.begin (); i != level.end ();
++         ++i)
++        fb.insert (i.name (), i.channel ().slice ());
++
++    out.setFrameBuffer (fb);
++    out.writeTiles (0, out.numXTiles (x) - 1, 0, out.numYTiles (y) - 1, x, y);
++}
++
++void
++saveFlatTiledPart (
++    MultiPartOutputFile& out, int partNumber, const FlatImage& img)
++{
++    TiledOutputPart part (out, partNumber);
++
++    switch (img.levelMode ())
++    {
++        case ONE_LEVEL: saveFlatTiledLevel (part, img, 0, 0); break;
++
++        case MIPMAP_LEVELS:
++            for (int x = 0; x < part.numLevels (); ++x)
++                saveFlatTiledLevel (part, img, x, x);
++            break;
++
++        case RIPMAP_LEVELS:
++            for (int y = 0; y < part.numYLevels (); ++y)
++                for (int x = 0; x < part.numXLevels (); ++x)
++                    saveFlatTiledLevel (part, img, x, y);
++            break;
++
++        default: assert (false);
++    }
++}
++
++void
++saveDeepScanLinePart (
++    MultiPartOutputFile& out, int partNumber, const DeepImage& img)
++{
++    const DeepImageLevel& level = img.level ();
++    DeepFrameBuffer       fb;
++
++    fb.insertSampleCountSlice (level.sampleCounts ().slice ());
++    for (DeepImageLevel::ConstIterator i = level.begin (); i != level.end ();
++         ++i)
++        fb.insert (i.name (), i.channel ().slice ());
++
++    DeepScanLineOutputPart part (out, partNumber);
++    part.setFrameBuffer (fb);
++    const Box2i& dw = out.header (partNumber).dataWindow ();
++    part.writePixels (dw.max.y - dw.min.y + 1);
++}
++
++void
++saveDeepTiledLevel (
++    DeepTiledOutputPart& out, const DeepImage& img, int x, int y)
++{
++    const DeepImageLevel& level = img.level (x, y);
++    DeepFrameBuffer       fb;
++
++    fb.insertSampleCountSlice (level.sampleCounts ().slice ());
++    for (DeepImageLevel::ConstIterator i = level.begin (); i != level.end ();
++         ++i)
++        fb.insert (i.name (), i.channel ().slice ());
++
++    out.setFrameBuffer (fb);
++    out.writeTiles (0, out.numXTiles (x) - 1, 0, out.numYTiles (y) - 1, x, y);
++}
++
++void
++saveDeepTiledPart (
++    MultiPartOutputFile& out, int partNumber, const DeepImage& img)
++{
++    DeepTiledOutputPart part (out, partNumber);
++
++    switch (img.levelMode ())
++    {
++        case ONE_LEVEL: saveDeepTiledLevel (part, img, 0, 0); break;
++
++        case MIPMAP_LEVELS:
++            for (int x = 0; x < part.numLevels (); ++x)
++                saveDeepTiledLevel (part, img, x, x);
++            break;
++
++        case RIPMAP_LEVELS:
++            for (int y = 0; y < part.numYLevels (); ++y)
++                for (int x = 0; x < part.numXLevels (); ++x)
++                    saveDeepTiledLevel (part, img, x, y);
++            break;
++
++        default: assert (false);
++    }
++}
++
++void
++loadFlatScanLinePart (MultiPartInputFile& in, int partNumber, FlatImage& img)
++{
++    const Header& hdr = in.header (partNumber);
++    for (ChannelList::ConstIterator i = hdr.channels ().begin ();
++         i != hdr.channels ().end ();
++         ++i)
++        img.insertChannel (i.name (), i.channel ());
++    img.resize (hdr.dataWindow (), ONE_LEVEL, ROUND_DOWN);
++
++    FlatImageLevel& level = img.level ();
++    FrameBuffer     fb;
++    for (FlatImageLevel::ConstIterator i = level.begin (); i != level.end ();
++         ++i)
++        fb.insert (i.name (), i.channel ().slice ());
++
++    InputPart part (in, partNumber);
++    part.setFrameBuffer (fb);
++    part.readPixels (level.dataWindow ().min.y, level.dataWindow ().max.y);
++}
++
++void
++loadFlatTiledLevel (TiledInputPart& in, FlatImage& img, int x, int y)
++{
++    FlatImageLevel& level = img.level (x, y);
++    FrameBuffer     fb;
++    for (FlatImageLevel::ConstIterator i = level.begin (); i != level.end ();
++         ++i)
++        fb.insert (i.name (), i.channel ().slice ());
++
++    in.setFrameBuffer (fb);
++    in.readTiles (0, in.numXTiles (x) - 1, 0, in.numYTiles (y) - 1, x, y);
++}
++
++void
++loadFlatTiledPart (MultiPartInputFile& in, int partNumber, FlatImage& img)
++{
++    const Header& hdr = in.header (partNumber);
++    for (ChannelList::ConstIterator i = hdr.channels ().begin ();
++         i != hdr.channels ().end ();
++         ++i)
++        img.insertChannel (i.name (), i.channel ());
++    img.resize (
++        hdr.dataWindow (),
++        hdr.tileDescription ().mode,
++        hdr.tileDescription ().roundingMode);
++
++    TiledInputPart part (in, partNumber);
++    switch (img.levelMode ())
++    {
++        case ONE_LEVEL: loadFlatTiledLevel (part, img, 0, 0); break;
++
++        case MIPMAP_LEVELS:
++            for (int x = 0; x < img.numLevels (); ++x)
++                loadFlatTiledLevel (part, img, x, x);
++            break;
++
++        case RIPMAP_LEVELS:
++            for (int y = 0; y < img.numYLevels (); ++y)
++                for (int x = 0; x < img.numXLevels (); ++x)
++                    loadFlatTiledLevel (part, img, x, y);
++            break;
++
++        default: assert (false);
++    }
++}
++
++void
++loadDeepScanLinePart (MultiPartInputFile& in, int partNumber, DeepImage& img)
++{
++    const Header& hdr = in.header (partNumber);
++    for (ChannelList::ConstIterator i = hdr.channels ().begin ();
++         i != hdr.channels ().end ();
++         ++i)
++        img.insertChannel (i.name (), i.channel ());
++    img.resize (hdr.dataWindow (), ONE_LEVEL, ROUND_DOWN);
++
++    DeepImageLevel& level = img.level ();
++    DeepFrameBuffer fb;
++    fb.insertSampleCountSlice (level.sampleCounts ().slice ());
++    for (DeepImageLevel::ConstIterator i = level.begin (); i != level.end ();
++         ++i)
++        fb.insert (i.name (), i.channel ().slice ());
++
++    DeepScanLineInputPart part (in, partNumber);
++    part.setFrameBuffer (fb);
++    {
++        SampleCountChannel::Edit edit (level.sampleCounts ());
++        part.readPixelSampleCounts (
++            level.dataWindow ().min.y, level.dataWindow ().max.y);
++    }
++    part.readPixels (level.dataWindow ().min.y, level.dataWindow ().max.y);
++}
++
++void
++loadDeepTiledLevel (DeepTiledInputPart& in, DeepImage& img, int x, int y)
++{
++    DeepImageLevel& level = img.level (x, y);
++    DeepFrameBuffer fb;
++    fb.insertSampleCountSlice (level.sampleCounts ().slice ());
++    for (DeepImageLevel::ConstIterator i = level.begin (); i != level.end ();
++         ++i)
++        fb.insert (i.name (), i.channel ().slice ());
++
++    in.setFrameBuffer (fb);
++    {
++        SampleCountChannel::Edit edit (level.sampleCounts ());
++        in.readPixelSampleCounts (
++            0, in.numXTiles (x) - 1, 0, in.numYTiles (y) - 1, x, y);
++    }
++    in.readTiles (0, in.numXTiles (x) - 1, 0, in.numYTiles (y) - 1, x, y);
++}
++
++void
++loadDeepTiledPart (MultiPartInputFile& in, int partNumber, DeepImage& img)
++{
++    const Header& hdr = in.header (partNumber);
++    for (ChannelList::ConstIterator i = hdr.channels ().begin ();
++         i != hdr.channels ().end ();
++         ++i)
++        img.insertChannel (i.name (), i.channel ());
++    img.resize (
++        hdr.dataWindow (),
++        hdr.tileDescription ().mode,
++        hdr.tileDescription ().roundingMode);
++
++    DeepTiledInputPart part (in, partNumber);
++    switch (img.levelMode ())
++    {
++        case ONE_LEVEL: loadDeepTiledLevel (part, img, 0, 0); break;
++
++        case MIPMAP_LEVELS:
++            for (int x = 0; x < img.numLevels (); ++x)
++                loadDeepTiledLevel (part, img, x, x);
++            break;
++
++        case RIPMAP_LEVELS:
++            for (int y = 0; y < img.numYLevels (); ++y)
++                for (int x = 0; x < img.numXLevels (); ++x)
++                    loadDeepTiledLevel (part, img, x, y);
++            break;
++
++        default: assert (false);
++    }
++}
++
++Box2i
++intersectWindow (const Box2i& a, const Box2i& b)
++{
++    Box2i result (
++        V2i (std::max (a.min.x, b.min.x), std::max (a.min.y, b.min.y)),
++        V2i (std::min (a.max.x, b.max.x), std::min (a.max.y, b.max.y)));
++    if (result.min.x > result.max.x || result.min.y > result.max.y)
++        throw ArgExc ("The requested data window does not intersect the part.");
++    return result;
++}
++
++template <class ImageType>
++void
++prepareWindowImage (ImageType& image, const Header& header, const Box2i& window)
++{
++    for (ChannelList::ConstIterator i = header.channels ().begin ();
++         i != header.channels ().end ();
++         ++i)
++        image.insertChannel (i.name (), i.channel ());
++    image.resize (window, ONE_LEVEL, ROUND_DOWN);
++}
++
++template <class T>
++void
++copyFlatChannel (
++    const FlatImageLevel& source,
++    FlatImageLevel&       target,
++    const string&         name,
++    const Channel&        channel,
++    const Box2i&          window)
++{
++    const TypedFlatImageChannel<T>& input  = source.typedChannel<T> (name);
++    TypedFlatImageChannel<T>&       output = target.typedChannel<T> (name);
++    for (int y = window.min.y; y <= window.max.y; ++y)
++        for (int x = window.min.x; x <= window.max.x; ++x)
++            if (x % channel.xSampling == 0 && y % channel.ySampling == 0)
++                output.at (x, y) = input.at (x, y);
++}
++
++void
++copyFlatWindow (
++    const FlatImage& source,
++    FlatImage&       target,
++    const Header&    header,
++    const Box2i&     window)
++{
++    prepareWindowImage (target, header, window);
++    for (ChannelList::ConstIterator i = header.channels ().begin ();
++         i != header.channels ().end ();
++         ++i)
++    {
++        if (i.channel ().type == HALF)
++            copyFlatChannel<half> (
++                source.level (),
++                target.level (),
++                i.name (),
++                i.channel (),
++                window);
++        else if (i.channel ().type == FLOAT)
++            copyFlatChannel<float> (
++                source.level (),
++                target.level (),
++                i.name (),
++                i.channel (),
++                window);
++        else
++            copyFlatChannel<unsigned int> (
++                source.level (),
++                target.level (),
++                i.name (),
++                i.channel (),
++                window);
++    }
++}
++
++template <class T>
++void
++copyDeepChannel (
++    const DeepImageLevel& source,
++    DeepImageLevel&       target,
++    const string&         name,
++    const Box2i&          window)
++{
++    const TypedDeepImageChannel<T>& input  = source.typedChannel<T> (name);
++    TypedDeepImageChannel<T>&       output = target.typedChannel<T> (name);
++    for (int y = window.min.y; y <= window.max.y; ++y)
++        for (int x = window.min.x; x <= window.max.x; ++x)
++            for (unsigned int s = 0; s < target.sampleCounts ().at (x, y); ++s)
++                output.at (x, y)[s] = input.at (x, y)[s];
++}
++
++void
++copyDeepWindow (
++    const DeepImage& source,
++    DeepImage&       target,
++    const Header&    header,
++    const Box2i&     window)
++{
++    prepareWindowImage (target, header, window);
++    const DeepImageLevel& input  = source.level ();
++    DeepImageLevel&       output = target.level ();
++    for (int y = window.min.y; y <= window.max.y; ++y)
++        for (int x = window.min.x; x <= window.max.x; ++x)
++            output.sampleCounts ().set (x, y, input.sampleCounts ().at (x, y));
++
++    for (ChannelList::ConstIterator i = header.channels ().begin ();
++         i != header.channels ().end ();
++         ++i)
++    {
++        if (i.channel ().type == HALF)
++            copyDeepChannel<half> (input, output, i.name (), window);
++        else if (i.channel ().type == FLOAT)
++            copyDeepChannel<float> (input, output, i.name (), window);
++        else
++            copyDeepChannel<unsigned int> (input, output, i.name (), window);
++    }
++}
++
++void
++loadFlatScanLineWindow (
++    MultiPartInputFile& in,
++    int                 partNumber,
++    const Box2i&        window,
++    FlatImage&          image)
++{
++    const Header& header = in.header (partNumber);
++    const Box2i   stagingWindow (
++        V2i (header.dataWindow ().min.x, window.min.y),
++        V2i (header.dataWindow ().max.x, window.max.y));
++    FlatImage staging;
++    prepareWindowImage (staging, header, stagingWindow);
++    FrameBuffer frameBuffer;
++    for (FlatImageLevel::ConstIterator i = staging.level ().begin ();
++         i != staging.level ().end ();
++         ++i)
++        frameBuffer.insert (i.name (), i.channel ().slice ());
++    InputPart part (in, partNumber);
++    part.setFrameBuffer (frameBuffer);
++    part.readPixels (window.min.y, window.max.y);
++    copyFlatWindow (staging, image, header, window);
++}
++
++void
++loadDeepScanLineWindow (
++    MultiPartInputFile& in,
++    int                 partNumber,
++    const Box2i&        window,
++    DeepImage&          image)
++{
++    const Header& header = in.header (partNumber);
++    const Box2i   stagingWindow (
++        V2i (header.dataWindow ().min.x, window.min.y),
++        V2i (header.dataWindow ().max.x, window.max.y));
++    DeepImage staging;
++    prepareWindowImage (staging, header, stagingWindow);
++    DeepImageLevel& level = staging.level ();
++    DeepFrameBuffer frameBuffer;
++    frameBuffer.insertSampleCountSlice (level.sampleCounts ().slice ());
++    for (DeepImageLevel::ConstIterator i = level.begin (); i != level.end ();
++         ++i)
++        frameBuffer.insert (i.name (), i.channel ().slice ());
++    DeepScanLineInputPart part (in, partNumber);
++    part.setFrameBuffer (frameBuffer);
++    {
++        SampleCountChannel::Edit edit (level.sampleCounts ());
++        part.readPixelSampleCounts (window.min.y, window.max.y);
++    }
++    part.readPixels (window.min.y, window.max.y);
++    copyDeepWindow (staging, image, header, window);
++}
++
++Box2i
++flatTileStagingWindow (
++    TiledInputPart& part,
++    const Box2i&    window,
++    int&            dx1,
++    int&            dx2,
++    int&            dy1,
++    int&            dy2)
++{
++    const Box2i& source = part.header ().dataWindow ();
++    dx1                 = (window.min.x - source.min.x) / part.tileXSize ();
++    dx2                 = (window.max.x - source.min.x) / part.tileXSize ();
++    dy1                 = (window.min.y - source.min.y) / part.tileYSize ();
++    dy2                 = (window.max.y - source.min.y) / part.tileYSize ();
++    return Box2i (
++        part.dataWindowForTile (dx1, dy1).min,
++        part.dataWindowForTile (dx2, dy2).max);
++}
++
++void
++loadFlatTiledWindow (
++    MultiPartInputFile& in,
++    int                 partNumber,
++    const Box2i&        window,
++    FlatImage&          image)
++{
++    TiledInputPart part (in, partNumber);
++    int            dx1, dx2, dy1, dy2;
++    const Box2i    stagingWindow =
++        flatTileStagingWindow (part, window, dx1, dx2, dy1, dy2);
++    FlatImage staging;
++    prepareWindowImage (staging, part.header (), stagingWindow);
++    FrameBuffer frameBuffer;
++    for (FlatImageLevel::ConstIterator i = staging.level ().begin ();
++         i != staging.level ().end ();
++         ++i)
++        frameBuffer.insert (i.name (), i.channel ().slice ());
++    part.setFrameBuffer (frameBuffer);
++    part.readTiles (dx1, dx2, dy1, dy2);
++    copyFlatWindow (staging, image, part.header (), window);
++}
++
++Box2i
++deepTileStagingWindow (
++    DeepTiledInputPart& part,
++    const Box2i&        window,
++    int&                dx1,
++    int&                dx2,
++    int&                dy1,
++    int&                dy2)
++{
++    const Box2i& source = part.header ().dataWindow ();
++    dx1                 = (window.min.x - source.min.x) / part.tileXSize ();
++    dx2                 = (window.max.x - source.min.x) / part.tileXSize ();
++    dy1                 = (window.min.y - source.min.y) / part.tileYSize ();
++    dy2                 = (window.max.y - source.min.y) / part.tileYSize ();
++    return Box2i (
++        part.dataWindowForTile (dx1, dy1).min,
++        part.dataWindowForTile (dx2, dy2).max);
++}
++
++void
++loadDeepTiledWindow (
++    MultiPartInputFile& in,
++    int                 partNumber,
++    const Box2i&        window,
++    DeepImage&          image)
++{
++    DeepTiledInputPart part (in, partNumber);
++    int                dx1, dx2, dy1, dy2;
++    const Box2i        stagingWindow =
++        deepTileStagingWindow (part, window, dx1, dx2, dy1, dy2);
++    DeepImage staging;
++    prepareWindowImage (staging, part.header (), stagingWindow);
++    DeepImageLevel& level = staging.level ();
++    DeepFrameBuffer frameBuffer;
++    frameBuffer.insertSampleCountSlice (level.sampleCounts ().slice ());
++    for (DeepImageLevel::ConstIterator i = level.begin (); i != level.end ();
++         ++i)
++        frameBuffer.insert (i.name (), i.channel ().slice ());
++    part.setFrameBuffer (frameBuffer);
++    {
++        SampleCountChannel::Edit edit (level.sampleCounts ());
++        part.readPixelSampleCounts (dx1, dx2, dy1, dy2);
++    }
++    part.readTiles (dx1, dx2, dy1, dy2);
++    copyDeepWindow (staging, image, part.header (), window);
++}
++
++} // namespace
++
++namespace
++{
++vector<Header>
++headersForParts (const ImageParts& parts, DataWindowSource dws)
++{
++    if (parts.empty ()) throw ArgExc ("Cannot save an empty image collection.");
++
++    vector<Header> headers;
++    headers.reserve (parts.size ());
++    set<string> names;
++
++    for (const ImagePart& part: parts)
++    {
++        Header hdr = headerForPart (part, dws);
++        if (!hdr.hasName () || hdr.name ().empty ())
++            throw ArgExc ("Each image part must have a name.");
++        if (!names.insert (hdr.name ()).second)
++            throw ArgExc ("Image part names must be unique.");
++        headers.push_back (std::move (hdr));
++    }
++
++    return headers;
++}
++
++void
++writeImageParts (
++    MultiPartOutputFile&  out,
++    const ImageParts&     parts,
++    const vector<Header>& headers)
++{
++    for (size_t i = 0; i < parts.size (); ++i)
++    {
++        const Image& img = *parts[i].image;
++        if (const FlatImage* fimg = dynamic_cast<const FlatImage*> (&img))
++        {
++            if (headers[i].hasTileDescription ())
++                saveFlatTiledPart (out, static_cast<int> (i), *fimg);
++            else
++                saveFlatScanLinePart (out, static_cast<int> (i), *fimg);
++        }
++        else if (const DeepImage* dimg = dynamic_cast<const DeepImage*> (&img))
++        {
++            if (headers[i].hasTileDescription ())
++                saveDeepTiledPart (out, static_cast<int> (i), *dimg);
++            else
++                saveDeepScanLinePart (out, static_cast<int> (i), *dimg);
++        }
++    }
++}
++
++void
++writeImagePart (
++    MultiPartOutputFile& out,
++    int                  partNumber,
++    const ImagePart&     part,
++    const Header&        header)
++{
++    const Image& image = *part.image;
++    if (const FlatImage* flat = dynamic_cast<const FlatImage*> (&image))
++    {
++        if (header.hasTileDescription ())
++            saveFlatTiledPart (out, partNumber, *flat);
++        else
++            saveFlatScanLinePart (out, partNumber, *flat);
++    }
++    else
++    {
++        const DeepImage& deep = static_cast<const DeepImage&> (image);
++        if (header.hasTileDescription ())
++            saveDeepTiledPart (out, partNumber, deep);
++        else
++            saveDeepScanLinePart (out, partNumber, deep);
++    }
++}
++
++ImagePart
++loadImagePartAt (MultiPartInputFile& in, int partNumber)
++{
++    const Header& hdr = in.header (partNumber);
++    if (!hdr.hasType () || !isSupportedType (hdr.type ()))
++        throw ArgExc ("Cannot load a non-image part.");
++
++    if (hdr.type () == SCANLINEIMAGE)
++    {
++        std::unique_ptr<FlatImage> img (new FlatImage);
++        loadFlatScanLinePart (in, partNumber, *img);
++        return ImagePart (hdr, std::move (img));
++    }
++    if (hdr.type () == TILEDIMAGE)
++    {
++        std::unique_ptr<FlatImage> img (new FlatImage);
++        loadFlatTiledPart (in, partNumber, *img);
++        return ImagePart (hdr, std::move (img));
++    }
++    if (hdr.type () == DEEPSCANLINE)
++    {
++        std::unique_ptr<DeepImage> img (new DeepImage);
++        loadDeepScanLinePart (in, partNumber, *img);
++        return ImagePart (hdr, std::move (img));
++    }
++
++    std::unique_ptr<DeepImage> img (new DeepImage);
++    loadDeepTiledPart (in, partNumber, *img);
++    return ImagePart (hdr, std::move (img));
++}
++
++ImagePart
++loadImagePartAtWindow (
++    MultiPartInputFile& in, int partNumber, const Box2i& requestedWindow)
++{
++    const Header& header = in.header (partNumber);
++    if (!header.hasType () || !isSupportedType (header.type ()))
++        throw ArgExc ("Cannot load a non-image part.");
++    if (header.hasTileDescription () &&
++        header.tileDescription ().mode != ONE_LEVEL)
++        throw ArgExc ("Windowed loading requires a ONE_LEVEL image part.");
++
++    const Box2i window =
++        intersectWindow (header.dataWindow (), requestedWindow);
++    Header outputHeader (header);
++    outputHeader.dataWindow () = window;
++
++    if (header.type () == SCANLINEIMAGE)
++    {
++        std::unique_ptr<FlatImage> image (new FlatImage);
++        loadFlatScanLineWindow (in, partNumber, window, *image);
++        return ImagePart (outputHeader, std::move (image));
++    }
++    if (header.type () == TILEDIMAGE)
++    {
++        std::unique_ptr<FlatImage> image (new FlatImage);
++        loadFlatTiledWindow (in, partNumber, window, *image);
++        return ImagePart (outputHeader, std::move (image));
++    }
++    if (header.type () == DEEPSCANLINE)
++    {
++        std::unique_ptr<DeepImage> image (new DeepImage);
++        loadDeepScanLineWindow (in, partNumber, window, *image);
++        return ImagePart (outputHeader, std::move (image));
++    }
++
++    std::unique_ptr<DeepImage> image (new DeepImage);
++    loadDeepTiledWindow (in, partNumber, window, *image);
++    return ImagePart (outputHeader, std::move (image));
++}
++
++ImageParts
++loadImageParts (MultiPartInputFile& in)
++{
++    ImageParts parts;
++    parts.reserve (in.parts ());
++
++    for (int i = 0; i < in.parts (); ++i)
++    {
++        const Header& header = in.header (i);
++        if (header.hasType () && isSupportedType (header.type ()))
++            parts.push_back (loadImagePartAt (in, i));
++    }
++
++    return parts;
++}
++
++ImagePart
++loadNamedImagePart (MultiPartInputFile& in, const string& partName)
++{
++    for (int i = 0; i < in.parts (); ++i)
++    {
++        const Header& hdr = in.header (i);
++        if (hdr.hasName () && hdr.name () == partName)
++            return loadImagePartAt (in, i);
++    }
++
++    throw ArgExc ("No image part has the requested name.");
++}
++
++ImagePart
++loadNamedImagePart (
++    MultiPartInputFile& in, const string& partName, const Box2i& dataWindow)
++{
++    for (int i = 0; i < in.parts (); ++i)
++    {
++        const Header& header = in.header (i);
++        if (header.hasName () && header.name () == partName)
++            return loadImagePartAtWindow (in, i, dataWindow);
++    }
++    throw ArgExc ("No image part has the requested name.");
++}
++
++struct RewritePart
++{
++    int              sourcePart;
++    const ImagePart* replacement;
++    Header           header;
++};
++
++vector<RewritePart>
++prepareRewrite (
++    MultiPartInputFile& in,
++    const ImageParts&   replacements,
++    DataWindowSource    dws)
++{
++    vector<Header> prepared;
++    prepared.reserve (replacements.size ());
++    set<string> replacementNames;
++
++    for (const ImagePart& replacement: replacements)
++    {
++        Header header = headerForPart (replacement, dws);
++        if (header.dataWindow ().min.x > header.dataWindow ().max.x ||
++            header.dataWindow ().min.y > header.dataWindow ().max.y)
++            throw ArgExc (
++                "Replacement header and image data windows do not intersect.");
++        if (!header.hasName () || header.name ().empty ())
++            throw ArgExc ("Each replacement image part must have a name.");
++        if (!replacementNames.insert (header.name ()).second)
++            throw ArgExc ("Replacement image part names must be unique.");
++        prepared.push_back (std::move (header));
++    }
++
++    vector<bool>        used (replacements.size (), false);
++    vector<RewritePart> result;
++    set<string>         sourceNames;
++
++    for (int sourcePart = 0; sourcePart < in.parts (); ++sourcePart)
++    {
++        const Header& sourceHeader = in.header (sourcePart);
++        if (!sourceHeader.hasType () || !isSupportedType (sourceHeader.type ()))
++            continue;
++
++        const bool named =
++            sourceHeader.hasName () && !sourceHeader.name ().empty ();
++        if (named && !sourceNames.insert (sourceHeader.name ()).second)
++            throw ArgExc ("Source image part names must be unique.");
++
++        const ImagePart* replacement = nullptr;
++        Header           outputHeader (sourceHeader);
++        for (size_t i = 0; i < replacements.size (); ++i)
++        {
++            if (named && prepared[i].name () == sourceHeader.name ())
++            {
++                replacement  = &replacements[i];
++                outputHeader = prepared[i];
++                used[i]      = true;
++                break;
++            }
++        }
++
++        result.push_back (
++            RewritePart{sourcePart, replacement, std::move (outputHeader)});
++    }
++
++    if (result.empty ())
++        throw ArgExc ("The source contains no supported image parts.");
++    for (bool matched: used)
++        if (!matched)
++            throw ArgExc (
++                "A replacement name does not match a supported part.");
++
++    return result;
++}
++
++void
++copyImagePart (
++    MultiPartInputFile&  input,
++    MultiPartOutputFile& output,
++    int                  inputPart,
++    int                  outputPart,
++    const string&        type)
++{
++    if (type == SCANLINEIMAGE)
++    {
++        InputPart  in (input, inputPart);
++        OutputPart out (output, outputPart);
++        out.copyPixels (in);
++    }
++    else if (type == TILEDIMAGE)
++    {
++        TiledInputPart  in (input, inputPart);
++        TiledOutputPart out (output, outputPart);
++        out.copyPixels (in);
++    }
++    else if (type == DEEPSCANLINE)
++    {
++        DeepScanLineInputPart  in (input, inputPart);
++        DeepScanLineOutputPart out (output, outputPart);
++        out.copyPixels (in);
++    }
++    else
++    {
++        DeepTiledInputPart  in (input, inputPart);
++        DeepTiledOutputPart out (output, outputPart);
++        out.copyPixels (in);
++    }
++}
++
++Header
++flatSingleHeader (const string& fileName, bool tiled)
++{
++    if (tiled)
++    {
++        TiledInputFile input (fileName.c_str ());
++        return input.header ();
++    }
++
++    InputFile input (fileName.c_str ());
++    return input.header ();
++}
++
++Header
++flatSingleHeader (IStream& stream, bool tiled)
++{
++    Header header;
++    if (tiled)
++    {
++        TiledInputFile input (stream);
++        header = input.header ();
++    }
++    else
++    {
++        InputFile input (stream);
++        header = input.header ();
++    }
++    stream.seekg (0);
++    return header;
++}
++
++void
++copyFlatSingle (
++    const string& inputFileName,
++    const string& outputFileName,
++    const Header& header,
++    bool          tiled)
++{
++    if (tiled)
++    {
++        TiledInputFile  input (inputFileName.c_str ());
++        TiledOutputFile output (outputFileName.c_str (), header);
++        output.copyPixels (input);
++    }
++    else
++    {
++        InputFile  input (inputFileName.c_str ());
++        OutputFile output (outputFileName.c_str (), header);
++        output.copyPixels (input);
++    }
++}
++
++void
++copyFlatSingle (
++    IStream&      inputStream,
++    OStream&      outputStream,
++    const Header& header,
++    bool          tiled)
++{
++    inputStream.seekg (0);
++    if (tiled)
++    {
++        TiledInputFile  input (inputStream);
++        TiledOutputFile output (outputStream, header);
++        output.copyPixels (input);
++    }
++    else
++    {
++        InputFile  input (inputStream);
++        OutputFile output (outputStream, header);
++        output.copyPixels (input);
++    }
++}
++
++void
++writeRewrite (
++    MultiPartInputFile& input, OStream& output, const vector<RewritePart>& plan)
++{
++    vector<Header> headers;
++    headers.reserve (plan.size ());
++    for (const RewritePart& part: plan)
++        headers.push_back (part.header);
++
++    MultiPartOutputFile out (
++        output, headers.data (), static_cast<int> (headers.size ()), false);
++
++    for (size_t i = 0; i < plan.size (); ++i)
++    {
++        const RewritePart& part = plan[i];
++        if (part.replacement)
++            writeImagePart (
++                out, static_cast<int> (i), *part.replacement, part.header);
++        else
++            copyImagePart (
++                input,
++                out,
++                part.sourcePart,
++                static_cast<int> (i),
++                input.header (part.sourcePart).type ());
++    }
++}
++
++MultiPartInputFile
++openMultipartInput (const string& fileName)
++{
++    return MultiPartInputFile (
++        fileName.c_str (),
++        ContextInitializer ().silentHeaderParse (true).strictHeaderValidation (
++            false),
++        globalThreadCount (),
++        true);
++}
++
++} // namespace
++
++void
++saveImages (
++    const string& fileName, const ImageParts& parts, DataWindowSource dws)
++{
++    vector<Header>      headers = headersForParts (parts, dws);
++    MultiPartOutputFile out (
++        fileName.c_str (), headers.data (), static_cast<int> (headers.size ()));
++    writeImageParts (out, parts, headers);
++}
++
++void
++saveImages (OStream& stream, const ImageParts& parts, DataWindowSource dws)
++{
++    vector<Header>      headers = headersForParts (parts, dws);
++    MultiPartOutputFile out (
++        stream, headers.data (), static_cast<int> (headers.size ()));
++    writeImageParts (out, parts, headers);
++}
++
++ImageParts
++loadImages (const string& fileName)
++{
++    MultiPartInputFile in = openMultipartInput (fileName);
++    return loadImageParts (in);
++}
++
++ImageParts
++loadImages (IStream& stream)
++{
++    MultiPartInputFile in (
++        stream.fileName (),
++        ContextInitializer ()
++            .silentHeaderParse (true)
++            .strictHeaderValidation (false)
++            .setInputStream (&stream),
++        globalThreadCount (),
++        true);
++    return loadImageParts (in);
++}
++
++ImagePart
++loadImagePart (const string& fileName, const string& partName)
++{
++    MultiPartInputFile in = openMultipartInput (fileName);
++    return loadNamedImagePart (in, partName);
++}
++
++ImagePart
++loadImagePart (IStream& stream, const string& partName)
++{
++    MultiPartInputFile in (
++        stream.fileName (),
++        ContextInitializer ()
++            .silentHeaderParse (true)
++            .strictHeaderValidation (false)
++            .setInputStream (&stream),
++        globalThreadCount (),
++        true);
++    return loadNamedImagePart (in, partName);
++}
++
++ImagePart
++loadImagePart (
++    const string& fileName, const string& partName, const Box2i& dataWindow)
++{
++    MultiPartInputFile input = openMultipartInput (fileName);
++    return loadNamedImagePart (input, partName, dataWindow);
++}
++
++ImagePart
++loadImagePart (IStream& stream, const string& partName, const Box2i& dataWindow)
++{
++    MultiPartInputFile input (
++        stream.fileName (),
++        ContextInitializer ()
++            .silentHeaderParse (true)
++            .strictHeaderValidation (false)
++            .setInputStream (&stream),
++        globalThreadCount (),
++        true);
++    return loadNamedImagePart (input, partName, dataWindow);
++}
++
++void
++rewriteImages (
++    const string&     inputFileName,
++    const string&     outputFileName,
++    const ImageParts& replacements,
++    DataWindowSource  dws)
++{
++    if (inputFileName == outputFileName)
++        throw ArgExc ("Input and output image filenames must be different.");
++
++    bool       tiled, deep, multiPart;
++    const bool flatSingle =
++        isOpenExrFile (inputFileName.c_str (), tiled, deep, multiPart) &&
++        !deep && !multiPart;
++    Header exactHeader;
++    if (flatSingle) exactHeader = flatSingleHeader (inputFileName, tiled);
++
++    MultiPartInputFile  input = openMultipartInput (inputFileName);
++    vector<RewritePart> plan  = prepareRewrite (input, replacements, dws);
++    if (flatSingle && !exactHeader.hasType () && !plan.front ().replacement)
++    {
++        copyFlatSingle (inputFileName, outputFileName, exactHeader, tiled);
++        return;
++    }
++    StdOFStream output (outputFileName.c_str ());
++    writeRewrite (input, output, plan);
++}
++
++void
++rewriteImages (
++    IStream&          inputStream,
++    OStream&          outputStream,
++    const ImageParts& replacements,
++    DataWindowSource  dws)
++{
++    bool       tiled, deep, multiPart;
++    const bool flatSingle =
++        isOpenExrFile (inputStream, tiled, deep, multiPart) && !deep &&
++        !multiPart;
++    Header exactHeader;
++    if (flatSingle) exactHeader = flatSingleHeader (inputStream, tiled);
++
++    {
++        MultiPartInputFile input (
++            inputStream.fileName (),
++            ContextInitializer ()
++                .silentHeaderParse (true)
++                .strictHeaderValidation (false)
++                .setInputStream (&inputStream),
++            globalThreadCount (),
++            true);
++        vector<RewritePart> plan = prepareRewrite (input, replacements, dws);
++        if (!flatSingle || exactHeader.hasType () || plan.front ().replacement)
++        {
++            writeRewrite (input, outputStream, plan);
++            return;
++        }
++    }
++
++    copyFlatSingle (inputStream, outputStream, exactHeader, tiled);
++}
++
+ OPENEXR_IMF_INTERNAL_NAMESPACE_SOURCE_EXIT
+diff --git a/src/lib/OpenEXRUtil/ImfImageIO.h b/src/lib/OpenEXRUtil/ImfImageIO.h
+index 34b9d53a..7e0f88c1 100644
+--- a/src/lib/OpenEXRUtil/ImfImageIO.h
++++ b/src/lib/OpenEXRUtil/ImfImageIO.h
+@@ -19,9 +19,38 @@
+ 
+ #include "ImfImage.h"
+ #include "ImfImageDataWindow.h"
++#include "ImfHeader.h"
++#include "ImfIO.h"
++
++#include <memory>
++#include <utility>
++#include <vector>
+ 
+ OPENEXR_IMF_INTERNAL_NAMESPACE_HEADER_ENTER
+ 
++//
++// An ImagePart owns the header and image data for one part in an image file.
++// ImageParts stores parts in file order.
++//
++
++struct ImagePart
++{
++    ImagePart (Header h, std::unique_ptr<Image> i)
++        : header (std::move (h)), image (std::move (i))
++    {}
++
++    ImagePart (ImagePart&&) noexcept            = default;
++    ImagePart& operator= (ImagePart&&) noexcept = default;
++
++    ImagePart (const ImagePart&)            = delete;
++    ImagePart& operator= (const ImagePart&) = delete;
++
++    Header                 header;
++    std::unique_ptr<Image> image;
++};
++
++using ImageParts = std::vector<ImagePart>;
++
+ //
+ // saveImage (n, h, i, d) or
+ // saveImage (n, i)
+@@ -74,6 +103,94 @@ Image* loadImage (const std::string& fileName, Header& hdr);
+ IMFUTIL_EXPORT
+ Image* loadImage (const std::string& fileName);
+ 
++//
++// saveImages (n, p, d)
++//
++//      Saves the ordered image parts p in an OpenEXR file with name n.
++//      Each part header is adjusted in the same way as by saveImage().
++//
++
++IMFUTIL_EXPORT
++void saveImages (
++    const std::string& fileName,
++    const ImageParts&  parts,
++    DataWindowSource   dws = USE_IMAGE_DATA_WINDOW);
++
++IMFUTIL_EXPORT
++void saveImages (
++    OStream&          stream,
++    const ImageParts& parts,
++    DataWindowSource  dws = USE_IMAGE_DATA_WINDOW);
++
++//
++// loadImages (n)
++//
++//      Loads all parts of the OpenEXR file n in file order.  The returned
++//      collection owns each part's header and image data.
++//
++
++IMFUTIL_EXPORT
++ImageParts loadImages (const std::string& fileName);
++
++IMFUTIL_EXPORT
++ImageParts loadImages (IStream& stream);
++
++//
++// loadImagePart (n, p) or loadImagePart (s, p)
++//
++//      Loads only the image part named p from a file or stream.  Pixel data
++//      belonging to other parts is not decoded.
++//
++
++IMFUTIL_EXPORT
++ImagePart
++loadImagePart (const std::string& fileName, const std::string& partName);
++
++IMFUTIL_EXPORT
++ImagePart loadImagePart (IStream& stream, const std::string& partName);
++
++//
++// loadImagePart (n, p, w) or loadImagePart (s, p, w)
++//
++//      Loads the intersection of the named ONE_LEVEL image part and w.
++//      Pixel storage wholly outside the returned data window is not read.
++//
++
++IMFUTIL_EXPORT
++ImagePart loadImagePart (
++    const std::string&            fileName,
++    const std::string&            partName,
++    const IMATH_NAMESPACE::Box2i& dataWindow);
++
++IMFUTIL_EXPORT
++ImagePart loadImagePart (
++    IStream&                      stream,
++    const std::string&            partName,
++    const IMATH_NAMESPACE::Box2i& dataWindow);
++
++//
++// rewriteImages (i, o, r, d)
++//
++//      Writes the supported parts from input i to output o in their original
++//      order.  Parts whose exact header name occurs in r are replaced using
++//      the saveImages() header and data-window rules.  Other supported parts
++//      retain their original headers and compressed pixel data.
++//
++
++IMFUTIL_EXPORT
++void rewriteImages (
++    const std::string& inputFileName,
++    const std::string& outputFileName,
++    const ImageParts&  replacements,
++    DataWindowSource   dws = USE_IMAGE_DATA_WINDOW);
++
++IMFUTIL_EXPORT
++void rewriteImages (
++    IStream&          input,
++    OStream&          output,
++    const ImageParts& replacements,
++    DataWindowSource  dws = USE_IMAGE_DATA_WINDOW);
++
+ OPENEXR_IMF_INTERNAL_NAMESPACE_HEADER_EXIT
+ 
+ #endif

@@ -1,0 +1,640 @@
+diff --git a/grader_tests/sample_locations_test.go b/grader_tests/sample_locations_test.go
+new file mode 100644
+index 0000000..732d1fe
+--- /dev/null
++++ b/grader_tests/sample_locations_test.go
+@@ -0,0 +1,572 @@
++//go:build samplelocations
++// +build samplelocations
++
++package samplelocations_test
++
++import (
++	"bytes"
++	"encoding/binary"
++	"errors"
++	"io"
++	"math"
++	"os"
++	"testing"
++
++	mp4 "github.com/abema/go-mp4"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++type byteRange struct {
++	start int64
++	end   int64
++}
++
++type guardedReadSeeker struct {
++	*bytes.Reader
++	media []byteRange
++}
++
++func (r *guardedReadSeeker) Read(p []byte) (int, error) {
++	pos, err := r.Seek(0, io.SeekCurrent)
++	if err != nil {
++		return 0, err
++	}
++	for _, media := range r.media {
++		if pos < media.end && pos+int64(len(p)) > media.start {
++			return 0, errors.New("media payload read")
++		}
++	}
++	return r.Reader.Read(p)
++}
++
++func startBox(t *testing.T, w *mp4.Writer, typ mp4.BoxType) *mp4.BoxInfo {
++	t.Helper()
++	bi, err := w.StartBox(&mp4.BoxInfo{Type: typ})
++	require.NoError(t, err)
++	return bi
++}
++
++func endBox(t *testing.T, w *mp4.Writer) *mp4.BoxInfo {
++	t.Helper()
++	bi, err := w.EndBox()
++	require.NoError(t, err)
++	return bi
++}
++
++func writeBox(t *testing.T, w *mp4.Writer, box mp4.IImmutableBox) *mp4.BoxInfo {
++	t.Helper()
++	startBox(t, w, box.GetType())
++	_, err := mp4.Marshal(w, box, mp4.Context{})
++	require.NoError(t, err)
++	return endBox(t, w)
++}
++
++func writeContainer(t *testing.T, w *mp4.Writer, typ mp4.BoxType, children func()) *mp4.BoxInfo {
++	t.Helper()
++	startBox(t, w, typ)
++	children()
++	return endBox(t, w)
++}
++
++func newOutput(t *testing.T) (*os.File, *mp4.Writer) {
++	t.Helper()
++	f, err := os.CreateTemp(t.TempDir(), "samples-*.mp4")
++	require.NoError(t, err)
++	return f, mp4.NewWriter(f)
++}
++
++func outputBytes(t *testing.T, f *os.File) []byte {
++	t.Helper()
++	_, err := f.Seek(0, io.SeekStart)
++	require.NoError(t, err)
++	data, err := io.ReadAll(f)
++	require.NoError(t, err)
++	require.NoError(t, f.Close())
++	return data
++}
++
++type classicOptions struct {
++	badTiming      bool
++	badComposition bool
++	badSTSC        string
++	syncSamples    []uint32
++	overflowOffset bool
++	outsideOffset  bool
++	prependValid   bool
++}
++
++func writeClassicTrack(t *testing.T, w *mp4.Writer, trackID uint32, offsets []uint64, options classicOptions) {
++	writeContainer(t, w, mp4.BoxTypeTrak(), func() {
++		writeBox(t, w, &mp4.Tkhd{TrackID: trackID})
++		writeContainer(t, w, mp4.BoxTypeMdia(), func() {
++			writeBox(t, w, &mp4.Mdhd{Timescale: 1000, DurationV0: 17})
++			writeContainer(t, w, mp4.BoxTypeMinf(), func() {
++				writeContainer(t, w, mp4.BoxTypeStbl(), func() {
++					co64 := &mp4.Co64{EntryCount: 2, ChunkOffset: append([]uint64(nil), offsets...)}
++					if options.overflowOffset {
++						co64.ChunkOffset[0] = math.MaxUint64 - 1
++					} else if options.outsideOffset {
++						co64.ChunkOffset[0] += 1000
++					}
++					writeBox(t, w, co64)
++					stts := &mp4.Stts{EntryCount: 2, Entries: []mp4.SttsEntry{{SampleCount: 2, SampleDelta: 5}, {SampleCount: 1, SampleDelta: 7}}}
++					if options.badTiming {
++						stts.EntryCount = 1
++						stts.Entries = stts.Entries[:1]
++					}
++					writeBox(t, w, stts)
++					ctts := &mp4.Ctts{EntryCount: 2, Entries: []mp4.CttsEntry{{SampleCount: 1, SampleOffsetV1: -3}, {SampleCount: 2, SampleOffsetV1: 2}}}
++					ctts.SetVersion(1)
++					if options.badComposition {
++						ctts.Entries[1].SampleCount = 1
++					}
++					writeBox(t, w, ctts)
++					stsc := &mp4.Stsc{EntryCount: 2, Entries: []mp4.StscEntry{{FirstChunk: 1, SamplesPerChunk: 2, SampleDescriptionIndex: 1}, {FirstChunk: 2, SamplesPerChunk: 1, SampleDescriptionIndex: 1}}}
++					switch options.badSTSC {
++					case "first":
++						stsc.Entries[0].FirstChunk = 2
++					case "descending":
++						stsc.Entries[1].FirstChunk = 1
++					case "uncovered":
++						stsc.EntryCount = 1
++						stsc.Entries = []mp4.StscEntry{{FirstChunk: 1, SamplesPerChunk: 1, SampleDescriptionIndex: 1}}
++					case "extra":
++						stsc.EntryCount = 1
++						stsc.Entries = []mp4.StscEntry{{FirstChunk: 1, SamplesPerChunk: 2, SampleDescriptionIndex: 1}}
++					}
++					writeBox(t, w, stsc)
++					stsz := &mp4.Stsz{SampleSize: 4, SampleCount: 3}
++					writeBox(t, w, stsz)
++					if options.syncSamples != nil {
++						writeBox(t, w, &mp4.Stss{EntryCount: uint32(len(options.syncSamples)), SampleNumber: options.syncSamples})
++					}
++				})
++			})
++		})
++	})
++}
++
++func buildClassic(t *testing.T, options classicOptions) ([]byte, []byteRange) {
++	t.Helper()
++	f, w := newOutput(t)
++	first := startBox(t, w, mp4.BoxTypeMdat())
++	_, err := w.Write([]byte("AAAABBBB"))
++	require.NoError(t, err)
++	first = endBox(t, w)
++	second := startBox(t, w, mp4.BoxTypeMdat())
++	_, err = w.Write([]byte("CCCC"))
++	require.NoError(t, err)
++	second = endBox(t, w)
++	offsets := []uint64{first.Offset + first.HeaderSize, second.Offset + second.HeaderSize}
++	writeContainer(t, w, mp4.BoxTypeMoov(), func() {
++		if options.prependValid {
++			writeClassicTrack(t, w, 1, offsets, classicOptions{})
++		}
++		writeClassicTrack(t, w, 2, offsets, options)
++	})
++	return outputBytes(t, f), []byteRange{
++		{start: int64(first.Offset + first.HeaderSize), end: int64(first.Offset + first.Size)},
++		{start: int64(second.Offset + second.HeaderSize), end: int64(second.Offset + second.Size)},
++	}
++}
++
++func buildClassicWithTrailingMedia(t *testing.T) ([]byte, []byteRange, uint64) {
++	t.Helper()
++	f, w := newOutput(t)
++	var co64 *mp4.BoxInfo
++	writeContainer(t, w, mp4.BoxTypeMoov(), func() {
++		writeContainer(t, w, mp4.BoxTypeTrak(), func() {
++			writeBox(t, w, &mp4.Tkhd{TrackID: 1})
++			writeContainer(t, w, mp4.BoxTypeMdia(), func() {
++				writeBox(t, w, &mp4.Mdhd{Timescale: 1000, DurationV0: 5})
++				writeContainer(t, w, mp4.BoxTypeMinf(), func() {
++					writeContainer(t, w, mp4.BoxTypeStbl(), func() {
++						co64 = writeBox(t, w, &mp4.Co64{EntryCount: 1, ChunkOffset: []uint64{0}})
++						writeBox(t, w, &mp4.Stts{EntryCount: 1, Entries: []mp4.SttsEntry{{SampleCount: 1, SampleDelta: 5}}})
++						writeBox(t, w, &mp4.Stsc{EntryCount: 1, Entries: []mp4.StscEntry{{FirstChunk: 1, SamplesPerChunk: 1, SampleDescriptionIndex: 1}}})
++						writeBox(t, w, &mp4.Stsz{SampleSize: 4, SampleCount: 1})
++					})
++				})
++			})
++		})
++	})
++	mdat := startBox(t, w, mp4.BoxTypeMdat())
++	_, err := w.Write([]byte("TAIL"))
++	require.NoError(t, err)
++	mdat = endBox(t, w)
++	data := outputBytes(t, f)
++	mediaStart := mdat.Offset + mdat.HeaderSize
++	entryOffset := co64.Offset + co64.HeaderSize + 8
++	binary.BigEndian.PutUint64(data[entryOffset:entryOffset+8], mediaStart)
++	return data, []byteRange{{start: int64(mediaStart), end: int64(mdat.Offset + mdat.Size)}}, mediaStart
++}
++
++func buildEmptyClassic(t *testing.T) []byte {
++	t.Helper()
++	f, w := newOutput(t)
++	writeContainer(t, w, mp4.BoxTypeMoov(), func() {
++		writeContainer(t, w, mp4.BoxTypeTrak(), func() {
++			writeBox(t, w, &mp4.Tkhd{TrackID: 1})
++			writeContainer(t, w, mp4.BoxTypeMdia(), func() {
++				writeBox(t, w, &mp4.Mdhd{Timescale: 1000})
++				writeContainer(t, w, mp4.BoxTypeMinf(), func() {
++					writeContainer(t, w, mp4.BoxTypeStbl(), func() {
++						writeBox(t, w, &mp4.Co64{})
++						writeBox(t, w, &mp4.Stts{})
++						writeBox(t, w, &mp4.Stsc{})
++						writeBox(t, w, &mp4.Stsz{})
++					})
++				})
++			})
++		})
++	})
++	return outputBytes(t, f)
++}
++
++func TestClassicSampleLocationsAndTiming(t *testing.T) {
++	data, media := buildClassic(t, classicOptions{})
++	info, err := mp4.Probe(&guardedReadSeeker{Reader: bytes.NewReader(data), media: media})
++	require.NoError(t, err)
++	require.Len(t, info.Tracks, 1)
++	samples := info.Tracks[0].Samples
++	require.Len(t, samples, 3)
++
++	assert.Equal(t, []uint64{8, 12, 24}, []uint64{samples[0].Offset, samples[1].Offset, samples[2].Offset})
++	assert.Equal(t, []uint32{4, 4, 4}, []uint32{samples[0].Size, samples[1].Size, samples[2].Size})
++	assert.Equal(t, []uint64{0, 5, 10}, []uint64{samples[0].DecodeTime, samples[1].DecodeTime, samples[2].DecodeTime})
++	assert.Equal(t, []int64{-3, 7, 12}, []int64{samples[0].PresentationTime, samples[1].PresentationTime, samples[2].PresentationTime})
++	assert.Equal(t, []int64{-3, 2, 2}, []int64{samples[0].CompositionTimeOffset, samples[1].CompositionTimeOffset, samples[2].CompositionTimeOffset})
++	for _, sample := range samples {
++		assert.True(t, sample.IsSync)
++	}
++	assert.Equal(t, "AAAA", string(data[samples[0].Offset:samples[0].Offset+uint64(samples[0].Size)]))
++	assert.Equal(t, "BBBB", string(data[samples[1].Offset:samples[1].Offset+uint64(samples[1].Size)]))
++	assert.Equal(t, "CCCC", string(data[samples[2].Offset:samples[2].Offset+uint64(samples[2].Size)]))
++}
++
++func TestClassicSyncTable(t *testing.T) {
++	data, _ := buildClassic(t, classicOptions{syncSamples: []uint32{1, 3}})
++	info, err := mp4.Probe(bytes.NewReader(data))
++	require.NoError(t, err)
++	assert.True(t, info.Tracks[0].Samples[0].IsSync)
++	assert.False(t, info.Tracks[0].Samples[1].IsSync)
++	assert.True(t, info.Tracks[0].Samples[2].IsSync)
++}
++
++func TestClassicFieldsAreDerivedIndependently(t *testing.T) {
++	data, _ := buildClassic(t, classicOptions{})
++	info, err := mp4.Probe(bytes.NewReader(data))
++	require.NoError(t, err)
++	samples := info.Tracks[0].Samples
++	t.Run("constant sizes", func(t *testing.T) {
++		assert.Equal(t, []uint32{4, 4, 4}, []uint32{samples[0].Size, samples[1].Size, samples[2].Size})
++	})
++	t.Run("signed composition", func(t *testing.T) { assert.Equal(t, int64(-3), samples[0].PresentationTime) })
++	t.Run("default sync", func(t *testing.T) { assert.True(t, samples[1].IsSync) })
++	t.Run("chunk accumulation", func(t *testing.T) { assert.Equal(t, samples[0].Offset+4, samples[1].Offset) })
++}
++
++func TestExistingClassicFixture(t *testing.T) {
++	f, err := os.Open("../testdata/sample.mp4")
++	require.NoError(t, err)
++	defer f.Close()
++	info, err := mp4.Probe(f)
++	require.NoError(t, err)
++	require.Len(t, info.Tracks, 2)
++	video := info.Tracks[0].Samples
++	require.Len(t, video, 10)
++	assert.Equal(t, uint64(48), video[0].Offset)
++	assert.Equal(t, uint64(48+video[0].Size), video[1].Offset)
++	assert.Equal(t, uint64(0), video[0].DecodeTime)
++	assert.Equal(t, uint64(1024), video[1].DecodeTime)
++	assert.Equal(t, int64(2048), video[0].PresentationTime)
++	assert.True(t, video[0].IsSync)
++	assert.False(t, video[1].IsSync)
++	for _, sample := range info.Tracks[1].Samples {
++		assert.True(t, sample.IsSync)
++	}
++	assert.Equal(t, uint64(40336), info.Tracks[0].Samples.GetBitrate(info.Tracks[0].Timescale))
++}
++
++func TestClassicMetadataCanPrecedeMedia(t *testing.T) {
++	data, media, mediaStart := buildClassicWithTrailingMedia(t)
++	info, err := mp4.Probe(&guardedReadSeeker{Reader: bytes.NewReader(data), media: media})
++	require.NoError(t, err)
++	require.Len(t, info.Tracks, 1)
++	require.Len(t, info.Tracks[0].Samples, 1)
++	assert.Equal(t, mediaStart, info.Tracks[0].Samples[0].Offset)
++	assert.Equal(t, "TAIL", string(data[mediaStart:mediaStart+4]))
++}
++
++func TestEmptyInitializationTrack(t *testing.T) {
++	info, err := mp4.Probe(bytes.NewReader(buildEmptyClassic(t)))
++	require.NoError(t, err)
++	require.Len(t, info.Tracks, 1)
++	assert.Empty(t, info.Tracks[0].Samples)
++}
++
++type fragmentOptions struct {
++	duplicateTFHD bool
++	duplicateTFDT bool
++	explicitBase  bool
++	underflow     bool
++	shortMedia    bool
++	unresolved    bool
++	timeOverflow  bool
++	sizeOverflow  bool
++	zeroTrack2    bool
++}
++
++func writeTrex(t *testing.T, w *mp4.Writer, trackID, duration, size, flags uint32) {
++	writeBox(t, w, &mp4.Trex{TrackID: trackID, DefaultSampleDescriptionIndex: 1, DefaultSampleDuration: duration, DefaultSampleSize: size, DefaultSampleFlags: flags})
++}
++
++func buildFragmented(t *testing.T, options fragmentOptions) ([]byte, []byteRange, uint64, uint64) {
++	t.Helper()
++	f, w := newOutput(t)
++	payload := []byte("ABCDEFGHIJKLM")
++	if options.shortMedia {
++		payload = payload[:12]
++	}
++	mdat := startBox(t, w, mp4.BoxTypeMdat())
++	_, err := w.Write(payload)
++	require.NoError(t, err)
++	mdat = endBox(t, w)
++	mediaStart := mdat.Offset + mdat.HeaderSize
++
++	writeContainer(t, w, mp4.BoxTypeMoov(), func() {
++		writeContainer(t, w, mp4.BoxTypeMvex(), func() {
++			writeTrex(t, w, 1, 11, 2, 0x00010000)
++			if !options.unresolved {
++				writeTrex(t, w, 2, 5, 2, 0)
++			}
++		})
++	})
++
++	firstMoof := startBox(t, w, mp4.BoxTypeMoof())
++	writeContainer(t, w, mp4.BoxTypeTraf(), func() {
++		tfhd := &mp4.Tfhd{TrackID: 1, DefaultSampleDuration: 3, DefaultSampleSize: 2, DefaultSampleFlags: 0x00010000}
++		flags := uint32(mp4.TfhdDefaultSampleDurationPresent | mp4.TfhdDefaultSampleSizePresent | mp4.TfhdDefaultSampleFlagsPresent)
++		if options.explicitBase {
++			tfhd.BaseDataOffset = mediaStart
++			flags |= mp4.TfhdBaseDataOffsetPresent
++		} else {
++			flags |= mp4.TfhdDefaultBaseIsMoof
++		}
++		tfhd.SetFlags(flags)
++		writeBox(t, w, tfhd)
++		if options.duplicateTFHD {
++			writeBox(t, w, tfhd)
++		}
++		tfdt := &mp4.Tfdt{BaseMediaDecodeTimeV0: 100}
++		if options.timeOverflow {
++			tfdt.SetVersion(1)
++			tfdt.BaseMediaDecodeTimeV1 = math.MaxUint64
++		}
++		writeBox(t, w, tfdt)
++		if options.duplicateTFDT {
++			writeBox(t, w, &mp4.Tfdt{BaseMediaDecodeTimeV0: 100})
++		}
++		dataOffset := int32(mediaStart) - int32(firstMoof.Offset)
++		if options.explicitBase {
++			dataOffset = 0
++		}
++		if options.underflow {
++			dataOffset = math.MinInt32
++		}
++		firstRun := &mp4.Trun{SampleCount: 2, DataOffset: dataOffset, FirstSampleFlags: 0, Entries: make([]mp4.TrunEntry, 2)}
++		firstRun.SetFlags(0x000001 | 0x000004)
++		writeBox(t, w, firstRun)
++		secondRun := &mp4.Trun{SampleCount: 1, Entries: []mp4.TrunEntry{{SampleDuration: 4, SampleSize: 3, SampleFlags: 0, SampleCompositionTimeOffsetV1: -9}}}
++		if options.sizeOverflow {
++			secondRun.Entries[0].SampleSize = math.MaxUint32
++		}
++		secondRun.SetVersion(1)
++		secondRun.SetFlags(0x000100 | 0x000200 | 0x000400 | 0x000800)
++		writeBox(t, w, secondRun)
++	})
++	writeContainer(t, w, mp4.BoxTypeTraf(), func() {
++		writeBox(t, w, &mp4.Tfhd{TrackID: 2})
++		count := uint32(2)
++		if options.zeroTrack2 {
++			count = 0
++		}
++		run := &mp4.Trun{SampleCount: count, Entries: make([]mp4.TrunEntry, count)}
++		writeBox(t, w, run)
++	})
++	endBox(t, w)
++
++	secondMoof := startBox(t, w, mp4.BoxTypeMoof())
++	writeContainer(t, w, mp4.BoxTypeTraf(), func() {
++		tfhd := &mp4.Tfhd{TrackID: 1}
++		tfhd.SetFlags(mp4.TfhdDefaultBaseIsMoof)
++		writeBox(t, w, tfhd)
++		run := &mp4.Trun{SampleCount: 1, DataOffset: int32(mediaStart+11) - int32(secondMoof.Offset), Entries: make([]mp4.TrunEntry, 1)}
++		run.SetFlags(0x000001)
++		writeBox(t, w, run)
++	})
++	endBox(t, w)
++
++	return outputBytes(t, f), []byteRange{{start: int64(mediaStart), end: int64(mdat.Offset + mdat.Size)}}, mediaStart, firstMoof.Offset
++}
++
++func TestFragmentSampleOwnershipDefaultsAndContinuation(t *testing.T) {
++	data, media, mediaStart, firstMoof := buildFragmented(t, fragmentOptions{})
++	info, err := mp4.Probe(&guardedReadSeeker{Reader: bytes.NewReader(data), media: media})
++	require.NoError(t, err)
++	require.Len(t, info.Segments, 3)
++	assert.Equal(t, []uint32{1, 2, 1}, []uint32{info.Segments[0].TrackID, info.Segments[1].TrackID, info.Segments[2].TrackID})
++
++	first := info.Segments[0]
++	assert.Equal(t, uint32(3), first.SampleCount)
++	assert.Equal(t, uint32(10), first.Duration)
++	assert.Equal(t, uint32(7), first.Size)
++	assert.Equal(t, uint64(100), first.BaseMediaDecodeTime)
++	assert.Equal(t, firstMoof, first.MoofOffset)
++	assert.Equal(t, int32(-3), first.CompositionTimeOffset)
++	require.Len(t, first.Samples, 3)
++	assert.Equal(t, []uint64{mediaStart, mediaStart + 2, mediaStart + 4}, []uint64{first.Samples[0].Offset, first.Samples[1].Offset, first.Samples[2].Offset})
++	assert.Equal(t, []uint64{100, 103, 106}, []uint64{first.Samples[0].DecodeTime, first.Samples[1].DecodeTime, first.Samples[2].DecodeTime})
++	assert.Equal(t, []int64{100, 103, 97}, []int64{first.Samples[0].PresentationTime, first.Samples[1].PresentationTime, first.Samples[2].PresentationTime})
++	assert.True(t, first.Samples[0].IsSync)
++	assert.False(t, first.Samples[1].IsSync)
++	assert.True(t, first.Samples[2].IsSync)
++
++	second := info.Segments[1]
++	require.Len(t, second.Samples, 2)
++	assert.Equal(t, []uint64{mediaStart + 7, mediaStart + 9}, []uint64{second.Samples[0].Offset, second.Samples[1].Offset})
++	assert.Equal(t, []uint64{0, 5}, []uint64{second.Samples[0].DecodeTime, second.Samples[1].DecodeTime})
++	assert.True(t, second.Samples[0].IsSync)
++	assert.True(t, second.Samples[1].IsSync)
++
++	third := info.Segments[2]
++	require.Len(t, third.Samples, 1)
++	assert.Equal(t, mediaStart+11, third.Samples[0].Offset)
++	assert.Equal(t, uint64(110), third.BaseMediaDecodeTime)
++	assert.Equal(t, uint64(110), third.Samples[0].DecodeTime)
++	assert.False(t, third.Samples[0].IsSync)
++	assert.Equal(t, "LM", string(data[third.Samples[0].Offset:third.Samples[0].Offset+uint64(third.Samples[0].Size)]))
++}
++
++func TestExistingFragmentedFixture(t *testing.T) {
++	f, err := os.Open("../testdata/sample_fragmented.mp4")
++	require.NoError(t, err)
++	defer f.Close()
++	info, err := mp4.Probe(f)
++	require.NoError(t, err)
++	require.Len(t, info.Segments, 8)
++	for _, segment := range info.Segments {
++		assert.Len(t, segment.Samples, int(segment.SampleCount))
++		var duration, size uint32
++		for _, sample := range segment.Samples {
++			duration += sample.TimeDelta
++			size += sample.Size
++		}
++		assert.Equal(t, segment.Duration, duration)
++		assert.Equal(t, segment.Size, size)
++	}
++	assert.Equal(t, uint64(1363), info.Segments[0].Samples[0].Offset)
++	assert.Equal(t, uint64(0), info.Segments[0].Samples[0].DecodeTime)
++	assert.Equal(t, int64(18000), info.Segments[0].Samples[0].PresentationTime)
++}
++
++func TestZeroSampleFragment(t *testing.T) {
++	data, _, _, _ := buildFragmented(t, fragmentOptions{zeroTrack2: true})
++	info, err := mp4.Probe(bytes.NewReader(data))
++	require.NoError(t, err)
++	require.Len(t, info.Segments, 3)
++	assert.Zero(t, info.Segments[1].SampleCount)
++	assert.Empty(t, info.Segments[1].Samples)
++}
++
++func TestFragmentStatesAreIndependent(t *testing.T) {
++	data, _, mediaStart, _ := buildFragmented(t, fragmentOptions{})
++	info, err := mp4.Probe(bytes.NewReader(data))
++	require.NoError(t, err)
++	t.Run("traf ownership", func(t *testing.T) {
++		assert.Equal(t, []uint32{1, 2, 1}, []uint32{info.Segments[0].TrackID, info.Segments[1].TrackID, info.Segments[2].TrackID})
++	})
++	t.Run("all runs", func(t *testing.T) {
++		assert.Equal(t, []uint32{3, 10, 7}, []uint32{info.Segments[0].SampleCount, info.Segments[0].Duration, info.Segments[0].Size})
++	})
++	t.Run("first flags scope", func(t *testing.T) {
++		assert.Equal(t, []bool{true, false}, []bool{info.Segments[0].Samples[0].IsSync, info.Segments[0].Samples[1].IsSync})
++	})
++	t.Run("signed offset", func(t *testing.T) { assert.Equal(t, mediaStart, info.Segments[0].Samples[0].Offset) })
++	t.Run("track time continuation", func(t *testing.T) {
++		assert.Equal(t, []uint64{0, 110}, []uint64{info.Segments[1].Samples[0].DecodeTime, info.Segments[2].Samples[0].DecodeTime})
++	})
++	t.Run("trex defaults", func(t *testing.T) {
++		assert.Equal(t, []uint32{5, 2}, []uint32{info.Segments[1].Samples[0].TimeDelta, info.Segments[1].Samples[0].Size})
++	})
++}
++
++func TestExplicitFragmentBaseDataOffset(t *testing.T) {
++	data, media, mediaStart, firstMoof := buildFragmented(t, fragmentOptions{explicitBase: true})
++	info, err := mp4.Probe(&guardedReadSeeker{Reader: bytes.NewReader(data), media: media})
++	require.NoError(t, err)
++	require.NotEmpty(t, info.Segments)
++	first := info.Segments[0]
++	assert.Equal(t, firstMoof, first.MoofOffset)
++	require.Len(t, first.Samples, 3)
++	assert.Equal(t, []uint64{mediaStart, mediaStart + 2, mediaStart + 4}, []uint64{first.Samples[0].Offset, first.Samples[1].Offset, first.Samples[2].Offset})
++}
++
++func TestClassicContradictionsReturnNil(t *testing.T) {
++	cases := []struct {
++		name    string
++		options classicOptions
++	}{
++		{name: "stts count", options: classicOptions{badTiming: true}},
++		{name: "ctts count", options: classicOptions{badComposition: true}},
++		{name: "bad first chunk", options: classicOptions{badSTSC: "first"}},
++		{name: "descending chunks", options: classicOptions{badSTSC: "descending"}},
++		{name: "uncovered samples", options: classicOptions{badSTSC: "uncovered"}},
++		{name: "extra samples", options: classicOptions{badSTSC: "extra"}},
++		{name: "zero sync index", options: classicOptions{syncSamples: []uint32{0}}},
++		{name: "duplicate sync index", options: classicOptions{syncSamples: []uint32{1, 1}}},
++		{name: "large sync index", options: classicOptions{syncSamples: []uint32{4}}},
++		{name: "offset overflow", options: classicOptions{overflowOffset: true}},
++		{name: "sample outside media", options: classicOptions{outsideOffset: true}},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			tc.options.prependValid = true
++			data, _ := buildClassic(t, tc.options)
++			info, err := mp4.Probe(bytes.NewReader(data))
++			assert.Error(t, err)
++			assert.Nil(t, info)
++		})
++	}
++}
++
++func TestOutOfMediaRangeReturnsNil(t *testing.T) {
++	data, _, _, _ := buildFragmented(t, fragmentOptions{shortMedia: true})
++	info, err := mp4.Probe(bytes.NewReader(data))
++	assert.Error(t, err)
++	assert.Nil(t, info)
++}
++
++func TestFragmentContradictionsReturnNil(t *testing.T) {
++	cases := []struct {
++		name    string
++		options fragmentOptions
++	}{
++		{name: "duplicate tfhd", options: fragmentOptions{duplicateTFHD: true}},
++		{name: "duplicate tfdt", options: fragmentOptions{duplicateTFDT: true}},
++		{name: "signed offset underflow", options: fragmentOptions{underflow: true}},
++		{name: "sample outside media", options: fragmentOptions{shortMedia: true}},
++		{name: "unresolved defaults", options: fragmentOptions{unresolved: true}},
++		{name: "decode time overflow", options: fragmentOptions{timeOverflow: true}},
++		{name: "aggregate overflow", options: fragmentOptions{sizeOverflow: true}},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			data, _, _, _ := buildFragmented(t, tc.options)
++			info, err := mp4.Probe(bytes.NewReader(data))
++			assert.Error(t, err)
++			assert.Nil(t, info)
++		})
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..a6b16a2
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,56 @@
++#!/usr/bin/env bash
++
++set -u
++
++mode=""
++output_path=""
++while [ "$#" -gt 0 ]; do
++    case "$1" in
++        base|new)
++            if [ -n "$mode" ]; then
++                echo "mode specified more than once" >&2
++                exit 2
++            fi
++            mode="$1"
++            shift
++            ;;
++        --output_path)
++            if [ "$#" -lt 2 ]; then
++                echo "--output_path requires a path" >&2
++                exit 2
++            fi
++            output_path="$2"
++            shift 2
++            ;;
++        --output_path=*)
++            output_path="${1#*=}"
++            shift
++            ;;
++        *)
++            echo "unknown argument: $1" >&2
++            exit 2
++            ;;
++    esac
++done
++
++if [ -z "$mode" ] || [ -z "$output_path" ]; then
++    echo "usage: ./test.sh [--output_path PATH] {base|new}" >&2
++    exit 2
++fi
++
++rm -f "$output_path"
++status=0
++if [ "$mode" = "base" ]; then
++    gotestsum --junitfile "$output_path" -- -count=1 ./... || status=$?
++else
++    gotestsum --junitfile "$output_path" -- -count=1 -tags samplelocations ./grader_tests || status=$?
++fi
++
++if [ ! -s "$output_path" ]; then
++    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?><testsuites tests="1" failures="1"><testsuite name="setup" tests="1" failures="1"><testcase name="runner"><failure message="test runner did not produce a report"/></testcase></testsuite></testsuites>' > "$output_path"
++    if [ "$status" -eq 0 ]; then
++        status=1
++    fi
++fi
++
++exit "$status"

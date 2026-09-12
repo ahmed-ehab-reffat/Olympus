@@ -1,0 +1,642 @@
+diff --git a/pyparsing/__init__.py b/pyparsing/__init__.py
+index e9418f1..5b32b70 100644
+--- a/pyparsing/__init__.py
++++ b/pyparsing/__init__.py
+@@ -151,6 +151,7 @@ from .core import *
+ from .core import _builtin_exprs as core_builtin_exprs
+ from .helpers import *
+ from .helpers import _builtin_exprs as helper_builtin_exprs
++from .sourcetree import SourceNode
+ 
+ from .unicode import unicode_set, UnicodeRangeList, pyparsing_unicode as unicode
+ from .testing import pyparsing_test as testing
+@@ -291,6 +292,7 @@ __all__ = [
+     "RecursiveGrammarException",
+     "Regex",
+     "SkipTo",
++    "SourceNode",
+     "StringEnd",
+     "StringStart",
+     "Suppress",
+diff --git a/pyparsing/core.py b/pyparsing/core.py
+index 3b33295..6a25080 100644
+--- a/pyparsing/core.py
++++ b/pyparsing/core.py
+@@ -4,6 +4,7 @@
+ from __future__ import annotations
+ 
+ import collections.abc
++import contextlib
+ from collections import deque
+ import os
+ import typing
+@@ -406,11 +407,79 @@ def null_debug_action(*args):
+     """'Do-nothing' debug action, to suppress debugging output during parsing."""
+ 
+ 
++_tree_builder = None
++_tree_probing = False
++
++
++@contextlib.contextmanager
++def _building_tree(element, instring):
++    """
++    Run a parse with a stand-in for ``ParserElement._parse``, so that an attempt
++    keeps a node only when it succeeds and a rejected alternative or a lookahead
++    leaves the tree alone. The method is swapped rather than edited, so an ordinary
++    parse keeps the stack depth it has always had.
++    """
++    from .sourcetree import _TreeBuilder
++
++    global _tree_builder
++
++    ParserElement.reset_cache()
++    if not element.streamlined:
++        element.streamline()
++    for e in element.ignoreExprs:
++        e.streamline()
++
++    builder = _TreeBuilder(instring)
++    inner = ParserElement._parse
++
++    def keeping_what_matched(self, instring, loc, do_actions=True, callPreParse=True):
++        # a parse started from inside a parse action builds its own tree, one over
++        # other text is none of this tree's business, and a try_parse only asks
++        # whether a match is possible, so none of the three is kept
++        if (
++            not do_actions
++            or _tree_probing
++            or _tree_builder is not builder
++            or instring is not builder.instring
++        ):
++            return inner(self, instring, loc, do_actions, callPreParse)
++
++        builder.enter()
++        mark = len(builder.starts)
++        try:
++            result = inner(self, instring, loc, do_actions, callPreParse)
++        except BaseException:
++            builder.abandon()
++            del builder.starts[mark:]
++            raise
++        if self.looks_only:
++            builder.abandon()
++            del builder.starts[mark:]
++            return result
++        builder.keep(self, loc, mark, result[0], callPreParse, result[1])
++        return result
++
++    global _tree_probing
++
++    outer, was_probing = _tree_builder, _tree_probing
++    _tree_probing = False
++    _tree_builder = builder
++    ParserElement._parse = keeping_what_matched
++    try:
++        yield builder
++    finally:
++        ParserElement._parse = inner
++        _tree_builder = outer
++        _tree_probing = was_probing
++
++
+ class ParserElement(ABC):
+     """Abstract base level parser element class."""
+ 
+     DEFAULT_WHITE_CHARS: str = " \n\t\r"
+     verbose_stacktrace: bool = False
++    # true for expressions that only look at text without taking any
++    looks_only: bool = False
+     _literalStringClass: type = None  # type: ignore[assignment]
+ 
+     @staticmethod
+@@ -972,13 +1041,45 @@ class ParserElement(ABC):
+                 loc, tokens = self.parseImpl(instring, pre_loc, do_actions)
+ 
+         tokens = self.postParse(instring, loc, tokens)
++        if _tree_builder is not None:
++            _tree_builder.starts.append(tokens_start)
+ 
+         ret_tokens = ParseResults(
+             tokens, self.resultsName, aslist=self.saveAsList, modal=self.modalResults
+         )
+         if self.parseAction and (do_actions or self.callDuringTry):
+-            if debugging:
+-                try:
++            # a parse an action starts is its own, so nothing it does reaches this
++            # tree, whatever text it runs over
++            global _tree_probing
++
++            was_probing = _tree_probing
++            _tree_probing = True
++            try:
++                if debugging:
++                    try:
++                        for fn in self.parseAction:
++                            try:
++                                tokens = fn(instring, tokens_start, ret_tokens)  # type: ignore [call-arg, arg-type]
++                            except IndexError as parse_action_exc:
++                                exc = ParseException("exception raised in parse action")
++                                raise exc from parse_action_exc
++
++                            if tokens is not None and tokens is not ret_tokens:
++                                ret_tokens = ParseResults(
++                                    tokens,
++                                    self.resultsName,
++                                    aslist=self.saveAsList
++                                    and isinstance(tokens, (ParseResults, list)),
++                                    modal=self.modalResults,
++                                )
++                    except Exception as err:
++                        # print "Exception raised in user parse action:", err
++                        if self.debugActions.debug_fail:
++                            self.debugActions.debug_fail(
++                                instring, tokens_start, self, err, False
++                            )
++                        raise
++                else:
+                     for fn in self.parseAction:
+                         try:
+                             tokens = fn(instring, tokens_start, ret_tokens)  # type: ignore [call-arg, arg-type]
+@@ -994,29 +1095,8 @@ class ParserElement(ABC):
+                                 and isinstance(tokens, (ParseResults, list)),
+                                 modal=self.modalResults,
+                             )
+-                except Exception as err:
+-                    # print "Exception raised in user parse action:", err
+-                    if self.debugActions.debug_fail:
+-                        self.debugActions.debug_fail(
+-                            instring, tokens_start, self, err, False
+-                        )
+-                    raise
+-            else:
+-                for fn in self.parseAction:
+-                    try:
+-                        tokens = fn(instring, tokens_start, ret_tokens)  # type: ignore [call-arg, arg-type]
+-                    except IndexError as parse_action_exc:
+-                        exc = ParseException("exception raised in parse action")
+-                        raise exc from parse_action_exc
+-
+-                    if tokens is not None and tokens is not ret_tokens:
+-                        ret_tokens = ParseResults(
+-                            tokens,
+-                            self.resultsName,
+-                            aslist=self.saveAsList
+-                            and isinstance(tokens, (ParseResults, list)),
+-                            modal=self.modalResults,
+-                        )
++            finally:
++                _tree_probing = was_probing
+         if debugging:
+             # print("Matched", self, "->", ret_tokens.as_list())
+             if self.debugActions.debug_match:
+@@ -1034,12 +1114,18 @@ class ParserElement(ABC):
+         raise_fatal: bool = False,
+         do_actions: bool = False,
+     ) -> int:
++        global _tree_probing
++
++        was_probing = _tree_probing
++        _tree_probing = True
+         try:
+             return self._parse(instring, loc, do_actions=do_actions)[0]
+         except ParseFatalException:
+             if raise_fatal:
+                 raise
+             raise ParseException(instring, loc, self.errmsg, self)
++        finally:
++            _tree_probing = was_probing
+ 
+     def can_parse_next(self, instring: str, loc: int, do_actions: bool = False) -> bool:
+         try:
+@@ -1359,6 +1445,63 @@ class ParserElement(ABC):
+         else:
+             return tokens
+ 
++    def parse_source(self, instring: str, parse_all: bool = False) -> "SourceNode":
++        """
++        Parse a string and return a :class:`SourceNode` tree of the text the parse
++        consumed, the whitespace and ignored text it skipped included.
++        """
++        try:
++            with _building_tree(self, instring) as builder:
++                loc, _ = self._parse(instring, 0)
++            if parse_all:
++                loc = self.preParse(instring, loc)
++                se = Empty() + StringEnd().set_debug(False)
++                se._parse(instring, loc)
++        except _ParseActionIndexError as pa_exc:
++            raise pa_exc.exc
++        except ParseBaseException as exc:
++            if ParserElement.verbose_stacktrace:
++                raise
++            raise exc.with_traceback(None)
++
++        return builder.rooted(self.name, loc if parse_all else None)
++
++    def scan_source(self, instring: str) -> "SourceNode":
++        """
++        Scan a string for matches and return one :class:`SourceNode` covering the
++        whole text: a node for every match, and the text in between as it stands.
++        """
++        preparser = Empty()
++        preparser.ignoreExprs = self.ignoreExprs
++        preparser.whiteChars = self.whiteChars
++
++        matches: list[SourceNode] = []
++        loc = 0
++        instrlen = len(instring)
++        try:
++            with _building_tree(self, instring) as builder:
++                while loc <= instrlen:
++                    preloc = preparser.preParse(instring, loc)
++                    try:
++                        next_loc, _ = self._parse(instring, preloc, callPreParse=False)
++                    except ParseException:
++                        builder.taken()
++                        loc = preloc + 1
++                        continue
++
++                    found = builder.taken()
++                    if next_loc > loc and found:
++                        matches.append(found[-1])
++                        loc = next_loc
++                    else:
++                        loc = preloc + 1
++        except ParseBaseException as exc:
++            if ParserElement.verbose_stacktrace:
++                raise
++            raise exc.with_traceback(None)
++
++        return builder.document(matches)
++
+     def scan_string(
+         self,
+         instring: str,
+@@ -5438,6 +5581,8 @@ class AtLineStart(ParseElementEnhance):
+ 
+ 
+ class FollowedBy(ParseElementEnhance):
++    looks_only = True
++
+     """Lookahead matching of the given parse expression.
+     ``FollowedBy`` does *not* advance the parsing position within
+     the input string, it only verifies that the specified parse
+@@ -5482,6 +5627,8 @@ class FollowedBy(ParseElementEnhance):
+ 
+ 
+ class PrecededBy(ParseElementEnhance):
++    looks_only = True
++
+     """Lookbehind matching of the given parse expression.
+     ``PrecededBy`` does not advance the parsing position within the
+     input string, it only verifies that the specified parse expression
+@@ -5613,6 +5760,8 @@ class Located(ParseElementEnhance):
+ 
+ 
+ class NotAny(ParseElementEnhance):
++    looks_only = True
++
+     """
+     Lookahead to disallow matching with the given parse expression.
+     ``NotAny`` does *not* advance the parsing position within the
+@@ -6320,6 +6469,10 @@ class Forward(ParseElementEnhance):
+                 )
+                 if do_actions:
+                     memo[act_key] = memo[peek_key]
++                # each expansion of the recursion re-parses the same text, so only
++                # the nodes of the one that survives belong in the tree
++                builder = _tree_builder if do_actions else None
++                mark = len(builder.frames[-1]) if builder is not None else 0
+                 while True:
+                     try:
+                         new_loc, new_peek = super().parseImpl(instring, loc, False)
+@@ -6340,6 +6493,8 @@ class Forward(ParseElementEnhance):
+                         return prev_loc, copy.copy(prev_peek)
+                     # the match did get better: see if we can improve further
+                     if do_actions:
++                        if builder is not None:
++                            del builder.frames[-1][mark:]
+                         try:
+                             memo[act_key] = super().parseImpl(instring, loc, True)
+                         except ParseException as e:
+diff --git a/pyparsing/sourcetree.py b/pyparsing/sourcetree.py
+new file mode 100644
+index 0000000..0d66b3b
+--- /dev/null
++++ b/pyparsing/sourcetree.py
+@@ -0,0 +1,314 @@
++# sourcetree.py
++"""
++A tree of the source text a parse consumed, including the text it skipped.
++"""
++
++from __future__ import annotations
++
++import typing
++
++_Part = typing.Union[str, "SourceNode"]
++
++
++class SourceNode:
++    """
++    One expression's share of the source text.
++
++    A node covers the text its expression matched, and carries the whitespace and
++    ignored text that was skipped just before it. Putting a node's own text back
++    together with the text of the nodes below it gives that part of the input back
++    exactly as it arrived.
++    """
++
++    __slots__ = (
++        "name",
++        "start",
++        "end",
++        "_trivia_parts",
++        "skipped",
++        "tokens",
++        "parent",
++        "_source",
++        "_parts",
++        "_replacement",
++        "_before",
++        "_after",
++        "_removed",
++    )
++
++    def __init__(
++        self,
++        name: str,
++        start: int,
++        end: int,
++        trivia: typing.Union[str, tuple[_Part, ...]],
++        parts: tuple[_Part, ...],
++        source: str = "",
++        tokens: typing.Any = None,
++        skipped: tuple["SourceNode", ...] = (),
++    ) -> None:
++        self.name = name
++        self.start = start
++        self.end = end
++        self._trivia_parts = (trivia,) if isinstance(trivia, str) else tuple(trivia)
++        self.skipped = skipped
++        self.tokens = tokens.copy() if hasattr(tokens, "copy") else tokens
++        self.parent: typing.Optional[SourceNode] = None
++        self._source = source
++        self._parts = parts
++        self._replacement: typing.Optional[str] = None
++        self._before = ""
++        self._after = ""
++        self._removed = False
++        for part in parts + self._trivia_parts:
++            if isinstance(part, SourceNode):
++                part.parent = self
++
++    @property
++    def trivia(self) -> str:
++        """
++        The text skipped just before this node, with any rewriting of the ignored
++        expressions inside it applied.
++        """
++        return "".join(
++            part if isinstance(part, str) else part.source()
++            for part in self._trivia_parts
++        )
++
++    @property
++    def children(self) -> tuple[SourceNode, ...]:
++        """
++        The nodes of the expressions this one is built from, in source order.
++        """
++        return tuple(part for part in self._parts if isinstance(part, SourceNode))
++
++    @property
++    def text(self) -> str:
++        """
++        The source text this node stands for, without the text skipped before it,
++        and with any replacement applied.
++        """
++        if self._replacement is not None:
++            return self._replacement
++        return "".join(
++            part if isinstance(part, str) else part.source() for part in self._parts
++        )
++
++    def source(self) -> str:
++        """
++        The source text this node accounts for, skipped text included, with any
++        rewriting applied.
++        """
++        if self._removed:
++            return ""
++        return self.trivia + self._before + self.text + self._after
++
++    def replace(self, text: str) -> None:
++        """
++        Put ``text`` where this node matched. Every other character of the input is
++        left as it was, the text skipped before this node included.
++        """
++        self._replacement = text
++
++    def remove(self) -> None:
++        """
++        Take this node out, along with the text skipped before it.
++        """
++        self._removed = True
++
++    def insert_before(self, text: str) -> None:
++        """
++        Put ``text`` between the text skipped before this node and its own text.
++        """
++        self._before += text
++
++    def insert_after(self, text: str) -> None:
++        """
++        Put ``text`` straight after this node's own text.
++        """
++        self._after += text
++
++    def find(self, name: str) -> typing.Optional[SourceNode]:
++        """
++        The first node of this name, this one included, in source order.
++        """
++        for node in self.walk():
++            if node.name == name:
++                return node
++        return None
++
++    def find_all(self, name: str) -> list[SourceNode]:
++        """
++        Every node of this name, in source order.
++        """
++        return [node for node in self.walk() if node.name == name]
++
++    @property
++    def line_number(self) -> int:
++        """
++        The line of the input this node starts on, counting from one.
++        """
++        return self._source.count("\n", 0, self.start) + 1
++
++    @property
++    def column(self) -> int:
++        """
++        The column of the input this node starts at, counting from one.
++        """
++        return self.start - self._source.rfind("\n", 0, self.start)
++
++    def dump(self, indent: str = "") -> str:
++        """
++        This node and the ones below it, one per line, for reading.
++        """
++        # an expression can be named after the characters it matches, newlines
++        # included, and a node still takes one line
++        name = self.name.replace("\r", "\\r").replace("\n", "\\n")
++        head = f"{indent}{name} [{self.start}:{self.end}] {self.text!r}"
++        return "\n".join(
++            [head] + [node.dump(indent + "  ") for node in self._below()]
++        )
++
++    def _below(self) -> list[SourceNode]:
++        """
++        Everything this node holds, the ignored expressions it skipped included,
++        in source order.
++        """
++        return sorted(self.skipped + self.children, key=lambda node: node.start)
++
++    def walk(self) -> typing.Iterator[SourceNode]:
++        """
++        This node and every node below it, in source order.
++        """
++        yield self
++        for node in self._below():
++            yield from node.walk()
++
++    def __repr__(self) -> str:
++        return f"SourceNode({self.name!r}, {self.start}, {self.end})"
++
++
++class _TreeBuilder:
++    """
++    Collects nodes while a parse runs.
++
++    One frame per attempt: an attempt that fails, or one made only to see whether it
++    could match, drops its frame and leaves nothing behind. A memoized attempt does
++    not run again, so the node it built the first time is reused.
++    """
++
++    __slots__ = ("instring", "frames", "starts", "memo")
++
++    def __init__(self, instring: str) -> None:
++        self.instring = instring
++        self.frames: list[list[SourceNode]] = [[]]
++        self.starts: list[int] = []
++        self.memo: dict[tuple[typing.Any, int, bool, int], tuple[typing.Any, int, tuple]] = {}
++
++    def enter(self) -> None:
++        self.frames.append([])
++
++    def abandon(self) -> None:
++        self.frames.pop()
++
++    def keep(self, element, loc: int, mark: int, end: int, call_pre_parse: bool, tokens=None):
++        children = self.frames.pop()
++        # an attempt that really ran reports where its match began; one the parser
++        # answered from its own memo reports nothing, so the first build stands in
++        start = self.starts[-1] if len(self.starts) > mark else -1
++        del self.starts[mark:]
++        # the element itself keys the memo, so a short-lived one cannot have its
++        # identity handed to another element while the tree is being built, and the
++        # end is part of the key, so a growing left recursion cannot be handed the
++        # nodes of a shorter expansion
++        key = (element, loc, call_pre_parse, end)
++        remembered = self.memo.get(key)
++        if start < 0 or (not children and remembered is not None):
++            if remembered is None:
++                start, parts, skipped = loc, (self.instring[loc:end],), ()
++            else:
++                parts, start, skipped = remembered
++        else:
++            # an ignored expression is matched while skipping ahead: before the
++            # match it belongs to the text skipped, and past the end it belongs to
++            # whatever comes next, never to this node
++            skipped = tuple(
++                child
++                for child in children
++                if child.end <= start and child.start < start
++            )
++            inside = [
++                child for child in children if child.start >= start and child.end <= end
++            ]
++            parts = self._cover(inside, start, end)
++            self.memo[key] = (parts, start, skipped)
++        node = SourceNode(
++            self._name(element),
++            start,
++            end,
++            self._cover(skipped, loc, start),
++            parts,
++            self.instring,
++            tokens,
++            skipped,
++        )
++        self.frames[-1].append(node)
++        return node
++
++    def rooted(self, name: str, end: typing.Optional[int] = None) -> SourceNode:
++        if not self.frames[0]:
++            # the whole grammar only looked at the text, so nothing was kept and
++            # there is no match to stand for
++            stop = end if end is not None else 0
++            return SourceNode(name, 0, stop, "", (self.instring[:stop],), self.instring)
++        node = self.frames[0][0]
++        if end is not None and end > node.end:
++            # parse_all also consumes the trailing whitespace, and a lossless tree
++            # has to account for it
++            node = SourceNode(
++                node.name,
++                node.start,
++                end,
++                node._trivia_parts,
++                node._parts + (self.instring[node.end : end],),
++                self.instring,
++                node.tokens,
++                node.skipped,
++            )
++        return node
++
++    def document(self, matches: typing.Sequence[SourceNode]) -> SourceNode:
++        """
++        A node covering the whole text, made of the matches and the text between them.
++        """
++        return SourceNode(
++            "source",
++            0,
++            len(self.instring),
++            "",
++            self._cover(matches, 0, len(self.instring)),
++            self.instring,
++        )
++
++    def taken(self) -> list[SourceNode]:
++        found, self.frames[0] = self.frames[0], []
++        return found
++
++    def _cover(
++        self, children: typing.Sequence[SourceNode], start: int, end: int
++    ) -> tuple[_Part, ...]:
++        parts: list[_Part] = []
++        pos = start
++        for child in children:
++            skipped = child.start - len(child.trivia)
++            if skipped > pos:
++                parts.append(self.instring[pos:skipped])
++            parts.append(child)
++            pos = child.end
++        if pos < end:
++            parts.append(self.instring[pos:end])
++        return tuple(parts)
++
++    @staticmethod
++    def _name(element) -> str:
++        return element.resultsName or element.name

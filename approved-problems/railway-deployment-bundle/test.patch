@@ -1,0 +1,1958 @@
+diff --git a/.config/nextest.toml b/.config/nextest.toml
+new file mode 100644
+index 0000000..88457dc
+--- /dev/null
++++ b/.config/nextest.toml
+@@ -0,0 +1,2 @@
++[profile.default.junit]
++path = "junit.xml"
+diff --git a/src/consts.rs b/src/consts.rs
+index 35c0f67..35d3ea3 100644
+--- a/src/consts.rs
++++ b/src/consts.rs
+@@ -20,3 +20,7 @@ pub const RAILWAY_HTTP_TIMEOUT_ENV: &str = "RAILWAY_HTTP_TIMEOUT";
+ pub const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 90;
+ 
+ pub const TICK_STRING: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ";
++
++#[cfg(all(test, deployment_plan_tests))]
++#[path = "controllers/deployment_plan_grader_tests.rs"]
++mod deployment_plan_grader_tests;
+diff --git a/src/controllers/deployment_plan_grader_tests.rs b/src/controllers/deployment_plan_grader_tests.rs
+new file mode 100644
+index 0000000..1f3817b
+--- /dev/null
++++ b/src/controllers/deployment_plan_grader_tests.rs
+@@ -0,0 +1,734 @@
++use std::{
++    collections::BTreeMap,
++    fs,
++    io::{Cursor, Read},
++    path::Path,
++};
++
++use flate2::read::GzDecoder;
++use sha2::{Digest, Sha256};
++use tempfile::tempdir;
++
++use crate::controllers::{
++    deploy_plan::{
++        DeployEntryKind, DeployPlan, create_deploy_plan, create_deploy_tarball_from_plan,
++        read_deploy_plan, serialize_deploy_plan,
++    },
++    upload,
++};
++
++type DecodedArchive = (
++    Vec<String>,
++    BTreeMap<String, Vec<u8>>,
++    BTreeMap<String, u32>,
++);
++
++fn plan(root: &Path) -> DeployPlan {
++    create_deploy_plan(root, root, None, false, true).unwrap()
++}
++
++fn sha256(bytes: &[u8]) -> String {
++    format!("{:x}", Sha256::digest(bytes))
++}
++
++fn decode_archive(body: Vec<u8>) -> DecodedArchive {
++    let mut archive = tar::Archive::new(GzDecoder::new(Cursor::new(body)));
++    let mut paths = Vec::new();
++    let mut files = BTreeMap::new();
++    let mut modes = BTreeMap::new();
++    for entry in archive.entries().unwrap() {
++        let mut entry = entry.unwrap();
++        let path = entry.path().unwrap().to_string_lossy().into_owned();
++        paths.push(path.clone());
++        modes.insert(path.clone(), entry.header().mode().unwrap() & 0o7777);
++        if entry.header().entry_type().is_file() {
++            let mut bytes = Vec::new();
++            entry.read_to_end(&mut bytes).unwrap();
++            files.insert(path, bytes);
++        }
++    }
++    (paths, files, modes)
++}
++
++fn normalized_paths(paths: Vec<String>) -> Vec<String> {
++    let mut paths = paths
++        .into_iter()
++        .map(|path| path.trim_end_matches('/').to_owned())
++        .collect::<Vec<_>>();
++    paths.sort();
++    paths
++}
++
++fn without_selected_root(paths: Vec<String>) -> Vec<String> {
++    normalized_paths(paths)
++        .into_iter()
++        .filter(|path| path != ".")
++        .collect()
++}
++
++#[test]
++fn deployment_plan_serialization_is_byte_deterministic_and_sorted() {
++    let temp = tempdir().unwrap();
++    fs::create_dir(temp.path().join("z-dir")).unwrap();
++    fs::write(temp.path().join("z-dir/z.txt"), "z").unwrap();
++    fs::write(temp.path().join("a.txt"), "a").unwrap();
++
++    let first = create_deploy_plan(temp.path(), temp.path(), None, true, false).unwrap();
++    let second = create_deploy_plan(temp.path(), temp.path(), None, true, false).unwrap();
++    let serialized = serialize_deploy_plan(&first).unwrap();
++    assert_eq!(serialized, serialize_deploy_plan(&second).unwrap());
++    let json: serde_json::Value = serde_json::from_slice(&serialized).unwrap();
++    assert_eq!(
++        json.get("pathAsRoot").and_then(serde_json::Value::as_bool),
++        Some(false)
++    );
++    assert_eq!(
++        json.get("noGitignore").and_then(serde_json::Value::as_bool),
++        Some(true)
++    );
++    let directories = json["entries"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .filter(|entry| entry["kind"].as_str() == Some("directory"))
++        .collect::<Vec<_>>();
++    assert!(directories.iter().any(|entry| entry["path"] == "z-dir"));
++    for directory in directories {
++        assert_eq!(directory["size"].as_u64(), Some(0));
++        assert!(directory.get("sha256").is_none());
++    }
++    assert!(
++        first
++            .entries
++            .windows(2)
++            .all(|pair| pair[0].path < pair[1].path)
++    );
++    for expected in ["a.txt", "z-dir", "z-dir/z.txt"] {
++        assert!(first.entries.iter().any(|entry| entry.path == expected));
++    }
++}
++
++#[test]
++fn deployment_plan_default_selection_matches_ordinary_upload() {
++    let temp = tempdir().unwrap();
++    let root = temp.path();
++    fs::create_dir(root.join(".git")).unwrap();
++    fs::create_dir(root.join("node_modules")).unwrap();
++    fs::create_dir(root.join("src")).unwrap();
++    fs::write(root.join(".git/config"), "private").unwrap();
++    fs::write(root.join("node_modules/dependency.js"), "private").unwrap();
++    fs::write(root.join(".gitignore"), "ignored.log\n").unwrap();
++    fs::write(root.join(".railwayignore"), "secret.env\n").unwrap();
++    fs::write(root.join("ignored.log"), "ignored").unwrap();
++    fs::write(root.join("secret.env"), "secret").unwrap();
++    fs::write(root.join("src/app.rs"), "fn main() {}\n").unwrap();
++
++    let ordinary = upload::create_deploy_tarball(root, root, false, |_, _| {}).unwrap();
++    let plan_path = root.join("deploy-plan.json");
++    let planned = create_deploy_plan(root, root, Some(&plan_path), false, true).unwrap();
++    fs::write(&plan_path, serialize_deploy_plan(&planned).unwrap()).unwrap();
++    let verified =
++        create_deploy_tarball_from_plan(root, root, Some(&plan_path), false, true, &planned)
++            .unwrap();
++
++    let (ordinary_paths, ordinary_files, _) = decode_archive(ordinary);
++    let (verified_paths, verified_files, _) = decode_archive(verified);
++    assert_eq!(
++        without_selected_root(ordinary_paths),
++        without_selected_root(verified_paths)
++    );
++    assert_eq!(ordinary_files, verified_files);
++    assert!(
++        !planned.entries.iter().any(|entry| {
++            entry.path == "deploy-plan.json"
++                || entry.path == "ignored.log"
++                || entry.path == "secret.env"
++                || entry.path.starts_with(".git/")
++                || entry.path.starts_with("node_modules/")
++        }),
++        "the plan must use ordinary selection and exclude its own output"
++    );
++}
++
++#[test]
++fn deployment_plan_no_gitignore_keeps_railwayignore_and_builtin_exclusions() {
++    let temp = tempdir().unwrap();
++    let root = temp.path();
++    fs::create_dir(root.join(".git")).unwrap();
++    fs::create_dir(root.join("node_modules")).unwrap();
++    fs::write(root.join(".gitignore"), "git-ignored.txt\n").unwrap();
++    fs::write(root.join(".railwayignore"), "railway-ignored.txt\n").unwrap();
++    fs::write(root.join("git-ignored.txt"), "included").unwrap();
++    fs::write(root.join("railway-ignored.txt"), "excluded").unwrap();
++    fs::write(root.join(".git/private"), "excluded").unwrap();
++    fs::write(root.join("node_modules/private"), "excluded").unwrap();
++
++    let planned = create_deploy_plan(root, root, None, true, true).unwrap();
++    assert!(
++        planned
++            .entries
++            .iter()
++            .any(|entry| entry.path == "git-ignored.txt")
++    );
++    assert!(!planned.entries.iter().any(|entry| {
++        entry.path == "railway-ignored.txt"
++            || entry.path.starts_with(".git/")
++            || entry.path.starts_with("node_modules/")
++    }));
++
++    let ordinary = upload::create_deploy_tarball(root, root, true, |_, _| {}).unwrap();
++    assert_eq!(
++        without_selected_root(decode_archive(ordinary).0),
++        planned
++            .entries
++            .iter()
++            .filter(|entry| entry.path != ".")
++            .map(|entry| entry.path.clone())
++            .collect::<Vec<_>>()
++    );
++}
++
++#[test]
++fn deployment_plan_verified_archive_uses_plan_paths_bytes_and_hashes() {
++    let temp = tempdir().unwrap();
++    fs::create_dir(temp.path().join("dir")).unwrap();
++    fs::write(temp.path().join("alpha"), "alpha").unwrap();
++    fs::write(temp.path().join("dir/beta"), "beta").unwrap();
++    let planned = plan(temp.path());
++
++    let body =
++        create_deploy_tarball_from_plan(temp.path(), temp.path(), None, false, true, &planned)
++            .unwrap();
++    let (paths, files, _) = decode_archive(body);
++    assert_eq!(
++        normalized_paths(paths),
++        normalized_paths(
++            planned
++                .entries
++                .iter()
++                .map(|entry| entry.path.clone())
++                .collect::<Vec<_>>()
++        )
++    );
++    for entry in planned
++        .entries
++        .iter()
++        .filter(|entry| matches!(&entry.kind, DeployEntryKind::File))
++    {
++        let bytes = files
++            .get(&entry.path)
++            .unwrap_or_else(|| panic!("archive omitted {}", entry.path));
++        assert_eq!(entry.size, bytes.len() as u64);
++        assert_eq!(entry.sha256.as_deref(), Some(sha256(bytes).as_str()));
++    }
++}
++
++#[test]
++fn deployment_plan_same_size_content_change_is_rejected() {
++    let temp = tempdir().unwrap();
++    fs::write(temp.path().join("app.txt"), "aaaa").unwrap();
++    let planned = plan(temp.path());
++    fs::write(temp.path().join("app.txt"), "bbbb").unwrap();
++
++    assert!(
++        create_deploy_tarball_from_plan(temp.path(), temp.path(), None, false, true, &planned)
++            .is_err()
++    );
++}
++
++#[test]
++fn deployment_plan_added_removed_and_renamed_inputs_are_rejected() {
++    let added = tempdir().unwrap();
++    fs::write(added.path().join("original"), "x").unwrap();
++    let added_plan = plan(added.path());
++    fs::write(added.path().join("extra"), "y").unwrap();
++    assert!(
++        create_deploy_tarball_from_plan(added.path(), added.path(), None, false, true, &added_plan)
++            .is_err()
++    );
++
++    let removed = tempdir().unwrap();
++    fs::write(removed.path().join("original"), "x").unwrap();
++    let removed_plan = plan(removed.path());
++    fs::remove_file(removed.path().join("original")).unwrap();
++    assert!(
++        create_deploy_tarball_from_plan(
++            removed.path(),
++            removed.path(),
++            None,
++            false,
++            true,
++            &removed_plan
++        )
++        .is_err()
++    );
++
++    let renamed = tempdir().unwrap();
++    fs::write(renamed.path().join("original"), "x").unwrap();
++    let renamed_plan = plan(renamed.path());
++    fs::rename(
++        renamed.path().join("original"),
++        renamed.path().join("renamed"),
++    )
++    .unwrap();
++    assert!(
++        create_deploy_tarball_from_plan(
++            renamed.path(),
++            renamed.path(),
++            None,
++            false,
++            true,
++            &renamed_plan
++        )
++        .is_err()
++    );
++}
++
++#[test]
++fn deployment_plan_invocation_option_mismatches_are_rejected() {
++    let temp = tempdir().unwrap();
++    fs::write(temp.path().join("app"), "x").unwrap();
++    let planned = plan(temp.path());
++
++    assert!(
++        create_deploy_tarball_from_plan(temp.path(), temp.path(), None, true, true, &planned)
++            .is_err()
++    );
++
++    assert!(
++        create_deploy_tarball_from_plan(temp.path(), temp.path(), None, false, false, &planned)
++            .is_err()
++    );
++}
++
++#[test]
++fn deployment_plan_service_prefix_and_path_as_root_modes_are_preserved() {
++    let temp = tempdir().unwrap();
++    let workspace = temp.path().join("workspace");
++    let service = workspace.join("services/api");
++    fs::create_dir_all(&service).unwrap();
++    fs::write(service.join("-hello.txt"), "sorts before the root marker").unwrap();
++    fs::write(service.join("app.txt"), "content").unwrap();
++
++    let prefixed = create_deploy_plan(&service, &workspace, None, false, false).unwrap();
++    assert_eq!(
++        prefixed
++            .entries
++            .iter()
++            .map(|entry| entry.path.as_str())
++            .collect::<Vec<_>>(),
++        [
++            "services/api",
++            "services/api/-hello.txt",
++            "services/api/app.txt",
++        ]
++    );
++    assert_eq!(
++        normalized_paths(
++            decode_archive(
++                create_deploy_tarball_from_plan(
++                    &service, &workspace, None, false, false, &prefixed,
++                )
++                .unwrap(),
++            )
++            .0,
++        ),
++        [
++            "services/api",
++            "services/api/-hello.txt",
++            "services/api/app.txt",
++        ]
++    );
++
++    let rooted = create_deploy_plan(&service, &service, None, false, true).unwrap();
++    assert_eq!(
++        rooted
++            .entries
++            .iter()
++            .map(|entry| entry.path.as_str())
++            .collect::<Vec<_>>(),
++        ["-hello.txt", ".", "app.txt"]
++    );
++    let ordinary_rooted_paths = normalized_paths(
++        decode_archive(
++            upload::create_deploy_tarball(&service, &service, false, |_, _| {}).unwrap(),
++        )
++        .0,
++    );
++    assert_eq!(ordinary_rooted_paths, ["-hello.txt", ".", "app.txt"]);
++    assert_eq!(
++        normalized_paths(
++            decode_archive(
++                create_deploy_tarball_from_plan(&service, &service, None, false, true, &rooted,)
++                    .unwrap(),
++            )
++            .0,
++        ),
++        ["-hello.txt", ".", "app.txt"]
++    );
++}
++
++#[test]
++fn deployment_plan_type_and_size_changes_are_rejected() {
++    let type_fixture = tempdir().unwrap();
++    fs::write(type_fixture.path().join("item"), "").unwrap();
++    let type_plan = plan(type_fixture.path());
++    fs::remove_file(type_fixture.path().join("item")).unwrap();
++    fs::create_dir(type_fixture.path().join("item")).unwrap();
++    assert!(
++        create_deploy_tarball_from_plan(
++            type_fixture.path(),
++            type_fixture.path(),
++            None,
++            false,
++            true,
++            &type_plan
++        )
++        .is_err()
++    );
++
++    let size_fixture = tempdir().unwrap();
++    fs::write(size_fixture.path().join("item"), "small").unwrap();
++    let size_plan = plan(size_fixture.path());
++    fs::write(size_fixture.path().join("item"), "larger").unwrap();
++    assert!(
++        create_deploy_tarball_from_plan(
++            size_fixture.path(),
++            size_fixture.path(),
++            None,
++            false,
++            true,
++            &size_plan
++        )
++        .is_err()
++    );
++}
++
++#[test]
++fn deployment_plan_parser_rejects_unknown_fields_and_unsupported_versions() {
++    let temp = tempdir().unwrap();
++    fs::write(temp.path().join("app"), "content").unwrap();
++    let planned = plan(temp.path());
++
++    let mut unknown: serde_json::Value =
++        serde_json::from_slice(&serialize_deploy_plan(&planned).unwrap()).unwrap();
++    unknown
++        .as_object_mut()
++        .unwrap()
++        .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
++    let plan_path = temp.path().join("plan.json");
++    fs::write(&plan_path, serde_json::to_vec(&unknown).unwrap()).unwrap();
++    assert!(read_deploy_plan(&plan_path).is_err());
++
++    let mut unknown_entry: serde_json::Value =
++        serde_json::from_slice(&serialize_deploy_plan(&planned).unwrap()).unwrap();
++    unknown_entry["entries"][0]
++        .as_object_mut()
++        .unwrap()
++        .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
++    fs::write(&plan_path, serde_json::to_vec(&unknown_entry).unwrap()).unwrap();
++    assert!(read_deploy_plan(&plan_path).is_err());
++
++    let mut unsupported_value: serde_json::Value =
++        serde_json::from_slice(&serialize_deploy_plan(&planned).unwrap()).unwrap();
++    unsupported_value["version"] = serde_json::Value::from(planned.version + 1);
++    fs::write(&plan_path, serde_json::to_vec(&unsupported_value).unwrap()).unwrap();
++    assert!(read_deploy_plan(&plan_path).is_err());
++
++    let mut unsupported = planned;
++    unsupported.version += 1;
++    assert!(serialize_deploy_plan(&unsupported).is_err());
++}
++
++#[test]
++fn deployment_plan_parser_rejects_unsorted_duplicate_and_invalid_entry_records() {
++    let temp = tempdir().unwrap();
++    fs::create_dir(temp.path().join("directory")).unwrap();
++    fs::write(temp.path().join("a"), "a").unwrap();
++    fs::write(temp.path().join("b"), "b").unwrap();
++
++    let mut unsorted = plan(temp.path());
++    unsorted.entries.reverse();
++    assert!(serialize_deploy_plan(&unsorted).is_err());
++
++    let mut duplicate = plan(temp.path());
++    let file_indices = duplicate
++        .entries
++        .iter()
++        .enumerate()
++        .filter(|(_, entry)| matches!(&entry.kind, DeployEntryKind::File))
++        .map(|(index, _)| index)
++        .collect::<Vec<_>>();
++    assert_eq!(file_indices.len(), 2);
++    let duplicate_path = duplicate.entries[file_indices[0]].path.clone();
++    duplicate.entries[file_indices[1]].path = duplicate_path;
++    assert!(serialize_deploy_plan(&duplicate).is_err());
++
++    let plan_path = temp.path().join("candidate-plan.json");
++    let valid_value: serde_json::Value =
++        serde_json::from_slice(&serialize_deploy_plan(&plan(temp.path())).unwrap()).unwrap();
++
++    let mut unsorted_value = valid_value.clone();
++    unsorted_value["entries"].as_array_mut().unwrap().reverse();
++    fs::write(&plan_path, serde_json::to_vec(&unsorted_value).unwrap()).unwrap();
++    assert!(read_deploy_plan(&plan_path).is_err());
++
++    let mut duplicate_value = valid_value.clone();
++    let entries = duplicate_value["entries"].as_array_mut().unwrap();
++    assert!(entries.len() >= 2);
++    entries[1] = entries[0].clone();
++    fs::write(&plan_path, serde_json::to_vec(&duplicate_value).unwrap()).unwrap();
++    assert!(read_deploy_plan(&plan_path).is_err());
++
++    let file_index = valid_value["entries"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .position(|entry| entry["kind"] == "file")
++        .unwrap();
++
++    let mut missing_digest_value = valid_value.clone();
++    missing_digest_value["entries"][file_index]
++        .as_object_mut()
++        .unwrap()
++        .remove("sha256");
++    fs::write(
++        &plan_path,
++        serde_json::to_vec(&missing_digest_value).unwrap(),
++    )
++    .unwrap();
++    assert!(read_deploy_plan(&plan_path).is_err());
++
++    let mut invalid_digest_value = valid_value.clone();
++    invalid_digest_value["entries"][file_index]["sha256"] =
++        serde_json::Value::String("abcd".to_owned());
++    fs::write(
++        &plan_path,
++        serde_json::to_vec(&invalid_digest_value).unwrap(),
++    )
++    .unwrap();
++    assert!(read_deploy_plan(&plan_path).is_err());
++
++    let mut unknown_kind_value = valid_value;
++    unknown_kind_value["entries"][file_index]["kind"] =
++        serde_json::Value::String("symlink".to_owned());
++    fs::write(&plan_path, serde_json::to_vec(&unknown_kind_value).unwrap()).unwrap();
++    assert!(read_deploy_plan(&plan_path).is_err());
++
++    let mut invalid_digest = plan(temp.path());
++    invalid_digest
++        .entries
++        .iter_mut()
++        .find(|entry| matches!(&entry.kind, DeployEntryKind::File))
++        .unwrap()
++        .sha256 = Some("ABC".to_owned());
++    assert!(serialize_deploy_plan(&invalid_digest).is_err());
++
++    let mut directory_digest = plan(temp.path());
++    directory_digest
++        .entries
++        .iter_mut()
++        .find(|entry| matches!(&entry.kind, DeployEntryKind::Directory))
++        .unwrap()
++        .sha256 = Some("0".repeat(64));
++    assert!(serialize_deploy_plan(&directory_digest).is_err());
++
++    let mut directory_size = plan(temp.path());
++    directory_size
++        .entries
++        .iter_mut()
++        .find(|entry| matches!(&entry.kind, DeployEntryKind::Directory))
++        .unwrap()
++        .size = 1;
++    assert!(serialize_deploy_plan(&directory_size).is_err());
++}
++
++#[test]
++fn deployment_plan_reader_rejects_directory_metadata_and_unsafe_paths() {
++    let temp = tempdir().unwrap();
++    fs::create_dir(temp.path().join("directory")).unwrap();
++    fs::write(temp.path().join("app"), "content").unwrap();
++    let value: serde_json::Value =
++        serde_json::from_slice(&serialize_deploy_plan(&plan(temp.path())).unwrap()).unwrap();
++    let plan_path = temp.path().join("candidate-plan.json");
++    let reject = |value: &serde_json::Value| {
++        fs::write(&plan_path, serde_json::to_vec(value).unwrap()).unwrap();
++        assert!(read_deploy_plan(&plan_path).is_err());
++    };
++
++    let mut directory_digest = value.clone();
++    directory_digest["entries"]
++        .as_array_mut()
++        .unwrap()
++        .iter_mut()
++        .find(|entry| entry["kind"].as_str() == Some("directory"))
++        .unwrap()
++        .as_object_mut()
++        .unwrap()
++        .insert(
++            "sha256".to_owned(),
++            serde_json::Value::String("0".repeat(64)),
++        );
++    reject(&directory_digest);
++
++    let mut directory_size = value.clone();
++    directory_size["entries"]
++        .as_array_mut()
++        .unwrap()
++        .iter_mut()
++        .find(|entry| entry["kind"].as_str() == Some("directory"))
++        .unwrap()
++        .as_object_mut()
++        .unwrap()
++        .insert("size".to_owned(), serde_json::Value::from(1));
++    reject(&directory_size);
++
++    #[cfg(unix)]
++    for kind in ["file", "directory"] {
++        let mut missing_mode = value.clone();
++        missing_mode["entries"]
++            .as_array_mut()
++            .unwrap()
++            .iter_mut()
++            .find(|entry| entry["kind"].as_str() == Some(kind))
++            .unwrap()
++            .as_object_mut()
++            .unwrap()
++            .remove("mode");
++        reject(&missing_mode);
++    }
++
++    for invalid_path in ["/absolute", "../escape", "nested/../escape"] {
++        let mut unsafe_path = value.clone();
++        unsafe_path["entries"]
++            .as_array_mut()
++            .unwrap()
++            .iter_mut()
++            .find(|entry| entry["kind"].as_str() == Some("file"))
++            .unwrap()
++            .as_object_mut()
++            .unwrap()
++            .insert(
++                "path".to_owned(),
++                serde_json::Value::String(invalid_path.to_owned()),
++            );
++        unsafe_path["entries"]
++            .as_array_mut()
++            .unwrap()
++            .sort_by(|left, right| {
++                left["path"]
++                    .as_str()
++                    .unwrap()
++                    .cmp(right["path"].as_str().unwrap())
++            });
++        reject(&unsafe_path);
++    }
++}
++
++#[cfg(unix)]
++#[test]
++fn deployment_plan_file_and_directory_modes_are_preserved_and_verified() {
++    use std::os::unix::fs::PermissionsExt;
++
++    let temp = tempdir().unwrap();
++    fs::create_dir(temp.path().join("directory")).unwrap();
++    fs::write(temp.path().join("executable"), "#!/bin/sh\n").unwrap();
++    fs::set_permissions(
++        temp.path().join("directory"),
++        fs::Permissions::from_mode(0o755),
++    )
++    .unwrap();
++    fs::set_permissions(
++        temp.path().join("executable"),
++        fs::Permissions::from_mode(0o755),
++    )
++    .unwrap();
++    let planned = plan(temp.path());
++    let (_, _, modes) = decode_archive(
++        create_deploy_tarball_from_plan(temp.path(), temp.path(), None, false, true, &planned)
++            .unwrap(),
++    );
++    assert_eq!(modes["directory"], 0o755);
++    assert_eq!(modes["executable"], 0o755);
++
++    fs::set_permissions(
++        temp.path().join("executable"),
++        fs::Permissions::from_mode(0o644),
++    )
++    .unwrap();
++    assert!(
++        create_deploy_tarball_from_plan(temp.path(), temp.path(), None, false, true, &planned)
++            .is_err()
++    );
++
++    fs::set_permissions(
++        temp.path().join("executable"),
++        fs::Permissions::from_mode(0o755),
++    )
++    .unwrap();
++    fs::set_permissions(
++        temp.path().join("directory"),
++        fs::Permissions::from_mode(0o700),
++    )
++    .unwrap();
++    assert!(
++        create_deploy_tarball_from_plan(temp.path(), temp.path(), None, false, true, &planned)
++            .is_err()
++    );
++}
++
++#[cfg(unix)]
++#[test]
++fn deployment_plan_followed_file_and_directory_links_match_ordinary_upload() {
++    use std::os::unix::fs::symlink;
++
++    let temp = tempdir().unwrap();
++    let root = temp.path().join("root");
++    let external_dir = temp.path().join("external-dir");
++    let external_file = temp.path().join("external.txt");
++    fs::create_dir(&root).unwrap();
++    fs::create_dir(&external_dir).unwrap();
++    fs::write(&external_file, "outside").unwrap();
++    fs::write(external_dir.join("nested.txt"), "nested").unwrap();
++    symlink(&external_file, root.join("linked.txt")).unwrap();
++    symlink(&external_dir, root.join("linked-dir")).unwrap();
++
++    let ordinary = upload::create_deploy_tarball(&root, &root, false, |_, _| {}).unwrap();
++    let planned = plan(&root);
++    let verified =
++        create_deploy_tarball_from_plan(&root, &root, None, false, true, &planned).unwrap();
++    let (ordinary_paths, ordinary_files, _) = decode_archive(ordinary);
++    let (verified_paths, verified_files, _) = decode_archive(verified);
++    assert_eq!(
++        without_selected_root(ordinary_paths),
++        without_selected_root(verified_paths)
++    );
++    assert_eq!(ordinary_files, verified_files);
++    assert_eq!(verified_files["linked.txt"], b"outside");
++    assert_eq!(verified_files["linked-dir/nested.txt"], b"nested");
++}
++
++#[cfg(unix)]
++#[test]
++fn deployment_plan_broken_followed_links_are_rejected_in_both_modes() {
++    use std::os::unix::fs::symlink;
++
++    let temp = tempdir().unwrap();
++    symlink(temp.path().join("missing"), temp.path().join("broken")).unwrap();
++    assert!(upload::create_deploy_tarball(temp.path(), temp.path(), false, |_, _| {}).is_err());
++    assert!(create_deploy_plan(temp.path(), temp.path(), None, false, true).is_err());
++}
++#[cfg(target_os = "linux")]
++#[test]
++fn deployment_plan_non_utf8_archive_paths_are_rejected() {
++    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
++
++    let temp = tempdir().unwrap();
++    fs::write(
++        temp.path()
++            .join(OsString::from_vec(b"invalid-\xff".to_vec())),
++        "content",
++    )
++    .unwrap();
++    assert!(create_deploy_plan(temp.path(), temp.path(), None, false, true).is_err());
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..43d2007
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,223 @@
++#!/usr/bin/env bash
++#
++# Usage: ./test.sh [--output_path PATH] <base|new>
++#   base runs Railway's pre-existing tests without grader-only features.
++#   new  runs only the deployment-plan grader tests.
++
++set -uo pipefail
++
++OUTPUT_PATH=""
++MODE=""
++RUNNER_LOG=""
++
++while [ "$#" -gt 0 ]; do
++    case "$1" in
++        --output_path)
++            OUTPUT_PATH="${2-}"
++            shift 2
++            ;;
++        --output_path=*)
++            OUTPUT_PATH="${1#*=}"
++            shift
++            ;;
++        base | new)
++            MODE="$1"
++            shift
++            ;;
++        *)
++            shift
++            ;;
++    esac
++done
++
++cd "$(dirname "$0")" || exit 2
++
++write_fallback_junit() {
++    local status="$1"
++    local output="$2"
++    local log="${3-}"
++    local diagnostics=""
++    local parsed_tests=0
++    local parsed_failures=0
++    local parsed_skips=0
++    local classname=""
++    local testname=""
++    case "$MODE" in
++        base)
++            classname="railwayapp::bin/railway"
++            testname="cli_tests.backwards_compat.root_commands_exist"
++            ;;
++        new)
++            classname="railwayapp::deployment_plan_cli"
++            testname="deployment_plan_write_is_offline_deterministic_and_self_excluding"
++            ;;
++        *)
++            classname="$MODE"
++            testname="run"
++            ;;
++    esac
++    if [ -n "$log" ] && [ -f "$log" ]; then
++        parsed_tests="$(grep -Ec '^test .* \.\.\. (ok|FAILED|ignored)$' "$log" || true)"
++        parsed_failures="$(grep -Ec '^test .* \.\.\. FAILED$' "$log" || true)"
++        parsed_skips="$(grep -Ec '^test .* \.\.\. ignored$' "$log" || true)"
++        diagnostics="$(
++            sed \
++                -e 's/&/\&amp;/g' \
++                -e 's/</\&lt;/g' \
++                -e 's/>/\&gt;/g' \
++                "$log"
++        )"
++    fi
++    mkdir -p "$(dirname "$output")"
++    if [ "$parsed_tests" -gt 0 ]; then
++        {
++            printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
++            printf '<testsuites tests="%s" failures="%s" errors="0" skipped="%s">\n' \
++                "$parsed_tests" "$parsed_failures" "$parsed_skips"
++            printf '  <testsuite name="%s" tests="%s" failures="%s" errors="0" skipped="%s">\n' \
++                "$MODE" "$parsed_tests" "$parsed_failures" "$parsed_skips"
++            while IFS= read -r result; do
++                local name="${result#test }"
++                local outcome=""
++                case "$name" in
++                    *" ... ok")
++                        name="${name% ... ok}"
++                        outcome="ok"
++                        ;;
++                    *" ... FAILED")
++                        name="${name% ... FAILED}"
++                        outcome="failed"
++                        ;;
++                    *" ... ignored")
++                        name="${name% ... ignored}"
++                        outcome="ignored"
++                        ;;
++                esac
++                name="$(
++                    printf '%s' "$name" |
++                        sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
++                )"
++                printf '    <testcase name="%s" classname="railwayapp">\n' "$name"
++                case "$outcome" in
++                    failed)
++                        printf '      <failure message="cargo test reported failure" type="test"/>\n'
++                        ;;
++                    ignored)
++                        printf '      <skipped/>\n'
++                        ;;
++                esac
++                printf '    </testcase>\n'
++            done < <(grep -E '^test .* \.\.\. (ok|FAILED|ignored)$' "$log")
++            printf '    <system-out>%s</system-out>\n' "$diagnostics"
++            printf '  </testsuite>\n</testsuites>\n'
++        } >"$output"
++        return
++    fi
++    cat >"$output" <<XML
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites tests="1" failures="1" errors="0" skipped="0">
++  <testsuite name="$MODE" tests="1" failures="1" errors="0" skipped="0">
++    <testcase name="$testname" classname="$classname">
++      <failure message="test runner exited with status $status and produced no per-test JUnit" type="runner">$diagnostics</failure>
++      <system-out>$diagnostics</system-out>
++    </testcase>
++  </testsuite>
++</testsuites>
++XML
++}
++
++run_and_capture() {
++    : >"$RUNNER_LOG"
++    "$@" 2>&1 | tee "$RUNNER_LOG"
++    return "${PIPESTATUS[0]}"
++}
++
++if [ -z "$MODE" ]; then
++    echo "usage: $0 [--output_path PATH] <base|new>" >&2
++    if [ -n "$OUTPUT_PATH" ]; then
++        MODE="invalid"
++        write_fallback_junit 2 "$OUTPUT_PATH" ""
++    fi
++    exit 2
++fi
++
++RUNNER_LOG="$(mktemp "${TMPDIR:-/tmp}/railway-test-run.XXXXXX")"
++trap 'rm -f -- "$RUNNER_LOG"' EXIT
++
++GRADER_CFG="--check-cfg=cfg(deployment_plan_tests)"
++if [ "$MODE" = "new" ]; then
++    GRADER_CFG="$GRADER_CFG --cfg deployment_plan_tests"
++fi
++export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$GRADER_CFG"
++
++if [ -n "$OUTPUT_PATH" ]; then
++    rm -f -- "$OUTPUT_PATH"
++fi
++find target -path '*/nextest/*/junit.xml' -type f -delete 2>/dev/null
++
++CARGO=(cargo)
++if [ -n "${RAILWAY_TEST_TOOLCHAIN-}" ]; then
++    CARGO=(cargo "+${RAILWAY_TEST_TOOLCHAIN}")
++elif command -v rustup >/dev/null 2>&1 &&
++    rustup toolchain list | grep -Eq '^1\.88\.0(-|[[:space:]])'; then
++    CARGO=(cargo +1.88.0)
++fi
++
++STATUS=0
++if "${CARGO[@]}" nextest --version >/dev/null 2>&1; then
++    case "$MODE" in
++        base)
++            run_and_capture "${CARGO[@]}" nextest run \
++                --profile default \
++                --no-fail-fast \
++                --locked \
++                --offline \
++                -E 'not (test(deploy_plan) | test(deployment_plan) | test(up_plan))'
++            STATUS=$?
++            ;;
++        new)
++            run_and_capture "${CARGO[@]}" nextest run \
++                --profile default \
++                --no-fail-fast \
++                --locked \
++                --offline \
++                -E 'test(deployment_plan_)'
++            STATUS=$?
++            ;;
++    esac
++else
++    echo "cargo-nextest unavailable; using cargo test" >&2
++    case "$MODE" in
++        base)
++            run_and_capture "${CARGO[@]}" test \
++                --locked \
++                --offline \
++                --no-fail-fast \
++                -- \
++                --skip deploy_plan \
++                --skip deployment_plan \
++                --skip up_plan
++            STATUS=$?
++            ;;
++        new)
++            run_and_capture "${CARGO[@]}" test \
++                --locked \
++                --offline \
++                --no-fail-fast \
++                deployment_plan_
++            STATUS=$?
++            ;;
++    esac
++fi
++
++if [ -n "$OUTPUT_PATH" ]; then
++    JUNIT_SOURCE="$(find target -path '*/nextest/*/junit.xml' -type f 2>/dev/null | head -1)"
++    if [ -n "$JUNIT_SOURCE" ] && [ -f "$JUNIT_SOURCE" ]; then
++        mkdir -p "$(dirname "$OUTPUT_PATH")"
++        cp "$JUNIT_SOURCE" "$OUTPUT_PATH"
++    else
++        write_fallback_junit "$STATUS" "$OUTPUT_PATH" "$RUNNER_LOG"
++    fi
++fi
++
++exit "$STATUS"
+diff --git a/tests/deployment_plan_cli.rs b/tests/deployment_plan_cli.rs
+new file mode 100644
+index 0000000..2ace276
+--- /dev/null
++++ b/tests/deployment_plan_cli.rs
+@@ -0,0 +1,963 @@
++#![cfg(deployment_plan_tests)]
++
++use std::{
++    fs,
++    io::{Cursor, Read},
++    net::TcpListener,
++    path::Path,
++    process::{Child, Command, Output, Stdio},
++    sync::mpsc::{self, Sender},
++    thread,
++    time::{Duration, Instant},
++};
++
++use flate2::read::GzDecoder;
++use tempfile::tempdir;
++
++const UPLOAD_CAPTURE_PROXY: &str = r#"
++import json
++import socket
++import ssl
++import sys
++
++certificate, key, ready, capture, source = sys.argv[1:]
++context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++context.load_cert_chain(certificate, key)
++listener = socket.socket()
++listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++listener.bind(("127.0.0.1", 0))
++listener.listen()
++with open(ready, "w", encoding="utf-8") as output:
++    output.write(str(listener.getsockname()[1]))
++
++project = {
++    "data": {
++        "project": {
++            "id": "offline-probe",
++            "name": "Offline Probe",
++            "workspaceId": "workspace",
++            "deletedAt": None,
++            "workspace": {"name": "Workspace"},
++            "buckets": {"edges": []},
++            "environments": {
++                "edges": [{
++                    "node": {
++                        "id": "offline-environment",
++                        "name": "offline-environment",
++                        "canAccess": True,
++                        "deletedAt": None,
++                        "unmergedChangesCount": 0
++                    }
++                }]
++            },
++            "services": {"edges": []}
++        }
++    }
++}
++uploaded = {
++    "deploymentId": "deployment",
++    "url": "https://example.invalid",
++    "logsUrl": "https://example.invalid/logs",
++    "deploymentDomain": "example.invalid"
++}
++mutated = False
++done = False
++
++def read_headers(stream):
++    request = stream.readline()
++    if not request:
++        return None
++    headers = {}
++    while True:
++        line = stream.readline()
++        if line in (b"\r\n", b"\n", b""):
++            break
++        name, value = line.decode("iso-8859-1").split(":", 1)
++        headers[name.lower()] = value.strip()
++    return request.decode("iso-8859-1").strip().split(" "), headers
++
++while not done:
++    connection, _ = listener.accept()
++    plain = connection.makefile("rb", buffering=0)
++    connect = read_headers(plain)
++    if connect is None:
++        connection.close()
++        continue
++    connection.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
++    try:
++        tls = context.wrap_socket(connection, server_side=True)
++        stream = tls.makefile("rb")
++        while not done:
++            parsed = read_headers(stream)
++            if parsed is None:
++                break
++            request, headers = parsed
++            method, path, _ = request
++            length = int(headers.get("content-length", "0"))
++            body = stream.read(length)
++            if path == "/graphql/v2":
++                if not mutated:
++                    with open(source, "wb") as changed:
++                        changed.write(b"changed\n")
++                    mutated = True
++                response = json.dumps(project).encode()
++            elif "/up" in path:
++                with open(capture, "wb") as output:
++                    output.write(body)
++                response = json.dumps(uploaded).encode()
++                done = True
++            else:
++                response = b'{"message":"unexpected request"}'
++            tls.sendall(
++                b"HTTP/1.1 200 OK\r\n"
++                + b"Content-Type: application/json\r\n"
++                + b"Content-Length: " + str(len(response)).encode() + b"\r\n"
++                + b"Connection: close\r\n\r\n"
++                + response
++            )
++            break
++    except (ConnectionError, ssl.SSLError):
++        pass
++    finally:
++        connection.close()
++
++listener.close()
++"#;
++
++enum ProxyCommand {
++    Snapshot(Sender<usize>),
++    Stop,
++}
++
++struct CountingProxy {
++    address: String,
++    commands: Sender<ProxyCommand>,
++    thread: Option<thread::JoinHandle<()>>,
++}
++
++impl CountingProxy {
++    fn new() -> Self {
++        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++        listener.set_nonblocking(true).unwrap();
++        let address = format!("http://{}", listener.local_addr().unwrap());
++        let (commands, command_rx) = mpsc::channel();
++        let thread = thread::spawn(move || {
++            let mut connections = 0;
++            let drain_connections = |connections: &mut usize| loop {
++                match listener.accept() {
++                    Ok((_socket, _)) => *connections += 1,
++                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
++                    Err(error) => panic!("counting proxy failed: {error}"),
++                }
++            };
++            loop {
++                drain_connections(&mut connections);
++                match command_rx.recv_timeout(Duration::from_millis(5)) {
++                    Ok(ProxyCommand::Snapshot(reply)) => {
++                        drain_connections(&mut connections);
++                        reply.send(connections).unwrap();
++                    }
++                    Ok(ProxyCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
++                    Err(mpsc::RecvTimeoutError::Timeout) => {}
++                }
++            }
++        });
++        Self {
++            address,
++            commands,
++            thread: Some(thread),
++        }
++    }
++
++    fn count(&self) -> usize {
++        let (reply, result) = mpsc::channel();
++        self.commands
++            .send(ProxyCommand::Snapshot(reply))
++            .expect("counting proxy stopped before snapshot");
++        result
++            .recv_timeout(Duration::from_secs(5))
++            .expect("counting proxy did not complete snapshot")
++    }
++}
++
++impl Drop for CountingProxy {
++    fn drop(&mut self) {
++        self.commands.send(ProxyCommand::Stop).unwrap();
++        self.thread.take().unwrap().join().unwrap();
++    }
++}
++
++struct UploadCaptureProxy {
++    address: String,
++    capture: std::path::PathBuf,
++    process: Child,
++}
++
++impl UploadCaptureProxy {
++    fn new(root: &Path, source: &Path) -> Self {
++        let script = root.join("capture-proxy.py");
++        let certificate = root.join("capture-cert.pem");
++        let key = root.join("capture-key.pem");
++        let ready = root.join("capture-ready");
++        let capture = root.join("captured-upload.tar.gz");
++        fs::write(&script, UPLOAD_CAPTURE_PROXY).unwrap();
++        let generated = Command::new("openssl")
++            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout"])
++            .arg(&key)
++            .args(["-out"])
++            .arg(&certificate)
++            .args(["-subj", "/CN=backboard.railway-develop.com", "-days", "1"])
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .status()
++            .expect("failed to invoke openssl for the upload-capture proxy");
++        assert!(
++            generated.success(),
++            "failed to create upload-capture TLS key"
++        );
++
++        let process = Command::new("python3")
++            .arg(&script)
++            .arg(&certificate)
++            .arg(&key)
++            .arg(&ready)
++            .arg(&capture)
++            .arg(source)
++            .stdout(Stdio::null())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .expect("failed to start upload-capture proxy");
++        let deadline = Instant::now() + Duration::from_secs(10);
++        let port = loop {
++            if let Ok(port) = fs::read_to_string(&ready)
++                && port.trim().parse::<u16>().is_ok()
++            {
++                break port;
++            }
++            assert!(
++                Instant::now() < deadline,
++                "upload-capture proxy did not become ready"
++            );
++            thread::sleep(Duration::from_millis(5));
++        };
++        Self {
++            address: format!("http://127.0.0.1:{}", port.trim()),
++            capture,
++            process,
++        }
++    }
++
++    fn captured_body(&self) -> Vec<u8> {
++        let deadline = Instant::now() + Duration::from_secs(10);
++        while !self.capture.exists() {
++            assert!(
++                Instant::now() < deadline,
++                "valid apply did not submit an upload body"
++            );
++            thread::sleep(Duration::from_millis(5));
++        }
++        fs::read(&self.capture).unwrap()
++    }
++}
++
++impl Drop for UploadCaptureProxy {
++    fn drop(&mut self) {
++        if self.process.try_wait().unwrap().is_none() {
++            self.process.kill().unwrap();
++        }
++        self.process.wait().unwrap();
++    }
++}
++
++fn run_with_auth_mode(
++    fixture: &Path,
++    proxy: &CountingProxy,
++    args: &[&str],
++    api_token: bool,
++) -> Output {
++    run_with_options(fixture, proxy, args, api_token, true)
++}
++
++fn run_without_network_opt_outs(
++    fixture: &Path,
++    proxy: &CountingProxy,
++    args: &[&str],
++    api_token: bool,
++) -> Output {
++    run_with_options(fixture, proxy, args, api_token, false)
++}
++
++fn run_with_options(
++    fixture: &Path,
++    proxy: &CountingProxy,
++    args: &[&str],
++    api_token: bool,
++    suppress_auxiliary_network: bool,
++) -> Output {
++    run_with_environment(
++        fixture,
++        proxy,
++        args,
++        api_token,
++        suppress_auxiliary_network,
++        &[],
++    )
++}
++
++fn run_with_target_environment(
++    fixture: &Path,
++    proxy: &CountingProxy,
++    args: &[&str],
++    api_token: bool,
++    environment: &[(&str, &str)],
++) -> Output {
++    run_with_environment(fixture, proxy, args, api_token, true, environment)
++}
++
++fn run_with_environment(
++    fixture: &Path,
++    proxy: &CountingProxy,
++    args: &[&str],
++    api_token: bool,
++    suppress_auxiliary_network: bool,
++    environment: &[(&str, &str)],
++) -> Output {
++    run_with_proxy_address(
++        fixture,
++        &proxy.address,
++        args,
++        api_token,
++        suppress_auxiliary_network,
++        environment,
++    )
++}
++
++fn run_with_proxy_address(
++    fixture: &Path,
++    proxy_address: &str,
++    args: &[&str],
++    api_token: bool,
++    suppress_auxiliary_network: bool,
++    environment: &[(&str, &str)],
++) -> Output {
++    let isolated_home = fixture.parent().unwrap().join("home");
++    fs::create_dir_all(&isolated_home).unwrap();
++    let mut command = Command::new(env!("CARGO_BIN_EXE_railway"));
++    command.current_dir(fixture).args(args);
++    for name in [
++        "ALL_PROXY",
++        "HTTPS_PROXY",
++        "HTTP_PROXY",
++        "all_proxy",
++        "https_proxy",
++        "http_proxy",
++    ] {
++        command.env(name, proxy_address);
++    }
++    command
++        .env("NO_PROXY", "")
++        .env("no_proxy", "")
++        .env("HOME", isolated_home)
++        .env_remove("RAILWAY_TOKEN")
++        .env_remove("RAILWAY_PROJECT_ID")
++        .env_remove("RAILWAY_ENVIRONMENT_ID")
++        .env_remove("RAILWAY_SERVICE_ID");
++    if suppress_auxiliary_network {
++        command
++            .env("CI", "1")
++            .env("DO_NOT_TRACK", "1")
++            .env("RAILWAY_NO_AUTO_UPDATE", "1")
++            .env("RAILWAY_NO_TELEMETRY", "1");
++    } else {
++        command
++            .env_remove("CI")
++            .env_remove("DO_NOT_TRACK")
++            .env_remove("RAILWAY_NO_AUTO_UPDATE")
++            .env_remove("RAILWAY_NO_TELEMETRY");
++    }
++    if api_token {
++        command.env("RAILWAY_API_TOKEN", "offline-probe-token");
++    } else {
++        command.env_remove("RAILWAY_API_TOKEN");
++    }
++    command.envs(environment.iter().copied());
++    command.output().unwrap()
++}
++
++fn archived_file(body: Vec<u8>, wanted: &str) -> Vec<u8> {
++    let mut archive = tar::Archive::new(GzDecoder::new(Cursor::new(body)));
++    for entry in archive.entries().unwrap() {
++        let mut entry = entry.unwrap();
++        if entry.path().unwrap() == Path::new(wanted) {
++            let mut bytes = Vec::new();
++            entry.read_to_end(&mut bytes).unwrap();
++            return bytes;
++        }
++    }
++    panic!("upload archive omitted {wanted}");
++}
++
++fn run(fixture: &Path, proxy: &CountingProxy, args: &[&str]) -> Output {
++    run_with_auth_mode(fixture, proxy, args, true)
++}
++
++fn write_expired_oauth_config(root: &Path) {
++    let config_dir = root.join("home/.railway");
++    fs::create_dir_all(&config_dir).unwrap();
++    fs::write(
++        config_dir.join("config.json"),
++        serde_json::to_vec(&serde_json::json!({
++            "projects": {},
++            "user": {
++                "accessToken": "expired-access-token",
++                "refreshToken": "refresh-token",
++                "tokenExpiresAt": 0
++            }
++        }))
++        .unwrap(),
++    )
++    .unwrap();
++}
++
++fn output_text(output: &Output) -> String {
++    format!(
++        "stdout:\n{}\nstderr:\n{}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    )
++}
++
++#[test]
++fn deployment_plan_write_is_offline_deterministic_and_self_excluding() {
++    let temp = tempdir().unwrap();
++    let fixture = temp.path().join("source");
++    fs::create_dir(&fixture).unwrap();
++    fs::write(fixture.join("app.txt"), "aaaa\n").unwrap();
++    write_expired_oauth_config(temp.path());
++    let proxy = CountingProxy::new();
++
++    let first = run_without_network_opt_outs(
++        &fixture,
++        &proxy,
++        &["up", "--write-plan", "plan.json", "--json"],
++        false,
++    );
++    assert!(first.status.success(), "{}", output_text(&first));
++    let first_plan = fs::read(fixture.join("plan.json")).unwrap();
++
++    let second = run_without_network_opt_outs(
++        &fixture,
++        &proxy,
++        &["up", "--write-plan", "plan.json", "--json"],
++        false,
++    );
++    assert!(second.status.success(), "{}", output_text(&second));
++    assert_eq!(
++        fs::read(fixture.join("plan.json")).unwrap(),
++        first_plan,
++        "rewriting a plan must exclude its previous output"
++    );
++    assert_eq!(proxy.count(), 0, "offline planning attempted a request");
++
++    let value: serde_json::Value = serde_json::from_slice(&first_plan).unwrap();
++    assert!(
++        !value["entries"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .any(|entry| entry["path"] == "plan.json")
++    );
++}
++
++#[test]
++fn deployment_plan_cli_source_root_matches_link_and_explicit_project_resolution() {
++    let temp = tempdir().unwrap();
++    let root = temp.path().join("linked-root");
++    let service = root.join("service");
++    let home = root.join("home");
++    fs::create_dir_all(&service).unwrap();
++    fs::create_dir_all(home.join(".railway")).unwrap();
++    let root = fs::canonicalize(root).unwrap();
++    let service = root.join("service");
++    let home = root.join("home");
++    fs::write(root.join("root.txt"), "root").unwrap();
++    fs::write(service.join("app.txt"), "service").unwrap();
++    let mut projects = serde_json::Map::new();
++    projects.insert(
++        root.to_string_lossy().into_owned(),
++        serde_json::json!({
++            "projectPath": root,
++            "project": "linked-project"
++        }),
++    );
++    fs::write(
++        home.join(".railway/config.json"),
++        serde_json::to_vec(&serde_json::json!({
++            "projects": projects,
++            "user": {
++                "accessToken": "expired-access-token",
++                "refreshToken": "refresh-token",
++                "tokenExpiresAt": 0
++            }
++        }))
++        .unwrap(),
++    )
++    .unwrap();
++    let proxy = CountingProxy::new();
++
++    let linked = run_with_auth_mode(
++        &service,
++        &proxy,
++        &["up", "--write-plan", "linked-plan.json", "--json"],
++        false,
++    );
++    assert!(linked.status.success(), "{}", output_text(&linked));
++    let linked_plan: serde_json::Value =
++        serde_json::from_slice(&fs::read(service.join("linked-plan.json")).unwrap()).unwrap();
++    let linked_paths = linked_plan["entries"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .filter_map(|entry| entry["path"].as_str())
++        .collect::<Vec<_>>();
++    assert!(
++        linked_paths.contains(&"root.txt"),
++        "{linked_paths:?}\n{}",
++        output_text(&linked)
++    );
++    assert!(
++        linked_paths.contains(&"service/app.txt"),
++        "{linked_paths:?}\n{}",
++        output_text(&linked)
++    );
++    assert_eq!(proxy.count(), 0);
++
++    let before_linked_apply = proxy.count();
++    let linked_apply = run_with_auth_mode(
++        &service,
++        &proxy,
++        &["up", "--from-plan", "linked-plan.json", "--json"],
++        false,
++    );
++    assert!(
++        !linked_apply.status.success(),
++        "{}",
++        output_text(&linked_apply)
++    );
++    assert!(
++        proxy.count() > before_linked_apply,
++        "linked-root apply did not finish local reconciliation\n{}",
++        output_text(&linked_apply)
++    );
++
++    fs::remove_file(service.join("linked-plan.json")).unwrap();
++    let before_explicit_write = proxy.count();
++    let explicit = run_with_auth_mode(
++        &service,
++        &proxy,
++        &[
++            "up",
++            "--project",
++            "explicit-project",
++            "--environment",
++            "explicit-environment",
++            "--write-plan",
++            "explicit-plan.json",
++            "--json",
++        ],
++        false,
++    );
++    assert!(explicit.status.success(), "{}", output_text(&explicit));
++    let explicit_plan: serde_json::Value =
++        serde_json::from_slice(&fs::read(service.join("explicit-plan.json")).unwrap()).unwrap();
++    let explicit_paths = explicit_plan["entries"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .filter_map(|entry| entry["path"].as_str())
++        .collect::<Vec<_>>();
++    assert!(explicit_paths.contains(&"."));
++    assert!(explicit_paths.contains(&"app.txt"));
++    assert!(!explicit_paths.contains(&"root.txt"));
++    assert!(!explicit_paths.contains(&"service/app.txt"));
++    assert_eq!(
++        proxy.count(),
++        before_explicit_write,
++        "explicit-project planning attempted a request"
++    );
++
++    let explicit_args = [
++        "up",
++        "--project",
++        "explicit-project",
++        "--environment",
++        "explicit-environment",
++        "--from-plan",
++        "explicit-plan.json",
++        "--json",
++    ];
++    let before_explicit_apply = proxy.count();
++    let explicit_apply = run_with_auth_mode(&service, &proxy, &explicit_args, true);
++    assert!(
++        !explicit_apply.status.success(),
++        "{}",
++        output_text(&explicit_apply)
++    );
++    assert!(
++        proxy.count() > before_explicit_apply,
++        "explicit-project apply did not finish local reconciliation\n{}",
++        output_text(&explicit_apply)
++    );
++
++    let before_token_apply = proxy.count();
++    let token_apply = run_with_target_environment(
++        &service,
++        &proxy,
++        &["up", "--from-plan", "explicit-plan.json", "--json"],
++        false,
++        &[("RAILWAY_TOKEN", "project-token")],
++    );
++    assert!(
++        !token_apply.status.success(),
++        "{}",
++        output_text(&token_apply)
++    );
++    assert!(
++        proxy.count() > before_token_apply,
++        "project-token apply did not use the current-directory source root\n{}",
++        output_text(&token_apply)
++    );
++
++    let before_environment_apply = proxy.count();
++    let environment_apply = run_with_target_environment(
++        &service,
++        &proxy,
++        &["up", "--from-plan", "explicit-plan.json", "--json"],
++        true,
++        &[
++            ("RAILWAY_PROJECT_ID", "environment-project"),
++            ("RAILWAY_ENVIRONMENT_ID", "environment"),
++        ],
++    );
++    assert!(
++        !environment_apply.status.success(),
++        "{}",
++        output_text(&environment_apply)
++    );
++    assert!(
++        proxy.count() > before_environment_apply,
++        "environment-targeted apply did not use the current-directory source root\n{}",
++        output_text(&environment_apply)
++    );
++
++    fs::write(service.join("app.txt"), "changed").unwrap();
++    let before_changed_apply = proxy.count();
++    let changed_apply = run_with_auth_mode(&service, &proxy, &explicit_args, true);
++    assert!(
++        !changed_apply.status.success(),
++        "{}",
++        output_text(&changed_apply)
++    );
++    assert_eq!(
++        proxy.count(),
++        before_changed_apply,
++        "changed explicit-project input reached the network"
++    );
++}
++
++#[test]
++fn deployment_plan_malformed_apply_fails_before_any_request() {
++    let temp = tempdir().unwrap();
++    let fixture = temp.path().join("source");
++    fs::create_dir(&fixture).unwrap();
++    fs::write(fixture.join("app.txt"), "content\n").unwrap();
++    fs::write(fixture.join("plan.json"), b"{not-json").unwrap();
++    write_expired_oauth_config(temp.path());
++    let proxy = CountingProxy::new();
++
++    let apply = run_without_network_opt_outs(
++        &fixture,
++        &proxy,
++        &[
++            "up",
++            "--project",
++            "offline-probe",
++            "--environment",
++            "offline-environment",
++            "--from-plan",
++            "plan.json",
++            "--json",
++        ],
++        false,
++    );
++    assert!(!apply.status.success(), "{}", output_text(&apply));
++    assert_eq!(proxy.count(), 0, "malformed local plan attempted a request");
++}
++
++#[test]
++fn deployment_plan_invalid_apply_fails_before_any_request() {
++    let temp = tempdir().unwrap();
++    let fixture = temp.path().join("source");
++    fs::create_dir(&fixture).unwrap();
++    fs::write(fixture.join("app.txt"), "aaaa\n").unwrap();
++    write_expired_oauth_config(temp.path());
++    let proxy = CountingProxy::new();
++
++    let write = run_without_network_opt_outs(
++        &fixture,
++        &proxy,
++        &[
++            "up",
++            "--project",
++            "offline-probe",
++            "--environment",
++            "offline-environment",
++            "--write-plan",
++            "plan.json",
++            "--json",
++        ],
++        false,
++    );
++    assert!(write.status.success(), "{}", output_text(&write));
++    fs::write(fixture.join("app.txt"), "bbbb\n").unwrap();
++
++    let apply = run_without_network_opt_outs(
++        &fixture,
++        &proxy,
++        &[
++            "up",
++            "--project",
++            "offline-probe",
++            "--environment",
++            "offline-environment",
++            "--from-plan",
++            "plan.json",
++            "--json",
++        ],
++        false,
++    );
++    assert!(!apply.status.success(), "{}", output_text(&apply));
++    assert_eq!(
++        proxy.count(),
++        0,
++        "invalid local verification attempted a request"
++    );
++}
++
++#[test]
++fn deployment_plan_valid_apply_continues_after_local_verification() {
++    let temp = tempdir().unwrap();
++    let fixture = temp.path().join("source");
++    fs::create_dir(&fixture).unwrap();
++    fs::write(fixture.join("app.txt"), "content\n").unwrap();
++    let proxy = CountingProxy::new();
++
++    let write = run(
++        &fixture,
++        &proxy,
++        &[
++            "up",
++            "--project",
++            "offline-probe",
++            "--environment",
++            "offline-environment",
++            "--write-plan",
++            "plan.json",
++            "--json",
++        ],
++    );
++    assert!(write.status.success(), "{}", output_text(&write));
++    assert_eq!(proxy.count(), 0);
++    drop(proxy);
++
++    let capture = UploadCaptureProxy::new(temp.path(), &fixture.join("app.txt"));
++    let apply = run_with_proxy_address(
++        &fixture,
++        &capture.address,
++        &[
++            "up",
++            "--project",
++            "offline-probe",
++            "--environment",
++            "offline-environment",
++            "--from-plan",
++            "plan.json",
++            "--detach",
++            "--json",
++        ],
++        true,
++        true,
++        &[("RAILWAY_ENV", "dev")],
++    );
++    assert!(
++        apply.status.success(),
++        "valid apply did not complete its captured upload\n{}",
++        output_text(&apply)
++    );
++    assert_eq!(
++        archived_file(capture.captured_body(), "app.txt"),
++        b"content\n",
++        "the public apply command did not upload its verified snapshot"
++    );
++    assert_eq!(
++        fs::read(fixture.join("app.txt")).unwrap(),
++        b"changed\n",
++        "the upload-capture boundary did not mutate the source"
++    );
++}
++
++#[test]
++fn deployment_plan_cli_option_mismatch_fails_before_any_request() {
++    let temp = tempdir().unwrap();
++    let fixture = temp.path().join("source");
++    let selected = fixture.join("selected");
++    fs::create_dir_all(&selected).unwrap();
++    fs::write(fixture.join("outside.txt"), "outside\n").unwrap();
++    fs::write(selected.join("app.txt"), "content\n").unwrap();
++    write_expired_oauth_config(temp.path());
++    let proxy = CountingProxy::new();
++
++    let write = run_without_network_opt_outs(
++        &fixture,
++        &proxy,
++        &[
++            "up",
++            "selected",
++            "--path-as-root",
++            "--write-plan",
++            "selected/plan.json",
++            "--json",
++        ],
++        false,
++    );
++    assert!(write.status.success(), "{}", output_text(&write));
++    assert_eq!(proxy.count(), 0);
++
++    let plan_path = selected.join("plan.json");
++    let value: serde_json::Value = serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
++    assert_eq!(value["pathAsRoot"], serde_json::Value::Bool(true));
++    let paths = value["entries"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .filter_map(|entry| entry["path"].as_str())
++        .collect::<Vec<_>>();
++    assert_eq!(paths, vec![".", "app.txt"]);
++
++    let before_valid_apply = proxy.count();
++    let valid_apply = run_without_network_opt_outs(
++        &fixture,
++        &proxy,
++        &[
++            "up",
++            "selected",
++            "--path-as-root",
++            "--from-plan",
++            "selected/plan.json",
++            "--json",
++        ],
++        false,
++    );
++    assert!(
++        !valid_apply.status.success(),
++        "{}",
++        output_text(&valid_apply)
++    );
++    assert!(
++        proxy.count() > before_valid_apply,
++        "positional path apply did not finish local reconciliation\n{}",
++        output_text(&valid_apply)
++    );
++
++    let before_mismatch = proxy.count();
++    let apply = run_without_network_opt_outs(
++        &fixture,
++        &proxy,
++        &[
++            "up",
++            "selected",
++            "--from-plan",
++            "selected/plan.json",
++            "--json",
++        ],
++        false,
++    );
++    assert!(!apply.status.success(), "{}", output_text(&apply));
++    assert_eq!(
++        proxy.count(),
++        before_mismatch,
++        "path-as-root mismatch attempted a request"
++    );
++
++    let before_no_gitignore_mismatch = proxy.count();
++    let apply = run_without_network_opt_outs(
++        &fixture,
++        &proxy,
++        &[
++            "up",
++            "selected",
++            "--path-as-root",
++            "--no-gitignore",
++            "--from-plan",
++            "selected/plan.json",
++            "--json",
++        ],
++        false,
++    );
++    assert!(!apply.status.success(), "{}", output_text(&apply));
++    assert_eq!(
++        proxy.count(),
++        before_no_gitignore_mismatch,
++        "no-gitignore mismatch attempted a request"
++    );
++}
++
++#[cfg(unix)]
++#[test]
++fn deployment_plan_write_rejects_unsupported_selected_socket() {
++    use std::os::unix::net::UnixListener;
++
++    let temp = tempdir().unwrap();
++    let fixture = temp.path().join("source");
++    fs::create_dir(&fixture).unwrap();
++    fs::write(fixture.join("app.txt"), "content\n").unwrap();
++    let _socket = UnixListener::bind(fixture.join("unsupported.sock")).unwrap();
++    let proxy = CountingProxy::new();
++
++    let write = run_without_network_opt_outs(
++        &fixture,
++        &proxy,
++        &["up", "--write-plan", "plan.json", "--json"],
++        false,
++    );
++    assert!(!write.status.success(), "{}", output_text(&write));
++    assert_eq!(proxy.count(), 0, "unsupported input attempted a request");
++}
++
++#[test]
++fn deployment_plan_flag_conflicts_are_rejected_by_public_cli() {
++    let temp = tempdir().unwrap();
++    let fixture = temp.path().join("source");
++    fs::create_dir(&fixture).unwrap();
++    let proxy = CountingProxy::new();
++
++    for args in [
++        vec![
++            "up",
++            "--write-plan",
++            "plan.json",
++            "--from-plan",
++            "plan.json",
++        ],
++        vec!["up", "--write-plan", "plan.json", "--new"],
++        vec!["up", "--from-plan", "plan.json", "--new"],
++    ] {
++        let output = run(&fixture, &proxy, &args);
++        assert!(
++            !output.status.success(),
++            "conflicting flags were not rejected during public CLI parsing\n{}",
++            output_text(&output)
++        );
++    }
++    assert_eq!(proxy.count(), 0);
++}

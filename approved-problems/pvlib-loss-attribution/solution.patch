@@ -1,0 +1,749 @@
+diff --git a/pvlib/lossattribution.py b/pvlib/lossattribution.py
+new file mode 100644
+index 0000000..91c9f76
+--- /dev/null
++++ b/pvlib/lossattribution.py
+@@ -0,0 +1,353 @@
++"""
++The ``lossattribution`` module contains the container that
++:py:class:`~pvlib.modelchain.ModelChain` fills in when a simulation is
++decomposed into the mechanisms that reduce AC power.
++"""
++
++from dataclasses import dataclass, field
++import itertools
++import math
++from typing import Optional, Tuple, TypeVar, Union
++
++import pandas as pd
++
++T = TypeVar('T')
++
++PerArray = Union[T, Tuple[T, ...]]
++
++REFERENCE_CELL_TEMPERATURE = 25.0
++"""Cell temperature (C) at which the temperature-free stages are evaluated."""
++
++BUCKET_NAMES = ('transposition', 'weather', 'reflection', 'spectral',
++                'temperature', 'dc_ohmic', 'dc_other', 'inverter')
++"""Names of the loss buckets, in the order the stages are applied."""
++
++PER_ARRAY_BUCKETS = ('transposition', 'weather', 'reflection', 'spectral',
++                     'temperature', 'dc_ohmic', 'dc_other')
++"""Buckets that are reported for each array."""
++
++FRAME_COLUMNS = ('reference',) + BUCKET_NAMES + ('ac',)
++"""Column order of :py:meth:`LossAttribution.to_frame`."""
++
++CONVERSION_MECHANISMS = ('reflection', 'spectral', 'temperature', 'dc_ohmic',
++                         'dc_other', 'inverter')
++"""Mechanisms :py:meth:`LossAttribution.shapley` credits, in bucket order."""
++
++
++def sum_over_arrays(value):
++    """
++    Add per-array values into a single system-wide value.
++
++    Parameters
++    ----------
++    value : Series, or tuple of Series
++        Per-array quantity. A bare Series is returned unchanged.
++
++    Returns
++    -------
++    Series
++    """
++    if isinstance(value, tuple):
++        total = value[0].copy()
++        for other in value[1:]:
++            total = total + other
++        return total
++    return value
++
++
++def energy(power):
++    """
++    Total energy of a power Series, taken as the sum over its index.
++
++    Parameters
++    ----------
++    power : Series
++        Power [W].
++
++    Returns
++    -------
++    float
++    """
++    return float(power.sum())
++
++
++def energy_fraction(bucket_energy, reference_energy):
++    """
++    Express a bucket energy as a fraction of the reference energy.
++
++    Parameters
++    ----------
++    bucket_energy : float
++        Energy attributed to one mechanism.
++    reference_energy : float
++        Energy of the loss-free reference stage.
++
++    Returns
++    -------
++    float
++        Zero when ``reference_energy`` is zero.
++    """
++    if reference_energy == 0:
++        return 0.0
++    return bucket_energy / reference_energy
++
++
++@dataclass
++class LossAttribution:
++    """
++    Decomposition of a :py:class:`~pvlib.modelchain.ModelChain` simulation
++    into the mechanisms that reduce AC power.
++
++    Every bucket is a power [W] on the model index. A bucket is negative when
++    its mechanism increases power, which happens for ``temperature`` below
++    :py:data:`REFERENCE_CELL_TEMPERATURE` and for spectral modifiers above
++    one.
++    """
++
++    reference: Optional[PerArray[pd.Series]] = field(default=None)
++    """Series (or tuple of Series, one per array) of DC power [W] from
++    clear-sky irradiance on a horizontal surface, with no reflection loss, no
++    spectral loss and a cell temperature of
++    :py:data:`REFERENCE_CELL_TEMPERATURE`."""
++
++    transposition: Optional[PerArray[pd.Series]] = field(default=None)
++    """Series (or tuple of Series, one per array) of power [W] lost by
++    orienting the modules as they are rather than horizontally. Negative
++    whenever the orientation collects more irradiance than a horizontal
++    surface would."""
++
++    weather: Optional[PerArray[pd.Series]] = field(default=None)
++    """Series (or tuple of Series, one per array) of power [W] lost because
++    the sky was not clear."""
++
++    reflection: Optional[PerArray[pd.Series]] = field(default=None)
++    """Series (or tuple of Series, one per array) of power [W] lost to
++    reflection."""
++
++    spectral: Optional[PerArray[pd.Series]] = field(default=None)
++    """Series (or tuple of Series, one per array) of power [W] lost to
++    spectral content."""
++
++    temperature: Optional[PerArray[pd.Series]] = field(default=None)
++    """Series (or tuple of Series, one per array) of power [W] lost to cell
++    temperature."""
++
++    dc_ohmic: Optional[PerArray[pd.Series]] = field(default=None)
++    """Series (or tuple of Series, one per array) of power [W] lost to DC
++    ohmic resistance."""
++
++    dc_other: Optional[PerArray[pd.Series]] = field(default=None)
++    """Series (or tuple of Series, one per array) of power [W] lost to the
++    remaining DC losses."""
++
++    inverter: Optional[pd.Series] = field(default=None)
++    """Series of power [W] lost in the inverter, for the system as a whole."""
++
++    ac: Optional[pd.Series] = field(default=None)
++    """Series of AC power [W] for the system as a whole."""
++
++    _lattice: Optional[object] = field(default=None, repr=False)
++    """Callable returning the power of every subset of
++    :py:data:`CONVERSION_MECHANISMS`, used by
++    :py:meth:`shapley`."""
++
++    @property
++    def num_arrays(self):
++        """Number of arrays the per-array buckets were reported for."""
++        if isinstance(self.reference, tuple):
++            return len(self.reference)
++        return 1
++
++    def _per_array_value(self, name, i):
++        """One array's entry of a per-array field."""
++        value = getattr(self, name)
++        if isinstance(value, tuple):
++            return value[i]
++        return value
++
++    def _array_dc(self, i):
++        """DC power one array delivered to the inverter."""
++        remaining = self._per_array_value('reference', i)
++        for name in PER_ARRAY_BUCKETS:
++            remaining = remaining - self._per_array_value(name, i)
++        return remaining
++
++    def _inverter_share(self, i):
++        """
++        Split the inverter loss across arrays by DC contribution.
++
++        The inverter is a system-wide device, so its loss is allocated in
++        proportion to the DC power each array delivered to it. Wherever no
++        array delivered any power the loss is split equally instead, so that
++        the shares always add up to the whole.
++        """
++        total = self._array_dc(0)
++        for other in range(1, self.num_arrays):
++            total = total + self._array_dc(other)
++        share = (self._array_dc(i) / total).where(
++            total != 0, 1.0 / self.num_arrays)
++        return self.inverter * share
++
++    def _array_column(self, name, i):
++        """One array's contribution to a column of :py:meth:`to_frame`."""
++        if name == 'inverter':
++            return self._inverter_share(i)
++        if name == 'ac':
++            return self._array_dc(i) - self._inverter_share(i)
++        return self._per_array_value(name, i)
++
++    def to_frame(self, per_array=False):
++        """
++        Collect the decomposition into a DataFrame.
++
++        Parameters
++        ----------
++        per_array : bool, default False
++            When False every per-array bucket is summed over the arrays, so
++            each column is a system-wide power [W]. When True the columns are
++            a MultiIndex whose first level is the array position and whose
++            second level is the bucket name; the system-wide ``inverter``
++            loss is split across the arrays in proportion to the DC power
++            each delivered, so that summing over the first level reproduces
++            the system-wide frame.
++
++        Returns
++        -------
++        DataFrame
++            Indexed by the model index with columns
++            :py:data:`FRAME_COLUMNS`, in that order.
++        """
++        if not per_array:
++            columns = {name: sum_over_arrays(getattr(self, name))
++                       for name in FRAME_COLUMNS}
++            return pd.DataFrame(columns, columns=list(FRAME_COLUMNS))
++        pairs = [(i, name) for i in range(self.num_arrays)
++                 for name in FRAME_COLUMNS]
++        data = {pair: self._array_column(pair[1], pair[0]) for pair in pairs}
++        frame = pd.DataFrame(data)
++        frame.columns = pd.MultiIndex.from_tuples(pairs)
++        return frame
++
++    def energies(self, per_array=False, freq=None):
++        """
++        Total energy of each column of :py:meth:`to_frame`.
++
++        Energy is the sum of power over the model index, so it does not
++        depend on the length of the interval between timestamps.
++
++        Parameters
++        ----------
++        per_array : bool, default False
++            Passed through to :py:meth:`to_frame`.
++        freq : str, optional
++            Pandas offset alias. When given, energies are totalled within
++            each period instead of over the whole index.
++
++        Returns
++        -------
++        Series, or DataFrame
++            A Series indexed by the columns of :py:meth:`to_frame`, in the
++            same order, or a DataFrame of one row per period when ``freq`` is
++            given.
++        """
++        frame = self.to_frame(per_array=per_array)
++        if freq is None:
++            return pd.Series(
++                [energy(frame[column]) for column in frame.columns],
++                index=frame.columns)
++        resampled = frame.resample(freq).sum()
++        resampled.columns = frame.columns
++        return resampled
++
++    def cumulative(self):
++        """
++        Power remaining after each stage of the decomposition.
++
++        The first column is the reference power and each later column is the
++        previous one less that stage's bucket, so the last bucket column
++        equals AC power. This is the waterfall the buckets describe.
++
++        Returns
++        -------
++        DataFrame
++            Indexed by the model index with columns ``'reference'`` followed
++            by :py:data:`BUCKET_NAMES`, in that order.
++        """
++        frame = self.to_frame()
++        remaining = frame['reference']
++        columns = {'reference': remaining}
++        for name in BUCKET_NAMES:
++            remaining = remaining - frame[name]
++            columns[name] = remaining
++        return pd.DataFrame(columns,
++                            columns=['reference'] + list(BUCKET_NAMES))
++
++    def shapley(self):
++        """
++        Credit each conversion mechanism its average marginal drop.
++
++        The sequential buckets depend on the order the stages are applied.
++        This reading removes that dependence: every mechanism in
++        :py:data:`CONVERSION_MECHANISMS` is credited the mean of the drop it
++        causes over all orderings of those mechanisms, holding orientation
++        and sky at their modeled values.
++
++        Returns
++        -------
++        dict
++            Keyed by :py:data:`CONVERSION_MECHANISMS`, each a system-wide
++            power [W]. The values sum, at every timestamp, to the ``weather``
++            column of :py:meth:`cumulative` less :py:attr:`ac`.
++        """
++        lattice = self._lattice()
++        count = len(CONVERSION_MECHANISMS)
++        credited = {}
++        for mechanism in CONVERSION_MECHANISMS:
++            others = [name for name in CONVERSION_MECHANISMS
++                      if name != mechanism]
++            total = None
++            for size in range(len(others) + 1):
++                weight = (math.factorial(size)
++                          * math.factorial(count - size - 1)
++                          / math.factorial(count))
++                for combination in itertools.combinations(others, size):
++                    without = frozenset(combination)
++                    drop = (lattice[without]
++                            - lattice[without | {mechanism}]) * weight
++                    total = drop if total is None else total + drop
++            credited[mechanism] = total
++        return credited
++
++    def as_fraction(self, per_array=False):
++        """
++        Express each bucket as a fraction of the reference energy.
++
++        Parameters
++        ----------
++        per_array : bool, default False
++            When False a single dictionary keyed by
++            :py:data:`BUCKET_NAMES` is returned and every energy is taken
++            over the whole system. When True a tuple of such dictionaries is
++            returned, one per array, and each array's buckets are divided by
++            that array's own reference energy.
++
++        Returns
++        -------
++        dict, or tuple of dict
++            Every value is zero when the reference energy of its divisor is
++            zero.
++        """
++        if not per_array:
++            reference_energy = energy(sum_over_arrays(self.reference))
++            return {name: energy_fraction(
++                energy(sum_over_arrays(getattr(self, name))),
++                reference_energy)
++                for name in BUCKET_NAMES}
++        frame = self.to_frame(per_array=True)
++        result = []
++        for i in range(self.num_arrays):
++            reference_energy = energy(frame[(i, 'reference')])
++            result.append({name: energy_fraction(
++                energy(frame[(i, name)]), reference_energy)
++                for name in BUCKET_NAMES})
++        return tuple(result)
+diff --git a/pvlib/__init__.py b/pvlib/__init__.py
+index 3e6e56b..7ea674f 100644
+--- a/pvlib/__init__.py
++++ b/pvlib/__init__.py
+@@ -14,6 +14,7 @@ from pvlib import (  # noqa: F401
+     irradiance,
+     ivtools,
+     location,
++    lossattribution,
+     modelchain,
+     pvarray,
+     pvsystem,
+diff --git a/pvlib/modelchain.py b/pvlib/modelchain.py
+index 45374bd..89c7fce 100644
+--- a/pvlib/modelchain.py
++++ b/pvlib/modelchain.py
+@@ -15,6 +15,9 @@ from typing import Union, Tuple, Optional, TypeVar
+ 
+ from pvlib import pvsystem, iam
+ import pvlib.irradiance  # avoid name conflict with full import
++from pvlib.lossattribution import (
++    CONVERSION_MECHANISMS, LossAttribution, PER_ARRAY_BUCKETS,
++    REFERENCE_CELL_TEMPERATURE, sum_over_arrays)
+ from pvlib.pvsystem import _DC_MODEL_PARAMS
+ from pvlib.tools import _build_kwargs
+ 
+@@ -241,6 +244,12 @@ class ModelChainResult:
+     """Series (or tuple of Series, one for each array) containing albedo.
+     """
+ 
++    loss_attribution: Optional[LossAttribution] = field(default=None)
++    """:py:class:`~pvlib.lossattribution.LossAttribution` decomposing the
++    simulation into the mechanisms that reduce AC power; assigned by
++    ``ModelChain.run_loss_attribution`` and its variants.
++    """
++
+     def _result_type(self, value):
+         """Coerce `value` to the correct type according to
+         ``self._singleton_tuples``."""
+@@ -1827,8 +1836,11 @@ class ModelChain:
+         Notes
+         -----
+         Assigns attributes:``cell_temperature``, ``dc``, ``ac``, ``losses``,
+-        ``diode_params`` (if dc_model is a single diode model).
++        ``diode_params`` (if dc_model is a single diode model). Clears
++        ``loss_attribution``, which describes a completed decomposition and
++        does not outlive the results it was computed from.
+         """
++        self.results.loss_attribution = None
+         self._prepare_temperature(data)
+         self.dc_model()
+         self.dc_ohmic_model()
+@@ -1973,6 +1985,337 @@ class ModelChain:
+ 
+         return self
+ 
++    def _per_array(self, value):
++        """Broadcast a result to a tuple with one entry per array."""
++        if isinstance(value, tuple):
++            return value
++        return (value,) * self.system.num_arrays
++
++    def _as_series(self, values, index):
++        """Coerce per-array values that may be scalars to Series."""
++        return tuple(value if isinstance(value, pd.Series)
++                     else pd.Series(value, index=index, dtype=float)
++                     for value in values)
++
++    def _assign_per_array(self, name, values):
++        """Assign per-array values using the shape the chain itself uses."""
++        if self.system.num_arrays == 1:
++            setattr(self.results, name, values[0])
++        else:
++            setattr(self.results, name, values)
++
++    def _attribution_shape(self, values):
++        """Present per-array attribution values as ``results`` would."""
++        if self.system.num_arrays == 1:
++            return self.results._result_type(values[0])
++        return values
++
++    def _staged_effective_irradiance(self, aoi_modifier, spectral_modifier):
++        """Re-run the effective irradiance model with given modifiers."""
++        self._assign_per_array('aoi_modifier', aoi_modifier)
++        self._assign_per_array('spectral_modifier', spectral_modifier)
++        self.effective_irradiance_model()
++        return self._per_array(self.results.effective_irradiance)
++
++    def _clearsky_irradiance(self):
++        """Clear-sky irradiance components from the chain's own model."""
++        solar_position = self.results.solar_position
++        return self.location.get_clearsky(
++            solar_position.index,
++            model=self.clearsky_model,
++            solar_position=solar_position)
++
++    def _clearsky_total_irradiance(self):
++        """
++        Transpose clear-sky irradiance onto every array.
++
++        Uses the chain's own clear-sky, airmass and transposition models and
++        the orientation the arrays already had, so the result differs from
++        ``results.total_irrad`` only through the sky condition.
++        """
++        solar_position = self.results.solar_position
++        clearsky = self._clearsky_irradiance()
++        return self._per_array(self.system.get_irradiance(
++            solar_position['apparent_zenith'],
++            solar_position['azimuth'],
++            clearsky['dni'],
++            clearsky['ghi'],
++            clearsky['dhi'],
++            albedo=self._array_albedo(),
++            airmass=self.results.airmass['airmass_relative'],
++            model=self.transposition_model))
++
++    def _array_albedo(self):
++        """Albedo of each array, falling back to the array's own value."""
++        if self.results.albedo is None:
++            return tuple(array.albedo for array in self.system.arrays)
++        return self._per_array(self.results.albedo)
++
++    def _horizontal_total_irradiance(self):
++        """
++        Transpose clear-sky irradiance onto a horizontal surface.
++
++        Every array is given a surface tilt of zero, so the result differs
++        from :py:meth:`_clearsky_total_irradiance` only through orientation.
++        """
++        solar_position = self.results.solar_position
++        clearsky = self._clearsky_irradiance()
++        albedo = self._array_albedo()
++        dni_extra = pvlib.irradiance.get_extra_radiation(
++            solar_position.index)
++        return tuple(
++            pvlib.irradiance.get_total_irradiance(
++                0.0, 180.0,
++                solar_position['apparent_zenith'],
++                solar_position['azimuth'],
++                clearsky['dni'],
++                clearsky['ghi'],
++                clearsky['dhi'],
++                dni_extra=dni_extra,
++                albedo=array_albedo,
++                airmass=self.results.airmass['airmass_relative'],
++                model=self.transposition_model)
++            for array_albedo in albedo)
++
++    def _staged_irradiance_from_total(self, total_irrad, aoi_modifier,
++                                      spectral_modifier):
++        """Effective irradiance for a substituted plane-of-array input."""
++        self._assign_per_array('total_irrad', total_irrad)
++        return self._staged_effective_irradiance(aoi_modifier,
++                                                 spectral_modifier)
++
++    def _stage_dc_power(self, effective_irradiance, cell_temperature,
++                        dc_ohmic, extra_losses):
++        """Evaluate DC power for one stage of the loss attribution."""
++        self._assign_per_array('effective_irradiance', effective_irradiance)
++        self._assign_per_array('cell_temperature', cell_temperature)
++        self.dc_model()
++        if dc_ohmic:
++            self.dc_ohmic_model()
++        if extra_losses:
++            self.losses_model()
++        return tuple(
++            (dc['p_mp'] if isinstance(dc, pd.DataFrame) else dc).copy()
++            for dc in self._per_array(self.results.dc))
++
++    def _subset_power(self, saved, enabled, index, optical):
++        """
++        Power reaching the meter with only ``enabled`` mechanisms active.
++
++        Orientation and sky stay at their modeled values; every mechanism in
++        :py:data:`~pvlib.lossattribution.CONVERSION_MECHANISMS` outside
++        ``enabled`` is held at its reference setting. Without ``'inverter'``
++        the inverter is ideal, so the result is DC power summed over the
++        arrays. When the chain was run from effective irradiance the
++        reflection and spectral mechanisms cannot be separated from the
++        input, so toggling them changes nothing.
++        """
++        unity = (1.0,) * self.system.num_arrays
++        if optical:
++            irradiance = self._staged_irradiance_from_total(
++                self._per_array(saved['total_irrad']),
++                self._per_array(saved['aoi_modifier'])
++                if 'reflection' in enabled else unity,
++                self._per_array(saved['spectral_modifier'])
++                if 'spectral' in enabled else unity)
++        else:
++            irradiance = self._per_array(saved['effective_irradiance'])
++        temperature = self._as_series(
++            self._per_array(saved['cell_temperature'])
++            if 'temperature' in enabled
++            else (REFERENCE_CELL_TEMPERATURE,) * self.system.num_arrays,
++            index)
++        power = self._stage_dc_power(irradiance, temperature,
++                                     'dc_ohmic' in enabled,
++                                     'dc_other' in enabled)
++        if 'inverter' in enabled:
++            self.ac_model()
++            return self.results.ac.copy()
++        return sum_over_arrays(power)
++
++    def _conversion_lattice(self, optical):
++        """
++        Power for every subset of the conversion mechanisms.
++
++        Returns
++        -------
++        dict
++            Keyed by frozensets of
++            :py:data:`~pvlib.lossattribution.CONVERSION_MECHANISMS`.
++        """
++        saved = {name: getattr(self.results, name)
++                 for name in _ATTRIBUTION_STATE}
++        index = self._per_array(self.results.effective_irradiance)[0].index
++        lattice = {}
++        try:
++            for size in reversed(range(len(CONVERSION_MECHANISMS) + 1)):
++                for combination in itertools.combinations(
++                        CONVERSION_MECHANISMS, size):
++                    enabled = frozenset(combination)
++                    lattice[enabled] = self._subset_power(
++                        saved, enabled, index, optical)
++        finally:
++            for name in _ATTRIBUTION_STATE:
++                setattr(self.results, name, saved[name])
++        return lattice
++
++    def _attribute_losses(self, optical):
++        """
++        Decompose the completed simulation into loss buckets.
++
++        Parameters
++        ----------
++        optical : bool
++            Whether the reflection and spectral stages can be evaluated. They
++            cannot when the chain was run from effective irradiance.
++
++        Returns
++        -------
++        self
++        """
++        saved = {name: getattr(self.results, name)
++                 for name in _ATTRIBUTION_STATE}
++        modeled_irradiance = self._per_array(self.results.effective_irradiance)
++        index = modeled_irradiance[0].index
++        unity = (1.0,) * self.system.num_arrays
++        try:
++            modeled_temperature = self._as_series(
++                self._per_array(self.results.cell_temperature), index)
++            reference_temperature = self._as_series(
++                (REFERENCE_CELL_TEMPERATURE,) * self.system.num_arrays, index)
++            if optical:
++                reference_irradiance = self._staged_irradiance_from_total(
++                    self._horizontal_total_irradiance(), unity, unity)
++                transposition_irradiance = self._staged_irradiance_from_total(
++                    self._clearsky_total_irradiance(), unity, unity)
++                weather_irradiance = self._staged_irradiance_from_total(
++                    self._per_array(saved['total_irrad']), unity, unity)
++                reflection_irradiance = self._staged_effective_irradiance(
++                    self._per_array(saved['aoi_modifier']), unity)
++            else:
++                reference_irradiance = modeled_irradiance
++                transposition_irradiance = modeled_irradiance
++                weather_irradiance = modeled_irradiance
++                reflection_irradiance = modeled_irradiance
++            stages = [
++                self._stage_dc_power(reference_irradiance,
++                                     reference_temperature, False, False),
++                self._stage_dc_power(transposition_irradiance,
++                                     reference_temperature, False, False),
++                self._stage_dc_power(weather_irradiance,
++                                     reference_temperature, False, False),
++                self._stage_dc_power(reflection_irradiance,
++                                     reference_temperature, False, False),
++                self._stage_dc_power(modeled_irradiance,
++                                     reference_temperature, False, False),
++                self._stage_dc_power(modeled_irradiance,
++                                     modeled_temperature, False, False),
++                self._stage_dc_power(modeled_irradiance,
++                                     modeled_temperature, True, False),
++                self._stage_dc_power(modeled_irradiance,
++                                     modeled_temperature, True, True),
++            ]
++        finally:
++            for name in _ATTRIBUTION_STATE:
++                setattr(self.results, name, saved[name])
++
++        attribution = LossAttribution(
++            reference=self._attribution_shape(stages[0]),
++            inverter=sum_over_arrays(stages[-1]) - self.results.ac,
++            ac=self.results.ac,
++            _lattice=partial(self._conversion_lattice, optical),
++        )
++        for name, before, after in zip(PER_ARRAY_BUCKETS, stages, stages[1:]):
++            setattr(attribution, name, self._attribution_shape(
++                tuple(b - a for b, a in zip(before, after))))
++        self.results.loss_attribution = attribution
++        return self
++
++    def run_loss_attribution(self, weather):
++        """
++        Run the model chain from broadband irradiance and decompose the
++        result into loss buckets.
++
++        Parameters
++        ----------
++        weather : DataFrame, or tuple or list of DataFrame
++            As required by
++            :py:meth:`~pvlib.modelchain.ModelChain.run_model`.
++
++        Returns
++        -------
++        self
++
++        Notes
++        -----
++        Assigns everything that
++        :py:meth:`~pvlib.modelchain.ModelChain.run_model` assigns, and
++        ``results.loss_attribution``.
++
++        See also
++        --------
++        pvlib.modelchain.ModelChain.run_loss_attribution_from_poa
++        pvlib.modelchain.ModelChain.run_loss_attribution_from_effective_irradiance
++        pvlib.lossattribution.LossAttribution
++        """
++        self.run_model(weather)
++        return self._attribute_losses(optical=True)
++
++    def run_loss_attribution_from_poa(self, data):
++        """
++        Run the model chain from plane-of-array irradiance and decompose the
++        result into loss buckets.
++
++        Parameters
++        ----------
++        data : DataFrame, or tuple or list of DataFrame
++            As required by
++            :py:meth:`~pvlib.modelchain.ModelChain.run_model_from_poa`.
++
++        Returns
++        -------
++        self
++
++        See also
++        --------
++        pvlib.modelchain.ModelChain.run_loss_attribution
++        pvlib.lossattribution.LossAttribution
++        """
++        self.run_model_from_poa(data)
++        return self._attribute_losses(optical=True)
++
++    def run_loss_attribution_from_effective_irradiance(self, data):
++        """
++        Run the model chain from effective irradiance and decompose the
++        result into loss buckets.
++
++        Reflection and spectral content are already accounted for in the
++        input, so those two buckets are zero and the reference stage uses the
++        supplied effective irradiance.
++
++        Parameters
++        ----------
++        data : DataFrame, or tuple or list of DataFrame
++            As required by
++            :py:meth:`~pvlib.modelchain.ModelChain.run_model_from_effective_irradiance`.
++
++        Returns
++        -------
++        self
++
++        See also
++        --------
++        pvlib.modelchain.ModelChain.run_loss_attribution
++        pvlib.lossattribution.LossAttribution
++        """
++        self.run_model_from_effective_irradiance(data)
++        return self._attribute_losses(optical=False)
++
++
++_ATTRIBUTION_STATE = ('total_irrad', 'aoi_modifier', 'spectral_modifier',
++                      'effective_irradiance', 'cell_temperature', 'dc',
++                      'diode_params', 'dc_ohmic_losses', 'losses', 'ac')
++
+ 
+ def _irrad_for_celltemp(total_irrad, effective_irradiance):
+     """

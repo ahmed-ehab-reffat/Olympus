@@ -1,0 +1,929 @@
+diff --git a/BE/Base/cfg.cc b/BE/Base/cfg.cc
+index fcb676f..c519f5c 100644
+--- a/BE/Base/cfg.cc
++++ b/BE/Base/cfg.cc
+@@ -125,7 +125,7 @@ Str NewDerivedBblName(Str orig_name, const char* suffix, Fun fun) {
+   strncat(buf, suffix, kMaxIdLength - 1);
+   const size_t len = strlen(buf);
+   ASSERT(len < kMaxIdLength - 10, "Bbl name too large");
+-  for (int i = 1; i < 10000; ++i) {
++  for (int i = 1; i < 100000; ++i) {
+     ToDecString(i, buf + len);
+     Str candidate = StrNew(buf);
+     if (FunBblFind(fun, candidate).isnull()) return candidate;
+diff --git a/BE/Base/lowering.cc b/BE/Base/lowering.cc
+index 46c5fec..309e476 100644
+--- a/BE/Base/lowering.cc
++++ b/BE/Base/lowering.cc
+@@ -384,6 +384,13 @@ void FunRegWidthWidening(Fun fun, DK narrow_kind, DK wide_kind,
+             NarrowOperand(InsOperand(ins, 2), fun, narrow_kind, inss);
+         inss->push_back(ins);
+         dirty = true;
++      } else if (InsOpcodeKind(ins) == OPC_KIND::BCOPY ||
++                 InsOpcodeKind(ins) == OPC_KIND::BZERO) {
++        const unsigned pos = InsOpcodeKind(ins) == OPC_KIND::BCOPY ? 2 : 1;
++        InsOperand(ins, pos) =
++            NarrowOperand(InsOperand(ins, pos), fun, narrow_kind, inss);
++        inss->push_back(ins);
++        dirty = true;
+       } else {
+         inss->push_back(ins);
+       }
+@@ -621,6 +628,176 @@ void FunEliminateCmp(Fun fun, std::vector<Ins>* inss) {
+   }
+ }
+ 
++DK BulkMemCntKind(DK kind) {
++  if (DKBitWidth(kind) >= 32) return kind;
++  return DKFlavor(kind) == DK_FLAVOR_U ? DK::U32 : DK::S32;
++}
++
++Bbl BblBulkMemLoop(Fun fun, Str name, bool is_copy, bool down, Reg dst,
++                   Reg src, Reg cnt, DK offset_kind) {
++  const Bbl bbl = BblNew(name);
++  FunBblAddBst(fun, bbl);
++  const DK cnt_kind = RegKind(cnt);
++  const Const zero = ConstNewACS(offset_kind, 0);
++  const Const step = ConstNewACS(offset_kind, down ? -1 : 1);
++  if (down) {
++    BblInsAppendList(bbl, InsNew(OPC::LEA, false, dst, dst, step));
++    if (is_copy) BblInsAppendList(bbl, InsNew(OPC::LEA, false, src, src, step));
++  }
++  Handle val;
++  if (is_copy) {
++    const Reg byte = FunGetScratchReg(fun, DK::U8, "bulk_byte", false);
++    BblInsAppendList(bbl, InsNew(OPC::LD, false, byte, src, zero));
++    val = byte;
++  } else {
++    val = ConstNewU(DK::U8, 0);
++  }
++  BblInsAppendList(bbl, InsNew(OPC::ST, false, dst, zero, val));
++  if (!down) {
++    BblInsAppendList(bbl, InsNew(OPC::LEA, false, dst, dst, step));
++    if (is_copy) BblInsAppendList(bbl, InsNew(OPC::LEA, false, src, src, step));
++  }
++  BblInsAppendList(bbl, InsNew(down ? OPC::ADD : OPC::SUB, false, cnt, cnt,
++                               ConstNewACS(cnt_kind, 1)));
++  BblInsAppendList(bbl,
++                   InsNew(OPC::BNE, false, cnt, ConstNewACS(cnt_kind, 0), bbl));
++  EdgLink(EdgNew(bbl, bbl));
++  return bbl;
++}
++
++int64_t ConstValueSignedAtWidth(Const num) {
++  const int64_t value = ConstValueACS(num);
++  const unsigned bw = DKBitWidth(ConstKind(num));
++  if (bw >= 64) return value;
++  const unsigned shift = 64 - bw;
++  return int64_t(uint64_t(value) << shift) >> shift;
++}
++
++uint64_t ConstValueUnsignedAtWidth(Const num) {
++  const uint64_t value = ConstValueU(num);
++  const unsigned bw = DKBitWidth(ConstKind(num));
++  if (bw >= 64) return value;
++  return value & ((uint64_t(1) << bw) - 1);
++}
++
++bool ConstIsZeroValue(Const num) {
++  if (DKFlavor(ConstKind(num)) == DK_FLAVOR_U) {
++    return ConstValueUnsignedAtWidth(num) == 0;
++  }
++  return ConstValueSignedAtWidth(num) == 0;
++}
++
++
++bool ConstIsNegativeValue(Const num) {
++  return DKFlavor(ConstKind(num)) == DK_FLAVOR_S &&
++         ConstValueSignedAtWidth(num) < 0;
++}
++
++Const ConstWithKind(Const num, DK kind) {
++  if (DKFlavor(ConstKind(num)) == DK_FLAVOR_U) {
++    return ConstNewU(kind, ConstValueUnsignedAtWidth(num));
++  }
++  return ConstNewACS(kind, ConstValueSignedAtWidth(num));
++}
++
++void BblReplaceSuccEdg(Bbl bbl, Bbl old_succ, Bbl new_succ) {
++  for (Edg edg : BblSuccEdgIter(bbl)) {
++    if (EdgSuccBbl(edg) == old_succ) {
++      EdgUnlink(edg);
++      EdgDel(edg);
++      break;
++    }
++  }
++  EdgLink(EdgNew(bbl, new_succ));
++}
++
++void InsEliminateBulkMem(Ins ins, Bbl bbl, Fun fun, DK offset_kind) {
++  const bool is_copy = InsOpcode(ins).kind == OPC_KIND::BCOPY;
++  const Handle length = InsOperand(ins, is_copy ? 2 : 1);
++  if (Kind(length) == RefKind::CONST && ConstIsZeroValue(Const(length))) {
++    BblInsUnlink(ins);
++    InsDel(ins);
++    return;
++  }
++  const Bbl tail = bbl;
++  const Bbl head = BblNew(NewDerivedBblName(Name(bbl), "_bulk", fun));
++  FunBblAddBst(fun, head);
++  FunBblInsertBefore(fun, tail, head);
++  BblSplitBeforeFixEdges(tail, ins, head);
++  BblInsUnlink(ins);
++  const Reg dst =
++      FunGetScratchReg(fun, RegKind(Reg(InsOperand(ins, 0))), "bulk_dst", false);
++  BblInsAppendList(head, InsNew(OPC::MOV, false, dst, InsOperand(ins, 0)));
++  Reg src;
++  if (is_copy) {
++    src = FunGetScratchReg(fun, RegKind(Reg(InsOperand(ins, 1))), "bulk_src",
++                           false);
++    BblInsAppendList(head, InsNew(OPC::MOV, false, src, InsOperand(ins, 1)));
++  }
++  const DK cnt_kind = BulkMemCntKind(
++      Kind(length) == RefKind::CONST ? ConstKind(Const(length))
++                                     : RegKind(Reg(length)));
++  const Reg cnt = FunGetScratchReg(fun, cnt_kind, "bulk_cnt", false);
++  if (Kind(length) == RefKind::CONST) {
++    BblInsAppendList(
++        head, InsNew(OPC::MOV, false, cnt,
++                     ConstWithKind(Const(length), cnt_kind)));
++    const bool down = ConstIsNegativeValue(Const(length));
++    const Bbl loop = BblBulkMemLoop(
++        fun, NewDerivedBblName(Name(bbl), down ? "_bulk_down" : "_bulk_up", fun),
++        is_copy, down, dst, src, cnt, offset_kind);
++    FunBblInsertBefore(fun, tail, loop);
++    BblReplaceSuccEdg(head, tail, loop);
++    EdgLink(EdgNew(loop, tail));
++    InsDel(ins);
++    return;
++  }
++  const DK length_kind = RegKind(Reg(length));
++  BblInsAppendList(head, InsNew(length_kind == cnt_kind ? OPC::MOV : OPC::CONV,
++                                false, cnt, length));
++  const Const zero = ConstNewACS(cnt_kind, 0);
++  BblInsAppendList(head, InsNew(OPC::BEQ, false, cnt, zero, tail));
++  const Bbl up =
++      BblBulkMemLoop(fun, NewDerivedBblName(Name(bbl), "_bulk_up", fun), is_copy,
++                     false, dst, src, cnt, offset_kind);
++  EdgLink(EdgNew(up, tail));
++  if (DKFlavor(length_kind) == DK_FLAVOR_U) {
++    FunBblInsertBefore(fun, tail, up);
++    EdgLink(EdgNew(head, up));
++    InsDel(ins);
++    return;
++  }
++  const Bbl down =
++      BblBulkMemLoop(fun, NewDerivedBblName(Name(bbl), "_bulk_down", fun),
++                     is_copy, true, dst, src, cnt, offset_kind);
++  EdgLink(EdgNew(down, tail));
++  const Bbl sel = BblNew(NewDerivedBblName(Name(bbl), "_bulk_sel", fun));
++  FunBblAddBst(fun, sel);
++  BblInsAppendList(sel, InsNew(OPC::BLT, false, cnt, zero, down));
++  EdgLink(EdgNew(sel, down));
++  EdgLink(EdgNew(sel, up));
++  FunBblInsertBefore(fun, tail, sel);
++  FunBblInsertBefore(fun, tail, up);
++  FunBblInsertBefore(fun, tail, down);
++  EdgLink(EdgNew(head, sel));
++  InsDel(ins);
++}
++
++void FunEliminateBulkMem(Fun fun, DK offset_kind) {
++  std::vector<std::pair<Ins, Bbl>> todo;
++  for (Bbl bbl : FunBblIter(fun)) {
++    for (Ins ins : BblInsIter(bbl)) {
++      const OPC_KIND kind = InsOpcode(ins).kind;
++      if (kind == OPC_KIND::BCOPY || kind == OPC_KIND::BZERO) {
++        todo.emplace_back(ins, bbl);
++      }
++    }
++  }
++  for (const auto& [ins, bbl] : todo) {
++    InsEliminateBulkMem(ins, bbl, fun, offset_kind);
++  }
++}
++
+ void FunEliminateCopySign(Fun fun, std::vector<Ins>* inss) {
+   for (Bbl bbl : FunBblIter(fun)) {
+     inss->clear();
+diff --git a/BE/Base/lowering.h b/BE/Base/lowering.h
+index 8491810..4ed7933 100644
+--- a/BE/Base/lowering.h
++++ b/BE/Base/lowering.h
+@@ -27,6 +27,8 @@ extern void FunEliminateCmp(Fun fun, std::vector<Ins>* inss);
+ 
+ extern void FunEliminateCntPop(Fun fun, std::vector<Ins>* inss);
+ 
++extern void FunEliminateBulkMem(Fun fun, DK offset_kind);
++
+ class RegConstCache {
+  public:
+   RegConstCache(Unit unit, DK addr_kind, DK offset_kind, uint32_t max_size)
+diff --git a/BE/Base/lowering.py b/BE/Base/lowering.py
+index bb0630b..0166673 100644
+--- a/BE/Base/lowering.py
++++ b/BE/Base/lowering.py
+@@ -456,6 +456,136 @@ def FunEliminateMemLoadStore(fun: ir.Fun, base_kind: o.DK, offset_kind: o.DK) ->
+         fun, _InsEliminateMemLoadStore, base_kind=base_kind, offset_kind=offset_kind)
+ 
+ 
++def BulkMemCntKind(kind: o.DK) -> o.DK:
++    """The kind of the byte counter used for a length of the given kind
++
++    A narrow length is widened to 32 bit of the same flavor so that the
++    counter arithmetic is available on every target. A wider length keeps
++    its own kind so that neither its magnitude nor its sign is lost.
++    """
++    if kind.bitwidth() >= 32:
++        return kind
++    return o.DK.U32 if kind.flavor() is o.DK_FLAVOR_U else o.DK.S32
++
++
++def _BblBulkMemLoop(fun: ir.Fun, name: str, is_copy: bool, down: bool,
++                    dst: ir.Reg, src: Optional[ir.Reg], cnt: ir.Reg,
++                    offset_kind: o.DK) -> ir.Bbl:
++    """Creates a bbl that transfers one byte per iteration
++
++    The upward loop steps the addresses after the access and counts cnt
++    down to zero, the downward loop steps them before the access and
++    counts cnt (which is negative) up to zero.
++    """
++    bbl = ir.Bbl(name)
++    fun.bbl_syms[name] = bbl
++    cnt_kind = cnt.kind
++    zero = ir.Const(offset_kind, 0)
++    step = ir.Const(offset_kind, -1 if down else 1)
++    if down:
++        bbl.inss.append(ir.Ins(o.LEA, [dst, dst, step], False))
++        if is_copy:
++            bbl.inss.append(ir.Ins(o.LEA, [src, src, step], False))
++    if is_copy:
++        val = fun.GetScratchReg(o.DK.U8, "bulk_byte", False)
++        bbl.inss.append(ir.Ins(o.LD, [val, src, zero], False))
++    else:
++        val = ir.Const(o.DK.U8, 0)
++    bbl.inss.append(ir.Ins(o.ST, [dst, zero, val], False))
++    if not down:
++        bbl.inss.append(ir.Ins(o.LEA, [dst, dst, step], False))
++        if is_copy:
++            bbl.inss.append(ir.Ins(o.LEA, [src, src, step], False))
++    bbl.inss.append(ir.Ins(o.ADD if down else o.SUB,
++                           [cnt, cnt, ir.Const(cnt_kind, 1)], False))
++    bbl.inss.append(ir.Ins(o.BNE, [cnt, ir.Const(cnt_kind, 0), bbl], False))
++    bbl.AddEdgeOut(bbl)
++    return bbl
++
++
++def InsEliminateBulkMem(ins: ir.Ins, bbl: ir.Bbl, fun: ir.Fun, offset_kind: o.DK):
++    """Rewrites bcopy/bzero into byte loops
++
++    bzero dst len / bcopy dst src len
++    becomes
++      mov d dst
++      mov s src            (bcopy only)
++      mov c len            (conv if len has another kind)
++      beq c 0 tail         (register lengths only)
++      blt c 0 down         (signed register lengths only)
++    .bbl up
++      ...
++    .bbl down
++      ...
++    .bbl tail
++    A constant length selects the loop statically and a constant zero
++    removes the instruction altogether.
++    """
++    is_copy = ins.opcode.kind is o.OPC_KIND.BCOPY
++    ops = ins.operands
++    length = ops[-1]
++    if isinstance(length, ir.Const) and length.value == 0:
++        del bbl.inss[bbl.index(ins)]
++        return
++    tail = bbl
++    head = cfg.BblSplitBeforeFixEdges(
++        bbl, ins, fun, cfg.NewDerivedBblName(bbl.name, "_bulk", fun))
++    assert head.inss[-1] is ins
++    del head.inss[-1]
++    pos = fun.bbls.index(tail)
++    dst = fun.GetScratchReg(ops[0].kind, "bulk_dst", False)
++    head.inss.append(ir.Ins(o.MOV, [dst, ops[0]], False))
++    src = None
++    if is_copy:
++        src = fun.GetScratchReg(ops[1].kind, "bulk_src", False)
++        head.inss.append(ir.Ins(o.MOV, [src, ops[1]], False))
++    cnt_kind = BulkMemCntKind(length.kind)
++    cnt = fun.GetScratchReg(cnt_kind, "bulk_cnt", False)
++    if isinstance(length, ir.Const):
++        head.inss.append(ir.Ins(o.MOV, [cnt, ir.Const(cnt_kind, length.value)], False))
++        down = length.kind.flavor() is o.DK_FLAVOR_S and length.value < 0
++        loop = _BblBulkMemLoop(
++            fun, cfg.NewDerivedBblName(bbl.name, "_bulk_down" if down else "_bulk_up", fun),
++            is_copy, down, dst, src, cnt, offset_kind)
++        fun.bbls.insert(pos, loop)
++        head.ReplaceEdgeOut(tail, loop)
++        loop.AddEdgeOut(tail)
++        return
++    if length.kind is cnt_kind:
++        head.inss.append(ir.Ins(o.MOV, [cnt, length], False))
++    else:
++        head.inss.append(ir.Ins(o.CONV, [cnt, length], False))
++    zero = ir.Const(cnt_kind, 0)
++    head.inss.append(ir.Ins(o.BEQ, [cnt, zero, tail], False))
++    up = _BblBulkMemLoop(fun, cfg.NewDerivedBblName(bbl.name, "_bulk_up", fun),
++                         is_copy, False, dst, src, cnt, offset_kind)
++    up.AddEdgeOut(tail)
++    if length.kind.flavor() is o.DK_FLAVOR_U:
++        fun.bbls.insert(pos, up)
++        head.AddEdgeOut(up)
++        return
++    down = _BblBulkMemLoop(fun, cfg.NewDerivedBblName(bbl.name, "_bulk_down", fun),
++                           is_copy, True, dst, src, cnt, offset_kind)
++    down.AddEdgeOut(tail)
++    sel = ir.Bbl(cfg.NewDerivedBblName(bbl.name, "_bulk_sel", fun))
++    fun.bbl_syms[sel.name] = sel
++    sel.inss.append(ir.Ins(o.BLT, [cnt, zero, down], False))
++    sel.AddEdgeOut(down)
++    sel.AddEdgeOut(up)
++    fun.bbls[pos:pos] = [sel, up, down]
++    head.AddEdgeOut(sel)
++
++
++def FunEliminateBulkMem(fun: ir.Fun, offset_kind: o.DK) -> int:
++    count = 0
++    for bbl in fun.bbls[:]:  # not we are updating the list while iterating over it
++        for ins in bbl.inss[:]:
++            if ins.opcode.kind in (o.OPC_KIND.BCOPY, o.OPC_KIND.BZERO):
++                InsEliminateBulkMem(ins, bbl, fun, offset_kind)
++                count += 1
++    return count
++
++
+ def _NarrowOperand(op, fun: ir.Fun, narrow_kind: o.DK, inss: List) -> ir.Reg:
+     if isinstance(op, ir.Const):
+         val = op.value & eval.MakeAllOnesMask(narrow_kind.bitwidth())
+@@ -586,6 +716,9 @@ def FunRegWidthWidening(fun: ir.Fun, narrow_kind: o.DK, wide_kind: o.DK):
+                 ops[1] = _NarrowOperand(ops[1], fun, narrow_kind, inss)
+                 ops[2] = _NarrowOperand(ops[2], fun, narrow_kind, inss)
+                 inss.append(ins)
++            elif kind in (o.OPC_KIND.BCOPY, o.OPC_KIND.BZERO):
++                ops[-1] = _NarrowOperand(ops[-1], fun, narrow_kind, inss)
++                inss.append(ins)
+             else:
+                 inss.append(ins)
+ 
+diff --git a/BE/BindingsC/cwerg.h b/BE/BindingsC/cwerg.h
+index 830b35a..86b4a23 100644
+--- a/BE/BindingsC/cwerg.h
++++ b/BE/BindingsC/cwerg.h
+@@ -98,6 +98,9 @@ enum CW_OPC {
+     CW_GETSP = 0x7a,
+     CW_GETTP = 0x7b,
+ 
++    CW_BCOPY = 0xb8,
++    CW_BZERO = 0xba,
++
+ };
+ enum CW_DK {
+     CW_INVALID = 0x00,
+diff --git a/BE/CodeGenA32/legalize.cc b/BE/CodeGenA32/legalize.cc
+index 1633343..c297979 100644
+--- a/BE/CodeGenA32/legalize.cc
++++ b/BE/CodeGenA32/legalize.cc
+@@ -242,6 +242,8 @@ void PhaseLegalization(Fun fun, Unit unit, std::ostream* fout) {
+ 
+   FunEliminateMemLoadStore(fun, DK::A32, DK::S32, &inss);
+ 
++  FunEliminateBulkMem(fun, DK::S32);
++
+   FunCanonicalize(fun);
+   // We need to run this before massaging immediates because it changes
+   // COND_RRA instruction possibly with immediates.
+diff --git a/BE/CodeGenA32/legalize.py b/BE/CodeGenA32/legalize.py
+index 21b8442..c3d3d90 100644
+--- a/BE/CodeGenA32/legalize.py
++++ b/BE/CodeGenA32/legalize.py
+@@ -286,6 +286,8 @@ def PhaseLegalization(fun: ir.Fun, unit: ir.Unit, _opt_stats: Dict[str, int]):
+     lowering.FunEliminateMemLoadStore(fun, base_kind=o.DK.A32,
+                                       offset_kind=o.DK.S32)
+ 
++    lowering.FunEliminateBulkMem(fun, offset_kind=o.DK.S32)
++
+     canonicalize.FunCanonicalize(fun)
+     # TODO: add a cfg linearization pass to improve control flow
+     # not this may affect immediates as it flips branches
+diff --git a/BE/CodeGenA64/legalize.cc b/BE/CodeGenA64/legalize.cc
+index a1e8fa2..d22c73b 100644
+--- a/BE/CodeGenA64/legalize.cc
++++ b/BE/CodeGenA64/legalize.cc
+@@ -204,6 +204,8 @@ void PhaseLegalizationStep2(Fun fun, Unit unit, std::ostream* fout) {
+   FunEliminateStkLoadStoreWithRegOffset(fun, DK::A64, DK::S32, &inss);
+   FunEliminateMemLoadStore(fun, DK::A64, DK::S32, &inss);
+ 
++  FunEliminateBulkMem(fun, DK::S32);
++
+   FunCanonicalize(fun);
+   // We need to run this before massaging immediates because it changes
+   // COND_RRA instruction possibly with immediates.
+diff --git a/BE/CodeGenA64/legalize.py b/BE/CodeGenA64/legalize.py
+index 91ddd3a..c61bf04 100644
+--- a/BE/CodeGenA64/legalize.py
++++ b/BE/CodeGenA64/legalize.py
+@@ -267,6 +267,8 @@ def PhaseLegalizationStep2(fun: ir.Fun, unit: ir.Unit, _opt_stats: Dict[str, int
+     lowering.FunEliminateMemLoadStore(fun, base_kind=o.DK.A64,
+                                       offset_kind=o.DK.S32)
+ 
++    lowering.FunEliminateBulkMem(fun, offset_kind=o.DK.S32)
++
+     canonicalize.FunCanonicalize(fun)
+     # TODO: add a cfg linearization pass to improve control flow
+     # not this may affect immediates as it flips branches
+diff --git a/BE/CodeGenC/codegen.py b/BE/CodeGenC/codegen.py
+index b2dfcb5..4a52059 100755
+--- a/BE/CodeGenC/codegen.py
++++ b/BE/CodeGenC/codegen.py
+@@ -310,6 +310,36 @@ def Handle_ST(fun: ir.Fun, _, ops: List, _ctx):
+     print(f"    *({RegType(ops[2])}*)(((char*){base}){offset}) = {src};")
+ 
+ 
++def BulkLoopVar(fun: ir.Fun) -> str:
++    """A loop variable that cannot capture one of the function's own registers"""
++    taken = {MangleReg(reg) for reg in fun.regs}
++    name = "bulk_i"
++    while name in taken:
++        name += "_"
++    return name
++
++
++def Handle_BULK(fun: ir.Fun, opcode, ops: List, _ctx):
++    """Byte loops for bcopy/bzero honoring the direction given by the sign of the length
++
++    The downward loop counts up to the negative length and offsets by one
++    below the cursor so that it never steps past the smallest length.
++    """
++    is_copy = opcode is o.BCOPY
++    length = ops[-1]
++    signed = length.kind.flavor() is o.DK_FLAVOR_S
++    ind = "int64_t" if signed else "uint64_t"
++    i = BulkLoopVar(fun)
++    n = f"({ind})({RegOrNum(fun, length)})"
++    dst = f"((uint8_t*){RegOrNum(fun, ops[0])})"
++    src = f"((uint8_t*){RegOrNum(fun, ops[1])})" if is_copy else None
++    up = f"{src}[{i}]" if is_copy else "0"
++    print(f"    for ({ind} {i} = 0; {i} < {n}; ++{i}) {dst}[{i}] = {up};")
++    if signed:
++        down = f"{src}[{i} - 1]" if is_copy else "0"
++        print(f"    for ({ind} {i} = 0; {i} > {n}; --{i}) {dst}[{i} - 1] = {down};")
++
++
+ def Handle_SWITCH(fun: ir.Fun, _, ops: List, _ctx):
+     jtb = ops[1]
+     assert isinstance(jtb, ir.Jtb)
+@@ -352,6 +382,8 @@ INS_HANDLER = {
+     o.OPC_KIND.LD: Handle_LD,
+     o.OPC_KIND.ST: Handle_ST,
+     o.OPC_KIND.SWITCH: Handle_SWITCH,
++    o.OPC_KIND.BCOPY: Handle_BULK,
++    o.OPC_KIND.BZERO: Handle_BULK,
+     o.OPC_KIND.CONV: Handle_CONV,
+     o.OPC_KIND.POPARG: Handle_POPARG,
+     o.OPC_KIND.PUSHARG: Handle_PUSHARG,
+diff --git a/BE/CodeGenX64/legalize.cc b/BE/CodeGenX64/legalize.cc
+index ff94b5a..d521725 100644
+--- a/BE/CodeGenX64/legalize.cc
++++ b/BE/CodeGenX64/legalize.cc
+@@ -366,6 +366,8 @@ void PhaseLegalization(Fun fun, Unit unit, std::ostream* fout) {
+   FunEliminateCopySign(fun, &inss);
+   FunEliminateCmp(fun, &inss);
+ 
++  FunEliminateBulkMem(fun, DK::S32);
++
+   FunCanonicalize(fun);
+   // We need to run this before massaging immediates because it changes
+   // COND_RRA instruction possibly with immediates.
+diff --git a/BE/CodeGenX64/legalize.py b/BE/CodeGenX64/legalize.py
+index da5b0f7..5448297 100644
+--- a/BE/CodeGenX64/legalize.py
++++ b/BE/CodeGenX64/legalize.py
+@@ -240,6 +240,8 @@ def PhaseLegalization(fun: ir.Fun, unit: ir.Unit, _opt_stats: Dict[str, int]):
+     # TODO: support a few special cases in the isel, e.g. cmpXX a 0, 1, x, y
+     lowering.FunEliminateCmp(fun)
+ 
++    lowering.FunEliminateBulkMem(fun, offset_kind=o.DK.S32)
++
+     canonicalize.FunCanonicalize(fun)
+     # TODO: add a cfg linearization pass to improve control flow
+     # not this may affect immediates as it flips branches
+diff --git a/IR/Docs/opcodes.md b/IR/Docs/opcodes.md
+index 7a310e4..fb18663 100644
+--- a/IR/Docs/opcodes.md
++++ b/IR/Docs/opcodes.md
+@@ -207,6 +207,8 @@ All kinds except for `CONST` must match the following regex: `[%_$a-zA-Z][%_$a-z
+ | 0x79 | getfp dst | Materialize the frame-pointer |
+ | 0x7a | getsp dst | Materialize the stack-pointer |
+ | 0x7b | gettp dst | Materialize the tls-pointer |
++| 0xb8 | bcopy dst_addr src_addr width | Copy bytes: `RAM[dst + i] := RAM[src + i]` |
++| 0xba | bzero dst_addr width | Zero bytes: `RAM[dst + i] := 0` |
+ | 0x01 | .mem name alignment mem_kind | Add new mem region to unit |
+ | 0x02 | .data repeat data | Add content to current mem region: multiple bytes |
+ | 0x03 | .addr.fun width fun | Add content to current mem region: code address |
+@@ -494,6 +496,20 @@ Materialize the stack-pointer
+ #### [7b] gettp *dst* <sub>[REG:ADDR]</sub>
+ Materialize the tls-pointer
+ 
++#### [b8] bcopy *dst_addr* <sub>[REG:ADDR]</sub> *src_addr* <sub>[REG:SAME_AS_PREV]</sub> *width* <sub>[REG/CONST:OFFSET]</sub>
++Copy bytes: `RAM[dst + i] := RAM[src + i]`
++
++               A non-negative length copies that many bytes upward starting
++               at the given addresses, one byte at a time.
++               A negative length copies downward starting with the byte
++               just below the given addresses.
++               The sign is taken from the value even when it is in a register.
++
++#### [ba] bzero *dst_addr* <sub>[REG:ADDR]</sub> *width* <sub>[REG/CONST:OFFSET]</sub>
++Zero bytes: `RAM[dst + i] := 0`
++
++               The length works like the one of `bcopy`.
++
+ ## Directives
+ 
+ #### [01] .mem *name* <sub>[NAME]</sub> *alignment* <sub>[INT]</sub> *mem_kind* <sub>[MEM_KIND]</sub>
+diff --git a/IR/opcode_gen.cc b/IR/opcode_gen.cc
+index 99e32ee..722bfd6 100644
+--- a/IR/opcode_gen.cc
++++ b/IR/opcode_gen.cc
+@@ -1032,6 +1032,321 @@ const Opcode GlobalOpcodes[256] = {
+        OPC_KIND::GETSPECIAL, OPC_GENUS::BASE, 1, 1,
+        {TC::ADDR}, 
+        "gettp", 0 },
++     {  // 7c 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 7d 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 7e 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 7f 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 80 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 81 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 82 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 83 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 84 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 85 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 86 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 87 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 88 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 89 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 8a 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 8b 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 8c 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 8d 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 8e 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 8f 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 90 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 91 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 92 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 93 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 94 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 95 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 96 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 97 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 98 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 99 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 9a 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 9b 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 9c 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 9d 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 9e 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // 9f 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // a0 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // a1 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // a2 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // a3 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // a4 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // a5 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // a6 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // a7 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // a8 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // a9 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // aa 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // ab 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // ac 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // ad 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // ae 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // af 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // b0 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // b1 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // b2 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // b3 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // b4 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // b5 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // b6 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // b7 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // b8 bcopy
++       {OP_KIND::REG, OP_KIND::REG, OP_KIND::REG_OR_CONST}, 
++       OPC_KIND::BCOPY, OPC_GENUS::BASE, 3, 0,
++       {TC::ADDR, TC::SAME_AS_PREV, TC::OFFSET}, 
++       "bcopy", OA::MEM_RD|OA::MEM_WR },
++     {  // b9 
++       {}, 
++       OPC_KIND::INVALID, OPC_GENUS::INVALID, 0, 0,
++       {}, 
++       "", 0 },
++     {  // ba bzero
++       {OP_KIND::REG, OP_KIND::REG_OR_CONST}, 
++       OPC_KIND::BZERO, OPC_GENUS::BASE, 2, 0,
++       {TC::ADDR, TC::OFFSET}, 
++       "bzero", OA::MEM_WR },
+ };
+ 
+ /* @AUTOGEN-END@ */
+diff --git a/IR/opcode_gen.h b/IR/opcode_gen.h
+index 67e06a1..ddaf1e9 100644
+--- a/IR/opcode_gen.h
++++ b/IR/opcode_gen.h
+@@ -79,6 +79,9 @@ enum class OPC : uint8_t {
+     GETSP = 0x7a,
+     GETTP = 0x7b,
+ 
++    BCOPY = 0xb8,
++    BZERO = 0xba,
++
+     DIR_MEM = 0x01,
+     DIR_DATA = 0x02,
+     DIR_ADDR_FUN = 0x03,
+diff --git a/IR/opcode_tab.py b/IR/opcode_tab.py
+index f0814d9..927a684 100755
+--- a/IR/opcode_tab.py
++++ b/IR/opcode_tab.py
+@@ -940,18 +940,24 @@ GETTP = Opcode(0x7b, "gettp", OPC_KIND.GETSPECIAL, [OP_KIND.REG],
+ # Misc Experimental
+ ############################################################
+ 
+-# Note, negative lengths copy downwards
+-Opcode(0xb8, "bcopy", OPC_KIND.BCOPY,
+-       [OP_KIND.REG, OP_KIND.REG, OP_KIND.REG_OR_CONST],
+-       [TC.ADDR, TC.SAME_AS_PREV, TC.OFFSET], OPC_GENUS.TBD,
+-       "TBD",
+-       OA.MEM_WR | OA.MEM_RD)
+-
+-# Note, negative lengths copy downwards
+-Opcode(0xba, "bzero", OPC_KIND.BZERO, [OP_KIND.REG, OP_KIND.REG_OR_CONST],
+-       [TC.ADDR, TC.OFFSET], OPC_GENUS.TBD,
+-       "TBD",
+-       OA.MEM_WR)
++BCOPY = Opcode(0xb8, "bcopy", OPC_KIND.BCOPY,
++               [OP_KIND.REG, OP_KIND.REG, OP_KIND.REG_OR_CONST],
++               [TC.ADDR, TC.SAME_AS_PREV, TC.OFFSET], OPC_GENUS.BASE,
++               """Copy bytes: `RAM[dst + i] := RAM[src + i]`
++
++               A non-negative length copies that many bytes upward starting
++               at the given addresses, one byte at a time.
++               A negative length copies downward starting with the byte
++               just below the given addresses.
++               The sign is taken from the value even when it is in a register.""",
++               OA.MEM_WR | OA.MEM_RD)
++
++BZERO = Opcode(0xba, "bzero", OPC_KIND.BZERO, [OP_KIND.REG, OP_KIND.REG_OR_CONST],
++               [TC.ADDR, TC.OFFSET], OPC_GENUS.BASE,
++               """Zero bytes: `RAM[dst + i] := 0`
++
++               The length works like the one of `bcopy`.""",
++               OA.MEM_WR)
+ 
+ 
+ ############################################################

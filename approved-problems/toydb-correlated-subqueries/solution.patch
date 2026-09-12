@@ -1,0 +1,1474 @@
+diff --git a/src/sql/execution/executor.rs b/src/sql/execution/executor.rs
+index 911f9b1..dc424e1 100644
+--- a/src/sql/execution/executor.rs
++++ b/src/sql/execution/executor.rs
+@@ -9,7 +9,7 @@ use crate::errinput;
+ use crate::error::Result;
+ use crate::sql::engine::Transaction;
+ use crate::sql::planner::{Direction, Node, Plan};
+-use crate::sql::types::{Expression, Label, Row, Rows, Table, Value};
++use crate::sql::types::{Expression, Label, QuantifiedOp, Row, Rows, Table, Value};
+ 
+ /// Executes statement plans.
+ ///
+@@ -46,12 +46,16 @@ use crate::sql::types::{Expression, Label, Row, Rows, Table, Value};
+ pub struct Executor<'a, T: Transaction> {
+     /// The transaction used to execute the plan.
+     txn: &'a T,
++    /// The stack of enclosing-query rows, used to bind correlated references in
++    /// subqueries. The innermost enclosing row is last; a subquery's
++    /// Outer(level, _) reads from the end inward.
++    outer: Vec<Row>,
+ }
+ 
+ impl<'a, T: Transaction> Executor<'a, T> {
+     /// Creates a new executor.
+     pub fn new(txn: &'a T) -> Self {
+-        Self { txn }
++        Self { txn, outer: Vec::new() }
+     }
+ 
+     /// Executes a plan, returning an execution result.
+@@ -114,15 +118,33 @@ impl<'a, T: Transaction> Executor<'a, T> {
+             // WHERE and similar filtering.
+             Node::Filter { source, predicate } => {
+                 let source = self.execute_node(*source)?;
+-                Box::new(source.filter_map(move |result| {
+-                    result
+-                        .and_then(|row| match predicate.evaluate(Some(&row))? {
+-                            Value::Boolean(true) => Ok(Some(row)),
+-                            Value::Boolean(false) | Value::Null => Ok(None),
+-                            value => errinput!("filter returned {value}, expected boolean",),
+-                        })
+-                        .transpose()
+-                }))
++                // If the predicate contains a subquery, it must be resolved
++                // against each row (it may be correlated), so buffer eagerly.
++                // Uncorrelated subqueries are resolved once, up front.
++                if predicate.has_subquery() {
++                    let predicate = self.resolve_uncorrelated(&predicate)?;
++                    let mut rows = Vec::new();
++                    for row in source {
++                        let row = row?;
++                        let predicate = self.resolve_subqueries(&predicate, Some(&row))?;
++                        match predicate.evaluate(Some(&row))? {
++                            Value::Boolean(true) => rows.push(Ok(row)),
++                            Value::Boolean(false) | Value::Null => {}
++                            value => return errinput!("filter returned {value}, expected boolean"),
++                        }
++                    }
++                    Box::new(rows.into_iter())
++                } else {
++                    Box::new(source.filter_map(move |result| {
++                        result
++                            .and_then(|row| match predicate.evaluate(Some(&row))? {
++                                Value::Boolean(true) => Ok(Some(row)),
++                                Value::Boolean(false) | Value::Null => Ok(None),
++                                value => errinput!("filter returned {value}, expected boolean",),
++                            })
++                            .transpose()
++                    }))
++                }
+             }
+ 
+             // JOIN using a hash join.
+@@ -173,16 +195,37 @@ impl<'a, T: Transaction> Executor<'a, T> {
+             // ORDER BY
+             Node::Order { source, key } => {
+                 let source = self.execute_node(*source)?;
+-                Box::new(Self::order(source, key)?)
++                Box::new(self.order(source, key)?)
+             }
+ 
+             // Projects columns from the source, and evaluates expressions.
+             Node::Projection { source, expressions, aliases: _ } => {
+                 let source = self.execute_node(*source)?;
+-                Box::new(source.map(move |result| {
+-                    let row = result?;
+-                    expressions.iter().map(|expr| expr.evaluate(Some(&row))).collect()
+-                }))
++                // If any expression contains a subquery, resolve it against each
++                // row (it may be correlated), so buffer eagerly. Uncorrelated
++                // subqueries are resolved once, up front.
++                if expressions.iter().any(|expr| expr.has_subquery()) {
++                    let expressions: Vec<Expression> = expressions
++                        .iter()
++                        .map(|expr| self.resolve_uncorrelated(expr))
++                        .collect::<Result<_>>()?;
++                    let mut rows = Vec::new();
++                    for row in source {
++                        let row = row?;
++                        let mut projected = Vec::with_capacity(expressions.len());
++                        for expr in &expressions {
++                            let expr = self.resolve_subqueries(expr, Some(&row))?;
++                            projected.push(expr.evaluate(Some(&row))?);
++                        }
++                        rows.push(Ok(projected));
++                    }
++                    Box::new(rows.into_iter())
++                } else {
++                    Box::new(source.map(move |result| {
++                        let row = result?;
++                        expressions.iter().map(|expr| expr.evaluate(Some(&row))).collect()
++                    }))
++                }
+             }
+ 
+             // Remaps source column indexes to new target column indexes.
+@@ -203,11 +246,26 @@ impl<'a, T: Transaction> Executor<'a, T> {
+             // Scans a table, optionally filtering rows.
+             Node::Scan { table, filter, alias: _ } => Box::new(self.txn.scan(&table.name, filter)?),
+ 
+-            // Emits constant values.
+-            Node::Values { rows } => Box::new(
+-                rows.into_iter()
+-                    .map(|row| row.into_iter().map(|expr| expr.evaluate(None)).collect()),
+-            ),
++            // Emits constant values. Values may contain (uncorrelated)
++            // subqueries, e.g. INSERT INTO t VALUES ((SELECT max(id) FROM t)).
++            Node::Values { rows } => {
++                if rows.iter().flatten().any(|expr| expr.has_subquery()) {
++                    let mut out = Vec::new();
++                    for row in rows {
++                        let values: Result<Row> = row
++                            .into_iter()
++                            .map(|expr| self.resolve_subqueries(&expr, None)?.evaluate(None))
++                            .collect();
++                        out.push(values);
++                    }
++                    Box::new(out.into_iter())
++                } else {
++                    Box::new(
++                        rows.into_iter()
++                            .map(|row| row.into_iter().map(|expr| expr.evaluate(None)).collect()),
++                    )
++                }
++            }
+         })
+     }
+ 
+@@ -285,7 +343,13 @@ impl<'a, T: Transaction> Executor<'a, T> {
+         while let Some(row) = source.next().transpose()? {
+             let mut update = row.clone();
+             for (column, expr) in &expressions {
+-                update[*column] = expr.evaluate(Some(&row))?;
++                // A SET expression may contain a subquery, possibly correlated
++                // with the row being updated.
++                update[*column] = if expr.has_subquery() {
++                    self.resolve_subqueries(expr, Some(&row))?.evaluate(Some(&row))?
++                } else {
++                    expr.evaluate(Some(&row))?
++                };
+             }
+             let id = row.into_iter().nth(primary_key).expect("short row");
+             updates.insert(id, update);
+@@ -295,16 +359,22 @@ impl<'a, T: Transaction> Executor<'a, T> {
+         Ok(count)
+     }
+ 
+-    /// Sorts the input rows.
+-    fn order(source: Rows, order: Vec<(Expression, Direction)>) -> Result<Rows> {
++    /// Sorts the input rows. A sort key may contain a subquery, possibly
++    /// correlated with the row being sorted.
++    fn order(&self, source: Rows, order: Vec<(Expression, Direction)>) -> Result<Rows> {
+         // We can't use sorted_by_cached_key(), since expression evaluation is
+         // fallible, and since we may have to vary the sort direction of each
+         // expression. Collect the rows and pre-computed sort keys into a vec.
+         let mut rows: Vec<(Row, Vec<Value>)> = source
+             .map(|result| {
+                 result.and_then(|row| {
+-                    let sort_keys =
+-                        order.iter().map(|(expr, _)| expr.evaluate(Some(&row))).try_collect()?;
++                    let sort_keys = order
++                        .iter()
++                        .map(|(expr, _)| match expr.has_subquery() {
++                            true => self.resolve_subqueries(expr, Some(&row))?.evaluate(Some(&row)),
++                            false => expr.evaluate(Some(&row)),
++                        })
++                        .try_collect()?;
+                     Ok((row, sort_keys))
+                 })
+             })
+@@ -326,6 +396,170 @@ impl<'a, T: Transaction> Executor<'a, T> {
+ 
+         Ok(Box::new(rows.into_iter().map(|(row, _)| Ok(row))))
+     }
++
++    /// Resolves only the uncorrelated subqueries in an expression, evaluating
++    /// each exactly once (their value does not depend on the outer row).
++    /// Correlated subqueries are left in place to be resolved per row. This lets
++    /// "WHERE x IN (SELECT ...)" run its subquery once rather than for every row.
++    fn resolve_uncorrelated(&self, expr: &Expression) -> Result<Expression> {
++        expr.clone().transform(&Ok, &|expr| match expr {
++            // Scalar and EXISTS subqueries yield a single row-independent value.
++            Expression::ScalarSubquery(plan) if !plan.references_outer() => {
++                self.eval_scalar(*plan, None).map(Expression::Constant)
++            }
++            Expression::Exists(plan) if !plan.references_outer() => {
++                self.eval_exists(*plan, None).map(Expression::Constant)
++            }
++            // A quantified comparison's needle is per-row, but the subquery rows
++            // are not: execute them once and cache them as constant Values, so
++            // only the comparison is repeated per row.
++            Expression::Quantified(needle, op, all, plan) if !plan.references_outer() => {
++                let rows = self
++                    .run_subquery(*plan, None)?
++                    .into_iter()
++                    .map(|row| row.into_iter().map(Expression::Constant).collect())
++                    .collect();
++                Ok(Expression::Quantified(needle, op, all, Box::new(Node::Values { rows })))
++            }
++            expr => Ok(expr),
++        })
++    }
++
++    /// Resolves all subqueries in an expression into constant values, given the
++    /// current row (used to bind correlated references). Subqueries are resolved
++    /// depth-first, so a subquery nested in another subquery's needle is
++    /// resolved first.
++    fn resolve_subqueries(&self, expr: &Expression, row: Option<&Row>) -> Result<Expression> {
++        expr.clone().transform(&Ok, &|expr| match expr {
++            Expression::ScalarSubquery(plan) => {
++                self.eval_scalar(*plan, row).map(Expression::Constant)
++            }
++            Expression::Exists(plan) => self.eval_exists(*plan, row).map(Expression::Constant),
++            Expression::Quantified(needle, op, all, plan) => {
++                self.eval_quantified(&needle, &op, all, *plan, row).map(Expression::Constant)
++            }
++            expr => Ok(expr),
++        })
++    }
++
++    /// Executes a subquery plan, binding its correlated references to the
++    /// enclosing rows, and returns its rows. The current row is pushed onto the
++    /// enclosing-row stack so nested subqueries can correlate with it (an empty
++    /// placeholder is pushed when resolving an uncorrelated subquery once).
++    fn run_subquery(&self, plan: Node, row: Option<&Row>) -> Result<Vec<Row>> {
++        let mut stack = self.outer.clone();
++        stack.push(row.cloned().unwrap_or_default());
++        let plan = Self::bind_outer(plan, &stack)?;
++        let mut executor = Executor::new(self.txn);
++        executor.outer = stack;
++        executor.execute_node(plan)?.collect()
++    }
++
++    /// Substitutes correlated Outer references in a subquery plan with values
++    /// from the enclosing-row stack, yielding a plan with no level-0 references.
++    /// Outer(level, index) reads the level-th enclosing row from the end of the
++    /// stack. Aggregate expressions are bound too (transform_expressions skips
++    /// them).
++    fn bind_outer(plan: Node, stack: &[Row]) -> Result<Node> {
++        let substitute = |expr: Expression| {
++            expr.transform(&Ok, &|expr| match expr {
++                Expression::Outer(level, index) => {
++                    match stack.len().checked_sub(level + 1).and_then(|i| stack[i].get(index)) {
++                        Some(value) => Ok(Expression::Constant(value.clone())),
++                        None => errinput!("invalid correlated column reference"),
++                    }
++                }
++                expr => Ok(expr),
++            })
++        };
++        plan.transform(
++            &|node| {
++                let node = node.transform_expressions(&Ok, &substitute)?;
++                match node {
++                    Node::Aggregate { source, group_by, aggregates } => Ok(Node::Aggregate {
++                        source,
++                        group_by: group_by.into_iter().map(&substitute).collect::<Result<_>>()?,
++                        aggregates: aggregates
++                            .into_iter()
++                            .map(|aggregate| aggregate.transform_expr(&substitute))
++                            .collect::<Result<_>>()?,
++                    }),
++                    node => Ok(node),
++                }
++            },
++            &Ok,
++        )
++    }
++
++    /// Evaluates a scalar subquery: a single value for a single row, NULL for no
++    /// rows, or an error for more than one row.
++    fn eval_scalar(&self, plan: Node, row: Option<&Row>) -> Result<Value> {
++        let mut rows = self.run_subquery(plan, row)?;
++        match rows.len() {
++            0 => Ok(Value::Null),
++            1 => Ok(rows.remove(0).into_iter().next().expect("scalar subquery has one column")),
++            _ => errinput!("scalar subquery returned more than one row"),
++        }
++    }
++
++    /// Evaluates an EXISTS subquery: true if it returns any row, else false.
++    /// Always two-valued (never NULL), regardless of NULLs in the rows.
++    fn eval_exists(&self, plan: Node, row: Option<&Row>) -> Result<Value> {
++        Ok(Value::Boolean(!self.run_subquery(plan, row)?.is_empty()))
++    }
++
++    /// Evaluates a quantified comparison "needle op ANY|ALL (subquery)" using SQL
++    /// three-valued logic. ANY is an OR over the rows (false for no rows); ALL is
++    /// an AND over the rows (true for no rows). A NULL comparison yields unknown.
++    fn eval_quantified(
++        &self,
++        needle: &Expression,
++        op: &QuantifiedOp,
++        all: bool,
++        plan: Node,
++        row: Option<&Row>,
++    ) -> Result<Value> {
++        let needle = needle.evaluate(row)?;
++        let (mut matched, mut unknown) = (false, false);
++        for subrow in self.run_subquery(plan, row)? {
++            let value = subrow.into_iter().next().expect("subquery has one column");
++            match Self::compare(op, &needle, &value)? {
++                // ANY matches on a true comparison; ALL matches (fails) on false.
++                Value::Boolean(result) if result != all => matched = true,
++                Value::Boolean(_) => {}
++                Value::Null => unknown = true,
++                value => return errinput!("subquery comparison returned {value}, expected boolean"),
++            }
++        }
++        Ok(if matched {
++            Value::Boolean(!all)
++        } else if unknown {
++            Value::Null
++        } else {
++            Value::Boolean(all)
++        })
++    }
++
++    /// Compares two values with the given operator, returning a three-valued
++    /// boolean. Reuses the existing expression comparison semantics, including
++    /// for NULL and NAN, by building and evaluating a comparison expression.
++    fn compare(op: &QuantifiedOp, lhs: &Value, rhs: &Value) -> Result<Value> {
++        let lhs = || Box::new(Expression::Constant(lhs.clone()));
++        let rhs = || Box::new(Expression::Constant(rhs.clone()));
++        let expr = match op {
++            QuantifiedOp::Equal => Expression::Equal(lhs(), rhs()),
++            QuantifiedOp::NotEqual => Expression::Not(Box::new(Expression::Equal(lhs(), rhs()))),
++            QuantifiedOp::GreaterThan => Expression::GreaterThan(lhs(), rhs()),
++            QuantifiedOp::GreaterThanOrEqual => {
++                Expression::Or(Expression::GreaterThan(lhs(), rhs()).into(), Expression::Equal(lhs(), rhs()).into())
++            }
++            QuantifiedOp::LessThan => Expression::LessThan(lhs(), rhs()),
++            QuantifiedOp::LessThanOrEqual => {
++                Expression::Or(Expression::LessThan(lhs(), rhs()).into(), Expression::Equal(lhs(), rhs()).into())
++            }
++        };
++        expr.evaluate(None)
++    }
+ }
+ 
+ /// A plan execution result.
+diff --git a/src/sql/mod.rs b/src/sql/mod.rs
+index ba9633d..efb839f 100644
+--- a/src/sql/mod.rs
++++ b/src/sql/mod.rs
+@@ -280,8 +280,6 @@ mod tests {
+     /// optionally emits the expression tree.
+     struct ExpressionRunner;
+ 
+-    type Catalog<'a> = <Local<storage::Memory> as Engine<'a>>::Transaction;
+-
+     impl goldenscript::Runner for ExpressionRunner {
+         fn run(&mut self, command: &goldenscript::Command) -> Result<String, Box<dyn Error>> {
+             let mut output = String::new();
+@@ -293,9 +291,13 @@ mod tests {
+             let input = &command.name;
+             let mut tags = command.tags.clone();
+ 
+-            // Parse and build the expression.
++            // Parse and build the expression, using an empty in-memory catalog.
++            // These expressions don't reference tables, but the planner is
++            // generic over the catalog (which subqueries use to look up tables).
+             let ast = Parser::parse_expr(input)?;
+-            let expr = Planner::<Catalog>::build_expression(ast, &Scope::new())?;
++            let engine = Local::new(storage::Memory::new());
++            let txn = engine.begin_read_only()?;
++            let expr = Planner::new(&txn).build_expression(ast, &Scope::new())?;
+ 
+             // Evaluate the expression.
+             let value = expr.evaluate(None)?;
+diff --git a/src/sql/parser/ast.rs b/src/sql/parser/ast.rs
+index f1241f0..d3f00c4 100644
+--- a/src/sql/parser/ast.rs
++++ b/src/sql/parser/ast.rs
+@@ -8,7 +8,7 @@ use crate::sql::types::DataType;
+ /// structure of a SQL statement. It is built from a raw SQL string by the
+ /// parser, and passed on to the planner which validates it and builds an
+ /// execution plan from it.
+-#[derive(Debug)]
++#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+ pub enum Statement {
+     /// BEGIN: begins a new transaction.
+     Begin {
+@@ -81,7 +81,7 @@ pub enum Statement {
+ }
+ 
+ /// A FROM item.
+-#[derive(Debug)]
++#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+ pub enum From {
+     /// A table.
+     Table {
+@@ -90,6 +90,15 @@ pub enum From {
+         /// An optional alias for the table.
+         alias: Option<String>,
+     },
++    /// A derived table: a parenthesized subquery with a required alias, e.g.
++    /// "(SELECT id, total FROM orders) AS o". Its columns are exposed under the
++    /// alias, like a table.
++    Subquery {
++        /// The subquery's SELECT statement.
++        query: Box<Statement>,
++        /// The required alias the derived table's columns are qualified by.
++        alias: String,
++    },
+     /// A join of two or more tables (may be nested).
+     Join {
+         /// The left table to join,
+@@ -104,7 +113,7 @@ pub enum From {
+ }
+ 
+ /// A CREATE TABLE column definition.
+-#[derive(Debug)]
++#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+ pub struct Column {
+     pub name: String,
+     pub datatype: DataType,
+@@ -117,7 +126,7 @@ pub struct Column {
+ }
+ 
+ /// JOIN types.
+-#[derive(Debug, PartialEq)]
++#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+ pub enum JoinType {
+     Cross,
+     Inner,
+@@ -137,7 +146,7 @@ impl JoinType {
+ }
+ 
+ /// ORDER BY direction.
+-#[derive(Debug, Default)]
++#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+ pub enum Direction {
+     #[default]
+     Ascending,
+@@ -157,6 +166,8 @@ pub enum Expression {
+     Function(String, Vec<Expression>),
+     /// An operator.
+     Operator(Operator),
++    /// A scalar subquery, e.g. (SELECT MAX(id) FROM t). Yields a single value.
++    Subquery(Box<Statement>),
+ }
+ 
+ /// Expression literal values.
+@@ -231,6 +242,23 @@ pub enum Operator {
+     Subtract(Box<Expression>, Box<Expression>),     // a - b
+ 
+     Like(Box<Expression>, Box<Expression>), // a LIKE b
++
++    In(Box<Expression>, Vec<Expression>),              // a IN (b, c, ...)
++    InSubquery(Box<Expression>, Box<Statement>),       // a IN (SELECT ...)
++    Exists(Box<Statement>),                            // EXISTS (SELECT ...)
++    Quantified(Box<Expression>, QuantifiedOp, bool, Box<Statement>), // a op ANY/ALL (SELECT ...), bool is all
++}
++
++/// The comparison used in a quantified subquery predicate, e.g. the = in
++/// "a = ANY (SELECT ...)".
++#[derive(Clone, Debug, Eq, Hash, PartialEq)]
++pub enum QuantifiedOp {
++    Equal,
++    NotEqual,
++    GreaterThan,
++    GreaterThanOrEqual,
++    LessThan,
++    LessThanOrEqual,
+ }
+ 
+ impl Expression {
+@@ -264,11 +292,15 @@ impl Expression {
+                 Factorial(expr) | Identity(expr) | Is(expr, _) | Negate(expr) | Not(expr) => {
+                     expr.walk(visitor)
+                 }
++
++                In(lhs, list) => lhs.walk(visitor) && list.iter().all(|e| e.walk(visitor)),
++                InSubquery(lhs, _) | Quantified(lhs, _, _, _) => lhs.walk(visitor),
++                Exists(_) => true,
+             },
+ 
+             Self::Function(_, exprs) => exprs.iter().any(|expr| expr.walk(visitor)),
+ 
+-            Self::All | Self::Column(_, _) | Self::Literal(_) => true,
++            Self::All | Self::Column(_, _) | Self::Literal(_) | Self::Subquery(_) => true,
+         }
+     }
+ 
+@@ -311,11 +343,18 @@ impl Expression {
+                 Factorial(expr) | Identity(expr) | Is(expr, _) | Negate(expr) | Not(expr) => {
+                     expr.collect(visitor, exprs);
+                 }
++
++                In(lhs, list) => {
++                    lhs.collect(visitor, exprs);
++                    list.iter().for_each(|e| e.collect(visitor, exprs));
++                }
++                InSubquery(lhs, _) | Quantified(lhs, _, _, _) => lhs.collect(visitor, exprs),
++                Exists(_) => {}
+             },
+ 
+             Self::Function(_, args) => args.iter().for_each(|arg| arg.collect(visitor, exprs)),
+ 
+-            Self::All | Self::Column(_, _) | Self::Literal(_) => {}
++            Self::All | Self::Column(_, _) | Self::Literal(_) | Self::Subquery(_) => {}
+         }
+     }
+ }
+diff --git a/src/sql/parser/lexer.rs b/src/sql/parser/lexer.rs
+index e492727..09fc5a0 100644
+--- a/src/sql/parser/lexer.rs
++++ b/src/sql/parser/lexer.rs
+@@ -86,7 +86,9 @@ impl From<Keyword> for Token {
+ /// Reserved SQL keywords.
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ pub enum Keyword {
++    All,
+     And,
++    Any,
+     As,
+     Asc,
+     Begin,
+@@ -109,6 +111,7 @@ pub enum Keyword {
+     Group,
+     Having,
+     If,
++    In,
+     Index,
+     Infinity,
+     Inner,
+@@ -139,6 +142,7 @@ pub enum Keyword {
+     Rollback,
+     Select,
+     Set,
++    Some,
+     String,
+     System,
+     Table,
+@@ -163,6 +167,8 @@ impl TryFrom<&str> for Keyword {
+         // allocating a string to change the case. Assert this.
+         debug_assert!(value.chars().all(|c| !c.is_uppercase()), "keyword must be lowercase");
+         Ok(match value {
++            "all" => Self::All,
++            "any" => Self::Any,
+             "as" => Self::As,
+             "asc" => Self::Asc,
+             "and" => Self::And,
+@@ -186,6 +192,7 @@ impl TryFrom<&str> for Keyword {
+             "group" => Self::Group,
+             "having" => Self::Having,
+             "if" => Self::If,
++            "in" => Self::In,
+             "index" => Self::Index,
+             "infinity" => Self::Infinity,
+             "inner" => Self::Inner,
+@@ -216,6 +223,7 @@ impl TryFrom<&str> for Keyword {
+             "rollback" => Self::Rollback,
+             "select" => Self::Select,
+             "set" => Self::Set,
++            "some" => Self::Some,
+             "string" => Self::String,
+             "system" => Self::System,
+             "table" => Self::Table,
+@@ -238,6 +246,8 @@ impl Display for Keyword {
+     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+         // Display keywords as uppercase.
+         f.write_str(match self {
++            Self::All => "ALL",
++            Self::Any => "ANY",
+             Self::As => "AS",
+             Self::Asc => "ASC",
+             Self::And => "AND",
+@@ -261,6 +271,7 @@ impl Display for Keyword {
+             Self::Group => "GROUP",
+             Self::Having => "HAVING",
+             Self::If => "IF",
++            Self::In => "IN",
+             Self::Index => "INDEX",
+             Self::Infinity => "INFINITY",
+             Self::Inner => "INNER",
+@@ -291,6 +302,7 @@ impl Display for Keyword {
+             Self::Rollback => "ROLLBACK",
+             Self::Select => "SELECT",
+             Self::Set => "SET",
++            Self::Some => "SOME",
+             Self::String => "STRING",
+             Self::System => "SYSTEM",
+             Self::Table => "TABLE",
+diff --git a/src/sql/parser/parser.rs b/src/sql/parser/parser.rs
+index 4ed025b..715eaef 100644
+--- a/src/sql/parser/parser.rs
++++ b/src/sql/parser/parser.rs
+@@ -390,8 +390,14 @@ impl Parser<'_> {
+         Ok(from)
+     }
+ 
+-    // Parses a FROM table.
++    // Parses a FROM table, or a derived table "(SELECT ...) [AS] alias".
+     fn parse_from_table(&mut self) -> Result<ast::From> {
++        if matches!(self.peek()?, Some(Token::OpenParen)) {
++            let query = self.parse_subquery()?;
++            self.skip(Keyword::As.into());
++            let alias = self.next_ident()?;
++            return Ok(ast::From::Subquery { query, alias });
++        }
+         let name = self.next_ident()?;
+         let mut alias = None;
+         if self.next_is(Keyword::As.into()) || matches!(self.peek()?, Some(Token::Ident(_))) {
+@@ -628,7 +634,32 @@ impl Parser<'_> {
+         // The right-hand side expression parsing will recursively apply any
+         // infix operators at or above this operator's precedence to the
+         // right-hand side.
+-        while let Some(infix) = self.parse_infix_operator_at(min_precedence) {
++        loop {
++            // The IN predicate "a [NOT] IN (list | SELECT ...)" has the same
++            // precedence as the equality operators (4). NOT IN is parsed as a
++            // negation of IN.
++            if 4 >= min_precedence
++                && matches!(
++                    self.peek()?,
++                    Some(Token::Keyword(Keyword::In)) | Some(Token::Keyword(Keyword::Not))
++                )
++            {
++                let negated = self.next_is(Keyword::Not.into());
++                self.expect(Keyword::In.into())?;
++                lhs = self.parse_in_predicate(lhs, negated)?;
++                continue;
++            }
++
++            let Some(infix) = self.parse_infix_operator_at(min_precedence) else { break };
++
++            // A quantified comparison "a <op> ANY|SOME|ALL (SELECT ...)".
++            if let Some(all) = self.parse_quantifier() {
++                let op = infix.into_quantified_op()?;
++                let query = self.parse_subquery()?;
++                lhs = ast::Operator::Quantified(Box::new(lhs), op, all, query).into();
++                continue;
++            }
++
+             let next_precedence = infix.precedence() + infix.associativity();
+             let rhs = self.parse_expression_at(next_precedence)?;
+             lhs = infix.into_expression(lhs, rhs);
+@@ -684,17 +715,65 @@ impl Parser<'_> {
+             }
+             Token::Ident(column) => ast::Expression::Column(None, column),
+ 
+-            // Parenthesized expression.
++            // An EXISTS predicate, e.g. EXISTS (SELECT 1 FROM t).
++            Token::Keyword(Keyword::Exists) => {
++                ast::Operator::Exists(self.parse_subquery()?).into()
++            }
++
++            // A parenthesized expression or a scalar subquery (SELECT ...).
+             Token::OpenParen => {
+-                let expr = self.parse_expression()?;
+-                self.expect(Token::CloseParen)?;
+-                expr
++                if matches!(self.peek()?, Some(Token::Keyword(Keyword::Select))) {
++                    let statement = self.parse_select()?;
++                    self.expect(Token::CloseParen)?;
++                    ast::Expression::Subquery(Box::new(statement))
++                } else {
++                    let expr = self.parse_expression()?;
++                    self.expect(Token::CloseParen)?;
++                    expr
++                }
+             }
+ 
+             token => return errinput!("expected expression atom, found {token}"),
+         })
+     }
+ 
++    /// Parses a parenthesized subquery "(SELECT ...)", returning the statement.
++    fn parse_subquery(&mut self) -> Result<Box<ast::Statement>> {
++        self.expect(Token::OpenParen)?;
++        let statement = self.parse_select()?;
++        self.expect(Token::CloseParen)?;
++        Ok(Box::new(statement))
++    }
++
++    /// Parses the right-hand side of an IN predicate, which is either a value
++    /// list "(a, b, c)" or a subquery "(SELECT ...)". The opening parenthesis
++    /// must not yet be consumed. Wraps the result in a NOT for "NOT IN".
++    fn parse_in_predicate(&mut self, lhs: ast::Expression, negated: bool) -> Result<ast::Expression> {
++        self.expect(Token::OpenParen)?;
++        let predicate = if matches!(self.peek()?, Some(Token::Keyword(Keyword::Select))) {
++            ast::Operator::InSubquery(Box::new(lhs), Box::new(self.parse_select()?))
++        } else {
++            let mut list = vec![self.parse_expression()?];
++            while self.next_is(Token::Comma) {
++                list.push(self.parse_expression()?);
++            }
++            ast::Operator::In(Box::new(lhs), list)
++        };
++        self.expect(Token::CloseParen)?;
++        let expr = ast::Expression::Operator(predicate);
++        Ok(if negated { ast::Operator::Not(Box::new(expr)).into() } else { expr })
++    }
++
++    /// Parses a subquery quantifier, returning Some(true) for ALL and
++    /// Some(false) for ANY/SOME, or None if the next token isn't a quantifier.
++    fn parse_quantifier(&mut self) -> Option<bool> {
++        self.next_if_map(|token| match token {
++            Token::Keyword(Keyword::All) => Some(true),
++            Token::Keyword(Keyword::Any) | Token::Keyword(Keyword::Some) => Some(false),
++            _ => None,
++        })
++    }
++
+     /// Parses a prefix operator, if there is one and its precedence is at least
+     /// min_precedence.
+     fn parse_prefix_operator_at(&mut self, min_precedence: Precedence) -> Option<PrefixOperator> {
+@@ -876,6 +955,20 @@ impl InfixOperator {
+         }
+     }
+ 
++    /// Converts a comparison operator into a quantified-subquery operator, for
++    /// "a <op> ANY|ALL (SELECT ...)". Errors for non-comparison operators.
++    fn into_quantified_op(self) -> Result<ast::QuantifiedOp> {
++        Ok(match self {
++            Self::Equal => ast::QuantifiedOp::Equal,
++            Self::NotEqual => ast::QuantifiedOp::NotEqual,
++            Self::GreaterThan => ast::QuantifiedOp::GreaterThan,
++            Self::GreaterThanOrEqual => ast::QuantifiedOp::GreaterThanOrEqual,
++            Self::LessThan => ast::QuantifiedOp::LessThan,
++            Self::LessThanOrEqual => ast::QuantifiedOp::LessThanOrEqual,
++            _ => return errinput!("ANY/SOME/ALL requires a comparison operator"),
++        })
++    }
++
+     /// Builds an AST expression for the infix operator.
+     fn into_expression(self, lhs: ast::Expression, rhs: ast::Expression) -> ast::Expression {
+         let (lhs, rhs) = (Box::new(lhs), Box::new(rhs));
+diff --git a/src/sql/planner/optimizer.rs b/src/sql/planner/optimizer.rs
+index 23d2288..7dc8172 100644
+--- a/src/sql/planner/optimizer.rs
++++ b/src/sql/planner/optimizer.rs
+@@ -50,8 +50,10 @@ impl ConstantFolding {
+         // cases such as 1 + a - 2 (which would require rearranging the
+         // expression as 1 - 2 + a to evaluate the 1 - 2 branch).
+         //
++        // Subqueries are not constant: they are resolved by the executor.
++        //
+         // TODO: consider doing something better.
+-        if !expr.contains(&|expr| matches!(expr, Column(_))) {
++        if !expr.has_subquery() && !expr.contains(&|expr| matches!(expr, Column(_))) {
+             return expr.evaluate(None).map(Constant);
+         }
+ 
+@@ -112,6 +114,12 @@ impl FilterPushdown {
+     /// Pushes an expression into a node if possible. Otherwise, returns the the
+     /// unpushed expression.
+     fn push_into(expr: Expression, target: &mut Node) -> Option<Expression> {
++        // Subquery predicates must stay in a Filter node, where the executor
++        // resolves them. They can't be pushed into a scan (where they would be
++        // evaluated by the storage engine) or a join.
++        if expr.has_subquery() && !matches!(target, Node::Filter { .. }) {
++            return Some(expr);
++        }
+         match target {
+             Node::Filter { predicate, .. } => {
+                 // Temporarily replace the predicate to take ownership.
+diff --git a/src/sql/planner/plan.rs b/src/sql/planner/plan.rs
+index cc73f1f..96fd71e 100644
+--- a/src/sql/planner/plan.rs
++++ b/src/sql/planner/plan.rs
+@@ -175,6 +175,41 @@ pub enum Node {
+ }
+ 
+ impl Node {
++    /// Returns true if any expression in this node tree references an enclosing
++    /// query, directly or through a nested subquery. Used by the executor to
++    /// decide whether a subquery must be re-evaluated for every outer row, or
++    /// can be evaluated just once (only a fully uncorrelated subquery is
++    /// cached). Conservative: a subquery that only references a further-out
++    /// query is still re-evaluated, which is correct if not optimal.
++    pub fn references_outer(&self) -> bool {
++        let has_outer = |expr: &Expression| expr.has_outer_reference();
++        let own = match self {
++            Self::Filter { predicate, .. } => has_outer(predicate),
++            Self::NestedLoopJoin { predicate: Some(predicate), .. } => has_outer(predicate),
++            Self::Order { key, .. } => key.iter().any(|(expr, _)| has_outer(expr)),
++            Self::Projection { expressions, .. } => expressions.iter().any(has_outer),
++            Self::Scan { filter: Some(filter), .. } => has_outer(filter),
++            Self::Values { rows } => rows.iter().flatten().any(has_outer),
++            Self::Aggregate { group_by, aggregates, .. } => {
++                group_by.iter().any(has_outer) || aggregates.iter().any(|a| has_outer(a.expr()))
++            }
++            _ => false,
++        };
++        own || match self {
++            Self::Aggregate { source, .. }
++            | Self::Filter { source, .. }
++            | Self::Limit { source, .. }
++            | Self::Offset { source, .. }
++            | Self::Order { source, .. }
++            | Self::Projection { source, .. }
++            | Self::Remap { source, .. } => source.references_outer(),
++            Self::HashJoin { left, right, .. } | Self::NestedLoopJoin { left, right, .. } => {
++                left.references_outer() || right.references_outer()
++            }
++            _ => false,
++        }
++    }
++
+     /// Returns the number of columns emitted by the node.
+     pub fn columns(&self) -> usize {
+         match self {
+@@ -402,6 +437,17 @@ impl Aggregate {
+             | Self::Sum(expr) => expr,
+         }
+     }
++
++    /// Transforms the aggregate's inner expression with the given closure.
++    pub fn transform_expr(self, f: &impl Fn(Expression) -> Result<Expression>) -> Result<Self> {
++        Ok(match self {
++            Self::Average(expr) => Self::Average(f(expr)?),
++            Self::Count(expr) => Self::Count(f(expr)?),
++            Self::Max(expr) => Self::Max(f(expr)?),
++            Self::Min(expr) => Self::Min(f(expr)?),
++            Self::Sum(expr) => Self::Sum(f(expr)?),
++        })
++    }
+ }
+ 
+ /// A sort order direction.
+diff --git a/src/sql/planner/planner.rs b/src/sql/planner/planner.rs
+index 7a1c6a8..d812e37 100644
+--- a/src/sql/planner/planner.rs
++++ b/src/sql/planner/planner.rs
+@@ -7,7 +7,7 @@ use crate::errinput;
+ use crate::error::Result;
+ use crate::sql::engine::Catalog;
+ use crate::sql::parser::ast;
+-use crate::sql::types::{Column, Expression, Label, Table, Value};
++use crate::sql::types::{Column, Expression, Label, QuantifiedOp, Table, Value};
+ 
+ /// The planner builds an execution plan from a parsed Abstract Syntax Tree,
+ /// using the catalog for schema information.
+@@ -36,7 +36,10 @@ impl<'a, C: Catalog> Planner<'a, C> {
+             Insert { table, columns, values } => self.build_insert(table, columns, values),
+             Update { table, set, r#where } => self.build_update(table, set, r#where),
+             Select { select, from, r#where, group_by, having, order_by, offset, limit } => {
+-                self.build_select(select, from, r#where, group_by, having, order_by, offset, limit)
++                let node = self.build_select(
++                    select, from, r#where, group_by, having, order_by, offset, limit, None,
++                )?;
++                Ok(Plan::Select(node))
+             }
+ 
+             // Transaction and explain statements are handled by Session.
+@@ -64,7 +67,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
+                     datatype: c.datatype,
+                     nullable,
+                     default: match c.default {
+-                        Some(expr) => Some(Self::build_constant_value(expr)?),
++                        Some(expr) => Some(self.build_constant_value(expr)?),
+                         None if nullable => Some(Value::Null),
+                         None => None,
+                     },
+@@ -86,14 +89,27 @@ impl<'a, C: Catalog> Planner<'a, C> {
+     fn build_delete(&self, table: String, r#where: Option<ast::Expression>) -> Result<Plan> {
+         let table = self.catalog.must_get_table(&table)?;
+         let scope = Scope::from_table(&table)?;
+-        let filter = r#where.map(|expr| Self::build_expression(expr, &scope)).transpose()?;
++        let filter = r#where.map(|expr| self.build_expression(expr, &scope)).transpose()?;
+         Ok(Plan::Delete {
+             table: table.name.clone(),
+             primary_key: table.primary_key,
+-            source: Node::Scan { table, alias: None, filter },
++            source: Self::scan_or_filter(table, filter),
+         })
+     }
+ 
++    /// Builds the scanned source for a DELETE or UPDATE. A filter containing a
++    /// subquery is applied by a Filter node, which the executor resolves, rather
++    /// than pushed into the scan, where the storage engine would evaluate it.
++    fn scan_or_filter(table: Table, filter: Option<Expression>) -> Node {
++        match filter {
++            Some(predicate) if predicate.has_subquery() => Node::Filter {
++                source: Box::new(Node::Scan { table, alias: None, filter: None }),
++                predicate,
++            },
++            filter => Node::Scan { table, alias: None, filter },
++        }
++    }
++
+     /// Builds an INSERT plan.
+     fn build_insert(
+         &self,
+@@ -118,7 +134,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
+         let rows = values
+             .into_iter()
+             .map(|exprs| {
+-                exprs.into_iter().map(|expr| Self::build_expression(expr, &scope)).collect()
++                exprs.into_iter().map(|expr| self.build_expression(expr, &scope)).collect()
+             })
+             .try_collect()?;
+         Ok(Plan::Insert { table, column_map, source: Node::Values { rows } })
+@@ -133,12 +149,12 @@ impl<'a, C: Catalog> Planner<'a, C> {
+     ) -> Result<Plan> {
+         let table = self.catalog.must_get_table(&table)?;
+         let scope = Scope::from_table(&table)?;
+-        let filter = r#where.map(|expr| Self::build_expression(expr, &scope)).transpose()?;
++        let filter = r#where.map(|expr| self.build_expression(expr, &scope)).transpose()?;
+         let mut expressions = Vec::with_capacity(set.len());
+         for (column, expr) in set {
+             let index = scope.lookup_column(None, &column)?;
+             let expr = match expr {
+-                Some(expr) => Self::build_expression(expr, &scope)?,
++                Some(expr) => self.build_expression(expr, &scope)?,
+                 None => match &table.columns[index].default {
+                     Some(default) => Expression::Constant(default.clone()),
+                     None => return errinput!("column {column} has no default value"),
+@@ -149,12 +165,13 @@ impl<'a, C: Catalog> Planner<'a, C> {
+         Ok(Plan::Update {
+             table: table.clone(),
+             primary_key: table.primary_key,
+-            source: Node::Scan { table, alias: None, filter },
++            source: Self::scan_or_filter(table, filter),
+             expressions,
+         })
+     }
+ 
+-    /// Builds a SELECT plan.
++    /// Builds a SELECT plan node. When outer is given, the query is a subquery
++    /// whose column references may correlate with the enclosing query's scope.
+     #[allow(clippy::too_many_arguments)]
+     fn build_select(
+         &self,
+@@ -166,8 +183,10 @@ impl<'a, C: Catalog> Planner<'a, C> {
+         order_by: Vec<(ast::Expression, ast::Direction)>,
+         offset: Option<ast::Expression>,
+         limit: Option<ast::Expression>,
+-    ) -> Result<Plan> {
++        outer: Option<&Scope>,
++    ) -> Result<Node> {
+         let mut scope = Scope::new();
++        scope.outer = outer.map(|outer| Box::new(outer.clone()));
+ 
+         // Build FROM clause.
+         let mut node = if !from.is_empty() {
+@@ -201,7 +220,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
+ 
+         // Build WHERE clause.
+         if let Some(r#where) = r#where {
+-            let predicate = Self::build_expression(r#where, &scope)?;
++            let predicate = self.build_expression(r#where, &scope)?;
+             node = Node::Filter { source: Box::new(node), predicate };
+         }
+ 
+@@ -220,7 +239,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
+             let mut expressions = Vec::with_capacity(select.len());
+             let mut aliases = Vec::with_capacity(select.len());
+             for (expr, alias) in select {
+-                expressions.push(Self::build_expression(expr, &scope)?);
++                expressions.push(self.build_expression(expr, &scope)?);
+                 aliases.push(Label::from(alias));
+             }
+ 
+@@ -238,7 +257,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
+             if scope.aggregates.is_empty() {
+                 return errinput!("HAVING requires GROUP BY or aggregate function");
+             }
+-            let predicate = Self::build_expression(having, &scope)?;
++            let predicate = self.build_expression(having, &scope)?;
+             node = Node::Filter { source: Box::new(node), predicate };
+         }
+ 
+@@ -246,14 +265,14 @@ impl<'a, C: Catalog> Planner<'a, C> {
+         if !order_by.is_empty() {
+             let key = order_by
+                 .into_iter()
+-                .map(|(expr, dir)| Ok((Self::build_expression(expr, &scope)?, dir.into())))
++                .map(|(expr, dir)| Ok((self.build_expression(expr, &scope)?, dir.into())))
+                 .collect::<Result<_>>()?;
+             node = Node::Order { source: Box::new(node), key };
+         }
+ 
+         // Build OFFSET clause.
+         if let Some(offset) = offset {
+-            let offset = match Self::build_constant_value(offset)? {
++            let offset = match self.build_constant_value(offset)? {
+                 Value::Integer(offset) if offset >= 0 => offset as usize,
+                 offset => return errinput!("invalid offset {offset}"),
+             };
+@@ -262,7 +281,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
+ 
+         // Build LIMIT clause.
+         if let Some(limit) = limit {
+-            let limit = match Self::build_constant_value(limit)? {
++            let limit = match self.build_constant_value(limit)? {
+                 Value::Integer(limit) if limit >= 0 => limit as usize,
+                 limit => return errinput!("invalid limit {limit}"),
+             };
+@@ -274,7 +293,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
+             node = Node::Remap { source: Box::new(node), targets }
+         }
+ 
+-        Ok(Plan::Select(node))
++        Ok(node)
+     }
+ 
+     /// Builds a FROM clause consisting of one or more items. Each item is
+@@ -316,6 +335,14 @@ impl<'a, C: Catalog> Planner<'a, C> {
+                 Node::Scan { table, alias, filter: None }
+             }
+ 
++            // A derived table: a subquery whose columns are exposed under the
++            // alias. It does not correlate with the enclosing query.
++            ast::From::Subquery { query, alias } => {
++                let node = self.build_subquery(*query, &Scope::new())?;
++                scope.add_subquery(&node, &alias)?;
++                node
++            }
++
+             // A two-way join. The left or right nodes may be chained joins.
+             ast::From::Join { mut left, mut right, r#type, predicate } => {
+                 // Right joins are built as a left join then column swap.
+@@ -329,7 +356,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
+                 let (left_size, right_size) = (left.columns(), right.columns());
+ 
+                 // Build the join node.
+-                let predicate = predicate.map(|e| Self::build_expression(e, &scope)).transpose()?;
++                let predicate = predicate.map(|e| self.build_expression(e, &scope)).transpose()?;
+                 let outer = r#type.is_outer();
+                 let mut node = Node::NestedLoopJoin { left, right, predicate, outer };
+ 
+@@ -377,10 +404,10 @@ impl<'a, C: Catalog> Planner<'a, C> {
+ 
+         // Build the node from the remaining unique expressions.
+         let group_by =
+-            group_by.into_iter().map(|expr| Self::build_expression(expr, scope)).try_collect()?;
++            group_by.into_iter().map(|expr| self.build_expression(expr, scope)).try_collect()?;
+         let aggregates = aggregates
+             .into_iter()
+-            .map(|expr| Self::build_aggregate_function(expr, scope))
++            .map(|expr| self.build_aggregate_function(expr, scope))
+             .try_collect()?;
+ 
+         *scope = child_scope;
+@@ -388,7 +415,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
+     }
+ 
+     /// Builds an aggregate function from an AST expression.
+-    fn build_aggregate_function(expr: ast::Expression, scope: &Scope) -> Result<Aggregate> {
++    fn build_aggregate_function(&self, expr: ast::Expression, scope: &Scope) -> Result<Aggregate> {
+         let ast::Expression::Function(name, mut args) = expr else {
+             panic!("aggregate expression must be function");
+         };
+@@ -401,7 +428,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
+         // Special-case COUNT(*) since expressions don't support tuples.
+         let expr = match (name.as_str(), args.remove(0)) {
+             ("count", ast::Expression::All) => Expression::Constant(Value::Boolean(true)),
+-            (_, arg) => Self::build_expression(arg, scope)?,
++            (_, arg) => self.build_expression(arg, scope)?,
+         };
+         Ok(match name.as_str() {
+             "avg" => Aggregate::Average(expr),
+@@ -491,8 +518,9 @@ impl<'a, C: Catalog> Planner<'a, C> {
+     }
+ 
+     /// Builds an expression from an AST expression, looking up columns and
+-    /// aggregate expressions in the scope.
+-    pub fn build_expression(expr: ast::Expression, scope: &Scope) -> Result<Expression> {
++    /// aggregate expressions in the scope. Subqueries are planned recursively,
++    /// using the current scope as their outer scope for correlation.
++    pub fn build_expression(&self, expr: ast::Expression, scope: &Scope) -> Result<Expression> {
+         use Expression::*;
+ 
+         // Look up aggregate functions or GROUP BY expressions. These were added
+@@ -503,7 +531,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
+ 
+         // Helper for building a boxed expression.
+         let build = |expr: Box<ast::Expression>| -> Result<Box<Expression>> {
+-            Ok(Box::new(Self::build_expression(*expr, scope)?))
++            Ok(Box::new(self.build_expression(*expr, scope)?))
+         };
+ 
+         Ok(match expr {
+@@ -518,8 +546,21 @@ impl<'a, C: Catalog> Planner<'a, C> {
+                 ast::Literal::Float(f) => Value::Float(f),
+                 ast::Literal::String(s) => Value::String(s),
+             }),
+-            ast::Expression::Column(table, name) => {
+-                Column(scope.lookup_column(table.as_deref(), &name)?)
++            ast::Expression::Column(table, name) => match scope.lookup_column(table.as_deref(), &name)
++            {
++                Ok(index) => Column(index),
++                // Fall back to the enclosing query scopes, for correlation.
++                Err(error) => match scope.lookup_outer(table.as_deref(), &name) {
++                    Some((level, index)) => Outer(level, index),
++                    None => return Err(error),
++                },
++            },
++            ast::Expression::Subquery(statement) => {
++                let node = self.build_subquery(*statement, scope)?;
++                if node.columns() != 1 {
++                    return errinput!("scalar subquery must return a single column");
++                }
++                ScalarSubquery(Box::new(node))
+             }
+             ast::Expression::Function(name, mut args) => match (name.as_str(), args.len()) {
+                 // NB: aggregate functions are processed above.
+@@ -527,6 +568,40 @@ impl<'a, C: Catalog> Planner<'a, C> {
+                 (name, n) => return errinput!("unknown function {name} with {n} arguments"),
+             },
+             ast::Expression::Operator(op) => match op {
++                // a IN (b, c, ...) desugars to a = b OR a = c OR ..., reusing
++                // the existing three-valued equality and OR semantics.
++                ast::Operator::In(lhs, list) => {
++                    let lhs = self.build_expression(*lhs, scope)?;
++                    let mut items = list.into_iter();
++                    let first = items.next().expect("IN list is never empty");
++                    let mut expr = Equal(Box::new(lhs.clone()), build(Box::new(first))?);
++                    for item in items {
++                        let equal = Equal(Box::new(lhs.clone()), build(Box::new(item))?);
++                        expr = Or(Box::new(expr), Box::new(equal));
++                    }
++                    expr
++                }
++                // a IN (SELECT ...) is equivalent to a = ANY (SELECT ...).
++                ast::Operator::InSubquery(lhs, statement) => {
++                    let needle = self.build_expression(*lhs, scope)?;
++                    let node = self.build_subquery(*statement, scope)?;
++                    if node.columns() != 1 {
++                        return errinput!("subquery must return a single column");
++                    }
++                    Quantified(Box::new(needle), QuantifiedOp::Equal, false, Box::new(node))
++                }
++                ast::Operator::Exists(statement) => {
++                    Exists(Box::new(self.build_subquery(*statement, scope)?))
++                }
++                ast::Operator::Quantified(lhs, op, all, statement) => {
++                    let needle = self.build_expression(*lhs, scope)?;
++                    let node = self.build_subquery(*statement, scope)?;
++                    if node.columns() != 1 {
++                        return errinput!("subquery must return a single column");
++                    }
++                    Quantified(Box::new(needle), op.into(), all, Box::new(node))
++                }
++
+                 ast::Operator::And(lhs, rhs) => And(build(lhs)?, build(rhs)?),
+                 ast::Operator::Not(expr) => Not(build(expr)?),
+                 ast::Operator::Or(lhs, rhs) => Or(build(lhs)?, build(rhs)?),
+@@ -567,10 +642,32 @@ impl<'a, C: Catalog> Planner<'a, C> {
+         })
+     }
+ 
++    /// Plans a subquery's SELECT statement, using the given scope as the outer
++    /// scope so the subquery's column references can correlate with it.
++    fn build_subquery(&self, statement: ast::Statement, outer: &Scope) -> Result<Node> {
++        // The parser only ever produces a SELECT for a subquery.
++        let ast::Statement::Select { select, from, r#where, group_by, having, order_by, offset, limit } =
++            statement
++        else {
++            panic!("subquery must be a SELECT statement");
++        };
++        self.build_select(
++            select,
++            from,
++            r#where,
++            group_by,
++            having,
++            order_by,
++            offset,
++            limit,
++            Some(outer),
++        )
++    }
++
+     /// Builds a constant value from an AST expression by evaluating it. The
+     /// expression can't contain column references or aggregate functions.
+-    fn build_constant_value(expr: ast::Expression) -> Result<Value> {
+-        Self::build_expression(expr, &Scope::new())?.evaluate(None)
++    fn build_constant_value(&self, expr: ast::Expression) -> Result<Value> {
++        self.build_expression(expr, &Scope::new())?.evaluate(None)
+     }
+ }
+ 
+@@ -585,8 +682,12 @@ impl<'a, C: Catalog> Planner<'a, C> {
+ /// row may come directly from a single table, or it may be the result of a long
+ /// chain of joins and projections. The scope keeps track of which columns are
+ /// currently visible and what names they have.
+-#[derive(Default)]
++#[derive(Clone, Default)]
+ pub struct Scope {
++    /// An enclosing query's scope, used to resolve correlated column references
++    /// in a subquery. A column not found in this scope is looked up here, and
++    /// becomes an Expression::Outer reference bound to the outer row at runtime.
++    outer: Option<Box<Scope>>,
+     /// The currently visible columns. If empty, only constant expressions can
+     /// be used (no column references).
+     columns: Vec<Label>,
+@@ -626,9 +727,27 @@ impl Scope {
+     pub fn spawn(&self) -> Self {
+         let mut child = Scope::new();
+         child.tables = self.tables.clone(); // retain table names
++        child.outer = self.outer.clone(); // retain correlation context
+         child
+     }
+ 
++    /// Looks up a correlated column in the enclosing query scopes, walking
++    /// outward. Returns the (level, index) of the column: level is how many
++    /// scopes out it was found (0 is the immediately enclosing query), index is
++    /// its column. Returns None if no enclosing scope contains the column.
++    fn lookup_outer(&self, table: Option<&str>, name: &str) -> Option<(usize, usize)> {
++        let mut scope = self.outer.as_deref();
++        let mut level = 0;
++        while let Some(outer) = scope {
++            if let Ok(index) = outer.lookup_column(table, name) {
++                return Some((level, index));
++            }
++            scope = outer.outer.as_deref();
++            level += 1;
++        }
++        None
++    }
++
+     /// Adds a table to the scope. The label is either the table's original name
+     /// or an alias, and must be unique. All table columns are added, in order.
+     fn add_table(&mut self, table: &Table, alias: Option<&str>) -> Result<()> {
+@@ -643,6 +762,26 @@ impl Scope {
+         Ok(())
+     }
+ 
++    /// Adds a derived table (a subquery) to the scope under the given alias,
++    /// exposing each of its output columns by their name where available. The
++    /// alias must be unique, like a table name.
++    fn add_subquery(&mut self, node: &Node, alias: &str) -> Result<()> {
++        if self.tables.contains(alias) {
++            return errinput!("duplicate table name {alias}");
++        }
++        for index in 0..node.columns() {
++            let label = match node.column_label(index) {
++                Label::Qualified(_, name) | Label::Unqualified(name) => {
++                    Label::Qualified(alias.to_string(), name)
++                }
++                Label::None => Label::None,
++            };
++            self.add_column(label);
++        }
++        self.tables.insert(alias.to_string());
++        Ok(())
++    }
++
+     /// Appends a column with the given label to the scope. Returns the column
+     /// index.
+     fn add_column(&mut self, label: Label) -> usize {
+diff --git a/src/sql/types/expression.rs b/src/sql/types/expression.rs
+index 7312de1..496cc2c 100644
+--- a/src/sql/types/expression.rs
++++ b/src/sql/types/expression.rs
+@@ -61,6 +61,49 @@ pub enum Expression {
+ 
+     // a LIKE b: checks if a string matches a pattern.
+     Like(Box<Expression>, Box<Expression>),
++
++    /// A scalar subquery (SELECT ...). Evaluates to the single value of the
++    /// single output column and row, NULL for no rows, or an error for more
++    /// than one row. Resolved by the executor before evaluation.
++    ScalarSubquery(Box<Node>),
++    /// EXISTS (SELECT ...): true if the subquery returns at least one row,
++    /// false otherwise (never NULL). Resolved by the executor.
++    Exists(Box<Node>),
++    /// a <op> ANY|ALL (SELECT ...): quantified comparison. all is true for ALL
++    /// and false for ANY/SOME. "a IN (SELECT ...)" is planned as "a = ANY (...)".
++    /// Resolved by the executor.
++    Quantified(Box<Expression>, QuantifiedOp, bool, Box<Node>),
++    /// A correlated reference to a column of an enclosing query, given as a
++    /// (level, index) pair: level is how many queries out to look (0 is the
++    /// immediately enclosing query), index is the column. The executor
++    /// substitutes the outer row's value before executing a correlated
++    /// subquery's plan.
++    Outer(usize, usize),
++}
++
++/// The comparison used by a quantified subquery, e.g. the > in "a > ALL (...)".
++#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
++pub enum QuantifiedOp {
++    Equal,
++    NotEqual,
++    GreaterThan,
++    GreaterThanOrEqual,
++    LessThan,
++    LessThanOrEqual,
++}
++
++impl From<crate::sql::parser::ast::QuantifiedOp> for QuantifiedOp {
++    fn from(op: crate::sql::parser::ast::QuantifiedOp) -> Self {
++        use crate::sql::parser::ast::QuantifiedOp as AstOp;
++        match op {
++            AstOp::Equal => Self::Equal,
++            AstOp::NotEqual => Self::NotEqual,
++            AstOp::GreaterThan => Self::GreaterThan,
++            AstOp::GreaterThanOrEqual => Self::GreaterThanOrEqual,
++            AstOp::LessThan => Self::LessThan,
++            AstOp::LessThanOrEqual => Self::LessThanOrEqual,
++        }
++    }
+ }
+ 
+ impl Expression {
+@@ -204,6 +247,15 @@ impl Expression {
+                 (String(_), Null) | (Null, String(_)) | (Null, Null) => Null,
+                 (lhs, rhs) => return errinput!("can't LIKE {lhs} and {rhs}"),
+             },
++
++            // Subqueries and correlated references are resolved into constants
++            // by the executor before evaluation, so they should never be
++            // evaluated directly. This can only happen if a subquery is used in
++            // a constant context (e.g. a DEFAULT or LIMIT clause).
++            Self::ScalarSubquery(_) | Self::Exists(_) | Self::Quantified(_, _, _, _) => {
++                return errinput!("unsupported subquery in this context");
++            }
++            Self::Outer(..) => return errinput!("unsupported correlated reference in this context"),
+         })
+     }
+ 
+@@ -234,7 +286,15 @@ impl Expression {
+             | Self::Not(expr)
+             | Self::SquareRoot(expr) => expr.walk(visitor),
+ 
+-            Self::Constant(_) | Self::Column(_) => true,
++            // The quantified needle is walked, but not the sub-plan (which is a
++            // separate node with its own column scope).
++            Self::Quantified(needle, _, _, _) => needle.walk(visitor),
++
++            Self::Constant(_)
++            | Self::Column(_)
++            | Self::ScalarSubquery(_)
++            | Self::Exists(_)
++            | Self::Outer(..) => true,
+         }
+     }
+ 
+@@ -245,6 +305,37 @@ impl Expression {
+         !self.walk(&mut |e| !visitor(e))
+     }
+ 
++    /// Returns true if the expression, or any subquery plan nested within it,
++    /// references a correlated outer column at any level. A subquery is treated
++    /// as correlated (and re-evaluated per outer row rather than cached) if it
++    /// transitively references an enclosing query through a deeper subquery.
++    pub fn has_outer_reference(&self) -> bool {
++        let mut found = false;
++        self.walk(&mut |expr| {
++            match expr {
++                Self::Outer(..) => found = true,
++                Self::ScalarSubquery(plan) | Self::Exists(plan) | Self::Quantified(_, _, _, plan) => {
++                    found = found || plan.references_outer()
++                }
++                _ => {}
++            }
++            !found
++        });
++        found
++    }
++
++    /// Returns true if the expression contains a subquery or correlated
++    /// reference, which must be resolved by the executor rather than folded or
++    /// pushed down by optimizers or evaluated by storage scans.
++    pub fn has_subquery(&self) -> bool {
++        self.contains(&|e| {
++            matches!(
++                e,
++                Self::ScalarSubquery(_) | Self::Exists(_) | Self::Quantified(..) | Self::Outer(..)
++            )
++        })
++    }
++
+     /// Transforms the expression by recursively applying the given closures
+     /// depth-first to each node before/after descending.
+     pub fn transform(
+@@ -280,7 +371,15 @@ impl Expression {
+             Self::Negate(expr) => Self::Negate(xform(expr)?),
+             Self::Not(expr) => Self::Not(xform(expr)?),
+ 
+-            expr @ (Self::Constant(_) | Self::Column(_)) => expr,
++            // The quantified needle is transformed; sub-plans and correlated
++            // references are left untouched (their columns are independent).
++            Self::Quantified(needle, op, all, plan) => Self::Quantified(xform(needle)?, op, all, plan),
++
++            expr @ (Self::Constant(_)
++            | Self::Column(_)
++            | Self::ScalarSubquery(_)
++            | Self::Exists(_)
++            | Self::Outer(..)) => expr,
+         };
+         self = after(self)?;
+         Ok(self)
+@@ -499,6 +598,22 @@ impl<'a> Display for ExpressionDisplay<'a> {
+             Subtract(lhs, rhs) => write!(f, "{} - {}", group(lhs), group(rhs))?,
+ 
+             Like(lhs, rhs) => write!(f, "{} LIKE {}", group(lhs), group(rhs))?,
++
++            ScalarSubquery(_) => write!(f, "(subquery)")?,
++            Exists(_) => write!(f, "EXISTS (subquery)")?,
++            Quantified(needle, op, all, _) => {
++                let op = match op {
++                    QuantifiedOp::Equal => "=",
++                    QuantifiedOp::NotEqual => "!=",
++                    QuantifiedOp::GreaterThan => ">",
++                    QuantifiedOp::GreaterThanOrEqual => ">=",
++                    QuantifiedOp::LessThan => "<",
++                    QuantifiedOp::LessThanOrEqual => "<=",
++                };
++                let quantifier = if *all { "ALL" } else { "ANY" };
++                write!(f, "{} {op} {quantifier} (subquery)", group(needle))?;
++            }
++            Outer(level, index) => write!(f, "#outer{level}.{index}")?,
+         }
+ 
+         if precedence < self.parent_precedence {
+@@ -519,14 +634,14 @@ impl<'a> ExpressionDisplay<'a> {
+     fn precedence(expr: &Expression) -> u8 {
+         use Expression::*;
+         match expr {
+-            Column(_) | Constant(_) | SquareRoot(_) => 11,
++            Column(_) | Constant(_) | SquareRoot(_) | ScalarSubquery(_) | Exists(_) | Outer(..) => 11,
+             Identity(_) | Negate(_) => 10,
+             Factorial(_) => 9,
+             Exponentiate(_, _) => 8,
+             Multiply(_, _) | Divide(_, _) | Remainder(_, _) => 7,
+             Add(_, _) | Subtract(_, _) => 6,
+             GreaterThan(_, _) | LessThan(_, _) => 5,
+-            Equal(_, _) | Like(_, _) | Is(_, _) => 4,
++            Equal(_, _) | Like(_, _) | Is(_, _) | Quantified(_, _, _, _) => 4,
+             Not(_) => 3,
+             And(_, _) => 2,
+             Or(_, _) => 1,
+diff --git a/src/sql/types/mod.rs b/src/sql/types/mod.rs
+index 697f230..a233219 100644
+--- a/src/sql/types/mod.rs
++++ b/src/sql/types/mod.rs
+@@ -4,6 +4,6 @@ mod expression;
+ mod schema;
+ mod value;
+ 
+-pub use expression::Expression;
++pub use expression::{Expression, QuantifiedOp};
+ pub use schema::{Column, Table};
+ pub use value::{DataType, Label, Row, Rows, Value};
+diff --git a/src/sql/types/value.rs b/src/sql/types/value.rs
+index c0cd3bb..4cf04b8 100644
+--- a/src/sql/types/value.rs
++++ b/src/sql/types/value.rs
+@@ -14,7 +14,7 @@ use crate::{errdata, errinput};
+ 
+ /// A primitive SQL data type. For simplicity, only a handful of scalar types
+ /// are supported (no compound types).
+-#[derive(Clone, Copy, Debug, Hash, PartialEq, Serialize, Deserialize)]
++#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+ pub enum DataType {
+     /// A boolean: true or false.
+     Boolean,

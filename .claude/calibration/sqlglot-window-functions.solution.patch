@@ -1,0 +1,445 @@
+diff --git a/sqlglot/executor/python.py b/sqlglot/executor/python.py
+index 1536bbd..80eae50 100644
+--- a/sqlglot/executor/python.py
++++ b/sqlglot/executor/python.py
+@@ -6,7 +6,7 @@ from sqlglot import exp, planner, tokens
+ from sqlglot.dialects.dialect import Dialect
+ from sqlglot.errors import ExecuteError
+ from sqlglot.executor.context import Context
+-from sqlglot.executor.env import ENV
++from sqlglot.executor.env import ENV, reverse_key
+ from sqlglot.executor.table import RowReader, Table
+ from sqlglot.generators.python import PythonGenerator
+ 
+@@ -37,6 +37,8 @@ class PythonExecutor:
+                     contexts[node] = self.scan(node, context)
+                 elif isinstance(node, planner.Aggregate):
+                     contexts[node] = self.aggregate(node, context)
++                elif isinstance(node, planner.Window):
++                    contexts[node] = self.window(node, context)
+                 elif isinstance(node, planner.Join):
+                     contexts[node] = self.join(node, context)
+                 elif isinstance(node, planner.Sort):
+@@ -278,6 +280,307 @@ class PythonExecutor:
+             return self.scan(step, context)
+         return context
+ 
++    def window(self, step, context):
++        source = context.table
++        rows = source.rows
++        length = len(rows)
++        names = list(step.windows)
++        computed = {
++            name: self._window_values(step.windows[name], context, length) for name in names
++        }
++
++        sink = self.table(list(source.columns) + names)
++        for i in range(length):
++            sink.append(tuple(rows[i]) + tuple(computed[name][i] for name in names))
++
++        context = self.context({step.name: sink, **{name: sink for name in context.tables}})
++
++        if step.projections or step.condition:
++            return self.scan(step, context)
++        return context
++
++    def _window_values(self, window, context, length):
++        partition = self.generate_tuple(window.args.get("partition_by") or [])
++        order = window.args.get("order")
++        ordereds = order.expressions if order else []
++        order_keys = self.generate_tuple([ordered.this for ordered in ordereds])
++        descs = [bool(ordered.args.get("desc")) for ordered in ordereds]
++
++        partitions = collections.defaultdict(list)
++        for i in range(length):
++            context.set_index(i)
++            partitions[context.eval_tuple(partition)].append((i, context.eval_tuple(order_keys)))
++
++        result = [None] * length
++        for members in partitions.values():
++            ordered = sorted(members, key=lambda m: self._order_key(m[1], descs))
++            self._apply_window(window, ordered, bool(ordereds), context, result)
++
++        return result
++
++    def _order_key(self, keys, descs):
++        key = []
++        for value, desc in zip(keys, descs):
++            if value is None:
++                key.append((1, 0))
++            else:
++                key.append((0, reverse_key(value) if desc else value))
++        return tuple(key)
++
++    def _peer_groups(self, ordered):
++        groups = []
++        for i, (index, key) in enumerate(ordered):
++            if i and key != ordered[i - 1][1]:
++                groups.append([])
++            elif i == 0:
++                groups.append([])
++            groups[-1].append((index, key))
++        return groups
++
++    def _apply_window(self, window, ordered, has_order, context, result):
++        func = window.this
++        ignore_nulls = isinstance(func, exp.IgnoreNulls)
++        if ignore_nulls:
++            func = func.this
++
++        condition = None
++        if isinstance(func, exp.Filter):
++            condition = func.args["expression"].this
++            func = func.this
++
++        kind = type(func)
++        length = len(ordered)
++        keys = [key for _, key in ordered]
++
++        if kind is exp.RowNumber:
++            for position, (index, _) in enumerate(ordered, 1):
++                result[index] = position
++            return
++        if kind in (exp.Rank, exp.PercentRank):
++            percent = kind is exp.PercentRank
++            rank = 0
++            for position, (index, key) in enumerate(ordered, 1):
++                if position == 1 or key != keys[position - 2]:
++                    rank = position
++                result[index] = (rank - 1) / (length - 1) if percent and length > 1 else (
++                    0.0 if percent else rank
++                )
++            return
++        if kind is exp.DenseRank:
++            rank = 0
++            for position, (index, key) in enumerate(ordered):
++                if position == 0 or key != keys[position - 1]:
++                    rank += 1
++                result[index] = rank
++            return
++        if kind is exp.CumeDist:
++            seen = 0
++            for group in self._peer_groups(ordered):
++                seen += len(group)
++                value = seen / length
++                for index, _ in group:
++                    result[index] = value
++            return
++        if kind is exp.Ntile:
++            buckets = int(func.text("this"))
++            base, extra = divmod(length, buckets)
++            position = 0
++            for bucket in range(1, buckets + 1):
++                for _ in range(base + (1 if bucket <= extra else 0)):
++                    result[ordered[position][0]] = bucket
++                    position += 1
++            return
++        values = self._window_inputs(func, ordered, context)
++
++        if kind in (exp.Lag, exp.Lead):
++            default = self.generate(func.args.get("default"))
++            offset = int(func.text("offset")) if func.args.get("offset") else 1
++            for position, (index, _) in enumerate(ordered):
++                target = self._navigate(position, offset, kind is exp.Lead, values, ignore_nulls)
++                result[index] = (
++                    values[target]
++                    if target is not None
++                    else (context.eval(default) if default else None)
++                )
++            return
++
++        first_peer, last_peer = self._peer_bounds(keys)
++        groups, group_index = self._group_meta(keys)
++        order = window.args.get("order")
++        descending = bool(order and order.expressions[0].args.get("desc"))
++        order_values = [key[0] if key else None for key in keys]
++        spec = window.args.get("spec")
++        reduce = (
++            None
++            if kind in (exp.FirstValue, exp.LastValue, exp.NthValue)
++            else self._window_reducer(kind)
++        )
++
++        mask = None
++        if condition is not None:
++            predicate = self.generate(condition)
++            mask = []
++            for index, _ in ordered:
++                context.set_index(index)
++                mask.append(bool(context.eval(predicate)))
++
++        for position, (index, _) in enumerate(ordered):
++            frame = self._frame(
++                position, spec, has_order, length, first_peer, last_peer,
++                groups, group_index, order_values, descending,
++            )
++            if ignore_nulls:
++                frame = [p for p in frame if values[p] is not None]
++            if kind is exp.FirstValue:
++                result[index] = values[frame[0]] if frame else None
++            elif kind is exp.LastValue:
++                result[index] = values[frame[-1]] if frame else None
++            elif kind is exp.NthValue:
++                nth = int(func.text("offset"))
++                result[index] = values[frame[nth - 1]] if 0 < nth <= len(frame) else None
++            else:
++                if mask is not None:
++                    frame = [p for p in frame if mask[p]]
++                result[index] = reduce([values[p] for p in frame])
++
++    def _window_inputs(self, func, ordered, context):
++        if isinstance(func.this, exp.Star):
++            return [1] * len(ordered)
++        code = self.generate(func.this)
++        values = []
++        for index, _ in ordered:
++            context.set_index(index)
++            values.append(context.eval(code))
++        return values
++
++    def _navigate(self, position, offset, forward, values, ignore_nulls):
++        step = 1 if forward else -1
++        remaining = offset
++        cursor = position
++        while remaining > 0:
++            cursor += step
++            if not 0 <= cursor < len(values):
++                return None
++            if ignore_nulls and values[cursor] is None:
++                continue
++            remaining -= 1
++        return cursor
++
++    def _frame(
++        self, position, spec, has_order, length, first_peer, last_peer,
++        groups, group_index, order_values, descending,
++    ):
++        if spec is None:
++            low, high = 0, (last_peer[position] if has_order else length - 1)
++        else:
++            kind = spec.text("kind")
++            low = self._frame_bound(
++                spec.args.get("start"), spec.text("start_side"), position, kind, True,
++                length, first_peer, last_peer, groups, group_index, order_values, descending,
++            )
++            end = spec.args.get("end")
++            if end is None:
++                high = position if kind == "ROWS" else last_peer[position]
++            else:
++                high = self._frame_bound(
++                    end, spec.text("end_side"), position, kind, False,
++                    length, first_peer, last_peer, groups, group_index, order_values, descending,
++                )
++
++        low = max(low, 0)
++        high = min(high, length - 1)
++        positions = list(range(low, high + 1)) if low <= high else []
++
++        exclude = spec.text("exclude") if spec is not None else None
++        if exclude:
++            positions = self._exclude(positions, exclude, position, first_peer, last_peer)
++
++        return positions
++
++    def _frame_bound(
++        self, bound, side, position, kind, is_start, length,
++        first_peer, last_peer, groups, group_index, order_values, descending,
++    ):
++        preceding = side == "PRECEDING"
++
++        if isinstance(bound, exp.Literal):
++            offset = int(bound.name)
++            if kind == "ROWS":
++                return position - offset if preceding else position + offset
++            if kind == "GROUPS":
++                target = group_index[position] + (-offset if preceding else offset)
++                target = max(0, min(target, len(groups) - 1))
++                return groups[target][0] if is_start else groups[target][1]
++            if descending:
++                raise NotImplementedError("RANGE frame offset requires ascending order")
++            current = order_values[position]
++            if current is None:
++                return position
++            limit = current - offset if preceding else current + offset
++            if is_start:
++                return next(
++                    (p for p in range(length) if order_values[p] is not None and order_values[p] >= limit),
++                    length,
++                )
++            return next(
++                (
++                    p
++                    for p in range(length - 1, -1, -1)
++                    if order_values[p] is not None and order_values[p] <= limit
++                ),
++                -1,
++            )
++
++        text = (bound if isinstance(bound, str) else bound.name if bound is not None else "").upper()
++        if "UNBOUNDED" in text:
++            return float("-inf") if preceding else float("inf")
++        if kind == "ROWS":
++            return position
++        return first_peer[position] if is_start else last_peer[position]
++
++    def _exclude(self, positions, exclude, position, first_peer, last_peer):
++        keyword = exclude.upper()
++        low, high = first_peer[position], last_peer[position]
++        if "CURRENT" in keyword:
++            return [p for p in positions if p != position]
++        if "GROUP" in keyword:
++            return [p for p in positions if not low <= p <= high]
++        if "TIES" in keyword:
++            return [p for p in positions if p == position or not low <= p <= high]
++        return positions
++
++    def _peer_bounds(self, keys):
++        length = len(keys)
++        first = [0] * length
++        last = [0] * length
++        start = 0
++        while start < length:
++            end = start
++            while end + 1 < length and keys[end + 1] == keys[start]:
++                end += 1
++            for i in range(start, end + 1):
++                first[i] = start
++                last[i] = end
++            start = end + 1
++        return first, last
++
++    def _group_meta(self, keys):
++        groups = []
++        group_index = [0] * len(keys)
++        start = 0
++        while start < len(keys):
++            end = start
++            while end + 1 < len(keys) and keys[end + 1] == keys[start]:
++                end += 1
++            for i in range(start, end + 1):
++                group_index[i] = len(groups)
++            groups.append((start, end))
++            start = end + 1
++        return groups, group_index
++
++    def _window_reducer(self, kind):
++        return self.env[kind.sql_names()[0].upper()]
++
+     def sort(self, step, context):
+         projections = self.generate_tuple(step.projections)
+         projection_columns = [p.alias_or_name for p in step.projections]
+diff --git a/sqlglot/planner.py b/sqlglot/planner.py
+index 4f555cb..ffbcc5f 100644
+--- a/sqlglot/planner.py
++++ b/sqlglot/planner.py
+@@ -148,7 +148,9 @@ class Step:
+             step.aggregations = list(aggregations)
+ 
+         for e in expression.expressions:
+-            if e.find(exp.AggFunc):
++            if e.find(exp.Window):
++                projections.append(e)
++            elif e.find(exp.AggFunc):
+                 projections.append(exp.column(e.alias_or_name, step.name, quoted=True))
+                 extract_agg_operands(e)
+             else:
+@@ -204,6 +206,77 @@ class Step:
+         else:
+             aggregate = None
+ 
++        windows: dict[str, exp.Window] = {}
++        window_names: dict[str, str] = {}
++        next_window_name = name_sequence("_w_")
++        window_definitions = {
++            definition.name: definition for definition in expression.args.get("windows") or []
++        }
++
++        def extract_windows(node: exp.Expr) -> None:
++            for window in list(node.find_all(exp.Window)):
++                alias = window.args.get("alias")
++                if alias is not None and not window.args.get("partition_by") and not window.args.get(
++                    "order"
++                ):
++                    definition = window_definitions.get(alias.name)
++                    if definition is not None:
++                        for arg in ("partition_by", "order", "spec"):
++                            value = definition.args.get(arg)
++                            if isinstance(value, list):
++                                window.set(arg, [child.copy() for child in value])
++                            elif value is not None:
++                                window.set(arg, value.copy())
++
++                key = window.sql()
++                name = window_names.get(key)
++                if name is None:
++                    name = next_window_name()
++                    window_names[key] = name
++                    windows[name] = window.copy()
++                window.replace(exp.column(name, step.name, quoted=True))
++
++        if aggregate is not None:
++            next_window_agg = name_sequence("_wf_")
++
++            def lift_window_aggs(node: exp.Expr) -> None:
++                for window in node.find_all(exp.Window):
++                    components = list(window.args.get("partition_by") or [])
++                    if window.args.get("order"):
++                        components.extend(window.args["order"].expressions)
++                    components.extend(window.this.iter_expressions())
++                    for component in components:
++                        for agg in list(component.find_all(exp.AggFunc)):
++                            alias = next_window_agg()
++                            extract_agg_operands(exp.alias_(agg.copy(), alias, quoted=True))
++                            agg.replace(exp.column(alias, step.name, quoted=True))
++
++            for projection in projections:
++                lift_window_aggs(projection)
++            set_ops_and_aggs(aggregate)
++
++        for projection in projections:
++            extract_windows(projection)
++
++        pre_order: exp.Order | None = expression.args.get("order")
++        if pre_order is not None:
++            for ordered in pre_order.expressions:
++                extract_windows(ordered)
++
++        qualify = expression.args.get("qualify")
++        if qualify is not None:
++            extract_windows(qualify.this)
++
++        if windows:
++            window_step = Window()
++            window_step.source = step.name
++            window_step.name = step.name
++            window_step.windows = windows
++            if qualify is not None:
++                window_step.condition = qualify.this
++            window_step.add_dependency(step)
++            step = window_step
++
+         order: exp.Order | None = expression.args.get("order")
+ 
+         if order is not None:
+@@ -406,6 +479,21 @@ class Sort(Step):
+         return lines
+ 
+ 
++class Window(Step):
++    def __init__(self) -> None:
++        super().__init__()
++        self.windows: dict[str, exp.Window] = {}
++        self.source: str | None = None
++
++    def _to_s(self, indent: str) -> list[str]:
++        lines = [f"{indent}Windows:"]
++
++        for name, window in self.windows.items():
++            lines.append(f"{indent}  - {name}: {window.sql()}")
++
++        return lines
++
++
+ class SetOperation(Step):
+     def __init__(self, op: type[exp.Expr], left: str, right: str, distinct: bool = False) -> None:
+         super().__init__()

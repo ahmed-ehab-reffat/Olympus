@@ -1,0 +1,396 @@
+diff --git a/crates/path/src/lib.rs b/crates/path/src/lib.rs
+index 3dbb5ab..ba524b1 100644
+--- a/crates/path/src/lib.rs
++++ b/crates/path/src/lib.rs
+@@ -203,6 +203,12 @@ pub enum LineJoin {
+     /// The bevel shape is a triangle that fills the area between the two stroked
+     /// segments.
+     Bevel,
++    /// The join surface follows the circular arc implied by the join point and
++    /// its two neighboring stroke points, keeping curvature continuous through
++    /// the corner. Falls back to a beveled corner when the join point and its
++    /// neighbors are collinear or when the join would reach farther than the
++    /// miter limit times the half stroke width from the join point.
++    Arcs,
+ }
+ 
+ /// The positive or negative side of a vector or segment.
+diff --git a/crates/tessellation/src/stroke.rs b/crates/tessellation/src/stroke.rs
+index 5a92f77..fa54acb 100644
+--- a/crates/tessellation/src/stroke.rs
++++ b/crates/tessellation/src/stroke.rs
+@@ -314,6 +314,7 @@ pub(crate) struct SidePoints {
+     single_vertex: Option<Point>,
+     prev_vertex: VertexId,
+     next_vertex: VertexId,
++    arcs_peak: Option<Point>,
+ }
+ 
+ #[derive(Copy, Clone, Debug)]
+@@ -344,6 +345,7 @@ impl Default for EndpointData {
+                 next: point(f32::NAN, f32::NAN),
+                 next_vertex: VertexId(u32::MAX),
+                 single_vertex: None,
++                arcs_peak: None,
+             }; 2],
+             fold: [false, false],
+             is_flattening_step: false,
+@@ -1726,12 +1728,248 @@ fn compute_join_side_positions_fixed_width(
+                 get_clip_intersections(n0, n1, front_normal, miter_limit * vertex.half_width);
+             join.side_points[front_side].prev = join.position + prev_normal;
+             join.side_points[front_side].next = join.position + next_normal;
++        } else if join.line_join == LineJoin::Arcs && !miter_limit_is_exceeded(front_normal, miter_limit) {
++            join.side_points[front_side].arcs_peak = arcs_join_position(
++                prev.position,
++                join.position,
++                next.position,
++                front_normal,
++                vertex.half_width,
++            );
+         }
+     }
+ 
+     Ok(())
+ }
+ 
++/// Circumcenter and circumradius of the triangle formed by three points, or
++/// `None` if the points are collinear (within a small tolerance).
++#[cfg_attr(feature = "profiling", inline(never))]
++fn circumcircle(a: Point, b: Point, c: Point) -> Option<(Point, f32)> {
++    let ax = a.x;
++    let ay = a.y;
++    let bx = b.x;
++    let by = b.y;
++    let cx = c.x;
++    let cy = c.y;
++
++    let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
++    if d.abs() < 1e-4 {
++        return None;
++    }
++
++    let a2 = ax * ax + ay * ay;
++    let b2 = bx * bx + by * by;
++    let c2 = cx * cx + cy * cy;
++
++    let ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d;
++    let uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
++
++    let center = point(ux, uy);
++    let radius = (center - b).length();
++
++    nan_check!(center);
++    debug_assert!(!radius.is_nan());
++
++    Some((center, radius))
++}
++
++/// The extrapolated-arc join vertex on the `front_normal` side, or `None`
++/// when the neighboring points are collinear.
++#[cfg_attr(feature = "profiling", inline(never))]
++fn arcs_join_position(
++    prev_pos: Point,
++    join_pos: Point,
++    next_pos: Point,
++    front_normal: Vector,
++    half_width: f32,
++) -> Option<Point> {
++    let (center, radius) = circumcircle(prev_pos, join_pos, next_pos)?;
++
++    let radial = (join_pos - center).normalize();
++    let sign = if radial.dot(front_normal) >= 0.0 { 1.0 } else { -1.0 };
++    let offset_radius = radius + sign * half_width;
++    if offset_radius <= 0.0 {
++        return None;
++    }
++
++    let result = center + radial * offset_radius;
++    nan_check!(result);
++
++    Some(result)
++}
++
++/// The normal at a join between `prev_tangent` and `next_tangent`, on the
++/// positive side (see [`compute_normal`]) when `positive_side` is `true`, or
++/// the opposite side otherwise.
++fn side_signed_normal(prev_tangent: Vector, next_tangent: Vector, positive_side: bool) -> Vector {
++    let normal = compute_normal(prev_tangent, next_tangent);
++    if positive_side {
++        normal
++    } else {
++        -normal
++    }
++}
++
++/// Computes the join vertex a `LineJoin::Arcs` join would use on the requested
++/// side of the turn from `prev` through `join` to `next` (`positive_side`
++/// selects the side described in [`compute_normal`], `!positive_side` the
++/// other one), or `None` when that side would fall back to a plain `Bevel`
++/// corner (either because `prev`, `join` and `next` are collinear, or because
++/// the join would exceed `miter_limit`).
++///
++/// `prev`, `join` and `next` are three consecutive points on a stroked path's
++/// centerline and `half_width` is half of the stroke's line width at `join`.
++/// This mirrors the geometry the stroke tessellator produces for an `Arcs`
++/// join on that side without requiring a full path or a tessellation pass,
++/// which is useful for previewing or hit-testing a stroke outline ahead of
++/// time. When the requested side is the concave (inner) side of the turn,
++/// the tessellator connects it directly regardless of `line_join` and does
++/// not use this geometry; this function still reports what an `Arcs` join
++/// would compute for that side in isolation.
++#[cfg_attr(feature = "profiling", inline(never))]
++pub fn compute_arcs_join(
++    prev: Point,
++    join: Point,
++    next: Point,
++    half_width: f32,
++    miter_limit: f32,
++    positive_side: bool,
++) -> Option<Point> {
++    debug_assert!(half_width > 0.0 && half_width.is_finite());
++    debug_assert!(miter_limit >= StrokeOptions::MINIMUM_MITER_LIMIT);
++    nan_check!(prev, join, next);
++    if prev == join || join == next {
++        return None;
++    }
++
++    let prev_tangent = (join - prev).normalize();
++    let next_tangent = (next - join).normalize();
++    let normal = side_signed_normal(prev_tangent, next_tangent, positive_side);
++
++    if miter_limit_is_exceeded(normal, miter_limit) {
++        return None;
++    }
++
++    arcs_join_position(prev, join, next, normal, half_width)
++}
++
++/// Returns `true` when the requested side (`positive_side` selects the side
++/// described in [`compute_normal`], `!positive_side` the other one) of the
++/// turn from `prev` through `join` to `next` is the convex side of the turn:
++/// the side an actual stroke tessellation draws a `LineJoin::Arcs` fan on.
++/// The other, concave side always connects directly regardless of
++/// `line_join`, and [`compute_arcs_join`]'s result is not used by the
++/// tessellator there.
++#[cfg_attr(feature = "profiling", inline(never))]
++pub fn arcs_join_side_is_convex(prev: Point, join: Point, next: Point, positive_side: bool) -> bool {
++    nan_check!(prev, join, next);
++    debug_assert!(prev != join && join != next, "prev, join and next must be distinct points");
++
++    let prev_tangent = (join - prev).normalize();
++    let next_tangent = (next - join).normalize();
++    nan_check!(prev_tangent, next_tangent);
++
++    let positive_is_convex = prev_tangent.cross(next_tangent) < 0.0;
++    positive_is_convex == positive_side
++}
++
++/// Computes the polyline `[start, .., peak, .., end]` that an actual
++/// `LineJoin::Arcs` join on the requested side would tessellate at the given
++/// `tolerance` (see `StrokeOptions::tolerance`), or an empty vector under the
++/// same fallback conditions as [`compute_arcs_join`].
++///
++/// `start` and `end` are the stroke's offset points on the requested side of
++/// the `prev`-to-`join` and `join`-to-`next` edges; `peak` is the point
++/// [`compute_arcs_join`] would return for the same inputs.
++#[cfg_attr(feature = "profiling", inline(never))]
++pub fn compute_arcs_join_polyline(
++    prev: Point,
++    join: Point,
++    next: Point,
++    half_width: f32,
++    miter_limit: f32,
++    tolerance: f32,
++    positive_side: bool,
++) -> Vec<Point> {
++    debug_assert!(half_width > 0.0 && half_width.is_finite());
++    debug_assert!(tolerance > 0.0 && tolerance.is_finite());
++    debug_assert!(miter_limit >= StrokeOptions::MINIMUM_MITER_LIMIT);
++    nan_check!(prev, join, next);
++    if prev == join || join == next {
++        return Vec::new();
++    }
++
++    let prev_tangent = (join - prev).normalize();
++    let next_tangent = (next - join).normalize();
++    let normal = side_signed_normal(prev_tangent, next_tangent, positive_side);
++
++    if miter_limit_is_exceeded(normal, miter_limit) {
++        return Vec::new();
++    }
++
++    let peak = match arcs_join_position(prev, join, next, normal, half_width) {
++        Some(p) => p,
++        None => return Vec::new(),
++    };
++
++    let side_sign = if positive_side { 1.0 } else { -1.0 };
++    let start = join + vector(-prev_tangent.y, prev_tangent.x) * half_width * side_sign;
++    let end = join + vector(-next_tangent.y, next_tangent.x) * half_width * side_sign;
++    nan_check!(start, end);
++
++    let angle_sign = if positive_side { -1.0 } else { 1.0 };
++    let start_angle = (start - join).angle_from_x_axis();
++
++    let mut peak_diff = start_angle.angle_to((peak - join).angle_from_x_axis());
++    if peak_diff.radians * angle_sign < 0.0 {
++        peak_diff.radians = angle_sign * (2.0 * PI - peak_diff.radians.abs());
++    }
++    let peak_angle = (start_angle + peak_diff).radians;
++
++    let mut end_diff = start_angle.angle_to((end - join).angle_from_x_axis());
++    if end_diff.radians * angle_sign < 0.0 {
++        end_diff.radians = angle_sign * (2.0 * PI - end_diff.radians.abs());
++    }
++    let end_angle = (start_angle + end_diff).radians;
++
++    let step = circle_flattening_step(half_width, tolerance);
++
++    let mut points = Vec::new();
++    points.push(start);
++    push_arc_subdivisions(&mut points, join, half_width, start_angle.radians, peak_angle, step);
++    points.push(peak);
++    push_arc_subdivisions(&mut points, join, half_width, peak_angle, end_angle, step);
++    points.push(end);
++
++    debug_assert!(points.len() >= 3, "polyline must contain at least start, peak and end");
++    debug_assert!(
++        points.iter().all(|p| (*p - join).length() > 0.0),
++        "no polyline point should coincide with the join"
++    );
++
++    points
++}
++
++/// Pushes the intermediate points of a circular arc of radius `radius`
++/// centered on `center`, strictly between the angles `a0` and `a1` (both
++/// exclusive), onto `points`. The number of intermediate points is derived
++/// from `step`, the maximum angular span (in radians) of a single segment.
++#[cfg_attr(feature = "profiling", inline(never))]
++fn push_arc_subdivisions(points: &mut Vec<Point>, center: Point, radius: f32, a0: f32, a1: f32, step: f32) {
++    debug_assert!(radius > 0.0);
++    debug_assert!(a0.is_finite() && a1.is_finite());
++    nan_check!(center);
++    let num_segments = ((a1 - a0).abs() / step).ceil().max(1.0) as u32;
++    for i in 1..num_segments {
++        let t = i as f32 / num_segments as f32;
++        let a = a0 + (a1 - a0) * t;
++        let p = center + vector(a.cos(), a.sin()) * radius;
++        nan_check!(p);
++        points.push(p);
++    }
++}
++
+ // A fast path for when we know we are in a flattened curve, taking
+ // advantage of knowing that we don't have to handle special joins.
+ //
+@@ -1958,6 +2196,8 @@ fn tessellate_join(
+ 
+         if join.line_join == LineJoin::Round {
+             tessellate_round_join(join, side, options, vertex, attributes, output)?;
++        } else if join.line_join == LineJoin::Arcs && join.side_points[side].arcs_peak.is_some() {
++            tessellate_arcs_join(join, side, options, vertex, attributes, output)?;
+         }
+     }
+ 
+@@ -2020,6 +2260,90 @@ fn tessellate_round_join(
+     )
+ }
+ 
++#[cfg_attr(feature = "profiling", inline(never))]
++fn tessellate_arcs_join(
++    join: &mut EndpointData,
++    side: usize,
++    options: &StrokeOptions,
++    vertex: &mut StrokeVertexData,
++    attributes: &dyn AttributeStore,
++    output: &mut dyn StrokeGeometryBuilder,
++) -> Result<(), TessellationError> {
++    let center = join.position;
++    let radius = join.half_width;
++    let peak = join.side_points[side].arcs_peak.unwrap();
++    let start_normal = join.side_points[side].prev - center;
++    let end_normal = join.side_points[side].next - center;
++    let peak_normal = peak - center;
++
++    let mut start_vertex = join.side_points[side].prev_vertex;
++    let mut end_vertex = join.side_points[side].next_vertex;
++
++    let angle_sign = if side == SIDE_NEGATIVE { 1.0 } else { -1.0 };
++
++    let mut start_angle = start_normal.angle_from_x_axis();
++    let mut diff = start_angle.angle_to(end_normal.angle_from_x_axis());
++    if diff.radians * angle_sign < 0.0 {
++        diff.radians = angle_sign * (2.0 * PI - diff.radians.abs());
++    }
++    let mut end_angle = start_angle + diff;
++
++    let mut peak_diff = start_angle.angle_to(peak_normal.angle_from_x_axis());
++    if peak_diff.radians * angle_sign < 0.0 {
++        peak_diff.radians = angle_sign * (2.0 * PI - peak_diff.radians.abs());
++    }
++
++    if peak_diff.radians.abs() > diff.radians.abs() {
++        // The curvature-derived peak fell outside the swept range between the two
++        // side offsets; keep the base triangle already produced by the caller and
++        // skip the additional fan rather than risk a self-crossing arc.
++        return Ok(());
++    }
++
++    let peak_angle = start_angle + peak_diff;
++
++    if side == SIDE_NEGATIVE {
++        core::mem::swap(&mut start_angle, &mut end_angle);
++        core::mem::swap(&mut start_vertex, &mut end_vertex);
++    }
++
++    let step = circle_flattening_step(radius, options.tolerance);
++
++    vertex.side = if side == SIDE_POSITIVE {
++        Side::Positive
++    } else {
++        Side::Negative
++    };
++    vertex.normal = peak_normal / radius;
++    let peak_vertex = output.add_stroke_vertex(StrokeVertex(vertex, attributes))?;
++
++    let first_span = (peak_angle.radians - start_angle.radians).abs();
++    let num_subdivisions_1 = (first_span / step).ceil().max(1.0).log2().round().max(1.0) as u32;
++
++    let second_span = (end_angle.radians - peak_angle.radians).abs();
++    let num_subdivisions_2 = (second_span / step).ceil().max(1.0).log2().round().max(1.0) as u32;
++
++    tessellate_arc(
++        (start_angle.radians, peak_angle.radians),
++        start_vertex,
++        peak_vertex,
++        num_subdivisions_1,
++        vertex,
++        attributes,
++        output,
++    )?;
++
++    tessellate_arc(
++        (peak_angle.radians, end_angle.radians),
++        peak_vertex,
++        end_vertex,
++        num_subdivisions_2,
++        vertex,
++        attributes,
++        output,
++    )
++}
++
+ #[cfg_attr(feature = "profiling", inline(never))]
+ fn add_join_base_vertices(
+     join: &mut EndpointData,
+@@ -2124,6 +2448,9 @@ fn compute_join_side_positions(
+         nan_check!(n0, n1, prev_normal, next_normal);
+         nan_check!(join.side_points[side].prev);
+         nan_check!(join.side_points[side].next);
++    } else if join.line_join == LineJoin::Arcs && !miter_limit_is_exceeded(normal, miter_limit) {
++        join.side_points[side].arcs_peak =
++            arcs_join_position(prev.position, join.position, next.position, normal, join.half_width);
+     }
+ }
+ 

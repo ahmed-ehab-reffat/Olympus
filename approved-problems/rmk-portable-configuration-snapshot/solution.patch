@@ -1,0 +1,1112 @@
+diff --git a/rynk/rynk-wasm/src/client.rs b/rynk/rynk-wasm/src/client.rs
+index e6cb12b5..1c0c9c91 100644
+--- a/rynk/rynk-wasm/src/client.rs
++++ b/rynk/rynk-wasm/src/client.rs
+@@ -26,7 +26,7 @@ use rynk::rmk_types::protocol::rynk::{
+     LockStatus, MacroData, MatrixState, PeripheralStatus, ProtocolVersion, SetComboBulkRequest, SetKeymapBulkRequest,
+     SetMorseBulkRequest, StorageResetMode,
+ };
+-use rynk::{Client, Driver, LayoutInfo, RynkDevice, RynkHostError, TopicEvent};
++use rynk::{Client, ConfigurationSnapshot, Driver, LayoutInfo, RynkDevice, RynkHostError, TopicEvent};
+ use wasm_bindgen::prelude::*;
+ 
+ use crate::transport::{JsByteLink, WasmReader, WasmWriter};
+@@ -59,20 +59,37 @@ pub async fn connect(link: JsByteLink) -> Result<RynkClient, JsValue> {
+ }
+ 
+ impl RynkClient {
++    async fn drive_with<T, E>(
++        &self,
++        fut: impl Future<Output = Result<T, E>>,
++        map_error: impl Fn(E) -> JsValue + Copy,
++    ) -> Result<T, JsValue> {
++        let mut fut = pin!(fut);
++        match select(self.driver.lock(), &mut fut).await {
++            Either::Second(result) => result.map_err(map_error),
++            Either::First(mut driver) => match select(driver.run(&self.client), &mut fut).await {
++                Either::First(error) => Err(error.into()),
++                Either::Second(result) => result.map_err(map_error),
++            },
++        }
++    }
++
+     /// Run one client future full-duplex: race it against locking the driver.
+     /// The lock winner pumps both directions for every parked call, and
+     /// releasing the lock when its own future resolves hands the pump to a
+     /// parked call. A dead link surfaces from the pump arm and reproduces for
+     /// every later call — the closed transport keeps reporting EOF.
+     async fn drive<T>(&self, fut: impl Future<Output = Result<T, RynkHostError>>) -> Result<T, JsValue> {
+-        let mut fut = pin!(fut);
+-        match select(self.driver.lock(), &mut fut).await {
+-            Either::Second(r) => r.map_err(Into::into),
+-            Either::First(mut driver) => match select(driver.run(&self.client), &mut fut).await {
+-                Either::First(err) => Err(err.into()),
+-                Either::Second(r) => r.map_err(Into::into),
+-            },
+-        }
++        self.drive_with(fut, |error: RynkHostError| error.into()).await
++    }
++
++    /// Snapshot operations have richer validation/progress errors than one
++    /// protocol endpoint, but participate in the same driver-pump election.
++    async fn drive_snapshot<T, E: core::fmt::Display>(
++        &self,
++        fut: impl Future<Output = Result<T, E>>,
++    ) -> Result<T, JsValue> {
++        self.drive_with(fut, snapshot_js_error).await
+     }
+ }
+ 
+@@ -85,6 +102,24 @@ impl RynkClient {
+     pub async fn next_topic(&self) -> Result<TopicEvent, JsValue> {
+         self.drive(async { Ok(self.client.next_topic().await) }).await
+     }
++
++    /// Export all mutable configuration as deterministic, versioned bytes.
++    pub async fn export_configuration_snapshot(&self) -> Result<Vec<u8>, JsValue> {
++        let snapshot = self.drive_snapshot(self.client.export_configuration()).await?;
++        snapshot.to_bytes().map_err(snapshot_js_error)
++    }
++
++    /// Decode, preflight, and restore a configuration snapshot.
++    pub async fn restore_configuration_snapshot(&self, bytes: Vec<u8>) -> Result<(), JsValue> {
++        let snapshot = ConfigurationSnapshot::from_bytes(&bytes).map_err(snapshot_js_error)?;
++        self.drive_snapshot(self.client.restore_configuration(&snapshot)).await
++    }
++}
++
++fn snapshot_js_error(error: impl core::fmt::Display) -> JsValue {
++    let js_error = js_sys::Error::new(&error.to_string());
++    js_error.set_name("ConfigurationSnapshotError");
++    js_error.into()
+ }
+ 
+ /// Generate the typed wasm request methods from the native client shape.
+diff --git a/rynk/src/lib.rs b/rynk/src/lib.rs
+index 94d552aa..f1662f53 100644
+--- a/rynk/src/lib.rs
++++ b/rynk/src/lib.rs
+@@ -98,6 +98,8 @@ mod device;
+ mod driver;
+ #[cfg(feature = "alloc")]
+ pub mod layout;
++#[cfg(feature = "alloc")]
++mod snapshot;
+ 
+ pub use device::RynkDevice;
+ pub use driver::{Client, Driver, RynkHostError};
+@@ -107,3 +109,7 @@ pub use layout::LayoutInfo;
+ pub use rmk_types;
+ /// The decoded topic union returned by [`Client::next_topic`]
+ pub use rmk_types::protocol::rynk::TopicEvent;
++#[cfg(feature = "alloc")]
++pub use snapshot::{
++    ConfigurationSnapshot, RestoreError, RestoreStage, SNAPSHOT_VERSION, SnapshotError, SnapshotGeometry, SnapshotRead,
++};
+diff --git a/rynk/src/snapshot.rs b/rynk/src/snapshot.rs
+new file mode 100644
+index 00000000..6fee95f8
+--- /dev/null
++++ b/rynk/src/snapshot.rs
+@@ -0,0 +1,1001 @@
++//! Portable, versioned snapshots of every mutable keyboard configuration resource.
++
++use alloc::vec::Vec;
++
++use heapless::Vec as HeaplessVec;
++use rmk_types::action::{EncoderAction, KeyAction};
++use rmk_types::combo::Combo;
++use rmk_types::constants::MACRO_DATA_SIZE;
++use rmk_types::fork::Fork;
++use rmk_types::morse::Morse;
++use rmk_types::protocol::rynk::{
++    BehaviorConfig, Cmd, DeviceCapabilities, DeviceInfo, KeyPosition, MacroData, SetComboBulkRequest,
++    SetComboRequest, SetEncoderRequest, SetForkRequest, SetKeyRequest, SetKeymapBulkRequest, SetMacroRequest,
++    SetMorseBulkRequest, SetMorseRequest,
++};
++use postcard::experimental::serialized_size;
++use serde::{Deserialize, Serialize};
++use thiserror::Error;
++
++use crate::{Client, RynkHostError};
++
++/// Current on-disk snapshot format version.
++pub const SNAPSHOT_VERSION: u16 = 1;
++
++/// Configuration dimensions a target must be able to hold before a snapshot
++/// can be restored.
++///
++/// Transport limits are deliberately omitted: a snapshot is portable between
++/// devices with a compatible configuration shape even when their transports
++/// use different frame or bulk-page sizes.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub struct SnapshotGeometry {
++    pub num_layers: u8,
++    pub num_rows: u8,
++    pub num_cols: u8,
++    pub num_encoders: u8,
++    pub max_combos: u8,
++    pub max_combo_keys: u8,
++    pub macro_space_size: u16,
++    pub max_morse: u8,
++    pub max_patterns_per_key: u8,
++    pub max_forks: u8,
++}
++
++impl SnapshotGeometry {
++    /// Whether a device of this shape can hold `snapshot`'s configuration.
++    ///
++    /// A larger device keeps its extra layers, keys, encoders, slots, and
++    /// macro bytes, so growth in any dimension stays compatible; a device that
++    /// is smaller anywhere could not hold every configured entry.
++    fn accepts(&self, snapshot: &SnapshotGeometry) -> bool {
++        self.num_layers >= snapshot.num_layers
++            && self.num_rows >= snapshot.num_rows
++            && self.num_cols >= snapshot.num_cols
++            && self.num_encoders >= snapshot.num_encoders
++            && self.max_combos >= snapshot.max_combos
++            && self.max_combo_keys >= snapshot.max_combo_keys
++            && self.macro_space_size >= snapshot.macro_space_size
++            && self.max_morse >= snapshot.max_morse
++            && self.max_patterns_per_key >= snapshot.max_patterns_per_key
++            && self.max_forks >= snapshot.max_forks
++    }
++}
++
++impl From<DeviceCapabilities> for SnapshotGeometry {
++    fn from(value: DeviceCapabilities) -> Self {
++        Self {
++            num_layers: value.num_layers,
++            num_rows: value.num_rows,
++            num_cols: value.num_cols,
++            num_encoders: value.num_encoders,
++            max_combos: value.max_combos,
++            max_combo_keys: value.max_combo_keys,
++            macro_space_size: value.macro_space_size,
++            max_morse: value.max_morse,
++            max_patterns_per_key: value.max_patterns_per_key,
++            max_forks: value.max_forks,
++        }
++    }
++}
++
++/// A deterministic snapshot of all mutable Rynk configuration.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct ConfigurationSnapshot {
++    pub version: u16,
++    pub device_info: DeviceInfo,
++    pub geometry: SnapshotGeometry,
++    pub default_layer: u8,
++    /// Layer-major, then row-major, then column-major.
++    pub keymap: Vec<KeyAction>,
++    /// Layer-major, then encoder-id-major.
++    pub encoders: Vec<EncoderAction>,
++    pub combos: Vec<Combo>,
++    pub forks: Vec<Fork>,
++    pub morses: Vec<Morse>,
++    /// Exactly `geometry.macro_space_size` bytes, including unused zeroes.
++    pub macro_data: Vec<u8>,
++    pub behavior: BehaviorConfig,
++}
++
++impl ConfigurationSnapshot {
++    /// Encode using postcard. Equal snapshots always produce equal bytes.
++    pub fn to_bytes(&self) -> Result<Vec<u8>, SnapshotError> {
++        self.validate()?;
++        let mut canonical = self.clone();
++        // `KeyAction::TapHold` carries a morse-profile index that its own
++        // `PartialEq` deliberately ignores, so two snapshots can be equal while
++        // differing in that byte. Normalise it, or equal snapshots would not
++        // encode alike.
++        for action in canonical.keymap.iter_mut() {
++            normalize_key_action(action);
++        }
++        for encoder in canonical.encoders.iter_mut() {
++            normalize_key_action(&mut encoder.clockwise);
++            normalize_key_action(&mut encoder.counter_clockwise);
++        }
++        for combo in canonical.combos.iter_mut() {
++            for action in combo.actions.iter_mut() {
++                normalize_key_action(action);
++            }
++            normalize_key_action(&mut combo.output);
++        }
++        for fork in canonical.forks.iter_mut() {
++            normalize_key_action(&mut fork.trigger);
++            normalize_key_action(&mut fork.negative_output);
++            normalize_key_action(&mut fork.positive_output);
++        }
++        // Morse equality is map-based while heapless::LinearMap serializes in
++        // insertion order. Sort its entries so semantically equal snapshots
++        // cannot acquire different persistent bytes.
++        for morse in &mut canonical.morses {
++            let mut actions: Vec<_> = morse
++                .actions
++                .iter()
++                .map(|(pattern, action)| (*pattern, *action))
++                .collect();
++            actions.sort_unstable_by_key(|(pattern, _)| pattern.to_u16());
++            morse.actions.clear();
++            for (pattern, action) in actions {
++                morse
++                    .actions
++                    .insert(pattern, action)
++                    .expect("canonicalization preserves the validated item count");
++            }
++        }
++        postcard::to_allocvec(&canonical).map_err(SnapshotError::Codec)
++    }
++
++    /// Decode one complete snapshot, rejecting trailing data and unknown versions.
++    pub fn from_bytes(bytes: &[u8]) -> Result<Self, SnapshotError> {
++        let (snapshot, trailing) =
++            postcard::take_from_bytes::<ConfigurationSnapshot>(bytes).map_err(SnapshotError::Codec)?;
++        if !trailing.is_empty() {
++            return Err(SnapshotError::TrailingBytes);
++        }
++        snapshot.validate()?;
++        Ok(snapshot)
++    }
++
++    /// Validate format version, dimensions, and all collection lengths.
++    pub fn validate(&self) -> Result<(), SnapshotError> {
++        if self.version != SNAPSHOT_VERSION {
++            return Err(SnapshotError::UnsupportedVersion(self.version));
++        }
++
++        let keymap_len = checked_product(&[
++            self.geometry.num_layers as usize,
++            self.geometry.num_rows as usize,
++            self.geometry.num_cols as usize,
++        ])?;
++        let encoder_len = checked_product(&[self.geometry.num_layers as usize, self.geometry.num_encoders as usize])?;
++
++        require_len("keymap", self.keymap.len(), keymap_len)?;
++        require_len("encoders", self.encoders.len(), encoder_len)?;
++        require_len("combos", self.combos.len(), self.geometry.max_combos as usize)?;
++        require_len("forks", self.forks.len(), self.geometry.max_forks as usize)?;
++        require_len("morses", self.morses.len(), self.geometry.max_morse as usize)?;
++        require_len(
++            "macro_data",
++            self.macro_data.len(),
++            self.geometry.macro_space_size as usize,
++        )?;
++        for (index, combo) in self.combos.iter().enumerate() {
++            require_item_limit(
++                "combo actions",
++                index,
++                combo.actions.len(),
++                self.geometry.max_combo_keys as usize,
++            )?;
++            if let Some(layer) = combo.layer {
++                if layer >= self.geometry.num_layers {
++                    return Err(SnapshotError::InvalidComboLayer {
++                        index,
++                        layer,
++                        num_layers: self.geometry.num_layers,
++                    });
++                }
++            }
++        }
++        for (index, morse) in self.morses.iter().enumerate() {
++            require_item_limit(
++                "morse patterns",
++                index,
++                morse.actions.len(),
++                self.geometry.max_patterns_per_key as usize,
++            )?;
++        }
++
++        if self.geometry.num_layers == 0 || self.default_layer >= self.geometry.num_layers {
++            return Err(SnapshotError::InvalidDefaultLayer {
++                layer: self.default_layer,
++                num_layers: self.geometry.num_layers,
++            });
++        }
++        Ok(())
++    }
++
++    fn validate_target(&self, info: &DeviceInfo, caps: DeviceCapabilities) -> Result<(), SnapshotError> {
++        self.validate()?;
++        validate_macro_chunk(caps)?;
++
++        // Manufacturer label, serial number, and firmware version are
++        // intentionally not compared: a portable snapshot targets another
++        // unit of the same keyboard model.
++        if self.device_info.vendor_id != info.vendor_id
++            || self.device_info.product_id != info.product_id
++            || self.device_info.product_name != info.product_name
++        {
++            return Err(SnapshotError::IncompatibleDeviceIdentity);
++        }
++        let actual = SnapshotGeometry::from(caps);
++        if !actual.accepts(&self.geometry) {
++            return Err(SnapshotError::IncompatibleGeometry {
++                snapshot: self.geometry,
++                device: actual,
++            });
++        }
++        Ok(())
++    }
++}
++
++/// Individual operations used while exporting a snapshot.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SnapshotRead {
++    Capabilities,
++    DeviceInfo,
++    DefaultLayer,
++    Keymap,
++    Encoder { layer: u8, encoder_id: u8 },
++    Combos,
++    Fork { index: u8 },
++    Morses,
++    Macro { offset: u16 },
++    Behavior,
++}
++
++/// Deterministic dirty-resource restore stages, reported when a write fails.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum RestoreStage {
++    Keymap,
++    Encoders,
++    Combos,
++    Forks,
++    Morses,
++    Macros,
++    Behavior,
++    DefaultLayer,
++}
++
++/// Snapshot validation, compatibility, encoding, and export errors.
++#[derive(Debug, Error)]
++pub enum SnapshotError {
++    #[error("snapshot codec error: {0}")]
++    Codec(postcard::Error),
++    #[error("snapshot has trailing bytes")]
++    TrailingBytes,
++    #[error("unsupported snapshot version {0}")]
++    UnsupportedVersion(u16),
++    #[error("snapshot dimensions overflow addressable memory")]
++    DimensionOverflow,
++    #[error("snapshot field {field} has length {actual}, expected {expected}")]
++    InvalidLength {
++        field: &'static str,
++        actual: usize,
++        expected: usize,
++    },
++    #[error("snapshot {field} entry {index} has {actual} items, maximum {maximum}")]
++    ItemLimitExceeded {
++        field: &'static str,
++        index: usize,
++        actual: usize,
++        maximum: usize,
++    },
++    #[error("combo {index} selects layer {layer}, outside the snapshot's {num_layers} layers")]
++    InvalidComboLayer { index: usize, layer: u8, num_layers: u8 },
++    #[error("default layer {layer} is invalid for a {num_layers}-layer snapshot")]
++    InvalidDefaultLayer { layer: u8, num_layers: u8 },
++    #[error("device does not support whole-configuration bulk transfer")]
++    BulkTransferUnsupported,
++    #[error("device advertises an invalid zero macro chunk size")]
++    ZeroMacroChunkSize,
++    #[error("device macro chunk size {actual} exceeds host capacity {maximum}")]
++    MacroChunkTooLarge { actual: usize, maximum: usize },
++    #[error("snapshot belongs to a different keyboard model")]
++    IncompatibleDeviceIdentity,
++    #[error("snapshot geometry {snapshot:?} does not fit device geometry {device:?}")]
++    IncompatibleGeometry {
++        snapshot: SnapshotGeometry,
++        device: SnapshotGeometry,
++    },
++    #[error("a {stage:?} write does not fit this device's frame: {source}")]
++    UnencodableWrite {
++        stage: RestoreStage,
++        #[source]
++        source: RynkHostError,
++    },
++    #[error("export read {operation:?} failed: {source}")]
++    Read {
++        operation: SnapshotRead,
++        #[source]
++        source: RynkHostError,
++    },
++}
++
++/// A preflight or write failure while restoring configuration.
++///
++/// Restore is deliberately not described as atomic. For [`Self::Write`],
++/// every listed dirty stage was fully applied, `stage` is the dirty stage that
++/// failed, and later dirty stages were not attempted. Equal resources that
++/// were skipped are not listed. [`Self::Preflight`] guarantees that no
++/// mutating request was sent.
++#[derive(Debug, Error)]
++pub enum RestoreError {
++    #[error("restore preflight failed: {0}")]
++    Preflight(#[source] SnapshotError),
++    #[error("restore failed in {stage:?} after completed stages {completed:?}: {source}")]
++    Write {
++        completed: Vec<RestoreStage>,
++        stage: RestoreStage,
++        #[source]
++        source: RynkHostError,
++    },
++}
++
++impl Client {
++    /// Read the whole keymap. The crate's pager is the fast path but is gated on
++    /// bulk transfer, which only restore requires; a device without it still
++    /// advertises a keymap, so fall back to addressing each key.
++    #[cfg(feature = "alloc")]
++    async fn read_keymap(&self, caps: DeviceCapabilities) -> Result<Vec<KeyAction>, RynkHostError> {
++        if caps.bulk_transfer_supported {
++            return self.read_all_keymap().await;
++        }
++        let mut keymap =
++            Vec::with_capacity(caps.num_layers as usize * caps.num_rows as usize * caps.num_cols as usize);
++        for layer in 0..caps.num_layers {
++            for row in 0..caps.num_rows {
++                for col in 0..caps.num_cols {
++                    keymap.push(self.get_key(layer, row, col).await?);
++                }
++            }
++        }
++        Ok(keymap)
++    }
++
++    /// Read every combo slot, per entry when bulk transfer is unavailable.
++    #[cfg(feature = "alloc")]
++    async fn read_combos(&self, caps: DeviceCapabilities) -> Result<Vec<Combo>, RynkHostError> {
++        if caps.bulk_transfer_supported {
++            return self.read_all_combos().await;
++        }
++        let mut combos = Vec::with_capacity(caps.max_combos as usize);
++        for index in 0..caps.max_combos {
++            combos.push(self.get_combo(index).await?);
++        }
++        Ok(combos)
++    }
++
++    /// Read every Morse slot, per entry when bulk transfer is unavailable.
++    #[cfg(feature = "alloc")]
++    async fn read_morses(&self, caps: DeviceCapabilities) -> Result<Vec<Morse>, RynkHostError> {
++        if caps.bulk_transfer_supported {
++            return self.read_all_morses().await;
++        }
++        let mut morses = Vec::with_capacity(caps.max_morse as usize);
++        for index in 0..caps.max_morse {
++            morses.push(self.get_morse(index).await?);
++        }
++        Ok(morses)
++    }
++
++    /// Read all mutable configuration into one portable snapshot.
++    #[cfg(feature = "alloc")]
++    pub async fn export_configuration(&self) -> Result<ConfigurationSnapshot, SnapshotError> {
++        let caps = self.get_capabilities().await.map_err(|source| SnapshotError::Read {
++            operation: SnapshotRead::Capabilities,
++            source,
++        })?;
++        let device_info = self.get_device_info().await.map_err(|source| SnapshotError::Read {
++            operation: SnapshotRead::DeviceInfo,
++            source,
++        })?;
++        self.export_with(caps, device_info).await
++    }
++
++    /// The body of [`export_configuration`](Self::export_configuration), taking
++    /// capabilities and identity the caller has already read. Restore reuses it
++    /// so acquiring the baseline does not repeat its own preflight reads.
++    #[cfg(feature = "alloc")]
++    async fn export_with(
++        &self,
++        caps: DeviceCapabilities,
++        device_info: DeviceInfo,
++    ) -> Result<ConfigurationSnapshot, SnapshotError> {
++        validate_macro_chunk(caps)?;
++        let default_layer = self.get_default_layer().await.map_err(|source| SnapshotError::Read {
++            operation: SnapshotRead::DefaultLayer,
++            source,
++        })?;
++        let keymap = self.read_keymap(caps).await.map_err(|source| SnapshotError::Read {
++            operation: SnapshotRead::Keymap,
++            source,
++        })?;
++
++        let mut encoders = Vec::with_capacity(caps.num_layers as usize * caps.num_encoders as usize);
++        for layer in 0..caps.num_layers {
++            for encoder_id in 0..caps.num_encoders {
++                encoders.push(
++                    self.get_encoder(encoder_id, layer)
++                        .await
++                        .map_err(|source| SnapshotError::Read {
++                            operation: SnapshotRead::Encoder { layer, encoder_id },
++                            source,
++                        })?,
++                );
++            }
++        }
++
++        let combos = self.read_combos(caps).await.map_err(|source| SnapshotError::Read {
++            operation: SnapshotRead::Combos,
++            source,
++        })?;
++        let mut forks = Vec::with_capacity(caps.max_forks as usize);
++        for index in 0..caps.max_forks {
++            forks.push(self.get_fork(index).await.map_err(|source| SnapshotError::Read {
++                operation: SnapshotRead::Fork { index },
++                source,
++            })?);
++        }
++        let morses = self.read_morses(caps).await.map_err(|source| SnapshotError::Read {
++            operation: SnapshotRead::Morses,
++            source,
++        })?;
++
++        let mut macro_data = Vec::with_capacity(caps.macro_space_size as usize);
++        let chunk_size = caps.macro_chunk_size as usize;
++        let mut offset = 0usize;
++        while offset < caps.macro_space_size as usize {
++            let chunk = self
++                .get_macro(offset as u16)
++                .await
++                .map_err(|source| SnapshotError::Read {
++                    operation: SnapshotRead::Macro { offset: offset as u16 },
++                    source,
++                })?;
++            let remaining = caps.macro_space_size as usize - offset;
++            let take = remaining.min(chunk_size);
++            if chunk.data.len() < take {
++                return Err(SnapshotError::InvalidLength {
++                    field: "macro chunk",
++                    actual: chunk.data.len(),
++                    expected: take,
++                });
++            }
++            macro_data.extend_from_slice(&chunk.data[..take]);
++            offset += take;
++        }
++
++        let behavior = self.get_behavior().await.map_err(|source| SnapshotError::Read {
++            operation: SnapshotRead::Behavior,
++            source,
++        })?;
++        let snapshot = ConfigurationSnapshot {
++            version: SNAPSHOT_VERSION,
++            device_info,
++            geometry: caps.into(),
++            default_layer,
++            keymap,
++            encoders,
++            combos,
++            forks,
++            morses,
++            macro_data,
++            behavior,
++        };
++        snapshot.validate()?;
++        Ok(snapshot)
++    }
++
++    /// Restore only the entries that differ after reading a complete target
++    /// baseline. No device mutation occurs when preflight or baseline reads fail.
++    ///
++    /// The target may be larger than the snapshot in any dimension, so every
++    /// comparison and every write address is computed in the *target's*
++    /// coordinates while the snapshot is enumerated in its own. Positions the
++    /// snapshot does not describe are left exactly as they were found.
++    #[cfg(feature = "alloc")]
++    pub async fn restore_configuration(&self, snapshot: &ConfigurationSnapshot) -> Result<(), RestoreError> {
++        // The capabilities call is local. Identity is the only wire read and
++        // is intentionally completed before the first mutating request.
++        let caps = self.get_capabilities().await.map_err(|source| {
++            RestoreError::Preflight(SnapshotError::Read {
++                operation: SnapshotRead::Capabilities,
++                source,
++            })
++        })?;
++        let info = self.get_device_info().await.map_err(|source| {
++            RestoreError::Preflight(SnapshotError::Read {
++                operation: SnapshotRead::DeviceInfo,
++                source,
++            })
++        })?;
++        snapshot.validate_target(&info, caps).map_err(RestoreError::Preflight)?;
++
++        // A complete baseline is required before mutation. Besides making an
++        // identical restore a no-op, this prevents a late read failure from
++        // leaving a partially updated configuration. Capabilities and identity
++        // are already in hand, so the baseline does not re-read them.
++        let current = self
++            .export_with(caps, info)
++            .await
++            .map_err(RestoreError::Preflight)?;
++
++        let source = snapshot.geometry;
++        let device = SnapshotGeometry::from(caps);
++        let mut completed = Vec::new();
++
++        // Keys are addressed by coordinate, so a wider or taller target gives
++        // the same (layer, row, column) a different flat index. Comparing the
++        // two vectors position-by-position would read the wrong entries and
++        // grouping in the snapshot's own index space would span the target's
++        // untouched trailing columns.
++        let (source_rows, source_cols) = (source.num_rows as usize, source.num_cols as usize);
++        let (device_rows, device_cols) = (device.num_rows as usize, device.num_cols as usize);
++        // A bulk request may bridge matching entries, so planning needs every
++        // slot the snapshot reaches, not only the ones that differ.
++        let mut key_slots = Vec::new();
++        for layer in 0..source.num_layers as usize {
++            for row in 0..source_rows {
++                for col in 0..source_cols {
++                    let item = snapshot.keymap[(layer * source_rows + row) * source_cols + col];
++                    let index = (layer * device_rows + row) * device_cols + col;
++                    let dirty = current.keymap[index] != item;
++                    key_slots.push(Slot { index, item, dirty });
++                }
++            }
++        }
++        let mut combo_slots = Vec::new();
++        for index in 0..source.max_combos as usize {
++            let item = snapshot.combos[index].clone();
++            let dirty = current.combos[index] != item;
++            combo_slots.push(Slot { index, item, dirty });
++        }
++        let mut morse_slots = Vec::new();
++        for index in 0..source.max_morse as usize {
++            let item = snapshot.morses[index].clone();
++            let dirty = current.morses[index] != item;
++            morse_slots.push(Slot { index, item, dirty });
++        }
++
++        // Encoders are layer-major over the device's own encoder count, so the
++        // stride differs whenever the target carries more encoders per layer.
++        // There is no bulk encoder endpoint, so each dirty one is its own write.
++        let mut dirty_encoders = Vec::new();
++        for layer in 0..source.num_layers as usize {
++            for encoder_id in 0..source.num_encoders as usize {
++                let desired = snapshot.encoders[layer * source.num_encoders as usize + encoder_id];
++                if current.encoders[layer * device.num_encoders as usize + encoder_id] != desired {
++                    dirty_encoders.push((layer as u8, encoder_id as u8, desired));
++                }
++            }
++        }
++
++        // Forks are slot-addressed and have no bulk endpoint either.
++        let mut dirty_forks = Vec::new();
++        for index in 0..source.max_forks as usize {
++            if current.forks[index] != snapshot.forks[index] {
++                dirty_forks.push((index as u8, snapshot.forks[index]));
++            }
++        }
++
++        // The chunk grid comes from the target, but it only runs to the end of
++        // the snapshot's macro space: a larger target keeps its trailing bytes,
++        // so the final write is short whenever they do not divide evenly.
++        let mut dirty_macros = Vec::new();
++        let chunk_size = caps.macro_chunk_size as usize;
++        let mut offset = 0usize;
++        while offset < snapshot.macro_data.len() {
++            let end = (offset + chunk_size).min(snapshot.macro_data.len());
++            if current.macro_data[offset..end] != snapshot.macro_data[offset..end] {
++                let mut data = HeaplessVec::<u8, MACRO_DATA_SIZE>::new();
++                data.extend_from_slice(&snapshot.macro_data[offset..end])
++                    .expect("validated macro chunk capacity");
++                dirty_macros.push((offset as u16, MacroData { data }));
++            }
++            offset = end;
++        }
++
++        let behavior_dirty = current.behavior != snapshot.behavior;
++        let default_layer_dirty = current.default_layer != snapshot.default_layer;
++
++        let keymap_dirty = key_slots.iter().any(|slot| slot.dirty);
++        let budget = caps.max_payload_size as usize;
++        // 3 fixed bytes before the keymap items: layer, start_row, start_col.
++        // 1 before combo and Morse items: start_index.
++        // A device that does not page still has per-entry setters, so the same
++        // dirty set is planned either as bulk pages or as single writes. Both
++        // shapes are measured against the frame before anything is sent.
++        let paged = caps.bulk_transfer_supported;
++        let mut keymap_pages = Vec::new();
++        if paged {
++            keymap_pages = plan_pages(Cmd::SetKeymapBulk, 3, budget, &key_slots)
++                .map_err(|source| unencodable(RestoreStage::Keymap, source))?;
++        } else {
++            for slot in key_slots.iter().filter(|slot| slot.dirty) {
++                let (layer, row, col) = keymap_position(slot.index, device_rows, device_cols);
++                let request = SetKeyRequest {
++                    position: KeyPosition { layer, row, col },
++                    action: slot.item,
++                };
++                fits_frame(Cmd::SetKeyAction, budget, &request)
++                    .map_err(|source| unencodable(RestoreStage::Keymap, source))?;
++            }
++        }
++        let mut combo_pages = Vec::new();
++        if paged {
++            combo_pages = plan_pages(Cmd::SetComboBulk, 1, budget, &combo_slots)
++                .map_err(|source| unencodable(RestoreStage::Combos, source))?;
++        } else {
++            for slot in combo_slots.iter().filter(|slot| slot.dirty) {
++                let request = SetComboRequest {
++                    index: slot.index as u8,
++                    config: slot.item.clone(),
++                };
++                fits_frame(Cmd::SetCombo, budget, &request)
++                    .map_err(|source| unencodable(RestoreStage::Combos, source))?;
++            }
++        }
++        let mut morse_pages = Vec::new();
++        if paged {
++            morse_pages = plan_pages(Cmd::SetMorseBulk, 1, budget, &morse_slots)
++                .map_err(|source| unencodable(RestoreStage::Morses, source))?;
++        } else {
++            for slot in morse_slots.iter().filter(|slot| slot.dirty) {
++                let request = SetMorseRequest {
++                    index: slot.index as u8,
++                    config: slot.item.clone(),
++                };
++                fits_frame(Cmd::SetMorse, budget, &request)
++                    .map_err(|source| unencodable(RestoreStage::Morses, source))?;
++            }
++        }
++
++        // The stages above are paged, so `split_pages` already refused anything
++        // that cannot fit. The rest send one request per entry, and `send_frame`
++        // would reject an oversized one just as locally, so they are measured
++        // here too rather than partway through the restore.
++        for (layer, encoder_id, action) in &dirty_encoders {
++            let request = SetEncoderRequest {
++                layer: *layer,
++                encoder_id: *encoder_id,
++                action: *action,
++            };
++            fits_frame(Cmd::SetEncoderAction, budget, &request)
++                .map_err(|source| unencodable(RestoreStage::Encoders, source))?;
++        }
++        for (index, config) in &dirty_forks {
++            let request = SetForkRequest {
++                index: *index,
++                config: *config,
++            };
++            fits_frame(Cmd::SetFork, budget, &request).map_err(|source| unencodable(RestoreStage::Forks, source))?;
++        }
++        for (offset, data) in &dirty_macros {
++            let request = SetMacroRequest {
++                offset: *offset,
++                data: data.clone(),
++            };
++            fits_frame(Cmd::SetMacro, budget, &request).map_err(|source| unencodable(RestoreStage::Macros, source))?;
++        }
++        if behavior_dirty {
++            fits_frame(Cmd::SetBehaviorConfig, budget, &snapshot.behavior)
++                .map_err(|source| unencodable(RestoreStage::Behavior, source))?;
++        }
++        if default_layer_dirty {
++            fits_frame(Cmd::SetDefaultLayer, budget, &snapshot.default_layer)
++                .map_err(|source| unencodable(RestoreStage::DefaultLayer, source))?;
++        }
++
++        for (start, actions) in keymap_pages {
++            let (layer, row, col) = keymap_position(start, device_rows, device_cols);
++            self.set_keymap_bulk(SetKeymapBulkRequest {
++                layer,
++                start_row: row,
++                start_col: col,
++                actions,
++            })
++            .await
++            .map_err(|source| restore_error(&completed, RestoreStage::Keymap, source))?;
++        }
++        if !paged {
++            for slot in key_slots.iter().filter(|slot| slot.dirty) {
++                let (layer, row, col) = keymap_position(slot.index, device_rows, device_cols);
++                self.set_key(layer, row, col, slot.item)
++                    .await
++                    .map_err(|source| restore_error(&completed, RestoreStage::Keymap, source))?;
++            }
++        }
++        if keymap_dirty {
++            completed.push(RestoreStage::Keymap);
++        }
++
++        let encoders_dirty = !dirty_encoders.is_empty();
++        for (layer, encoder_id, action) in dirty_encoders {
++            self.set_encoder(encoder_id, layer, action)
++                .await
++                .map_err(|source| restore_error(&completed, RestoreStage::Encoders, source))?;
++        }
++        if encoders_dirty {
++            completed.push(RestoreStage::Encoders);
++        }
++
++        let combos_dirty = combo_slots.iter().any(|slot| slot.dirty);
++        for (start, configs) in combo_pages {
++            self.set_combo_bulk(SetComboBulkRequest {
++                start_index: start as u8,
++                configs,
++            })
++            .await
++            .map_err(|source| restore_error(&completed, RestoreStage::Combos, source))?;
++        }
++        if !paged {
++            for slot in combo_slots.iter().filter(|slot| slot.dirty) {
++                self.set_combo(slot.index as u8, slot.item.clone())
++                    .await
++                    .map_err(|source| restore_error(&completed, RestoreStage::Combos, source))?;
++            }
++        }
++        if combos_dirty {
++            completed.push(RestoreStage::Combos);
++        }
++
++        let forks_dirty = !dirty_forks.is_empty();
++        for (index, config) in dirty_forks {
++            self.set_fork(index, config)
++                .await
++                .map_err(|source| restore_error(&completed, RestoreStage::Forks, source))?;
++        }
++        if forks_dirty {
++            completed.push(RestoreStage::Forks);
++        }
++
++        let morses_dirty = morse_slots.iter().any(|slot| slot.dirty);
++        for (start, configs) in morse_pages {
++            self.set_morse_bulk(SetMorseBulkRequest {
++                start_index: start as u8,
++                configs,
++            })
++            .await
++            .map_err(|source| restore_error(&completed, RestoreStage::Morses, source))?;
++        }
++        if !paged {
++            for slot in morse_slots.iter().filter(|slot| slot.dirty) {
++                self.set_morse(slot.index as u8, slot.item.clone())
++                    .await
++                    .map_err(|source| restore_error(&completed, RestoreStage::Morses, source))?;
++            }
++        }
++        if morses_dirty {
++            completed.push(RestoreStage::Morses);
++        }
++
++        let macros_dirty = !dirty_macros.is_empty();
++        for (offset, data) in dirty_macros {
++            self.set_macro(offset, data)
++                .await
++                .map_err(|source| restore_error(&completed, RestoreStage::Macros, source))?;
++        }
++        if macros_dirty {
++            completed.push(RestoreStage::Macros);
++        }
++
++        if behavior_dirty {
++            self.set_behavior(snapshot.behavior)
++                .await
++                .map_err(|source| restore_error(&completed, RestoreStage::Behavior, source))?;
++            completed.push(RestoreStage::Behavior);
++        }
++
++        // Change the active default only after its backing configuration has
++        // been restored successfully.
++        if default_layer_dirty {
++            self.set_default_layer(snapshot.default_layer)
++                .await
++                .map_err(|source| restore_error(&completed, RestoreStage::DefaultLayer, source))?;
++        }
++        Ok(())
++    }
++
++    /// Validate an untrusted snapshot against the connected device without
++    /// sending any mutating request.
++    #[cfg(feature = "alloc")]
++    pub async fn preflight_restore(&self, snapshot: &ConfigurationSnapshot) -> Result<(), SnapshotError> {
++        let caps = self.get_capabilities().await.map_err(|source| SnapshotError::Read {
++            operation: SnapshotRead::Capabilities,
++            source,
++        })?;
++        let info = self.get_device_info().await.map_err(|source| SnapshotError::Read {
++            operation: SnapshotRead::DeviceInfo,
++            source,
++        })?;
++        snapshot.validate_target(&info, caps)
++    }
++}
++
++/// Drop the part of a key action its equality ignores, so equal actions encode
++/// alike. The profile index is a per-key timing hint that `PartialEq` excludes
++/// on purpose, as `rmk-types` documents.
++#[cfg(feature = "alloc")]
++fn normalize_key_action(action: &mut KeyAction) {
++    if let KeyAction::TapHold(tap, hold, _) = *action {
++        *action = KeyAction::TapHold(tap, hold, 0);
++    }
++}
++
++fn checked_product(values: &[usize]) -> Result<usize, SnapshotError> {
++    values
++        .iter()
++        .try_fold(1usize, |product, value| product.checked_mul(*value))
++        .ok_or(SnapshotError::DimensionOverflow)
++}
++
++fn require_len(field: &'static str, actual: usize, expected: usize) -> Result<(), SnapshotError> {
++    if actual == expected {
++        Ok(())
++    } else {
++        Err(SnapshotError::InvalidLength {
++            field,
++            actual,
++            expected,
++        })
++    }
++}
++
++fn require_item_limit(field: &'static str, index: usize, actual: usize, maximum: usize) -> Result<(), SnapshotError> {
++    if actual <= maximum {
++        Ok(())
++    } else {
++        Err(SnapshotError::ItemLimitExceeded {
++            field,
++            index,
++            actual,
++            maximum,
++        })
++    }
++}
++
++/// Macro paging has to be workable before a read loop starts: a zero chunk
++/// cannot advance an offset, and an oversized one cannot be buffered.
++fn validate_macro_chunk(caps: DeviceCapabilities) -> Result<(), SnapshotError> {
++    let chunk_size = caps.macro_chunk_size as usize;
++    if caps.macro_space_size > 0 && chunk_size == 0 {
++        return Err(SnapshotError::ZeroMacroChunkSize);
++    }
++    if chunk_size > MACRO_DATA_SIZE {
++        return Err(SnapshotError::MacroChunkTooLarge {
++            actual: chunk_size,
++            maximum: MACRO_DATA_SIZE,
++        });
++    }
++    Ok(())
++}
++
++/// Split dirty entries into runs of adjacent target addresses. A gap, whether
++/// an entry that already matches or a coordinate the snapshot does not cover,
++/// ends a run, because one request writes a consecutive span. Sizing each run
++/// into pages is left to [`split_pages`], the same budget-aware pager the
++/// whole-resource writers use.
++/// A flat target index as the coordinate the protocol addresses keys by.
++#[cfg(feature = "alloc")]
++fn keymap_position(index: usize, rows: usize, cols: usize) -> (u8, u8, u8) {
++    let within_layer = index % (rows * cols);
++    ((index / (rows * cols)) as u8, (within_layer / cols) as u8, (within_layer % cols) as u8)
++}
++
++/// Whether a request's payload fits the target's advertised frame. This is the
++/// same budget `split_pages` applies to bulk pages and the same one `send_frame`
++/// enforces for every request, so checking it here catches a shortfall the host
++/// can see without a device.
++#[cfg(feature = "alloc")]
++fn fits_frame<Request: Serialize>(cmd: Cmd, budget: usize, request: &Request) -> Result<(), RynkHostError> {
++    match serialized_size(request) {
++        Ok(size) if size <= budget => Ok(()),
++        _ => Err(RynkHostError::Encode(cmd)),
++    }
++}
++
++/// One slot the snapshot reaches, in the target's index space: what it should
++/// hold, and whether the target already holds it.
++#[cfg(feature = "alloc")]
++struct Slot<Item> {
++    index: usize,
++    item: Item,
++    dirty: bool,
++}
++
++/// Plan the fewest bulk requests that carry every differing entry, failing here
++/// rather than mid-restore. A shortfall the target's frame cannot carry is a
++/// verdict the host reaches without a device, so planning every fallible request
++/// up front is what lets it surface as a preflight error with nothing written.
++///
++/// A request is one contiguous run in the target's index space, so it may carry
++/// entries that already match in order to bridge two that differ. Within a run
++/// of reachable slots the fewest requests come from starting at the leftmost
++/// differing entry, extending while the frame has room, then trimming back to
++/// the last differing entry reached. Starting earlier only spends budget without
++/// extending the reach, and stopping earlier cannot help, because carrying any
++/// differing entry further right means carrying everything before it too.
++#[cfg(feature = "alloc")]
++fn plan_pages<Item: Serialize + Clone>(
++    cmd: Cmd,
++    fixed: usize,
++    budget: usize,
++    slots: &[Slot<Item>],
++) -> Result<Vec<(usize, Vec<Item>)>, RynkHostError> {
++    let mut planned = Vec::new();
++    for segment in contiguous_segments(slots) {
++        let mut cursor = 0;
++        while cursor < segment.len() {
++            if !segment[cursor].dirty {
++                cursor += 1;
++                continue;
++            }
++            let (mut used, mut frontier, mut last_dirty) = (0usize, cursor, cursor);
++            while frontier < segment.len() {
++                let size = serialized_size(&segment[frontier].item).map_err(|_| RynkHostError::Encode(cmd))?;
++                // postcard's item count widens as the run fills, which is the
++                // same measure `split_pages` applies to a whole-resource write.
++                let count = serialized_size(&(frontier - cursor + 1)).map_err(|_| RynkHostError::Encode(cmd))?;
++                if fixed + count + used + size > budget {
++                    break;
++                }
++                used += size;
++                if segment[frontier].dirty {
++                    last_dirty = frontier;
++                }
++                frontier += 1;
++            }
++            // Not even the differing entry itself fits the frame.
++            if frontier == cursor {
++                return Err(RynkHostError::Encode(cmd));
++            }
++            let items = segment[cursor..=last_dirty].iter().map(|slot| slot.item.clone()).collect();
++            planned.push((segment[cursor].index, items));
++            cursor = last_dirty + 1;
++        }
++    }
++    Ok(planned)
++}
++
++/// Split the reachable slots into maximal runs of consecutive indices. Each gap
++/// is a slot the snapshot does not reach, and no request may cross one.
++#[cfg(feature = "alloc")]
++fn contiguous_segments<Item>(slots: &[Slot<Item>]) -> Vec<&[Slot<Item>]> {
++    let mut segments = Vec::new();
++    let mut start = 0;
++    for index in 1..slots.len() {
++        if slots[index - 1].index + 1 != slots[index].index {
++            segments.push(&slots[start..index]);
++            start = index;
++        }
++    }
++    if !slots.is_empty() {
++        segments.push(&slots[start..]);
++    }
++    segments
++}
++
++/// A write this device could never carry is a host-side verdict, so it is a
++/// preflight failure however late in the diff it was discovered.
++fn unencodable(stage: RestoreStage, source: RynkHostError) -> RestoreError {
++    RestoreError::Preflight(SnapshotError::UnencodableWrite { stage, source })
++}
++
++fn restore_error(completed: &[RestoreStage], stage: RestoreStage, source: RynkHostError) -> RestoreError {
++    RestoreError::Write {
++        completed: completed.to_vec(),
++        stage,
++        source,
++    }
++}

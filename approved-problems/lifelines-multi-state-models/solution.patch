@@ -1,0 +1,1021 @@
+diff --git a/lifelines/fitters/multi_state_fitter.py b/lifelines/fitters/multi_state_fitter.py
+new file mode 100644
+index 0000000..03facf6
+--- /dev/null
++++ b/lifelines/fitters/multi_state_fitter.py
+@@ -0,0 +1,425 @@
++# -*- coding: utf-8 -*-
++from __future__ import annotations
++
++import numpy as np
++import pandas as pd
++
++from lifelines.fitters import BaseFitter
++from lifelines.fitters.kaplan_meier_fitter import KaplanMeierFitter
++from lifelines.utils import coalesce, inv_normal_cdf, median_survival_times
++from lifelines.utils.multi_state import (
++    check_transitions_frame,
++    hazard_increments,
++    occupants_at,
++    product_integral,
++    risk_and_transition_counts,
++    sojourn_durations,
++    state_space,
++    transition_label,
++    transition_times,
++)
++
++
++class MultiStateFitter(BaseFitter):
++    """
++    Class for fitting the Aalen-Johansen estimate of a multi state model, where subjects move
++    between an arbitrary set of states rather than between alive and dead only.
++
++    The data is given as one row per interval a subject was observed to occupy a state for, so
++    a subject that moved twice and was then censored contributes three rows. Delayed entry,
++    interruptions in observation and returns to a state already visited are all expressed by
++    the intervals themselves.
++
++    Parameters
++    ----------
++    alpha: float, optional (default=0.05)
++        The alpha value associated with the confidence intervals.
++    label: string, optional
++        Provide a new label for the estimate.
++
++    Examples
++    --------
++
++    .. code:: python
++
++        from lifelines import MultiStateFitter
++
++        msf = MultiStateFitter()
++        msf.fit(transitions)
++        msf.state_occupation_
++        msf.transition_matrix(10.0)
++
++    Attributes
++    ----------
++    states_: list
++        every state seen in the data, in increasing order.
++    transitions_: list
++        every ordered pair of states an observed transition moved between, in increasing order.
++    absorbing_states_: list
++        the states that are never left, in increasing order.
++    timeline: ndarray
++        zero followed by the times a transition was observed at.
++    state_occupation_: DataFrame
++        the probability of occupying each state, over the timeline.
++    cumulative_hazard_: DataFrame
++        the cumulative transition hazard of each transition, over the timeline.
++    at_risk_: DataFrame
++        the size of the risk set of each state, over the transition times.
++    transition_counts_: DataFrame
++        the number of observed transitions of each kind, over the transition times.
++    initial_distribution_: Series
++        the probability of occupying each state at time zero.
++    """
++
++    def fit(self, transitions: pd.DataFrame, initial_state=None, timeline=None, label: str = None) -> MultiStateFitter:
++        """
++        Parameters
++        ----------
++        transitions: DataFrame
++            one row per interval a subject was observed to occupy a state for, with columns
++            ``id``, ``start``, ``stop``, ``from_state``, ``to_state`` and ``observed``. The
++            row describes the half open interval ``(start, stop]``; ``observed`` is truthy
++            when the subject moved to ``to_state`` at ``stop`` and falsy when it was right
++            censored there, in which case ``to_state`` is ignored.
++        initial_state: optional
++            the state every subject is taken to occupy at time zero. If not given, the
++            distribution at time zero is the share of subjects whose earliest interval starts
++            in each state.
++        timeline: iterable, optional
++            report the estimates at these times rather than at the transition times.
++        label: string, optional
++            a string to name this fit.
++
++        Returns
++        -------
++        self: MultiStateFitter
++        """
++        df = check_transitions_frame(transitions)
++        self._transitions_frame = df
++        self._label = coalesce(label, self._label, "MS_estimate")
++
++        self.states_, self.transitions_, self.absorbing_states_ = state_space(df)
++        self._labels = [transition_label(origin, target) for origin, target in self.transitions_]
++        self._event_times = transition_times(df)
++        self._timeline = np.concatenate([[0.0], self._event_times])
++        self.timeline = self._requested_timeline(timeline)
++
++        at_risk, counts = risk_and_transition_counts(df, self.states_, self._event_times)
++        self._increments = hazard_increments(at_risk, counts)
++        self._matrices = product_integral(self._increments)
++
++        self.at_risk_ = pd.DataFrame(at_risk, index=self._event_times, columns=self.states_)
++        self.at_risk_.index.name = "timeline"
++        self.transition_counts_ = pd.DataFrame(
++            np.column_stack(
++                [counts[:, self.states_.index(origin), self.states_.index(target)] for origin, target in self.transitions_]
++            )
++            if self.transitions_
++            else np.zeros((self._event_times.shape[0], 0)),
++            index=self._event_times,
++            columns=self._labels,
++        )
++        self.transition_counts_.index.name = "timeline"
++
++        self._build_cumulative_hazard(at_risk, counts)
++        self.initial_distribution_ = self._build_initial_distribution(df, initial_state)
++        self._occupation = np.einsum("j,ijk->ik", self.initial_distribution_.values, self._matrices)
++        self.state_occupation_ = self._report(self._occupation, self.states_)
++        return self
++
++    def _requested_timeline(self, timeline) -> np.ndarray:
++        if timeline is None:
++            return self._timeline
++        requested = np.asarray(timeline, dtype=float)
++        if requested.ndim != 1 or requested.shape[0] == 0:
++            raise ValueError("The timeline must be a non-empty one dimensional sequence.")
++        if not np.isfinite(requested).all():
++            raise ValueError("Every time on the timeline must be finite.")
++        if (requested < 0).any():
++            raise ValueError("Every time on the timeline must be non-negative.")
++        if (np.diff(requested) <= 0).any():
++            raise ValueError("The timeline must be strictly increasing.")
++        return requested
++
++    def _report(self, values: np.ndarray, columns) -> pd.DataFrame:
++        rows = np.searchsorted(self._timeline, self.timeline, side="right") - 1
++        frame = pd.DataFrame(values[rows], index=self.timeline, columns=columns)
++        frame.index.name = "timeline"
++        return frame
++
++    def _build_cumulative_hazard(self, at_risk: np.ndarray, counts: np.ndarray) -> None:
++        hazards, variances = [], []
++        for origin, target in self.transitions_:
++            row, column = self.states_.index(origin), self.states_.index(target)
++            leaving = at_risk[:, row]
++            taken = counts[:, row, column]
++            increments = self._increments[:, row, column]
++            with np.errstate(divide="ignore", invalid="ignore"):
++                terms = np.where(leaving > 0, taken * (leaving - taken) / leaving**3, 0.0)
++            hazards.append(np.concatenate([[0.0], np.cumsum(increments)]))
++            variances.append(np.concatenate([[0.0], np.cumsum(terms)]))
++
++        shape = (self._timeline.shape[0], 0)
++        self.cumulative_hazard_ = self._report(np.column_stack(hazards) if hazards else np.zeros(shape), self._labels)
++        self.variance_ = self._report(np.column_stack(variances) if variances else np.zeros(shape), self._labels)
++        self.confidence_interval_cumulative_hazard_ = self._bounds()
++        self.confidence_interval_ = self.confidence_interval_cumulative_hazard_
++
++    def _bounds(self) -> pd.DataFrame:
++        z = inv_normal_cdf(1 - self.alpha / 2)
++        frame = pd.DataFrame(index=self.timeline)
++        for label in self._labels:
++            hazard = self.cumulative_hazard_[label].values
++            spread = z * np.sqrt(self.variance_[label].values) / np.where(hazard == 0, 1, hazard)
++            frame["%s_lower_%g" % (label, 1 - self.alpha)] = hazard * np.exp(-spread)
++            frame["%s_upper_%g" % (label, 1 - self.alpha)] = hazard * np.exp(spread)
++        frame.index.name = "timeline"
++        return frame
++
++    def _build_initial_distribution(self, df: pd.DataFrame, initial_state) -> pd.Series:
++        distribution = pd.Series(0.0, index=self.states_)
++        if initial_state is not None:
++            if initial_state not in self.states_:
++                raise ValueError("The initial state %s does not appear in the data." % initial_state)
++            distribution.loc[initial_state] = 1.0
++            return distribution
++        first = df.groupby("id", sort=False).head(1)
++        shares = first.groupby("from_state", sort=False)["weights"].sum() / first["weights"].sum()
++        distribution.loc[shares.index] = shares.values
++        return distribution
++
++    def transition_matrix(self, t: float, since: float = 0.0, markov: bool = True) -> pd.DataFrame:
++        """
++        The matrix of transition probabilities over the half open interval ``(since, t]``.
++
++        The entry in row ``j`` and column ``k`` is the probability that a subject occupying
++        ``j`` at ``since`` occupies ``k`` at ``t``.
++
++        Parameters
++        ----------
++        t: float
++            the end of the interval.
++        since: float, optional (default=0.0)
++            the start of the interval.
++        markov: bool, optional (default=True)
++            when False, each row is estimated from the subjects that were occupying that row's
++            state at ``since`` rather than from the whole sample. A row whose state nobody was
++            occupying at ``since`` is all null.
++        """
++        if since < 0:
++            raise ValueError("The since argument must be non-negative.")
++        if t < since:
++            raise ValueError("The t argument must not be smaller than the since argument.")
++        if markov:
++            window = (self._event_times > since) & (self._event_times <= t)
++            matrix = product_integral(self._increments[window])[-1]
++            return pd.DataFrame(matrix, index=self.states_, columns=self.states_)
++        return self._landmark_transition_matrix(t, since)
++
++    def _landmark_transition_matrix(self, t: float, since: float) -> pd.DataFrame:
++        occupants = occupants_at(self._transitions_frame, since)
++        matrix = np.full((len(self.states_), len(self.states_)), np.nan)
++        for row, state in enumerate(self.states_):
++            identifiers = occupants.get(state)
++            if not identifiers:
++                continue
++            subset = self._transitions_frame.loc[self._transitions_frame["id"].isin(set(identifiers))]
++            times = transition_times(subset)
++            times = times[(times > since) & (times <= t)]
++            if times.shape[0] == 0:
++                matrix[row, row] = 1.0
++                matrix[row, [column for column in range(len(self.states_)) if column != row]] = 0.0
++                continue
++            at_risk, counts = risk_and_transition_counts(subset, self.states_, times)
++            matrix[row] = product_integral(hazard_increments(at_risk, counts))[-1][row]
++        return pd.DataFrame(matrix, index=self.states_, columns=self.states_)
++
++    def probability_of_ever_reaching(self, state, from_state=None) -> pd.Series:
++        """
++        The probability that a subject has occupied ``state`` at or before each time on the
++        timeline. A subject that starts in ``state`` has already reached it.
++
++        Parameters
++        ----------
++        state:
++            the state to follow.
++        from_state: optional
++            condition on occupying this state at time zero rather than on the fitted
++            distribution at time zero.
++        """
++        if state not in self.states_:
++            raise ValueError("The state %s does not appear in the data." % state)
++        if from_state is not None and from_state not in self.states_:
++            raise ValueError("The state %s does not appear in the data." % from_state)
++        row = self.states_.index(state)
++        increments = self._increments.copy()
++        increments[:, row, :] = 0.0
++        matrices = product_integral(increments)
++        if from_state is None:
++            start = self.initial_distribution_.values
++        else:
++            start = np.eye(len(self.states_))[self.states_.index(from_state)]
++        reached = np.einsum("j,ijk->ik", start, matrices)[:, row]
++        return self._report(reached[:, np.newaxis], [state])[state]
++
++    def expected_number_of_visits(self, t: float, from_state=None) -> pd.Series:
++        """
++        The expected number of times each state has been entered by time ``t``, counting the
++        state a subject starts in as one visit to it.
++
++        Parameters
++        ----------
++        t: float
++            the end of the window to count over.
++        from_state: optional
++            condition on occupying this state at time zero rather than on the fitted
++            distribution at time zero.
++        """
++        if t < 0:
++            raise ValueError("The t argument must be non-negative.")
++        occupation = self._occupation_path(from_state)
++        visits = occupation[0].astype(float).copy()
++        for index, time in enumerate(self._event_times):
++            if time > t:
++                break
++            entering = occupation[index] @ np.clip(self._increments[index], 0.0, None)
++            visits = visits + entering
++        return pd.Series(visits, index=self.states_)
++
++    def sojourn_survival(self, state) -> pd.Series:
++        """
++        The survival function of the time a single stay in ``state`` lasts, with a stay that
++        did not end in an observed transition treated as right censored.
++
++        Parameters
++        ----------
++        state:
++            the state to measure stays in.
++        """
++        if state not in self.states_:
++            raise ValueError("The state %s does not appear in the data." % state)
++        durations, observed, weights = sojourn_durations(self._transitions_frame, state)
++        if durations.shape[0] == 0:
++            raise ValueError("No subject was ever observed in the state %s." % state)
++        fitter = KaplanMeierFitter().fit(durations, observed, weights=weights, label="sojourn")
++        return fitter.survival_function_["sojourn"]
++
++    def mean_sojourn_time(self, state, t: float) -> float:
++        """
++        The mean length of a single stay in ``state``, counting a stay that runs past ``t`` as
++        lasting exactly ``t``.
++
++        Parameters
++        ----------
++        state:
++            the state to measure stays in.
++        t: float
++            the time to restrict the mean at.
++        """
++        if t < 0:
++            raise ValueError("The t argument must be non-negative.")
++        survival = self.sojourn_survival(state)
++        times = np.concatenate([survival.index.values, [t]])
++        values = survival.values
++        total = 0.0
++        for index in range(values.shape[0]):
++            lower = min(times[index], t)
++            upper = min(times[index + 1], t)
++            total += values[index] * (upper - lower)
++        return total
++
++    def state_occupation_at(self, t: float) -> pd.Series:
++        """
++        The probability of occupying each state at time ``t``, counting every transition
++        observed at ``t`` itself.
++
++        Parameters
++        ----------
++        t: float
++            the time to report the occupation probabilities at.
++        """
++        if t < 0:
++            raise ValueError("The t argument must be non-negative.")
++        row = np.searchsorted(self._timeline, t, side="right") - 1
++        return pd.Series(self._occupation[row], index=self.states_)
++
++    def predict(self, times) -> pd.DataFrame:
++        """
++        The probability of occupying each state at every time in ``times``.
++
++        Parameters
++        ----------
++        times: iterable
++            the times to report the occupation probabilities at.
++        """
++        requested = np.atleast_1d(np.asarray(times, dtype=float))
++        if (requested < 0).any():
++            raise ValueError("Every requested time must be non-negative.")
++        rows = np.searchsorted(self._timeline, requested, side="right") - 1
++        return pd.DataFrame(self._occupation[rows], index=requested, columns=self.states_)
++
++    def expected_length_of_stay(self, t: float, from_state=None, since: float = 0.0) -> pd.Series:
++        """
++        The expected time spent in each state between ``since`` and ``t``.
++
++        Parameters
++        ----------
++        t: float
++            the end of the window to integrate over.
++        from_state: optional
++            condition on occupying this state at time zero rather than on the fitted
++            distribution at time zero.
++        since: float, optional (default=0.0)
++            the start of the window to integrate over.
++        """
++        if since < 0:
++            raise ValueError("The since argument must be non-negative.")
++        if t < since:
++            raise ValueError("The t argument must not be smaller than the since argument.")
++        occupation = self._occupation_path(from_state)
++
++        total = np.zeros(len(self.states_))
++        for index in range(self._timeline.shape[0]):
++            lower = max(self._timeline[index], since)
++            upper = min(self._timeline[index + 1] if index + 1 < self._timeline.shape[0] else t, t)
++            if upper <= lower:
++                continue
++            total = total + occupation[index] * (upper - lower)
++        return pd.Series(total, index=self.states_)
++
++    def _occupation_path(self, from_state) -> np.ndarray:
++        if from_state is None:
++            return self._occupation
++        if from_state not in self.states_:
++            raise ValueError("The state %s does not appear in the data." % from_state)
++        return self._matrices[:, self.states_.index(from_state), :]
++
++    def median_sojourn_time(self, state) -> float:
++        """
++        The median length of a single stay in ``state``, or infinity when fewer than half of
++        the stays were observed to end.
++
++        Parameters
++        ----------
++        state:
++            the state to measure stays in.
++        """
++        return median_survival_times(self.sojourn_survival(state).to_frame())
++
++    @property
++    def summary(self) -> pd.DataFrame:
++        """
++        A DataFrame with one row per observed transition, holding the number of times it was
++        taken and its cumulative hazard at the end of the timeline.
++        """
++        totals = [
++            self._increments[:, self.states_.index(origin), self.states_.index(target)].sum()
++            for origin, target in self.transitions_
++        ]
++        return pd.DataFrame(
++            {
++                "n_transitions": self.transition_counts_.sum(),
++                "cumulative_hazard": pd.Series(totals, index=self._labels),
++            },
++            index=self._labels,
++        )
+diff --git a/lifelines/utils/multi_state.py b/lifelines/utils/multi_state.py
+new file mode 100644
+index 0000000..c74e76d
+--- /dev/null
++++ b/lifelines/utils/multi_state.py
+@@ -0,0 +1,373 @@
++# -*- coding: utf-8 -*-
++from __future__ import annotations
++
++import numpy as np
++import pandas as pd
++
++
++TRANSITION_COLUMNS = ["id", "start", "stop", "from_state", "to_state", "observed"]
++WEIGHT_COLUMN = "weights"
++
++
++def transition_label(from_state, to_state) -> str:
++    """
++    The canonical name of a transition, used as a column name in the tables produced by
++    :class:`~lifelines.fitters.multi_state_fitter.MultiStateFitter`.
++    """
++    return "%s->%s" % (from_state, to_state)
++
++
++def check_transitions_frame(transitions: pd.DataFrame) -> pd.DataFrame:
++    """
++    Validate a frame of observed state occupancies and return a normalized copy of it.
++
++    The returned frame holds the six required columns and a weight, has ``start`` and ``stop``
++    cast to floats and ``observed`` cast to a boolean, and is sorted by subject and then by
++    ``start``. A frame that carries no ``weights`` column is given a weight of one per row.
++
++    Parameters
++    ----------
++    transitions: DataFrame
++        one row per interval a subject was observed to occupy a state for. Required columns
++        are ``id``, ``start``, ``stop``, ``from_state``, ``to_state`` and ``observed``.
++    """
++    missing = [column for column in TRANSITION_COLUMNS if column not in transitions.columns]
++    if missing:
++        raise ValueError("The transitions DataFrame is missing the column(s): %s." % ", ".join(map(str, missing)))
++
++    columns = list(TRANSITION_COLUMNS)
++    if WEIGHT_COLUMN in transitions.columns:
++        columns.append(WEIGHT_COLUMN)
++    df = transitions.loc[:, columns].copy()
++    if df.shape[0] == 0:
++        raise ValueError("The transitions DataFrame is empty.")
++    if df.isnull().values.any():
++        raise ValueError("The transitions DataFrame contains null values.")
++
++    df["start"] = df["start"].astype(float)
++    df["stop"] = df["stop"].astype(float)
++    df["observed"] = df["observed"].astype(bool)
++    if WEIGHT_COLUMN in df.columns:
++        df[WEIGHT_COLUMN] = df[WEIGHT_COLUMN].astype(float)
++        if (df[WEIGHT_COLUMN] <= 0).any():
++            raise ValueError("Every weight must be strictly positive.")
++    else:
++        df[WEIGHT_COLUMN] = 1.0
++
++    if not np.isfinite(df[["start", "stop"]].values).all():
++        raise ValueError("The start and stop columns must be finite.")
++    if (df["start"] < 0).any():
++        raise ValueError("The start column must be non-negative.")
++    if (df["stop"] <= df["start"]).any():
++        raise ValueError("Every interval must have a stop strictly greater than its start.")
++
++    observed = df.loc[df["observed"]]
++    if (observed["from_state"].values == observed["to_state"].values).any():
++        raise ValueError("An observed transition must enter a different state than the one it leaves.")
++
++    df = df.sort_values(["id", "start"], kind="stable").reset_index(drop=True)
++    _check_for_overlapping_occupancies(df)
++    return df
++
++
++def _check_for_overlapping_occupancies(df: pd.DataFrame) -> None:
++    for subject, rows in df.groupby("id", sort=False):
++        starts = rows["start"].values
++        stops = rows["stop"].values
++        if (starts[1:] < stops[:-1]).any():
++            raise ValueError("Subject %s has overlapping intervals in the transitions DataFrame." % subject)
++
++        origins = rows["from_state"].values
++        targets = rows["to_state"].values
++        observed = rows["observed"].values
++        adjacent = starts[1:] == stops[:-1]
++        broken = adjacent & observed[:-1] & (origins[1:] != targets[:-1])
++        if broken.any():
++            raise ValueError(
++                "Subject %s leaves an interval for one state and picks up immediately in another." % subject
++            )
++
++
++def state_space(df: pd.DataFrame):
++    """
++    Return the sorted states, the sorted observed transitions and the sorted absorbing states
++    of a validated transitions frame.
++    """
++    observed = df.loc[df["observed"]]
++    states = sorted(set(df["from_state"]) | set(observed["to_state"]))
++    transitions = sorted({(origin, target) for origin, target in zip(observed["from_state"], observed["to_state"])})
++    absorbing = sorted(set(states) - set(df["from_state"]))
++    return states, transitions, absorbing
++
++
++def transition_times(df: pd.DataFrame) -> np.ndarray:
++    """
++    The distinct times at which a transition was observed, in increasing order.
++    """
++    return np.unique(df.loc[df["observed"], "stop"].values.astype(float))
++
++
++def risk_and_transition_counts(df: pd.DataFrame, states, times: np.ndarray):
++    """
++    Count, at every transition time, how many subjects are at risk in each state and how many
++    moved along each ordered pair of states.
++
++    A subject is at risk in the state of an interval over the half open interval that the row
++    describes, so an interval ``(start, stop]`` contributes to the risk set at every time
++    strictly after ``start`` and up to and including ``stop``.
++    """
++    position = {state: index for index, state in enumerate(states)}
++    starts = df["start"].values
++    stops = df["stop"].values
++    weights = df[WEIGHT_COLUMN].values
++    origins = np.array([position[state] for state in df["from_state"]], dtype=int)
++
++    occupied = (starts[np.newaxis, :] < times[:, np.newaxis]) & (times[:, np.newaxis] <= stops[np.newaxis, :])
++    at_risk = np.zeros((times.shape[0], len(states)))
++    for index in range(len(states)):
++        at_risk[:, index] = (occupied[:, origins == index] * weights[origins == index]).sum(axis=1)
++
++    counts = np.zeros((times.shape[0], len(states), len(states)))
++    observed = df.loc[df["observed"]]
++    row_of_time = {time: index for index, time in enumerate(times)}
++    for stop, origin, target, weight in zip(
++        observed["stop"], observed["from_state"], observed["to_state"], observed[WEIGHT_COLUMN]
++    ):
++        row = row_of_time.get(float(stop))
++        if row is not None:
++            counts[row, position[origin], position[target]] += weight
++
++    return at_risk, counts
++
++
++def hazard_increments(at_risk: np.ndarray, counts: np.ndarray) -> np.ndarray:
++    """
++    The Nelson-Aalen increments of the transition intensity matrix at every transition time.
++
++    Off the diagonal an entry is the number of observed transitions divided by the size of the
++    risk set of the state being left; a row whose risk set is empty contributes nothing. The
++    diagonal is minus the total of the rest of its row.
++    """
++    denominator = at_risk[:, :, np.newaxis]
++    increments = np.divide(counts, denominator, out=np.zeros_like(counts), where=denominator > 0)
++    leaving = increments.sum(axis=2)
++    diagonal = np.arange(increments.shape[1])
++    increments[:, diagonal, diagonal] = -leaving
++    return increments
++
++
++def product_integral(increments: np.ndarray) -> np.ndarray:
++    """
++    The running matrix product of ``I + dA`` over the increments, in increasing time order,
++    with each new factor applied on the right.
++
++    The returned array has one more entry than ``increments``: the identity, followed by the
++    product accumulated up to and including each increment.
++    """
++    n_states = increments.shape[1]
++    identity = np.eye(n_states)
++    matrices = np.empty((increments.shape[0] + 1, n_states, n_states))
++    running = identity
++    matrices[0] = running
++    for index in range(increments.shape[0]):
++        running = running @ (identity + increments[index])
++        matrices[index + 1] = running
++    return matrices
++
++
++def transitions_from_events(durations, event_observed, initial_state, event_states=None, entry=None) -> pd.DataFrame:
++    """
++    Build a transitions frame from the duration and event arrays the other fitters take.
++
++    Every subject starts in ``initial_state`` and either leaves it once, for the state named by
++    its event code, or is right censored in it. This is the competing risks shape of a multi
++    state model, so the state occupation of the fitted model reproduces the cumulative
++    incidence of each cause.
++
++    Parameters
++    ----------
++    durations: iterable
++        the time each subject was last seen at.
++    event_observed: iterable
++        the event code of each subject, where 0 means the subject was censored.
++    initial_state:
++        the state every subject starts in.
++    event_states: dict, optional
++        maps each non-zero event code to the state it moves the subject into. If not given, the
++        state is the event code itself.
++    entry: iterable, optional
++        the time each subject came under observation. Defaults to zero for everybody.
++    """
++    durations = np.asarray(durations, dtype=float)
++    codes = np.asarray(event_observed)
++    if durations.shape[0] != codes.shape[0]:
++        raise ValueError("durations and event_observed must have the same length.")
++    starts = np.zeros_like(durations) if entry is None else np.asarray(entry, dtype=float)
++    if starts.shape[0] != durations.shape[0]:
++        raise ValueError("entry must have the same length as durations.")
++
++    rows = []
++    for position in range(durations.shape[0]):
++        code = codes[position]
++        moved = bool(code != 0)
++        target = initial_state
++        if moved:
++            target = code if event_states is None else event_states.get(code)
++            if target is None:
++                raise ValueError("The event code %s has no state in event_states." % code)
++        rows.append((position, starts[position], durations[position], initial_state, target, int(moved)))
++    return pd.DataFrame(rows, columns=TRANSITION_COLUMNS)
++
++
++def occupants_at(df: pd.DataFrame, time: float):
++    """
++    Map each state to the identifiers of the subjects occupying it at ``time``.
++
++    A subject occupies the state of the interval that contains ``time`` when the interval is
++    read as closed on the left and open on the right, so a subject that moves at ``time``
++    is counted in the state it moves into.
++    """
++    occupants = {}
++    inside = (df["start"].values <= time) & (time < df["stop"].values)
++    for state, identifier in zip(df.loc[inside, "from_state"], df.loc[inside, "id"]):
++        occupants.setdefault(state, []).append(identifier)
++    return occupants
++
++
++def sojourn_durations(df: pd.DataFrame, state):
++    """
++    The lengths of the stays in ``state``, whether each of them ended in an observed transition
++    and the weight of each of them, in the order the stays appear in the frame.
++    """
++    stays = df.loc[df["from_state"] == state]
++    return (
++        stays["stop"].values - stays["start"].values,
++        stays["observed"].values.astype(int),
++        stays[WEIGHT_COLUMN].values,
++    )
++
++
++def state_matrix_from_transitions(
++    df: pd.DataFrame, initial_state, censoring_col: str = "censoring_time", visit: str = "first"
++) -> pd.DataFrame:
++    """
++    Collapse a transitions frame back into a wide frame holding one row per subject.
++
++    The frame has an ``id`` column, one column per state other than ``initial_state`` holding
++    the first time the subject entered that state, and a column named by ``censoring_col``
++    holding the last time the subject was under observation. Subjects appear in increasing
++    order of identifier and the state columns are in increasing order.
++
++    Parameters
++    ----------
++    df: DataFrame
++        a transitions frame, as accepted by :func:`check_transitions_frame`.
++    initial_state:
++        the state that is dropped from the columns of the result.
++    censoring_col: string, optional (default="censoring_time")
++        the name to give the column holding the last observation time.
++    visit: string, optional (default="first")
++        whether a state a subject entered more than once is reported at the first or at the
++        last of those times.
++    """
++    if visit not in ("first", "last"):
++        raise ValueError("The visit argument must be either first or last.")
++    df = check_transitions_frame(df)
++    states, _, _ = state_space(df)
++    if initial_state not in states:
++        raise ValueError("The initial state %s does not appear in the data." % initial_state)
++    if censoring_col in ("id", initial_state):
++        raise ValueError("The censoring column %s collides with another column of the result." % censoring_col)
++
++    columns = [state for state in states if state != initial_state]
++    entries = {}
++    last_seen = {}
++    for identifier, start, stop, origin, target, observed in zip(
++        df["id"], df["start"], df["stop"], df["from_state"], df["to_state"], df["observed"]
++    ):
++        record = entries.setdefault(identifier, {})
++        keep = visit == "last"
++        if observed and target != initial_state and (keep or target not in record):
++            record[target] = stop
++        if origin != initial_state and (keep or origin not in record):
++            record[origin] = start
++        last_seen[identifier] = max(last_seen.get(identifier, stop), stop)
++
++    rows = []
++    for identifier in sorted(entries):
++        record = entries[identifier]
++        rows.append([identifier] + [record.get(state, np.nan) for state in columns] + [last_seen[identifier]])
++    return pd.DataFrame(rows, columns=["id"] + columns + [censoring_col])
++
++
++def transitions_from_state_matrix(
++    df: pd.DataFrame, id_col: str, censoring_col: str, initial_state, entry_col: str = None
++) -> pd.DataFrame:
++    """
++    Build a transitions frame from a wide frame holding one row per subject.
++
++    Every column other than ``id_col`` and ``censoring_col`` is read as a state, and the value
++    in it is the time the subject entered that state, or null if the subject never did. Each
++    subject starts in ``initial_state`` at time zero, moves through the states it entered in
++    increasing time order, and is right censored in the state it was last seen in at the time
++    in ``censoring_col``.
++
++    Parameters
++    ----------
++    df: DataFrame
++        one row per subject.
++    id_col: string
++        the column holding the subject identifier.
++    censoring_col: string
++        the column holding the time the subject was last under observation.
++    initial_state:
++        the state every subject occupies at time zero.
++    entry_col: string, optional
++        the column holding the time the subject came under observation. Defaults to zero for
++        everybody.
++    """
++    reserved = [id_col, censoring_col] + ([entry_col] if entry_col is not None else [])
++    for column in reserved:
++        if column not in df.columns:
++            raise ValueError("The DataFrame is missing the column %s." % column)
++
++    state_columns = [column for column in df.columns if column not in reserved]
++    if initial_state in state_columns:
++        raise ValueError("The initial state %s must not also be a column of the DataFrame." % initial_state)
++
++    identifiers = df[id_col].tolist()
++    censoring_times = df[censoring_col].tolist()
++    starts = [0.0] * df.shape[0] if entry_col is None else df[entry_col].tolist()
++    entry_times = {column: df[column].tolist() for column in state_columns}
++
++    rows = []
++    for position in range(df.shape[0]):
++        identifier = identifiers[position]
++        censoring_time = float(censoring_times[position])
++        origin_time = float(starts[position])
++        if origin_time < 0:
++            raise ValueError("Subject %s comes under observation at a negative time." % identifier)
++        if censoring_time <= origin_time:
++            raise ValueError("Subject %s is censored before it comes under observation." % identifier)
++
++        entries = sorted(
++            (float(entry_times[column][position]), column)
++            for column in state_columns
++            if pd.notnull(entry_times[column][position])
++        )
++        times = [time for time, _ in entries]
++        if any(time <= origin_time for time in times):
++            raise ValueError("Subject %s enters a state before it comes under observation." % identifier)
++        if any(time > censoring_time for time in times):
++            raise ValueError("Subject %s enters a state after its censoring time." % identifier)
++        if len(set(times)) != len(times):
++            raise ValueError("Subject %s enters two states at the same time." % identifier)
++
++        current_state, current_time = initial_state, origin_time
++        for entry_time, state in entries:
++            rows.append((identifier, current_time, entry_time, current_state, state, 1))
++            current_state, current_time = state, entry_time
++        if censoring_time > current_time:
++            rows.append((identifier, current_time, censoring_time, current_state, current_state, 0))
++
++    return pd.DataFrame(rows, columns=TRANSITION_COLUMNS)
+diff --git a/lifelines/__init__.py b/lifelines/__init__.py
+index 3b5eae3..9604382 100644
+--- a/lifelines/__init__.py
++++ b/lifelines/__init__.py
+@@ -22,6 +22,7 @@ from lifelines.fitters.generalized_gamma_regression_fitter import GeneralizedGam
+ from lifelines.fitters.spline_fitter import SplineFitter
+ from lifelines.fitters.mixture_cure_fitter import MixtureCureFitter
+ from lifelines.fitters.crc_spline_fitter import CRCSplineFitter
++from lifelines.fitters.multi_state_fitter import MultiStateFitter
+ from lifelines import datasets
+ 
+ from lifelines.version import __version__
+@@ -37,6 +38,7 @@ __all__ = [
+     "ExponentialFitter",
+     "CoxTimeVaryingFitter",
+     "AalenJohansenFitter",
++    "MultiStateFitter",
+     "LogNormalFitter",
+     "GeneralizedGammaFitter",
+     "LogLogisticFitter",
+diff --git a/lifelines/statistics.py b/lifelines/statistics.py
+index 324b41b..13d29b2 100644
+--- a/lifelines/statistics.py
++++ b/lifelines/statistics.py
+@@ -18,6 +18,8 @@ from lifelines.utils import (
+     _expected_value_of_survival_squared_up_to_t,
+ )
+ 
++from lifelines.utils.multi_state import check_transitions_frame, risk_and_transition_counts, state_space, transition_label
++
+ from lifelines import KaplanMeierFitter
+ 
+ __all__ = [
+@@ -25,6 +27,8 @@ __all__ = [
+     "logrank_test",
+     "multivariate_logrank_test",
+     "pairwise_logrank_test",
++    "transition_logrank_test",
++    "multivariate_transition_logrank_test",
+     "survival_difference_at_fixed_point_in_time_test",
+     "proportional_hazard_test",
+     "power_under_cph",
+@@ -972,3 +976,142 @@ def proportional_hazard_test(
+             **kwargs
+         )
+     return result
++
++
++def transition_logrank_test(
++    transitions_A, transitions_B, from_state=None, to_state=None, t_0=-1, **kwargs
++) -> StatisticalResult:
++    r"""
++    Compare the intensity of a transition between two groups of subjects moving through a
++    multi state model.
++
++    The null hypothesis is that the groups leave ``from_state`` for ``to_state`` at the same
++    rate. At every time any group was seen taking the transition, the count observed in a group
++    is compared to the count expected from the pooled risk sets, and the standardized total of
++    those differences is referred to a chi squared distribution. When the model has a single
++    transition this is the ordinary log rank test.
++
++    Parameters
++    ----------
++    transitions_A: DataFrame
++        the transitions frame of the first group, as accepted by ``MultiStateFitter.fit``.
++    transitions_B: DataFrame
++        the transitions frame of the second group.
++    from_state: optional
++        the state the transition leaves. If not given, every transition seen in any group is
++        tested and the result holds one row per transition.
++    to_state: optional
++        the state the transition enters, required whenever ``from_state`` is given.
++    t_0: float, optional (default=-1)
++        transitions after this time are ignored. Specify -1 to use all time.
++
++    Returns
++    -------
++    StatisticalResult
++
++    """
++    return _transition_logrank([transitions_A, transitions_B], from_state, to_state, t_0, kwargs)
++
++
++def multivariate_transition_logrank_test(
++    transitions, groups, from_state=None, to_state=None, t_0=-1, **kwargs
++) -> StatisticalResult:
++    r"""
++    Compare the intensity of a transition across any number of groups of subjects moving
++    through a multi state model.
++
++    Parameters
++    ----------
++    transitions: DataFrame
++        one transitions frame holding every group, as accepted by ``MultiStateFitter.fit``.
++    groups: iterable
++        a label per row of ``transitions`` saying which group the row belongs to.
++    from_state: optional
++        the state the transition leaves. If not given, every transition seen in any group is
++        tested and the result holds one row per transition.
++    to_state: optional
++        the state the transition enters, required whenever ``from_state`` is given.
++    t_0: float, optional (default=-1)
++        transitions after this time are ignored. Specify -1 to use all time.
++
++    Returns
++    -------
++    StatisticalResult
++
++    """
++    labels = pd.Series(np.asarray(groups), index=transitions.index)
++    if labels.nunique() < 2:
++        raise ValueError("At least two groups are needed to compare.")
++    frames = [transitions.loc[labels == label] for label in sorted(labels.unique())]
++    return _transition_logrank(frames, from_state, to_state, t_0, kwargs)
++
++
++def _transition_logrank(frames, from_state, to_state, t_0, kwargs) -> StatisticalResult:
++    if (from_state is None) != (to_state is None):
++        raise ValueError("Specify both from_state and to_state, or neither of them.")
++
++    frames = [check_transitions_frame(frame) for frame in frames]
++    spaces = [state_space(frame) for frame in frames]
++    states = sorted(set().union(*[set(space[0]) for space in spaces]))
++    if from_state is None:
++        pairs = sorted(set().union(*[set(space[1]) for space in spaces]))
++    else:
++        pairs = [(from_state, to_state)]
++    if not pairs:
++        raise ValueError("No group has an observed transition to test.")
++
++    degrees_of_freedom = len(frames) - 1
++    statistics, p_values, names = [], [], []
++    for origin, target in pairs:
++        statistic = _transition_logrank_statistic(frames, states, origin, target, t_0)
++        statistics.append(statistic)
++        p_values.append(_chisq_test_p_value(statistic, degrees_of_freedom))
++        names.append(transition_label(origin, target))
++
++    common = dict(t_0=t_0, null_distribution="chi squared", degrees_of_freedom=degrees_of_freedom, **kwargs)
++    if from_state is not None:
++        return StatisticalResult(p_values[0], statistics[0], **common)
++    return StatisticalResult(p_values, statistics, name=names, **common)
++
++
++def _transition_logrank_statistic(frames, states, origin, target, t_0) -> float:
++    if origin not in states or target not in states:
++        raise ValueError("The transition %s does not appear in any group." % transition_label(origin, target))
++
++    taken = np.concatenate(
++        [
++            frame[(frame["observed"]) & (frame["from_state"] == origin) & (frame["to_state"] == target)]["stop"].values
++            for frame in frames
++        ]
++    )
++    times = np.unique(taken)
++    if t_0 > 0:
++        times = times[times <= t_0]
++    if times.shape[0] == 0:
++        return 0.0
++
++    row, column = states.index(origin), states.index(target)
++    at_risk, observed = [], []
++    for frame in frames:
++        risk, counts = risk_and_transition_counts(frame, states, times)
++        at_risk.append(risk[:, row])
++        observed.append(counts[:, row, column])
++    at_risk = np.column_stack(at_risk)
++    observed = np.column_stack(observed)
++
++    total_risk = at_risk.sum(axis=1)
++    total_observed = observed.sum(axis=1)
++    usable = total_risk > 1
++    share = np.divide(at_risk, total_risk[:, np.newaxis], out=np.zeros_like(at_risk), where=total_risk[:, np.newaxis] > 0)
++    deviation = (observed - share * total_observed[:, np.newaxis]).sum(axis=0)
++
++    factor = np.where(usable, total_observed * (total_risk - total_observed) / np.where(usable, total_risk - 1, 1), 0.0)
++    covariance = np.zeros((len(frames), len(frames)))
++    for index in range(times.shape[0]):
++        weights = share[index]
++        covariance += factor[index] * (np.diag(weights) - np.outer(weights, weights))
++
++    reduced = covariance[:-1, :-1]
++    if not np.any(reduced):
++        return 0.0
++    return float(deviation[:-1] @ np.linalg.pinv(reduced) @ deviation[:-1])
+diff --git a/lifelines/utils/__init__.py b/lifelines/utils/__init__.py
+index ee87e2d..8ea8b40 100644
+--- a/lifelines/utils/__init__.py
++++ b/lifelines/utils/__init__.py
+@@ -20,6 +20,11 @@ import pandas as pd
+ import formulaic
+ 
+ from lifelines.utils.concordance import concordance_index
++from lifelines.utils.multi_state import (
++    state_matrix_from_transitions,
++    transitions_from_events,
++    transitions_from_state_matrix,
++)
+ from lifelines.exceptions import ConvergenceWarning, ApproximationWarning, ConvergenceError
+ 
+ 
+@@ -38,6 +43,9 @@ __all__ = [
+     "to_episodic_format",
+     "add_covariate_to_timeline",
+     "covariates_from_event_matrix",
++    "transitions_from_state_matrix",
++    "state_matrix_from_transitions",
++    "transitions_from_events",
+     "find_best_parametric_model",
+ ]
+ 

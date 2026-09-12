@@ -1,0 +1,553 @@
+diff --git a/guard/src/rules/eval.rs b/guard/src/rules/eval.rs
+index ad5d47b..9914161 100644
+--- a/guard/src/rules/eval.rs
++++ b/guard/src/rules/eval.rs
+@@ -1,7 +1,7 @@
+ use super::exprs::*;
+ use super::*;
+ use crate::rules::eval::operators::Comparator;
+-use crate::rules::eval_context::{block_scope, resolve_function, ValueScope};
++use crate::rules::eval_context::{block_scope, resolve_arithmetic, resolve_function, ValueScope};
+ use crate::rules::path_value::compare_eq;
+ use std::collections::HashMap;
+ 
+@@ -1098,6 +1098,20 @@ pub(in crate::rules) fn eval_guard_access_clause<'value, 'loc: 'value>(
+                 LetValue::Value(rhs_val) => {
+                     (vec![QueryResult::Literal(Rc::new(rhs_val.clone()))], true)
+                 }
++                LetValue::BinaryOperation { .. } => match resolve_arithmetic(val, resolver) {
++                    Ok(value) => (vec![QueryResult::Literal(Rc::new(value))], true),
++                    Err(e) => {
++                        resolver.end_record(
++                            &blk_context,
++                            RecordType::GuardClauseBlockCheck(BlockCheck {
++                                status: Status::FAIL,
++                                at_least_one_matches: !all,
++                                message: Some(format!("Error {e} when handling clause, bailing")),
++                            }),
++                        )?;
++                        return Err(e);
++                    }
++                },
+                 LetValue::AccessClause(acc_querty) => match resolver.query(&acc_querty.query) {
+                     Ok(result) => (result, false),
+                     Err(e) => {
+@@ -1607,6 +1621,13 @@ pub(in crate::rules) fn eval_parameterized_rule_call<'value, 'loc: 'value>(
+                 let result = resolve_function(name, parameters, resolver)?;
+                 resolved_parameters.insert((param_rule.parameter_names[idx]).as_str(), result);
+             }
++            LetValue::BinaryOperation { .. } => {
++                let value = resolve_arithmetic(each, resolver)?;
++                resolved_parameters.insert(
++                    (param_rule.parameter_names[idx]).as_str(),
++                    vec![QueryResult::Resolved(Rc::new(value))],
++                );
++            }
+         }
+     }
+     let mut eval = ResolvedParameterContext {
+diff --git a/guard/src/rules/eval_context.rs b/guard/src/rules/eval_context.rs
+index 1ff1216..1c86e25 100644
+--- a/guard/src/rules/eval_context.rs
++++ b/guard/src/rules/eval_context.rs
+@@ -1,7 +1,7 @@
+ use crate::rules::errors::Error;
+ use crate::rules::exprs::{
+-    AccessQuery, Block, Conjunctions, FunctionExpr, GuardClause, LetExpr, LetValue,
+-    ParameterizedRule, QueryPart, Rule, RulesFile, SliceDisplay,
++    AccessQuery, ArithmeticOperator, Block, Conjunctions, FunctionExpr, GuardClause, LetExpr,
++    LetValue, ParameterizedRule, QueryPart, Rule, RulesFile, SliceDisplay,
+ };
+ use crate::rules::functions::collections::count;
+ use crate::rules::functions::converters::{
+@@ -10,7 +10,7 @@ use crate::rules::functions::converters::{
+ use crate::rules::functions::strings::{
+     join, json_parse, regex_replace, substring, to_lower, to_upper, url_decode,
+ };
+-use crate::rules::path_value::{Location, MapValue, PathAwareValue};
++use crate::rules::path_value::{Location, MapValue, Path, PathAwareValue};
+ use crate::rules::values::CmpOperator;
+ use crate::rules::Result;
+ use crate::rules::Status::SKIP;
+@@ -35,6 +35,7 @@ pub(crate) struct Scope<'value, 'loc: 'value> {
+     literals: HashMap<&'value str, Rc<PathAwareValue>>,
+     variable_queries: HashMap<&'value str, &'value AccessQuery<'loc>>,
+     function_expressions: HashMap<&'value str, &'value FunctionExpr<'loc>>,
++    arithmetic_expressions: HashMap<&'value str, &'value LetValue<'loc>>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Default)]
+@@ -61,6 +62,7 @@ impl<'value, 'loc: 'value> RootScope<'value, 'loc> {
+             self.rules,
+             self.parameterized_rules,
+             self.scope.function_expressions,
++            self.scope.arithmetic_expressions,
+             new_root,
+         )
+     }
+@@ -90,6 +92,7 @@ type ExtractedStatements<'value, 'loc> = (
+     HashMap<&'value str, Rc<PathAwareValue>>,
+     HashMap<&'value str, &'value AccessQuery<'loc>>,
+     HashMap<&'value str, &'value FunctionExpr<'loc>>,
++    HashMap<&'value str, &'value LetValue<'loc>>,
+ );
+ 
+ fn extract_variables<'value, 'loc: 'value>(
+@@ -98,6 +101,7 @@ fn extract_variables<'value, 'loc: 'value>(
+     let mut literals = HashMap::with_capacity(expressions.len());
+     let mut queries = HashMap::with_capacity(expressions.len());
+     let mut functions = HashMap::with_capacity(expressions.len());
++    let mut arithmetic = HashMap::new();
+     for each in expressions {
+         match &each.value {
+             LetValue::Value(v) => {
+@@ -110,10 +114,130 @@ fn extract_variables<'value, 'loc: 'value>(
+             LetValue::FunctionCall(function) => {
+                 functions.insert(each.var.as_str(), function);
+             }
++            LetValue::BinaryOperation { .. } => {
++                arithmetic.insert(each.var.as_str(), &each.value);
++            }
++        }
++    }
++
++    (literals, queries, functions, arithmetic)
++}
++
++enum Numeric {
++    Int(i64),
++    Float(f64),
++}
++
++impl Numeric {
++    fn as_f64(&self) -> f64 {
++        match self {
++            Numeric::Int(i) => *i as f64,
++            Numeric::Float(f) => *f,
++        }
++    }
++}
++
++fn as_numeric(value: &PathAwareValue) -> Result<Numeric> {
++    match value {
++        PathAwareValue::Int((_, i)) => Ok(Numeric::Int(*i)),
++        PathAwareValue::Float((_, f)) => Ok(Numeric::Float(*f)),
++        _ => Err(Error::IncompatibleError(
++            "arithmetic operands must be numeric".to_string(),
++        )),
++    }
++}
++
++fn apply_arithmetic(
++    operator: ArithmeticOperator,
++    lhs: &PathAwareValue,
++    rhs: &PathAwareValue,
++) -> Result<PathAwareValue> {
++    let path = Path::root();
++    match (as_numeric(lhs)?, as_numeric(rhs)?) {
++        (Numeric::Int(a), Numeric::Int(b)) => {
++            let result = match operator {
++                ArithmeticOperator::Add => a.checked_add(b),
++                ArithmeticOperator::Subtract => a.checked_sub(b),
++                ArithmeticOperator::Multiply => a.checked_mul(b),
++                ArithmeticOperator::Divide => {
++                    if b == 0 {
++                        return Err(Error::IncompatibleError("division by zero".to_string()));
++                    }
++                    if a % b == 0 {
++                        a.checked_div(b)
++                    } else {
++                        return Ok(PathAwareValue::Float((path, a as f64 / b as f64)));
++                    }
++                }
++                ArithmeticOperator::Modulo => {
++                    if b == 0 {
++                        return Err(Error::IncompatibleError("modulo by zero".to_string()));
++                    }
++                    Some(a % b)
++                }
++            };
++            match result {
++                Some(value) => Ok(PathAwareValue::Int((path, value))),
++                None => Err(Error::IncompatibleError("arithmetic overflow".to_string())),
++            }
++        }
++        (a, b) => {
++            let (x, y) = (a.as_f64(), b.as_f64());
++            let value = match operator {
++                ArithmeticOperator::Add => x + y,
++                ArithmeticOperator::Subtract => x - y,
++                ArithmeticOperator::Multiply => x * y,
++                ArithmeticOperator::Divide => {
++                    if y == 0.0 {
++                        return Err(Error::IncompatibleError("division by zero".to_string()));
++                    }
++                    x / y
++                }
++                ArithmeticOperator::Modulo => {
++                    if y == 0.0 {
++                        return Err(Error::IncompatibleError("modulo by zero".to_string()));
++                    }
++                    x % y
++                }
++            };
++            Ok(PathAwareValue::Float((path, value)))
+         }
+     }
++}
+ 
+-    (literals, queries, functions)
++fn single_numeric_value(results: Vec<QueryResult>) -> Result<PathAwareValue> {
++    let mut resolved: Vec<Rc<PathAwareValue>> = results
++        .into_iter()
++        .filter_map(|each| match each {
++            QueryResult::Resolved(value) | QueryResult::Literal(value) => Some(value),
++            QueryResult::UnResolved(_) => None,
++        })
++        .collect();
++    if resolved.len() != 1 {
++        return Err(Error::MultipleValues(format!(
++            "an arithmetic operand must resolve to exactly one value, found {}",
++            resolved.len()
++        )));
++    }
++    Ok((*resolved.remove(0)).clone())
++}
++
++pub(crate) fn resolve_arithmetic<'value, 'loc: 'value>(
++    operand: &'value LetValue<'loc>,
++    resolver: &mut dyn EvalContext<'value, 'loc>,
++) -> Result<PathAwareValue> {
++    match operand {
++        LetValue::Value(value) => Ok(value.clone()),
++        LetValue::AccessClause(query) => single_numeric_value(resolver.query(&query.query)?),
++        LetValue::FunctionCall(FunctionExpr {
++            name, parameters, ..
++        }) => single_numeric_value(resolve_function(name, parameters, resolver)?),
++        LetValue::BinaryOperation { operator, lhs, rhs } => {
++            let lhs = resolve_arithmetic(lhs, resolver)?;
++            let rhs = resolve_arithmetic(rhs, resolver)?;
++            apply_arithmetic(*operator, &lhs, &rhs)
++        }
++    }
+ }
+ 
+ fn retrieve_index(
+@@ -846,6 +970,10 @@ fn query_retrieval_with_converter<'value, 'loc: 'value>(
+                     LetValue::FunctionCall(FunctionExpr {
+                         parameters, name, ..
+                     }) => resolve_function(name, parameters, resolver)?,
++
++                    LetValue::BinaryOperation { .. } => vec![QueryResult::Literal(Rc::new(
++                        resolve_arithmetic(&map_key_filter.compare_with, resolver)?,
++                    ))],
+                 };
+ 
+                 let lhs = map
+@@ -927,7 +1055,8 @@ pub(crate) fn root_scope<'value, 'loc: 'value>(
+     rules_file: &'value RulesFile<'loc>,
+     root: Rc<PathAwareValue>,
+ ) -> RootScope<'value, 'loc> {
+-    let (literals, queries, function_expressions) = extract_variables(&rules_file.assignments);
++    let (literals, queries, function_expressions, arithmetic_expressions) =
++        extract_variables(&rules_file.assignments);
+     let mut lookup_cache = HashMap::with_capacity(rules_file.guard_rules.len());
+     for rule in &rules_file.guard_rules {
+         lookup_cache
+@@ -946,6 +1075,7 @@ pub(crate) fn root_scope<'value, 'loc: 'value>(
+         lookup_cache,
+         parameterized_rules,
+         function_expressions,
++        arithmetic_expressions,
+         root,
+     )
+ }
+@@ -956,6 +1086,7 @@ pub(crate) fn root_scope_with<'value, 'loc: 'value>(
+     lookup_cache: HashMap<&'value str, Vec<&'value Rule<'loc>>>,
+     parameterized_rules: HashMap<&'value str, &'value ParameterizedRule<'loc>>,
+     function_expressions: HashMap<&'value str, &'value FunctionExpr<'loc>>,
++    arithmetic_expressions: HashMap<&'value str, &'value LetValue<'loc>>,
+     root: Rc<PathAwareValue>,
+ ) -> RootScope<'value, 'loc> {
+     RootScope {
+@@ -965,6 +1096,7 @@ pub(crate) fn root_scope_with<'value, 'loc: 'value>(
+             variable_queries: queries,
+             //resolved_variables: std::cell::RefCell::new(HashMap::new()),
+             function_expressions,
++            arithmetic_expressions,
+             resolved_variables: HashMap::new(),
+         },
+         rules: lookup_cache,
+@@ -982,7 +1114,8 @@ pub(crate) fn block_scope<'value, 'block, 'loc: 'value, 'eval, T>(
+     root: Rc<PathAwareValue>,
+     parent: &'eval mut dyn EvalContext<'value, 'loc>,
+ ) -> BlockScope<'value, 'loc, 'eval> {
+-    let (literals, variable_queries, function_expressions) = extract_variables(&block.assignments);
++    let (literals, variable_queries, function_expressions, arithmetic_expressions) =
++        extract_variables(&block.assignments);
+     BlockScope {
+         scope: Scope {
+             literals,
+@@ -991,6 +1124,7 @@ pub(crate) fn block_scope<'value, 'block, 'loc: 'value, 'eval, T>(
+             //resolved_variables: std::cell::RefCell::new(HashMap::new()),
+             resolved_variables: HashMap::new(),
+             function_expressions,
++            arithmetic_expressions,
+         },
+         parent,
+     }
+@@ -1135,6 +1269,15 @@ impl<'value, 'loc: 'value> EvalContext<'value, 'loc> for RootScope<'value, 'loc>
+             return Ok(result);
+         }
+ 
++        if let Some(&operand) = self.scope.arithmetic_expressions.get(variable_name) {
++            let value = resolve_arithmetic(operand, self)?;
++            let result = vec![QueryResult::Literal(Rc::new(value))];
++            self.scope
++                .resolved_variables
++                .insert(variable_name, result.clone());
++            return Ok(result);
++        }
++
+         let query = match self.scope.variable_queries.get(variable_name) {
+             Some(val) => val,
+             None => {
+@@ -1563,6 +1706,15 @@ impl<'value, 'loc: 'value, 'eval> EvalContext<'value, 'loc> for BlockScope<'valu
+             return Ok(result);
+         }
+ 
++        if let Some(&operand) = self.scope.arithmetic_expressions.get(variable_name) {
++            let value = resolve_arithmetic(operand, self)?;
++            let result = vec![QueryResult::Literal(Rc::new(value))];
++            self.scope
++                .resolved_variables
++                .insert(variable_name, result.clone());
++            return Ok(result);
++        }
++
+         let query = match self.scope.variable_queries.get(variable_name) {
+             Some(val) => val,
+             None => return self.parent.resolve_variable(variable_name),
+@@ -2457,6 +2609,10 @@ pub(crate) fn resolve_function<'value, 'eval, 'loc: 'value>(
+                         let result = resolve_function(name, parameters, resolver)?;
+                         args.push(result);
+                     }
++                    LetValue::BinaryOperation { .. } => {
++                        let value = resolve_arithmetic(param, resolver)?;
++                        args.push(vec![QueryResult::Literal(Rc::new(value))]);
++                    }
+                 }
+ 
+                 Ok(args)
+diff --git a/guard/src/rules/evaluate.rs b/guard/src/rules/evaluate.rs
+index df45063..b43ea42 100644
+--- a/guard/src/rules/evaluate.rs
++++ b/guard/src/rules/evaluate.rs
+@@ -1058,6 +1058,7 @@ fn extract_variables<'s, 'loc>(
+                 queries.insert(&each.var, query);
+             }
+             LetValue::FunctionCall(_) => {}
++            LetValue::BinaryOperation { .. } => {}
+         }
+     }
+     Ok(())
+diff --git a/guard/src/rules/exprs.rs b/guard/src/rules/exprs.rs
+index d44fd5d..a7cb161 100644
+--- a/guard/src/rules/exprs.rs
++++ b/guard/src/rules/exprs.rs
+@@ -27,11 +27,38 @@ impl<'loc> std::fmt::Display for FileLocation<'loc> {
+     }
+ }
+ 
++#[derive(Eq, PartialEq, Debug, Clone, Copy, Serialize, Deserialize, Hash)]
++pub(crate) enum ArithmeticOperator {
++    Add,
++    Subtract,
++    Multiply,
++    Divide,
++    Modulo,
++}
++
++impl std::fmt::Display for ArithmeticOperator {
++    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
++        let s = match self {
++            ArithmeticOperator::Add => "+",
++            ArithmeticOperator::Subtract => "-",
++            ArithmeticOperator::Multiply => "*",
++            ArithmeticOperator::Divide => "/",
++            ArithmeticOperator::Modulo => "%",
++        };
++        write!(f, "{}", s)
++    }
++}
++
+ #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, Hash)]
+ pub(crate) enum LetValue<'loc> {
+     Value(PathAwareValue),
+     AccessClause(AccessQuery<'loc>),
+     FunctionCall(FunctionExpr<'loc>),
++    BinaryOperation {
++        operator: ArithmeticOperator,
++        lhs: Box<LetValue<'loc>>,
++        rhs: Box<LetValue<'loc>>,
++    },
+ }
+ 
+ ///
+@@ -382,6 +409,9 @@ impl<'loc> std::fmt::Display for LetValue<'loc> {
+             LetValue::AccessClause(acc) => acc.fmt(f)?,
+             LetValue::Value(v) => write!(f, "{}", ValueOnlyDisplay(Rc::new(v.clone())))?,
+             LetValue::FunctionCall(call_expr) => write!(f, "{}", call_expr)?,
++            LetValue::BinaryOperation { operator, lhs, rhs } => {
++                write!(f, "{} {} {}", lhs, operator, rhs)?
++            }
+         }
+         Ok(())
+     }
+diff --git a/guard/src/rules/parser.rs b/guard/src/rules/parser.rs
+index dcda3b0..d33c019 100644
+--- a/guard/src/rules/parser.rs
++++ b/guard/src/rules/parser.rs
+@@ -11,10 +11,10 @@ use nom::character::complete::{anychar, digit1, one_of};
+ use nom::character::complete::{char, multispace0, multispace1, space0};
+ use nom::combinator::{all_consuming, cut, peek};
+ use nom::combinator::{map, value};
+-use nom::combinator::{map_res, opt};
++use nom::combinator::{map_res, opt, verify};
+ use nom::error::context;
+ use nom::error::ErrorKind;
+-use nom::multi::{fold_many1, separated_list0, separated_list1};
++use nom::multi::{fold_many0, fold_many1, separated_list0, separated_list1};
+ use nom::multi::{many0, many1};
+ use nom::number::complete::double;
+ use nom::sequence::{delimited, preceded};
+@@ -999,6 +999,11 @@ where
+         let (rest, (compare_with, custom_message)) =
+             context("expecting either a property access \"engine.core\" or value like \"string\" or [\"this\", \"that\"]",
+                     cut(alt((
++                        map(tuple((
++                            arithmetic_expr, preceded(zero_or_more_ws_or_comment, opt(custom_message)))),
++                            |(rhs, msg)| {
++                                (Some(rhs), msg.map(String::from).or(None))
++                            }),
+                         //
+                         // Order does matter here as true/false and other values can be interpreted as access
+                         //
+@@ -1109,10 +1114,19 @@ fn function_expr(input: Span) -> IResult<Span, FunctionExpr> {
+     ))
+ }
+ 
+-pub(crate) fn let_value(input: Span) -> IResult<Span, LetValue> {
++fn let_primary(input: Span) -> IResult<Span, LetValue> {
+     preceded(
+         zero_or_more_ws_or_comment,
+         alt((
++            delimited(
++                char('('),
++                delimited(
++                    zero_or_more_ws_or_comment,
++                    let_value,
++                    zero_or_more_ws_or_comment,
++                ),
++                char(')'),
++            ),
+             map(parse_value, |val| {
+                 LetValue::Value(PathAwareValue::try_from(val).unwrap())
+             }),
+@@ -1122,6 +1136,56 @@ pub(crate) fn let_value(input: Span) -> IResult<Span, LetValue> {
+     )(input)
+ }
+ 
++fn arithmetic_term(input: Span) -> IResult<Span, LetValue> {
++    let (rest, first) = let_primary(input)?;
++    fold_many0(
++        pair(
++            preceded(
++                zero_or_more_ws_or_comment,
++                alt((
++                    value(ArithmeticOperator::Multiply, char('*')),
++                    value(ArithmeticOperator::Divide, char('/')),
++                )),
++            ),
++            let_primary,
++        ),
++        move || first.clone(),
++        |lhs, (operator, rhs)| LetValue::BinaryOperation {
++            operator,
++            lhs: Box::new(lhs),
++            rhs: Box::new(rhs),
++        },
++    )(rest)
++}
++
++pub(crate) fn let_value(input: Span) -> IResult<Span, LetValue> {
++    let (rest, first) = arithmetic_term(input)?;
++    fold_many0(
++        pair(
++            preceded(
++                zero_or_more_ws_or_comment,
++                alt((
++                    value(ArithmeticOperator::Add, char('+')),
++                    value(ArithmeticOperator::Subtract, char('-')),
++                )),
++            ),
++            arithmetic_term,
++        ),
++        move || first.clone(),
++        |lhs, (operator, rhs)| LetValue::BinaryOperation {
++            operator,
++            lhs: Box::new(lhs),
++            rhs: Box::new(rhs),
++        },
++    )(rest)
++}
++
++fn arithmetic_expr(input: Span) -> IResult<Span, LetValue> {
++    verify(let_value, |value| {
++        matches!(value, LetValue::BinaryOperation { .. })
++    })(input)
++}
++
+ fn call_expr(input: Span) -> IResult<Span, (String, Vec<LetValue>)> {
+     tuple((
+         var_name,
+@@ -1434,6 +1498,16 @@ fn let_assignment_expr(input: Span) -> IResult<Span, String> {
+ fn assignment(input: Span) -> IResult<Span, LetExpr> {
+     let (input, var_name) = let_assignment_expr(input)?;
+ 
++    if let Ok((input, value)) = arithmetic_expr(input) {
++        return Ok((
++            input,
++            LetExpr {
++                var: var_name,
++                value,
++            },
++        ));
++    }
++
+     match parse_value(input) {
+         Ok((input, value)) => Ok((
+             input,
+@@ -1444,9 +1518,6 @@ fn assignment(input: Span) -> IResult<Span, LetExpr> {
+         )),
+ 
+         Err(nom::Err::Error(_)) => {
+-            //
+-            // if we did not succeed in parsing a value object, then
+-            // if must be an access pattern, or function call  else it is a failure
+             match cut(preceded(zero_or_more_ws_or_comment, function_expr))(input) {
+                 Ok((input, function)) => Ok((
+                     input,
+diff --git a/guard/src/rules/path_value.rs b/guard/src/rules/path_value.rs
+index 5b99e75..ca6cb7e 100644
+--- a/guard/src/rules/path_value.rs
++++ b/guard/src/rules/path_value.rs
+@@ -772,6 +772,8 @@ impl QueryResolver for PathAwareValue {
+                         }
+ 
+                         LetValue::FunctionCall(_) => unreachable!(),
++
++                        LetValue::BinaryOperation { .. } => unreachable!(),
+                     };
+                     if query.len() > 1 {
+                         let mut acc = Vec::with_capacity(selected.len());

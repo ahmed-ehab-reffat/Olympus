@@ -1,0 +1,1220 @@
+diff --git a/src/textual/app.py b/src/textual/app.py
+index a716ba355..7ea7051e6 100644
+--- a/src/textual/app.py
++++ b/src/textual/app.py
+@@ -4406,6 +4406,8 @@ class App(Generic[ReturnType], DOMNode):
+                     if screen._running:
+                         self._update_mouse_over(screen)
+                 finally:
++                    # Update position and subtree dependent CSS
++                    parent._update_position_dependent_styles()
+                     parent.refresh(layout=True)
+ 
+         await_complete = AwaitRemove(
+diff --git a/src/textual/css/_nth.py b/src/textual/css/_nth.py
+new file mode 100644
+index 000000000..e2aa03df9
+--- /dev/null
++++ b/src/textual/css/_nth.py
+@@ -0,0 +1,77 @@
++from __future__ import annotations
++
++import re
++
++RE_NTH = re.compile(
++    r"odd|even|(?P<coefficient>[+-]?\d*)n(?:\s*(?P<sign>[+-])\s*(?P<offset>\d+))?|(?P<integer>[+-]?\d+)"
++)
++
++
++def parse_nth(value: str) -> tuple[int, int]:
++    """Parse the an+b microsyntax used by positional pseudo-classes.
++
++    Args:
++        value: The argument of a positional pseudo-class, e.g. "2n+1" or "odd".
++
++    Returns:
++        A pair (a, b) such that the expression selects positions a*n + b.
++
++    Raises:
++        ValueError: If the value is not a valid an+b expression.
++    """
++    value = value.strip()
++    match = RE_NTH.fullmatch(value)
++    if match is None:
++        raise ValueError(f"invalid nth expression {value!r}")
++    if value == "odd":
++        return (2, 1)
++    if value == "even":
++        return (2, 0)
++    integer = match.group("integer")
++    if integer is not None:
++        return (0, int(integer))
++    coefficient = match.group("coefficient")
++    if coefficient in ("", "+"):
++        a = 1
++    elif coefficient == "-":
++        a = -1
++    else:
++        a = int(coefficient)
++    offset = match.group("offset")
++    if offset is None:
++        b = 0
++    else:
++        b = -int(offset) if match.group("sign") == "-" else int(offset)
++    return (a, b)
++
++
++def nth_matches(a: int, b: int, position: int) -> bool:
++    """Check if a 1-based position is selected by an an+b expression.
++
++    Args:
++        a: The step of the expression.
++        b: The offset of the expression.
++        position: A 1-based position.
++
++    Returns:
++        `True` if the position equals a*n + b for some n >= 0.
++    """
++    if a == 0:
++        return position == b
++    multiple, remainder = divmod(position - b, a)
++    return remainder == 0 and multiple >= 0
++
++
++def format_nth(a: int, b: int) -> str:
++    """Format an (a, b) pair back to canonical an+b form.
++
++    Args:
++        a: The step of the expression.
++        b: The offset of the expression.
++
++    Returns:
++        The expression in canonical an+b form.
++    """
++    if a == 0:
++        return str(b)
++    return f"{a}n{b:+d}" if b else f"{a}n"
+diff --git a/src/textual/css/constants.py b/src/textual/css/constants.py
+index 8242ecd94..b7f541f91 100644
+--- a/src/textual/css/constants.py
++++ b/src/textual/css/constants.py
+@@ -83,6 +83,16 @@ VALID_PSEUDO_CLASSES: Final = {
+     "even",
+     "empty",
+ }
++NTH_PSEUDO_CLASSES: Final = {
++    "nth-child",
++    "nth-last-child",
++    "nth-of-type",
++    "nth-last-of-type",
++}
++LOGICAL_PSEUDO_CLASSES: Final = {"not", "is", "where"}
++VALID_FUNCTIONAL_PSEUDO_CLASSES: Final = (
++    NTH_PSEUDO_CLASSES | LOGICAL_PSEUDO_CLASSES | {"has"}
++)
+ VALID_OVERLAY: Final = {"none", "screen"}
+ VALID_CONSTRAIN: Final = {"inflect", "inside", "none"}
+ VALID_KEYLINE: Final = {"none", "thin", "heavy", "double"}
+diff --git a/src/textual/css/match.py b/src/textual/css/match.py
+index 00665f15c..8bdb0b303 100644
+--- a/src/textual/css/match.py
++++ b/src/textual/css/match.py
+@@ -2,7 +2,7 @@ from __future__ import annotations
+ 
+ from typing import TYPE_CHECKING, Iterable
+ 
+-from textual.css.model import CombinatorType, Selector, SelectorSet
++from textual.css.model import CombinatorType, CompoundSelector, SelectorSet
+ 
+ if TYPE_CHECKING:
+     from textual.dom import DOMNode
+@@ -19,56 +19,95 @@ def match(selector_sets: Iterable[SelectorSet], node: DOMNode) -> bool:
+         True if the node matches the selector, otherwise False.
+     """
+     return any(
+-        _check_selectors(selector_set.selectors, node.css_path_nodes)
++        _check_levels(selector_set._levels, node.css_path_nodes)
+         for selector_set in selector_sets
+     )
+ 
+ 
+-def _check_selectors(selectors: list[Selector], css_path_nodes: list[DOMNode]) -> bool:
+-    """Match a list of selectors against DOM nodes.
++def _check_chain(
++    chain: tuple[CompoundSelector, ...], index: int, node: DOMNode
++) -> bool:
++    """Match a sibling chain of compound selectors against a node.
++
++    The compound at `index` must match the node itself; compounds before it
++    must match the node's preceding displayed siblings, walking adjacent or
++    general sibling combinators leftwards.
++
++    Args:
++        chain: The compound selectors of a single tree level.
++        index: Index of the compound to check against the node.
++        node: A DOM node.
++
++    Returns:
++        True if the chain up to and including `index` matches, otherwise False.
++    """
++    if not chain[index].check(node):
++        return False
++    if index == 0:
++        return True
++    parent = node._parent
++    if parent is None:
++        return False
++    siblings = parent._nodes.displayed
++    try:
++        position = siblings.index(node)
++    except ValueError:
++        return False
++    if chain[index].combinator == CombinatorType.ADJACENT_SIBLING:
++        return position > 0 and _check_chain(chain, index - 1, siblings[position - 1])
++    return any(
++        _check_chain(chain, index - 1, siblings[sibling_position])
++        for sibling_position in range(position - 1, -1, -1)
++    )
++
++
++def _check_levels(
++    levels: tuple[tuple[CompoundSelector, ...], ...],
++    css_path_nodes: list[DOMNode],
++) -> bool:
++    """Match per-level sibling chains against the path of DOM nodes.
+ 
+     Args:
+-        selectors: A list of selectors.
+-        css_path_nodes: The DOM nodes to check the selectors against.
++        levels: Compound selectors grouped per tree level.
++        css_path_nodes: The DOM nodes to check the levels against.
+ 
+     Returns:
+-        True if any node in css_path_nodes matches a selector.
++        True if the final level matches the last node of the path.
+     """
+ 
+     DESCENDENT = CombinatorType.DESCENDENT
+ 
+     node = css_path_nodes[-1]
+     path_count = len(css_path_nodes)
+-    selector_count = len(selectors)
++    level_count = len(levels)
+ 
+     stack: list[tuple[int, int]] = [(0, 0)]
+ 
+     push = stack.append
+     pop = stack.pop
+-    selector_index = 0
+ 
+     while stack:
+-        selector_index, node_index = stack[-1]
+-        if selector_index == selector_count or node_index == path_count:
++        level_index, node_index = stack[-1]
++        if level_index == level_count or node_index == path_count:
+             pop()
+         else:
+             path_node = css_path_nodes[node_index]
+-            selector = selectors[selector_index]
+-            if selector.combinator == DESCENDENT:
++            chain = levels[level_index]
++            if chain[0].combinator == DESCENDENT:
+                 # Find a matching descendent
+-                if selector.check(path_node):
+-                    if path_node is node and selector_index == selector_count - 1:
++                if _check_chain(chain, len(chain) - 1, path_node):
++                    if path_node is node and level_index == level_count - 1:
+                         return True
+-                    stack[-1] = (selector_index + 1, node_index + selector.advance)
+-                    push((selector_index, node_index + 1))
++                    stack[-1] = (level_index + 1, node_index + 1)
++                    push((level_index, node_index + 1))
+                 else:
+-                    stack[-1] = (selector_index, node_index + 1)
++                    stack[-1] = (level_index, node_index + 1)
+             else:
+                 # Match the next node
+-                if selector.check(path_node):
+-                    if path_node is node and selector_index == selector_count - 1:
++                if _check_chain(chain, len(chain) - 1, path_node):
++                    if path_node is node and level_index == level_count - 1:
+                         return True
+-                    stack[-1] = (selector_index + 1, node_index + selector.advance)
++                    stack[-1] = (level_index + 1, node_index + 1)
+                 else:
+                     pop()
+     return False
+diff --git a/src/textual/css/model.py b/src/textual/css/model.py
+index 05c64d9a7..4961b8b50 100644
+--- a/src/textual/css/model.py
++++ b/src/textual/css/model.py
+@@ -3,11 +3,12 @@ from __future__ import annotations
+ from dataclasses import dataclass, field
+ from enum import Enum
+ from functools import partial
+-from typing import TYPE_CHECKING, Iterable
++from typing import TYPE_CHECKING, Iterable, Union
+ 
+ import rich.repr
+ 
+ from textual.css._help_renderables import HelpText
++from textual.css._nth import format_nth, nth_matches
+ from textual.css.styles import Styles
+ from textual.css.tokenize import Token
+ from textual.css.types import Specificity3
+@@ -15,7 +16,7 @@ from textual.css.types import Specificity3
+ if TYPE_CHECKING:
+     from typing import Callable
+ 
+-    from typing_extensions import Self
++    from typing_extensions import Self, TypeAlias
+ 
+     from textual.dom import DOMNode
+ 
+@@ -44,6 +45,16 @@ class CombinatorType(Enum):
+     """Selector is a descendant of the previous selector"""
+     CHILD = 3
+     """Selector is an immediate child of the previous selector"""
++    ADJACENT_SIBLING = 4
++    """Selector is the displayed sibling immediately after the previous selector"""
++    GENERAL_SIBLING = 5
++    """Selector is a displayed sibling somewhere after the previous selector"""
++
++
++SIBLING_COMBINATORS = {
++    CombinatorType.ADJACENT_SIBLING,
++    CombinatorType.GENERAL_SIBLING,
++}
+ 
+ 
+ def _check_universal(name: str, node: DOMNode) -> bool:
+@@ -107,6 +118,223 @@ _CHECKS = {
+ }
+ 
+ 
++def _render_arguments(arguments: tuple[tuple[Selector, ...], ...]) -> str:
++    """Rebuild selector arguments as they would appear in CSS.
++
++    Args:
++        arguments: Compound selector arguments.
++
++    Returns:
++        The arguments as a comma separated string.
++    """
++    return ", ".join(
++        "".join(selector.css for selector in argument) for argument in arguments
++    )
++
++
++def _argument_pseudo_class_names(
++    arguments: tuple[tuple[Selector, ...], ...]
++) -> set[str]:
++    """Collect the pseudo class names used by selector arguments.
++
++    Args:
++        arguments: Compound selector arguments.
++
++    Returns:
++        Set of pseudo class names.
++    """
++    names: set[str] = set()
++    for argument in arguments:
++        for selector in argument:
++            names.update(selector.pseudo_classes)
++            for functional in selector.functional_pseudo_classes:
++                names.update(functional.pseudo_class_names)
++    return names
++
++
++def _max_argument_specificity(
++    arguments: tuple[tuple[Selector, ...], ...]
++) -> Specificity3:
++    """The specificity of the most specific selector argument.
++
++    Args:
++        arguments: Compound selector arguments.
++
++    Returns:
++        The highest specificity among the arguments.
++    """
++    specificities: list[Specificity3] = []
++    for argument in arguments:
++        id_total = class_total = type_total = 0
++        for selector in argument:
++            _id, _class, _type = selector.specificity
++            id_total += _id
++            class_total += _class
++            type_total += _type
++        specificities.append((id_total, class_total, type_total))
++    return max(specificities)
++
++
++def _check_arguments(
++    arguments: tuple[tuple[Selector, ...], ...], node: DOMNode
++) -> bool:
++    """Check if a node matches any of the selector arguments.
++
++    Args:
++        arguments: Compound selector arguments.
++        node: A DOM node.
++
++    Returns:
++        `True` if any argument matches the node, otherwise `False`.
++    """
++    return any(
++        all(selector.check(node) for selector in argument) for argument in arguments
++    )
++
++
++@dataclass
++class NthPseudoClass:
++    """A positional pseudo class with an an+b argument, e.g. `:nth-child(2n+1)`."""
++
++    name: str
++    a: int
++    b: int
++    of: tuple[tuple[Selector, ...], ...] = ()
++
++    def __post_init__(self) -> None:
++        self._of_type: bool = self.name.endswith("of-type")
++        self._from_last: bool = self.name.startswith("nth-last")
++
++    @property
++    def css(self) -> str:
++        """Rebuilds the pseudo class as it would appear in CSS."""
++        nth = format_nth(self.a, self.b)
++        if self.of:
++            nth = f"{nth} of {_render_arguments(self.of)}"
++        return f":{self.name}({nth})"
++
++    @property
++    def specificity(self) -> Specificity3:
++        """Specificity contributed by this pseudo class."""
++        return (0, 1, 0)
++
++    @property
++    def pseudo_class_names(self) -> set[str]:
++        """Pseudo class names this pseudo class depends on."""
++        return {self.name} | _argument_pseudo_class_names(self.of)
++
++    def check(self, node: DOMNode) -> bool:
++        """Check if a given node matches the pseudo class.
++
++        Args:
++            node: A DOM node.
++
++        Returns:
++            `True` if the pseudo class matches, otherwise `False`.
++        """
++        if self.of:
++            parent = node._parent
++            siblings = [node] if parent is None else parent._nodes.displayed
++            filtered = [
++                sibling for sibling in siblings if _check_arguments(self.of, sibling)
++            ]
++            try:
++                position = filtered.index(node) + 1
++            except ValueError:
++                return False
++            count = len(filtered)
++        elif self._of_type:
++            position, count = node._displayed_type_position
++        else:
++            position, count = node._displayed_position
++        if not position:
++            return False
++        if self._from_last:
++            position = count - position + 1
++        return nth_matches(self.a, self.b, position)
++
++
++@dataclass
++class LogicalPseudoClass:
++    """A logical pseudo class with selector arguments, e.g. `:not(.disabled)`."""
++
++    name: str
++    arguments: tuple[tuple[Selector, ...], ...]
++
++    @property
++    def css(self) -> str:
++        """Rebuilds the pseudo class as it would appear in CSS."""
++        return f":{self.name}({_render_arguments(self.arguments)})"
++
++    @property
++    def specificity(self) -> Specificity3:
++        """Specificity contributed by this pseudo class.
++
++        `:not` and `:is` count their most specific argument; `:where` counts nothing.
++        """
++        if self.name == "where":
++            return (0, 0, 0)
++        return _max_argument_specificity(self.arguments)
++
++    @property
++    def pseudo_class_names(self) -> set[str]:
++        """Pseudo class names this pseudo class depends on."""
++        return {self.name} | _argument_pseudo_class_names(self.arguments)
++
++    def check(self, node: DOMNode) -> bool:
++        """Check if a given node matches the pseudo class.
++
++        Args:
++            node: A DOM node.
++
++        Returns:
++            `True` if the pseudo class matches, otherwise `False`.
++        """
++        matched = _check_arguments(self.arguments, node)
++        return not matched if self.name == "not" else matched
++
++
++@dataclass
++class HasPseudoClass:
++    """The `:has()` pseudo class, matching on a widget's descendants."""
++
++    arguments: tuple[tuple[Selector, ...], ...]
++
++    @property
++    def css(self) -> str:
++        """Rebuilds the pseudo class as it would appear in CSS."""
++        return f":has({_render_arguments(self.arguments)})"
++
++    @property
++    def specificity(self) -> Specificity3:
++        """Specificity contributed by this pseudo class."""
++        return _max_argument_specificity(self.arguments)
++
++    @property
++    def pseudo_class_names(self) -> set[str]:
++        """Pseudo class names this pseudo class depends on."""
++        return {"has"} | _argument_pseudo_class_names(self.arguments)
++
++    def check(self, node: DOMNode) -> bool:
++        """Check if a given node matches the pseudo class.
++
++        Args:
++            node: A DOM node.
++
++        Returns:
++            `True` if the pseudo class matches, otherwise `False`.
++        """
++        return any(
++            _check_arguments(self.arguments, child) for child in node.walk_children()
++        )
++
++
++FunctionalPseudoClass: TypeAlias = Union[
++    NthPseudoClass, LogicalPseudoClass, HasPseudoClass
++]
++"""Union of the functional pseudo class forms attachable to a selector."""
++
++
+ @dataclass
+ class Selector:
+     """Represents a CSS selector.
+@@ -122,8 +350,8 @@ class Selector:
+     combinator: CombinatorType = CombinatorType.DESCENDENT
+     type: SelectorType = SelectorType.TYPE
+     pseudo_classes: set[str] = field(default_factory=set)
++    functional_pseudo_classes: tuple[FunctionalPseudoClass, ...] = ()
+     specificity: Specificity3 = field(default_factory=lambda: (0, 0, 0))
+-    advance: int = 1
+ 
+     def __post_init__(self) -> None:
+         self._check: Callable[[DOMNode], bool] = partial(_CHECKS[self.type], self.name)
+@@ -131,9 +359,11 @@ class Selector:
+     @property
+     def css(self) -> str:
+         """Rebuilds the selector as it would appear in CSS."""
+-        pseudo_suffix = "".join(f":{name}" for name in sorted(self.pseudo_classes))
++        pseudo_suffix = "".join(
++            f":{name}" for name in sorted(self.pseudo_classes)
++        ) + "".join(functional.css for functional in self.functional_pseudo_classes)
+         if self.type == SelectorType.UNIVERSAL:
+-            return "*"
++            return f"*{pseudo_suffix}"
+         elif self.type == SelectorType.TYPE:
+             return f"{self.name}{pseudo_suffix}"
+         elif self.type == SelectorType.CLASS:
+@@ -151,6 +381,21 @@ class Selector:
+         specificity1, specificity2, specificity3 = self.specificity
+         self.specificity = (specificity1, specificity2 + 1, specificity3)
+ 
++    def _add_functional_pseudo_class(self, functional: FunctionalPseudoClass) -> None:
++        """Adds a functional pseudo class and updates specificity.
++
++        Args:
++            functional: A functional pseudo class.
++        """
++        self.functional_pseudo_classes = (*self.functional_pseudo_classes, functional)
++        specificity1, specificity2, specificity3 = self.specificity
++        functional1, functional2, functional3 = functional.specificity
++        self.specificity = (
++            specificity1 + functional1,
++            specificity2 + functional2,
++            specificity3 + functional3,
++        )
++
+     def check(self, node: DOMNode) -> bool:
+         """Check if a given node matches the selector.
+ 
+@@ -160,10 +405,16 @@ class Selector:
+         Returns:
+             True if the selector matches, otherwise False.
+         """
+-        return self._check(node) and (
+-            node.has_pseudo_classes(self.pseudo_classes)
+-            if self.pseudo_classes
+-            else True
++        return (
++            self._check(node)
++            and (
++                node.has_pseudo_classes(self.pseudo_classes)
++                if self.pseudo_classes
++                else True
++            )
++            and all(
++                functional.check(node) for functional in self.functional_pseudo_classes
++            )
+         )
+ 
+ 
+@@ -176,6 +427,57 @@ class Declaration:
+     tokens: list[Token] = field(default_factory=list)
+ 
+ 
++@dataclass
++class CompoundSelector:
++    """A run of simple selectors which all apply to a single node."""
++
++    selectors: tuple[Selector, ...]
++    combinator: CombinatorType
++
++    def check(self, node: DOMNode) -> bool:
++        """Check if a given node matches every selector of the compound.
++
++        Args:
++            node: A DOM node.
++
++        Returns:
++            `True` if the compound selector matches, otherwise `False`.
++        """
++        return all(selector.check(node) for selector in self.selectors)
++
++
++def _selectors_to_levels(
++    selectors: list[Selector],
++) -> tuple[tuple[CompoundSelector, ...], ...]:
++    """Group a flat selector list into per-tree-level sibling chains.
++
++    Each level holds one or more compound selectors; compounds after the first
++    are linked to their predecessor by a sibling combinator and all apply to
++    nodes under the same parent.
++
++    Args:
++        selectors: A flat list of selectors.
++
++    Returns:
++        A tuple of levels, each a tuple of compound selectors.
++    """
++    SAME = CombinatorType.SAME
++    levels: list[list[CompoundSelector]] = []
++    for selector in selectors:
++        combinator = selector.combinator
++        if combinator == SAME and levels:
++            chain = levels[-1]
++            compound = chain[-1]
++            chain[-1] = CompoundSelector(
++                (*compound.selectors, selector), compound.combinator
++            )
++        elif combinator in SIBLING_COMBINATORS and levels:
++            levels[-1].append(CompoundSelector((selector,), combinator))
++        else:
++            levels.append([CompoundSelector((selector,), combinator)])
++    return tuple(tuple(chain) for chain in levels)
++
++
+ @rich.repr.auto(angular=True)
+ @dataclass
+ class SelectorSet:
+@@ -185,9 +487,9 @@ class SelectorSet:
+     specificity: Specificity3 = (0, 0, 0)
+ 
+     def __post_init__(self) -> None:
+-        SAME = CombinatorType.SAME
+-        for selector, next_selector in zip(self.selectors, self.selectors[1:]):
+-            selector.advance = int(next_selector.combinator != SAME)
++        self._levels: tuple[tuple[CompoundSelector, ...], ...] = _selectors_to_levels(
++            self.selectors
++        )
+ 
+     @property
+     def css(self) -> str:
+@@ -198,7 +500,12 @@ class SelectorSet:
+         """Are all the selectors simple (i.e. only dependent on static DOM state)."""
+         simple_types = {SelectorType.ID, SelectorType.TYPE}
+         return all(
+-            (selector.type in simple_types and not selector.pseudo_classes)
++            (
++                selector.type in simple_types
++                and not selector.pseudo_classes
++                and not selector.functional_pseudo_classes
++                and selector.combinator not in SIBLING_COMBINATORS
++            )
+             for selector in self.selectors
+         )
+ 
+@@ -244,6 +551,7 @@ class RuleSet:
+     tie_breaker: int = 0
+     selector_names: set[str] = field(default_factory=set)
+     pseudo_classes: set[str] = field(default_factory=set)
++    has_sibling_combinator: bool = False
+ 
+     def __hash__(self):
+         return id(self)
+@@ -256,6 +564,10 @@ class RuleSet:
+                 tokens.append(" ")
+             elif selector.combinator == CombinatorType.CHILD:
+                 tokens.append(" > ")
++            elif selector.combinator == CombinatorType.ADJACENT_SIBLING:
++                tokens.append(" + ")
++            elif selector.combinator == CombinatorType.GENERAL_SIBLING:
++                tokens.append(" ~ ")
+             tokens.append(selector.css)
+ 
+         return "".join(tokens).strip()
+@@ -293,6 +605,10 @@ class RuleSet:
+         for selector_set in self.selector_set:
+             for selector in selector_set.selectors:
+                 add_pseudo_classes(selector.pseudo_classes)
++                for functional in selector.functional_pseudo_classes:
++                    add_pseudo_classes(functional.pseudo_class_names)
++                if selector.combinator in SIBLING_COMBINATORS:
++                    self.has_sibling_combinator = True
+ 
+             selector = selector_set.selectors[-1]
+             selector_type = selector.type
+diff --git a/src/textual/css/parse.py b/src/textual/css/parse.py
+index e030cc4ac..75502f1d2 100644
+--- a/src/textual/css/parse.py
++++ b/src/textual/css/parse.py
+@@ -6,11 +6,16 @@ from functools import lru_cache
+ from typing import Iterable, Iterator, NoReturn
+ 
+ from textual.css._help_renderables import HelpText
++from textual.css._nth import parse_nth
+ from textual.css._styles_builder import DeclarationError, StylesBuilder
++from textual.css.constants import NTH_PSEUDO_CLASSES
+ from textual.css.errors import UnresolvedVariableError
+ from textual.css.model import (
+     CombinatorType,
+     Declaration,
++    HasPseudoClass,
++    LogicalPseudoClass,
++    NthPseudoClass,
+     RuleSet,
+     Selector,
+     SelectorSet,
+@@ -24,7 +29,7 @@ from textual.css.tokenize import (
+     tokenize_declarations,
+     tokenize_values,
+ )
+-from textual.css.tokenizer import ReferencedBy, UnexpectedEnd
++from textual.css.tokenizer import ReferencedBy, TokenError, UnexpectedEnd
+ from textual.css.types import CSSLocation, Specificity3
+ from textual.suggestions import get_suggestion
+ 
+@@ -40,6 +45,114 @@ SELECTOR_MAP: dict[str, tuple[SelectorType, Specificity3]] = {
+     "nested": (SelectorType.NESTED, (0, 0, 0)),
+ }
+ 
++ARGUMENT_SELECTOR_MAP: dict[str, tuple[SelectorType, Specificity3]] = {
++    "argument_selector": (SelectorType.TYPE, (0, 0, 1)),
++    "argument_class": (SelectorType.CLASS, (0, 1, 0)),
++    "argument_id": (SelectorType.ID, (1, 0, 0)),
++    "argument_universal": (SelectorType.UNIVERSAL, (0, 0, 0)),
++}
++
++
++def parse_pseudo_function(
++    token: Token, tokens: Iterator[Token]
++) -> NthPseudoClass | LogicalPseudoClass | HasPseudoClass:
++    """Parse the arguments of a functional pseudo-class.
++
++    Args:
++        token: The pseudo_function token which opened the arguments.
++        tokens: The token stream, positioned after the opening token.
++
++    Returns:
++        The parsed functional pseudo-class.
++
++    Raises:
++        TokenError: If the arguments are not valid for the pseudo-class.
++    """
++    name = token.value.strip(":")[:-1]
++    line_no, col_no = token.location
++
++    def parse_error(message: str) -> NoReturn:
++        raise TokenError(
++            token.read_from, token.code, (line_no + 1, col_no + 1), message
++        )
++
++    def parse_argument_selectors() -> tuple[tuple[Selector, ...], ...]:
++        arguments: list[tuple[Selector, ...]] = []
++        compound: list[Selector] = []
++        pending_space = False
++        after_comma = False
++        for argument_token in tokens:
++            token_name = argument_token.name
++            if token_name == "whitespace":
++                pending_space = True
++                continue
++            elif token_name == "pseudo_function_end":
++                if after_comma:
++                    parse_error(f"expected a selector after ',' in :{name}()")
++                break
++            elif token_name == "argument_comma":
++                if not compound:
++                    parse_error(f"expected a selector before ',' in :{name}()")
++                arguments.append(tuple(compound))
++                compound = []
++                after_comma = True
++            elif token_name == "argument_pseudo_function":
++                nested_name = argument_token.value.strip(":")[:-1]
++                parse_error(f":{nested_name}() cannot be nested in :{name}()")
++            elif token_name in ("nth_value", "nth_of"):
++                parse_error(f"invalid selector in :{name}()")
++            else:
++                if compound and pending_space:
++                    parse_error(f"combinators are not allowed in :{name}()")
++                if token_name == "argument_pseudo_class":
++                    if not compound:
++                        compound.append(Selector(name="", type=SelectorType.UNIVERSAL))
++                    compound[-1]._add_pseudo_class(argument_token.value.strip(":"))
++                else:
++                    selector_type, specificity = ARGUMENT_SELECTOR_MAP[token_name]
++                    compound.append(
++                        Selector(
++                            name=argument_token.value.lstrip(".#"),
++                            type=selector_type,
++                            specificity=specificity,
++                        )
++                    )
++                after_comma = False
++            pending_space = False
++        if compound:
++            arguments.append(tuple(compound))
++        if not arguments:
++            parse_error(f"expected at least one selector in :{name}()")
++        return tuple(arguments)
++
++    if name in NTH_PSEUDO_CLASSES:
++        value = ""
++        of: tuple[tuple[Selector, ...], ...] = ()
++        for argument_token in tokens:
++            token_name = argument_token.name
++            if token_name == "pseudo_function_end":
++                break
++            elif token_name == "nth_of":
++                if name not in ("nth-child", "nth-last-child"):
++                    parse_error(f"'of' is not allowed in :{name}()")
++                of = parse_argument_selectors()
++                break
++            elif token_name in ("whitespace", "nth_value"):
++                value += argument_token.value
++            else:
++                parse_error(f"invalid nth expression in :{name}()")
++        try:
++            a, b = parse_nth(value)
++        except ValueError:
++            parse_error(f"invalid nth expression {value.strip()!r} in :{name}()")
++        return NthPseudoClass(name, a, b, of)
++
++    if name == "has":
++        return HasPseudoClass(parse_argument_selectors())
++
++    return LogicalPseudoClass(name, parse_argument_selectors())
++
++
+ RE_ID_SELECTOR = re.compile("#" + IDENTIFIER)
+ 
+ 
+@@ -96,6 +209,10 @@ def parse_selectors(css_selectors: str) -> tuple[SelectorSet, ...]:
+ 
+         if token_name == "pseudo_class":
+             selectors[-1]._add_pseudo_class(token.value.lstrip(":"))
++        elif token_name == "pseudo_function":
++            selectors[-1]._add_functional_pseudo_class(
++                parse_pseudo_function(token, tokens)
++            )
+         elif token_name == "whitespace":
+             if combinator is None or combinator == CombinatorType.SAME:
+                 combinator = CombinatorType.DESCENDENT
+@@ -107,6 +224,10 @@ def parse_selectors(css_selectors: str) -> tuple[SelectorSet, ...]:
+             break
+         elif token_name == "combinator_child":
+             combinator = CombinatorType.CHILD
++        elif token_name == "combinator_adjacent_sibling":
++            combinator = CombinatorType.ADJACENT_SIBLING
++        elif token_name == "combinator_general_sibling":
++            combinator = CombinatorType.GENERAL_SIBLING
+         else:
+             _selector, specificity = get_selector(
+                 token_name, (SelectorType.TYPE, (0, 0, 0))
+@@ -143,6 +264,10 @@ def parse_rule_set(
+     while True:
+         if token.name == "pseudo_class":
+             selectors[-1]._add_pseudo_class(token.value.lstrip(":"))
++        elif token.name == "pseudo_function":
++            selectors[-1]._add_functional_pseudo_class(
++                parse_pseudo_function(token, tokens)
++            )
+         elif token.name == "whitespace":
+             if combinator is None or combinator == CombinatorType.SAME:
+                 combinator = CombinatorType.DESCENDENT
+@@ -154,6 +279,10 @@ def parse_rule_set(
+             break
+         elif token.name == "combinator_child":
+             combinator = CombinatorType.CHILD
++        elif token.name == "combinator_adjacent_sibling":
++            combinator = CombinatorType.ADJACENT_SIBLING
++        elif token.name == "combinator_general_sibling":
++            combinator = CombinatorType.GENERAL_SIBLING
+         else:
+             _selector, specificity = get_selector(
+                 token.name, (SelectorType.TYPE, (0, 0, 0))
+@@ -233,6 +362,10 @@ def parse_rule_set(
+                             final_selector.pseudo_classes
+                             | nested_selector.pseudo_classes
+                         ),
++                        functional_pseudo_classes=(
++                            final_selector.functional_pseudo_classes
++                            + nested_selector.functional_pseudo_classes
++                        ),
+                         specificity=_add_specificity(
+                             final_selector.specificity, nested_selector.specificity
+                         ),
+diff --git a/src/textual/css/stylesheet.py b/src/textual/css/stylesheet.py
+index 34387071f..51df43b03 100644
+--- a/src/textual/css/stylesheet.py
++++ b/src/textual/css/stylesheet.py
+@@ -16,7 +16,7 @@ from rich.text import Text
+ 
+ from textual.cache import LRUCache
+ from textual.css.errors import StylesheetError
+-from textual.css.match import _check_selectors
++from textual.css.match import _check_levels
+ from textual.css.model import RuleSet
+ from textual.css.parse import parse
+ from textual.css.styles import RulesMap, Styles
+@@ -451,7 +451,7 @@ class Stylesheet:
+             Specificity of any matching selectors.
+         """
+         for selector_set in rule_set.selector_set:
+-            if _check_selectors(selector_set.selectors, css_path_nodes):
++            if _check_levels(selector_set._levels, css_path_nodes):
+                 yield selector_set.specificity
+ 
+     # pseudo classes which iterate over multiple nodes
+@@ -461,6 +461,14 @@ class Stylesheet:
+         "last-of-type",
+         "first-child",
+         "last-child",
++        "nth-child",
++        "nth-last-child",
++        "nth-of-type",
++        "nth-last-of-type",
++        "not",
++        "is",
++        "where",
++        "has",
+         "odd",
+         "even",
+         "focus-within",
+@@ -503,19 +511,34 @@ class Stylesheet:
+         }
+         rules = list(filter(limit_rules.__contains__, reversed(self.rules)))
+         all_pseudo_classes = set().union(*[rule.pseudo_classes for rule in rules])
++        has_sibling_combinator = any(rule.has_sibling_combinator for rule in rules)
+         node._has_hover_style = "hover" in all_pseudo_classes
+         node._has_focus_within = "focus-within" in all_pseudo_classes
+         node._has_order_style = not all_pseudo_classes.isdisjoint(
+-            {"first-of-type", "last-of-type", "first-child", "last-child", "empty"}
++            {
++                "first-of-type",
++                "last-of-type",
++                "first-child",
++                "last-child",
++                "nth-last-child",
++                "nth-last-of-type",
++                "empty",
++            }
+         )
+         node._has_odd_or_even = (
+-            "odd" in all_pseudo_classes or "even" in all_pseudo_classes
++            not all_pseudo_classes.isdisjoint(
++                {"odd", "even", "nth-child", "nth-of-type"}
++            )
++            or has_sibling_combinator
+         )
++        node._has_subtree_style = "has" in all_pseudo_classes
+ 
+         cache_key: tuple | None = None
+ 
+-        if cache is not None and all_pseudo_classes.isdisjoint(
+-            self._EXCLUDE_PSEUDO_CLASSES_FROM_CACHE
++        if (
++            cache is not None
++            and not has_sibling_combinator
++            and all_pseudo_classes.isdisjoint(self._EXCLUDE_PSEUDO_CLASSES_FROM_CACHE)
+         ):
+             cache_key = (
+                 node._parent,
+diff --git a/src/textual/css/tokenize.py b/src/textual/css/tokenize.py
+index df14368b6..856e72631 100644
+--- a/src/textual/css/tokenize.py
++++ b/src/textual/css/tokenize.py
+@@ -110,18 +110,38 @@ expect_selector_continue = Expect(
+     whitespace=r"\s+",
+     comment_start=COMMENT_START,
+     comment_line=COMMENT_LINE,
++    pseudo_function=r"\:[a-zA-Z_-]+\(",
+     pseudo_class=r"\:[a-zA-Z_-]+",
+     selector_id=r"\#" + IDENTIFIER,
+     selector_class=r"\." + IDENTIFIER,
+     selector_universal=r"\*",
+     selector=SELECTOR_TYPE_NAME,
+     combinator_child=">",
++    combinator_adjacent_sibling=r"\+",
++    combinator_general_sibling=r"\~",
+     new_selector=r",",
+     declaration_set_start=r"\{",
+     declaration_set_end=r"\}",
+     nested=r"\&",
+ ).expect_eof(True)
+ 
++# The arguments of a functional pseudo-class, e.g. ":nth-child( 2n+1 )"
++# or ":not( .my-class, Button )"
++expect_pseudo_function_arguments = Expect(
++    "pseudo-class arguments or )",
++    whitespace=r"\s+",
++    pseudo_function_end=r"\)",
++    argument_comma=r",",
++    nth_value=r"[+-]?\d*n(?:\s*[+-]\s*\d+)?|[+-]?\d+|odd|even",
++    nth_of=r"of(?![a-zA-Z0-9_-])",
++    argument_pseudo_function=r"\:[a-zA-Z_-]+\(",
++    argument_pseudo_class=r"\:[a-zA-Z_-]+",
++    argument_id=r"\#" + IDENTIFIER,
++    argument_class=r"\." + IDENTIFIER,
++    argument_universal=r"\*",
++    argument_selector=SELECTOR_TYPE_NAME,
++)
++
+ # A rule declaration e.g. "text: red;"
+ #                          ^---^
+ expect_declaration = Expect(
+@@ -240,6 +260,8 @@ class TCSSTokenizerState:
+         "selector_id": expect_selector_continue,
+         "selector_class": expect_selector_continue,
+         "selector_universal": expect_selector_continue,
++        "pseudo_function": expect_pseudo_function_arguments,
++        "pseudo_function_end": expect_selector_continue,
+         "declaration_set_start": expect_declaration,
+         "declaration_name": expect_declaration_content,
+         "declaration_end": expect_declaration,
+diff --git a/src/textual/css/tokenizer.py b/src/textual/css/tokenizer.py
+index 3b31b3df1..79ba6c940 100644
+--- a/src/textual/css/tokenizer.py
++++ b/src/textual/css/tokenizer.py
+@@ -11,7 +11,10 @@ from rich.panel import Panel
+ from rich.text import Text
+ 
+ from textual.css._error_tools import friendly_list
+-from textual.css.constants import VALID_PSEUDO_CLASSES
++from textual.css.constants import (
++    VALID_FUNCTIONAL_PSEUDO_CLASSES,
++    VALID_PSEUDO_CLASSES,
++)
+ from textual.suggestions import get_suggestion
+ 
+ if TYPE_CHECKING:
+@@ -316,7 +319,7 @@ class Tokenizer:
+         )
+ 
+         if (
+-            token.name == "pseudo_class"
++            token.name in ("pseudo_class", "argument_pseudo_class")
+             and token.value.strip(":") not in VALID_PSEUDO_CLASSES
+         ):
+             pseudo_class = token.value.strip(":")
+@@ -337,6 +340,32 @@ class Tokenizer:
+                     f"unknown pseudo-class {pseudo_class!r}; {all_valid}",
+                 )
+ 
++        if (
++            token.name in ("pseudo_function", "argument_pseudo_function")
++            and token.value.strip(":")[:-1] not in VALID_FUNCTIONAL_PSEUDO_CLASSES
++        ):
++            pseudo_class = token.value.strip(":")[:-1]
++            suggestion = get_suggestion(
++                pseudo_class, list(VALID_FUNCTIONAL_PSEUDO_CLASSES)
++            )
++            all_valid = (
++                f"must be one of {friendly_list(VALID_FUNCTIONAL_PSEUDO_CLASSES)}"
++            )
++            if suggestion:
++                raise TokenError(
++                    self.read_from,
++                    self.code,
++                    (line_no + 1, col_no + 1),
++                    f"unknown pseudo-class {pseudo_class!r}; did you mean {suggestion!r}?; {all_valid}",
++                )
++            else:
++                raise TokenError(
++                    self.read_from,
++                    self.code,
++                    (line_no + 1, col_no + 1),
++                    f"unknown pseudo-class {pseudo_class!r}; {all_valid}",
++                )
++
+         col_no += len(value)
+         if col_no >= len(line):
+             line_no += 1
+diff --git a/src/textual/dom.py b/src/textual/dom.py
+index 44e1396e3..cb2a75947 100644
+--- a/src/textual/dom.py
++++ b/src/textual/dom.py
+@@ -223,9 +223,15 @@ class DOMNode(MessagePump):
+         self._has_hover_style: bool = False
+         self._has_focus_within: bool = False
+         self._has_order_style: bool = False
+-        """The node has an ordered dependent pseudo-style (`:odd`, `:even`, `:first-of-type`, `:last-of-type`, `:first-child`, `:last-child`)"""
++        """The node has an end-dependent positional pseudo-style (`:first-of-type`, `:last-of-type`, `:first-child`, `:last-child`, `:nth-last-child`, `:nth-last-of-type`)"""
+         self._has_odd_or_even: bool = False
+-        """The node has the pseudo class `odd` or `even`."""
++        """The node has a start-dependent positional style (`:odd`, `:even`, `:nth-child`, `:nth-of-type`, or a sibling combinator)."""
++        self._has_subtree_style: bool = False
++        """The node has a style which depends on its descendants (`:has`)."""
++        self._displayed_position_cache: tuple[int, tuple[int, int]] = (-1, (0, 0))
++        """Used to cache the result of `_displayed_position`."""
++        self._displayed_type_position_cache: tuple[int, tuple[int, int]] = (-1, (0, 0))
++        """Used to cache the result of `_displayed_type_position`."""
+         self._reactive_connect: (
+             dict[str, tuple[MessagePump, Reactive[object] | object]] | None
+         ) = None
+@@ -1814,6 +1820,30 @@ class DOMNode(MessagePump):
+         except NoActiveAppError:
+             pass
+ 
++    def _update_position_dependent_styles(self, at_end: bool = False) -> None:
++        """Update children and descendants whose styles depend on sibling state.
++
++        Args:
++            at_end: Children were only appended, so start-anchored positions of
++                existing children are unchanged.
++        """
++        for child in self.displayed_children:
++            if child._has_order_style or (not at_end and child._has_odd_or_even):
++                child.update_node_styles()
++        self._update_subtree_dependent_styles()
++
++    def _update_subtree_dependent_styles(self) -> None:
++        """Update nodes whose styles depend on the subtree this node belongs to."""
++        from textual.app import ScreenStackError
++
++        try:
++            screen = self.screen
++        except (NoScreen, NoActiveAppError, ScreenStackError):
++            return
++        for node in screen.walk_children(with_self=True):
++            if node._has_subtree_style:
++                node.update_node_styles()
++
+     def add_class(self, *class_names: str, update: bool = True) -> Self:
+         """Add class names to this Node.
+ 
+@@ -1867,6 +1897,53 @@ class DOMNode(MessagePump):
+         self.update_node_styles()
+         return self
+ 
++    @property
++    def _displayed_position(self) -> tuple[int, int]:
++        """The 1-based position of this node among its parent's displayed children, with the count.
++
++        The position is `0` if the node is not displayed; a node with no parent
++        reports position 1 of 1.
++        """
++        parent = self._parent
++        if parent is None:
++            return (1, 1)
++        # The position only changes when the parent's nodes._updates changes
++        if parent._nodes._updates == self._displayed_position_cache[0]:
++            return self._displayed_position_cache[1]
++        displayed = parent._nodes.displayed
++        position = 0
++        for index, child in enumerate(displayed, 1):
++            if child is self:
++                position = index
++                break
++        result = (position, len(displayed))
++        self._displayed_position_cache = (parent._nodes._updates, result)
++        return result
++
++    @property
++    def _displayed_type_position(self) -> tuple[int, int]:
++        """The 1-based position of this node among its parent's displayed children of its type, with the count.
++
++        The position is `0` if the node is not displayed; a node with no parent
++        reports position 1 of 1.
++        """
++        parent = self._parent
++        if parent is None:
++            return (1, 1)
++        # The position only changes when the parent's nodes._updates changes
++        if parent._nodes._updates == self._displayed_type_position_cache[0]:
++            return self._displayed_type_position_cache[1]
++        node_type = type(self)
++        position = count = 0
++        for child in parent._nodes.displayed:
++            if isinstance(child, node_type):
++                count += 1
++                if child is self:
++                    position = count
++        result = (position, count)
++        self._displayed_type_position_cache = (parent._nodes._updates, result)
++        return result
++
+     def has_pseudo_class(self, class_name: str) -> bool:
+         """Check the node has the given pseudo class.
+ 
+diff --git a/src/textual/widget.py b/src/textual/widget.py
+index 63ef5da97..9e5625113 100644
+--- a/src/textual/widget.py
++++ b/src/textual/widget.py
+@@ -1486,20 +1486,13 @@ class Widget(DOMNode):
+             parent, *widgets, before=insert_before, after=insert_after
+         )
+ 
+-        def update_styles(children: list[DOMNode]) -> None:
+-            """Update order related CSS"""
+-            if before is not None or after is not None:
+-                # If the new children aren't at the end.
+-                # we need to update both odd/even, first-of-type/last-of-type and first-child/last-child
+-                for child in children:
+-                    if child._has_order_style or child._has_odd_or_even:
+-                        child.update_node_styles()
+-            else:
+-                for child in children:
+-                    if child._has_order_style:
+-                        child.update_node_styles()
++        def update_styles() -> None:
++            """Update position and subtree dependent CSS"""
++            self._update_position_dependent_styles(
++                at_end=before is None and after is None
++            )
+ 
+-        self.call_later(update_styles, self.displayed_children)
++        self.call_later(update_styles)
+         await_mount = AwaitMount(self, mounted)
+         self.call_next(await_mount)
+ 

@@ -1,0 +1,485 @@
+diff --git a/geo/src/algorithm/mod.rs b/geo/src/algorithm/mod.rs
+index 08b77bf..9a57423 100644
+--- a/geo/src/algorithm/mod.rs
++++ b/geo/src/algorithm/mod.rs
+@@ -376,3 +376,7 @@ pub use rhumb::{RhumbBearing, RhumbDestination, RhumbDistance, RhumbIntermediate
+ 
+ pub mod validation;
+ pub use validation::Validation;
++
++/// Build polygons from the lines of a geometry (noding assumed).
++pub mod polygonize;
++pub use polygonize::Polygonize;
+diff --git a/geo/src/algorithm/polygonize/assemble.rs b/geo/src/algorithm/polygonize/assemble.rs
+new file mode 100644
+index 0000000..249d18d
+--- /dev/null
++++ b/geo/src/algorithm/polygonize/assemble.rs
+@@ -0,0 +1,112 @@
++use crate::{Coord, LineString, MultiPolygon, Polygon};
++
++/// Turns traced faces into polygons: positively-oriented rings become shells,
++/// negatively-oriented rings become holes, and each hole is placed inside the
++/// smallest shell that strictly contains it. Rings that no shell contains (the
++/// unbounded face) are dropped.
++pub(super) fn build_polygons(rings: Vec<Vec<Coord<f64>>>) -> MultiPolygon<f64> {
++    let mut shells: Vec<Vec<Coord<f64>>> = Vec::new();
++    let mut holes: Vec<Vec<Coord<f64>>> = Vec::new();
++    for ring in rings {
++        let area = signed_area(&ring);
++        if area > 0.0 {
++            shells.push(ring);
++        } else if area < 0.0 {
++            holes.push(ring);
++        }
++    }
++
++    let shell_areas: Vec<f64> = shells.iter().map(|s| signed_area(s).abs()).collect();
++    let mut assigned: Vec<Vec<Vec<Coord<f64>>>> = vec![Vec::new(); shells.len()];
++
++    for hole in holes {
++        let mut best: Option<usize> = None;
++        for (index, shell) in shells.iter().enumerate() {
++            if !ring_strictly_contains(shell, &hole) {
++                continue;
++            }
++            if best.map_or(true, |b| shell_areas[index] < shell_areas[b]) {
++                best = Some(index);
++            }
++        }
++        if let Some(index) = best {
++            assigned[index].push(hole);
++        }
++    }
++
++    let polygons = shells
++        .into_iter()
++        .zip(assigned)
++        .map(|(shell, interiors)| {
++            Polygon::new(
++                LineString::new(shell),
++                interiors.into_iter().map(LineString::new).collect(),
++            )
++        })
++        .collect();
++    MultiPolygon::new(polygons)
++}
++
++fn signed_area(ring: &[Coord<f64>]) -> f64 {
++    let n = ring.len();
++    if n < 3 {
++        return 0.0;
++    }
++    let mut sum = 0.0;
++    for i in 0..n {
++        let a = ring[i];
++        let b = ring[(i + 1) % n];
++        sum += a.x * b.y - b.x * a.y;
++    }
++    sum / 2.0
++}
++
++/// True when every vertex of `hole` lies inside `shell` and at least one lies
++/// strictly inside it (never merely on its boundary). This distinguishes a real
++/// hole, whose vertices sit strictly within its container, from the unbounded
++/// face, whose vertices lie on the shells it borders.
++fn ring_strictly_contains(shell: &[Coord<f64>], hole: &[Coord<f64>]) -> bool {
++    let mut any_strictly_inside = false;
++    for &vertex in hole {
++        if point_on_ring(vertex, shell) {
++            continue;
++        }
++        if !point_in_ring(vertex, shell) {
++            return false;
++        }
++        any_strictly_inside = true;
++    }
++    any_strictly_inside
++}
++
++fn point_in_ring(p: Coord<f64>, ring: &[Coord<f64>]) -> bool {
++    let n = ring.len();
++    let mut inside = false;
++    let mut j = n - 1;
++    for i in 0..n {
++        let a = ring[i];
++        let b = ring[j];
++        if (a.y > p.y) != (b.y > p.y) {
++            let x_crossing = (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x;
++            if p.x < x_crossing {
++                inside = !inside;
++            }
++        }
++        j = i;
++    }
++    inside
++}
++
++fn point_on_ring(p: Coord<f64>, ring: &[Coord<f64>]) -> bool {
++    let n = ring.len();
++    (0..n).any(|i| point_on_segment(p, ring[i], ring[(i + 1) % n]))
++}
++
++fn point_on_segment(p: Coord<f64>, a: Coord<f64>, b: Coord<f64>) -> bool {
++    let cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
++    if cross != 0.0 {
++        return false;
++    }
++    let dot = (p.x - a.x) * (p.x - b.x) + (p.y - a.y) * (p.y - b.y);
++    dot <= 0.0
++}
+diff --git a/geo/src/algorithm/polygonize/graph.rs b/geo/src/algorithm/polygonize/graph.rs
+new file mode 100644
+index 0000000..7700a78
+--- /dev/null
++++ b/geo/src/algorithm/polygonize/graph.rs
+@@ -0,0 +1,240 @@
++use std::collections::HashMap;
++
++use crate::{Coord, LineString};
++
++/// A node is identified by the exact bit pattern of a coordinate, so two
++/// endpoints are the same node only when their `x` and `y` are exactly equal.
++type NodeKey = (u64, u64);
++
++fn node_key(coord: &Coord<f64>) -> NodeKey {
++    (coord.x.to_bits(), coord.y.to_bits())
++}
++
++fn endpoints(edge: &LineString<f64>) -> (NodeKey, NodeKey) {
++    (node_key(edge.0.first().unwrap()), node_key(edge.0.last().unwrap()))
++}
++
++/// The result of reducing a set of lines to the parts that bound polygons.
++pub(super) struct Decomposition {
++    /// Traced minimal faces, each a ring of coordinates (first not repeated).
++    pub rings: Vec<Vec<Coord<f64>>>,
++    /// Lines pruned because they dangle from a degree-one endpoint.
++    pub dangles: Vec<LineString<f64>>,
++    /// Lines removed because they bridge the graph without bounding any face.
++    pub cut_edges: Vec<LineString<f64>>,
++}
++
++/// Reduces `lines` to bounding edges — removing dangles and cut edges — and
++/// traces the faces the survivors enclose.
++pub(super) fn decompose(lines: Vec<LineString<f64>>) -> Decomposition {
++    let mut edges: Vec<LineString<f64>> = lines.into_iter().filter(|l| l.0.len() >= 2).collect();
++    let mut dangles = Vec::new();
++    let mut cut_edges = Vec::new();
++
++    loop {
++        let pruned = remove_dangles(&mut edges);
++        let pruned_any = !pruned.is_empty();
++        dangles.extend(pruned);
++
++        let cut = remove_cut_edges(&mut edges);
++        let cut_any = !cut.is_empty();
++        cut_edges.extend(cut);
++
++        if !pruned_any && !cut_any {
++            break;
++        }
++    }
++
++    let rings = if edges.is_empty() { Vec::new() } else { trace_faces(&edges) };
++    Decomposition { rings, dangles, cut_edges }
++}
++
++/// Repeatedly removes every edge touching a degree-one node until only edges on
++/// cycles remain, returning the removed edges.
++fn remove_dangles(edges: &mut Vec<LineString<f64>>) -> Vec<LineString<f64>> {
++    let mut removed = Vec::new();
++    loop {
++        let mut degree: HashMap<NodeKey, usize> = HashMap::new();
++        for edge in edges.iter() {
++            let (a, b) = endpoints(edge);
++            *degree.entry(a).or_default() += 1;
++            *degree.entry(b).or_default() += 1;
++        }
++        let mut kept = Vec::with_capacity(edges.len());
++        let mut removed_this_pass = 0;
++        for edge in edges.drain(..) {
++            let (a, b) = endpoints(&edge);
++            if degree[&a] >= 2 && degree[&b] >= 2 {
++                kept.push(edge);
++            } else {
++                removed.push(edge);
++                removed_this_pass += 1;
++            }
++        }
++        *edges = kept;
++        if removed_this_pass == 0 {
++            break;
++        }
++    }
++    removed
++}
++
++/// Removes bridges — edges whose removal disconnects the graph — since they lie
++/// on no cycle and cannot bound a face. Returns the removed edges.
++fn remove_cut_edges(edges: &mut Vec<LineString<f64>>) -> Vec<LineString<f64>> {
++    if edges.is_empty() {
++        return Vec::new();
++    }
++
++    // Index the nodes.
++    let mut ids: HashMap<NodeKey, usize> = HashMap::new();
++    for edge in edges.iter() {
++        let (a, b) = endpoints(edge);
++        let next = ids.len();
++        ids.entry(a).or_insert(next);
++        let next = ids.len();
++        ids.entry(b).or_insert(next);
++    }
++    let node_count = ids.len();
++
++    // Adjacency as (neighbour node, edge index).
++    let mut adjacency: Vec<Vec<(usize, usize)>> = vec![Vec::new(); node_count];
++    for (index, edge) in edges.iter().enumerate() {
++        let (a, b) = endpoints(edge);
++        let (a, b) = (ids[&a], ids[&b]);
++        adjacency[a].push((b, index));
++        adjacency[b].push((a, index));
++    }
++
++    let bridges = find_bridges(node_count, &adjacency);
++    if bridges.is_empty() {
++        return Vec::new();
++    }
++
++    let mut removed = Vec::new();
++    let mut kept = Vec::with_capacity(edges.len());
++    for (index, edge) in edges.drain(..).enumerate() {
++        if bridges.contains(&index) {
++            removed.push(edge);
++        } else {
++            kept.push(edge);
++        }
++    }
++    *edges = kept;
++    removed
++}
++
++/// Iterative Tarjan bridge search over a multigraph; edges are identified by
++/// index so parallel edges are never mistaken for bridges.
++fn find_bridges(node_count: usize, adjacency: &[Vec<(usize, usize)>]) -> Vec<usize> {
++    let mut disc = vec![usize::MAX; node_count];
++    let mut low = vec![0usize; node_count];
++    let mut timer = 0;
++    let mut bridges = Vec::new();
++
++    for source in 0..node_count {
++        if disc[source] != usize::MAX {
++            continue;
++        }
++        disc[source] = timer;
++        low[source] = timer;
++        timer += 1;
++        // Stack of (node, parent edge index, next neighbour to visit).
++        let mut stack: Vec<(usize, usize, usize)> = vec![(source, usize::MAX, 0)];
++        while let Some(&(node, parent_edge, cursor)) = stack.last() {
++            if cursor < adjacency[node].len() {
++                stack.last_mut().unwrap().2 += 1;
++                let (neighbour, edge) = adjacency[node][cursor];
++                if edge == parent_edge {
++                    continue;
++                }
++                if disc[neighbour] == usize::MAX {
++                    disc[neighbour] = timer;
++                    low[neighbour] = timer;
++                    timer += 1;
++                    stack.push((neighbour, edge, 0));
++                } else {
++                    low[node] = low[node].min(disc[neighbour]);
++                }
++            } else {
++                stack.pop();
++                if let Some(&(parent, _, _)) = stack.last() {
++                    low[parent] = low[parent].min(low[node]);
++                    if low[node] > disc[parent] {
++                        bridges.push(parent_edge);
++                    }
++                }
++            }
++        }
++    }
++    bridges
++}
++
++/// Builds directed edges, links each into the tightest-turning face, and traces
++/// those faces into coordinate rings.
++fn trace_faces(edges: &[LineString<f64>]) -> Vec<Vec<Coord<f64>>> {
++    // Two directed edges per input line: origin -> destination and its reverse.
++    let mut coords: Vec<Vec<Coord<f64>>> = Vec::with_capacity(edges.len() * 2);
++    let mut sym = Vec::with_capacity(edges.len() * 2);
++    for edge in edges {
++        let forward = edge.0.clone();
++        let mut backward = forward.clone();
++        backward.reverse();
++        let index = coords.len();
++        coords.push(forward);
++        sym.push(index + 1);
++        coords.push(backward);
++        sym.push(index);
++    }
++
++    let departure_angle = |seq: &[Coord<f64>]| {
++        let origin = seq[0];
++        let next = seq[1];
++        (next.y - origin.y).atan2(next.x - origin.x)
++    };
++
++    // Group directed edges by origin node.
++    let mut leaving: HashMap<NodeKey, Vec<usize>> = HashMap::new();
++    for (index, seq) in coords.iter().enumerate() {
++        leaving.entry(node_key(&seq[0])).or_default().push(index);
++    }
++
++    // Around each node link every arriving edge to the next edge clockwise,
++    // i.e. the previous one in counter-clockwise angular order, so each traced
++    // face is the smallest one to that side.
++    let mut next = vec![usize::MAX; coords.len()];
++    for group in leaving.values_mut() {
++        group.sort_by(|&a, &b| {
++            departure_angle(&coords[a])
++                .partial_cmp(&departure_angle(&coords[b]))
++                .unwrap()
++        });
++        let count = group.len();
++        for position in 0..count {
++            let departing = group[position];
++            let clockwise_prev = group[(position + count - 1) % count];
++            next[sym[departing]] = clockwise_prev;
++        }
++    }
++
++    let mut visited = vec![false; coords.len()];
++    let mut rings = Vec::new();
++    for start in 0..coords.len() {
++        if visited[start] {
++            continue;
++        }
++        let mut ring = Vec::new();
++        let mut edge = start;
++        loop {
++            visited[edge] = true;
++            let seq = &coords[edge];
++            ring.extend_from_slice(&seq[..seq.len() - 1]);
++            edge = next[edge];
++            if edge == start {
++                break;
++            }
++        }
++        rings.push(ring);
++    }
++    rings
++}
+diff --git a/geo/src/algorithm/polygonize/mod.rs b/geo/src/algorithm/polygonize/mod.rs
+new file mode 100644
+index 0000000..fa6ba67
+--- /dev/null
++++ b/geo/src/algorithm/polygonize/mod.rs
+@@ -0,0 +1,103 @@
++mod assemble;
++mod graph;
++
++use crate::{
++    Geometry, GeometryCollection, Line, LineString, MultiLineString, MultiPolygon,
++};
++
++/// The outcome of [`Polygonize`]: the polygons formed by the lines, together
++/// with the lines that could not take part in a polygon.
++#[derive(Clone, Debug, PartialEq)]
++pub struct Polygonized {
++    /// The polygons formed by the lines.
++    pub polygons: MultiPolygon<f64>,
++    /// Dangling lines: those that hang off a free endpoint and bound nothing.
++    pub dangles: MultiLineString<f64>,
++    /// Cut edges: those that connect the graph but bound no polygon (bridges).
++    pub cut_edges: MultiLineString<f64>,
++}
++
++/// Build polygons from the lines of a geometry.
++///
++/// Every [`Line`] and [`LineString`] contained in the geometry is collected —
++/// including those nested inside a [`MultiLineString`], a
++/// [`GeometryCollection`], or a [`Geometry`], recursing through nested
++/// collections — and the arrangement they form is turned into polygons. Each
++/// smallest region enclosed by the lines becomes a polygon; where the lines of
++/// one enclosed region sit inside another, the inner region is cut out as a
++/// hole of the outer polygon.
++///
++/// Lines that bound no region are not part of any polygon: a line hanging off a
++/// free endpoint is reported as a *dangle*, and a line that connects the
++/// arrangement without closing a region is reported as a *cut edge*. Non-linear
++/// geometries contribute nothing.
++///
++/// The input lines are assumed to be noded, i.e. they touch only at their
++/// endpoints. The order of the returned polygons, and the starting vertex and
++/// winding of each ring, are unspecified.
++pub trait Polygonize {
++    fn polygonize(&self) -> Polygonized;
++}
++
++impl Polygonize for MultiLineString<f64> {
++    fn polygonize(&self) -> Polygonized {
++        polygonize_lines(self.0.clone())
++    }
++}
++
++impl Polygonize for LineString<f64> {
++    fn polygonize(&self) -> Polygonized {
++        polygonize_lines(vec![self.clone()])
++    }
++}
++
++impl Polygonize for Line<f64> {
++    fn polygonize(&self) -> Polygonized {
++        polygonize_lines(vec![LineString::from(self)])
++    }
++}
++
++impl Polygonize for GeometryCollection<f64> {
++    fn polygonize(&self) -> Polygonized {
++        let mut lines = Vec::new();
++        for geometry in &self.0 {
++            collect_lines(geometry, &mut lines);
++        }
++        polygonize_lines(lines)
++    }
++}
++
++impl Polygonize for Geometry<f64> {
++    fn polygonize(&self) -> Polygonized {
++        let mut lines = Vec::new();
++        collect_lines(self, &mut lines);
++        polygonize_lines(lines)
++    }
++}
++
++fn polygonize_lines(lines: Vec<LineString<f64>>) -> Polygonized {
++    let decomposition = graph::decompose(lines);
++    Polygonized {
++        polygons: assemble::build_polygons(decomposition.rings),
++        dangles: MultiLineString::new(decomposition.dangles),
++        cut_edges: MultiLineString::new(decomposition.cut_edges),
++    }
++}
++
++/// Recursively gathers every [`Line`] and [`LineString`] reachable in
++/// `geometry`, descending into multi-geometries and nested collections.
++fn collect_lines(geometry: &Geometry<f64>, out: &mut Vec<LineString<f64>>) {
++    match geometry {
++        Geometry::Line(line) => out.push(LineString::from(line)),
++        Geometry::LineString(line_string) => out.push(line_string.clone()),
++        Geometry::MultiLineString(multi_line_string) => {
++            out.extend(multi_line_string.0.iter().cloned());
++        }
++        Geometry::GeometryCollection(collection) => {
++            for geometry in &collection.0 {
++                collect_lines(geometry, out);
++            }
++        }
++        _ => {}
++    }
++}

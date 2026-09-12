@@ -1,0 +1,1074 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..8477b5db
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,45 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++cd /app
++
++NEW_TESTS="tests/test_local_refinement_681511.py"
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  JUNIT_ARG="--junitxml=$OUTPUT_PATH"
++else
++  JUNIT_ARG=""
++fi
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest "$NEW_TESTS" -p no:cacheprovider $JUNIT_ARG
++else
++  python -m pytest tests/ --ignore="$NEW_TESTS" --ignore=tests/test_mamba.py \
++    -p no:cacheprovider $JUNIT_ARG
++fi
++EXIT_CODE=$?
++
++if [ -n "$OUTPUT_PATH" ] && [ ! -s "$OUTPUT_PATH" ]; then
++  cat > "$OUTPUT_PATH" <<'XMLEOF'
++<?xml version="1.0" encoding="utf-8"?>
++<testsuites><testsuite name="pytest" errors="1" failures="0" tests="1" time="0">
++<testcase classname="test_local_refinement" name="collection" time="0">
++<error message="pytest produced no results">The test run did not start.</error>
++</testcase></testsuite></testsuites>
++XMLEOF
++fi
++
++exit $EXIT_CODE
+diff --git a/tests/test_local_refinement_681511.py b/tests/test_local_refinement_681511.py
+new file mode 100644
+index 00000000..084be792
+--- /dev/null
++++ b/tests/test_local_refinement_681511.py
+@@ -0,0 +1,1017 @@
++import numpy as np
++import pytest
++from numpy.testing import assert_allclose, assert_array_equal
++
++import skfem
++from skfem import (Basis, ElementQuad0, ElementQuad1, ElementQuad2,
++                   ElementVector, FacetBasis, Functional, InteriorFacetBasis,
++                   MeshHex, MeshLine, MeshQuad, MeshQuad1, MeshQuad2,
++                   MeshTet, MeshTri, solve,
++                   solver_eigen_scipy_sym)
++from skfem.models import poisson as models
++
++
++def unit_square(times=2):
++    return MeshQuad().refined(times)
++
++
++def cells_at(m, points):
++    centers = m.p[:, m.t].mean(axis=1)
++    return np.array([int(np.argmin((centers[0] - x) ** 2
++                                   + (centers[1] - y) ** 2))
++                     for x, y in points], dtype=np.int32)
++
++
++def cells_inside(m, x0, x1, y0, y1):
++    centers = m.p[:, m.t].mean(axis=1)
++    return np.nonzero((centers[0] > x0) & (centers[0] < x1)
++                      & (centers[1] > y0) & (centers[1] < y1))[0]
++
++
++def marked(m, points):
++    return m.refined(cells_at(m, points))
++
++
++def marked_all(m):
++    return m.refined(np.arange(m.nelements, dtype=np.int32))
++
++
++def one_corner():
++    return marked(unit_square(), [(.125, .125)])
++
++
++def two_corners():
++    return marked(unit_square(), [(.125, .125), (.625, .625)])
++
++
++def deep_corner():
++    m = unit_square()
++    for h in (.125, .0625, .03125):
++        m = marked(m, [(h, h)])
++    return m
++
++
++def split_facet_of(m, vertex):
++    for facet in m.split_facets():
++        ends = m.p[:, m.facets[:, facet]]
++        if np.allclose(ends.mean(axis=1), m.p[:, vertex]):
++            return facet
++    raise AssertionError("no split facet carries this vertex")
++
++
++def quad(x0, y0, h):
++    return [(x0, y0), (x0 + h, y0), (x0 + h, y0 + h), (x0, y0 + h)]
++
++
++def from_quads(quads):
++    ix, p, t = {}, [], []
++    for q in quads:
++        column = []
++        for corner in q:
++            key = (round(corner[0], 12), round(corner[1], 12))
++            if key not in ix:
++                ix[key] = len(p)
++                p.append(key)
++            column.append(ix[key])
++        t.append(column)
++    return MeshQuad1(np.array(p).T, np.array(t).T)
++
++
++def tee_junction():
++    quads = [quad(0., 0., .5), quad(0., .5, .5), quad(.5, .5, .5)]
++    for y in (0., .25):
++        for x in (.5, .75):
++            quads.append(quad(x, y, .25))
++    return from_quads(quads)
++
++
++def vertices_inside_facets(m):
++    worst = 0
++    for facet in range(m.facets.shape[1]):
++        first, second = m.facets[:, facet]
++        origin = m.p[:, first]
++        span = m.p[:, second] - origin
++        length = span @ span
++        along = ((m.p - origin[:, None]).T @ span) / length
++        foot = origin[:, None] + np.outer(span, along)
++        offset = np.linalg.norm(m.p - foot, axis=0)
++        inside = ((along > 1e-9) & (along < 1. - 1e-9)
++                  & (offset < 1e-9 * np.sqrt(length)))
++        worst = max(worst, int(inside.sum()))
++    return worst
++
++
++def centroids(m):
++    return np.sort(np.round(m.p[:, m.t].mean(axis=1), 12), axis=1)
++
++
++def on_unit_boundary(p):
++    return ((np.abs(p) < 1e-12) | (np.abs(p - 1.) < 1e-12)).any(axis=0)
++
++
++def bilinear(basis):
++    x, y = basis.doflocs
++    return 1. + 2. * x + 3. * y + 4. * x * y
++
++
++def biquadratic(basis):
++    x, y = basis.doflocs
++    return 1. + 2. * x + 3. * y + 4. * x * y + 5. * x ** 2 + 6. * y ** 2 * x
++
++
++def poisson(basis):
++    A = models.laplace.assemble(basis)
++    b = models.unit_load.assemble(basis)
++    return solve(*skfem.constrain(basis, A, b, D=basis.get_dofs()))
++
++
++def dirichlet(basis, fun):
++    D = basis.get_dofs().flatten()
++    x = np.zeros(basis.N)
++    x[D] = fun(basis.doflocs[0, D], basis.doflocs[1, D])
++    A = models.laplace.assemble(basis)
++    return solve(*skfem.constrain(basis, A, np.zeros(basis.N), x=x, D=D))
++
++
++@Functional
++def unit(w):
++    return 1. + 0. * w.x[0]
++
++
++@Functional
++def squared_jump(w):
++    return (w['a'] - w['b']) ** 2
++
++
++def test_marking_one_element_creates_four():
++    assert one_corner().nelements == 19
++
++
++def test_marking_one_element_adds_five_vertices():
++    assert one_corner().p.shape[1] == unit_square().p.shape[1] + 5
++
++
++def test_empty_marking_keeps_the_mesh():
++    m = marked(unit_square(), [])
++    assert m.nelements == 16
++    assert_allclose(centroids(m), centroids(unit_square()))
++
++
++def test_marking_every_element_matches_uniform_refinement():
++    m = marked_all(unit_square())
++    assert_allclose(centroids(m), centroids(MeshQuad().refined(3)))
++
++
++def test_marking_every_element_leaves_no_hanging_vertex():
++    assert len(marked_all(unit_square()).hanging_nodes()) == 0
++
++
++def test_every_split_facet_carries_one_hanging_vertex():
++    m = two_corners()
++    assert len(m.split_facets()) > 0
++    assert len(m.hanging_nodes()) == len(m.split_facets())
++
++
++def test_hanging_vertices_sit_on_facet_midpoints():
++    m = one_corner()
++    for vertex in m.hanging_nodes():
++        parent = split_facet_of(m, vertex)
++        ends = m.p[:, m.facets[:, parent]]
++        assert_allclose(m.p[:, vertex], ends.mean(axis=1))
++
++
++def test_hanging_vertices_are_interior():
++    m = two_corners()
++    assert not on_unit_boundary(m.p[:, m.hanging_nodes()]).any()
++
++
++def test_hanging_queries_are_sorted():
++    m = deep_corner()
++    for query in (m.hanging_nodes, m.split_facets, m.hanging_facets):
++        values = query()
++        assert_array_equal(values, np.sort(values))
++
++
++def test_each_split_facet_has_two_halves():
++    m = two_corners()
++    assert len(m.hanging_facets()) == 2 * len(m.split_facets())
++
++
++def test_conforming_mesh_has_no_hanging_entities():
++    m = unit_square()
++    assert len(m.hanging_nodes()) == 0
++    assert len(m.split_facets()) == 0
++    assert len(m.hanging_facets()) == 0
++
++
++def test_triangle_mesh_reports_no_hanging_entities():
++    assert len(MeshTri().refined(2).hanging_nodes()) == 0
++
++
++def test_refinement_stays_one_irregular():
++    assert deep_corner().is_one_irregular()
++
++
++def test_conforming_mesh_is_one_irregular():
++    assert unit_square().is_one_irregular()
++
++
++def test_hand_built_junction_is_detected():
++    m = tee_junction()
++    assert len(m.split_facets()) > 0
++    assert len(m.hanging_nodes()) == len(m.split_facets())
++    for vertex in m.hanging_nodes():
++        ends = m.p[:, m.facets[:, split_facet_of(m, vertex)]]
++        assert_allclose(m.p[:, vertex], ends.mean(axis=1))
++
++
++def test_refining_the_fine_side_pulls_in_the_coarse_neighbour():
++    m = one_corner()
++    assert marked(m, [(.1875, .1875)]).nelements > m.nelements + 3
++
++
++def test_balancing_repeats_until_nothing_is_forced():
++    m = marked(deep_corner(), [(.046875, .046875)])
++    assert vertices_inside_facets(m) <= 1
++
++
++def test_balancing_cascades_over_three_levels():
++    m = deep_corner()
++    assert m.is_one_irregular()
++    assert vertices_inside_facets(m) <= 1
++
++
++def test_refinement_never_duplicates_a_vertex():
++    m = one_corner()
++    m = m.refined(m.hanging_elements())
++    assert len(np.unique(np.round(m.p.T, 12), axis=0)) == m.p.shape[1]
++
++
++def test_repeated_refinement_reuses_the_hanging_vertex():
++    m = one_corner()
++    after = m.refined(m.hanging_elements()[:1])
++    assert after.nelements == m.nelements + 3
++    assert after.p.shape[1] < m.p.shape[1] + 5
++    assert len(np.unique(np.round(after.p.T, 12), axis=0)) == after.p.shape[1]
++
++
++def test_hanging_elements_are_on_the_coarse_side():
++    m = one_corner()
++    for elem in m.hanging_elements():
++        assert len(np.intersect1d(m.t2f[:, elem], m.split_facets())) > 0
++
++
++def test_hanging_elements_of_a_conforming_mesh_are_empty():
++    assert len(unit_square().hanging_elements()) == 0
++
++
++def test_boundary_facets_exclude_the_halves():
++    m = two_corners()
++    assert len(np.intersect1d(m.boundary_facets(), m.hanging_facets())) == 0
++
++
++def test_boundary_facets_exclude_the_split_facets():
++    m = two_corners()
++    assert len(np.intersect1d(m.boundary_facets(), m.split_facets())) == 0
++
++
++def test_boundary_nodes_are_on_the_unit_square():
++    m = deep_corner()
++    assert on_unit_boundary(m.p[:, m.boundary_nodes()]).all()
++
++
++def test_boundary_nodes_cover_the_unit_square():
++    m = deep_corner()
++    expected = np.nonzero(on_unit_boundary(m.p))[0]
++    assert_array_equal(np.sort(m.boundary_nodes()), expected)
++
++
++def test_boundary_facet_basis_integrates_the_perimeter():
++    assert_allclose(unit.assemble(FacetBasis(deep_corner(), ElementQuad1())),
++                    4.)
++
++
++def test_facets_satisfying_ignores_the_halves():
++    m = two_corners()
++    left = m.facets_satisfying(lambda x: x[0] < 1e-12, boundaries_only=True)
++    assert_allclose(m.p[0, m.facets[:, left]], 0.)
++
++
++def test_boundary_dofs_are_on_the_unit_square():
++    m = deep_corner()
++    basis = Basis(m, ElementQuad2())
++    assert on_unit_boundary(basis.doflocs[:, basis.get_dofs().flatten()]).all()
++
++
++def test_interior_facet_pairing_names_the_coarse_element():
++    m = two_corners()
++    f2t = m.hanging_f2t()
++    assert (f2t[1, m.hanging_facets()] != -1).all()
++    assert (f2t[1, m.boundary_facets()] == -1).all()
++
++
++def test_interior_facet_pairing_is_unchanged_when_conforming():
++    m = unit_square()
++    assert_array_equal(m.hanging_f2t(), m.f2t)
++
++
++def test_constrained_dofs_are_sorted_and_unique():
++    basis = Basis(deep_corner(), ElementQuad2())
++    dofs = basis.hanging_dofs()
++    assert_array_equal(dofs, np.unique(dofs))
++
++
++def test_prolongation_is_square():
++    basis = Basis(two_corners(), ElementQuad1())
++    P = basis.hanging_prolongation()
++    assert P.shape == (basis.N, basis.N)
++
++
++def test_prolongation_has_no_constrained_columns():
++    basis = Basis(deep_corner(), ElementQuad2())
++    P = basis.hanging_prolongation()
++    assert P[:, basis.hanging_dofs()].nnz == 0
++
++
++def test_prolongation_rows_of_free_dofs_are_unit_rows():
++    basis = Basis(two_corners(), ElementQuad1())
++    P = basis.hanging_prolongation()
++    free = np.setdiff1d(np.arange(basis.N), basis.hanging_dofs())
++    assert_allclose(P[free][:, free].toarray(), np.eye(len(free)))
++
++
++def test_conforming_mesh_gives_the_identity_prolongation():
++    basis = Basis(unit_square(), ElementQuad1())
++    P = basis.hanging_prolongation()
++    assert len(basis.hanging_dofs()) == 0
++    assert_allclose(P.toarray(), np.eye(basis.N))
++
++
++def test_first_order_weights_are_the_midpoint_average():
++    basis = Basis(one_corner(), ElementQuad1())
++    P = basis.hanging_prolongation()
++    for dof in basis.hanging_dofs():
++        row = P[dof].toarray()[0]
++        assert_allclose(np.sort(row[row.nonzero()]), [.5, .5])
++
++
++def test_first_order_masters_are_the_facet_ends():
++    m = one_corner()
++    basis = Basis(m, ElementQuad1())
++    P = basis.hanging_prolongation()
++    for vertex in m.hanging_nodes():
++        parent = split_facet_of(m, vertex)
++        row = P[basis.nodal_dofs[0, vertex]].toarray()[0]
++        assert_array_equal(np.sort(row.nonzero()[0]),
++                           np.sort(basis.nodal_dofs[0, m.facets[:, parent]]))
++
++
++def test_second_order_vertex_takes_the_coarse_facet_dof():
++    m = one_corner()
++    basis = Basis(m, ElementQuad2())
++    P = basis.hanging_prolongation()
++    for vertex in m.hanging_nodes():
++        parent = split_facet_of(m, vertex)
++        row = P[basis.nodal_dofs[0, vertex]].toarray()[0]
++        assert_array_equal(row.nonzero()[0], [basis.facet_dofs[0, parent]])
++        assert_allclose(row[row.nonzero()], [1.])
++
++
++def test_second_order_half_weights_are_not_an_average():
++    m = one_corner()
++    basis = Basis(m, ElementQuad2())
++    P = basis.hanging_prolongation()
++    for half in m.hanging_facets():
++        row = P[basis.facet_dofs[0, half]].toarray()[0]
++        assert_allclose(np.sort(row[row.nonzero()]), [-.125, .375, .75])
++
++
++def test_zeroth_order_element_has_no_constrained_dofs():
++    basis = Basis(two_corners(), ElementQuad0())
++    assert len(basis.hanging_dofs()) == 0
++
++
++def test_vector_element_constrains_every_component():
++    m = one_corner()
++    scalar = Basis(m, ElementQuad1())
++    vector = Basis(m, ElementVector(ElementQuad1()))
++    assert len(scalar.hanging_dofs()) > 0
++    assert len(vector.hanging_dofs()) == 2 * len(scalar.hanging_dofs())
++
++
++def test_vector_element_does_not_mix_components():
++    basis = Basis(one_corner(), ElementVector(ElementQuad1()))
++    P = basis.hanging_prolongation()
++    for dof in basis.hanging_dofs():
++        row = P[dof].toarray()[0]
++        assert (row.nonzero()[0] % 2 == dof % 2).all()
++
++
++def test_composite_element_constrains_both_fields():
++    basis = Basis(one_corner(), ElementQuad2() * ElementQuad1())
++    first, second = basis.split_indices()
++    dofs = basis.hanging_dofs()
++    assert len(np.intersect1d(dofs, first)) > 0
++    assert len(np.intersect1d(dofs, second)) > 0
++
++
++@pytest.mark.parametrize(
++    "element,interp",
++    [
++        (ElementQuad1(), bilinear),
++        (ElementQuad2(), biquadratic),
++    ]
++)
++def test_prolongation_reproduces_a_polynomial(element, interp):
++    basis = Basis(two_corners(), element)
++    x = interp(basis)
++    assert_allclose(basis.hanging_prolongation() @ x, x, atol=1e-12)
++
++
++def test_prolongation_reproduces_a_polynomial_on_a_deep_mesh():
++    basis = Basis(deep_corner(), ElementQuad1())
++    x = bilinear(basis)
++    assert_allclose(basis.hanging_prolongation() @ x, x, atol=1e-12)
++
++
++def test_prolongation_reproduces_a_vector_field():
++    basis = Basis(two_corners(), ElementVector(ElementQuad1()))
++    x, y = basis.doflocs
++    values = np.where(np.arange(basis.N) % 2 == 0,
++                      1. + 2. * x + 3. * y,
++                      7. - x + 5. * y)
++    assert_allclose(basis.hanging_prolongation() @ values, values, atol=1e-12)
++
++
++def test_prolongation_reproduces_a_polynomial_on_a_junction():
++    basis = Basis(tee_junction(), ElementQuad1())
++    x = bilinear(basis)
++    assert_allclose(basis.hanging_prolongation() @ x, x, atol=1e-12)
++
++
++def test_constrained_solution_obeys_the_constraints():
++    basis = Basis(two_corners(), ElementQuad1())
++    x = poisson(basis)
++    assert_allclose(basis.hanging_prolongation() @ x, x, atol=1e-12)
++
++
++def test_constrained_solution_satisfies_the_discrete_identity():
++    basis = Basis(two_corners(), ElementQuad1())
++    x = poisson(basis)
++    A = models.laplace.assemble(basis)
++    b = models.unit_load.assemble(basis)
++    assert_allclose(x @ (A @ x), x @ b, rtol=1e-10)
++
++
++def test_deep_solution_satisfies_the_discrete_identity():
++    basis = Basis(deep_corner(), ElementQuad2())
++    x = poisson(basis)
++    A = models.laplace.assemble(basis)
++    b = models.unit_load.assemble(basis)
++    assert_allclose(x @ (A @ x), x @ b, rtol=1e-10)
++
++
++def test_constrained_solution_vanishes_on_the_boundary():
++    basis = Basis(deep_corner(), ElementQuad1())
++    x = poisson(basis)
++    assert_allclose(x[basis.get_dofs().flatten()], 0., atol=1e-14)
++
++
++def test_fully_marked_mesh_solves_like_uniform_refinement():
++    local = Basis(marked_all(unit_square()), ElementQuad1())
++    uniform = Basis(MeshQuad().refined(3), ElementQuad1())
++    assert_allclose(poisson(local).max(), poisson(uniform).max())
++
++
++def test_harmonic_data_is_reproduced_exactly():
++    basis = Basis(deep_corner(), ElementQuad1())
++    x = dirichlet(basis, lambda a, b: a + 2. * b)
++    assert_allclose(x, basis.doflocs[0] + 2. * basis.doflocs[1], atol=1e-12)
++
++
++def test_second_order_harmonic_data_is_reproduced_exactly():
++    basis = Basis(two_corners(), ElementQuad2())
++    x = dirichlet(basis, lambda a, b: 3. * a - b)
++    assert_allclose(x, 3. * basis.doflocs[0] - basis.doflocs[1], atol=1e-12)
++
++
++def test_the_solution_has_no_jump_over_a_hanging_facet():
++    m = two_corners()
++    e = ElementQuad1()
++    x = poisson(Basis(m, e))
++    sides = [InteriorFacetBasis(m, e, facets=m.hanging_facets(), side=itr)
++             for itr in [0, 1]]
++    jump = squared_jump.assemble(sides[0],
++                                 a=sides[0].interpolate(x),
++                                 b=sides[1].interpolate(x))
++    assert jump < 1e-24
++
++
++def test_nonhomogeneous_solve_fills_in_the_constrained_values():
++    basis = Basis(two_corners(), ElementQuad1())
++    x = dirichlet(basis, lambda a, b: a * b)
++    assert_allclose(x[basis.hanging_dofs()],
++                    (basis.hanging_prolongation() @ x)[basis.hanging_dofs()],
++                    atol=1e-14)
++
++
++def test_constrained_projection_reproduces_a_polynomial():
++    basis = Basis(two_corners(), ElementQuad1())
++    x = basis.project(lambda p: 1. + 2. * p[0] + 3. * p[1] + 4. * p[0] * p[1])
++    assert_allclose(x, bilinear(basis), atol=1e-12)
++
++
++def test_constrained_projection_obeys_the_constraints():
++    basis = Basis(deep_corner(), ElementQuad2())
++    x = basis.project(lambda p: p[0] ** 3 - p[1] ** 3)
++    assert_allclose(basis.hanging_prolongation() @ x, x, atol=1e-12)
++
++
++def test_constrained_projection_of_an_unrepresentable_function():
++    basis = Basis(two_corners(), ElementQuad1())
++    x = basis.project(lambda p: np.exp(-30. * ((p[0] - .2) ** 2
++                                               + (p[1] - .2) ** 2)))
++    assert_allclose(basis.hanging_prolongation() @ x, x, atol=1e-12)
++
++
++def test_constrained_eigenvectors_obey_the_constraints():
++    basis = Basis(two_corners(), ElementQuad1())
++    A, M = models.laplace.assemble(basis), models.mass.assemble(basis)
++    _, X = solve(*skfem.constrain(basis, A, M, D=basis.get_dofs()),
++                 solver=solver_eigen_scipy_sym(k=2))
++    P = basis.hanging_prolongation()
++    assert_allclose(P @ X[:, 0], X[:, 0], atol=1e-12)
++
++
++def test_constrained_eigenpairs_satisfy_the_rayleigh_quotient():
++    basis = Basis(two_corners(), ElementQuad1())
++    A, M = models.laplace.assemble(basis), models.mass.assemble(basis)
++    L, X = solve(*skfem.constrain(basis, A, M, D=basis.get_dofs()),
++                 solver=solver_eigen_scipy_sym(k=3))
++    assert (L > 0.).all()
++    for itr in range(len(L)):
++        v = X[:, itr]
++        assert_allclose(v @ (A @ v), L[itr] * (v @ (M @ v)), rtol=1e-10)
++
++
++def test_named_boundaries_survive_refinement():
++    m = unit_square().with_defaults()
++    r = marked(m, [(.125, .125), (.625, .625)])
++    assert_allclose(r.p[0, r.facets[:, r.boundaries['left']]], 0.)
++    assert_allclose(r.p[1, r.facets[:, r.boundaries['top']]], 1.)
++
++
++def test_a_split_named_facet_becomes_two():
++    m = unit_square().with_defaults()
++    r = marked(m, [(.125, .125)])
++    assert len(r.boundaries['bottom']) == len(m.boundaries['bottom']) + 1
++
++
++def test_named_subdomains_survive_refinement():
++    m = unit_square().with_subdomains({'lower': lambda x: x[1] < .5})
++    r = marked(m, [(.125, .125), (.625, .625)])
++    below = np.nonzero(r.p[:, r.t].mean(axis=1)[1] < .5)[0]
++    assert_array_equal(np.sort(r.subdomains['lower']), below)
++
++
++def test_conforming_removes_every_hanging_vertex():
++    assert len(deep_corner().conforming().hanging_nodes()) == 0
++
++
++def test_conforming_only_refines_further():
++    m = one_corner()
++    c = m.conforming()
++    assert len(c.hanging_nodes()) == 0
++    assert c.nelements >= m.nelements
++    assert_allclose(unit.assemble(Basis(c, ElementQuad1())), 1.)
++
++
++def test_conforming_keeps_a_conforming_mesh():
++    m = unit_square()
++    assert m.conforming().nelements == m.nelements
++
++
++def test_coarsening_undoes_refinement():
++    m = unit_square()
++    r = two_corners()
++    c = r.coarsened(np.concatenate((cells_inside(r, 0., .25, 0., .25),
++                                    cells_inside(r, .5, .75, .5, .75))))
++    assert_allclose(centroids(c), centroids(m))
++    assert c.p.shape[1] == m.p.shape[1]
++
++
++def test_coarsening_a_uniform_mesh_removes_one_level():
++    m = unit_square()
++    c = m.coarsened(np.arange(m.nelements))
++    assert_allclose(centroids(c), centroids(MeshQuad().refined(1)))
++
++
++def test_coarsening_without_marks_keeps_the_mesh():
++    m = two_corners()
++    assert m.coarsened(np.array([], dtype=np.int32)).nelements == m.nelements
++
++
++def test_coarsening_needs_all_four_siblings():
++    r = one_corner()
++    assert r.coarsened(cells_inside(r, 0., .25, 0., .13)).nelements \
++        == r.nelements
++
++
++def test_coarsening_stops_at_a_finer_neighbour():
++    m = two_corners()
++    c = m.coarsened(np.arange(m.nelements))
++    assert len(c.hanging_nodes()) == 0
++    assert vertices_inside_facets(c) == 0
++
++
++def test_coarsening_a_deep_mesh_stops_at_a_finer_neighbour():
++    m = deep_corner()
++    c = m.coarsened(np.arange(m.nelements))
++    assert vertices_inside_facets(c) <= 1
++    assert c.is_one_irregular()
++
++
++def test_coarsening_keeps_the_domain_area():
++    m = deep_corner()
++    c = m.coarsened(np.arange(m.nelements))
++    assert_allclose(unit.assemble(Basis(c, ElementQuad1())), 1.)
++
++
++def test_named_boundaries_survive_coarsening():
++    m = unit_square().with_defaults()
++    r = marked(m, [(.125, .125)])
++    c = r.coarsened(cells_inside(r, 0., .25, 0., .25))
++    assert_allclose(c.p[0, c.facets[:, c.boundaries['left']]], 0.)
++    assert len(c.boundaries['bottom']) == len(m.boundaries['bottom'])
++
++
++def test_named_subdomains_survive_coarsening():
++    m = unit_square().with_subdomains({'lower': lambda x: x[1] < .5})
++    r = marked(m, [(.125, .125)])
++    c = r.coarsened(cells_inside(r, 0., .25, 0., .25))
++    below = np.nonzero(c.p[:, c.t].mean(axis=1)[1] < .5)[0]
++    assert_array_equal(np.sort(c.subdomains['lower']), below)
++
++
++def test_coarsen_theta_selects_the_small_indicators():
++    assert_array_equal(skfem.coarsen_theta(np.array([1., 2., 3., 4.])), [0, 1])
++
++
++def test_coarsen_theta_accepts_a_reference_value():
++    est = np.array([1., 2., 3.])
++    assert_array_equal(skfem.coarsen_theta(est, max=4.), [0, 1])
++
++
++def test_second_order_quad_mesh_rejects_adaptive_refinement():
++    m = one_corner()
++    assert len(m.hanging_nodes()) == len(m.split_facets())
++    with pytest.raises(NotImplementedError):
++        MeshQuad2.from_mesh(unit_square()).refined(np.array([0]))
++
++
++def test_estimator_vanishes_for_an_exact_solution():
++    basis = Basis(two_corners(), ElementQuad1())
++    x = dirichlet(basis, lambda a, b: a + 2. * b)
++    eta = models.residual_estimator(basis, x, lambda p: 0. * p[0])
++    assert np.abs(eta).max() < 1e-20
++
++
++def test_estimator_has_one_value_per_element():
++    m = deep_corner()
++    basis = Basis(m, ElementQuad1())
++    eta = models.residual_estimator(basis, poisson(basis),
++                                    lambda p: 1. + 0. * p[0])
++    assert eta.shape == (m.nelements,)
++    assert (eta > 0.).all()
++
++
++def test_estimator_distributes_every_jump():
++    m = two_corners()
++    e = ElementQuad1()
++    basis = Basis(m, e)
++    x = poisson(basis)
++
++    def load(p):
++        return 1. + 0. * p[0]
++
++    eta = models.residual_estimator(basis, x, load)
++
++    @Functional
++    def interior(w):
++        return w.h ** 2 * load(w.x) ** 2
++
++    facets = np.nonzero(m.hanging_f2t()[1] != -1)[0]
++    sides = [InteriorFacetBasis(m, e, facets=facets, side=itr)
++             for itr in [0, 1]]
++
++    @Functional
++    def jump(w):
++        return w.h * ((w['a'].grad[0] - w['b'].grad[0]) * w.n[0]
++                      + (w['a'].grad[1] - w['b'].grad[1]) * w.n[1]) ** 2
++
++    total = (interior.assemble(basis)
++             + jump.assemble(sides[0],
++                             a=sides[0].interpolate(x),
++                             b=sides[1].interpolate(x)))
++    assert_allclose(eta.sum(), total)
++
++
++def test_hanging_elements_are_sorted():
++    m = deep_corner()
++    assert_array_equal(m.hanging_elements(), np.sort(m.hanging_elements()))
++
++
++def test_named_boundaries_survive_conforming():
++    c = one_corner().with_defaults().conforming()
++    assert_allclose(c.p[0, c.facets[:, c.boundaries['left']]], 0.)
++    ends = c.p[:, c.facets[:, c.boundaries['bottom']]]
++    assert_allclose(ends[1], 0.)
++    assert_allclose(np.abs(ends[0, 1] - ends[0, 0]).sum(), 1.)
++
++
++def test_named_subdomains_survive_conforming():
++    m = unit_square().with_subdomains({'lower': lambda x: x[1] < .5})
++    c = marked(m, [(.125, .125)]).conforming()
++    below = np.nonzero(c.p[:, c.t].mean(axis=1)[1] < .5)[0]
++    assert_array_equal(np.sort(c.subdomains['lower']), below)
++
++
++def test_coarsening_undoes_the_newest_level_first():
++    m = one_corner()
++    c = m.coarsened(np.arange(m.nelements))
++    widths = c.p[0, c.t].max(axis=0) - c.p[0, c.t].min(axis=0)
++    assert widths.min() >= .25 - 1e-12
++    assert len(cells_inside(c, 0., .25, 0., .25)) == 1
++
++
++def test_coarsening_a_deep_mesh_is_repeatable():
++    m = deep_corner()
++    first = m.coarsened(np.arange(m.nelements))
++    second = first.coarsened(np.arange(first.nelements))
++    assert second.nelements < first.nelements
++    assert second.is_one_irregular()
++
++
++def test_constrained_dofs_may_be_given_again_in_D():
++    basis = Basis(two_corners(), ElementQuad1())
++    A = models.laplace.assemble(basis)
++    b = models.unit_load.assemble(basis)
++    plain = solve(*skfem.constrain(basis, A, b, D=basis.get_dofs()))
++    both = np.concatenate((basis.get_dofs().flatten(), basis.hanging_dofs()))
++    again = solve(*skfem.constrain(basis, A, b, D=both))
++    assert_allclose(again, plain, atol=1e-14)
++
++
++def test_a_master_pinned_through_D_carries_its_constrained_dof():
++    basis = Basis(one_corner(), ElementQuad1())
++    m = basis.mesh
++    vertex = m.hanging_nodes()[0]
++    masters = basis.nodal_dofs[0, m.facets[:, split_facet_of(m, vertex)]]
++    D = np.concatenate((basis.get_dofs().flatten(), masters))
++    x = np.zeros(basis.N)
++    x[masters] = [2., 6.]
++    A = models.laplace.assemble(basis)
++    y = solve(*skfem.constrain(basis, A, np.zeros(basis.N), x=x, D=D))
++    assert_allclose(y[basis.nodal_dofs[0, vertex]], 4.)
++    assert_allclose(y[masters], [2., 6.])
++
++
++def test_hanging_pairing_names_the_hanging_element():
++    m = two_corners()
++    f2t = m.hanging_f2t()
++    for half in m.hanging_facets():
++        assert f2t[1, half] in m.hanging_elements()
++
++
++def test_estimator_gives_the_coarse_element_its_share():
++    m = two_corners()
++    e = ElementQuad1()
++    basis = Basis(m, e)
++    x = poisson(basis)
++
++    def load(p):
++        return 1. + 0. * p[0]
++
++    @Functional
++    def interior(w):
++        return w.h ** 2 * load(w.x) ** 2
++
++    @Functional
++    def jump(w):
++        return w.h * ((w['a'].grad[0] - w['b'].grad[0]) * w.n[0]
++                      + (w['a'].grad[1] - w['b'].grad[1]) * w.n[1]) ** 2
++
++    f2t = m.hanging_f2t()
++    facets = np.nonzero(f2t[1] != -1)[0]
++    sides = [InteriorFacetBasis(m, e, facets=facets, side=itr)
++             for itr in [0, 1]]
++    jumps = jump.elemental(sides[0],
++                           a=sides[0].interpolate(x),
++                           b=sides[1].interpolate(x))
++
++    expected = interior.elemental(basis)
++    for itr in [0, 1]:
++        np.add.at(expected, f2t[itr, facets], .5 * jumps)
++    assert_allclose(models.residual_estimator(basis, x, load), expected)
++
++
++def test_repeated_and_negative_marks_follow_numpy_rules():
++    m = unit_square()
++    once = m.refined(np.array([0], dtype=np.int32))
++    assert m.refined(np.array([0, 0, 0])).nelements == once.nelements
++    assert (m.refined(np.array([-1])).nelements
++            == m.refined(np.array([m.nelements - 1])).nelements)
++
++
++def test_an_out_of_range_mark_is_rejected():
++    m = unit_square()
++    with pytest.raises(IndexError):
++        m.refined(np.array([m.nelements]))
++
++
++def test_coarsening_follows_the_same_index_rules():
++    r = one_corner()
++    inner = cells_inside(r, 0., .25, 0., .25)
++    plain = r.coarsened(inner)
++    assert r.coarsened(np.concatenate((inner, inner))).nelements \
++        == plain.nelements
++    assert r.coarsened(inner - r.nelements).nelements == plain.nelements
++
++
++def test_a_named_interior_facet_is_split_too():
++    m = unit_square().with_boundaries(
++        {'mid': lambda x: np.abs(x[0] - .5) < 1e-12},
++        boundaries_only=False,
++    )
++    r = marked(m, [(.375, .125)])
++    assert len(r.boundaries['mid']) == len(m.boundaries['mid']) + 1
++    assert_allclose(r.p[0, r.facets[:, r.boundaries['mid']]], .5)
++
++
++def test_a_named_interior_facet_survives_coarsening():
++    m = unit_square().with_boundaries(
++        {'mid': lambda x: np.abs(x[0] - .5) < 1e-12},
++        boundaries_only=False,
++    )
++    r = marked(m, [(.375, .125)])
++    c = r.coarsened(cells_inside(r, .25, .5, 0., .25))
++    assert len(c.boundaries['mid']) == len(m.boundaries['mid'])
++    assert_allclose(c.p[0, c.facets[:, c.boundaries['mid']]], .5)
++
++
++@pytest.mark.parametrize(
++    "mesh",
++    [MeshTri().refined(2), MeshTet().refined(1), MeshHex().refined(1),
++     MeshLine().refined(2)]
++)
++def test_every_conforming_mesh_answers_the_queries(mesh):
++    assert len(mesh.hanging_nodes()) == 0
++    assert len(mesh.split_facets()) == 0
++    assert len(mesh.hanging_facets()) == 0
++    assert len(mesh.hanging_elements()) == 0
++    assert mesh.is_one_irregular()
++    assert_array_equal(mesh.hanging_f2t(), mesh.f2t)
++
++
++def test_an_out_of_range_coarsening_mark_is_rejected():
++    r = one_corner()
++    with pytest.raises(IndexError):
++        r.coarsened(np.array([r.nelements]))
++
++
++def test_the_last_negative_mark_is_still_valid():
++    m = unit_square()
++    assert (m.refined(np.array([-m.nelements])).nelements
++            == m.refined(np.array([0])).nelements)
++
++
++def test_a_mark_below_the_negative_range_is_rejected():
++    m = unit_square()
++    with pytest.raises(IndexError):
++        m.refined(np.array([-(m.nelements + 1)]))
++
++
++def test_a_coarsening_mark_below_the_negative_range_is_rejected():
++    r = one_corner()
++    with pytest.raises(IndexError):
++        r.coarsened(np.array([-(r.nelements + 1)]))
++
++
++def test_coarsen_theta_keeps_indicators_on_a_custom_cutoff():
++    est = np.array([1., 2., 3., 4.])
++    assert_array_equal(skfem.coarsen_theta(est, .75), [0, 1, 2])
++    assert_array_equal(skfem.coarsen_theta(est, .25), [0])
++    assert_array_equal(skfem.coarsen_theta(est, 1.), [0, 1, 2, 3])
++
++
++def unit_cells(order):
++    return from_quads([quad(x, y, 1.) for x, y in order])
++
++
++def interior_vertices(m, size):
++    inside = ((m.p[0] > 0.) & (m.p[0] < size)
++              & (m.p[1] > 0.) & (m.p[1] < size))
++    return np.nonzero(inside)[0]
++
++
++@pytest.mark.parametrize(
++    "order",
++    [
++        [(x, y) for y in (0., 1., 2.) for x in (0., 1., 2.)],
++        [(x, y) for y in (2., 1., 0.) for x in (2., 1., 0.)],
++        [(x, y) for x in (0., 1., 2.) for y in (2., 1., 0.)],
++    ]
++)
++def test_coarsening_takes_the_highest_shared_vertex_first(order):
++    m = unit_cells(order)
++    inside = interior_vertices(m, 3.)
++    winner = m.p[:, inside.max()]
++    c = m.coarsened(np.arange(m.nelements))
++    widths = c.p[0, c.t].max(axis=0) - c.p[0, c.t].min(axis=0)
++    merged = np.nonzero(widths > 1.5)[0]
++    assert len(merged) == 1
++    assert_allclose(c.p[:, c.t[:, merged[0]]].mean(axis=1), winner)
++    assert c.nelements == 6
++
++
++def test_composite_element_reproduces_each_field():
++    basis = Basis(two_corners(), ElementQuad2() * ElementQuad1())
++    first, second = basis.split_indices()
++    x, y = basis.doflocs
++    values = np.zeros(basis.N)
++    values[first] = (1. + 2. * x[first] + 3. * y[first]
++                     + 4. * x[first] * y[first] + 5. * x[first] ** 2
++                     + 6. * y[first] ** 2 * x[first])
++    values[second] = 7. - x[second] + 5. * y[second]
++    assert_allclose(basis.hanging_prolongation() @ values, values, atol=1e-12)
++
++
++def test_composite_element_does_not_couple_the_fields():
++    basis = Basis(two_corners(), ElementQuad2() * ElementQuad1())
++    first, second = basis.split_indices()
++    P = basis.hanging_prolongation()
++    for dof in basis.hanging_dofs():
++        home = first if dof in first else second
++        assert np.isin(P[dof].toarray()[0].nonzero()[0], home).all()
++
++
++def midline_mesh():
++    return unit_square().with_boundaries(
++        {'mid': lambda x: np.abs(x[0] - .5) < 1e-12},
++        boundaries_only=False,
++    )
++
++
++def tagged_length(m, name):
++    ends = m.p[:, m.facets[:, m.boundaries[name]]]
++    return np.abs(ends[1, 1] - ends[1, 0]).sum()
++
++
++def test_a_named_interior_facet_survives_conforming():
++    m = midline_mesh()
++    c = marked(m, [(.375, .125)]).conforming()
++    assert_allclose(c.p[0, c.facets[:, c.boundaries['mid']]], .5)
++    assert_allclose(tagged_length(c, 'mid'), tagged_length(m, 'mid'))
++
++
++def test_conforming_splits_a_named_interior_facet_into_halves():
++    m = midline_mesh()
++    r = marked(m, [(.375, .125)])
++    c = r.conforming()
++    assert len(c.boundaries['mid']) > len(r.boundaries['mid'])
++    assert len(r.boundaries['mid']) > len(m.boundaries['mid'])
++
++
++def test_constrained_projection_of_a_vector_field():
++    basis = Basis(two_corners(), ElementVector(ElementQuad1()))
++    x = basis.project(lambda p: np.array([1. + 2. * p[0] + 3. * p[1],
++                                          7. - p[0] + 5. * p[1]]))
++    a, b = basis.doflocs
++    expected = np.where(np.arange(basis.N) % 2 == 0,
++                        1. + 2. * a + 3. * b,
++                        7. - a + 5. * b)
++    assert_allclose(x, expected, atol=1e-12)
++
++
++def test_constrained_vector_projection_obeys_the_constraints():
++    basis = Basis(two_corners(), ElementVector(ElementQuad1()))
++    x = basis.project(lambda p: np.array([p[0] ** 3, p[1] ** 3]))
++    assert_allclose(basis.hanging_prolongation() @ x, x, atol=1e-12)
++
++
++def test_constrained_projection_of_a_composite_field():
++    basis = Basis(two_corners(), ElementQuad2() * ElementQuad1())
++    x = basis.project(lambda p: (1. + 2. * p[0] + 3. * p[1] + 4. * p[0] * p[1],
++                                 7. - p[0]))
++    first, second = basis.split_indices()
++    a, b = basis.doflocs
++    assert_allclose(x[first],
++                    1. + 2. * a[first] + 3. * b[first]
++                    + 4. * a[first] * b[first], atol=1e-12)
++    assert_allclose(x[second], 7. - a[second], atol=1e-12)
++
++
++def test_constrained_composite_projection_obeys_the_constraints():
++    basis = Basis(two_corners(), ElementQuad2() * ElementQuad1())
++    x = basis.project(lambda p: (p[0] ** 3, p[1] ** 3))
++    assert_allclose(basis.hanging_prolongation() @ x, x, atol=1e-12)

@@ -1,0 +1,882 @@
+diff --git a/boundary.go b/boundary.go
+index e0372e6..bd86a67 100644
+--- a/boundary.go
++++ b/boundary.go
+@@ -27,6 +27,9 @@ type boundaryReader struct {
+ 	final       []byte        // Final boundary prefix
+ 	buffer      *bytes.Buffer // Content waiting to be read
+ 	unbounded   bool          // Flag to throw errNoBoundaryTerminator
++	preamble    bytes.Buffer  // Bytes seen before the first delimiter
++	delimiter   []byte        // First delimiter line, as it arrived
++	terminator  []byte        // Closing delimiter line, as it arrived
+ }
+ 
+ // newBoundaryReader returns an initialized boundaryReader
+@@ -201,14 +204,23 @@ func (b *boundaryReader) Next() (bool, error) {
+ 
+ 		if len(line) > 0 && (line[0] == '\r' || line[0] == '\n') {
+ 			// Blank line
++			if b.partsRead == 0 {
++				b.preamble.Write(line)
++			}
+ 			continue
+ 		}
+ 		if b.isTerminator(line) {
++			if b.terminator == nil {
++				b.terminator = append([]byte(nil), line...)
++			}
+ 			b.finished = true
+ 			return false, nil
+ 		}
+ 		if err != io.EOF && b.isDelimiter(line) {
+ 			// Start of a new part.
++			if b.delimiter == nil {
++				b.delimiter = append([]byte(nil), line...)
++			}
+ 			b.partsRead++
+ 			b.atPartStart = true
+ 			return true, nil
+@@ -220,6 +232,7 @@ func (b *boundaryReader) Next() (bool, error) {
+ 		if b.partsRead == 0 {
+ 			// The first part didn't find the starting delimiter, burn off any preamble in front of
+ 			// the boundary.
++			b.preamble.Write(line)
+ 			continue
+ 		}
+ 		b.finished = true
+diff --git a/edit.go b/edit.go
+new file mode 100644
+index 0000000..d53f96e
+--- /dev/null
++++ b/edit.go
+@@ -0,0 +1,431 @@
++package enmime
++
++import (
++	"bytes"
++	"regexp"
++	"strings"
++
++	inttp "github.com/jhillyerd/enmime/v2/internal/textproto"
++	"github.com/jhillyerd/enmime/v2/mediatype"
++	"github.com/pkg/errors"
++)
++
++// Replace swaps this part's decoded content. The part is encoded afresh on the way out, everything
++// else in the message is left as it arrived.
++func (p *Part) Replace(content []byte) error {
++	if p == nil {
++		return errors.New("cannot replace content of a nil part")
++	}
++	if p.Boundary != "" {
++		return errors.New("cannot replace content of a multipart part")
++	}
++	named := strings.ToLower(inttp.MIMEHeader(p.Header).Get(hnContentEncoding))
++	switch named {
++	case "", cte7Bit, cte8Bit, cteBinary, cteQuotedPrintable, cteBase64:
++	default:
++		return errors.New("cannot re-encode a part whose header names transfer encoding " + named)
++	}
++	p.Content = append([]byte(nil), content...)
++	p.ContentReader = nil
++	p.markEdited()
++	return nil
++}
++
++// Remove detaches this part from its parent. Removing the last child of a multipart leaves that
++// multipart in place with nothing between its boundary markers.
++func (p *Part) Remove() error {
++	if p == nil {
++		return errors.New("cannot remove a nil part")
++	}
++	if p.Parent == nil {
++		return errors.New("cannot remove the root part")
++	}
++	parent := p.Parent
++	if parent.FirstChild == p {
++		parent.FirstChild = p.NextSibling
++	} else {
++		prev := parent.FirstChild
++		for prev != nil && prev.NextSibling != p {
++			prev = prev.NextSibling
++		}
++		if prev == nil {
++			return errors.New("part is not a child of its parent")
++		}
++		prev.NextSibling = p.NextSibling
++	}
++	p.Parent = nil
++	p.NextSibling = nil
++	parent.markEdited()
++	return nil
++}
++
++// AppendChild adds a part after this part's existing children.
++func (p *Part) AppendChild(child *Part) error {
++	if p == nil || child == nil {
++		return errors.New("cannot append a nil part")
++	}
++	if p.Boundary == "" {
++		return errors.New("cannot add a part to a part that is not multipart")
++	}
++	if p == child {
++		return errors.New("cannot add a part to itself")
++	}
++	child.Parent = p
++	child.NextSibling = nil
++	if p.FirstChild == nil {
++		p.FirstChild = child
++	} else {
++		last := p.FirstChild
++		for last.NextSibling != nil {
++			last = last.NextSibling
++		}
++		last.NextSibling = child
++	}
++	p.markEdited()
++	return nil
++}
++
++// InsertBefore adds a part immediately ahead of sibling, which must already be a child of this part.
++func (p *Part) InsertBefore(sibling, child *Part) error {
++	if p == nil || child == nil || sibling == nil {
++		return errors.New("cannot insert a nil part")
++	}
++	if p.Boundary == "" {
++		return errors.New("cannot add a part to a part that is not multipart")
++	}
++	if p.FirstChild == sibling {
++		child.Parent = p
++		child.NextSibling = sibling
++		p.FirstChild = child
++		p.markEdited()
++		return nil
++	}
++	prev := p.FirstChild
++	for prev != nil && prev.NextSibling != sibling {
++		prev = prev.NextSibling
++	}
++	if prev == nil {
++		return errors.New("sibling is not a child of this part")
++	}
++	child.Parent = p
++	child.NextSibling = sibling
++	prev.NextSibling = child
++	p.markEdited()
++	return nil
++}
++
++// SetHeader replaces a header field, or adds it at the end of the block when it was not present.
++// Every other header field keeps the place, the case and the folding it arrived with.
++func (p *Part) SetHeader(name, value string) error {
++	if p == nil {
++		return errors.New("cannot set a header on a nil part")
++	}
++	if err := checkHeaderName(name); err != nil {
++		return err
++	}
++	if err := checkHeaderValue(value); err != nil {
++		return err
++	}
++	if strings.EqualFold(name, hnContentType) {
++		framed, err := p.applyContentType(value)
++		if err != nil {
++			return err
++		}
++		value = framed
++	}
++	p.Header.Set(name, value)
++	p.markHeaderEdited()
++	return p.setRawHeader(name, value)
++}
++
++// DeleteHeader drops a header field. Every other header field is left as it arrived.
++func (p *Part) DeleteHeader(name string) error {
++	if p == nil {
++		return errors.New("cannot delete a header on a nil part")
++	}
++	if err := checkHeaderName(name); err != nil {
++		return err
++	}
++	if p.rawHeader == nil {
++		// A part that was built rather than parsed has no raw block to edit, only its header map.
++		if inttp.MIMEHeader(p.Header).Get(name) == "" {
++			return nil
++		}
++		p.Header.Del(name)
++		p.markHeaderEdited()
++		return nil
++	}
++	if !p.deleteRawHeader(name) {
++		return nil
++	}
++	p.Header.Del(name)
++	p.markHeaderEdited()
++	return nil
++}
++
++// checkHeaderName refuses a name that cannot be written as a header field.
++func checkHeaderName(name string) error {
++	if name == "" {
++		return errors.New("provide non-empty header name")
++	}
++	for _, c := range []byte(name) {
++		if !inttp.ValidEmailHeaderFieldByte(c) {
++			return errors.New("invalid header name " + name)
++		}
++	}
++	return nil
++}
++
++// applyContentType re-reads what a part reports from a Content-Type its caller wrote, so a
++// multipart is framed with the boundary its own header now names.
++func (p *Part) applyContentType(value string) (string, error) {
++	mtype, mparams, _, err := p.readMediaType(value)
++	if err != nil {
++		return "", errors.WithStack(err)
++	}
++	if kind, sub, ok := strings.Cut(mtype, "/"); !ok || kind == "" || sub == "" {
++		return "", errors.New("cannot read " + value + " as a content type")
++	}
++	frames := strings.HasPrefix(strings.ToLower(mtype), "multipart/")
++	if frames != (p.Boundary != "") {
++		// Turning a multipart into a leaf would strand its children, and the other way round would
++		// leave a body with no part to hold it.
++		return "", errors.New("cannot change whether a part is a multipart through " + hnContentType)
++	}
++	boundary := mparams[hpBoundary]
++	if frames && boundary == "" {
++		// A multipart still has to frame its parts, so it keeps the marker it is framed with and
++		// says so.
++		boundary = p.Boundary
++		mparams[hpBoundary] = boundary
++		value = value + "; " + hpBoundary + "=" + quoteParam(boundary)
++	}
++	p.ContentType = mtype
++	p.Charset = mparams[hpCharset]
++	p.Boundary = boundary
++	if p.ContentTypeParams != nil {
++		params := make(map[string]string, len(mparams))
++		for name, param := range mparams {
++			params[name] = param
++		}
++		p.ContentTypeParams = params
++	}
++	return value, nil
++}
++
++// quoteParam writes a parameter value the way this package writes one, quoted when it has to be.
++func quoteParam(value string) string {
++	if strings.ContainsAny(value, " \t;\"()<>@,:/[]?=") {
++		return `"` + value + `"`
++	}
++	return value
++}
++
++// readMediaType parses a media type with whatever parser this part was read by, or the package
++// default when it was built rather than parsed.
++func (p *Part) readMediaType(ctype string) (string, map[string]string, []string, error) {
++	if p.parser == nil {
++		return mediatype.Parse(ctype)
++	}
++	return p.parseMediaType(ctype)
++}
++
++// checkHeaderValue refuses a value that would not stay on the field line it is written to.
++func checkHeaderValue(value string) error {
++	if strings.ContainsAny(value, "\r\n") {
++		return errors.New("header value cannot be written on one line")
++	}
++	return nil
++}
++
++// markHeaderEdited records that this part's header block changed, and that every multipart above it
++// must be rebuilt. The part's own content is left alone.
++func (p *Part) markHeaderEdited() {
++	p.headerEdited = true
++	for parent := p.Parent; parent != nil; parent = parent.Parent {
++		parent.edited = true
++	}
++}
++
++// markEdited records that this part must be encoded afresh, and that every multipart above it must
++// be rebuilt.
++func (p *Part) markEdited() {
++	p.edited = true
++	for parent := p.Parent; parent != nil; parent = parent.Parent {
++		parent.edited = true
++	}
++}
++
++////////////////////////////////////////////////////////////////
++
++// headerFields splits a raw header block into its fields, each field holding its own continuation
++// lines, followed by the blank line that closes the block.
++func headerFields(raw []byte) (fields [][]byte, terminator []byte) {
++	lines := splitAfterNewline(raw)
++	for _, line := range lines {
++		trimmed := bytes.TrimRight(line, "\r\n")
++		if len(trimmed) == 0 {
++			terminator = append(terminator, line...)
++			continue
++		}
++		if 0 < len(fields) && (line[0] == ' ' || line[0] == '\t') {
++			fields[len(fields)-1] = append(fields[len(fields)-1], line...)
++			continue
++		}
++		fields = append(fields, append([]byte(nil), line...))
++	}
++	return fields, terminator
++}
++
++func splitAfterNewline(raw []byte) [][]byte {
++	var out [][]byte
++	for 0 < len(raw) {
++		i := bytes.IndexByte(raw, '\n')
++		if i < 0 {
++			out = append(out, raw)
++			break
++		}
++		out = append(out, raw[:i+1])
++		raw = raw[i+1:]
++	}
++	return out
++}
++
++func fieldName(field []byte) string {
++	i := bytes.IndexByte(field, ':')
++	if i < 0 {
++		return ""
++	}
++	return strings.ToLower(strings.TrimSpace(string(field[:i])))
++}
++
++func (p *Part) lineEnding() []byte {
++	if 0 < len(p.lineEnd) {
++		return p.lineEnd
++	}
++	return []byte("\r\n")
++}
++
++// setRawHeader edits the stored header block in place, so untouched fields keep their bytes.
++func (p *Part) setRawHeader(name, value string) error {
++	if p.rawHeader == nil {
++		return nil
++	}
++	fields, terminator := headerFields(p.rawHeader)
++	replacement := append([]byte(inttp.CanonicalEmailMIMEHeaderKey(name)+": "+value), p.lineEnding()...)
++	want := strings.ToLower(name)
++	found := false
++	var out []byte
++	for _, field := range fields {
++		if fieldName(field) == want {
++			if found {
++				continue
++			}
++			found = true
++			out = append(out, replacement...)
++			continue
++		}
++		out = append(out, field...)
++	}
++	if !found {
++		out = append(out, replacement...)
++	}
++	p.rawHeader = append(out, terminator...)
++	p.Header.Set(name, value)
++	return nil
++}
++
++// deleteRawHeader drops a field and its continuation lines from the stored header block. It reports
++// whether the block held that field at all.
++func (p *Part) deleteRawHeader(name string) bool {
++	if p.rawHeader == nil {
++		return false
++	}
++	fields, terminator := headerFields(p.rawHeader)
++	want := strings.ToLower(name)
++	found := false
++	var out []byte
++	for _, field := range fields {
++		if fieldName(field) == want {
++			found = true
++			continue
++		}
++		out = append(out, field...)
++	}
++	if !found {
++		return false
++	}
++	p.rawHeader = append(out, terminator...)
++	return true
++}
++
++// setRawBoundary points this multipart's Content-Type header at a new boundary, leaving the rest of
++// that header, and every other header, untouched.
++func (p *Part) setRawBoundary(boundary string) error {
++	old := p.Boundary
++	p.Boundary = boundary
++	if p.ContentTypeParams == nil {
++		p.ContentTypeParams = map[string]string{}
++	}
++	p.ContentTypeParams[hpBoundary] = boundary
++	if p.rawHeader == nil || old == "" {
++		return nil
++	}
++
++	p.setRawContentTypeParam(hpBoundary, boundary)
++	return nil
++}
++
++// paramPattern matches one named Content-Type parameter and its value, quoted or bare.
++func paramPattern(name string) *regexp.Regexp {
++	return regexp.MustCompile(`(?i)(^|[;\s])(` + regexp.QuoteMeta(name) + `[ \t]*=[ \t]*)("[^"]*"|[^;\s]+)`)
++}
++
++// replaceParam swaps the value of one parameter and nothing else, so a value that happens to appear
++// inside another parameter is left alone.
++func replaceParam(field []byte, name, next string) []byte {
++	re := paramPattern(name)
++	return re.ReplaceAllFunc(field, func(match []byte) []byte {
++		parts := re.FindSubmatch(match)
++		value := []byte(next)
++		if 0 < len(parts[3]) && parts[3][0] == '"' {
++			value = []byte(`"` + next + `"`)
++		}
++		out := append([]byte(nil), parts[1]...)
++		out = append(out, parts[2]...)
++		return append(out, value...)
++	})
++}
++
++// setRawContentTypeParam points one parameter of this part's Content-Type at a new value, leaving
++// the rest of that header, and every other header, untouched.
++func (p *Part) setRawContentTypeParam(name, value string) {
++	if p.rawHeader == nil {
++		return
++	}
++	fields, terminator := headerFields(p.rawHeader)
++	var out []byte
++	for _, field := range fields {
++		if fieldName(field) == strings.ToLower(hnContentType) {
++			field = replaceParam(field, name, value)
++			p.Header.Set(hnContentType, fieldValue(field))
++		}
++		out = append(out, field...)
++	}
++	p.rawHeader = append(out, terminator...)
++}
++
++// fieldValue reads back what a header field says, with the lines continuing it folded into one.
++func fieldValue(field []byte) string {
++	i := bytes.IndexByte(field, ':')
++	if i < 0 {
++		return ""
++	}
++	var parts []string
++	for _, line := range splitAfterNewline(field[i+1:]) {
++		if trimmed := strings.TrimSpace(string(line)); trimmed != "" {
++			parts = append(parts, trimmed)
++		}
++	}
++	return strings.Join(parts, " ")
++}
+diff --git a/part.go b/part.go
+index 154eb44..d2cb28a 100644
+--- a/part.go
++++ b/part.go
+@@ -52,6 +52,49 @@ type Part struct {
+ 	randSource rand.Source // optional rand for uuid boundary generation
+ 
+ 	encoder *Encoder // provides encoding options
++
++	rawMessage []byte // Whole message exactly as it arrived, root part only.
++	rawHeader  []byte // Header block exactly as it arrived, nil when this part was not parsed.
++	rawBody   []byte // Leaf body exactly as it arrived, nil for multipart parts.
++	preamble  []byte // Bytes between a multipart header and its first delimiter.
++	delimiter []byte // The first delimiter line of a multipart, as it arrived.
++	closeLine []byte // The closing delimiter line of a multipart, as it arrived.
++	lineEnd   []byte // The line ending this part arrived with.
++	arrived   string // The boundary this multipart's markers arrived with.
++
++	edited       bool // Content or structure below this part changed since parsing.
++	headerEdited bool // A header of this part changed since parsing.
++}
++
++// readRawHeaderBlock consumes the header block, terminated by a blank line or the end of input, and
++// returns it exactly as it arrived.
++func readRawHeaderBlock(r *bufio.Reader) ([]byte, error) {
++	var raw []byte
++	for {
++		line, err := r.ReadBytes('\n')
++		raw = append(raw, line...)
++		if err != nil {
++			if errors.Is(err, io.EOF) {
++				return raw, nil
++			}
++			return nil, errors.WithStack(err)
++		}
++		trimmed := bytes.TrimRight(line, "\r\n")
++		if len(trimmed) == 0 {
++			return raw, nil
++		}
++	}
++}
++
++// detectLineEnding reports the line ending used by a raw region.
++func detectLineEnding(raw []byte) []byte {
++	if i := bytes.IndexByte(raw, '\n'); i > 0 && raw[i-1] == '\r' {
++		return []byte("\r\n")
++	}
++	if bytes.IndexByte(raw, '\n') >= 0 {
++		return []byte("\n")
++	}
++	return []byte("\r\n")
+ }
+ 
+ // NewPart creates a new Part object.
+@@ -112,7 +155,13 @@ func (p *Part) TextContent() bool {
+ 
+ // setupHeaders reads the header, then populates the MIME header values for this Part.
+ func (p *Part) setupHeaders(r *bufio.Reader, defaultContentType string) error {
+-	header, err := readHeader(r, p)
++	raw, err := readRawHeaderBlock(r)
++	if err != nil {
++		return err
++	}
++	p.rawHeader = raw
++	p.lineEnd = detectLineEnding(raw)
++	header, err := readHeader(bufio.NewReader(bytes.NewReader(raw)), p)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -276,6 +325,12 @@ func (p *Part) convertFromStatedCharset(r io.Reader) io.Reader {
+ // placing the result into Part.Content.  IO errors will be returned immediately; other errors
+ // and warnings will be added to Part.Errors.
+ func (p *Part) decodeContent(r io.Reader, readPartErrorPolicy ReadPartErrorPolicy) error {
++	raw, err := io.ReadAll(r)
++	if err != nil {
++		return errors.WithStack(err)
++	}
++	p.rawBody = raw
++	r = bytes.NewReader(raw)
+ 	header := inttp.MIMEHeader(p.Header)
+ 	// contentReader will point to the end of the content decoding pipeline.
+ 	contentReader := r
+@@ -398,7 +453,8 @@ func ReadParts(r io.Reader) (*Part, error) {
+ 
+ // ReadParts reads a MIME document from the provided reader and parses it into tree of Part objects.
+ func (p Parser) ReadParts(r io.Reader) (*Part, error) {
+-	br := bufio.NewReader(r)
++	var raw bytes.Buffer
++	br := bufio.NewReader(io.TeeReader(r, &raw))
+ 	root := &Part{PartID: "0", parser: &p}
+ 
+ 	// Read header; top-level default CT is text/plain us-ascii according to RFC 822.
+@@ -417,6 +473,7 @@ func (p Parser) ReadParts(r io.Reader) (*Part, error) {
+ 			return nil, err
+ 		}
+ 	}
++	root.rawMessage = raw.Bytes()
+ 	return root, nil
+ }
+ 
+@@ -502,6 +559,10 @@ func parseParts(parent *Part, reader *bufio.Reader) error {
+ 		return errors.WithStack(err)
+ 	}
+ 	parent.Epilogue = epilogue
++	parent.preamble = br.preamble.Bytes()
++	parent.delimiter = br.delimiter
++	parent.closeLine = br.terminator
++	parent.arrived = parent.Boundary
+ 
+ 	// If a Part is "multipart/" Content-Type, it will have .0 appended to its PartID
+ 	// i.e. it is the root of its MIME Part subtree.
+diff --git a/rewrite.go b/rewrite.go
+new file mode 100644
+index 0000000..cbc8e70
+--- /dev/null
++++ b/rewrite.go
+@@ -0,0 +1,282 @@
++package enmime
++
++import (
++	"bufio"
++	"bytes"
++	"fmt"
++	"io"
++	"strings"
++
++	inttp "github.com/jhillyerd/enmime/v2/internal/textproto"
++	"github.com/pkg/errors"
++)
++
++// Rewrite writes this part and everything below it back out. Every part and every header that was
++// not changed since parsing is written exactly as it arrived; only what was changed is encoded
++// afresh.
++func (p *Part) Rewrite(w io.Writer) error {
++	if p == nil {
++		return errors.New("cannot rewrite a nil part")
++	}
++	buf, err := p.rewriteBytes()
++	if err != nil {
++		return err
++	}
++	n, err := w.Write(buf)
++	if err != nil {
++		return errors.WithStack(err)
++	}
++	if n < len(buf) {
++		// A writer that takes less than it was given without saying so still lost bytes.
++		return errors.WithStack(io.ErrShortWrite)
++	}
++	return nil
++}
++
++// Rewrite writes the envelope's message back out, preserving everything that was not changed.
++func (e *Envelope) Rewrite(w io.Writer) error {
++	if e == nil || e.Root == nil {
++		return errors.New("cannot rewrite a nil envelope")
++	}
++	return e.Root.Rewrite(w)
++}
++
++// rewriteBytes renders one part, header and body, into a buffer.
++func (p *Part) rewriteBytes() ([]byte, error) {
++	if p.rawHeader == nil {
++		// This part was built rather than parsed, so there is nothing to preserve. Building writes
++		// carriage returns whatever the message around it does, so its lines are retargeted.
++		var buf bytes.Buffer
++		if err := p.Encode(&buf); err != nil {
++			return nil, err
++		}
++		return retargetLineEndings(buf.Bytes(), p.messageLineEnding()), nil
++	}
++
++	if p.rawMessage != nil && !p.edited && !p.headerEdited {
++		return p.rawMessage, nil
++	}
++
++	body, err := p.rewriteBody()
++	if err != nil {
++		return nil, err
++	}
++	out := make([]byte, 0, len(p.rawHeader)+len(body))
++	out = append(out, p.rawHeader...)
++	return append(out, body...), nil
++}
++
++// rewriteBody renders a part's body: verbatim when nothing below it changed, rebuilt otherwise.
++func (p *Part) rewriteBody() ([]byte, error) {
++	if p.Boundary == "" {
++		if !p.edited && p.rawBody != nil {
++			return p.rawBody, nil
++		}
++		return p.freshContent()
++	}
++	return p.rewriteMultipart()
++}
++
++// freshContent encodes edited content using the transfer encoding this part's header names, or the
++// one the builder would pick when it names none.
++func (p *Part) freshContent() ([]byte, error) {
++	cte := te7Bit
++	named := strings.ToLower(inttp.MIMEHeader(p.Header).Get(hnContentEncoding))
++	switch named {
++	case cteBase64:
++		cte = teBase64
++	case cteQuotedPrintable:
++		cte = teQuoted
++	case cte8Bit:
++		cte = te8Bit
++	case cte7Bit:
++		cte = te7Bit
++	case cteBinary:
++		cte = teRaw
++	default:
++		cte = p.builderTransferEncoding()
++		if err := p.setRawHeader(hnContentEncoding, cteName(cte)); err != nil {
++			return nil, err
++		}
++	}
++
++	// The parser hands back content already decoded out of the part's character set, so the bytes
++	// written here are that decoding and the part has to say so.
++	if cs := p.Charset; cs != "" && !strings.EqualFold(cs, utf8) {
++		p.Charset = utf8
++		if p.ContentTypeParams != nil {
++			p.ContentTypeParams[hpCharset] = utf8
++		}
++		p.setRawContentTypeParam(hpCharset, utf8)
++	}
++
++	var buf bytes.Buffer
++	b := bufio.NewWriter(&buf)
++	if err := p.encodeContent(b, cte); err != nil {
++		return nil, err
++	}
++	if err := b.Flush(); err != nil {
++		return nil, errors.WithStack(err)
++	}
++	if cte == teBase64 || cte == teQuoted {
++		// The breaks these two put in are lines this rewrite is writing, not content.
++		return retargetLineEndings(buf.Bytes(), p.messageLineEnding()), nil
++	}
++	return buf.Bytes(), nil
++}
++
++// messageLineEnding reports the line ending the message holding this part arrived with.
++func (p *Part) messageLineEnding() []byte {
++	for at := p; at != nil; at = at.Parent {
++		if 0 < len(at.lineEnd) {
++			return at.lineEnd
++		}
++	}
++	return crnl
++}
++
++// retargetLineEndings moves freshly written lines onto the line ending the message uses.
++func retargetLineEndings(raw, le []byte) []byte {
++	if bytes.Equal(le, crnl) {
++		return raw
++	}
++	return bytes.ReplaceAll(raw, crnl, le)
++}
++
++// builderTransferEncoding picks the encoding building a message would pick for this content.
++func (p *Part) builderTransferEncoding() transferEncoding {
++	if len(p.Content) == 0 {
++		return te7Bit
++	}
++	if strings.HasPrefix(strings.ToLower(p.ContentType), "message/") {
++		return te8Bit
++	}
++	if p.TextContent() && p.ContentReader == nil {
++		return p.selectTransferEncoding(p.Content, false)
++	}
++	return teBase64
++}
++
++func cteName(cte transferEncoding) string {
++	switch cte {
++	case teBase64:
++		return cteBase64
++	case teQuoted:
++		return cteQuotedPrintable
++	case te8Bit:
++		return cte8Bit
++	}
++	return cte7Bit
++}
++
++// rewriteMultipart rebuilds a multipart body from its children, keeping the preamble, the epilogue
++// and the boundary it arrived with unless some child now contains that boundary.
++func (p *Part) rewriteMultipart() ([]byte, error) {
++	var children [][]byte
++	for c := p.FirstChild; c != nil; c = c.NextSibling {
++		b, err := c.rewriteBytes()
++		if err != nil {
++			return nil, err
++		}
++		children = append(children, b)
++	}
++
++	original := p.Boundary
++	// The markers on the wire carry the boundary this multipart was parsed with, which is not the
++	// one it names any more once a header edit has renamed it.
++	arrived := p.arrived
++	if arrived == "" {
++		arrived = original
++	}
++	// Everything this rebuild is about to emit: the parts themselves, this multipart's own header
++	// block, the bytes ahead of the first marker and the bytes after the closing one.
++	regions := append(append([][]byte{}, children...), p.rawHeader, p.preamble, p.Epilogue)
++
++	boundary := original
++	if boundaryCollides(boundary, regions) {
++		next, err := p.freeBoundary(regions)
++		if err != nil {
++			return nil, err
++		}
++		if err := p.setRawBoundary(next); err != nil {
++			return nil, err
++		}
++		boundary = next
++	}
++
++	// The separator is the one the markers themselves arrived with, which is not always the one the
++	// enclosing header used.
++	le := markerLineEnding(p.delimiter)
++	if len(le) == 0 {
++		le = p.lineEnd
++	}
++	if len(le) == 0 {
++		le = []byte("\r\n")
++	}
++	delim := append([]byte("--"), boundary...)
++
++	var out bytes.Buffer
++	out.Write(p.preamble)
++	for _, child := range children {
++		out.Write(delim)
++		out.Write(le)
++		out.Write(child)
++		// The reader takes exactly one line ending off a part when it reaches the next marker, so
++		// exactly one goes back.
++		out.Write(le)
++	}
++	if len(children) == 0 {
++		out.Write(delim)
++		out.Write(le)
++	}
++	out.Write(delim)
++	out.WriteString("--")
++	out.Write(closingTail(p.closeLine, arrived))
++	out.Write(p.Epilogue)
++	return out.Bytes(), nil
++}
++
++// markerLineEnding reports the line ending a captured marker line arrived with.
++func markerLineEnding(line []byte) []byte {
++	if bytes.HasSuffix(line, []byte("\r\n")) {
++		return []byte("\r\n")
++	}
++	if bytes.HasSuffix(line, []byte("\n")) {
++		return []byte("\n")
++	}
++	return nil
++}
++
++// closingTail returns whatever followed the closing marker on its own line, so the line ending it
++// arrived with is not lost when the marker itself has to change.
++func closingTail(closeLine []byte, boundary string) []byte {
++	marker := []byte("--" + boundary + "--")
++	if i := bytes.Index(closeLine, marker); 0 <= i {
++		return closeLine[i+len(marker):]
++	}
++	return nil
++}
++
++// boundaryCollides reports whether any region the rewrite emits opens a line with the boundary
++// marker, which is the only position a reader would take for a delimiter.
++func boundaryCollides(boundary string, regions [][]byte) bool {
++	marker := []byte("--" + boundary)
++	nlMarker := append([]byte("\n"), marker...)
++	for _, region := range regions {
++		if bytes.HasPrefix(region, marker) || bytes.Contains(region, nlMarker) {
++			return true
++		}
++	}
++	return false
++}
++
++// freeBoundary picks a marker that appears in none of the regions the rewrite is about to emit.
++func (p *Part) freeBoundary(regions [][]byte) (string, error) {
++	for i := 0; i < 1000; i++ {
++		candidate := fmt.Sprintf("%s_%d", p.Boundary, i)
++		if !boundaryCollides(candidate, regions) {
++			return candidate, nil
++		}
++	}
++	return "", errors.New("unable to find an unused boundary")
++}
