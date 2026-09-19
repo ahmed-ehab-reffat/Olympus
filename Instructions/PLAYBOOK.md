@@ -1282,3 +1282,175 @@ has a long tail of self-inflicted bugs; plan for it and prefer redesigns over gu
 **Pass-rate stability.** Two full batches, four levers apart, both exactly 1/10 with the same
 dominant cluster — evidence that a band carried by a SEMANTIC distinction reproduces across
 batches, unlike the numeric/ordering bands that swung 22%-vs-50% on vrp-tsplib.
+
+
+## ray-optics-formula-conditionals (APPROVED Olympus 2026-09-14)
+
+Shape O-Pipeline-hard: comparisons, `if`, `and`, `or`, `not` carried through all seven consumers of
+one formula DAG. 7 files, 329 effective LOC, 96 tests. Batches 0/11, 1/10 (FP-flagged), 1/10 accepted.
+
+**The reusable pick shape: "add a node family to an IR that a static analysis consumes".** Parser,
+two evaluators, two code generators, a symbolic derivative and an interval estimator all read the
+same DAG. The breadth is the LOC; the band came almost entirely from the ANALYSIS consumer's
+exceptions (F-26 identical operands, F-27 `or` polarity: 24 of 40 kill events) and from the code
+generator's per-node representation choice (F-10, 11 events). The parser and evaluators killed 2.
+
+**Spend the description budget on consequences, not cases.** meta.md sat at the 500-word cap from
+round 9 on. Every behaviour promise was either a stacked trap or FP exposure (L53), and the accepted
+version promises LESS than the first: top-level-only switching sets, left-to-right `and`/`or`,
+precision scoped to f32-representable values and to two stated pruning mechanisms.
+
+**Cost profile.** 11 precheck rounds before batch 1, three full-price batches, five review rounds
+between batches 2 and 3, 16 reference bugs. A route that only changed tests (Re-eval eligible) was
+measured and blocked by the FP check, so plan for at least one description change after batch 1 on a
+spec this dense.
+
+## worldengine-orographic-precipitation (APPROVED Olympus 2026-09-16)
+
+Shape O-Composite-add, Python (Mindwerks/worldengine): prevailing winds and a steady-state orographic
+rainfall field joined into precipitation and carried through the world model, protobuf + HDF5,
+equality, drawing, generation steps and CLI. 14 files, 251 effective LOC, 66 tests. Batches 1/10 (no
+clean pass) and 2/10 accepted, Nova only.
+
+**Reusable pick shape: a new physical layer in a simulation pipeline with a keyed world model.** The
+simulation math is LOC and FP insurance (0 kills in 20 runs). The band came from data-model
+integration: the container key (F-28, 23 of 46 kill events in batch 2), the accessor form (F-16) and a
+lifecycle guard (F-29).
+
+**Settle the solver-visible surface before batch 1.** About nine review rounds landed before the first
+batch; batch 1 still exposed a description-induced regression (L57), so both batches were full price.
+
+**Environment checklist that cost rounds here:** fixture fetches pinned by SHA, pip pins, generated
+code regenerated at base's generator version and formatted with the repo's tool, a writable fixture
+path for uid 1000.
+
+## cwerg-bcopy-bzero-lowering (APPROVED Olympus 2026-09-16)
+
+Shape O-Pipeline-hard, C++ + Python (robertmuth/Cwerg): two experimental IR opcodes lowered to byte
+loops in both twins for a32/a64/x64 plus the C backend, under py/cc assembly and optimizer parity.
+19 files, 690 human-effective LOC (≈375 without generated `opcode_gen.cc`), 23 golden cases, 122 base.
+Batches 0/10, 0/11, re-eval 1/11, 1/10, 0/9, **3/10 accepted** (Nova 2/9, Vega 1/1).
+
+**Reusable pick shape: a new instruction in a twin-implementation compiler.** The walls are in code
+the agent did not write and are reached through one pipeline each: the optimizer's width pass (F-30),
+the twins' constant folders (F-31), C++ CFG bookkeeping under the text renderer (F-32). One golden
+program run through every pipeline the repo already runs is the whole test design.
+
+**Budget the parity promise (L60).** It drew about nine pre-existing-divergence findings across 27
+review rounds. Fix them in the reference; keep their tests out unless the feature reaches them.
+
+**Environment checklist that cost rounds here:** cold build under the 600 s environment start (L62);
+exclude base suites that need absent cross compilers or GCC 13 and say so in meta.md; `chmod -R
+a+rwX /app` in the same layer as the build.
+
+## tippecanoe-tile-join-size-recourses (APPROVED Olympus 2026-09-16)
+
+Shape O-Composite-add in C++: `-M`/`--maximum-tile-bytes` and `--drop-smallest-as-needed` for
+`tile-join`, plus tileset metadata that describes only what was written. 5 files, 294 effective LOC,
+49 CLI tests, meta.md 362 words. One batch: 1/10, accepted.
+
+**The reusable pick shape: "give a legacy tool a recourse, and keep its books honest".** The recourse
+(rank, shed, compact) supplies the LOC and the reviewer surface. The band came from the accounting
+beside it: recording a recourse that did not act (F-15) and a field the tool already merges from its
+inputs whose aggregate the feature redefines (F-33). Look for both at pick time.
+
+**Cost profile.** Two precheck rounds and four Auto Review revisions before the first batch, ten
+reference bugs, three harness bugs, one full-price batch. Every round after the core slice changed
+tests or the solution; meta.md changed in rounds 3, 4 and 8 only, all before the batch.
+
+**Compiled-repo tax.** Budget a timestamp-proof rebuild in test.sh from day one (L63), a thread pin
+if the repo's golden tests are parallel, and a check that any adapter over the repo's own test runner
+maps every failure element.
+
+## sfepy-adaptive-stepping-accounting (APPROVED Olympus 2026-09-16)
+
+- **Outcome:** 2/15 after eleven batches (nine at 0%, one FP-flagged re-eval pass). 4 files,
+  290 human-effective LOC, 117 tests, meta.md 444 words.
+- **Decisive move 1, scope:** cut the restart lane (R60) once two batches in a row were walled by it
+  and stating its base bugs had not helped.
+- **Decisive move 2, agent mix:** at 0/12 with 116/117 near-misses on stated sentences, append Orion
+  and Vega runs rather than drop the sentence (L65).
+- **What carried the band:** F-34 aliased rollback snapshot (8/13), F-10 hostile-hook cell (7/13),
+  F-35 index rewind (2/13). 87 of 117 tests killed nobody.
+- **Procedure:** dedupe the cumulative pool before mining (L64); when a near-universal kill might be a
+  surface issue, probe the saved near-miss patches before relaxing anything (Pattern 93).
+
+## mwparserfromhell-site-aware-parsing (APPROVED Olympus 2026-09-18)
+
+- **Outcome:** 2/19 on a tests-only re-eval of batch 1 (0/20). 14 files, 405 human-effective LOC,
+  190 test cases, meta.md 292 words, 9 review rounds.
+- **Decisive move:** drop the one reviewer-requested test on pre-existing behaviour that meta.md never
+  stated (L66), keep the reference fix, re-eval instead of a fresh batch.
+- **What carried the band:** F-36 segmented lookahead consumption (11/19), F-37 in-band EOF sentinel
+  (7/19), the F-10 colon-on-reassignment cell (5/19, all Vega). 66 of 98 test functions killed nobody.
+- **Procedure:** validate the Docker image as uid 1000 offline before the first precheck; replay saved
+  patches to project any tests-only change (L68); expect twin-arm parity to be met by delegation (L67).
+
+## kira-loop-crossfade (APPROVED Olympus 2026-09-18)
+
+Rust audio engine, O-Composite-add across two playback paths, 11 files, 237 effective LOC, 55 tests,
+meta.md 496 words. Accepted at 3/10 Nova; the fair suite reads 9/10 (see failure-patterns.md dossier).
+
+- **Copy:** the decoder-thread test harness (Pattern 95): an event log with a condvar, a call-budget gate
+  that logs when it blocks, a seek count taken inside `play()`, and seek budgets compared against a
+  plain loop whose wraps land on the same output frames. It replaced two quality-review failures
+  (event order, a 16384 buffer constant) with exact deterministic checks.
+- **Do not copy:** the pick shape. Every rule fits in one 500-word description and each rule is local,
+  so agents transcribe it (L1, L58). The only genuine kill was a composition cell (live region change
+  x shortened wrap, F-10). Budget the trap design on such cells from day one.
+- **Do not copy:** asserting a fixed backlog behind a gate (L70). It was the entire accepted band.
+
+## planetiler-custommap-schema-composition (APPROVED Olympus 2026-09-18)
+
+Java config-composition feature across loader, CLI and validator, 7 files, 316 effective LOC, 83 tests,
+meta.md 485 words. Batch 1 0/8 measured nothing (compile-wipe); batch 2 accepted at 3/10 Nova.
+
+- **Copy:** the provenance clause as a trap (F-38). "Removing an id that the earlier files did not
+  contribute" plus one add-then-remove test carried 7 of 10 failures while every evaluator called it
+  clear. Any layered-input format with a removal marker can carry it.
+- **Copy:** the test.sh self-repair for an agent-poisoned local artifact repo (L73), and the non-root
+  Docker checklist in DOCKER.md for Maven reactors.
+- **Do not copy:** an unstated call shape for a new API (L72). It cost a full batch.
+- **Do not copy:** a long rulebook of stated merge rules as the difficulty plan. It is 83 tests of FP
+  insurance and zero kills; both kills were reviewer findings against the reference (L50).
+
+## featurevisor-minimal-rebucketing (APPROVED Olympus 2026-09-19)
+
+TypeScript builder feature across traffic, allocator, datafile build and CLI output, 4 files, 164
+human-effective (207 platform), 34 new tests, meta.md 460 words. Batch 1 2/11; tests-only Auto Review
+round; re-eval 2/11, approved.
+
+- **Copy:** picking a capability defined by the repo's own model (range allocations, state file, slot
+  ranges). It is the only kind that survives the sibling-library prior-art check.
+- **Copy:** turning each reference bug into a test (L50). Both killers came from there.
+- **Copy:** a shape-tolerant reader for any output the prose does not fix (`renderLines`).
+- **Do not copy:** a band carried by one host-language edge. It was accepted, but the review filed the
+  rate as overstated (L74); the independent helper cluster carried the case.
+- **Do not copy:** editing an existing spec file in test.patch. Move superseded cases into your new
+  spec file so new mode stays all-f2p (Pattern 97).
+
+
+## ir-sim-scenario-events (APPROVED Olympus 2026-09-19)
+
+- **Declarative config features are a live O-Composite-add lane in simulators.** A new YAML section
+  checked in the step loop touches parsing, stepping, object lifecycle and reset paths, and cleared the
+  scope gate with no prior art. Phrase the contract on the repo's own nouns (object groups, step modes,
+  the three reset paths).
+- **The band came from an integration default, not from the lifecycle design.** Three reset paths, an
+  id rewind, list aliasing and short-circuit-safe edge tracking all read 0/11. The loader-injected
+  group index read 10/11 (F-41). Look for what the loader does implicitly.
+- **Pin derived-view timing only after someone decides it.** The first batch lost 11/11 to a sensor
+  timing assertion the description never stated.
+- **Use squares for exact boundaries.** Circle centroids are off by an ulp (L75).
+
+## featurevisor-target-specialization (APPROVED Olympus 2026-09-19)
+
+Second lane in a proven repo, accepted at 3/10 on its second batch. What to reuse:
+1. **Pick a lane where the repo ships its own evaluator of the thing you transform.** "The output must
+   evaluate exactly like the input" is a fair, one-sentence contract, and the evaluator is the test oracle.
+2. **Put the new kernel in a new module and leave exported helpers alone.** Their spec files stay in base
+   mode and become the batch's top killer (F-12 exported variant).
+3. **Ship a seeded equivalence corpus** (fixed seeds, batched so every batch fails on base). It found every
+   unsound fold the hand-written cells missed.
+4. **Measure LOC by building, then pivot early.** The dinit lane before it looked like 315-340 eff on
+   paper and was 105 built; this one was 231 on paper-free measurement and held.

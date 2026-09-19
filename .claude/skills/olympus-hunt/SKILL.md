@@ -106,11 +106,19 @@ the capability check in Stage 2c and the seam audit in Stage 3, not by more repo
 | # | Requirement | Why |
 |---|---|---|
 | 1 | **stars ≥ 500** (`RULES.md` floor). No ceiling — but 5000+ is a PENALTY band | <500 = platform-invalid. High stars = more training data AND faster global saturation, so score 5000+ down and verify the platform sub-count before authoring. It is not a reject; the 10000 cap was arbitrary and cost us candidates |
-| 2 | **Go, Rust, Python, TypeScript/JavaScript, C++, or Java** | This hunt's scope. **Python added 2026-08-07; TypeScript/JavaScript, C++ and Java added 2026-08-11** — all four base images (`olympus-base-typescript`, `olympus-base-cpp`, `olympus-base-jvm`, plus `olympus-base-python`) are supported per `DOCKER.md`. See § Python notes and § TS/JS/C++/Java notes below — each carries a different trap mix and its own extra gates |
+| 2 | **Go, Rust, Python, TypeScript/JavaScript, C++, or Java — as the PRIMARY or a MAJOR language by code volume** | This hunt's scope. ⛔ **Plain C is NOT supported (platform picker, 2026-09-19):** "No supported language is a primary or major part of this repo (top: C). Use a repo where Python, TypeScript, JavaScript, Go, Rust, Java, or C++ is primary or a top-3 language by code volume." The top-3 clause has a size floor: tyfkda/xcc was refused with TypeScript 2nd at 4.9% of bytes. Check `gh api repos/O/R/languages` at Stage 1; RULES.md's "C/C++" wording and `olympus-base-cpp` building C are NOT eligibility. |
 | 3 | **≥1 commit in last 12 months** | `RULES.md` repo requirement |
 | 4 | **Permissive license** — MIT, BSD (any clause), Apache-2.0, Boost/BSL-1.0, CC-BY | GPL/AGPL = hard reject |
 | 5 | **Pure-language implementation** — no CGO / no `-sys` C bindings, **in the TEST build path as well as the lib** | Docker builds offline and fast |
 | 6 | **This repo is where development HAPPENS** — not an abandoned upstream of a fork, and **the last 12mo must contain real CODE commits, not only docs/README/CI** | A starred corpse reads `archived:false` with recent `pushed_at` and gorgeously cold core dirs. Killed a full mtail seam audit; see `SATURATED-REPOS.md § E`. ⚠️ Measured 2026-08-05: bunster (★2675) shows `pushed:2026-04-28` and 8 commits/12mo — **all 8 are docs/README typo fixes, zero code in a full year**, and every fork is ★0 so there is no livelier home. Read the commit SUBJECTS, never the count or `pushed_at`; a `docs:`/`chore:`-only stream is a corpse and will trip the platform's active-maintenance precheck |
+
+### ⛔ Requirement 0 — THE PLATFORM PICKER ACCEPTS THE REPO (added 2026-09-17)
+
+Before scoring a finalist, ask the user to try selecting it in the platform's repository picker. Some
+repos are **reserved to prevent data contamination** and the picker refuses them outright. Nothing on
+GitHub or in this workspace predicts it, and **a repo that was selectable before can become reserved
+later** (scriggo: usable 2026-07-21, reserved 2026-09-17, after a full design plus a validated core
+slice). Record every refusal in `SATURATED-REPOS.md § A0`.
 
 ### ⛔ Requirement 7 — THE REPO RUNS ITS OWN TESTS IN CI, AND THEY PASS (added 2026-09-01)
 
@@ -278,6 +286,7 @@ apply to all three the same way they do to Go/Rust/Python.
   ```
   Prefer repos with header-only or vendored-and-committed dependencies (no network fetch at build
   time) per the `nlohmann/json` FetchContent-offline pattern already validated in `DOCKER.md`.
+- **Tracked build outputs (L63):** the Dockerfile's `make` runs before the platform commits `/app`, so every `.o` and binary is a tracked file in the solver's sandbox. Agents `git restore` them for a clean diff, and a plain `make` in test.sh then grades the baseline binary (tippecanoe: 9/10 restored, 7/10 graded stale). Budget a timestamp-proof rebuild in test.sh, not a reject.
 - **Docker:** Pattern B, `olympus-base-cpp`. Verified toolchain + footguns: `DOCKER.md`. No JUnit
   reporter is native to most C++ test frameworks — Catch2/GoogleTest both support
   `--reporter junit` / `--gtest_output=xml:` flags; confirm the repo's existing framework supports
@@ -301,6 +310,9 @@ apply to all three the same way they do to Go/Rust/Python.
 - **Docker:** Pattern B, `olympus-base-jvm`. Local setup notes: `Instructions/jvm-toolchain.md`.
   Gradle-cache directory must be `a+rwX` writable per `DOCKER.md`; use the documented
   `gradlew test --tests __nope__` graph-warming trick to pre-populate the cache offline.
+- **Extra gate G-JVM2 (vendored-jar licence, added 2026-09-18-B):** `find . -name '*.jar' -not -path
+  './gradle/*'` plus `ls lib*/*/ | grep -iE 'licen|copying'`. synthea's correct top-level Apache-2.0
+  label hid an LGPL-3.0 jar in `lib/sbscl/` compiled into the engine; same rule as the C++ `external/` scan.
 - **Extra gate G-JVM1 (test-graph warm gate):** confirm `gradlew`/`mvn` can resolve all test deps
   from a warmed local cache with network disabled — a repo pulling test deps from a private or
   non-Maven-Central repository is a hard Docker-feasibility reject.
@@ -758,6 +770,23 @@ gh issue list -R $R --state open --limit 60 --json number,title,comments \
       | "#\(.number) \(.title)"'
 ```
 
+### ⛔ FIRST, check that the "welcome" is not a REMOVAL record (added 2026-09-18, paid for by kira)
+
+A changelog or release note that says a capability is "no longer" supported, often followed by a
+friendly "if you need it, let me know" or "please make a PR", is NOT an invitation. It records that
+the repo used to ship the capability and dropped it on purpose. The scope gate rules reintroducing a
+removed capability **publicly-solved and unfixable**, "regardless of whether the modern
+implementation uses a new ... mechanism" (kira-frame-accurate-start-times, killed at the core slice
+on `changelog.md` "Clocks are no longer sample accurate ... let me know!" and the removing commit).
+
+```bash
+# removal records for the lane, BEFORE reading any tracker invitation
+grep -niE "no longer|removed|dropped|deprecat|can no longer|not supported any ?more" CHANGELOG* changelog* RELEASE* docs/*change* 2>/dev/null | head -30
+git log --oneline -S"<old API name or keyword>" | head          # did the capability exist before?
+```
+
+Any hit covering your lane kills it; so does a public branch that implements the old behaviour.
+
 **Grade each hit:**
 
 - **Maintainer says yes, no design published, no PR** -> BEST CASE. Author it, inventing your own
@@ -796,6 +825,13 @@ test above on the lane it points at:
   visible and unclaimed for a long time precisely because it is the obvious thing to pick.
 
 The lane's AGE is the tell: a fresh invitation is a lead, a two-year-old one is a queue.
+
+⛔ **A maintainer's NUMBERED PLAN inside a popular issue is a reject, not a risk to weigh (2026-09-19,
+oxipng #551).** When the owner splits the feature into stages and the later stages are open, each
+stage is a pre-sized pick that a different rival can take, and building the union is ruled a
+set-level derivative ("stitches two older major implementation blocks"). oxipng was flagged exactly
+this way in the dossier, authored anyway on the strength of its size, and died at the core-slice
+precheck against two older submissions (44.5% and 48.9%). See `TOO-EASY.md § oxipng-apng-frame-optimization`.
 
 ---
 
@@ -839,6 +875,72 @@ precondition; one kind is not enough, because there is nothing for the new quant
 with. **If you take this seam, never write an iteration-count or unbounded-chain-length promise
 into meta.md** — that clause was ruled a functional false positive on customasm.
 
+### F-34 seam probe — a solve that writes into the caller's state vector (8 of 13 on sfepy)
+
+```bash
+# Python/NumPy: in-place updates of an array the caller keeps
+grep -rnE "\[:\] *=|\+= *d[a-z_]*|np\.copyto\(|out=" --include=*.py <solver dirs> | head -20
+# Rust/Go/C++: a solve or step taking the state by mutable reference or slice
+grep -rnE "fn (solve|step|iterate)[a-z_]*\([^)]*&mut|\) (Solve|Step)[A-Za-z]*\([^)]*\[\]float64" . | head
+```
+
+Dossier row: `F-34 seam: yes/no + file:line of the in-place write`. Pair it with any feature that
+returns a state from before a solve (rollback, retry, stop). Confirm with a two-line probe that the
+object handed to the solve is the object it mutates; a solver that returns a fresh array has no seam.
+The same repo usually carries F-35 (a stepper that advances before the attempt) and an F-10
+hostile-hook cell (a public callback that sets the step).
+
+### F-36 / F-37 seam probe — a marker-split, backtracking tokenizer, and a C reader with in-band EOF (11/19 and 7/19 on mwparserfromhell)
+
+```bash
+# F-36: input split on marker characters into a segment list, backtracking by resetting a head index
+grep -rnE "re\.compile\(r?\"?\(\[|\.split\(self\._text|self\._head *= *reset|_text\[self\._head" --include=*.py . | head
+# F-37: a C reader that returns 0 for an out-of-range read, and loops that test it as EOF
+grep -rnE "return '\\\\0';|return 0; */\* *EOF" --include=*.c . | head
+grep -rcE "if \(!this|while \(\(this = " --include=*.c . | sort -t: -k2 -nr | head -3
+```
+
+Dossier rows: `F-36 seam: yes/no + the split regex file:line`, `F-37 seam: yes/no + reader
+file:line + count of '!this' checks`. Both pay only with a feature that consumes a run the USER
+defines (a character set, a delimiter). If the repo also has a Python twin of the C tokenizer,
+expect passers to satisfy parity by delegating C to Python (L67): the twin adds F-37 and a parity
+corpus, not a second implementation's worth of difficulty.
+
+### F-38 / F-9 seam probe — a layered-input format with a removal marker, and a loader with two origins (7/10 and 3/10 on planetiler)
+
+```bash
+# F-38: ordered merge of inputs where an entry can mark itself removed/overridden
+grep -rnE "\b(extends|inherit|overlay|parent)s?\b" --include=*.java --include=*.go --include=*.rs --include=*.py . | grep -viE "class .* extends|test" | head
+grep -rnE "\"(remove|delete|drop|unset)\"|@JsonProperty\(\"(remove|delete)" . | head
+# F-9 origin variant: a loader that falls back from disk to bundled resources, plus a second consumer
+grep -rnE "getResource\(|loadResource\(|include_str!|importlib\.resources|embed\.FS" . | head
+grep -rnE "resolveSibling\(|Path\.of\(.*examples|os\.path\.join\(os\.path\.dirname" . | head
+```
+
+Dossier rows: `F-38 seam: yes/no + the merge loop file:line`, `F-9 origin seam: yes/no + both
+resolution sites`. F-38 pays when the feature can make one input both add and remove the same kind
+of entry. If the repo has NO composition yet, the feature itself creates the seam: a config format
+whose README already says "may change between releases" is an invitation (planetiler issue #1148).
+If the repo already settles a fixed point AFTER the merge you would add, do not count it as F-22:
+planetiler's deferred argument settlement killed 0/10.
+
+### F-39 / F-40 seam probe — a helper whose bug the new regime reaches, and a string-keyed record (3/11 and 7/11 on featurevisor)
+
+```bash
+# F-39: early-exit loops that rebuild their result from only the items they touched
+grep -rnE "while \(remaining > 0 && i < |while remaining > 0 and i < |for .*break;.*return result" --include=*.ts --include=*.js --include=*.py --include=*.go . | grep -v spec | head
+# then list the helper's callers: F-39 is live only if every caller keeps the lossy path unreachable
+grep -rn "<helperName>(" --include=*.ts . | grep -v spec
+# F-40: records keyed by user strings, built on plain objects, in a TS/JS repo with an unrestricted key type
+grep -rnE "export type [A-Za-z]*(Value|Key) = string;" packages/*/src --include=*.ts | head
+grep -rnE "(: \{\}|= \{\});?$|\[[a-z]+\] = \{" --include=*.ts --include=*.js . | grep -v spec | head
+```
+
+Dossier rows: `F-39 seam: yes/no + helper file:line + the regime its callers avoid`, `F-40 seam:
+yes/no + the key type's declaration`. Prove F-39 before designing: call the helper with the new
+regime's input in a scratch test and watch the tail disappear. F-40 is narrow; plan a core-algorithm
+killer beside it (L74).
+
 ## Stage 3 — TRAP-SEAM AUDIT (the stage that actually decides — 10 min)
 
 This is what separates this skill from a GitHub search. Clone the finalist shallowly and look for
@@ -859,6 +961,11 @@ ls */ | head -20                      # multi-package? (Gate: clear module bound
 | **A construct that is both producer and consumer** | call bindings, aliases, bidirectional constraints, two-way edges | **F-2** bidirectional seam (~50% kill) |
 | **An exemption/protection spanning two collections** | "skip if X" logic where the protected entity has 2+ member lists | **F-3** second-axis carve-out (~28% kill) |
 | **Aliasing-graph IR** | Rust `Rc<RefCell<_>>`/`RRC`, Go maps mutated during range | **F-4** ownership trap (~18%, kills whole runs) |
+| **A solver or iterative loop that writes its iterate into the caller's buffer** | `x[:] = ...`, `x += dx`, `out=` arguments, a Newton/PETSc/SciPy wrapper handed the state vector | **F-34** aliased rollback snapshot (8/13 on sfepy, sole failure of both near-misses) |
+| **A stepper whose `advance()` bumps the index before the attempt runs** | time steppers, cursors, generators that yield after incrementing | **F-35** index rewind on stop (2/13) |
+| **A public callback that can set the quantity a feature must bound** | `adapt_fun`-style hooks, user step controllers, size callbacks | **F-10** hostile-hook cell (7/13 on sfepy) |
+| **A tokenizer that splits input on marker characters and backtracks by resetting an index into the segment list** | `re.compile(r"([{}\[\]<>|=...])")` feeding `self._text`, `self._head = reset` on a failed route | **F-36** segmented lookahead consumption (11/19 on mwparserfromhell, sole failure of four near-misses) |
+| **A C reader that returns `'\0'` for out-of-range reads, with dozens of `!this` end checks** | `Tokenizer_read`-style helpers, `while ((c = read()))` loops | **F-37** in-band EOF collision (7/19, C arm only), once the feature accepts caller-chosen characters |
 | **A pass-through node type in an analysis** | "transparent"/combinational/identity nodes | **F-5** transitive reachability |
 | **Two documented transforms with unstated order** | validate + normalise living in different functions | **F-6** ordering inversion |
 | **Suppression contexts across several stages** | "not inside X" handled in 2+ places | **F-7** context-exclusion completeness |
@@ -876,11 +983,25 @@ ls */ | head -20                      # multi-package? (Gate: clear module bound
 | **A lookup that throws on a missing key, whose throw the repo's own suite never exercises, in a namespace your feature must traverse before every key is known** | grep the resolver for the throw (`Unknown`, `not found`, `orElseThrow`, `panic!`), then delete it and run the base suite — if the suite still passes, the behaviour is untested and the seam is live | **F-24** absent-key sentinel replaces an existing hard failure — 8/10 in TWO independent batches on dfu-derived-recursion, four runs failed ONLY this pair; costs one clause naming the semantic difference |
 | **A public API that hands the CALLER a value the feature cannot resolve yet** (an id/handle/template returned during a registration or builder phase) | check whether the API returns the unresolved thing to user code at all; if the caller can assign it to a local or memoize the supplier that produced it, the placeholder's lifetime is a seam | **F-25** placeholder validity window narrower than the caller's — 4/10 + 4/10 on dfu-derived-recursion; zero description words |
 | **A pervasive "value or provider" container the repo uses for every scalar-or-callable quantity, whose constructor validates by signature/type introspection** | grep the container for `inspect.signature`/`__code__.co_argcount`/arity or dimensionality checks; then confirm a plain Python/JS callable with a DEFAULTED or KEYWORD-ONLY parameter is refused while the repo's own docs call it "a number or a function of X" | **F-23** repo-idiomatic wrapper narrows the stated input domain — 6/10 on rocketpy, reproducible across batches AND solver families; costs zero description words, but the axis is BINARY (flips all runs or none) |
+| **An interval / range / sign / nullability estimator over an IR whose builder shares identical subexpressions, into which your feature adds an operator that is exact on identical operands** | build `x < x` (or `a - a`) through the repo's builder and check both operand ids are the same node; then confirm the estimator's binary arm never compares operand identity | **F-26** correlated operands estimated as independent intervals — top killer on ray-optics-formula-conditionals (7/10, reproduced 5/10 and 5/11 under two other descriptions); zero description words |
+| **A flow-sensitive refinement pass (range narrowing, type guards, null-flow) into which your feature adds a DUAL pair of logical combinators** | find where the pass narrows inside a selected branch; if one polarity's sound refinement would need a union the pass does not build, the seam is live | **F-27** polarity copied from the sibling combinator — 6/10 on ray-optics, and it ROSE as the sentence got clearer; one sentence states both polarities |
+| **A keyed container of named concepts that already ships a composite value type** (`LayerWithThresholds`, a tuple-valued record, a struct-of-arrays entry), where your feature adds a concept with two parallel components | grep the container setters for a subclass of the base value type that carries extra fields; if one exists, a new two-part concept named in the singular is a live seam | **F-28** composite concept split into sibling keys — 7/10 top killer on worldengine-orographic-precipitation and the sole failure of all four 63/66 near-misses; no extra description words |
+| **A plugin/simulation family whose members declare an applicability predicate that no call path consults** | count `def is_applicable` / `can_apply` / `should_run` definitions, then call sites; definitions with zero calls = live, provided your contract keeps caller-supplied state | **F-29** guard declared, never consulted — 2/10 on worldengine (after 1/10); one direct-call test |
+| **Twin implementations of one pipeline (Python spec + C++ port, interpreter + compiler) under an "identical output" convention, with a pass that widens or promotes values under a low-bits invariant** | grep the pass docstring for "lower bits" / "widen" / "promote"; list which pipelines call it (optimizer, which targets); then diff the twins' constant folders on an overflowing add | **F-30** (new full-width consumer after the widening pass, 10/10 → 2/10 across five batches) + **F-31** (host integer semantics diverge in folding, 2/10) + **F-32** (CFG edits at scale caught only by the strict renderer, 2-3/10). Budget L60: every pre-existing twin divergence becomes a review finding |
+| **An input reader that folds a metadata/aggregate field from EVERY input with a fixed operator (sum, overwrite), where your feature changes how that field aggregates** | grep the per-input metadata loop for `+=` / assignment on each field it reads back (tippecanoe `handle_strategies`); then confirm the base suite never merges two inputs that both carry the field | **F-33** inherited aggregate merged with the base operator — 3/10 on tippecanoe-tile-join-size-recourses, and the reference author made the same mistake; one clause, two tests |
+| **A range, cursor or allocation helper whose loop exits early and keeps only the items it touched, where every existing caller stays in a regime that never reaches the lossy path** | grep the helper for `while (remaining > 0 && i < n)`-style loops that return a rebuilt list; list its callers; call it with the new regime's input (an earlier item used up EXACTLY, later items untouched) and watch the tail vanish | **F-39** inherited helper bug — 3/11 on featurevisor-minimal-rebucketing, three independent implementations, and the reference reused it first; zero description words |
+| **A TS/JS feature that returns figures in a record keyed by user-controlled strings, whose key type in the repo is plain `string`** | grep the types package for `= string;` key aliases and the builder for `{}` records indexed by those keys | **F-40** `__proto__` key lost — 7/11 on featurevisor, sole failure of six near-misses; narrow, pair it with a core killer (L74) |
+| **A batch loader that injects a per-entry attribute (group index, owner, id) which the public single-object constructor leaves at a default, next to a subsystem that dispatches by that attribute** | diff the loader's factory call against the factory's public signature: `grep -rn "create_from_parse\|group_start_index\|enumerate(parse)" ; grep -n "group: int = 0\|owner=None"`; then find the per-group / per-owner dispatch | **F-41** runtime creation path skips a loader-injected attribute — 10/11 on ir-sim-scenario-events, sole failure of six 89/90 near-misses; zero description words |
 | **Two lexical spellings of one concept the language treats as equivalent** | line vs block comments, short vs long flags, quote styles, prefix vs infix call syntax; grep the lexer for a second branch on the same token class | **F-18** token-form parity gap — decided the band on gluon (7/11, 22 of 37 kills) |
 
 ```bash
 # Fast seam probes
 grep -rnE '"//"|"/\*"|starts_with\(.--.\)' --include=*.rs --include=*.go | head   # F-18: two lexical forms of one concept
+grep -rnE "class [A-Za-z]*Layer[A-Za-z]*\(Layer|class [A-Za-z]*\([A-Za-z]*(Record|Entry|Layer)\)" --include=*.py | head   # F-28: composite value types in a keyed container
+for f in is_applicable can_apply should_run; do echo "$f defs=$(grep -rn "def $f" --include=*.py | wc -l) calls=$(grep -rn "\.$f(" --include=*.py | wc -l)"; done   # F-29: guard declared, never called
+grep -rniE "lower [0-9a-z]* ?bits|widen|promot" --include=*.py --include=*.cc <lowering-dir>/ | head   # F-30: low-bits invariant in a width pass
+grep -rn "FunRegWidthWidening\|Widen" --include=*.py --include=*.cc | grep -v "def \|^.*\.h:" | head   # F-30: which pipelines run it (optimizer? which targets?)
+grep -rnE "//|int\(|& *0x[fF]+|mask" <py-eval-file> | head; grep -rnE "int64_t|uint64_t|SignExtend" <cc-eval-file> | head   # F-31: twin folders, unbounded vs fixed width
 grep -rn "RefCell\|Rc<\|RRC" --include=*.rs | wc -l        # F-4 (Rust)
 grep -rn "for .* := range" --include=*.go | wc -l          # F-4 (Go, check for in-loop mutation)
 grep -rln "fixpoint\|fixed_point\|until.*changed\|converge" # F-2 (existing fixed points = coupled domain)
@@ -914,6 +1035,11 @@ rg -n 'public .*(id|ref|reference|handle|placeholder)\(' -tsrc | head -20
 grep -rnE "signature\(|co_argcount|__code__|getfullargspec|arity|n_args|num_inputs" --include=*.py --include=*.js --include=*.ts | head
 grep -rniE "class (Function|Supplier|Lazy|Provider|Expr|Value)\b" --include=*.py | head
 # then: does `Container(lambda x, scale=0.5: ...)` raise where `Container(lambda x: ...)` does not?
+# F-26: node-sharing IR + an estimator that combines operand ranges without an identity check
+grep -rnE "intern|hashCons|nodeKey|dedup|cache\.get\(" --include=*.js --include=*.ts --include=*.rs --include=*.go | head
+grep -rnE "estimate|interval|range" <analysis-file> | head   # then: does any binary arm test left === right?
+# F-27: a narrowing pass with a per-branch context, where your feature adds and/or style combinators
+grep -rnE "narrow|restrict|refine|guard" <analysis-file> | head
 grep -rnE "addr_unit|unit_size|granularity|default_.*= *8" | head              # F-9 elidable default across stages
 ls */                                                       # multi-package boundary count
 
@@ -970,6 +1096,8 @@ head -5 <repo>/<vendored-dir>/__init__.py     # look for a foreign copyright hol
 # 2. Does the domain's canonical toolchain ship your capability as a named function?
 gh api "search/code?q=repo:<REFERENCE_TOOL>+filename:<your-capability>"
 # 3. ⭐ Does the repo's OWN PREVIOUS MAJOR VERSION ship it? (added 2026-09-09 - one call, decisive)
+#    Same question for a capability a later release REMOVED (kira 0.10, 2026-09-18): the removing
+#    commit plus the changelog line is publicly-solved prior art, and the gate calls it unfixable.
 git ls-remote --tags origin | sed 's|.*refs/tags/||' | grep -v '\^{}' | sort -V | tail -20
 gh api "repos/<R>/contents/<old/path/to/Capability.py>?ref=<PREVIOUS_MAJOR_TAG>" -q .size
 ```
@@ -995,6 +1123,25 @@ Domain -> reference toolchain: power systems -> **MATPOWER**; SPIR-V -> SPIRV-To
 llvm-dwarfdump/gimli; WASM -> wabt/binaryen; SQL -> the engine's own docs; CP -> the Global Constraint
 Catalogue; circuits -> SPICE.
 
+**⛔ THEN THE SIBLING-LIBRARY CHECK (added 2026-09-17, paid for by sfepy arc-length).** The port check
+asks whether the repo's PARENT ships the capability. The scope gate also asks whether ANY public
+library in the same language and domain does, even with a different data model. If the pick's hard
+part is a named textbook algorithm, it is dead the moment a sibling ships a working version, because
+the gate treats your repo's wiring as "integration and policy work" around a cribbable core.
+
+```bash
+gh search code "<the algorithm's signature formula or function name>" --language=<lang> --limit 20
+# then the 3-5 nearest sibling libraries, by name, e.g. sfepy -> jax-fem, scikit-fem, dolfinx, GetFEM
+gh search code "<formula>" --repo <sibling/one> ; gh search code "<formula>" --repo <sibling/two>
+```
+
+Measured: sfepy arc-length continuation cleared every other gate here (zero source hits, zero issues
+or PRs, reproduced on base, 205-eff slice validated) and died at the scope gate as publicly solved by
+JAX-FEM `jax_fem/solver.py:595` (the corrector, root choice, loop, step cap and target polish, 7 of 15
+cases). Corpus overlap was only 1.9%, so the repo was fine; the ALGORITHM was not. The pick that
+followed (featurevisor rebucketing) passed because its hard part is the repo's own range model and
+nothing public reallocates it. See `TOO-EASY.md` (sibling-library textbook-algorithm row).
+
 **Measured 2026-09-01, and it killed a pick that had cleared everything else.** pandapower continuation
 power flow passed absorption (0 files for continuation/voltage_stability/loadability), passed Phase 2
 (nobody had requested it), sketched at 445-675 effective against a same-repo 557 calibration, and had
@@ -1018,7 +1165,64 @@ arm must touch, plus any semantics the sibling does not have); **below ~150 eff 
 a coupled second lever named in the dossier, above 250 it proceeds.** Write the number down; a
 verdict without one is an opinion.
 
-**The shape-level tell, visible at pick time.** If the capability can be phrased as *"add the missing
+⚠️ **Sketch against the CHOKEPOINT, not the surface list (added 2026-09-19, paid for by dinit).** A
+dossier that lists every behaviour the contract touches (start, failure, stop, restart, force, pins,
+control, reload, checker) and sums a per-surface estimate will overshoot whenever those surfaces share
+one per-link decision. dinit's `depends-any` sketched 315-340 eff that way; the built reference was
+**105 human-eff**, because stop, restart, forced stop, stop ordering and soft release all route through
+`is_hard()` in `stop_dependents`. Count the distinct DECISION POINTS the new semantic changes and size
+each; the interdependence that makes the traps good is the same property that makes the diff small.
+
+⚠️ **Sketch against the GENERIC BASE CLASS, not just the sibling arm (added 2026-09-16, paid for by
+ott-jax/ott).** The dossier's "missing machinery" line is the field that decides the pick, and it is
+the easiest one to fill optimistically. Before writing a number, grep the base class for the thing you
+claim is missing. On ott the thesis was "no geometry-agnostic cost-statistic estimator"; the base
+`Geometry` already computes mean and std through `apply_cost`/`apply_square_cost` **specifically so
+they work for the online and low-rank representations**, which was the whole claimed difficulty. The
+one genuinely absent statistic (a non-materialising median) turned out to be a PERFORMANCE claim, and
+a performance claim is not behaviourally testable, so it buys neither difficulty nor LOC. Two checks
+that would have caught it in ten minutes:
+
+1. **Grep the abstract base for your capability's verb** before believing a subclass gap is real. A
+   `NotImplementedError` in ONE subclass beside a working generic implementation in the base is
+   absorption, not a gap.
+2. **Ask whether the missing thing is a VALUE or a COST.** If the naive implementation produces the
+   right answer and is merely slower or fatter, no fair test separates it from yours, and the lane
+   dies whatever its seams look like. The exception is a repo that enforces the constraint with a
+   raised error rather than with memory pressure (ott's `Grid` does; nothing else in ott does).
+
+**The law behind it:** cold + well-factored is the profile of a repo whose remaining capabilities are
+ABSORBED. A library is cold BECAUSE its abstractions already cover its domain, and every signal this
+skill ranks on (cold directories, zero open PRs, clean dedup) selects for exactly that. This skill
+ranks AVAILABILITY; the absorption sketch measures SIZE; they are anti-correlated. Do the sketch for
+the RANK 1 candidate's named lane before writing the dossier, not at authoring time.
+
+⚠️ **AUTHOR-CONTROLLED SIBLING PACKAGE = a distinct absorption class (added 2026-09-16, killed
+quimb and momepy).** The repo's most nameable, most algorithmically-dense lanes have been moved OUT
+into a separate package the SAME maintainer/org controls, while star count, CI and issue volume stay
+healthy - so the hunt's signals all read green. quimb delegates 100% of contraction-path logic to
+`cotengra` (a 339-line `functools.wraps` shim), its whole symmetry axis to `symmray`, its backends to
+`autoray`; momepy deprecated its entire `preprocessing.py` network-simplification subsystem into
+`neatnet`. In every case what's left in the repo is a thin catalogue. Cheap detector, run at Stage 2c:
+read `pyproject.toml`/`Cargo.toml` deps AND optional-extras for packages sharing the maintainer's org
+or handle, then `grep -rn "deprecat" src/` for notices pointing at them. If the dense subsystem is
+being hollowed into a sibling, the repo is absorbed even though it looks alive.
+
+⚠️ **GDAL/geospatial is NO LONGER a Docker blocker (measured 2026-09-16).** `pyogrio` wheels bundle
+GDAL 3.12.4, so the geopandas stack (geopandas, libpysal, shapely 2, and consumers like momepy)
+pip-installs offline with no system libs, no conda, no compiler - 45 momepy tests passed in 2.65s
+inside `olympus-base-python`. Do not exclude a geospatial repo on the GDAL fear; it may be gating
+good candidates. The remaining Docker risks are the real ones: cgo/C-extension builds needing
+external headers (GEOS via cgo still bites, e.g. imposm3), and network-at-build-time fetches.
+
+⚠️ **A curated catalogue is not an engine, and its LOC does not clear the floor (momepy, 2026-09-16).**
+When each public function is a one-line wrapper around a published formula with a 30-line docstring
+(momepy `convexity` = 38 lines, one of them code), no single-capability lane can reach 200-250
+effective LOC without becoming "add N functions to namespace X", the triviality auto-RED. Measure the
+nearest recent real capability in effective LOC before believing a catalogue repo can carry a pick;
+momepy's biggest in 9 months was ~80 eff.
+
+**The shape-level tell, visible at pick time.****The shape-level tell, visible at pick time.** If the capability can be phrased as *"add the missing
 X arm to a thing that already handles A, B and C"*, it is absorbed by construction — the framework
 around the dispatch does the work, which is exactly why the arm is small. Look for: kind-dispatch
 `if/else if` chains on a type tag, plugin/policy registries, visitor interfaces, `register*Handler`
@@ -1119,6 +1323,13 @@ One block per candidate, ranked by **trap-seam score first**, mechanical fit sec
 |---|---|---|
 | F-1 convergent-architecture wall | yes/no | `path/to/file.rs:120` — <the destructive stage> |
 | F-2 bidirectional seam | yes/no | <construct> |
+| F-26 correlated-operand seam | yes/no | <estimator + node-sharing builder> |
+| F-27 dual-combinator narrowing | yes/no | <refinement pass> |
+| F-28 composite concept in a keyed container | yes/no | <container + existing composite value type + the two-part concept> |
+| F-29 declared-never-called guard | yes/no | <predicate name, definition count, call-site count> |
+| F-30 low-bits invariant vs full-width consumer | yes/no | <width pass + pipelines that run it + the new full-width operand> |
+| F-31 twin host-integer divergence | yes/no | <the two constant folders + an overflowing fold that prints differently> |
+| F-32 scale-only CFG malformation | yes/no | <CFG-editing twin + the stricter output path> |
 | F-3 second-axis carve-out | yes/no | <exemption + its two collections> |
 | F-4 ownership trap | yes/no | <RefCell/range-mutation count> |
 | F-5 transitive pass-through | yes/no | <node type> |
@@ -1201,6 +1412,8 @@ Before `olympus-author`, the chosen candidate must clear the full
 | Repo has an open, uncommented, long-lived issue asking for a famous feature | Every author picks it; the SIX-CHECK is blind to the pipeline (Stage 2b) |
 | Active maintainer workstream in the target CAPABILITY (not merely the target files) | Corrected Gate 5. A `fix/<topic>-*` branch family or >=4 merged PRs in one narrow lane means that lane is dead — pick another lane, not another repo (Stage 2c) |
 | Two or more TRACKER-SOURCED candidate lanes already dead in the same repo | Lane density, not bad luck. A further tracker-sourced candidate is a coin flip at the same odds (veryl: 4 for 4). One INVENTED lane (built from the source tree, not the tracker) is still allowed before stopping |
+| The lane restores a capability a release REMOVED ("X is no longer ...", "removed X", even beside "let me know if you need it") | Scope gate: publicly-solved, unfixable, whatever the new mechanism (kira-frame-accurate-start-times, 2026-09-18). Check the changelog for removals BEFORE reading it for invitations (Stage 2d) |
+| A popular repo whose maintainer merged ~1 PR in 12 months while the PR queue keeps filling | **Dormancy is a derivative MAGNET, not an opportunity** (added 2026-09-16, paid for by ruptures). When nobody merges, the obvious features pile up as PUBLIC, READABLE PR DIFFS — exactly what the exclusivity gate rejects on. ruptures passed every mechanical gate, the dedup check and the seam audit, then died to a two-day-old open PR implementing the precise interaction the trap thesis rested on, beside three more PRs adding new detectors and costs. Prefer "maintained but consuming a DIFFERENT lane" over "dormant with a full PR queue". Corollary: run Stage 2c's PR enumeration BEFORE the seam audit, never after — it is two API calls |
 | Core dirs frozen for 12mo while the periphery stays busy, and you have NOT checked for a live fork | Ambiguous: either a real cold seam or a dead upstream. `gh api "repos/O/R/forks?sort=newest"` — a livelier low-star fork means the coldness is a corpse (`SATURATED-REPOS.md § E`) |
 
 ## Anti-patterns for the hunt itself
@@ -1219,7 +1432,8 @@ Before `olympus-author`, the chosen candidate must clear the full
 A hunt clones repos and builds them; the builds are what fill the disk. Clone 3-32M, target 1-5G.
 `df -h /home` before any build, prefer scoped builds, and `rm -rf worktrees/<repo>/target` the moment
 a measurement is recorded. Keep the clone for shelved-but-viable candidates so the audit is not
-repeated. There is NO local Docker here, so Docker feasibility is always an ESTIMATE, never a test.
+repeated. Docker is available (since 2026-08-25), but a hunt still only ESTIMATES Docker feasibility;
+the clean-room build belongs to authoring.
 
 
 ## Seam rows added 2026-08-07 (lyon-fill-internal-vertices)
@@ -1234,3 +1448,71 @@ repeated. There is NO local Docker here, so Docker feasibility is always an ESTI
   creates the sentinel pressure creates the placeholder.
 - **F-21 type-check shortcut** — target repos with a builder/visitor/sink INTERFACE plus an `Abstract*` base holding the state, and no accessor on the interface. Java and Rust trait-object APIs both qualify. Measured 5/10 top killer and sole near-miss failure on datafixerupper.
 - **F-16 unparameterised setter** — repos with an options struct carrying a boolean `with_*` setter. Grep `fn with_[a-z_]*\(mut self, [a-z_]*: bool\)`. Measured 4/10 but it is a COMPILE error: bonus only.
+
+
+## Seam rows added 2026-09-14 (ray-optics-formula-conditionals)
+
+- **F-26 correlated operands** — target expression engines that already carry a static analysis
+  (interval ranges, sign, nullability) over a node-sharing DAG. Adding comparisons or equality makes
+  `x < x` a free top killer: 7/10 on ray-optics, and it reproduced under three different descriptions.
+- **F-27 dual-combinator polarity** — the same engines, when the feature adds `and`/`or` style
+  combinators to a narrowing pass. 6/10. Stating the polarity outright did not defuse it.
+- **Validator environment (L56)** — when the feature emits a second language (WGSL, GLSL, SQL), check
+  at hunt time that the tests can validate it in-process. A Dockerfile-installed compiler CLI failed
+  Verify Solution twice on ray-optics while passing every local clean-room.
+
+
+## Seam rows added 2026-09-16 (cwerg-bcopy-bzero-lowering)
+
+- **F-30 low-bits invariant** — target compilers and VMs with a width / promotion pass that promises
+  only "the low bits are right", run on some pipelines only. A feature adding a full-width consumer
+  (a length, a count, a shift amount) gets a wall that stayed live for five batches after the rule
+  was stated: 10/10, 8/11, 7/10, 3/9, 2/10.
+- **F-31 / F-32 twin implementations** — a Python spec with a C++ port gives two more seams for
+  free: constant folders with different host integer semantics (2/10, identical 5-test set) and
+  C++ CFG edits that only the strict text renderer rejects at scale (2/10). Price L60 before
+  picking: parity between twins pulled about nine pre-existing divergences into review.
+- **Docker cold build (L62)** — for a C++ repo, time `docker build --no-cache` at hunt time. The
+  platform's 600 s environment start includes it; cwerg's first Dockerfile took 704 s.
+
+
+## Seam rows added 2026-09-19 (featurevisor-minimal-rebucketing)
+
+- **F-39 inherited helper bug** — repos whose small range or cursor helper is correct for today's
+  callers and lossy in the regime your feature needs. 3/11, and the reference fell in first.
+- **F-40 `__proto__` record key** — TS/JS repos with an unrestricted string key type. 7/11, six of
+  them near-misses. Reviewers accept it but call the rate overstated if it carries the band alone (L74).
+- **Method: the niche subagent sweep found this repo.** Four agents (simulation, CAD/EDA, workflow and
+  rule engines, binary toolkits), each gated on the sibling-library check, screened ~170 repos in one
+  pass. Three niches came back empty; the engines niche returned featurevisor, whose hard part is its
+  own allocation model. The dossiers live in `worktrees/_hunt/agents/`.
+
+
+
+## Seam rows added 2026-09-19 (ir-sim-scenario-events)
+
+- **F-41 loader-injected attribute** — target engines whose scene/config loader passes a per-entry
+  index into the object constructor (ir-sim: `group=group_start_index + group_index`) while the public
+  constructor defaults it (`group=0`), and some subsystem dispatches by it (group behaviors, ownership,
+  batching). Any "create objects at runtime" feature inherits the gap: 10/11 on ir-sim.
+- **What did NOT pay on ir-sim:** a lifecycle-rich engine (three reset paths, a shared object list
+  indexed by a spatial tree, an id counter, lazy edge tracking) looked like a trap goldmine at hunt
+  time, and every one of those seams killed 0/11 once the prompt named the lifecycle paths. Rank a
+  repo on seams whose FIX hides in code the prompt cannot name (a loader convention, a dispatch key),
+  not on how many lifecycle paths it has.
+
+
+## Seam rows added 2026-09-19 (featurevisor-target-specialization)
+
+- **F-12 exported-helper variant** — target repos where the capability's natural home is an EXPORTED
+  helper with its own spec file pinning today's contract (featurevisor's two-valued
+  `applyContextToConditions` / `applyContextToSegments`, 4,000 spec lines). A feature that needs a
+  different semantic there gets a free baseline wall: 7/20 runs. Probe: `grep -rl "<helper>" --include=*.spec.* .`
+  and count assertions that pin the behaviour you are changing.
+- **F-43 implicit container** — expression formats where a bare list (or map) means AND and may sit
+  under `and` / `or` / `not`. Grep the evaluator for an `Array.isArray` branch inside the recursion
+  (`sdk/src/conditions.ts` has one at every level). Pays only when the feature makes the agent write
+  its own evaluator or rewriter, and only with a seeded equivalence corpus.
+- **The SDK as oracle.** A repo that ships both a builder and an evaluator of the builder's output
+  gives a free, fair oracle for any build-time transformation: "evaluates exactly as before".
+

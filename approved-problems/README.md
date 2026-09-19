@@ -828,3 +828,298 @@ finding against YOUR reference predicts an agent failure mode — all three that
 killers), L51 (most reference bugs in a long cycle are fix-induced; delete the mechanism, do not
 narrow the guard), Pattern 88 (bind-mount replay). Known gap the reviewer named and we accepted:
 no test wraps a reference in `DSL.check`.
+
+
+## ray-optics-formula-conditionals (JavaScript / ray-optics formula engine) — ACCEPTED 2026-09-14, 1/10
+
+**What made it hard.** Comparisons, `if`, `and`, `or` and `not` in the formula language, carried
+through all seven consumers of the formula DAG: parser and statement splitter, closure evaluator, JS
+generator, WGSL generator (raw vs wrapped lowering), symbolic derivative (switching sets) and the
+interval range estimator (truth sets, branch pruning, parameter narrowing). 7 files, 329 effective
+LOC, 96 tests.
+
+**What broke it.** Four exceptions to rules the agents otherwise got right: (1) **7/10** — `x < x`
+estimated as two independent intervals, so a branch it can never select leaks values and invalidity
+(5/10 and 5/11 in the earlier batches, under different descriptions); (2) **6/10** — `or` narrowing
+its true branch the way `and` does, which got WORSE as the sentence got clearer; (3) **6/10**, the
+sole failure of the 94/96 near-miss — a valid comparison lowered to plain f32 reading a wrapped
+operand without `.value`; (4) **3/10** — the repo's subtract-and-guard equality idiom overflowing for
+far-apart operands. 86 of 96 tests killed nothing.
+
+**The fixes, and what each cost.** Eleven precheck rounds fixed 13 reference bugs and added a test for
+each; batch 1 read **0/11**. One sentence bound its "except" clause to `if` alone (11/11), and beneath
+it eight independent reviewer-finding tests stacked to zero. Route B made bare comparison derivatives
+0 everywhere and dropped five tests; batch 2 read 1/10 and the pass was FP-flagged (nested-`if`
+value over-guard). A probe battery showed no batch-2 agent was clean on every stated sentence, so the
+spec was cut: top-level-only switching, left-to-right `and`/`or`, scoped invalid-operand precision.
+Five more review rounds followed: f32 agreement scoped instead of emulated; a later-operand
+feasibility test dropped after it failed 14/21 saved solutions; a WGSL agreement point moved off 1/3;
+a `naga-wasi-cli` validity test that failed Verify Solution twice (never locally) replaced by an
+in-process check. Batch 3: Vega passed, 1/10, accepted.
+
+**Carried forward**: F-26 (correlated operands estimated as independent intervals), F-27
+(dual-combinator polarity), F-10 evidence (valid node over a maybe-invalid operand; variadic-argument
+grammar cell), F-23 evidence (numeric-domain idiom), L52 (qualifier attachment), L53 (the FP check
+reads the description: shrink the spec), L54 (scope precision findings), L55 (L50's budget), L56 (no
+external validator in tests), Pattern 89 (stated-but-untested probe battery).
+
+## worldengine-orographic-precipitation (Python / world generator climate pipeline) — ACCEPTED 2026-09-16, 2/10
+
+**What made it hard.** Prevailing winds by latitude band and a cyclic, steady-state orographic moisture
+transport, blended into the existing precipitation stage and carried through everything that touches a
+world: a `winds` generation step, the world model and equality, protobuf and HDF5, wind and rainfall
+maps, CLI info, docs. 14 files, 251 effective LOC, 66 tests.
+
+**What broke it.** Not the physics: the 24 transport tests killed nobody in 20 runs. (1) **7/10**, and the
+only failure of all four 63/66 near-misses: wind stored as two sibling layer keys instead of one
+composite `wind` layer, dying as `KeyError` in the round-trip tests; (2) **2/10**, whole-layer arrays
+written as cell-taking methods; (3) **2/10**, `is_applicable` written but `execute` still overwrote a
+supplied wind (the reference's own round-1 bug). 52 of 66 tests killed nothing.
+
+**The fixes, and what each cost.** The first build failed rebuild-safety (fixture repo cloned from a
+moving branch): pinned by SHA and pip versions. Review rounds then replaced a zero-start two-lap loop
+with a stated steady state, fixed two 0/0 NaN paths (uniform temperature, 1x1 world), regenerated
+`World_pb2.py` at base's protobuf version, and removed six unfair or vacuous assertions (band-edge
+direction, `wind_at` tuple form, a rank-3 fit, a post-erosion inequality, two direct-execute wind
+tests). Batch 1 read 1/10 but was 0/10 clean: "a winds step between plates and precipitations" made all
+ten agents strip `Step.plates`, and one of the two identical 65/65 hunks was graded PASS. One sentence
+and a plates test fixed it, plus float tolerances; batch 2 read 2/10 and was accepted over one FP-judge
+dissent.
+
+**Carried forward**: F-28 (composite concept split into sibling container keys), F-29 (guard declared,
+never consulted), F-16 evidence (accessor-shape variant), L57 (placement prose repairs existing steps),
+L58 (a stated numerical kernel is free), L59 (no exact float equality at exact points), Pattern 90.
+
+## tippecanoe-tile-join-size-recourses (C++ / tippecanoe tile-join) — ACCEPTED 2026-09-16, 1/10
+
+**What made it hard.** `tile-join` used to drop any merged tile over 500K. It now gets `-M` and
+`--drop-smallest-as-needed`: features are shed across the whole tile by extent (polygon bbox area,
+line width plus height, point zero) with merge-order ties, attribute pools are compacted, and
+tilestats, zoom ranges and bounds count only what was written. `strategies` adds the new drops to
+inherited counts and reports the largest tile a zoom wanted. 5 files, 294 effective LOC, 49 tests.
+
+**What broke it.** Two accounting cells beside the recourse, both found first as bugs in the reference:
+(1) **4/10** — `tile_size_desired` recorded for an oversized tile that could not shed anything (F-15);
+(2) **3/10** — inherited `tile_size_desired` still summed by the base reader instead of maximized
+(F-33). Singletons: a regression that segfaulted ordinary joins, and a per-feature re-encode that timed
+out. The ranking, compaction and booking machinery the design led with drew no failures.
+
+**The fixes, and what each cost.** Two prechecks and four Auto Review revisions before the only batch.
+Solution fixes: shedding that could empty a tile, drops from a still-skipped tile, the summed inherited
+size, ranking erased by `--exclude-all-tile-geometries`, float false ties after a non-divisible
+rescale, an unsheddable tile left out of the size, stale bounds after a rescale. Harness fixes: a repo
+golden test that fails above 8 threads (pinned), two F2P tests that passed on base, and a Catch2
+adapter that reported a throwing unit test as a pass (Tests 0/3). In the batch, 7 of 10 runs were
+graded against a stale binary because the agents had `git restore`d tracked build outputs; two were
+flagged ENV-blocked, and both contests were upheld.
+
+**Carried forward**: F-33 (inherited aggregate merged with the base operator), F-15 accounting variant,
+L63 (tracked build outputs grade the baseline binary), L50 and L58 evidence, Pattern 92
+(timestamp-proof build in test.sh).
+
+## cwerg-bcopy-bzero-lowering (C++ + Python / Cwerg twin compiler backend) — ACCEPTED 2026-09-16, 3/10
+
+**What made it hard.** `bzero`/`bcopy` lowered to byte loops in both the Python spec and the C++ port,
+for a32/a64/x64 and the C backend, with signed/unsigned widths, negative lengths, overlap order, and
+byte-identical py/cc assembly and optimizer output. 19 files, 690 effective LOC (≈375 without the
+generated opcode table), 23 golden cases.
+
+**What broke it.** Three walls in code the agents did not write: (1) **F-30**, the optimizer's width
+pass keeps only the low bits, so a U8 length that wrapped to 0 becomes 256 and the optimized C binary
+segfaults (10/10 in batch 1, 2/10 in the accepted batch); (2) **F-31**, the Python and C++ constant
+folders disagree on wrapped constants (`4294967294` vs `-2`, 2/10, identical failure set); (3) **F-32**,
+C++ CFG edits that crash only the text renderer on a program with dozens of occurrences (2/10).
+
+**The fixes, and what each cost.** Batch 1 0/10: the multiplicity sentence had been trimmed on a
+concision finding and the narrow-wrap rule was unstated; both restored. Batch 2 0/11: a parity-only
+coverage program hit a pre-existing parameter-widening bug (11/11); dropped, re-eval 1/11. Batch 4
+1/10 after a meta.md edit. Eight review rounds then fixed about nine pre-existing py/cc and C-UB
+divergences in the reference; two of them also got tests and batch 5 read 0/9. A Docker replay of
+the nine solutions picked the suite without them (3/9). The Dockerfile also had to come under the
+platform's 600 s environment start (704 s to 413 s). Batch 6: 3/10, accepted; all three FP dissents
+were overruled as pre-existing or out of scope.
+
+**Carried forward**: F-30, F-31, F-32, F-4 and F-27 evidence, L26 evidence, L60 (parity imports
+pre-existing divergences), L61 (bisect an everyone-kill against the near-miss), L62 (cold build vs the
+600 s start), Pattern 91 (one bind-mount build layer).
+
+
+## sfepy-adaptive-stepping-accounting (Python / sfepy time-stepping solvers) — ACCEPTED 2026-09-16, 2/15
+
+**What made it hard.** Attempt-level accounting (`StepLog`/`StepRecord`), declared termination,
+cap-over-floor precedence, rollback and final-time bounds across `ts.simple`, `ts.adaptive` and five
+elastodynamics solvers, plus controller `get_state`/`set_state`. 4 files, 290 human-effective LOC,
+117 tests.
+
+**What broke it.** Three cells in the stop and retry path every solver shares: (1) **F-34**, a rollback
+snapshot saved by assignment while sfepy's Newton writes the iterate into the same array (8/13, sole
+failure of both 116/117 runs); (2) an **F-10** hostile-hook cell, a user `adapt_fun` that overshoots, where
+a `min()` clamp gives an equal retry or the run ends past `t1` (7/13); (3) **F-35**, the stepper index
+rewound along with the state (2/13).
+
+**The fixes, and what each cost.** Batches 1-6 read 0 while review rounds fixed 12 named reference
+defects; R35 cut an elastodynamics cache trap nobody could reach. Batch 7 (re-eval) passed one run,
+FP-flagged on two pre-existing restart bugs; stating them in meta.md (R48, R56) left batches 8 and 9 at
+0/8 and 0/9. R60 cut the restart lane (19 tests, two sentences, `problem.py`). Batch 10 read 0/12 with
+runs at 117/116/116/115; a probe showed the top wall was fair, so four runs (Orion, two Vega, Nova) were
+appended to the pool instead of cutting it, and the pool read 2/15. One Solution Quality high (R61) was
+our own docstring, not the code.
+
+**Carried forward**: F-34 and F-35 (new), F-10 hook-cell and F-12 example-test evidence, L26/L50/L53
+evidence, L64 (the pool is cumulative), L65 (a Nova zero is not a solvability verdict), Pattern 93
+(probe the observation surface before relaxing a wall).
+
+## mwparserfromhell-site-aware-parsing (Python + C extension / MediaWiki parser) — ACCEPTED 2026-09-18, 2/19
+
+**What made it hard.** A `SiteInfo` profile (linktrail characters, namespace names, recognised tags)
+threaded through `parse`, the builder, `Wikilink` and BOTH tokenizers, the pure-Python one and its C
+twin, under an identical-trees contract. 14 files, 405 human-effective LOC, 190 test cases.
+
+**What broke it.** (1) **F-36**, the trail run consumed from the tokenizer's marker-split, backtracking
+segment list: sliced back into the shared list, scanned one segment only, re-split into characters, or
+emitted as a separate text node on the file/category reject branch (11/19, sole failure of four 189/190
+runs, found by a seeded generated parity corpus); (2) **F-37**, the C reader's `'\0'` doubling as end of
+input when NUL is a trail character (7/19, C only); (3) an **F-10** two-path cell, the leading colon
+ignored after `node.title = ...` (5/19, every Vega run).
+
+**The fixes, and what each cost.** Eight precheck and Auto Review rounds before any batch: private
+tokenizer assertions removed, a new token class that leaked into the repo's parametrized token test,
+the Python trail scan stopping at marker segments, the C NUL sentinel (18 checks, 51 base tests broke
+mid-way), a root-owned `/app` that failed the uid-1000 build behind `|| cat`, casefold recognition and
+pairing, recursive `parse` inputs, attribute-bearing tags. Batch 1 read **0/20**: 19 runs failed one
+reviewer-requested test on base tag pairing that meta.md never stated. Dropping it (tests-only) and
+replaying the 20 saved patches in Docker projected 3/20; the re-eval read **2/19**, accepted. Both
+passers delegate the C tokenizer to the Python one when a site is given, and both FP panels upheld it.
+
+**Carried forward**: F-36 and F-37 (new), F-10 two-path cell and F-7 evidence, L66 (test a reviewer's
+pre-existing-behaviour finding only if meta.md states it), L67 (twin parity is met by delegation), L68
+(a Docker replay projects a tests-only re-eval), Pattern 94
+
+## kira-loop-crossfade (Rust / kira game-audio engine) — ACCEPTED 2026-09-18, 3/10 (fair suite 9/10)
+
+**What made it hard.** Crossfaded loop regions on static and streaming sounds: a public `LoopCrossfade`,
+settings and handle commands on both, a shortened wrap in the shared transport, a static blend before
+the resampler, streaming head frames decoded after each wrap under stated seek budgets, and
+`bake_loop_crossfade`. 11 files, 237 human-effective LOC, 55 tests, a 496-word description.
+
+**What broke it.** Very little, honestly. One run missed an **F-10** live-change cell (switching to a
+loop that ends before the playhead, with the wrap shortened by the fade). Six runs failed a test that
+demanded 48 buffered frames behind a 60-decoder-call gate: the reference's queue depth, not a contract.
+They queued 47 (one 24), then hit silence. Replayed with a smaller prefix, all six pass 55/55.
+
+**The fixes, and what each cost.** Seven rounds before any batch, all tests-only after the third
+except two wording edits: API shapes stated in meta (R2); the Rust build-fail fallback switched to
+per-test node names after Verify Solution failed on `cargo-test.compilation`, and a startup double seek
+fixed in the reference (R3); an event-driven decoder harness replacing event-order and 16384-constant
+assertions (R4); streaming clamp, reverse seeks and stereo (R5); eased handle updates, live streaming
+seek, 4 Hz seconds, and two seek tests that passed with seeks ignored (R6); a baked `EndOfAudio` end
+accepted in either representation (R7). Accepted on the first batch.
+
+**Carried forward**: F-10 live-change cell, L69 (a same-index sentinel kill cluster is the harness
+until replayed), L70 (gating one resource and asserting on another encodes the reference's ratio), L71
+(run the action-ignored mutant on every "eventually" test), Pattern 95
+
+## planetiler-custommap-schema-composition (Java / planetiler custom-map YAML schemas) — ACCEPTED 2026-09-18, 3/10
+
+**What made it hard.** Schema composition for planetiler's configurable profiles: `extends` with
+relative and bundled-sample parents, static `SchemaConfig.load(List<Path>)` and `SchemaConfig.files(Path)`,
+per-field merge rules, layer `remove`, examples inlined from every contributor, comma-separated
+`--schema` for generation and verification, and a validator that watches every contributing file.
+7 files, 316 human-effective LOC, 83 tests, a 485-word description.
+
+**What broke it.** One provenance clause: "removing an id that the earlier files did not contribute".
+7 of 10 runs checked it against the map they were mutating, so a layer added and removed in the same
+file slipped through (F-38); three of them failed nothing else. Three runs re-resolved a standalone
+bundled schema's examples on disk in the validator (F-9). The whole stated merge rulebook killed nobody.
+
+**The fixes, and what each cost.** Six review rounds before and between batches found ten reference
+bugs, two of them caused by the previous fix, and both measured killers began as those findings.
+Batch 1 read 0/8 and measured nothing: "`SchemaConfig.files` returns ..." never said static, every agent
+wrote an instance accessor, and the single test class failed to compile. One run also broke offline
+Maven grading with its own `mvn install`. Replaying the saved patches with a one-line shim read 2/8;
+naming both signatures, stating two under-specified error cases and making test.sh repair the Maven
+repo gave 3/10 on the next batch. Docker validation as uid 1000 caught three non-root blockers
+(`/app` perms, git safe.directory, root-owned `target/`) before any platform run hit them.
+
+**Carried forward**: F-38 (new), F-9 origin variant, F-22 counter-evidence, L72 (state every new API's
+call shape; shim-replay a compile-wiped batch), L73 (the grader inherits the agent's container),
+Pattern 96, the Maven reactor section of DOCKER.md
+
+## featurevisor-minimal-rebucketing (TypeScript / featurevisor datafile builder) — ACCEPTED 2026-09-19, 2/11
+
+**What made it hard.** Minimum-disruption rebucketing in the builder that turns YAML into datafiles.
+Today a rule keeps its bucketed users only when its percentage grows. The feature keeps each
+variation's lowest still-valid buckets through any traffic change and refills the rest lowest-first in
+declared order. It adds allocation-change accounting, a per-build `rebucketing` collector and a
+per-environment summary. 4 files, 164 human-effective LOC (207 by the platform counter), 34 new tests,
+a 460-word description.
+
+**What broke it.** Two clusters, both bugs in my own reference first. 7 of 11 runs kept the
+per-variation record in a plain object and lost the variation `__proto__` (F-40); six of them failed
+nothing else. 3 runs reused the repo's free-range helper, which drops later ranges when an earlier one
+is used up exactly (F-39). The allocation algorithm the design was built around killed nobody.
+
+**The fixes, and what each cost.** The repo was found by a four-niche subagent sweep, after sfepy
+arc-length died at the scope gate as publicly solved by a sibling library. The scope gate passed on a
+160-eff slice. Three rounds with no batch then fixed a truthiness bug on zero weight overrides
+(inherited from the repo), a brittle output label, 18 new-mode tests that passed on base, and 314
+phantom test IDs from repo titles containing `::`. Batch 1 read 2/11. The Auto Review asked for
+tests-only changes: formatter shape, stored slot ranges, disjoint accounting, two environments, and a
+diagnostic in the no-XML fallback. The local replay predicted the re-eval exactly: 2/11, approved.
+
+**Carried forward**: F-39 and F-40 (new), L74 (a band carried by one host-language edge is accepted but
+called overstated), evidence for L49, L50, L58 and L68, Pattern 97 (keep Verify Solution's test sets
+clean), the sibling-library check in olympus-hunt Stage 3b.
+
+
+
+## ir-sim-scenario-events (Python / ir-sim robot simulator) — ACCEPTED 2026-09-19, 1/11
+
+**What made it hard.** A declarative `events:` section for ir-sim's world YAML. Events are checked at
+the end of every step: time, arrival, collision, centre distance, region enter/leave, all/any/not.
+Actions are spawn, delete, goal and pause, with repeat, cooldown, delay and an event log. `reset()`
+undoes what events did to the scene; random reset and reload start them over. 3 source files + docs,
+363 human-effective LOC, 90 tests, a 494-word description.
+
+**What broke it.** 10 of 11 runs spawned a robot through the factory's default `group=0`, so a robot
+driven only by a group behavior never moved; the YAML loader makes every entry its own group (F-41).
+For six runs it was the only failure out of 90. Two runs restored two deletions in the wrong order
+(F-42) and two padded the closed region with an epsilon (L75). Every lifecycle trap in the design
+(three reset paths, id rewind, list aliasing, short-circuit edge tracking) killed nobody.
+
+**The fixes, and what each cost.** Found by a softened hunt, after five parked leads died. The scope
+gate passed on the first artifact. Six quality rounds fixed eleven reference bugs, among them group
+membership for spawns (which became F-41), nested validation, stale status between events, centroid
+distance and eager sensor refresh. Test Quality and Solution Quality disagreed on spawn-template
+validation, and one noun in the description settled it (Pattern 98). Batch 1 was 0/11 to one unfair
+sensor-timing pin. The fix and the Auto Review changes went through re-eval at 1/11, exactly the local
+replay's number. The requested id-rewind regression test was withheld because every agent shared the
+bug (L76).
+
+**Carried forward**: F-41 and F-42 (new), L75 (exact boundaries need binary-exact geometry), L76 (don't
+ship a test for a reviewer bug every agent shares), Pattern 98, 0/11 evidence on F-9 origin, F-35 and
+F-20, a loader-attribute seam row in olympus-hunt and audits in olympus-author.
+
+## featurevisor-target-specialization (TypeScript / featurevisor Target datafile builder) — ACCEPTED 2026-09-19, 3/10
+
+**What made it hard.** Make the datafiles built for a Target sound and pruned. `applyContextToDatafile`
+folded any condition matching the Target context to `*`, so `notEquals`/`notExists` on attributes the Target
+never set broadened silently, false negatives stayed live, and rules for other Targets were never removed. The
+feature is a three-valued specializer (decide a condition only when the Target sets its path), SDK-faithful
+folding, first-match pruning of force / traffic / rule and variation overrides / global overrides by each
+list's own match rule, and segment GC. 2 files, 232 human-effective LOC, 33 new tests including 8 seeded
+equivalence batches that compare against the SDK.
+
+**What broke it.** Seven of twenty runs rewrote the repo's exported two-valued helpers and failed their specs
+after passing every new test (F-12). Three dropped the list arm under `and`/`or`/`not` (F-43, caught only by the
+seeded corpus). The per-list match rules the design leaned on killed one run in twenty.
+
+**The fixes, and what each cost.** dinit `depends-any` was built first and shelved at 105 eff. Batch 1 read
+2/10; the review found the reference pruning a global `conditions: "*"` written as `JSON.stringify("*")`, a bug
+all 10 runs shared. Re-eval with its test would have read 0/10, so one meta clause named the root cause
+("scalar JSON included") and a fresh batch read 3/10, approved.
+
+**Carried forward**: F-43 (new), F-12 exported-helper variant, F-39 parser instance, L77 (naming an N/N gap's
+root cause takes it to 0/N), L78 (removed repo specs draw one cheat verdict per batch), Pattern 99 (seeded
+equivalence corpus), the chokepoint LOC rule in olympus-hunt Stage 3b.
+

@@ -1,0 +1,686 @@
+diff --git a/src/animation.rs b/src/animation.rs
+new file mode 100644
+index 00000000..dc520d4e
+--- /dev/null
++++ b/src/animation.rs
+@@ -0,0 +1,283 @@
++use crate::{apng::Frame, colors::ColorType, headers::IhdrData, png::PngImage};
++
++const DISPOSE_BACKGROUND: u8 = 1;
++const DISPOSE_PREVIOUS: u8 = 2;
++const BLEND_OVER: u8 = 1;
++
++type Pixel = [u16; 4];
++
++/// A frame of the animation together with its decoded image
++#[derive(Debug, Clone)]
++pub struct AnimationFrame {
++    pub control: Frame,
++    pub image: PngImage,
++}
++
++/// Read a pixel as normalized 16-bit RGBA, with every fully transparent pixel reading the same
++fn read_pixel(png: &PngImage, x: usize, y: usize) -> Pixel {
++    let bytes = png.bytes_per_channel();
++    let channels = png.channels_per_pixel();
++    let row = png.ihdr.width as usize * bytes * channels;
++    let start = y * row + x * bytes * channels;
++    let sample = |c: usize| -> u16 {
++        let i = start + c * bytes;
++        if bytes == 2 {
++            u16::from_be_bytes([png.data[i], png.data[i + 1]])
++        } else {
++            u16::from(png.data[i])
++        }
++    };
++    let scale = |v: u16| if bytes == 2 { v } else { v * 257 };
++    let px = match &png.ihdr.color_type {
++        ColorType::Grayscale { transparent_shade } => {
++            let v = sample(0);
++            let a = if Some(v) == *transparent_shade {
++                0
++            } else {
++                65535
++            };
++            [scale(v), scale(v), scale(v), a]
++        }
++        ColorType::RGB { transparent_color } => {
++            let (r, g, b) = (sample(0), sample(1), sample(2));
++            let key = transparent_color.is_some_and(|t| t.r == r && t.g == g && t.b == b);
++            [scale(r), scale(g), scale(b), if key { 0 } else { 65535 }]
++        }
++        ColorType::Indexed { palette } => {
++            let c = palette
++                .get(png.data[start] as usize)
++                .copied()
++                .unwrap_or_default();
++            [c.r, c.g, c.b, c.a].map(|v| u16::from(v) * 257)
++        }
++        ColorType::GrayscaleAlpha => [sample(0), sample(0), sample(0), sample(1)].map(scale),
++        ColorType::RGBA => [sample(0), sample(1), sample(2), sample(3)].map(scale),
++    };
++    if px[3] == 0 { [0; 4] } else { px }
++}
++
++/// Composite a pixel over another as described by the APNG specification
++fn blend_over(bg: Pixel, fg: Pixel) -> Pixel {
++    match fg[3] {
++        0 => return bg,
++        65535 => return fg,
++        _ => {}
++    }
++    let fa = f64::from(fg[3]) / 65535.0;
++    let ba = f64::from(bg[3]) / 65535.0;
++    let out_a = fa + ba * (1.0 - fa);
++    let mut out = [0; 4];
++    for c in 0..3 {
++        let v = (f64::from(fg[c]) * fa + f64::from(bg[c]) * ba * (1.0 - fa)) / out_a;
++        out[c] = v.round() as u16;
++    }
++    out[3] = (out_a * 65535.0).round() as u16;
++    out
++}
++
++/// The canvas region covered by a frame, as (x, y, width, height)
++fn region(frame: &Frame) -> (usize, usize, usize, usize) {
++    (
++        frame.x_offset as usize,
++        frame.y_offset as usize,
++        frame.width as usize,
++        frame.height as usize,
++    )
++}
++
++/// Render a frame onto the state left by the previous frame, returning the displayed canvas and
++/// the state it leaves for the next frame
++fn render(before: &[Pixel], width: usize, frame: &AnimationFrame) -> (Vec<Pixel>, Vec<Pixel>) {
++    let (fx, fy, fw, fh) = region(&frame.control);
++    let mut displayed = before.to_vec();
++    for y in 0..fh {
++        for x in 0..fw {
++            let i = (fy + y) * width + fx + x;
++            let px = read_pixel(&frame.image, x, y);
++            displayed[i] = if frame.control.blend_op == BLEND_OVER {
++                blend_over(before[i], px)
++            } else {
++                px
++            };
++        }
++    }
++    let mut after = displayed.clone();
++    for y in fy..fy + fh {
++        for x in fx..fx + fw {
++            let i = y * width + x;
++            match frame.control.dispose_op {
++                DISPOSE_BACKGROUND => after[i] = [0; 4],
++                DISPOSE_PREVIOUS => after[i] = before[i],
++                _ => {}
++            }
++        }
++    }
++    (displayed, after)
++}
++
++/// The smallest rectangle of a frame's region that still produces the same displayed canvas and
++/// leaves the same state for the next frame
++fn needed_rect(
++    frame: &Frame,
++    width: usize,
++    before: &[Pixel],
++    displayed: &[Pixel],
++) -> Option<(usize, usize, usize, usize)> {
++    let (fx, fy, fw, fh) = region(frame);
++    let mut bounds: Option<(usize, usize, usize, usize)> = None;
++    for y in fy..fy + fh {
++        for x in fx..fx + fw {
++            let i = y * width + x;
++            let changed = displayed[i] != before[i];
++            let cleared = frame.dispose_op == DISPOSE_BACKGROUND && displayed[i][3] != 0;
++            if changed || cleared {
++                bounds = Some(match bounds {
++                    None => (x, y, x, y),
++                    Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
++                });
++            }
++        }
++    }
++    bounds.map(|(x0, y0, x1, y1)| (x0, y0, x1 - x0 + 1, y1 - y0 + 1))
++}
++
++/// Cut a rectangle out of an image of 8 or more bits per channel
++fn cropped_image(png: &PngImage, x: usize, y: usize, width: usize, height: usize) -> PngImage {
++    let pixel_bytes = png.ihdr.bpp() / 8;
++    let row = png.ihdr.width as usize * pixel_bytes;
++    let mut data = Vec::with_capacity(width * height * pixel_bytes);
++    for line in y..y + height {
++        let start = line * row + x * pixel_bytes;
++        data.extend_from_slice(&png.data[start..start + width * pixel_bytes]);
++    }
++    PngImage {
++        data,
++        ihdr: IhdrData {
++            width: width as u32,
++            height: height as u32,
++            color_type: png.ihdr.color_type.clone(),
++            ..png.ihdr
++        },
++    }
++}
++
++fn gcd(a: u64, b: u64) -> u64 {
++    if b == 0 { a } else { gcd(b, a % b) }
++}
++
++/// Add two frame delays exactly, returning `None` if the total cannot be stored in a fcTL chunk
++#[must_use]
++pub fn added_delays(a: (u16, u16), b: (u16, u16)) -> Option<(u16, u16)> {
++    let den = |d: u16| if d == 0 { 100 } else { u64::from(d) };
++    let (an, ad) = (u64::from(a.0), den(a.1));
++    let (bn, bd) = (u64::from(b.0), den(b.1));
++    let num = an * bd + bn * ad;
++    let den = ad * bd;
++    let divisor = gcd(num, den).max(1);
++    let (num, den) = (num / divisor, den / divisor);
++    Some((u16::try_from(num).ok()?, u16::try_from(den).ok()?))
++}
++
++/// Crop each frame to the region that changes the animation and merge frames that change nothing
++/// into the frame before them. The first frame is never altered.
++#[must_use]
++pub fn optimized_frames(
++    frames: Vec<AnimationFrame>,
++    width: u32,
++    height: u32,
++) -> Vec<AnimationFrame> {
++    let width = width as usize;
++    let mut before = vec![[0; 4]; width * height as usize];
++    let mut last: Option<(Vec<Pixel>, Vec<Pixel>)> = None;
++    let mut kept: Vec<AnimationFrame> = Vec::with_capacity(frames.len());
++    for mut frame in frames {
++        let (displayed, after) = render(&before, width, &frame);
++        if let (Some((last_displayed, last_after)), Some(prev)) = (&last, kept.last_mut()) {
++            let prev_delay = (prev.control.delay_num, prev.control.delay_den);
++            let delay = (frame.control.delay_num, frame.control.delay_den);
++            if *last_displayed == displayed
++                && *last_after == after
++                && let Some((num, den)) = added_delays(prev_delay, delay)
++            {
++                prev.control.delay_num = num;
++                prev.control.delay_den = den;
++                before = after;
++                continue;
++            }
++            let (fx, fy, _, _) = region(&frame.control);
++            let (x, y, w, h) =
++                needed_rect(&frame.control, width, &before, &displayed).unwrap_or((fx, fy, 1, 1));
++            frame.image = cropped_image(&frame.image, x - fx, y - fy, w, h);
++            frame.control.x_offset = x as u32;
++            frame.control.y_offset = y as u32;
++            frame.control.width = w as u32;
++            frame.control.height = h as u32;
++        }
++        before = after.clone();
++        last = Some((displayed, after));
++        kept.push(frame);
++    }
++    kept
++}
++
++/// Stack images of the same format on top of each other so they can be reduced as one
++#[must_use]
++pub fn stacked_images(images: &[PngImage]) -> PngImage {
++    let pixel_bytes = images[0].ihdr.bpp() / 8;
++    let width = images.iter().map(|i| i.ihdr.width).max().unwrap_or(1);
++    let height = images.iter().map(|i| i.ihdr.height).sum();
++    let mut data = Vec::with_capacity(width as usize * height as usize * pixel_bytes);
++    for image in images {
++        let row = image.ihdr.width as usize * pixel_bytes;
++        for line in image.data.chunks(row) {
++            data.extend_from_slice(line);
++            let last = &line[row - pixel_bytes..];
++            for _ in image.ihdr.width..width {
++                data.extend_from_slice(last);
++            }
++        }
++    }
++    PngImage {
++        data,
++        ihdr: IhdrData {
++            width,
++            height,
++            color_type: images[0].ihdr.color_type.clone(),
++            ..images[0].ihdr
++        },
++    }
++}
++
++/// Split a stacked image back into images of the given sizes
++#[must_use]
++pub fn split_images(stacked: &PngImage, sizes: &[(u32, u32)]) -> Vec<PngImage> {
++    let bits = stacked.ihdr.bpp();
++    let stacked_row = (stacked.ihdr.width as usize * bits).div_ceil(8);
++    let mut lines = stacked.data.chunks(stacked_row);
++    sizes
++        .iter()
++        .map(|&(width, height)| {
++            let row_bits = width as usize * bits;
++            let row = row_bits.div_ceil(8);
++            let mask = match row_bits % 8 {
++                0 => 0xFF,
++                used => 0xFFu8 << (8 - used),
++            };
++            let mut data = Vec::with_capacity(row * height as usize);
++            for line in lines.by_ref().take(height as usize) {
++                data.extend_from_slice(&line[..row]);
++                *data.last_mut().unwrap() &= mask;
++            }
++            PngImage {
++                data,
++                ihdr: IhdrData {
++                    width,
++                    height,
++                    color_type: stacked.ihdr.color_type.clone(),
++                    bit_depth: stacked.ihdr.bit_depth,
++                    ..stacked.ihdr
++                },
++            }
++        })
++        .collect()
++}
+diff --git a/src/cli.rs b/src/cli.rs
+index 6d3f79f0..3d863a2c 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -311,6 +311,12 @@ Do not convert to indexed and do not modify an existing color palette.")
+                 .long("ng")
+                 .action(ArgAction::SetTrue),
+         )
++        .arg(
++            Arg::new("no-frame-reduction")
++                .help("Do not crop or merge animation frames")
++                .long("nf")
++                .action(ArgAction::SetTrue),
++        )
+         .arg(
+             Arg::new("no-reductions")
+                 .help("Do not perform any transformations")
+diff --git a/src/headers.rs b/src/headers.rs
+index 4723c5ae..26a4568a 100644
+--- a/src/headers.rs
++++ b/src/headers.rs
+@@ -343,14 +343,7 @@ pub fn preprocess_chunks(aux_chunks: &mut Vec<Chunk>, opts: &mut Options) {
+         opts.grayscale_reduction = false;
+     }
+ 
+-    // Check for APNG by presence of acTL chunk
+-    if aux_chunks.iter().any(|c| &c.name == b"acTL") {
+-        warn!("APNG detected, disabling all reductions");
+-        opts.interlace = None;
+-        opts.bit_depth_reduction = false;
+-        opts.color_type_reduction = false;
+-        opts.palette_reduction = false;
+-    } else if let StripChunks::Keep(names) = &opts.strip {
++    if let StripChunks::Keep(names) = &opts.strip {
+         // Check for explicitly kept chunks that will prevent reductions
+         for name in Chunk::REDUCTION_CONFLICTS {
+             if names.contains(&name) && aux_chunks.iter().any(|c| c.name == name) {
+diff --git a/src/lib.rs b/src/lib.rs
+index 4b580048..183942f9 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -24,6 +24,14 @@ pub use rgb::{RGB16, RGBA8};
+ 
+ #[cfg(feature = "zopfli")]
+ pub use crate::deflate::ZopfliOptions;
++use crate::{
++    animation::*,
++    apng::Frame,
++    evaluate::{Candidate, Evaluator},
++    headers::*,
++    png::{PngData, PngImage},
++    reduction::{bit_depth::*, interlace::changed_interlacing, *},
++};
+ pub use crate::{
+     colors::{BitDepth, ColorType},
+     deflate::Deflater,
+@@ -32,13 +40,8 @@ pub use crate::{
+     headers::StripChunks,
+     options::{InFile, Options, OutFile},
+ };
+-use crate::{
+-    evaluate::{Candidate, Evaluator},
+-    headers::*,
+-    png::{PngData, PngImage},
+-    reduction::*,
+-};
+ 
++mod animation;
+ mod apng;
+ mod atomicmin;
+ mod colors;
+@@ -325,16 +328,32 @@ fn optimize_png(
+     let mut opts = opts.to_owned();
+     preprocess_chunks(&mut png.aux_chunks, &mut opts);
+ 
+-    let max_size = if opts.force {
+-        None
+-    } else {
+-        Some(png.raw.estimated_output_size(&png.idat_data))
+-    };
+-    if let Some(result) = optimize_raw(raw.clone(), &opts, deadline.clone(), max_size) {
++    if !png.frames.is_empty() {
++        let frame_images = prepare_animation(png, &opts, &deadline)?;
++        let mut idat_opts = opts.clone();
++        idat_opts.bit_depth_reduction = false;
++        idat_opts.color_type_reduction = false;
++        idat_opts.palette_reduction = false;
++        idat_opts.interlace = None;
++        idat_opts.idat_recoding = true;
++        let Some(result) = optimize_raw(png.raw.clone(), &idat_opts, deadline, None) else {
++            return Ok(original_data.to_vec());
++        };
+         png.raw = result.image;
+         png.idat_data = result.idat_data.unwrap();
+-        recompress_frames(png, &opts, deadline, result.filter)?;
++        compress_frames(png, frame_images, &opts, &result.filter)?;
+         postprocess_chunks(&mut png.aux_chunks, &png.raw.ihdr, &raw.ihdr);
++    } else {
++        let max_size = if opts.force {
++            None
++        } else {
++            Some(png.raw.estimated_output_size(&png.idat_data))
++        };
++        if let Some(result) = optimize_raw(raw.clone(), &opts, deadline, max_size) {
++            png.raw = result.image;
++            png.idat_data = result.idat_data.unwrap();
++            postprocess_chunks(&mut png.aux_chunks, &png.raw.ihdr, &raw.ihdr);
++        }
+     }
+ 
+     let output = png.output();
+@@ -380,6 +399,108 @@ fn optimize_png(
+     Ok(output)
+ }
+ 
++/// Choose the filters and deflater used to evaluate reductions
++fn evaluation_settings(opts: &Options) -> (IndexSet<FilterStrategy>, Deflater) {
++    let compression = match opts.deflater {
++        Deflater::Libdeflater { compression } if compression < 11 => 5.min(compression),
++        _ if opts.filters.len() <= 4 => 7,
++        _ => 8,
++    };
++    // If only one or two filters are given, use them for evaluations
++    let eval_filters = if opts.filters.len() <= 2 {
++        opts.filters.clone()
++    } else {
++        // None and Bigrams work well together, especially for alpha reductions
++        indexset! {FilterStrategy::NONE, FilterStrategy::Bigrams}
++    };
++    (eval_filters, Deflater::Libdeflater { compression })
++}
++
++/// Crop and merge the frames of an APNG and reduce the default image and every frame together,
++/// returning the frame images
++fn prepare_animation(
++    png: &mut PngData,
++    opts: &Options,
++    deadline: &Arc<Deadline>,
++) -> PngResult<Vec<PngImage>> {
++    let orig = png.raw.ihdr.clone();
++    let normalized = |image: PngImage| {
++        let image = changed_interlacing(&image, false).unwrap_or(image);
++        expanded_bit_depth_to_8(&image).unwrap_or(image)
++    };
++    let mut images = Vec::with_capacity(png.frames.len() + 1);
++    images.push(normalized((*png.raw).clone()));
++    for frame in &png.frames {
++        let ihdr = IhdrData {
++            width: frame.width,
++            height: frame.height,
++            color_type: orig.color_type.clone(),
++            ..orig
++        };
++        images.push(normalized(PngImage::new(ihdr, &frame.data)?));
++    }
++
++    if opts.frame_reduction {
++        let first_fctl = png
++            .aux_chunks
++            .iter()
++            .take_while(|c| &c.name != b"IDAT")
++            .position(|c| &c.name == b"fcTL");
++        let mut animation = Vec::with_capacity(images.len());
++        if let Some(i) = first_fctl {
++            animation.push(AnimationFrame {
++                control: Frame::from_fctl_data(&png.aux_chunks[i].data)?,
++                image: images[0].clone(),
++            });
++        }
++        for (control, image) in png.frames.drain(..).zip(images.drain(1..)) {
++            animation.push(AnimationFrame { control, image });
++        }
++        let mut optimized = optimized_frames(animation, orig.width, orig.height).into_iter();
++        if let Some(i) = first_fctl {
++            let first = optimized.next().unwrap();
++            let sequence_number = read_be_u32(&png.aux_chunks[i].data[0..4]);
++            png.aux_chunks[i].data = first.control.fctl_data(sequence_number);
++        }
++        for frame in optimized {
++            png.frames.push(frame.control);
++            images.push(frame.image);
++        }
++        let num_frames = png.frames.len() + usize::from(first_fctl.is_some());
++        if let Some(actl) = png.aux_chunks.iter_mut().find(|c| &c.name == b"acTL") {
++            actl.data[0..4].copy_from_slice(&(num_frames as u32).to_be_bytes());
++        }
++    }
++
++    // Interlacing is applied to each image separately after the reductions
++    let reduction_opts = Options {
++        interlace: None,
++        ..opts.clone()
++    };
++    let sizes: Vec<_> = images
++        .iter()
++        .map(|i| (i.ihdr.width, i.ihdr.height))
++        .collect();
++    let stacked = Arc::new(stacked_images(&images));
++    let (eval_filters, eval_deflater) = evaluation_settings(opts);
++    let eval = Evaluator::new(deadline.clone(), eval_filters, eval_deflater, false, false);
++    let reduced = perform_reductions(stacked, &reduction_opts, deadline, &eval);
++    let reduced = eval.get_best_candidate().map_or(reduced, |c| c.image);
++    let mut images = split_images(&reduced, &sizes);
++    for image in &mut images {
++        if image.ihdr.bit_depth < orig.bit_depth && !opts.bit_depth_reduction {
++            *image = reduced_bit_depth_forced(image, orig.bit_depth);
++        }
++        if opts.interlace.unwrap_or(orig.interlaced)
++            && let Some(interlaced) = changed_interlacing(image, true)
++        {
++            *image = interlaced;
++        }
++    }
++    png.raw = Arc::new(images.remove(0));
++    Ok(images)
++}
++
+ /// Perform optimization on the input image data using the options provided
+ fn optimize_raw(
+     image: Arc<PngImage>,
+@@ -393,19 +514,7 @@ fn optimize_raw(
+     // 8 is a little slower but not noticeably when used only for reductions (o3 and higher)
+     // 9 is not appreciably better than 8
+     // 10 and higher are quite slow - good for filters but only good for reductions if matching the main zc level
+-    let compression = match opts.deflater {
+-        Deflater::Libdeflater { compression } if compression < 11 => 5.min(compression),
+-        _ if opts.filters.len() <= 4 => 7,
+-        _ => 8,
+-    };
+-    let eval_deflater = Deflater::Libdeflater { compression };
+-    // If only one or two filters are given, use them for evaluations
+-    let eval_filters = if opts.filters.len() <= 2 {
+-        opts.filters.clone()
+-    } else {
+-        // None and Bigrams work well together, especially for alpha reductions
+-        indexset! {FilterStrategy::NONE, FilterStrategy::Bigrams}
+-    };
++    let (eval_filters, eval_deflater) = evaluation_settings(opts);
+     // This will collect all versions of images and pick one that compresses best
+     let eval = Evaluator::new(
+         deadline.clone(),
+@@ -587,41 +696,22 @@ fn report_format(prefix: &str, png: &PngImage) {
+     );
+ }
+ 
+-/// Recompress the additional frames of an APNG
+-fn recompress_frames(
++/// Compress the frames of an APNG with the filter chosen for the main image
++fn compress_frames(
+     png: &mut PngData,
++    images: Vec<PngImage>,
+     opts: &Options,
+-    deadline: Arc<Deadline>,
+-    filter: FilterStrategy,
++    filter: &FilterStrategy,
+ ) -> PngResult<()> {
+-    if !opts.idat_recoding || png.frames.is_empty() {
+-        return Ok(());
+-    }
+-    // Ensure we don't try to recompress frames with a predefined filter
++    // Ensure we don't try to compress frames with a predefined filter
+     debug_assert!(!matches!(filter, FilterStrategy::Predefined { .. }));
+     png.frames
+         .par_iter_mut()
++        .zip(images)
+         .with_max_len(1)
+-        .enumerate()
+-        .try_for_each(|(i, frame)| {
+-            if deadline.passed() {
+-                return Ok(());
+-            }
+-            let mut ihdr = png.raw.ihdr.clone();
+-            ihdr.width = frame.width;
+-            ihdr.height = frame.height;
+-            let image = PngImage::new(ihdr, &frame.data)?;
++        .try_for_each(|(frame, image)| {
+             let (filtered, _) = image.filter_image(filter.clone(), opts.optimize_alpha);
+-            let max_size = Some(frame.data.len() - 1);
+-            if let Ok(data) = opts.deflater.deflate(&filtered, max_size) {
+-                debug!(
+-                    "Recompressed fdAT #{:<2}: {} ({} bytes decrease)",
+-                    i,
+-                    data.len(),
+-                    frame.data.len() - data.len()
+-                );
+-                frame.data = data;
+-            }
++            frame.data = opts.deflater.deflate(&filtered, None)?;
+             Ok(())
+         })
+ }
+diff --git a/src/main.rs b/src/main.rs
+index 5c07f455..c800479a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -361,11 +361,14 @@ fn parse_opts_into_struct(
+ 
+     opts.grayscale_reduction = !matches.get_flag("no-grayscale-reduction");
+ 
++    opts.frame_reduction = !matches.get_flag("no-frame-reduction");
++
+     if matches.get_flag("no-reductions") {
+         opts.bit_depth_reduction = false;
+         opts.color_type_reduction = false;
+         opts.palette_reduction = false;
+         opts.grayscale_reduction = false;
++        opts.frame_reduction = false;
+         opts.interlace = None;
+     }
+ 
+diff --git a/src/options.rs b/src/options.rs
+index 101de7f9..a2d13555 100644
+--- a/src/options.rs
++++ b/src/options.rs
+@@ -125,6 +125,10 @@ pub struct Options {
+     ///
+     /// Default: `true`
+     pub grayscale_reduction: bool,
++    /// Whether to crop and merge the frames of an animated PNG
++    ///
++    /// Default: `true`
++    pub frame_reduction: bool,
+     /// Whether to perform recoding of IDAT and other compressed chunks
+     ///
+     /// If any type of reduction is performed, IDAT recoding will be performed
+@@ -297,6 +301,7 @@ impl Default for Options {
+             color_type_reduction: true,
+             palette_reduction: true,
+             grayscale_reduction: true,
++            frame_reduction: true,
+             idat_recoding: true,
+             scale_16: false,
+             strip: StripChunks::None,
+diff --git a/src/sanity_checks.rs b/src/sanity_checks.rs
+index 9ba42c0f..68c5e5cb 100644
+--- a/src/sanity_checks.rs
++++ b/src/sanity_checks.rs
+@@ -25,29 +25,49 @@ pub fn validate_output(output: &[u8], original_data: &[u8]) -> bool {
+             warn!("Failed to read input image for validation: {}", old_err);
+             true
+         }
+-        (Ok(new_frames), Ok(old_frames)) if new_frames.len() != old_frames.len() => false,
+         (Ok(new_frames), Ok(old_frames)) => {
+-            for (a, b) in old_frames.iter().zip(new_frames) {
+-                if !images_equal(a, &b) {
+-                    return false;
+-                }
++            let (old, new) = (timeline(old_frames), timeline(new_frames));
++            old.len() == new.len()
++                && old.iter().zip(&new).all(|((a, a_delay), (b, b_delay))| {
++                    images_equal(a, b) && a_delay.0 * b_delay.1 == b_delay.0 * a_delay.1
++                })
++        }
++    }
++}
++
++/// Merge consecutive frames that display the same image, adding up their delays
++fn timeline(frames: Vec<(RgbaImage, (u64, u64))>) -> Vec<(RgbaImage, (u64, u64))> {
++    let mut merged: Vec<(RgbaImage, (u64, u64))> = Vec::with_capacity(frames.len());
++    for (image, (num, den)) in frames {
++        match merged.last_mut() {
++            Some((last, (last_num, last_den))) if images_equal(last, &image) => {
++                *last_num = *last_num * den + num * *last_den;
++                *last_den *= den;
+             }
+-            true
++            _ => merged.push((image, (num, den))),
+         }
+     }
++    merged
+ }
+ 
+-/// Loads a PNG image from memory to frames of [RgbaImage]
+-fn load_png_image_from_memory(png_data: &[u8]) -> Result<Vec<RgbaImage>, image::ImageError> {
++/// Loads a PNG image from memory to frames of [RgbaImage] with their delays in milliseconds
++fn load_png_image_from_memory(
++    png_data: &[u8],
++) -> Result<Vec<(RgbaImage, (u64, u64))>, image::ImageError> {
+     let decoder = PngDecoder::new(Cursor::new(png_data))?;
+     if decoder.is_apng()? {
+         decoder
+             .apng()?
+             .into_frames()
+-            .map(|f| f.map(image::Frame::into_buffer))
++            .map(|f| {
++                f.map(|f| {
++                    let (num, den) = f.delay().numer_denom_ms();
++                    (f.into_buffer(), (u64::from(num), u64::from(den)))
++                })
++            })
+             .collect()
+     } else {
+-        DynamicImage::from_decoder(decoder).map(|i| vec![i.into_rgba8()])
++        DynamicImage::from_decoder(decoder).map(|i| vec![(i.into_rgba8(), (0, 1))])
+     }
+ }
+ 

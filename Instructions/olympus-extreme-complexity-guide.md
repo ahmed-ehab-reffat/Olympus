@@ -1346,3 +1346,155 @@ algorithm forces the caller-facing surface to change.
 **Adding discrimination to a saturated band is invisible.** Three more killing tests, 11 more kill
 events, identical 1/10. Once one cluster takes 8/10, extra traps cannot show up in the rate. Judge
 them as FP insurance and reviewer-proofing, not as band movement.
+
+
+## Confirmed anti-agent patterns — ray-optics-formula-conditionals (APPROVED 2026-09-14)
+
+**The strongest traps were single exceptions to rules the agents got right.** All four killers had
+the same form: identical operands in an interval combine, the one asymmetric polarity of a dual
+combinator, a valid node over an invalid operand, a repo idiom's numeric domain. Each needs no
+description words beyond the general rule, and each looks like a bug somewhere else when it fails.
+
+**Clarity did not defuse a symmetry trap.** F-27 rose from 3/11 to 6/10 after the redesign made the
+`or` sentence shorter and more explicit. Like F-24, a trap whose wrong answer is a sound engineering
+instinct (make `or` mirror `and`) survives disclosure.
+
+**Stacking math is real at the low end.** About eight independent 30-60% traps from reviewer findings
+gave 0/11 even with the unfair walls removed. Four correlated seams (every failing run failed at
+least two killing tests) gave 1/10. Aim for three or four strong seams, not eight medium ones.
+
+**The hard-looking design carried no difficulty.** Nested switching sets, selection-aware guard chains
+and fixpoint narrowing cost five reference bugs and several review rounds. They were deleted, and the
+problem was accepted without them.
+
+## Confirmed anti-agent patterns — worldengine-orographic-precipitation (APPROVED 2026-09-16)
+
+**A stated noun beat a stated formula.** "A wind layer with a direction and a strength per cell"
+killed 7/10 (F-28); a fully stated steady-state transport killed 0/20 (L58). The wall that holds is the
+one whose wrong answer still passes everything the agent checks: sibling keys round-trip their values
+and fail only on the concept's name.
+
+**A guard written correctly and never called.** When a framework declares a predicate its call path
+ignores, agents implement the predicate and copy the unconditional sibling `execute` (F-29). The trap
+needs one direct-call test and no extra prose.
+
+**Misdirection can point at the wrong target.** Placement prose ("between plates and precipitations")
+steered every batch-1 agent into rewriting an existing step (L57). That is FP exposure, not
+difficulty: it was neutralised with one sentence, and the rate did not fall.
+
+## Confirmed anti-agent patterns — cwerg-bcopy-bzero-lowering (APPROVED 2026-09-16)
+
+**The strongest wall was an existing pass's weak invariant.** A width pass that only promises the
+low bits killed 10/10 before the rule was stated and 2/10 after five batches (F-30). Telling agents
+the result does not tell them where the fix lives, because the pass is not in any file the feature
+names.
+
+**Twins double the surface without doubling the prose.** One parity sentence made the constant
+folders (F-31) and C++ CFG handling at scale (F-32) separate walls, each killing 2/10 with failures
+that read as unrelated crashes (`could not find matching pattern for mov fw1@rdx 4294967294`, a bare
+SIGSEGV).
+
+**Parity also stacks unfair walls if you let it.** Each pre-existing divergence a reviewer finds looks
+like a free trap (L50). Two of them, float DIV and narrow DIV/REM chains, took a batch to 0/9. Walls
+the feature does not reach are not difficulty (L60).
+
+## Confirmed anti-agent patterns — tippecanoe-tile-join-size-recourses (APPROVED 2026-09-16)
+
+**The machinery was free; the accounting was not.** Cross-layer ranking with a stated tie-break,
+attribute-pool compaction, extent rescaling and a booking restructure drew no failure attribution in
+ten runs. Seven of nine failures were two accounting edge cells: a recourse that could not act still
+recorded itself (F-15), and an inherited field kept the reader's old operator (F-33). Confirms L58 on a
+second problem.
+
+**The traps that worked were bugs in the reference first.** Both killers came out of reviewer findings
+against my own solution (L50). The trap DESIGN.md led with, pool compaction, killed nobody.
+
+**A harness artifact can hide every trap at once.** With 7 of 10 runs graded against a stale binary,
+the JUnit files showed 49/49 failures for nearly every run. The batch was still accepted at 1/10, but
+no per-test difficulty could be measured (L63).
+
+## Confirmed anti-agent patterns — sfepy-adaptive-stepping-accounting (APPROVED 2026-09-16)
+
+- **Aliased rollback over an in-place solver (F-34), 8/13.** The rollback branch is correct; the callee
+  mutates the snapshot. Only the nothing-accepted fixture sees it.
+- **Hostile user hook against a stated bound (F-10 cell), 7/13.** Three words of contract. A `min()`
+  clamp satisfies "not larger" and fails "smaller".
+- **Rollback over-reach to the index (F-35), 2/13.** Assert the relation between the last record and
+  the stepper, once per stop kind.
+- **Compounding:** 6 runs missed both F-34 and the hook cell. Both sit in the same stop and retry path,
+  so a run that rushes one tends to rush the other.
+- **Not a pattern: breadth.** 87 of 117 tests, including an elastodynamics rollback lane built over
+  three review rounds, killed nobody.
+
+## Confirmed anti-agent patterns — mwparserfromhell-site-aware-parsing (APPROVED 2026-09-18)
+
+- **Lookahead run over a marker-split, backtracking stream (F-36), 11/19.** Four shortcuts, four
+  symptoms: next-segment-only scan (C/Python divergence), slicing back into the shared list (lost
+  characters after a failed route), re-splitting into single characters (tag names break), and the
+  reject branch emitting peeked text (split text nodes). A seeded generated corpus with failed routes
+  finds all four; the hand-written trail tests found none.
+- **In-band EOF sentinel (F-37), 7/19.** The repo idiom `while ((this = read()))` is copied into the new
+  loop; the fix belongs in the reader.
+- **Two computation paths for one property (F-10 cell), 5/19.** The escape rule held at parse time and
+  was dropped on reassignment.
+- **Not patterns here: a second implementation arm (delegated, L67), a wiki-markup carve-out, namespace
+  normalisation breadth and Unicode trail sets.** All killed nobody.
+
+## Confirmed anti-agent patterns — kira-loop-crossfade (APPROVED 2026-09-18)
+
+- **Worked (1/10):** F-10 live-change cell. A handle switches to a loop that ends before the playhead
+  while the wrap is shortened by the crossfade. Two stated sentences meet there; one run broke the wrap.
+- **Did not work (0/10 each):** stated decoder seek budgets (startup, per wrap), head frames kept for
+  the pass, mirrored reverse fade, clamp to half the loop, easing curves, source-frame blending under
+  non-unit rates, stereo, bake-equals-live, seconds conversion at other sample rates, eased and seek
+  commands through live handles. Each was a precisely stated local rule.
+- **Counterfeit difficulty:** a gated buffered-prefix test that encoded the reference's queue depth
+  failed six correct runs (L69/L70). Never count such a cluster as a trap.
+
+## Confirmed anti-agent patterns — planetiler-custommap-schema-composition (APPROVED 2026-09-18)
+
+- **Worked (7/10):** F-38, validity against the pre-input snapshot. One input adds a layer and removes
+  it again; the running-map check accepts it. Sole failure of three 82/83 runs.
+- **Worked (3/10):** F-9 origin variant. The validator re-resolves a bundled root's relative examples
+  reference as a filesystem path.
+- **Did not work (0/10 each):** deferred argument settlement (the repo's fixed point already runs after
+  the merge, so F-22 did not apply), layer position and feature append order, last-set scalars that
+  survive accessor defaults, sources replaced by id, tag mappings per key, diamond dedup, cycle naming,
+  depth-first order, relative and bundled parent resolution, comma-list CLI generation.
+- **Counterfeit difficulty:** an unstated static signature, which failed 8/8 at compile time (L72).
+
+## Confirmed anti-agent patterns — featurevisor-minimal-rebucketing (APPROVED 2026-09-19)
+
+- **Worked (7/11):** F-40, a record keyed by user strings that must hold `__proto__`. Sole failure of
+  six 33/34 runs.
+- **Worked (3/11):** F-39, a repo helper whose lossy path only the new regime reaches. Independent of
+  F-40, which kept the batch from reading as one special key.
+- **Did not work (0/11 each):** the inclusive/prefix/half-open boundary mismatch the design was built
+  on, lowest-first retention, declared-order refill, region cuts through later slots, sort-and-merge,
+  idempotent rebuild, reuse by rule key, zero overrides, stored-ranges changes, disjoint accounting,
+  build collection order and the two-environment print trace.
+- **Counterfeit difficulty, removed:** formatter return-shape tests (7 kill events in batch 1, 0 after a
+  tolerant reader, no pass moved).
+
+
+## Confirmed anti-agent patterns — ir-sim-scenario-events (APPROVED 2026-09-19)
+
+- **Loader-injected attribute (F-41), 10/11.** When the repo's batch loader assigns a per-entry key
+  (group index) that the public constructor defaults, any runtime-created object silently joins an
+  existing structure and loses the keyed dispatch. The only symptom is an object that does not move.
+  Zero description words; the promise "runtime objects are ordinary members of everything the engine
+  does" makes it fair.
+- **Positional undo order (F-42), 2/11.** Two deletions restored by ascending saved index shift each
+  other. One two-deletion fixture.
+- **Not anti-agent any more:** multi-path lifecycle integration the prompt names (0/11 across eleven
+  reproduced mutants). Agents now wire every named path.
+
+## featurevisor-target-specialization (APPROVED Olympus 2026-09-19)
+
+- **Equivalence-to-the-repo's-evaluator is a contract that stays hard when fully stated.** The rule is one
+  sentence; the instance space (nested lists, empty containers, decided negations, per-list match rules) is
+  combinatorial, and a seeded corpus probes it. This is P1 (algebraic-law contracts) confirmed.
+- **Baseline preservation beats any authored wall when the natural home of the change is an exported,
+  separately tested helper.** 7/20 kills, zero description words.
+- **Do not count on stated per-kind rules.** Force OR vs global AND vs rule-override precedence read as a
+  strong F-3/F-10 design and killed 1 of 20.

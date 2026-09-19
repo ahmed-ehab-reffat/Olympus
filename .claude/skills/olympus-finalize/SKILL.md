@@ -35,36 +35,54 @@ worth exactly its measured counts — never write a kill count you did not compu
 tag and attributes failures to the wrong test — it will tell you a confident, wrong story.
 
 ```bash
-cd problems/<name>/agent-runs*
+cd problems/<name>/agent-runs*/<latest batch>
 python3 - <<'EOF'
-import glob, json, xml.etree.ElementTree as ET
+import glob, json, os, xml.etree.ElementTree as ET
 from collections import Counter
-kills, runs, verdicts = Counter(), {}, {}
+kills, runs, verdicts, allt = Counter(), {}, {}, set()
 for d in sorted(glob.glob('*/')):
     n = d.strip('/')
-    j = json.load(open(d+'eval-result.json'))
-    verdicts[n] = j.get('verdict')
-    failed = [tc.get('classname','').split('/')[-1]
-              for tc in ET.parse(d+'junit-new.xml').iter('testcase')
+    ev = d+'eval-result.json'
+    verdicts[n] = json.load(open(ev)).get('verdict') if os.path.exists(ev) else 'NO_RESULT'
+    if not os.path.exists(d+'junit-new.xml'):
+        print(f"{n:16} {verdicts[n]:24} no junit"); continue
+    cases = list(ET.parse(d+'junit-new.xml').iter('testcase'))
+    failed = [tc.get('name') for tc in cases
               if tc.find('failure') is not None or tc.find('error') is not None]
+    allt.update(tc.get('name') for tc in cases)
     runs[n] = failed
-    for f in failed: kills[f] += 1
-    print(f"{n:16} {verdicts[n]:24} {len(failed):3} failed")
+    wiped = len(failed) == len(cases)
+    if not wiped:
+        kills.update(failed)
+    print(f"{n:16} {verdicts[n]:24} {len(failed):3}/{len(cases)} failed{'  WIPEOUT, not counted' if wiped else ''}")
 print("\nPASS RATE:", sum(1 for v in verdicts.values() if 'PASS' in (v or '')), "/", len(verdicts))
-print("\nPER-TEST KILLS:")
+print("\nPER-TEST KILLS (wipeouts excluded):")
 for k, v in kills.most_common(): print(f"  {v:3}  {k}")
-allt = {tc.get('classname','').split('/')[-1]
-        for d in glob.glob('*/') for tc in ET.parse(d+'junit-new.xml').iter('testcase')}
-print("\nKILLED NOTHING:", sorted(allt - set(kills)))
+print("\nKILLED NOTHING:", len(allt - set(kills)), "of", len(allt))
 EOF
 ```
+
+**Key on `name`, and compare element counts, never sets of names.** pytest puts the module in
+`classname` and the test in `name`, so keying on `classname` collapses the whole suite into one row.
+A wrapper timeout can write duplicate test names (sfepy: 117 elements, 116 distinct), so a set-based
+"failed everything" check lets it through and inflates every kill count.
+
+**The pool is cumulative (L64).** A later batch folder re-lists earlier runs under new numbers and
+appends the new ones. Mine only the LATEST folder, and fingerprint runs (added LOC plus
+`total_prompt_tokens`) to tell appended runs from re-listed ones before you write any split.
+
+**If most failing runs fail EVERY new test, the JUnit files are not data.** Check the evaluators for
+"stale", "restored" or "unbuilt" first (L63). Then per-test kill counts are an artifact of the harness,
+and the failure taxonomy has to come from the evaluators' static findings plus a trajectory scan for
+`git restore`/`checkout` of build outputs after the last build. Say so in the dossier.
 
 Then the qualitative half — the evaluator's own words are the best failure taxonomy you will get:
 
 ```bash
 python3 -c "
-import json, glob
+import json, glob, os
 for d in sorted(glob.glob('*/')):
+    if not os.path.exists(d+'eval-result.json'): print(d, 'NO RESULT'); continue
     j = json.load(open(d+'eval-result.json'))
     print('=='*30); print(d, j.get('verdict'))
     print('SUMMARY:', str(j.get('summary'))[:400])
@@ -80,13 +98,14 @@ Long-horizon and scope facts, from the patches and trajectories:
 
 ```bash
 python3 -c "
-import json, glob, re
+import json, glob, os, re
 for d in sorted(glob.glob('*/')):
+    if not os.path.exists(d+'solution-patch.patch'): continue
     p = open(d+'solution-patch.patch').read()
-    fm = json.load(open(d+'trajectory.json'))['final_metrics']
+    fm = json.load(open(d+'trajectory.json')).get('final_metrics', {})
     print(d.strip('/'), 'files', len(re.findall(r'^diff --git', p, re.M)),
           '| +LOC', len([l for l in p.splitlines() if l.startswith('+') and not l.startswith('+++')]),
-          '| prompt_tok', fm['total_prompt_tokens'])
+          '| prompt_tok', fm.get('total_prompt_tokens'))
 "
 ```
 

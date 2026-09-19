@@ -1,0 +1,1427 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..abcd8dd
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,48 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++
++MODE="${MODE:-base}"
++cd "$(dirname "$0")"
++
++# allow-existing-test's golden output only matches when tippecanoe runs with 8 or fewer threads;
++# pin the count so the base suite gives the same result on any host.
++export TIPPECANOE_MAX_THREADS=8
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++fi
++
++make -j"$(nproc 2>/dev/null || echo 2)" >/tmp/tilejoin_build.log 2>&1
++BUILD_STATUS=$?
++
++if [ $BUILD_STATUS -ne 0 ]; then
++  if [ -n "$OUTPUT_PATH" ]; then
++    {
++      printf '<?xml version="1.0" encoding="UTF-8"?>\n'
++      printf '<testsuites><testsuite name="build" tests="1" failures="1" errors="0" time="0">\n'
++      printf '<testcase name="make" classname="build" time="0"><failure message="build failed"><![CDATA[\n'
++      tail -c 60000 /tmp/tilejoin_build.log
++      printf ']]></failure></testcase>\n</testsuite></testsuites>\n'
++    } > "$OUTPUT_PATH"
++  fi
++  tail -40 /tmp/tilejoin_build.log
++  exit 1
++fi
++
++if [ -n "$OUTPUT_PATH" ]; then
++  python3 -B tests/tile_join_limit_0dae2a/run_tests.py "$MODE" --output_path "$OUTPUT_PATH"
++else
++  python3 -B tests/tile_join_limit_0dae2a/run_tests.py "$MODE"
++fi
+diff --git a/tests/tile_join_limit_0dae2a/mvt.py b/tests/tile_join_limit_0dae2a/mvt.py
+new file mode 100644
+index 0000000..e0b5ace
+--- /dev/null
++++ b/tests/tile_join_limit_0dae2a/mvt.py
+@@ -0,0 +1,254 @@
++import gzip
++import struct
++
++
++def _varint(buf, pos):
++    result = 0
++    shift = 0
++    while True:
++        b = buf[pos]
++        pos += 1
++        result |= (b & 0x7F) << shift
++        if not (b & 0x80):
++            return result, pos
++        shift += 7
++
++
++def _fields(buf, start, end):
++    pos = start
++    while pos < end:
++        key, pos = _varint(buf, pos)
++        field, wire = key >> 3, key & 7
++        if wire == 0:
++            value, pos = _varint(buf, pos)
++            yield field, value
++        elif wire == 1:
++            yield field, struct.unpack_from('<d', buf, pos)[0]
++            pos += 8
++        elif wire == 2:
++            length, pos = _varint(buf, pos)
++            yield field, (pos, pos + length)
++            pos += length
++        elif wire == 5:
++            yield field, struct.unpack_from('<f', buf, pos)[0]
++            pos += 4
++        else:
++            raise ValueError('unsupported wire type %d' % wire)
++
++
++def _packed(buf, start, end):
++    out = []
++    pos = start
++    while pos < end:
++        value, pos = _varint(buf, pos)
++        out.append(value)
++    return out
++
++
++def _zigzag(n):
++    return (n >> 1) ^ -(n & 1)
++
++
++def _value(buf, start, end):
++    for field, payload in _fields(buf, start, end):
++        if field == 1:
++            return buf[payload[0]:payload[1]].decode('utf-8')
++        if field in (2, 3):
++            return payload
++        if field in (4, 5):
++            return payload
++        if field == 6:
++            return _zigzag(payload)
++        if field == 7:
++            return bool(payload)
++    return None
++
++
++def _value_field(buf, start, end):
++    for field, _ in _fields(buf, start, end):
++        return field
++    return None
++
++
++def _feature(buf, start, end):
++    feature = {'id': None, 'tags': [], 'type': 0, 'geometry': []}
++    for field, payload in _fields(buf, start, end):
++        if field == 1:
++            feature['id'] = payload
++        elif field == 2:
++            feature['tags'] = _packed(buf, payload[0], payload[1])
++        elif field == 3:
++            feature['type'] = payload
++        elif field == 4:
++            feature['geometry'] = _packed(buf, payload[0], payload[1])
++    return feature
++
++
++def _layer(buf, start, end):
++    layer = {'name': '', 'keys': [], 'values': [], 'value_fields': [], 'features': [], 'extent': 4096}
++    for field, payload in _fields(buf, start, end):
++        if field == 1:
++            layer['name'] = buf[payload[0]:payload[1]].decode('utf-8')
++        elif field == 2:
++            layer['features'].append(_feature(buf, payload[0], payload[1]))
++        elif field == 3:
++            layer['keys'].append(buf[payload[0]:payload[1]].decode('utf-8'))
++        elif field == 4:
++            layer['values'].append(_value(buf, payload[0], payload[1]))
++            layer['value_fields'].append(_value_field(buf, payload[0], payload[1]))
++        elif field == 5:
++            layer['extent'] = payload
++    return layer
++
++
++def decode_tile(data):
++    if data[:2] == b'\x1f\x8b':
++        data = gzip.decompress(data)
++    layers = []
++    for field, payload in _fields(data, 0, len(data)):
++        if field == 3:
++            layers.append(_layer(data, payload[0], payload[1]))
++    return layers
++
++
++def attributes(layer, feature):
++    out = {}
++    tags = feature['tags']
++    for i in range(0, len(tags) - 1, 2):
++        out[layer['keys'][tags[i]]] = layer['values'][tags[i + 1]]
++    return out
++
++
++def used_pool_indexes(layer):
++    keys = set()
++    values = set()
++    for feature in layer['features']:
++        tags = feature['tags']
++        for i in range(0, len(tags) - 1, 2):
++            keys.add(tags[i])
++            values.add(tags[i + 1])
++    return keys, values
++
++
++def bbox(feature):
++    x = y = 0
++    xs = []
++    ys = []
++    geom = feature['geometry']
++    i = 0
++    while i < len(geom):
++        command = geom[i] & 0x7
++        count = geom[i] >> 3
++        i += 1
++        if command in (1, 2):
++            for _ in range(count):
++                x += _zigzag(geom[i])
++                y += _zigzag(geom[i + 1])
++                i += 2
++                xs.append(x)
++                ys.append(y)
++        else:
++            pass
++    if not xs:
++        return None
++    return min(xs), min(ys), max(xs), max(ys)
++
++
++def extent_of(feature):
++    box = bbox(feature)
++    if box is None or feature['type'] == 1:
++        return 0.0
++    width = box[2] - box[0]
++    height = box[3] - box[1]
++    if feature['type'] == 3:
++        return float(width) * float(height)
++    return float(width) + float(height)
++
++
++def _put_varint(value):
++    out = bytearray()
++    while True:
++        byte = value & 0x7F
++        value >>= 7
++        if value:
++            out.append(byte | 0x80)
++        else:
++            out.append(byte)
++            return bytes(out)
++
++
++def _varint_field(field, value):
++    return _put_varint(field << 3) + _put_varint(value)
++
++
++def _bytes_field(field, payload):
++    return _put_varint((field << 3) | 2) + _put_varint(len(payload)) + payload
++
++
++def _zig(n):
++    return 2 * n if n >= 0 else -2 * n - 1
++
++
++def _encode_value(value):
++    if isinstance(value, tuple):
++        kind, raw = value
++        if kind == 'bool':
++            return _varint_field(7, 1 if raw else 0)
++        if kind == 'double':
++            return _put_varint((3 << 3) | 1) + struct.pack('<d', raw)
++        if kind == 'float':
++            return _put_varint((2 << 3) | 5) + struct.pack('<f', raw)
++        if kind == 'sint':
++            return _varint_field(6, _zig(raw))
++        if kind == 'int':
++            return _varint_field(4, raw)
++        return _varint_field(5, raw)
++    if isinstance(value, int):
++        return _varint_field(5, value)
++    return _bytes_field(1, value.encode('utf-8'))
++
++
++def line_geometry(points):
++    x, y = points[0]
++    commands = [1 | (1 << 3), _zig(x), _zig(y), 2 | ((len(points) - 1) << 3)]
++    for px, py in points[1:]:
++        commands += [_zig(px - x), _zig(py - y)]
++        x, y = px, py
++    return commands
++
++
++def encode_tile(layers):
++    tile = b''
++    for layer in layers:
++        keys = []
++        values = []
++        features = b''
++        for feature in layer['features']:
++            tags = []
++            for key, value in feature['attributes'].items():
++                if key not in keys:
++                    keys.append(key)
++                if value not in values:
++                    values.append(value)
++                tags += [keys.index(key), values.index(value)]
++            body = _bytes_field(2, b''.join(_put_varint(t) for t in tags))
++            body += _varint_field(3, feature['type'])
++            body += _bytes_field(4, b''.join(_put_varint(c) for c in feature['geometry']))
++            features += _bytes_field(2, body)
++        encoded = _varint_field(15, 2) + _bytes_field(1, layer['name'].encode('utf-8')) + features
++        for key in keys:
++            encoded += _bytes_field(3, key.encode('utf-8'))
++        for value in values:
++            encoded += _bytes_field(4, _encode_value(value))
++        encoded += _varint_field(5, layer['extent'])
++        tile += _bytes_field(3, encoded)
++    return tile
++
++
++def point_geometry(points):
++    x = y = 0
++    commands = [1 | (len(points) << 3)]
++    for px, py in points:
++        commands += [_zig(px - x), _zig(py - y)]
++        x, y = px, py
++    return commands
+diff --git a/tests/tile_join_limit_0dae2a/run_tests.py b/tests/tile_join_limit_0dae2a/run_tests.py
+new file mode 100644
+index 0000000..2b590ee
+--- /dev/null
++++ b/tests/tile_join_limit_0dae2a/run_tests.py
+@@ -0,0 +1,1107 @@
++import gzip
++import json
++import os
++import random
++import shutil
++import sqlite3
++import subprocess
++import sys
++import tempfile
++import time
++import traceback
++import xml.etree.ElementTree as ET
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import mvt
++
++ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
++WORK = None
++
++BASE_TARGETS = [
++    'raw-tiles-test', 'parallel-test', 'radix-sort-test', 'pbf-test', 'join-test',
++    'enumerate-test', 'decode-test', 'join-filter-test', 'json-tool-test',
++    'allow-existing-test', 'csv-test', 'layer-json-test', 'pmtiles-test',
++    'decode-pmtiles-test', 'overzoom-test', 'flatgeobuf-test',
++]
++
++
++def run(args, cwd=ROOT):
++    proc = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++    return proc.returncode, proc.stdout.decode('utf-8', 'replace'), proc.stderr.decode('utf-8', 'replace')
++
++
++def path(name):
++    return os.path.join(WORK, name)
++
++
++def write_geojson(name, features):
++    target = path(name)
++    with open(target, 'w') as f:
++        for feature in features:
++            f.write(json.dumps(feature) + '\n')
++    return target
++
++
++def point(i, x, y, props=None):
++    attributes = {'id': i, 'name': 'feature-%d-abcdefghijklmnopqrst' % i, 'cat': 'c%d' % (i % 7)}
++    if props:
++        attributes.update(props)
++    return {'type': 'Feature', 'properties': attributes,
++            'geometry': {'type': 'Point', 'coordinates': [x, y]}}
++
++
++def square(i, x, y, size, props=None):
++    attributes = {'id': i, 'name': 'square-%d' % i}
++    if props:
++        attributes.update(props)
++    ring = [[x, y], [x + size, y], [x + size, y + size], [x, y + size], [x, y]]
++    return {'type': 'Feature', 'properties': attributes,
++            'geometry': {'type': 'Polygon', 'coordinates': [ring]}}
++
++
++def dense_points(count, seed=1):
++    rng = random.Random(seed)
++    return [point(i, -122.5 + rng.random() * 0.5, 37.7 + rng.random() * 0.4) for i in range(count)]
++
++
++def graduated_squares(count):
++    features = []
++    for i in range(count):
++        size = 0.0006 * (i + 1)
++        features.append(square(i, -122.4 + i * 0.02, 37.75, size))
++    return features
++
++
++def build_tileset(name, features, extra=None):
++    source = write_geojson(name + '.json', features)
++    out = path(name + '.mbtiles')
++    args = [os.path.join(ROOT, 'tippecanoe'), '-q', '-f', '-o', out, '-z0', '-r1', '-pf', '--no-tile-size-limit', '-pS']
++    if extra:
++        args += extra
++    args.append(source)
++    code, _, err = run(args)
++    if code != 0:
++        raise AssertionError('tippecanoe failed: %s' % err[-400:])
++    return out
++
++
++def join(name, inputs, extra=None):
++    out = path(name + '.mbtiles')
++    args = [os.path.join(ROOT, 'tile-join'), '-f', '-o', out]
++    if extra:
++        args += extra
++    args += inputs
++    code, _, err = run(args)
++    return out, code, err
++
++
++def tiles(mbtiles):
++    conn = sqlite3.connect(mbtiles)
++    rows = list(conn.execute('select zoom_level, tile_column, tile_row, tile_data from tiles'))
++    conn.close()
++    return rows
++
++
++def only_tile(mbtiles):
++    rows = tiles(mbtiles)
++    assert len(rows) == 1, 'expected exactly one tile, got %d' % len(rows)
++    return rows[0][3]
++
++
++def metadata(mbtiles):
++    conn = sqlite3.connect(mbtiles)
++    rows = dict(conn.execute('select name, value from metadata'))
++    conn.close()
++    return rows
++
++
++def strategies(mbtiles):
++    raw = metadata(mbtiles).get('strategies')
++    if raw is None:
++        return None
++    return json.loads(raw)
++
++
++def layers_of(mbtiles):
++    return mvt.decode_tile(only_tile(mbtiles))
++
++
++def feature_count(mbtiles):
++    return sum(len(layer['features']) for layer in layers_of(mbtiles))
++
++
++def ids_of(layers):
++    found = set()
++    for layer in layers:
++        for feature in layer['features']:
++            attributes = mvt.attributes(layer, feature)
++            if 'id' in attributes:
++                found.add(attributes['id'])
++    return found
++
++
++def assert_pools_are_used(layers):
++    for layer in layers:
++        used_keys, used_values = mvt.used_pool_indexes(layer)
++        unused_keys = set(range(len(layer['keys']))) - used_keys
++        unused_values = set(range(len(layer['values']))) - used_values
++        assert not unused_keys, 'layer %s keeps %d unused attribute keys' % (layer['name'], len(unused_keys))
++        assert not unused_values, 'layer %s keeps %d unused attribute values' % (layer['name'], len(unused_values))
++
++
++def meta_json(mbtiles):
++    return json.loads(metadata(mbtiles)['json'])
++
++
++def tilestats_layers(mbtiles):
++    out = {}
++    for layer in meta_json(mbtiles)['tilestats']['layers']:
++        attributes = {}
++        for attribute in layer.get('attributes', []):
++            attributes[attribute['attribute']] = attribute.get('values', [])
++        out[layer['layer']] = {'count': layer['count'], 'geometry': layer['geometry'], 'attributes': attributes}
++    return out
++
++
++def vector_layers(mbtiles):
++    return {layer['id']: (layer['minzoom'], layer['maxzoom'])
++            for layer in meta_json(mbtiles)['vector_layers']}
++
++
++def bounds_of(mbtiles):
++    return [float(value) for value in metadata(mbtiles)['bounds'].split(',')]
++
++
++def zoom_range(mbtiles):
++    rows = metadata(mbtiles)
++    return int(rows['minzoom']), int(rows['maxzoom'])
++
++
++def written_feature_count(mbtiles):
++    total = 0
++    for row in tiles(mbtiles):
++        for layer in mvt.decode_tile(row[3]):
++            total += len(layer['features'])
++    return total
++
++
++def oversized_source():
++    return build_tileset('oversized', dense_points(90000))
++
++
++def quadrant_points(count, seed=7):
++    rng = random.Random(seed)
++    features = []
++    for i in range(count):
++        quadrant = i % 4
++        lon = (-140.0 if quadrant in (0, 2) else 40.0) + rng.random() * 40.0
++        lat = (40.0 if quadrant in (0, 1) else -40.0) + rng.random() * 20.0
++        features.append(point(i, lon, lat))
++    return features
++
++
++def quad_source():
++    return build_tileset('quad', quadrant_points(90000), ['-Z0', '-z1', '-l', 'quad'])
++
++
++def pyramid_source():
++    rng = random.Random(11)
++    lons = [(-170.0, -100.0), (-80.0, -10.0), (10.0, 80.0), (100.0, 170.0)]
++    lats = [(70.0, 80.0), (10.0, 60.0), (-60.0, -10.0), (-80.0, -70.0)]
++    features = []
++    for i in range(96000):
++        lon = lons[i % 4]
++        lat = lats[(i // 4) % 4]
++        features.append(point(i, lon[0] + rng.random() * (lon[1] - lon[0]), lat[0] + rng.random() * (lat[1] - lat[0])))
++    return build_tileset('pyramid', features, ['-Z0', '-z2', '-l', 'pyramid'])
++
++
++def mixed_extents():
++    small = [point(i, -122.5 + (i % 20) * 0.01, 37.7 + (i // 20) * 0.01, {'tag': 'small'})
++             for i in range(400)]
++    big = [square(1000 + i, -170.0 + (i % 20) * 17.0, -70.0 + (i // 20) * 9.0, 5.0,
++                  {'tag': 'big'}) for i in range(300)]
++    return small, big
++
++
++def set_strategies(mbtiles, value):
++    conn = sqlite3.connect(mbtiles)
++    conn.execute("delete from metadata where name = 'strategies'")
++    conn.execute("insert into metadata (name, value) values ('strategies', ?)", (json.dumps(value),))
++    conn.commit()
++    conn.close()
++
++
++def blob(rng, length):
++    return ''.join(rng.choice('abcdefghijklmnopqrstuvwxyz0123456789') for _ in range(length))
++
++
++def rectangle(i, x, y, width, height):
++    ring = [[x, y], [x + width, y], [x + width, y + height], [x, y + height], [x, y]]
++    return {'type': 'Feature', 'properties': {'id': i, 'name': 'rectangle-%d' % i},
++            'geometry': {'type': 'Polygon', 'coordinates': [ring]}}
++
++
++def write_mbtiles(name, layers=None, tiles=None):
++    tiles = tiles or {(0, 0, 0): layers}
++    target = path(name + '.mbtiles')
++    conn = sqlite3.connect(target)
++    conn.execute('create table metadata (name text, value text)')
++    conn.execute('create table tiles (zoom_level integer, tile_column integer, tile_row integer, tile_data blob)')
++    conn.execute("insert into metadata (name, value) values ('name', ?)", (name,))
++    conn.execute("insert into metadata (name, value) values ('format', 'pbf')")
++    for (zoom, column, row), tile_layers in sorted(tiles.items()):
++        conn.execute('insert into tiles values (?, ?, ?, ?)',
++                     (zoom, column, row, gzip.compress(mvt.encode_tile(tile_layers), mtime=0)))
++    conn.commit()
++    conn.close()
++    return target
++
++
++def typed_attributes_by_id(layers):
++    found = {}
++    for layer in layers:
++        for feature in layer['features']:
++            tags = feature['tags']
++            attributes = {}
++            for i in range(0, len(tags) - 1, 2):
++                attributes[layer['keys'][tags[i]]] = (layer['values'][tags[i + 1]], layer['value_fields'][tags[i + 1]])
++            found[attributes['id'][0]] = attributes
++    return found
++
++
++def line(i, coordinates):
++    return {'type': 'Feature', 'properties': {'id': i, 'name': 'line-%d' % i},
++            'geometry': {'type': 'LineString', 'coordinates': coordinates}}
++
++
++TESTS = []
++
++
++def test(fn):
++    TESTS.append(fn)
++    return fn
++
++
++@test
++def maximum_tile_bytes_option_is_accepted():
++    source = build_tileset('small', dense_points(200))
++    out, code, err = join('small_joined', [source], ['-M', '2000000'])
++    assert code == 0, err[-400:]
++    assert len(tiles(out)) == 1
++
++
++@test
++def maximum_tile_bytes_long_form_sets_the_limit():
++    source = build_tileset('midsize_long', dense_points(20000))
++    out, code, err = join('midsize_long_reduced', [source], ['--maximum-tile-bytes=40000', '--drop-smallest-as-needed'])
++    assert code == 0, err[-400:]
++    assert feature_count(out) < 20000
++    assert len(only_tile(out)) <= 40000
++
++
++@test
++def oversized_tile_is_skipped_without_the_option():
++    source = oversized_source()
++    out, code, _ = join('skipped', [source])
++    assert code == 0
++    assert len(tiles(out)) == 0
++    assert meta_json(out)['tilestats']['layerCount'] == 0
++    assert strategies(out) is None
++
++
++@test
++def oversized_tile_is_reduced_instead_of_skipped():
++    source = oversized_source()
++    out, code, err = join('reduced', [source], ['--drop-smallest-as-needed'])
++    assert code == 0, err[-400:]
++    assert len(tiles(out)) == 1
++
++
++@test
++def reduced_tile_is_within_the_limit():
++    source = oversized_source()
++    out, _, _ = join('reduced2', [source], ['--drop-smallest-as-needed'])
++    assert len(only_tile(out)) <= 500000
++
++
++@test
++def raised_limit_keeps_every_feature():
++    source = oversized_source()
++    out, _, _ = join('raised', [source], ['-M', '2000000', '--drop-smallest-as-needed'])
++    assert feature_count(out) == 90000
++
++
++@test
++def lowered_limit_reduces_a_tile_that_otherwise_fits():
++    source = build_tileset('midsize', dense_points(20000))
++    whole, _, _ = join('midsize_whole', [source], ['-M', '2000000'])
++    reduced, _, _ = join('midsize_reduced', [source], ['-M', '40000', '--drop-smallest-as-needed'])
++    assert feature_count(whole) == 20000
++    assert feature_count(reduced) < 20000
++    assert len(only_tile(reduced)) <= 40000
++
++
++@test
++def tile_at_exactly_the_limit_is_not_reduced():
++    source = build_tileset('exact', dense_points(5000))
++    whole, _, _ = join('exact_whole', [source], ['-M', '5000000'])
++    size = len(only_tile(whole))
++    out, _, _ = join('exact_join', [source], ['-M', str(size), '--drop-smallest-as-needed'])
++    assert feature_count(out) == 5000
++    assert strategies(out) is None
++
++
++@test
++def no_tile_size_limit_keeps_the_oversized_tile():
++    source = oversized_source()
++    out, _, _ = join('unlimited', [source], ['--no-tile-size-limit', '--drop-smallest-as-needed'])
++    assert feature_count(out) == 90000
++
++
++@test
++def reduced_layer_keeps_no_unused_attribute_entries():
++    small, big = mixed_extents()
++    source = build_tileset('pools', small + big, ['-l', 'mix'])
++    big_only = build_tileset('pools_big', big, ['-l', 'mix'])
++    whole, _, _ = join('pools_whole', [source], ['-M', '5000000'])
++    assert 'cat' in layers_of(whole)[0]['keys']
++    reference, _, _ = join('pools_reference', [big_only], ['-M', '5000000'])
++    out, _, _ = join('pools_reduced', [source], ['-M', str(len(only_tile(reference))), '--drop-smallest-as-needed'])
++    layers = layers_of(out)
++    assert_pools_are_used(layers)
++    assert 'cat' not in layers[0]['keys'], layers[0]['keys']
++
++
++@test
++def surviving_features_keep_their_own_attributes():
++    source = oversized_source()
++    out, _, _ = join('attrs', [source], ['--drop-smallest-as-needed'])
++    for layer in layers_of(out):
++        for feature in layer['features']:
++            attributes = mvt.attributes(layer, feature)
++            assert set(attributes) == {'id', 'name', 'cat'}, sorted(attributes)
++            assert attributes['name'] == 'feature-%d-abcdefghijklmnopqrst' % attributes['id']
++            assert attributes['cat'] == 'c%d' % (attributes['id'] % 7)
++
++
++@test
++def features_are_shed_in_increasing_order_of_extent():
++    source = build_tileset('graduated', graduated_squares(400))
++    whole, _, _ = join('graduated_whole', [source], ['-M', '5000000'])
++    whole_layers = layers_of(whole)
++    extents = {}
++    for layer in whole_layers:
++        for feature in layer['features']:
++            extents[mvt.attributes(layer, feature)['id']] = mvt.extent_of(feature)
++    size = len(only_tile(whole))
++    reduced, _, _ = join('graduated_reduced', [source], ['-M', str(size // 3), '--drop-smallest-as-needed'])
++    kept = ids_of(layers_of(reduced))
++    assert 0 < len(kept) < len(extents)
++    dropped = set(extents) - kept
++    assert min(extents[i] for i in kept) >= max(extents[i] for i in dropped)
++
++
++@test
++def reduction_is_reported_in_the_strategies_metadata():
++    source = oversized_source()
++    out, _, _ = join('reported', [source], ['--drop-smallest-as-needed'])
++    recorded = strategies(out)
++    assert recorded is not None
++    assert recorded[0]['dropped_as_needed'] == 90000 - feature_count(out)
++    assert recorded[0]['tile_size_desired'] > 500000
++
++
++@test
++def strategies_are_untouched_when_nothing_is_reduced():
++    source = build_tileset('untouched', dense_points(500))
++    out, _, _ = join('untouched_join', [source], ['--drop-smallest-as-needed'])
++    assert strategies(out) is None
++
++
++@test
++def an_emptied_layer_is_not_written():
++    small = [square(i, -122.4 + (i % 40) * 0.004, 37.70 + (i // 40) * 0.004, 0.0004) for i in range(400)]
++    wide = [square(1000 + i, -122.0 + (i % 20) * 0.05, 37.90 + (i // 20) * 0.05, 0.04) for i in range(400)]
++    source_small = build_tileset('tiny_layer', small, ['-l', 'tiny'])
++    source_wide = build_tileset('wide_layer', wide, ['-l', 'wide'])
++    wide_only, _, _ = join('wide_only', [source_wide], ['-M', '5000000'])
++    budget = len(only_tile(wide_only))
++    out, _, _ = join('two_layers_reduced', [source_small, source_wide],
++                     ['-M', str(budget), '--drop-smallest-as-needed'])
++    names = [layer['name'] for layer in layers_of(out)]
++    assert 'wide' in names, names
++    assert 'tiny' not in names, names
++
++
++@test
++def layer_statistics_count_only_the_features_that_were_written():
++    source = oversized_source()
++    out, _, _ = join('booked', [source], ['--drop-smallest-as-needed'])
++    written = written_feature_count(out)
++    assert 0 < written < 90000, written
++    assert tilestats_layers(out)['oversized']['count'] == written
++
++
++@test
++def layer_statistics_omit_a_dropped_features_attribute_value():
++    small, big = mixed_extents()
++    source = build_tileset('mixed', small + big, ['-l', 'mix'])
++    big_only = build_tileset('mixed_big', big, ['-l', 'mix'])
++    whole, _, _ = join('mixed_whole', [source], ['-M', '5000000'])
++    assert set(tilestats_layers(whole)['mix']['attributes']['tag']) == {'big', 'small'}
++    reference, _, _ = join('mixed_big_join', [big_only], ['-M', '5000000'])
++    budget = len(only_tile(reference))
++    out, _, _ = join('mixed_reduced', [source], ['-M', str(budget), '--drop-smallest-as-needed'])
++    attributes = tilestats_layers(out)['mix']['attributes']
++    assert set(attributes['tag']) == {'big'}, attributes['tag']
++    assert 'cat' not in attributes, sorted(attributes)
++    assert tilestats_layers(whole)['mix']['geometry'] == 'Point'
++    assert tilestats_layers(out)['mix']['geometry'] == 'Polygon'
++
++
++@test
++def bounds_cover_only_the_features_that_survived():
++    west = [point(i, -170.0 + (i % 50) * 0.1, 10.0 + (i // 50) * 0.1) for i in range(400)]
++    east = [square(1000 + i, 160.0 + (i % 20) * 0.5, 20.0 + (i // 20) * 0.5, 0.5)
++            for i in range(400)]
++    source = build_tileset('spread', west + east, ['-l', 'spread'])
++    east_only = build_tileset('spread_east', east, ['-l', 'spread'])
++    whole, _, _ = join('spread_whole', [source], ['-M', '5000000'])
++    assert bounds_of(whole)[0] < -160.0, bounds_of(whole)
++    reference, _, _ = join('spread_east_join', [east_only], ['-M', '5000000'])
++    budget = len(only_tile(reference))
++    out, _, _ = join('spread_reduced', [source], ['-M', str(budget), '--drop-smallest-as-needed'])
++    assert bounds_of(out)[0] > 100.0, bounds_of(out)
++
++
++@test
++def a_skipped_tile_is_not_counted_in_the_layer_statistics():
++    source = quad_source()
++    out, code, _ = join('quad_skipped', [source])
++    assert code == 0
++    assert len(tiles(out)) == 4
++    assert tilestats_layers(out)['quad']['count'] == 90000
++
++
++@test
++def a_skipped_tile_does_not_extend_the_tileset_zoom_range():
++    source = quad_source()
++    out, _, _ = join('quad_zooms', [source])
++    assert zoom_range(out) == (1, 1)
++
++
++@test
++def a_skipped_tile_does_not_extend_the_layer_zoom_range():
++    source = quad_source()
++    out, _, _ = join('quad_layer_zooms', [source])
++    assert vector_layers(out) == {'quad': (1, 1)}
++
++
++@test
++def a_skipped_tile_does_not_widen_the_bounds():
++    far = [point(i, -170.0 + (i % 10) * 0.1, 10.0 + (i // 10) * 0.1) for i in range(100)]
++    dense = [point(1000 + i, 40.0 + (i % 300) * 0.1, -20.0 + (i // 300) * 0.1)
++             for i in range(90000)]
++    far_source = build_tileset('far', far, ['-Z1', '-z1', '-l', 'spread'])
++    dense_source = build_tileset('dense', dense, ['-Z1', '-z1', '-l', 'spread'])
++    out, _, _ = join('skip_bounds', [far_source, dense_source])
++    assert len(tiles(out)) == 1
++    edges = bounds_of(out)
++    assert edges[2] < 0.0, edges
++
++
++@test
++def no_tile_size_limit_books_the_oversized_tile():
++    source = quad_source()
++    out, _, _ = join('quad_unlimited', [source], ['--no-tile-size-limit', '--drop-smallest-as-needed'])
++    assert len(tiles(out)) == 5
++    assert zoom_range(out) == (0, 1)
++    assert tilestats_layers(out)['quad']['count'] == 180000
++    assert strategies(out) is None
++
++
++@test
++def an_emptied_layer_is_not_counted_in_the_layer_statistics():
++    small = [square(i, -122.4 + (i % 40) * 0.004, 37.70 + (i // 40) * 0.004, 0.0004)
++             for i in range(400)]
++    wide = [square(1000 + i, -122.0 + (i % 20) * 0.05, 37.90 + (i // 20) * 0.05, 0.04)
++            for i in range(400)]
++    source_small = build_tileset('tiny_layer', small, ['-l', 'tiny'])
++    source_wide = build_tileset('wide_layer', wide, ['-l', 'wide'])
++    wide_only, _, _ = join('wide_alone', [source_wide], ['-M', '5000000'])
++    budget = len(only_tile(wide_only))
++    out, _, _ = join('two_layers_booked', [source_small, source_wide],
++                     ['-M', str(budget), '--drop-smallest-as-needed'])
++    layers = tilestats_layers(out)
++    assert 'tiny' not in layers, sorted(layers)
++    assert layers['wide']['count'] == written_feature_count(out)
++    assert vector_layers(out) == {'wide': (0, 0)}
++
++
++@test
++def a_skipped_multi_layer_tile_leaves_no_layer_behind():
++    first = build_tileset('half_one', dense_points(45000, seed=2), ['-l', 'one'])
++    second = build_tileset('half_two', dense_points(45000, seed=3), ['-l', 'two'])
++    out, _, _ = join('both_skipped', [first, second])
++    assert len(tiles(out)) == 0
++    assert meta_json(out)['tilestats']['layerCount'] == 0
++    assert vector_layers(out) == {}
++
++
++@test
++def a_copied_tile_is_booked_exactly_as_before():
++    source = build_tileset('plain', dense_points(500))
++    out, _, _ = join('plain_join', [source], ['--drop-smallest-as-needed'])
++    assert tilestats_layers(out)['plain']['count'] == 500
++    assert written_feature_count(out) == 500
++    assert zoom_range(out) == (0, 0)
++    assert vector_layers(out) == {'plain': (0, 0)}
++
++
++@test
++def a_reduced_tile_and_a_copied_tile_are_booked_together():
++    source = quad_source()
++    out, _, _ = join('quad_reduced', [source], ['--drop-smallest-as-needed'])
++    assert len(tiles(out)) == 5
++    written = written_feature_count(out)
++    assert 90000 < written < 180000, written
++    assert tilestats_layers(out)['quad']['count'] == written
++    assert zoom_range(out) == (0, 1)
++
++
++@test
++def ties_are_shed_from_the_end_of_the_merge_order():
++    source = build_tileset('ties', dense_points(3000))
++    whole, _, _ = join('ties_whole', [source], ['-M', '5000000'])
++    order = []
++    for layer in layers_of(whole):
++        for feature in layer['features']:
++            order.append(mvt.attributes(layer, feature)['id'])
++    assert len(order) == 3000
++    budget = len(only_tile(whole)) // 2
++    out, _, _ = join('ties_reduced', [source], ['-M', str(budget), '--drop-smallest-as-needed'])
++    kept = ids_of(layers_of(out))
++    assert 0 < len(kept) < len(order), len(kept)
++    assert kept == set(order[:len(kept)]), 'ties were not shed from the end of the merge order'
++
++
++@test
++def no_tile_compression_measures_the_uncompressed_tile():
++    source = build_tileset('measured', dense_points(20000))
++    packed, _, _ = join('measured_packed', [source], ['-M', '5000000'])
++    packed_size = len(only_tile(packed))
++    raw, _, _ = join('measured_raw', [source], ['-M', '5000000', '--no-tile-compression'])
++    raw_size = len(only_tile(raw))
++    assert raw_size > packed_size, (raw_size, packed_size)
++    budget = (packed_size + raw_size) // 2
++    fits, _, _ = join('measured_fits', [source], ['-M', str(budget), '--drop-smallest-as-needed'])
++    assert feature_count(fits) == 20000
++    shrunk, _, _ = join('measured_shrunk', [source],
++                        ['-M', str(budget), '--no-tile-compression', '--drop-smallest-as-needed'])
++    assert feature_count(shrunk) < 20000
++    assert len(only_tile(shrunk)) <= budget
++
++
++@test
++def lines_are_shed_by_the_width_plus_height_of_their_bounding_box():
++    straight = [line(1000 + i, [[-170.0 + (i % 20) * 8.0, -60.0 + (i // 20) * 6.0],
++                                [-167.0 + (i % 20) * 8.0, -60.0 + (i // 20) * 6.0]]) for i in range(200)]
++    zigzag = [line(i, [[-170.0 + (i % 20) * 8.0 + (k % 2) * 1.0, 5.0 + (i // 20) * 6.0 + k * 0.05]
++                       for k in range(20)]) for i in range(200)]
++    source = build_tileset('lines', straight + zigzag, ['-l', 'lines'])
++    straight_only = build_tileset('lines_straight', straight, ['-l', 'lines'])
++    whole, _, _ = join('lines_whole', [source], ['-M', '5000000'])
++    extents = {}
++    for layer in layers_of(whole):
++        for feature in layer['features']:
++            extents[mvt.attributes(layer, feature)['id']] = mvt.extent_of(feature)
++    assert max(extents[i] for i in range(0, 200)) < min(extents[i] for i in range(1000, 1200))
++    reference, _, _ = join('lines_reference', [straight_only], ['-M', '5000000'])
++    budget = len(only_tile(reference))
++    out, _, _ = join('lines_reduced', [source], ['-M', str(budget), '--drop-smallest-as-needed'])
++    kept = ids_of(layers_of(out))
++    assert not (kept & set(range(0, 200))), 'a zigzag line outlasted a straight one'
++    assert kept & set(range(1000, 1200)), 'every straight line was shed'
++
++
++@test
++def a_tile_is_reduced_to_its_last_feature_when_that_feature_fits():
++    rng = random.Random(5)
++    smaller = square(1, 10.0, 10.0, 2.0, {'blob': blob(rng, 1000)})
++    larger = square(2, 40.0, 10.0, 8.0, {'blob': blob(rng, 1000)})
++    source = build_tileset('pair', [smaller, larger], ['-l', 'pair'])
++    larger_only = build_tileset('pair_larger', [larger], ['-l', 'pair'])
++    alone, _, _ = join('pair_alone', [larger_only], ['-M', '5000000', '--no-tile-compression'])
++    budget = len(only_tile(alone))
++    out, _, _ = join('pair_reduced', [source],
++                     ['-M', str(budget), '--no-tile-compression', '--drop-smallest-as-needed'])
++    assert ids_of(layers_of(out)) == {2}
++
++
++@test
++def features_shed_from_a_tile_that_is_still_skipped_are_reported():
++    rng = random.Random(9)
++    points = [point(100 + i, -50.0 + i * 0.5, 5.0) for i in range(20)]
++    huge = square(1, 20.0, 20.0, 10.0, {'blob': blob(rng, 4000)})
++    source = build_tileset('shed_then_skip', points + [huge], ['-l', 'sk'])
++    whole, _, _ = join('shed_then_skip_whole', [source], ['-M', '5000000', '--no-tile-compression'])
++    desired = len(only_tile(whole))
++    out, code, _ = join('shed_then_skip_reduced', [source],
++                        ['-M', '3000', '--no-tile-compression', '--drop-smallest-as-needed'])
++    assert code == 0
++    assert len(tiles(out)) == 0
++    assert meta_json(out)['tilestats']['layerCount'] == 0
++    recorded = strategies(out)
++    assert recorded[0]['dropped_as_needed'] == 20
++    assert recorded[0]['tile_size_desired'] == desired
++
++
++@test
++def shed_counts_are_added_to_inherited_strategies():
++    source = oversized_source()
++    plain, _, _ = join('inherit_plain', [source], ['--drop-smallest-as-needed'])
++    own = strategies(plain)[0]
++    set_strategies(source, [{'dropped_as_needed': 1000, 'tile_size_desired': 5000000}])
++    out, _, _ = join('inherit_large', [source], ['--drop-smallest-as-needed'])
++    recorded = strategies(out)[0]
++    assert recorded['dropped_as_needed'] == own['dropped_as_needed'] + 1000
++    assert recorded['tile_size_desired'] == 5000000
++
++
++@test
++def tile_size_desired_is_the_larger_of_the_inherited_and_the_new_size():
++    source = oversized_source()
++    plain, _, _ = join('inherit_small_plain', [source], ['--drop-smallest-as-needed'])
++    own = strategies(plain)[0]
++    set_strategies(source, [{'dropped_as_needed': 1000, 'tile_size_desired': 600000}])
++    out, _, _ = join('inherit_small', [source], ['--drop-smallest-as-needed'])
++    assert strategies(out)[0]['tile_size_desired'] == own['tile_size_desired']
++
++
++@test
++def inherited_strategies_survive_a_run_that_sheds_nothing():
++    source = build_tileset('inherit_noop', dense_points(500))
++    inherited = [{'dropped_as_needed': 7, 'tile_size_desired': 123456}]
++    set_strategies(source, inherited)
++    out, code, _ = join('inherit_noop_join', [source], ['--drop-smallest-as-needed'])
++    assert code == 0
++    assert strategies(out) == inherited
++
++
++@test
++def strategies_total_every_reduced_tile_at_each_zoom():
++    source = pyramid_source()
++    whole, _, _ = join('pyramid_whole', [source], ['-M', '5000000'])
++    largest = {}
++    before = {}
++    for zoom, _, _, data in tiles(whole):
++        largest[zoom] = max(largest.get(zoom, 0), len(data))
++        before[zoom] = before.get(zoom, 0) + sum(len(layer['features']) for layer in mvt.decode_tile(data))
++        assert len(data) > 60000
++    out, _, _ = join('pyramid_reduced', [source], ['-M', '60000', '--drop-smallest-as-needed'])
++    after = {}
++    written = {}
++    for zoom, _, _, data in tiles(out):
++        after[zoom] = after.get(zoom, 0) + sum(len(layer['features']) for layer in mvt.decode_tile(data))
++        written[zoom] = written.get(zoom, 0) + 1
++    assert written == {0: 1, 1: 4, 2: 16}, written
++    recorded = strategies(out) or []
++    assert len(recorded) == 3, recorded
++    assert [recorded[z].get('dropped_as_needed', 0) for z in (0, 1, 2)] == [before[z] - after[z] for z in (0, 1, 2)], recorded
++    assert [recorded[z].get('tile_size_desired', 0) for z in (0, 1, 2)] == [largest[z] for z in (0, 1, 2)], recorded
++
++
++@test
++def polygons_are_shed_by_the_area_of_their_bounding_box():
++    thin = [rectangle(i, -170.0 + i * 1.6, -40.0, 0.5, 20.0) for i in range(100)]
++    squat = [rectangle(1000 + i, -170.0 + (i % 20) * 8.0, 5.0 + (i // 20) * 6.0, 5.0, 5.0) for i in range(100)]
++    source = build_tileset('rects', thin + squat, ['-l', 'rects', '-pt'])
++    squat_only = build_tileset('rects_squat', squat, ['-l', 'rects', '-pt'])
++    whole, _, _ = join('rects_whole', [source], ['-M', '5000000'])
++    boxes = {}
++    for layer in layers_of(whole):
++        for feature in layer['features']:
++            boxes[mvt.attributes(layer, feature)['id']] = mvt.bbox(feature)
++    assert len(boxes) == 200
++    area = {i: (b[2] - b[0]) * (b[3] - b[1]) for i, b in boxes.items()}
++    span = {i: (b[2] - b[0]) + (b[3] - b[1]) for i, b in boxes.items()}
++    assert max(area[i] for i in range(0, 100)) < min(area[i] for i in range(1000, 1100))
++    assert min(span[i] for i in range(0, 100)) > max(span[i] for i in range(1000, 1100))
++    reference, _, _ = join('rects_reference', [squat_only], ['-M', '5000000'])
++    budget = len(only_tile(reference))
++    out, _, _ = join('rects_reduced', [source], ['-M', str(budget), '--drop-smallest-as-needed'])
++    kept = ids_of(layers_of(out))
++    assert not (kept & set(range(0, 100))), 'a thin rectangle outlasted a squat one'
++    assert kept & set(range(1000, 1100)), 'every squat rectangle was shed'
++
++
++@test
++def lines_are_not_ranked_by_their_longest_side():
++    straight = [line(1000 + i, [[-170.0 + (i % 12) * 16.0, -50.0 + (i // 12) * 5.0],
++                                [-161.0 + (i % 12) * 16.0, -50.0 + (i // 12) * 5.0]]) for i in range(60)]
++    bent = [line(i, [[-170.0 + (i % 12) * 16.0, (i // 12) * 6.0],
++                     [-164.7 + (i % 12) * 16.0, (i // 12) * 6.0],
++                     [-164.7 + (i % 12) * 16.0, 5.0 + (i // 12) * 6.0]]) for i in range(60)]
++    source = build_tileset('bent', straight + bent, ['-l', 'bent'])
++    straight_only = build_tileset('bent_straight', straight, ['-l', 'bent'])
++    whole, _, _ = join('bent_whole', [source], ['-M', '5000000'])
++    boxes = {}
++    for layer in layers_of(whole):
++        for feature in layer['features']:
++            boxes[mvt.attributes(layer, feature)['id']] = mvt.bbox(feature)
++    assert len(boxes) == 120
++    span = {i: (b[2] - b[0]) + (b[3] - b[1]) for i, b in boxes.items()}
++    longest = {i: max(b[2] - b[0], b[3] - b[1]) for i, b in boxes.items()}
++    assert max(span[i] for i in range(1000, 1060)) < min(span[i] for i in range(0, 60))
++    assert max(longest[i] for i in range(0, 60)) < min(longest[i] for i in range(1000, 1060))
++    reference, _, _ = join('bent_reference', [straight_only], ['-M', '5000000'])
++    budget = len(only_tile(reference))
++    out, _, _ = join('bent_reduced', [source], ['-M', str(budget), '--drop-smallest-as-needed'])
++    kept = ids_of(layers_of(out))
++    assert not (kept & set(range(1000, 1060))), 'a straight line outlasted a bent one'
++    assert kept & set(range(0, 60)), 'every bent line was shed'
++
++
++@test
++def extent_still_orders_shedding_when_geometries_are_excluded():
++    small, big = mixed_extents()
++    source = build_tileset('bare', small + big, ['-l', 'mix'])
++    big_only = build_tileset('bare_big', big, ['-l', 'mix'])
++    reference, _, _ = join('bare_reference', [big_only], ['-M', '5000000', '--exclude-all-tile-geometries'])
++    budget = len(only_tile(reference))
++    out, code, err = join('bare_reduced', [source],
++                          ['-M', str(budget), '--exclude-all-tile-geometries', '--drop-smallest-as-needed'])
++    assert code == 0, err[-400:]
++    tags = set()
++    for layer in layers_of(out):
++        for feature in layer['features']:
++            tags.add(mvt.attributes(layer, feature)['tag'])
++    assert tags == {'big'}, tags
++
++
++@test
++def a_coarser_layer_is_ranked_after_its_coordinates_are_rescaled():
++    coarse = [line(i, [[-170.0 + (i % 10) * 16.0, -50.0 + (i // 10) * 8.0],
++                       [-160.0 + (i % 10) * 16.0, -50.0 + (i // 10) * 8.0]]) for i in range(30)]
++    fine = [line(1000 + i, [[-170.0 + (i % 10) * 16.0, 10.0 + (i // 10) * 8.0],
++                            [-165.0 + (i % 10) * 16.0, 10.0 + (i // 10) * 8.0]]) for i in range(30)]
++    anchor = [rectangle(5000, 100.0, -60.0, 60.0, 120.0)]
++    coarse_source = build_tileset('coarse', coarse, ['-l', 'grid', '-d10'])
++    fine_source = build_tileset('fine', fine + anchor, ['-l', 'grid'])
++    anchor_source = build_tileset('anchor', anchor, ['-l', 'grid'])
++    coarse_layer = layers_of(coarse_source)[0]
++    fine_layer = layers_of(fine_source)[0]
++    assert (coarse_layer['extent'], fine_layer['extent']) == (1024, 4096)
++    source_coarse = [mvt.extent_of(f) for f in coarse_layer['features']]
++    source_fine = [mvt.extent_of(f) for f in fine_layer['features'] if mvt.attributes(fine_layer, f)['id'] < 5000]
++    assert max(source_coarse) < min(source_fine)
++    whole, _, _ = join('grid_whole', [coarse_source, fine_source], ['-M', '5000000'])
++    merged = layers_of(whole)[0]
++    merged_extent = {mvt.attributes(merged, f)['id']: mvt.extent_of(f) for f in merged['features']}
++    assert merged['extent'] == 4096
++    assert min(merged_extent[i] for i in range(30)) > max(merged_extent[i] for i in range(1000, 1030))
++    reference, _, _ = join('grid_reference', [coarse_source, anchor_source], ['-M', '5000000', '--no-tile-compression'])
++    budget = len(only_tile(reference)) - 1
++    out, _, _ = join('grid_reduced', [coarse_source, fine_source],
++                     ['-M', str(budget), '--no-tile-compression', '--drop-smallest-as-needed'])
++    kept = ids_of(layers_of(out))
++    assert not (kept & set(range(1000, 1030))), 'a finer line outlasted a rescaled coarse one'
++    assert kept & set(range(0, 30)), 'every coarse line was shed'
++
++
++@test
++def excluded_geometries_are_ranked_on_their_rescaled_coordinates():
++    narrow = {'name': 'edge', 'extent': 3, 'features': [
++        {'type': 2, 'geometry': mvt.line_geometry([(0, 0), (1, 0)]), 'attributes': {'id': 1}},
++        {'type': 2, 'geometry': mvt.line_geometry([(2, 0), (3, 0)]), 'attributes': {'id': 2}}]}
++    wide = {'name': 'edge', 'extent': 4, 'features': [
++        {'type': 2, 'geometry': mvt.line_geometry([(0, 1), (4, 1)]), 'attributes': {'id': 3}}]}
++    first = write_mbtiles('edge_narrow', [narrow])
++    second = write_mbtiles('edge_wide', [wide])
++    merged, code, err = join('edge_merged', [first, second], ['-M', '5000000', '--no-tile-compression'])
++    assert code == 0, err[-400:]
++    layer = layers_of(merged)[0]
++    assert layer['extent'] == 4
++    widths = [(mvt.attributes(layer, f)['id'], mvt.bbox(f)[2] - mvt.bbox(f)[0]) for f in layer['features']]
++    assert widths == [(1, 1), (2, 2), (3, 4)], widths
++    bare, _, _ = join('edge_bare', [first, second], ['-M', '5000000', '--no-tile-compression', '--exclude-all-tile-geometries'])
++    budget = len(only_tile(bare)) - 1
++    out, _, _ = join('edge_reduced', [first, second],
++                     ['-M', str(budget), '--no-tile-compression', '--exclude-all-tile-geometries', '--drop-smallest-as-needed'])
++    kept = ids_of(layers_of(out))
++    assert 1 not in kept, kept
++    assert 3 in kept, kept
++
++
++@test
++def strategies_inherited_from_every_input_are_combined():
++    first = build_tileset('inherit_half_one', dense_points(45000, seed=2), ['-l', 'pts'])
++    second = build_tileset('inherit_half_two', dense_points(45000, seed=3), ['-l', 'pts'])
++    plain, _, _ = join('inherit_halves_plain', [first, second], ['--drop-smallest-as-needed'])
++    own = strategies(plain)[0]
++    assert own['tile_size_desired'] < 5000000
++    set_strategies(first, [{'dropped_as_needed': 100, 'tile_size_desired': 5000000}])
++    set_strategies(second, [{'dropped_as_needed': 200, 'tile_size_desired': 6000000}])
++    out, _, _ = join('inherit_halves', [first, second], ['--drop-smallest-as-needed'])
++    recorded = strategies(out)[0]
++    assert recorded['dropped_as_needed'] == own['dropped_as_needed'] + 300
++    assert recorded['tile_size_desired'] == 6000000
++
++
++@test
++def a_multipoint_is_shed_as_a_zero_extent_feature():
++    layer = {'name': 'spread', 'extent': 4096, 'features': [
++        {'type': 1, 'geometry': mvt.point_geometry([(0, 0), (100, 0)]), 'attributes': {'id': 2}},
++        {'type': 2, 'geometry': mvt.line_geometry([(0, 50), (1, 50)]), 'attributes': {'id': 1}},
++        {'type': 2, 'geometry': mvt.line_geometry([(0, 90), (500, 90)]), 'attributes': {'id': 3}}]}
++    source = write_mbtiles('spread', [layer])
++    whole, code, err = join('spread_whole', [source], ['-M', '5000000', '--no-tile-compression'])
++    assert code == 0, err[-400:]
++    decoded = layers_of(whole)[0]
++    assert [(mvt.attributes(decoded, f)['id'], f['type']) for f in decoded['features']] == [(2, 1), (1, 2), (3, 2)]
++    budget = len(only_tile(whole)) - 1
++    out, _, _ = join('spread_reduced', [source],
++                     ['-M', str(budget), '--no-tile-compression', '--drop-smallest-as-needed'])
++    kept = ids_of(layers_of(out))
++    assert 2 not in kept, kept
++    assert 3 in kept, kept
++
++
++@test
++def surviving_features_keep_the_type_of_every_attribute_value():
++    survivors = [
++        {'type': 2, 'geometry': mvt.line_geometry([(0, 100), (3000, 100)]),
++         'attributes': {'id': 1, 'flag': ('bool', True), 'ratio': ('double', 2.5), 'scale': ('float', 1.5),
++                        'delta': ('sint', -7), 'count': ('uint', 42), 'offset': ('int', 9), 'label': 'kept'}},
++        {'type': 2, 'geometry': mvt.line_geometry([(0, 300), (3000, 300)]),
++         'attributes': {'id': 2, 'flag': ('bool', False), 'ratio': ('double', -0.25), 'scale': ('float', 3.0),
++                        'delta': ('sint', 11), 'count': ('uint', 7), 'offset': ('int', 9), 'label': 'also kept'}}]
++    shed = [{'type': 1, 'geometry': mvt.point_geometry([(10 + i * 30, 2000)]),
++             'attributes': {'id': 100 + i, 'flag': ('bool', i % 2 == 0), 'ratio': ('double', i / 8.0), 'note': 'shed-%d' % i}}
++            for i in range(40)]
++    source = write_mbtiles('typed', [{'name': 'typed', 'extent': 4096, 'features': survivors + shed}])
++    survivors_only = write_mbtiles('typed_survivors', [{'name': 'typed', 'extent': 4096, 'features': survivors}])
++    whole, code, err = join('typed_whole', [source], ['-M', '5000000', '--no-tile-compression'])
++    assert code == 0, err[-400:]
++    before = typed_attributes_by_id(layers_of(whole))
++    assert len({field for key in (1, 2) for _, field in before[key].values()}) >= 6, before
++    reference, _, _ = join('typed_reference', [survivors_only], ['-M', '5000000', '--no-tile-compression'])
++    budget = len(only_tile(reference)) + 2
++    out, _, _ = join('typed_reduced', [source],
++                     ['-M', str(budget), '--no-tile-compression', '--drop-smallest-as-needed'])
++    after = typed_attributes_by_id(layers_of(out))
++    assert 1 in after, sorted(after)
++    assert not (set(after) - {1, 2}), sorted(after)
++    for key in after:
++        assert after[key] == before[key], (key, after[key], before[key])
++
++
++@test
++def ties_are_shed_in_merge_order_across_inputs_and_layers():
++    rows = {'a': 500, 'b': 1500}
++
++    def points(ids):
++        return [{'type': 1, 'geometry': mvt.point_geometry([(40 + 60 * (i % 100), rows['b'] if 100 <= i < 200 else (rows['a'] if i < 100 else 2500))]),
++                 'attributes': {'id': i}} for i in ids]
++
++    def layers(ids):
++        out = []
++        for i in ids:
++            name = 'b' if 100 <= i < 200 else 'a'
++            if not out or out[-1]['name'] != name:
++                out.append({'name': name, 'extent': 4096, 'ids': []})
++            out[-1]['ids'].append(i)
++        return [{'name': layer['name'], 'extent': 4096, 'features': points(layer['ids'])} for layer in out]
++
++    first_a, first_b, second_a = list(range(0, 20)), list(range(100, 120)), list(range(200, 220))
++    first = write_mbtiles('tie_first', layers(first_a + first_b))
++    second = write_mbtiles('tie_second', layers(second_a))
++    whole, code, err = join('tie_whole', [first, second], ['-M', '5000000', '--no-tile-compression'])
++    assert code == 0, err[-400:]
++    grouped = {layer['name']: [mvt.attributes(layer, f)['id'] for f in layer['features']] for layer in layers_of(whole)}
++    assert grouped['b'] == first_b, grouped
++    assert grouped['a'] in (first_a + second_a, second_a + first_a), grouped
++    merge_order = first_a + first_b + second_a if grouped['a'][0] == 0 else second_a + first_a + first_b
++    prefix = write_mbtiles('tie_prefix', layers(merge_order[:30]))
++    reference, _, _ = join('tie_reference', [prefix], ['-M', '5000000', '--no-tile-compression'])
++    out, _, _ = join('tie_reduced', [first, second],
++                     ['-M', str(len(only_tile(reference))), '--no-tile-compression', '--drop-smallest-as-needed'])
++    kept = ids_of(layers_of(out))
++    assert 0 < len(kept) < 60, len(kept)
++    assert kept == set(merge_order[:len(kept)]), sorted(kept)
++@test
++def an_oversized_tile_skipped_without_shedding_keeps_inherited_strategies():
++    source = oversized_source()
++    inherited = [{'dropped_as_needed': 7, 'tile_size_desired': 123456}]
++    set_strategies(source, inherited)
++    out, code, _ = join('skip_inherited', [source], ['-M', '500000'])
++    assert code == 0
++    assert len(tiles(out)) == 0
++    assert strategies(out) == inherited
++
++
++@test
++def a_tile_that_cannot_shed_leaves_strategies_untouched():
++    rng = random.Random(13)
++    lone = [{'type': 2, 'geometry': mvt.line_geometry([(0, 10), (4000, 10)]), 'attributes': {'id': 1, 'blob': blob(rng, 4000)}}]
++    source = write_mbtiles('lone', [{'name': 'lone', 'extent': 4096, 'features': lone}])
++    out, code, err = join('lone_reduced', [source], ['-M', '3000', '--no-tile-compression', '--drop-smallest-as-needed'])
++    assert code == 0, err[-400:]
++    assert len(tiles(out)) == 0
++    assert strategies(out) is None
++    inherited = [{'dropped_as_needed': 7, 'tile_size_desired': 123456}]
++    set_strategies(source, inherited)
++    out, _, _ = join('lone_inherited', [source], ['-M', '3000', '--no-tile-compression', '--drop-smallest-as-needed'])
++    assert strategies(out) == inherited
++
++
++@test
++def tile_size_desired_counts_a_tile_too_large_to_shed():
++    rng = random.Random(17)
++    lone = [{'type': 2, 'geometry': mvt.line_geometry([(0, 10), (4000, 10)]), 'attributes': {'id': 1, 'blob': blob(rng, 8000)}}]
++    crowd = [{'type': 1, 'geometry': mvt.point_geometry([(40 + 25 * k, 2000)]), 'attributes': {'id': 100 + k, 'note': 'crowd-%d' % k}}
++             for k in range(150)]
++    crowd.append({'type': 2, 'geometry': mvt.line_geometry([(0, 10), (4000, 10)]), 'attributes': {'id': 99, 'blob': blob(rng, 1500)}})
++    source = write_mbtiles('split_zoom', tiles={(1, 0, 0): [{'name': 'm', 'extent': 4096, 'features': lone}],
++                                                (1, 1, 0): [{'name': 'm', 'extent': 4096, 'features': crowd}]})
++    whole, code, err = join('split_zoom_whole', [source], ['-M', '5000000', '--no-tile-compression'])
++    assert code == 0, err[-400:]
++    sizes = {(row[0], row[1]): len(row[3]) for row in tiles(whole)}
++    assert sizes[(1, 0)] > sizes[(1, 1)] > 3000, sizes
++    out, _, _ = join('split_zoom_reduced', [source], ['-M', '3000', '--no-tile-compression', '--drop-smallest-as-needed'])
++    assert [(row[0], row[1]) for row in tiles(out)] == [(1, 1)]
++    recorded = strategies(out) or []
++    assert len(recorded) == 2, recorded
++    assert recorded[1].get('dropped_as_needed', 0) == 151 - written_feature_count(out), recorded
++    assert recorded[1].get('tile_size_desired', 0) == sizes[(1, 0)], recorded
++
++
++@test
++def bounds_follow_features_rescaled_into_a_larger_extent():
++    coarse = write_mbtiles('bounds_coarse', [{'name': 'edge', 'extent': 3, 'features': [
++        {'type': 1, 'geometry': mvt.point_geometry([(2, 2)]), 'attributes': {'id': 1}}]}])
++    fine = write_mbtiles('bounds_fine', [{'name': 'edge', 'extent': 4, 'features': [
++        {'type': 1, 'geometry': mvt.point_geometry([(3, 3)]), 'attributes': {'id': 2}}]}])
++    out, code, err = join('bounds_merged', [coarse, fine], ['-M', '5000000', '--no-tile-compression'])
++    assert code == 0, err[-400:]
++    layer = layers_of(out)[0]
++    assert layer['extent'] == 4
++    assert [(mvt.attributes(layer, f)['id'], mvt.bbox(f)[:2]) for f in layer['features']] == [(1, (2, 2)), (2, (3, 3))]
++    minlon, minlat, maxlon, maxlat = bounds_of(out)
++    assert abs(minlon) < 0.5 and abs(maxlat) < 0.5, bounds_of(out)
++    assert abs(maxlon - 90.0) < 0.5, bounds_of(out)
++
++
++def junit(results, output_path, suite):
++    suites = ET.Element('testsuites')
++    element = ET.SubElement(suites, 'testsuite', name=suite,
++                            tests=str(len(results)),
++                            failures=str(sum(1 for r in results if r[1] is not None)),
++                            errors='0', time='%.3f' % sum(r[2] for r in results))
++    for name, failure, seconds, output in results:
++        case = ET.SubElement(element, 'testcase', name=name, classname=suite, time='%.3f' % seconds)
++        if failure is not None:
++            node = ET.SubElement(case, 'failure', message=failure[:200])
++            node.text = output
++    directory = os.path.dirname(output_path)
++    if directory:
++        os.makedirs(directory, exist_ok=True)
++    ET.ElementTree(suites).write(output_path, encoding='utf-8', xml_declaration=True)
++
++
++def run_new():
++    global WORK
++    results = []
++    for fn in TESTS:
++        WORK = tempfile.mkdtemp(prefix='tjlimit-')
++        started = time.time()
++        try:
++            fn()
++            results.append((fn.__name__, None, time.time() - started, ''))
++        except BaseException as exc:
++            results.append((fn.__name__, '%s: %s' % (type(exc).__name__, exc),
++                            time.time() - started, traceback.format_exc()))
++        finally:
++            shutil.rmtree(WORK, ignore_errors=True)
++    return results
++
++
++def golden_checks():
++    out = []
++    for directory in sorted(os.listdir(os.path.join(ROOT, 'tests'))):
++        outdir = os.path.join(ROOT, 'tests', directory, 'out')
++        if os.path.isdir(outdir):
++            for name in sorted(os.listdir(outdir)):
++                if name.endswith('.json'):
++                    out.append('tests/%s/out/%s.check' % (directory, name))
++    return out
++
++
++def run_base():
++    results = []
++    jobs = '-j%d' % (os.cpu_count() or 2)
++    for target in BASE_TARGETS:
++        started = time.time()
++        code, out, err = run(['make', jobs, target])
++        results.append(('make_%s' % target.replace('-', '_'),
++                        None if code == 0 else 'exit %d' % code,
++                        time.time() - started, out[-4000:] + err[-4000:]))
++
++    unit_xml = os.path.join(tempfile.mkdtemp(prefix='tjunit-'), 'unit.xml')
++    started = time.time()
++    code, out, err = run([os.path.join(ROOT, 'unit'), '-r', 'junit', '-o', unit_xml])
++    parsed = False
++    unit_results = []
++    if os.path.exists(unit_xml):
++        try:
++            tree = ET.parse(unit_xml)
++            for case in tree.iter('testcase'):
++                problems = case.findall('failure') + case.findall('error')
++                unit_results.append(('unit_' + case.get('name', 'case').replace(' ', '_'),
++                                     None if not problems else (problems[0].get('message') or problems[0].tag),
++                                     float(case.get('time', '0') or 0),
++                                     '\n'.join((problem.text or '') for problem in problems)))
++            parsed = True
++        except ET.ParseError:
++            parsed = False
++    results.extend(unit_results)
++    if not parsed or (code != 0 and all(result[1] is None for result in unit_results)):
++        results.append(('unit_suite', None if code == 0 else 'exit %d' % code,
++                        time.time() - started, out[-4000:] + err[-4000:]))
++
++    checks = golden_checks()
++    started = time.time()
++    code, out, err = run(['make', jobs] + checks)
++    results.append(('golden_file_checks', None if code == 0 else 'exit %d' % code,
++                    time.time() - started, out[-6000:] + err[-6000:]))
++    return results
++
++
++def main():
++    mode = 'base'
++    output_path = None
++    args = sys.argv[1:]
++    i = 0
++    while i < len(args):
++        if args[i].startswith('--output_path='):
++            output_path = args[i].split('=', 1)[1]
++        elif args[i] == '--output_path':
++            output_path = args[i + 1]
++            i += 1
++        elif args[i] in ('base', 'new'):
++            mode = args[i]
++        i += 1
++
++    results = run_new() if mode == 'new' else run_base()
++    if output_path:
++        junit(results, output_path, 'tile_join_limit' if mode == 'new' else 'tippecanoe_base')
++    failed = [r for r in results if r[1] is not None]
++    for name, failure, _, _ in results:
++        print('%s %s' % ('FAIL' if failure else 'ok  ', name))
++    print('%d/%d passed' % (len(results) - len(failed), len(results)))
++    return 1 if failed else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())

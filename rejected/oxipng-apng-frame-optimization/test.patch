@@ -1,0 +1,1265 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..14d3f241
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,47 @@
++#!/usr/bin/env bash
++set -uo pipefail
++export PATH="/opt/cargo/bin:/root/.cargo/bin:$PATH"; export CARGO_INCREMENTAL=0; export RUSTC_BOOTSTRAP=1
++MODE=""; OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++TEST_JSON="$(mktemp)"; TEST_ERR="$(mktemp)"; STATUS=0
++BASE_TARGETS="--lib --bins --test alpha --test filters --test flags --test interlaced --test interlacing --test lib --test raw --test reduction --test regression --test strategies"
++case "$MODE" in
++  base) cargo test --features sanity-checks $BASE_TARGETS -- -Z unstable-options --format json --report-time > "$TEST_JSON" 2> "$TEST_ERR"; STATUS=$? ;;
++  new)  cargo test --features sanity-checks --test apng_frames_8ecd58 -- -Z unstable-options --format json --report-time > "$TEST_JSON" 2> "$TEST_ERR"; STATUS=$? ;;
++esac
++cat "$TEST_ERR" >&2
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  cargo2junit < "$TEST_JSON" > "$OUTPUT_PATH" 2>/dev/null || true
++  if ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++    [ "$STATUS" -eq 0 ] && STATUS=1
++    sanitized=$( { cat "$TEST_ERR"; cat "$TEST_JSON"; } | tail -c 4000 | sed -e 's/]]>/]]]]><![CDATA[>/g')
++    if [ "$MODE" = "new" ]; then
++      count=0; cases=""
++      for name in $(grep -A1 '^#\[test\]' tests/apng_frames_8ecd58.rs | sed -n 's/^fn \([a-z0-9_]*\)().*/\1/p'); do
++        count=$((count + 1))
++        cases="${cases}    <testcase name=\"${name}\" classname=\"\"><failure message=\"build failed\"><![CDATA[${sanitized}]]></failure></testcase>
++"
++      done
++    else
++      count=1
++      cases="    <testcase name=\"compilation\" classname=\"cargo-test\"><failure message=\"build failed\"><![CDATA[${sanitized}]]></failure></testcase>
++"
++    fi
++    {
++      printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n'
++      printf '  <testsuite name="cargo test #0" tests="%s" failures="%s" errors="0">\n' "$count" "$count"
++      printf '%s' "$cases"
++      printf '  </testsuite>\n</testsuites>\n'
++    } > "$OUTPUT_PATH"
++  fi
++fi
++exit $STATUS
+diff --git a/tests/apng_frames_8ecd58.rs b/tests/apng_frames_8ecd58.rs
+new file mode 100644
+index 00000000..52e659f2
+--- /dev/null
++++ b/tests/apng_frames_8ecd58.rs
+@@ -0,0 +1,1206 @@
++#![cfg(feature = "sanity-checks")]
++
++use std::{fs, io::Cursor, path::PathBuf, process::Command};
++
++use image::{AnimationDecoder, DynamicImage, RgbaImage, codecs::png::PngDecoder};
++use oxipng::{internal_tests::*, *};
++
++type Px = [u8; 4];
++
++const NONE: u8 = 0;
++const BACKGROUND: u8 = 1;
++const PREVIOUS: u8 = 2;
++const SOURCE: u8 = 0;
++const OVER: u8 = 1;
++
++const RED: Px = [220, 20, 20, 255];
++const GREEN: Px = [20, 200, 40, 255];
++const BLUE: Px = [30, 40, 210, 255];
++const WHITE: Px = [255, 255, 255, 255];
++const CLEAR: Px = [0, 0, 0, 0];
++
++#[derive(Clone)]
++struct Fr {
++    x: u32,
++    y: u32,
++    w: u32,
++    h: u32,
++    delay: (u16, u16),
++    dispose: u8,
++    blend: u8,
++    px: Vec<Px>,
++}
++
++#[derive(Clone, Copy, PartialEq)]
++enum Format {
++    Rgba,
++    Indexed(u8),
++    Interlaced,
++}
++
++struct Anim {
++    w: u32,
++    h: u32,
++    hidden: Option<Vec<Px>>,
++    frames: Vec<Fr>,
++    plays: u32,
++    format: Format,
++}
++
++#[derive(Debug, PartialEq, Clone, Copy)]
++struct Ctl {
++    x: u32,
++    y: u32,
++    w: u32,
++    h: u32,
++    delay: (u16, u16),
++    dispose: u8,
++    blend: u8,
++}
++
++struct Parsed {
++    depth: u8,
++    color_type: u8,
++    interlaced: bool,
++    actl: (u32, u32),
++    ctls: Vec<Ctl>,
++    default_in_animation: bool,
++    fdat_count: usize,
++}
++
++fn fr(x: u32, y: u32, w: u32, h: u32, px: Vec<Px>) -> Fr {
++    Fr {
++        x,
++        y,
++        w,
++        h,
++        delay: (1, 10),
++        dispose: NONE,
++        blend: SOURCE,
++        px,
++    }
++}
++
++fn with(mut f: Fr, dispose: u8, blend: u8) -> Fr {
++    f.dispose = dispose;
++    f.blend = blend;
++    f
++}
++
++fn delayed(mut f: Fr, num: u16, den: u16) -> Fr {
++    f.delay = (num, den);
++    f
++}
++
++fn solid(w: u32, h: u32, c: Px) -> Vec<Px> {
++    vec![c; (w * h) as usize]
++}
++
++fn paint(mut px: Vec<Px>, w: u32, cells: &[(u32, u32)], c: Px) -> Vec<Px> {
++    for &(x, y) in cells {
++        px[(y * w + x) as usize] = c;
++    }
++    px
++}
++
++fn block(mut px: Vec<Px>, w: u32, x0: u32, y0: u32, bw: u32, bh: u32, c: Px) -> Vec<Px> {
++    for y in y0..y0 + bh {
++        for x in x0..x0 + bw {
++            px[(y * w + x) as usize] = c;
++        }
++    }
++    px
++}
++
++fn gradient(w: u32, h: u32, seed: u32) -> Vec<Px> {
++    (0..w * h)
++        .map(|i| {
++            let v = (i * 7 + seed * 13) % 251;
++            [v as u8, (v * 3 % 256) as u8, (255 - v) as u8, 255]
++        })
++        .collect()
++}
++
++fn anim(w: u32, h: u32, frames: Vec<Fr>) -> Anim {
++    Anim {
++        w,
++        h,
++        hidden: None,
++        frames,
++        plays: 0,
++        format: Format::Rgba,
++    }
++}
++
++fn chunk(out: &mut Vec<u8>, name: &[u8], data: &[u8]) {
++    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
++    let mut body = name.to_vec();
++    body.extend_from_slice(data);
++    out.extend_from_slice(&body);
++    out.extend_from_slice(&crc32(&body).to_be_bytes());
++}
++
++fn palette_of(a: &Anim) -> Vec<Px> {
++    let mut palette: Vec<Px> = Vec::new();
++    let all = a
++        .hidden
++        .iter()
++        .flatten()
++        .chain(a.frames.iter().flat_map(|f| f.px.iter()));
++    for p in all {
++        if !palette.contains(p) {
++            palette.push(*p);
++        }
++    }
++    palette
++}
++
++fn scanline(format: Format, palette: &[Px], row: &[Px]) -> Vec<u8> {
++    match format {
++        Format::Indexed(depth) => {
++            let mut bytes = vec![0u8; (row.len() * depth as usize).div_ceil(8)];
++            for (i, p) in row.iter().enumerate() {
++                let idx = palette.iter().position(|c| c == p).unwrap() as u8;
++                let bit = i * depth as usize;
++                bytes[bit / 8] |= idx << (8 - depth as usize - bit % 8);
++            }
++            bytes
++        }
++        _ => row.iter().flatten().copied().collect(),
++    }
++}
++
++fn image_data(format: Format, palette: &[Px], w: u32, h: u32, px: &[Px]) -> Vec<u8> {
++    let mut raw = Vec::new();
++    if format == Format::Interlaced {
++        let passes = [
++            (0, 0, 8, 8),
++            (4, 0, 8, 8),
++            (0, 4, 4, 8),
++            (2, 0, 4, 4),
++            (0, 2, 2, 4),
++            (1, 0, 2, 2),
++            (0, 1, 1, 2),
++        ];
++        for (x0, y0, dx, dy) in passes {
++            if x0 >= w || y0 >= h {
++                continue;
++            }
++            for y in (y0..h).step_by(dy as usize) {
++                let row: Vec<Px> = (x0..w)
++                    .step_by(dx as usize)
++                    .map(|x| px[(y * w + x) as usize])
++                    .collect();
++                raw.push(0);
++                raw.extend(scanline(format, palette, &row));
++            }
++        }
++    } else {
++        for row in px.chunks(w as usize) {
++            raw.push(0);
++            raw.extend(scanline(format, palette, row));
++        }
++    }
++    deflate(&raw, 6, None).unwrap()
++}
++
++fn fctl(seq: u32, f: &Fr) -> Vec<u8> {
++    let mut d = seq.to_be_bytes().to_vec();
++    for v in [f.w, f.h, f.x, f.y] {
++        d.extend_from_slice(&v.to_be_bytes());
++    }
++    d.extend_from_slice(&f.delay.0.to_be_bytes());
++    d.extend_from_slice(&f.delay.1.to_be_bytes());
++    d.extend_from_slice(&[f.dispose, f.blend]);
++    d
++}
++
++fn encode(a: &Anim) -> Vec<u8> {
++    let palette = palette_of(a);
++    let (depth, color_type) = match a.format {
++        Format::Indexed(depth) => (depth, 3),
++        _ => (8, 6),
++    };
++    let mut out = vec![0x89, b'P', b'N', b'G', 13, 10, 26, 10];
++    let mut ihdr = a.w.to_be_bytes().to_vec();
++    ihdr.extend_from_slice(&a.h.to_be_bytes());
++    ihdr.extend_from_slice(&[
++        depth,
++        color_type,
++        0,
++        0,
++        u8::from(a.format == Format::Interlaced),
++    ]);
++    chunk(&mut out, b"IHDR", &ihdr);
++    let mut actl = (a.frames.len() as u32).to_be_bytes().to_vec();
++    actl.extend_from_slice(&a.plays.to_be_bytes());
++    chunk(&mut out, b"acTL", &actl);
++    if color_type == 3 {
++        let plte: Vec<u8> = palette.iter().flat_map(|p| p[..3].to_vec()).collect();
++        chunk(&mut out, b"PLTE", &plte);
++        let trns: Vec<u8> = palette.iter().map(|p| p[3]).collect();
++        chunk(&mut out, b"tRNS", &trns);
++    }
++    let mut seq = 0;
++    let rest = match &a.hidden {
++        Some(img) => {
++            chunk(
++                &mut out,
++                b"IDAT",
++                &image_data(a.format, &palette, a.w, a.h, img),
++            );
++            &a.frames[..]
++        }
++        None => {
++            chunk(&mut out, b"fcTL", &fctl(0, &a.frames[0]));
++            seq = 1;
++            let first = &a.frames[0];
++            chunk(
++                &mut out,
++                b"IDAT",
++                &image_data(a.format, &palette, a.w, a.h, &first.px),
++            );
++            &a.frames[1..]
++        }
++    };
++    for f in rest {
++        chunk(&mut out, b"fcTL", &fctl(seq, f));
++        let mut d = (seq + 1).to_be_bytes().to_vec();
++        d.extend(image_data(a.format, &palette, f.w, f.h, &f.px));
++        chunk(&mut out, b"fdAT", &d);
++        seq += 2;
++    }
++    chunk(&mut out, b"IEND", &[]);
++    out
++}
++
++fn be32(d: &[u8]) -> u32 {
++    u32::from_be_bytes(d[..4].try_into().unwrap())
++}
++
++fn be16(d: &[u8]) -> u16 {
++    u16::from_be_bytes(d[..2].try_into().unwrap())
++}
++
++fn parse(data: &[u8]) -> Parsed {
++    let mut p = Parsed {
++        depth: 0,
++        color_type: 0,
++        interlaced: false,
++        actl: (0, 0),
++        ctls: Vec::new(),
++        default_in_animation: false,
++        fdat_count: 0,
++    };
++    let mut seen_idat = false;
++    let mut i = 8;
++    while i < data.len() {
++        let n = be32(&data[i..]) as usize;
++        let name = &data[i + 4..i + 8];
++        let d = &data[i + 8..i + 8 + n];
++        match name {
++            b"IHDR" => {
++                p.depth = d[8];
++                p.color_type = d[9];
++                p.interlaced = d[12] == 1;
++            }
++            b"acTL" => p.actl = (be32(d), be32(&d[4..])),
++            b"IDAT" => seen_idat = true,
++            b"fdAT" => p.fdat_count += 1,
++            b"fcTL" => {
++                if !seen_idat {
++                    p.default_in_animation = true;
++                }
++                p.ctls.push(Ctl {
++                    w: be32(&d[4..]),
++                    h: be32(&d[8..]),
++                    x: be32(&d[12..]),
++                    y: be32(&d[16..]),
++                    delay: (be16(&d[20..]), be16(&d[22..])),
++                    dispose: d[24],
++                    blend: d[25],
++                });
++            }
++            _ => {}
++        }
++        i += 12 + n;
++    }
++    p
++}
++
++fn visible(img: RgbaImage) -> Vec<Px> {
++    img.pixels()
++        .map(|p| if p.0[3] == 0 { CLEAR } else { p.0 })
++        .collect()
++}
++
++fn frames_of(data: &[u8]) -> Vec<(Vec<Px>, (u64, u64))> {
++    let decoder = PngDecoder::new(Cursor::new(data)).unwrap();
++    decoder
++        .apng()
++        .unwrap()
++        .into_frames()
++        .map(|f| {
++            let f = f.unwrap();
++            let (num, den) = f.delay().numer_denom_ms();
++            (visible(f.into_buffer()), (u64::from(num), u64::from(den)))
++        })
++        .collect()
++}
++
++fn timeline(data: &[u8]) -> Vec<(Vec<Px>, (u64, u64))> {
++    let mut merged: Vec<(Vec<Px>, (u64, u64))> = Vec::new();
++    for (img, (num, den)) in frames_of(data) {
++        match merged.last_mut() {
++            Some((last, (n, d))) if *last == img => {
++                *n = *n * den + num * *d;
++                *d *= den;
++            }
++            _ => merged.push((img, (num, den))),
++        }
++    }
++    merged
++}
++
++fn same_delay(a: (u64, u64), b: (u64, u64)) -> bool {
++    a.0 * b.1 == b.0 * a.1
++}
++
++fn default_image(data: &[u8]) -> Vec<Px> {
++    let decoder = PngDecoder::new(Cursor::new(data)).unwrap();
++    visible(DynamicImage::from_decoder(decoder).unwrap().into_rgba8())
++}
++
++fn assert_plays_same(input: &[u8], output: &[u8]) {
++    let (a, b) = (timeline(input), timeline(output));
++    assert_eq!(
++        a.len(),
++        b.len(),
++        "number of distinct displayed canvases differs"
++    );
++    for (i, ((ia, da), (ib, db))) in a.iter().zip(&b).enumerate() {
++        assert!(ia == ib, "displayed canvas {i} differs");
++        assert!(
++            same_delay(*da, *db),
++            "display time {i} differs: {da:?} vs {db:?}"
++        );
++    }
++    assert_eq!(
++        default_image(input),
++        default_image(output),
++        "default image differs"
++    );
++}
++
++fn opts() -> Options {
++    Options {
++        force: true,
++        ..Options::from_preset(2)
++    }
++}
++
++fn run_with(a: &Anim, opts: &Options) -> (Vec<u8>, Vec<u8>, Parsed) {
++    let input = encode(a);
++    let output = optimize_from_memory(&input, opts).unwrap();
++    let parsed = parse(&output);
++    (input, output, parsed)
++}
++
++fn run(a: &Anim) -> (Vec<u8>, Vec<u8>, Parsed) {
++    run_with(a, &opts())
++}
++
++fn rect(c: &Ctl) -> (u32, u32, u32, u32) {
++    (c.x, c.y, c.w, c.h)
++}
++
++fn secs(d: (u16, u16)) -> (u64, u64) {
++    (u64::from(d.0), if d.1 == 0 { 100 } else { u64::from(d.1) })
++}
++
++fn assert_frame_count(p: &Parsed, n: usize) {
++    assert_eq!(p.ctls.len(), n);
++    assert_eq!(p.actl.0 as usize, n);
++    let expected_fdat = if p.default_in_animation { n - 1 } else { n };
++    assert_eq!(p.fdat_count, expected_fdat);
++}
++
++fn four_color_frames() -> Vec<Fr> {
++    let base = block(solid(48, 48, RED), 48, 0, 24, 48, 24, GREEN);
++    vec![
++        fr(0, 0, 48, 48, base.clone()),
++        fr(0, 0, 48, 48, block(base.clone(), 48, 8, 8, 16, 16, BLUE)),
++        fr(0, 0, 48, 48, block(base, 48, 20, 20, 12, 12, WHITE)),
++    ]
++}
++
++#[test]
++fn opaque_animation_drops_alpha_channel() {
++    let (input, output, p) = run(&anim(48, 48, four_color_frames()));
++    assert!(
++        matches!(p.color_type, 0 | 2 | 3),
++        "color type {}",
++        p.color_type
++    );
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn few_color_animation_is_reduced_below_rgba8() {
++    let (input, output, p) = run(&anim(48, 48, four_color_frames()));
++    assert!(matches!(p.color_type, 0 | 3), "color type {}", p.color_type);
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn palette_covers_colors_of_every_frame() {
++    let mut frames = vec![fr(
++        0,
++        0,
++        40,
++        40,
++        block(solid(40, 40, RED), 40, 0, 0, 20, 40, GREEN),
++    )];
++    for k in 0..6u8 {
++        let c1 = [10 + k * 30, 100, 50, 255];
++        let c2 = [60, 10 + k * 35, 200, 255];
++        let px = block(
++            block(solid(40, 40, RED), 40, 0, 0, 20, 40, c1),
++            40,
++            20,
++            0,
++            20,
++            40,
++            c2,
++        );
++        frames.push(fr(0, 0, 40, 40, px));
++    }
++    let (input, output, p) = run(&anim(40, 40, frames));
++    assert_ne!((p.color_type, p.depth), (6, 8));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn hidden_default_image_colors_survive_reduction() {
++    let mut hidden = block(solid(40, 40, BLUE), 40, 0, 0, 40, 10, WHITE);
++    hidden = block(hidden, 40, 0, 30, 40, 10, [250, 200, 0, 255]);
++    let mut a = anim(
++        40,
++        40,
++        four_color_frames()
++            .into_iter()
++            .map(|f| {
++                let px =
++                    f.px.chunks(48)
++                        .take(40)
++                        .flat_map(|r| r[..40].to_vec())
++                        .collect();
++                fr(0, 0, 40, 40, px)
++            })
++            .collect(),
++    );
++    a.hidden = Some(hidden);
++    let (input, output, p) = run(&a);
++    assert!(!p.default_in_animation);
++    assert_ne!((p.color_type, p.depth), (6, 8));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn grayscale_frames_with_one_colored_frame_stay_color() {
++    let gray = |v: u8| [v, v, v, 255];
++    let frames = vec![
++        fr(
++            0,
++            0,
++            32,
++            32,
++            gradient(32, 32, 1).iter().map(|p| gray(p[0])).collect(),
++        ),
++        fr(
++            0,
++            0,
++            32,
++            32,
++            gradient(32, 32, 2).iter().map(|p| gray(p[1])).collect(),
++        ),
++        fr(
++            0,
++            0,
++            32,
++            32,
++            paint(
++                gradient(32, 32, 3).iter().map(|p| gray(p[2])).collect(),
++                32,
++                &[(31, 31)],
++                RED,
++            ),
++        ),
++    ];
++    let (input, output, p) = run(&anim(32, 32, frames));
++    assert!(matches!(p.color_type, 2 | 3), "color type {}", p.color_type);
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn grayscale_animation_becomes_grayscale() {
++    let gray = |v: u8| [v, v, v, 255];
++    let frames = vec![
++        fr(
++            0,
++            0,
++            32,
++            32,
++            gradient(32, 32, 1).iter().map(|p| gray(p[0])).collect(),
++        ),
++        fr(
++            0,
++            0,
++            32,
++            32,
++            gradient(32, 32, 5).iter().map(|p| gray(p[1])).collect(),
++        ),
++    ];
++    let (input, output, p) = run(&anim(32, 32, frames));
++    assert!(matches!(p.color_type, 0 | 3), "color type {}", p.color_type);
++    assert_plays_same(&input, &output);
++}
++
++fn many_colors(w: u32, h: u32) -> Vec<Px> {
++    (0..w * h)
++        .map(|i| [(i % 251) as u8 + 3, (i / 251) as u8 + 3, 90, 255])
++        .collect()
++}
++
++#[test]
++fn transparency_color_is_unused_in_every_frame() {
++    let first = paint(
++        many_colors(64, 64),
++        64,
++        &[(0, 0), (9, 9), (40, 3)],
++        [0, 0, 0, 255],
++    );
++    let second = block(many_colors(64, 64), 64, 10, 10, 20, 20, CLEAR);
++    let a = anim(
++        64,
++        64,
++        vec![fr(0, 0, 64, 64, first), fr(0, 0, 64, 64, second)],
++    );
++    let opts = Options {
++        optimize_alpha: true,
++        ..opts()
++    };
++    let (input, output, p) = run_with(&a, &opts);
++    assert_eq!(p.color_type, 2);
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn interlaced_animation_is_deinterlaced_by_default() {
++    let mut a = anim(
++        24,
++        24,
++        four_color_frames()
++            .into_iter()
++            .map(|f| {
++                let px =
++                    f.px.chunks(48)
++                        .take(24)
++                        .flat_map(|r| r[..24].to_vec())
++                        .collect();
++                fr(0, 0, 24, 24, px)
++            })
++            .collect(),
++    );
++    a.format = Format::Interlaced;
++    let (input, output, p) = run(&a);
++    assert!(!p.interlaced);
++    assert_eq!(rect(&p.ctls[1]), (8, 8, 16, 16));
++    assert_ne!((p.color_type, p.depth), (6, 8));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn low_depth_indexed_animation_stays_valid() {
++    let base = block(solid(20, 20, RED), 20, 0, 0, 20, 10, GREEN);
++    let frames = vec![
++        fr(0, 0, 20, 20, base.clone()),
++        fr(0, 0, 20, 20, block(base.clone(), 20, 3, 3, 5, 5, BLUE)),
++        fr(0, 0, 20, 20, block(base, 20, 11, 11, 6, 4, WHITE)),
++    ];
++    let mut a = anim(20, 20, frames);
++    a.format = Format::Indexed(2);
++    let (input, output, p) = run(&a);
++    assert_eq!(p.color_type, 3);
++    assert_frame_count(&p, 3);
++    assert_eq!(rect(&p.ctls[1]), (3, 3, 5, 5));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn reductions_use_only_the_pixels_kept_after_cropping() {
++    let base = block(solid(64, 64, RED), 64, 0, 0, 64, 32, GREEN);
++    let mut junk: Vec<Px> = (0..64 * 64u32)
++        .map(|i| [(i % 256) as u8, (i / 256) as u8, 7, 0])
++        .collect();
++    junk = block(junk, 64, 30, 30, 4, 4, BLUE);
++    let frames = vec![
++        fr(0, 0, 64, 64, base),
++        with(fr(0, 0, 64, 64, junk), NONE, OVER),
++    ];
++    let (input, output, p) = run(&anim(64, 64, frames));
++    assert_eq!(rect(&p.ctls[1]), (30, 30, 4, 4));
++    assert!(matches!(p.color_type, 2 | 3), "color type {}", p.color_type);
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn changed_block_is_cropped() {
++    let base = gradient(16, 16, 4);
++    let frames = vec![
++        fr(0, 0, 16, 16, base.clone()),
++        fr(
++            0,
++            0,
++            16,
++            16,
++            paint(base, 16, &[(5, 3), (9, 7), (6, 5)], WHITE),
++        ),
++    ];
++    let (input, output, p) = run(&anim(16, 16, frames));
++    assert_frame_count(&p, 2);
++    assert_eq!(rect(&p.ctls[1]), (5, 3, 5, 5));
++    assert_eq!((p.ctls[1].dispose, p.ctls[1].blend), (NONE, SOURCE));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn offset_frame_is_cropped_inside_its_region() {
++    let base = solid(20, 20, RED);
++    let sub = block(solid(10, 8, RED), 10, 6, 2, 3, 4, BLUE);
++    let frames = vec![fr(0, 0, 20, 20, base), fr(7, 9, 10, 8, sub)];
++    let (input, output, p) = run(&anim(20, 20, frames));
++    assert_eq!(rect(&p.ctls[1]), (13, 11, 3, 4));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn background_disposed_frame_keeps_pixels_it_clears() {
++    let base = solid(16, 16, RED);
++    let frames = vec![
++        fr(0, 0, 16, 16, base),
++        with(
++            fr(2, 2, 8, 8, block(solid(8, 8, RED), 8, 3, 3, 2, 2, BLUE)),
++            BACKGROUND,
++            SOURCE,
++        ),
++        fr(12, 12, 2, 2, solid(2, 2, GREEN)),
++    ];
++    let (input, output, p) = run(&anim(16, 16, frames));
++    assert_eq!(rect(&p.ctls[1]), (2, 2, 8, 8));
++    assert_eq!(p.ctls[1].dispose, BACKGROUND);
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn background_disposed_frame_drops_already_clear_pixels() {
++    let base = block(solid(16, 16, CLEAR), 16, 4, 4, 8, 8, RED);
++    let frames = vec![
++        fr(0, 0, 16, 16, base),
++        with(
++            fr(
++                0,
++                0,
++                16,
++                16,
++                block(solid(16, 16, CLEAR), 16, 5, 6, 3, 2, BLUE),
++            ),
++            BACKGROUND,
++            SOURCE,
++        ),
++        fr(0, 0, 2, 2, solid(2, 2, GREEN)),
++    ];
++    let (input, output, p) = run(&anim(16, 16, frames));
++    assert_eq!(rect(&p.ctls[1]), (4, 4, 8, 8));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn background_disposed_over_frame_keeps_visible_pixels() {
++    let base = solid(12, 12, RED);
++    let sub = block(solid(6, 6, CLEAR), 6, 2, 2, 2, 2, BLUE);
++    let frames = vec![
++        fr(0, 0, 12, 12, base),
++        with(fr(3, 3, 6, 6, sub), BACKGROUND, OVER),
++        fr(0, 0, 1, 1, solid(1, 1, GREEN)),
++    ];
++    let (input, output, p) = run(&anim(12, 12, frames));
++    assert_eq!(rect(&p.ctls[1]), (3, 3, 6, 6));
++    assert_eq!((p.ctls[1].dispose, p.ctls[1].blend), (BACKGROUND, OVER));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn previous_disposed_frame_is_cropped_to_changes() {
++    let base = solid(16, 16, RED);
++    let sub = block(solid(10, 10, RED), 10, 4, 1, 2, 3, BLUE);
++    let frames = vec![
++        fr(0, 0, 16, 16, base),
++        with(fr(3, 3, 10, 10, sub), PREVIOUS, SOURCE),
++        fr(0, 15, 1, 1, solid(1, 1, GREEN)),
++    ];
++    let (input, output, p) = run(&anim(16, 16, frames));
++    assert_eq!(rect(&p.ctls[1]), (7, 4, 2, 3));
++    assert_eq!(p.ctls[1].dispose, PREVIOUS);
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn previous_dispose_restores_canvas_for_next_frame() {
++    let base = solid(16, 16, RED);
++    let frames = vec![
++        fr(0, 0, 16, 16, base.clone()),
++        with(fr(2, 2, 6, 6, solid(6, 6, BLUE)), PREVIOUS, SOURCE),
++        fr(0, 0, 16, 16, paint(base, 16, &[(12, 13)], GREEN)),
++    ];
++    let (input, output, p) = run(&anim(16, 16, frames));
++    assert_frame_count(&p, 3);
++    assert_eq!(rect(&p.ctls[2]), (12, 13, 1, 1));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn over_frame_drops_transparent_border() {
++    let base = gradient(16, 16, 2);
++    let sub = block(solid(10, 10, CLEAR), 10, 3, 4, 2, 2, WHITE);
++    let frames = vec![
++        fr(0, 0, 16, 16, base),
++        with(fr(2, 2, 10, 10, sub), NONE, OVER),
++    ];
++    let (input, output, p) = run(&anim(16, 16, frames));
++    assert_eq!(rect(&p.ctls[1]), (5, 6, 2, 2));
++    assert_eq!(p.ctls[1].blend, OVER);
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn source_frame_keeps_transparent_border_over_opaque_pixels() {
++    let base = gradient(16, 16, 2);
++    let sub = block(solid(10, 10, CLEAR), 10, 3, 4, 2, 2, WHITE);
++    let frames = vec![fr(0, 0, 16, 16, base), fr(2, 2, 10, 10, sub)];
++    let (input, output, p) = run(&anim(16, 16, frames));
++    assert_eq!(rect(&p.ctls[1]), (2, 2, 10, 10));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn source_frame_drops_transparent_border_over_transparent_pixels() {
++    let base = block(solid(16, 16, CLEAR), 16, 0, 0, 4, 4, GREEN);
++    let sub = block(solid(10, 10, CLEAR), 10, 3, 4, 2, 2, WHITE);
++    let frames = vec![fr(0, 0, 16, 16, base), fr(4, 4, 10, 10, sub)];
++    let (input, output, p) = run(&anim(16, 16, frames));
++    assert_eq!(rect(&p.ctls[1]), (7, 8, 2, 2));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn transparent_pixels_of_any_color_count_as_equal() {
++    let base = block(solid(12, 12, [9, 9, 9, 0]), 12, 0, 0, 12, 4, RED);
++    let redraw = block(solid(12, 12, [200, 100, 50, 0]), 12, 0, 0, 12, 4, RED);
++    let frames = vec![
++        fr(0, 0, 12, 12, base),
++        fr(0, 0, 12, 12, paint(redraw, 12, &[(6, 8)], BLUE)),
++    ];
++    let (input, output, p) = run(&anim(12, 12, frames));
++    assert_eq!(rect(&p.ctls[1]), (6, 8, 1, 1));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn first_frame_is_never_cropped_when_default_image_is_hidden() {
++    let first = block(solid(16, 16, CLEAR), 16, 5, 5, 3, 3, RED);
++    let mut a = anim(
++        16,
++        16,
++        vec![
++            fr(0, 0, 16, 16, first),
++            fr(
++                0,
++                0,
++                16,
++                16,
++                block(solid(16, 16, CLEAR), 16, 5, 5, 3, 3, BLUE),
++            ),
++        ],
++    );
++    a.hidden = Some(solid(16, 16, WHITE));
++    let (input, output, p) = run(&a);
++    assert!(!p.default_in_animation);
++    assert_eq!(rect(&p.ctls[0]), (0, 0, 16, 16));
++    assert_eq!(rect(&p.ctls[1]), (5, 5, 3, 3));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn identical_frame_merges_into_default_image_frame() {
++    let base = gradient(16, 16, 6);
++    let frames = vec![
++        fr(0, 0, 16, 16, base.clone()),
++        fr(0, 0, 16, 16, base.clone()),
++        fr(0, 0, 16, 16, paint(base, 16, &[(1, 1)], WHITE)),
++    ];
++    let (input, output, p) = run(&anim(16, 16, frames));
++    assert!(p.default_in_animation);
++    assert_frame_count(&p, 2);
++    assert!(
++        same_delay(secs(p.ctls[0].delay), (1, 5)),
++        "delay {:?}",
++        p.ctls[0].delay
++    );
++    assert!(same_delay(secs(p.ctls[1].delay), (1, 10)));
++    assert_eq!(rect(&p.ctls[1]), (1, 1, 1, 1));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn identical_frame_merges_into_first_frame_after_hidden_default_image() {
++    let base = gradient(16, 16, 6);
++    let mut a = anim(
++        16,
++        16,
++        vec![
++            delayed(fr(0, 0, 16, 16, base.clone()), 1, 4),
++            delayed(fr(0, 0, 16, 16, base), 1, 6),
++        ],
++    );
++    a.hidden = Some(solid(16, 16, GREEN));
++    let (input, output, p) = run(&a);
++    assert!(!p.default_in_animation);
++    assert_frame_count(&p, 1);
++    assert!(
++        same_delay(secs(p.ctls[0].delay), (5, 12)),
++        "delay {:?}",
++        p.ctls[0].delay
++    );
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn run_of_identical_frames_merges_into_one() {
++    let base = gradient(16, 16, 8);
++    let shown = paint(base.clone(), 16, &[(4, 4)], WHITE);
++    let part: Vec<Px> = (0..16)
++        .map(|i| shown[((2 + i / 4) * 16 + 2 + i % 4) as usize])
++        .collect();
++    let frames = vec![
++        fr(0, 0, 16, 16, base),
++        delayed(fr(0, 0, 16, 16, shown.clone()), 1, 3),
++        delayed(fr(2, 2, 4, 4, part), 1, 7),
++        delayed(fr(0, 0, 16, 16, shown), 2, 21),
++    ];
++    let (input, output, p) = run(&anim(16, 16, frames));
++    assert_frame_count(&p, 2);
++    assert!(
++        same_delay(secs(p.ctls[1].delay), (4, 7)),
++        "delay {:?}",
++        p.ctls[1].delay
++    );
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn zero_denominator_means_hundredths() {
++    let base = gradient(12, 12, 3);
++    let frames = vec![
++        delayed(fr(0, 0, 12, 12, base.clone()), 5, 0),
++        delayed(fr(0, 0, 12, 12, base), 1, 10),
++    ];
++    let (input, output, p) = run(&anim(12, 12, frames));
++    assert_frame_count(&p, 1);
++    assert!(
++        same_delay(secs(p.ctls[0].delay), (3, 20)),
++        "delay {:?}",
++        p.ctls[0].delay
++    );
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn delays_that_cannot_be_written_are_not_merged() {
++    let base = gradient(12, 12, 3);
++    let frames = vec![
++        delayed(fr(0, 0, 12, 12, base.clone()), 1, 65535),
++        delayed(fr(0, 0, 12, 12, base.clone()), 1, 65534),
++        fr(0, 0, 12, 12, paint(base, 12, &[(2, 2)], WHITE)),
++    ];
++    let (input, output, p) = run(&anim(12, 12, frames));
++    assert_frame_count(&p, 3);
++    assert_eq!((p.ctls[1].w, p.ctls[1].h), (1, 1));
++    assert!(same_delay(secs(p.ctls[1].delay), (1, 65534)));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn large_delay_sum_that_fits_is_merged() {
++    let base = gradient(12, 12, 3);
++    let frames = vec![
++        delayed(fr(0, 0, 12, 12, base.clone()), 250, 256),
++        delayed(fr(0, 0, 12, 12, base), 300, 256),
++    ];
++    let (input, output, p) = run(&anim(12, 12, frames));
++    assert_frame_count(&p, 1);
++    assert!(same_delay(secs(p.ctls[0].delay), (550, 256)));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn same_display_but_different_following_canvas_is_kept() {
++    let base = solid(12, 12, RED);
++    let frames = vec![
++        fr(0, 0, 12, 12, base.clone()),
++        with(fr(0, 0, 12, 12, base), BACKGROUND, SOURCE),
++        with(fr(0, 0, 3, 3, solid(3, 3, BLUE)), NONE, OVER),
++    ];
++    let (input, output, p) = run(&anim(12, 12, frames));
++    assert_frame_count(&p, 3);
++    assert_eq!(rect(&p.ctls[1]), (0, 0, 12, 12));
++    assert_eq!(p.ctls[1].dispose, BACKGROUND);
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn redraw_after_background_dispose_is_merged() {
++    let base = solid(12, 12, CLEAR);
++    let frames = vec![
++        fr(0, 0, 12, 12, base),
++        delayed(
++            with(fr(4, 4, 3, 3, solid(3, 3, BLUE)), BACKGROUND, SOURCE),
++            1,
++            5,
++        ),
++        delayed(
++            with(fr(4, 4, 3, 3, solid(3, 3, BLUE)), BACKGROUND, SOURCE),
++            3,
++            10,
++        ),
++        fr(0, 0, 1, 1, solid(1, 1, GREEN)),
++    ];
++    let (input, output, p) = run(&anim(12, 12, frames));
++    assert_frame_count(&p, 3);
++    assert_eq!(rect(&p.ctls[1]), (4, 4, 3, 3));
++    assert!(
++        same_delay(secs(p.ctls[1].delay), (1, 2)),
++        "delay {:?}",
++        p.ctls[1].delay
++    );
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn empty_frame_after_background_dispose_becomes_single_pixel() {
++    let base = solid(12, 12, CLEAR);
++    let frames = vec![
++        fr(0, 0, 12, 12, base),
++        with(fr(4, 4, 3, 3, solid(3, 3, BLUE)), BACKGROUND, SOURCE),
++        with(fr(2, 2, 6, 6, solid(6, 6, CLEAR)), NONE, OVER),
++        fr(10, 10, 2, 2, solid(2, 2, GREEN)),
++    ];
++    let (input, output, p) = run(&anim(12, 12, frames));
++    assert_frame_count(&p, 4);
++    assert_eq!((p.ctls[2].w, p.ctls[2].h), (1, 1));
++    let c = p.ctls[2];
++    assert!(c.x >= 2 && c.x < 8 && c.y >= 2 && c.y < 8);
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn frame_count_and_play_count_are_written() {
++    let base = gradient(12, 12, 1);
++    let mut a = anim(
++        12,
++        12,
++        vec![
++            fr(0, 0, 12, 12, base.clone()),
++            fr(0, 0, 12, 12, base.clone()),
++            fr(0, 0, 12, 12, base.clone()),
++            fr(0, 0, 12, 12, paint(base, 12, &[(0, 0)], WHITE)),
++        ],
++    );
++    a.plays = 3;
++    let (input, output, p) = run(&a);
++    assert_eq!(p.actl, (2, 3));
++    assert_frame_count(&p, 2);
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn frame_reduction_off_keeps_frames_but_reduces_colors() {
++    let frames = vec![
++        fr(
++            0,
++            0,
++            16,
++            16,
++            block(solid(16, 16, RED), 16, 0, 0, 8, 16, GREEN),
++        ),
++        fr(
++            0,
++            0,
++            16,
++            16,
++            block(solid(16, 16, RED), 16, 0, 0, 8, 16, GREEN),
++        ),
++        fr(
++            0,
++            0,
++            16,
++            16,
++            block(solid(16, 16, RED), 16, 2, 2, 3, 3, BLUE),
++        ),
++    ];
++    let a = anim(16, 16, frames);
++    let opts = Options {
++        frame_reduction: false,
++        ..opts()
++    };
++    let (input, output, p) = run_with(&a, &opts);
++    assert_frame_count(&p, 3);
++    assert!(p.ctls.iter().all(|c| rect(c) == (0, 0, 16, 16)));
++    assert_ne!((p.color_type, p.depth), (6, 8));
++    assert_plays_same(&input, &output);
++}
++
++#[test]
++fn frame_reduction_is_on_in_every_preset() {
++    for level in 0..=6 {
++        assert!(
++            Options::from_preset(level).frame_reduction,
++            "preset {level}"
++        );
++    }
++    assert!(Options::default().frame_reduction);
++}
++
++fn cli(args: &[&str], a: &Anim, name: &str) -> Parsed {
++    let input = PathBuf::from(format!("tests/files/{name}.png"));
++    let output = input.with_extension("out.png");
++    fs::write(&input, encode(a)).unwrap();
++    let status = Command::new(env!("CARGO_BIN_EXE_oxipng"))
++        .args(args)
++        .arg("--force")
++        .arg("--out")
++        .arg(&output)
++        .arg(&input)
++        .output()
++        .unwrap();
++    assert!(
++        status.status.success(),
++        "{}",
++        String::from_utf8_lossy(&status.stderr)
++    );
++    let data = fs::read(&output).unwrap();
++    let original = fs::read(&input).unwrap();
++    fs::remove_file(&input).ok();
++    fs::remove_file(&output).ok();
++    assert_plays_same(&original, &data);
++    parse(&data)
++}
++
++fn cli_anim() -> Anim {
++    let base = block(solid(16, 16, RED), 16, 0, 0, 16, 8, GREEN);
++    anim(
++        16,
++        16,
++        vec![
++            fr(0, 0, 16, 16, base.clone()),
++            fr(0, 0, 16, 16, base.clone()),
++            fr(0, 0, 16, 16, block(base, 16, 3, 3, 2, 2, BLUE)),
++        ],
++    )
++}
++
++#[test]
++fn cli_crops_and_merges_by_default() {
++    let p = cli(&[], &cli_anim(), "apng_cli_default_8ecd58");
++    assert_frame_count(&p, 2);
++    assert_eq!(rect(&p.ctls[1]), (3, 3, 2, 2));
++}
++
++#[test]
++fn cli_nf_keeps_frames() {
++    let p = cli(&["--nf"], &cli_anim(), "apng_cli_nf_8ecd58");
++    assert_frame_count(&p, 3);
++    assert!(p.ctls.iter().all(|c| rect(c) == (0, 0, 16, 16)));
++    assert_ne!((p.color_type, p.depth), (6, 8));
++}
++
++#[test]
++fn cli_nx_keeps_frames_and_format() {
++    let p = cli(&["--nx"], &cli_anim(), "apng_cli_nx_8ecd58");
++    assert_frame_count(&p, 3);
++    assert!(p.ctls.iter().all(|c| rect(c) == (0, 0, 16, 16)));
++    assert_eq!((p.color_type, p.depth), (6, 8));
++}
++
++#[test]
++fn validation_accepts_merged_animation() {
++    let base = gradient(12, 12, 2);
++    let a = anim(
++        12,
++        12,
++        vec![
++            fr(0, 0, 12, 12, base.clone()),
++            fr(0, 0, 12, 12, base.clone()),
++            fr(0, 0, 12, 12, paint(base, 12, &[(5, 5)], WHITE)),
++        ],
++    );
++    let (input, output, p) = run(&a);
++    assert_frame_count(&p, 2);
++    assert!(validate_output(&output, &input));
++}
++
++#[test]
++fn validation_rejects_changed_display_time() {
++    let base = gradient(12, 12, 2);
++    let changed = paint(base.clone(), 12, &[(5, 5)], WHITE);
++    let a = anim(
++        12,
++        12,
++        vec![
++            fr(0, 0, 12, 12, base.clone()),
++            fr(0, 0, 12, 12, changed.clone()),
++        ],
++    );
++    let b = anim(
++        12,
++        12,
++        vec![
++            delayed(fr(0, 0, 12, 12, base), 1, 5),
++            fr(0, 0, 12, 12, changed),
++        ],
++    );
++    assert!(!validate_output(&encode(&b), &encode(&a)));
++    assert!(validate_output(&encode(&a), &encode(&a)));
++}
++
++#[test]
++fn validation_rejects_changed_frame() {
++    let base = gradient(12, 12, 2);
++    let a = anim(
++        12,
++        12,
++        vec![
++            fr(0, 0, 12, 12, base.clone()),
++            fr(0, 0, 12, 12, paint(base.clone(), 12, &[(5, 5)], WHITE)),
++        ],
++    );
++    let b = anim(
++        12,
++        12,
++        vec![
++            fr(0, 0, 12, 12, base.clone()),
++            fr(0, 0, 12, 12, paint(base, 12, &[(5, 6)], WHITE)),
++        ],
++    );
++    assert!(!validate_output(&encode(&b), &encode(&a)));
++}

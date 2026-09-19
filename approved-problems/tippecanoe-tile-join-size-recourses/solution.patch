@@ -1,0 +1,778 @@
+diff --git a/README.md b/README.md
+index 61fb98f..292a8e7 100644
+--- a/README.md
++++ b/README.md
+@@ -846,7 +846,9 @@ The options are:
+ 
+ ### Setting or disabling tile size limits
+ 
+- * `-pk` or `--no-tile-size-limit`: Don't skip tiles larger than 500K.
++ * `-M` *bytes* or `--maximum-tile-bytes=`*bytes*: Use the specified number of *bytes* as the maximum size of a compressed tile, or of an uncompressed one with `--no-tile-compression`, instead of 500K.
++ * `--drop-smallest-as-needed`: Drop the smallest features (physically smallest: the shortest lines or the smallest polygons) from each tile that is too big, instead of leaving the tile out of the tileset.
++ * `-pk` or `--no-tile-size-limit`: Don't limit the size of tiles.
+  * `-pC` or `--no-tile-compression`: Don't compress the PBF vector tile data.
+  * `-pg` or `--no-tile-stats`: Don't generate the `tilestats` row in the tileset metadata. Uploads without [tilestats](https://github.com/mapbox/mapbox-geostats) will take longer to process.
+  * `--tile-stats-attributes-limit=`*count*: Include `tilestats` information about at most *count* attributes instead of the default 1000.
+@@ -859,8 +861,9 @@ The options are:
+ 
+ Because tile-join just copies the geometries to the new .mbtiles without processing them
+ (except to rescale the extents if necessary),
+-it doesn't have any of tippecanoe's recourses if the new tiles are bigger than the 500K tile limit.
+-If a tile is too big and you haven't specified `-pk`, it is just left out of the new tileset.
++it has fewer recourses than tippecanoe if the new tiles are bigger than the tile size limit.
++If a tile is too big and you haven't specified `-pk` or `--drop-smallest-as-needed`,
++it is just left out of the new tileset.
+ 
+ Example
+ -------
+diff --git a/man/tippecanoe.1 b/man/tippecanoe.1
+index b7d675d..db12949 100644
+--- a/man/tippecanoe.1
++++ b/man/tippecanoe.1
+@@ -890,7 +890,11 @@ The options are:
+ \fB-pe\fR or \fB--empty-csv-columns-are-null\fR: Treat empty CSV columns as nulls rather than as empty strings.
+ .SS Setting or disabling tile size limits
+ .IP \(bu 2
+-\fB-pk\fR or \fB--no-tile-size-limit\fR: Don't skip tiles larger than 500K.
++\fB-M\fR \fIbytes\fP or \fB--maximum-tile-bytes=\fR\fIbytes\fP: Use the specified number of \fIbytes\fP as the maximum size of a compressed tile, or of an uncompressed one with \fB--no-tile-compression\fR, instead of 500K.
++.IP \(bu 2
++\fB--drop-smallest-as-needed\fR: Drop the smallest features (physically smallest: the shortest lines or the smallest polygons) from each tile that is too big, instead of leaving the tile out of the tileset.
++.IP \(bu 2
++\fB-pk\fR or \fB--no-tile-size-limit\fR: Don't limit the size of tiles.
+ .IP \(bu 2
+ \fB-pC\fR or \fB--no-tile-compression\fR: Don't compress the PBF vector tile data.
+ .IP \(bu 2
+@@ -908,8 +912,9 @@ The options are:
+ .PP
+ Because tile-join just copies the geometries to the new .mbtiles without processing them
+ (except to rescale the extents if necessary),
+-it doesn't have any of tippecanoe's recourses if the new tiles are bigger than the 500K tile limit.
+-If a tile is too big and you haven't specified \fB-pk\fR, it is just left out of the new tileset.
++it has fewer recourses than tippecanoe if the new tiles are bigger than the tile size limit.
++If a tile is too big and you haven't specified \fB-pk\fR or \fB--drop-smallest-as-needed\fR,
++it is just left out of the new tileset.
+ .SH Example
+ Imagine you have a tileset of census blocks:
+ .EX
+diff --git a/mvt.cpp b/mvt.cpp
+index 8042db7..ff68dd0 100644
+--- a/mvt.cpp
++++ b/mvt.cpp
+@@ -634,6 +634,38 @@ void mvt_layer::tag(mvt_feature &feature, std::string const &key, mvt_value cons
+ 	feature.tags.push_back(value_dedup[value_hash]);
+ }
+ 
++void mvt_layer::compact_attributes() {
++	std::vector<std::string> old_keys = std::move(keys);
++	std::vector<mvt_value> old_values = std::move(values);
++	std::vector<mvt_feature> old_features = std::move(features);
++
++	keys.clear();
++	values.clear();
++	features.clear();
++	key_dedup.assign(key_dedup.size(), -1);
++	value_dedup.assign(value_dedup.size(), -1);
++
++	for (size_t f = 0; f < old_features.size(); f++) {
++		mvt_feature &in = old_features[f];
++
++		mvt_feature out;
++		out.type = in.type;
++		out.id = in.id;
++		out.has_id = in.has_id;
++		out.dropped = in.dropped;
++		out.seq = in.seq;
++		out.geometry = std::move(in.geometry);
++
++		for (size_t i = 0; i + 1 < in.tags.size(); i += 2) {
++			if (in.tags[i] < old_keys.size() && in.tags[i + 1] < old_values.size()) {
++				tag(out, old_keys[in.tags[i]], old_values[in.tags[i + 1]]);
++			}
++		}
++
++		features.push_back(std::move(out));
++	}
++}
++
+ bool is_integer(const char *s, long long *v) {
+ 	errno = 0;
+ 	char *endptr;
+diff --git a/mvt.hpp b/mvt.hpp
+index 0c36b74..2c30e88 100644
+--- a/mvt.hpp
++++ b/mvt.hpp
+@@ -228,6 +228,10 @@ struct mvt_layer {
+ 	int detail() const {
+ 		return std::round(std::log(extent) / std::log(2));
+ 	}
++
++	// Rebuild the key and value pools so they contain only what the
++	// layer's remaining features refer to.
++	void compact_attributes();
+ };
+ 
+ struct mvt_tile {
+diff --git a/tile-join.cpp b/tile-join.cpp
+index 8466684..b050f98 100644
+--- a/tile-join.cpp
++++ b/tile-join.cpp
+@@ -47,6 +47,8 @@
+ #include "usage.hpp"
+ 
+ int pk = false;
++size_t max_tile_size = 500000;
++bool drop_smallest_as_needed = false;
+ int pC = false;
+ int pg = false;
+ int pe = false;
+@@ -96,9 +98,79 @@ struct arg {
+ 	double minlat, minlon;
+ 	double maxlat, maxlon;
+ 	double minlon2, maxlon2;
++
++	std::vector<struct strategy> strategies{};
++	std::vector<size_t> oversized{};
++};
++
++struct tile_bounds {
++	long long minx = LLONG_MAX;
++	long long miny = LLONG_MAX;
++	long long maxx = LLONG_MIN;
++	long long maxy = LLONG_MIN;
++	long long minx2 = LLONG_MAX;
++	long long maxx2 = LLONG_MIN;
++	bool any = false;
++
++	void add(long long gx, long long gy, long long gx2) {
++		minx = std::min(minx, gx);
++		miny = std::min(miny, gy);
++		maxx = std::max(maxx, gx);
++		maxy = std::max(maxy, gy);
++		minx2 = std::min(minx2, gx2);
++		maxx2 = std::max(maxx2, gx2);
++		any = true;
++	}
++
++};
++
++// What one feature of the tile being merged would contribute to the tileset's
++// books. Held until the tile it belongs to is known to reach the output.
++struct feature_box {
++	long long xmin = LLONG_MAX;
++	long long ymin = LLONG_MAX;
++	long long xmax = LLONG_MIN;
++	long long ymax = LLONG_MIN;
++
++	void add(mvt_geometry const &g) {
++		if (g.op == mvt_moveto || g.op == mvt_lineto) {
++			xmin = std::min(xmin, g.x);
++			ymin = std::min(ymin, g.y);
++			xmax = std::max(xmax, g.x);
++			ymax = std::max(ymax, g.y);
++		}
++	}
++
++	void rescale(long long from, long long to) {
++		if (xmin <= xmax) {
++			xmin = xmin * to / from;
++			ymin = ymin * to / from;
++			xmax = xmax * to / from;
++			ymax = ymax * to / from;
++		}
++	}
++
++	double extent(int type) const {
++		if (type == mvt_point || xmin > xmax) {
++			return 0;
++		}
++
++		if (type == mvt_polygon) {
++			return (double) (xmax - xmin) * (double) (ymax - ymin);
++		}
++
++		return (double) (xmax - xmin) + (double) (ymax - ymin);
++	}
++};
++
++struct staged_feature {
++	std::string layer = "";
++	int type = 0;
++	feature_box box{};
++	std::vector<std::pair<std::string, serial_val>> attributes{};
+ };
+ 
+-void append_tile(std::string message, int z, unsigned x, unsigned y, std::map<std::string, layermap_entry> &layermap, std::vector<std::string> &header, std::map<std::string, std::vector<std::string>> &mapping, sqlite3 * /* db */, std::set<std::string> &exclude, std::set<std::string> &include, std::set<std::string> &keep_layers, std::set<std::string> &remove_layers, int ifmatched, mvt_tile &outtile, json_object *filter, struct arg *a) {
++void append_tile(std::string message, int z, unsigned x, unsigned y, std::map<std::string, layermap_entry> & /* layermap */, std::vector<std::string> &header, std::map<std::string, std::vector<std::string>> &mapping, sqlite3 * /* db */, std::set<std::string> &exclude, std::set<std::string> &include, std::set<std::string> &keep_layers, std::set<std::string> &remove_layers, int ifmatched, mvt_tile &outtile, json_object *filter, std::vector<staged_feature> *staged) {
+ 	mvt_tile tile;
+ 	int features_added = 0;
+ 	bool was_compressed;
+@@ -158,23 +230,14 @@ void append_tile(std::string message, int z, unsigned x, unsigned y, std::map<st
+ 						outlayer.features[i].geometry[j].x = outlayer.features[i].geometry[j].x * layer.extent / outlayer.extent;
+ 						outlayer.features[i].geometry[j].y = outlayer.features[i].geometry[j].y * layer.extent / outlayer.extent;
+ 					}
++
++					(*staged)[outlayer.features[i].seq].box.rescale(outlayer.extent, layer.extent);
+ 				}
+ 
+ 				outlayer.extent = layer.extent;
+ 			}
+ 		}
+ 
+-		auto tilestats = layermap.find(layer.name);
+-
+-		long long minx = LLONG_MAX;
+-		long long miny = LLONG_MAX;
+-		long long maxx = LLONG_MIN;
+-		long long maxy = LLONG_MIN;
+-
+-		long long minx2 = LLONG_MAX;
+-		long long maxx2 = LLONG_MIN;
+-		bool features_added_to_layer = false;
+-
+ 		for (size_t f = 0; f < layer.features.size(); f++) {
+ 			mvt_feature &feat = layer.features[f];
+ 
+@@ -303,12 +366,9 @@ void append_tile(std::string message, int z, unsigned x, unsigned y, std::map<st
+ 			}
+ 
+ 			for (auto &m : matches) {
+-				if (tilestats == layermap.end()) {
+-					layermap.insert(std::pair<std::string, layermap_entry>(layer.name, layermap_entry(layermap.size())));
+-					tilestats = layermap.find(layer.name);
+-					tilestats->second.minzoom = z;
+-					tilestats->second.maxzoom = z;
+-				}
++				staged_feature sf;
++				sf.layer = layer.name;
++				sf.type = feat.type;
+ 
+ 				mvt_feature outfeature;
+ 				outfeature.id = m.id;
+@@ -320,92 +380,39 @@ void append_tile(std::string message, int z, unsigned x, unsigned y, std::map<st
+ 
+ 					if (fa != m.attributes.end()) {
+ 						outlayer.tag(outfeature, k, fa->second.first);
+-						add_to_tilestats(tilestats->second.tilestats, k, fa->second.second);
++						sf.attributes.push_back(std::pair<std::string, serial_val>(k, fa->second.second));
+ 						m.attributes.erase(fa);
+ 					}
+ 				}
+ 
+-				if (exclude_all_tile_geometries) {
+-					outfeature.type = -1;
+-				} else {
+-					outfeature.type = feat.type;
+-					outfeature.geometry = feat.geometry;
++				std::vector<mvt_geometry> geometry = feat.geometry;
+ 
+-					if (layer.extent != outlayer.extent) {
+-						for (size_t i = 0; i < outfeature.geometry.size(); i++) {
+-							outfeature.geometry[i].x = outfeature.geometry[i].x * outlayer.extent / layer.extent;
+-							outfeature.geometry[i].y = outfeature.geometry[i].y * outlayer.extent / layer.extent;
+-						}
++				if (layer.extent != outlayer.extent) {
++					for (size_t i = 0; i < geometry.size(); i++) {
++						geometry[i].x = geometry[i].x * outlayer.extent / layer.extent;
++						geometry[i].y = geometry[i].y * outlayer.extent / layer.extent;
+ 					}
++				}
+ 
+-					for (auto const &g : outfeature.geometry) {
+-						if (g.op == mvt_moveto || g.op == mvt_lineto) {
+-							// pin to the tile extent, since we don't want bounds bigger than the earth
+-							long long gx = std::min((long long) outlayer.extent, std::max(0LL, g.x));
+-							long long gy = std::min((long long) outlayer.extent, std::max(0LL, g.y));
+-
+-							// to world scale
+-							gx = gx * (1LL << (32 - z)) / outlayer.extent;
+-							gy = gy * (1LL << (32 - z)) / outlayer.extent;
+-
+-							// to world offset
+-							gx += (1LL << (32 - z)) * x;
+-							gy += (1LL << (32 - z)) * y;
+-
+-							minx = std::min(minx, gx);
+-							miny = std::min(miny, gy);
+-							maxx = std::max(maxx, gx);
+-							maxy = std::max(maxy, gy);
+-
+-							// if in the western hemisphere, try shifting to east
+-							if (gx < (1LL << 31)) {
+-								gx += 1LL << 32;
+-							}
++				for (auto const &g : geometry) {
++					sf.box.add(g);
++				}
+ 
+-							minx2 = std::min(minx2, gx);
+-							maxx2 = std::max(maxx2, gx);
+-						}
+-					}
++				if (exclude_all_tile_geometries) {
++					outfeature.type = -1;
++				} else {
++					outfeature.type = feat.type;
++					outfeature.geometry = std::move(geometry);
+ 				}
+ 
+ 				features_added++;
+-				features_added_to_layer = true;
+-				outlayer.features.push_back(outfeature);
+ 
+-				if (z < tilestats->second.minzoom) {
+-					tilestats->second.minzoom = z;
+-				}
+-				if (z > tilestats->second.maxzoom) {
+-					tilestats->second.maxzoom = z;
+-				}
+-
+-				if (feat.type == mvt_point) {
+-					tilestats->second.points++;
+-				} else if (feat.type == mvt_linestring) {
+-					tilestats->second.lines++;
+-				} else if (feat.type == mvt_polygon) {
+-					tilestats->second.polygons++;
+-				}
++				outfeature.seq = staged->size();
++				staged->push_back(sf);
++				outlayer.features.push_back(outfeature);
+ 			}
+ 		}
+ 
+-		if (features_added_to_layer) {
+-			double lat1, lon1;
+-			double lat2, lon2;
+-			tile2lonlat(minx, maxy, 32, &lon1, &lat1);
+-			tile2lonlat(maxx, miny, 32, &lon2, &lat2);
+-
+-			a->minlat = std::min(a->minlat, std::min(lat1, lat2));
+-			a->minlon = std::min(a->minlon, std::min(lon1, lon2));
+-			a->maxlat = std::max(a->maxlat, std::max(lat1, lat2));
+-			a->maxlon = std::max(a->maxlon, std::max(lon1, lon2));
+-
+-			tile2lonlat(minx2, maxy, 32, &lon1, &lat1);
+-			tile2lonlat(maxx2, miny, 32, &lon2, &lat2);
+-
+-			a->minlon2 = std::min(a->minlon2, std::min(lon1, lon2));
+-			a->maxlon2 = std::max(a->maxlon2, std::max(lon1, lon2));
+-		}
+ 	}
+ 
+ 	if (features_added == 0) {
+@@ -850,14 +857,270 @@ struct tileset_reader *begin_reading(char *fname) {
+ 	return r;
+ }
+ 
++struct ranked_feature {
++	size_t layer = 0;
++	size_t feature = 0;
++	double extent = 0;
++	size_t seq = 0;
++
++	bool operator<(ranked_feature const &o) const {
++		if (extent != o.extent) {
++			return extent < o.extent;
++		}
++
++		return seq > o.seq;
++	}
++};
++
++static std::vector<ranked_feature> rank_features(mvt_tile const &tile, std::vector<staged_feature> const &staged) {
++	std::vector<ranked_feature> ranked;
++
++	for (size_t i = 0; i < tile.layers.size(); i++) {
++		for (size_t j = 0; j < tile.layers[i].features.size(); j++) {
++			ranked_feature rf;
++			rf.layer = i;
++			rf.feature = j;
++			rf.seq = tile.layers[i].features[j].seq;
++			rf.extent = staged[rf.seq].box.extent(staged[rf.seq].type);
++			ranked.push_back(rf);
++		}
++	}
++
++	std::stable_sort(ranked.begin(), ranked.end());
++	return ranked;
++}
++
++static size_t drop_ranked(mvt_tile &tile, std::vector<ranked_feature> const &ranked, size_t to_drop) {
++	if (to_drop == 0) {
++		return 0;
++	}
++
++	std::vector<std::vector<bool>> doomed;
++	for (size_t i = 0; i < tile.layers.size(); i++) {
++		doomed.push_back(std::vector<bool>(tile.layers[i].features.size(), false));
++	}
++
++	for (size_t i = 0; i < to_drop && i < ranked.size(); i++) {
++		doomed[ranked[i].layer][ranked[i].feature] = true;
++	}
++
++	size_t dropped = 0;
++
++	for (size_t i = 0; i < tile.layers.size(); i++) {
++		std::vector<mvt_feature> kept;
++
++		for (size_t j = 0; j < tile.layers[i].features.size(); j++) {
++			if (doomed[i][j]) {
++				dropped++;
++			} else {
++				kept.push_back(std::move(tile.layers[i].features[j]));
++			}
++		}
++
++		tile.layers[i].features = std::move(kept);
++		tile.layers[i].compact_attributes();
++	}
++
++	return dropped;
++}
++
++static void drop_empty_layers(mvt_tile &tile) {
++	std::vector<mvt_layer> kept;
++
++	for (size_t i = 0; i < tile.layers.size(); i++) {
++		if (tile.layers[i].features.size() > 0) {
++			kept.push_back(std::move(tile.layers[i]));
++		}
++	}
++
++	tile.layers = std::move(kept);
++}
++
++static std::string encode_and_compress(mvt_tile &tile) {
++	std::string pbf = tile.encode();
++	std::string compressed;
++
++	if (!pC) {
++		compress(pbf, compressed, true);
++	} else {
++		compressed = pbf;
++	}
++
++	return compressed;
++}
++
++static size_t count_features(mvt_tile const &tile) {
++	size_t count = 0;
++
++	for (size_t i = 0; i < tile.layers.size(); i++) {
++		count += tile.layers[i].features.size();
++	}
++
++	return count;
++}
++
++static std::string reduce_to_fit(mvt_tile &tile, std::vector<staged_feature> const &staged, std::string compressed, size_t *dropped) {
++	while (compressed.size() > max_tile_size) {
++		size_t remaining = count_features(tile);
++		if (remaining <= 1) {
++			break;
++		}
++
++		double fraction = (double) max_tile_size / compressed.size() * 0.75;
++		size_t keep = (size_t) (remaining * fraction);
++		if (keep >= remaining) {
++			keep = remaining - 1;
++		}
++		if (keep < 1) {
++			keep = 1;
++		}
++
++		std::vector<ranked_feature> ranked = rank_features(tile, staged);
++		size_t n = drop_ranked(tile, ranked, remaining - keep);
++		if (n == 0) {
++			break;
++		}
++
++		*dropped += n;
++		drop_empty_layers(tile);
++		compressed = encode_and_compress(tile);
++	}
++
++	return compressed;
++}
++
++static void note_strategy(std::vector<strategy> &strategies, int z, size_t dropped) {
++	if ((size_t) z >= strategies.size()) {
++		strategies.resize(z + 1);
++	}
++
++	strategies[z].dropped_as_needed += dropped;
++}
++
++static void note_oversized(std::vector<size_t> &oversized, int z, size_t tile_size) {
++	if ((size_t) z >= oversized.size()) {
++		oversized.resize(z + 1, 0);
++	}
++
++	oversized[z] = std::max(oversized[z], tile_size);
++}
++
++// Credit the tileset's books with the features that actually reached the
++// output tile, identified by the sequence each was staged under.
++static void book_tile(mvt_tile const &tile, std::vector<staged_feature> const &staged, std::map<std::string, layermap_entry> &layermap, struct arg *a, int z, long long x, long long y) {
++	std::vector<bool> survived(staged.size(), false);
++
++	for (size_t i = 0; i < tile.layers.size(); i++) {
++		for (size_t j = 0; j < tile.layers[i].features.size(); j++) {
++			size_t seq = tile.layers[i].features[j].seq;
++
++			if (seq < survived.size()) {
++				survived[seq] = true;
++			}
++		}
++	}
++
++	std::map<std::string, tile_bounds> bounds;
++
++	for (size_t i = 0; i < staged.size(); i++) {
++		if (!survived[i]) {
++			continue;
++		}
++
++		staged_feature const &sf = staged[i];
++		auto tilestats = layermap.find(sf.layer);
++
++		if (tilestats == layermap.end()) {
++			layermap.insert(std::pair<std::string, layermap_entry>(sf.layer, layermap_entry(layermap.size())));
++			tilestats = layermap.find(sf.layer);
++			tilestats->second.minzoom = z;
++			tilestats->second.maxzoom = z;
++		}
++
++		for (size_t k = 0; k < sf.attributes.size(); k++) {
++			add_to_tilestats(tilestats->second.tilestats, sf.attributes[k].first, sf.attributes[k].second);
++		}
++
++		if (z < tilestats->second.minzoom) {
++			tilestats->second.minzoom = z;
++		}
++		if (z > tilestats->second.maxzoom) {
++			tilestats->second.maxzoom = z;
++		}
++
++		if (sf.type == mvt_point) {
++			tilestats->second.points++;
++		} else if (sf.type == mvt_linestring) {
++			tilestats->second.lines++;
++		} else if (sf.type == mvt_polygon) {
++			tilestats->second.polygons++;
++		}
++
++	}
++
++	for (size_t i = 0; i < tile.layers.size(); i++) {
++		mvt_layer const &layer = tile.layers[i];
++
++		for (size_t j = 0; j < layer.features.size(); j++) {
++			for (auto const &g : layer.features[j].geometry) {
++				if (g.op == mvt_moveto || g.op == mvt_lineto) {
++					// pin to the tile extent, since we don't want bounds bigger than the earth
++					long long gx = std::min((long long) layer.extent, std::max(0LL, g.x));
++					long long gy = std::min((long long) layer.extent, std::max(0LL, g.y));
++
++					// to world scale
++					gx = gx * (1LL << (32 - z)) / layer.extent;
++					gy = gy * (1LL << (32 - z)) / layer.extent;
++
++					// to world offset
++					gx += (1LL << (32 - z)) * x;
++					gy += (1LL << (32 - z)) * y;
++
++					long long gx2 = gx;
++
++					// if in the western hemisphere, try shifting to east
++					if (gx2 < (1LL << 31)) {
++						gx2 += 1LL << 32;
++					}
++
++					bounds[layer.name].add(gx, gy, gx2);
++				}
++			}
++		}
++	}
++
++	for (auto bi = bounds.begin(); bi != bounds.end(); ++bi) {
++		if (!bi->second.any) {
++			continue;
++		}
++
++		double lat1, lon1;
++		double lat2, lon2;
++		tile2lonlat(bi->second.minx, bi->second.maxy, 32, &lon1, &lat1);
++		tile2lonlat(bi->second.maxx, bi->second.miny, 32, &lon2, &lat2);
++
++		a->minlat = std::min(a->minlat, std::min(lat1, lat2));
++		a->minlon = std::min(a->minlon, std::min(lon1, lon2));
++		a->maxlat = std::max(a->maxlat, std::max(lat1, lat2));
++		a->maxlon = std::max(a->maxlon, std::max(lon1, lon2));
++
++		tile2lonlat(bi->second.minx2, bi->second.maxy, 32, &lon1, &lat1);
++		tile2lonlat(bi->second.maxx2, bi->second.miny, 32, &lon2, &lat2);
++
++		a->minlon2 = std::min(a->minlon2, std::min(lon1, lon2));
++		a->maxlon2 = std::max(a->maxlon2, std::max(lon1, lon2));
++	}
++}
++
+ void *join_worker(void *v) {
+ 	arg *a = (arg *) v;
+ 
+ 	for (auto ai = a->inputs.begin(); ai != a->inputs.end(); ++ai) {
+ 		mvt_tile tile;
++		std::vector<staged_feature> staged;
+ 
+ 		for (size_t i = 0; i < ai->second.size(); i++) {
+-			append_tile(ai->second[i], ai->first.z, ai->first.x, ai->first.y, *(a->layermap), *(a->header), *(a->mapping), a->db, *(a->exclude), *(a->include), *(a->keep_layers), *(a->remove_layers), a->ifmatched, tile, a->filter, a);
++			append_tile(ai->second[i], ai->first.z, ai->first.x, ai->first.y, *(a->layermap), *(a->header), *(a->mapping), a->db, *(a->exclude), *(a->include), *(a->keep_layers), *(a->remove_layers), a->ifmatched, tile, a->filter, &staged);
+ 		}
+ 
+ 		ai->second.clear();
+@@ -872,18 +1135,23 @@ void *join_worker(void *v) {
+ 		}
+ 
+ 		if (anything) {
+-			std::string pbf = outtile.encode();
+-			std::string compressed;
++			std::string compressed = encode_and_compress(outtile);
++			size_t desired = compressed.size();
++			size_t dropped = 0;
+ 
+-			if (!pC) {
+-				compress(pbf, compressed, true);
+-			} else {
+-				compressed = pbf;
++			if (!pk && drop_smallest_as_needed && compressed.size() > max_tile_size) {
++				note_oversized(a->oversized, ai->first.z, desired);
++				compressed = reduce_to_fit(outtile, staged, compressed, &dropped);
+ 			}
+ 
+-			if (!pk && compressed.size() > 500000) {
+-				fprintf(stderr, "Tile %lld/%lld/%lld size is %lld, >500000. Skipping this tile.\n", ai->first.z, ai->first.x, ai->first.y, (long long) compressed.size());
+-			} else {
++			if (dropped > 0) {
++				note_strategy(a->strategies, ai->first.z, dropped);
++			}
++
++			if (!pk && compressed.size() > max_tile_size) {
++				fprintf(stderr, "Tile %lld/%lld/%lld size is %lld, >%zu. Skipping this tile.\n", ai->first.z, ai->first.x, ai->first.y, (long long) compressed.size(), max_tile_size);
++			} else if (outtile.layers.size() > 0) {
++				book_tile(outtile, staged, *(a->layermap), a, ai->first.z, ai->first.x, ai->first.y);
+ 				a->outputs.insert(std::pair<zxy, std::string>(ai->first, compressed));
+ 			}
+ 		}
+@@ -892,7 +1160,7 @@ void *join_worker(void *v) {
+ 	return NULL;
+ }
+ 
+-void dispatch_tasks(std::map<zxy, std::vector<std::string>> &tasks, std::vector<std::map<std::string, layermap_entry>> &layermaps, sqlite3 *outdb, const char *outdir, std::vector<std::string> &header, std::map<std::string, std::vector<std::string>> &mapping, sqlite3 *db, std::set<std::string> &exclude, std::set<std::string> &include, int ifmatched, std::set<std::string> &keep_layers, std::set<std::string> &remove_layers, json_object *filter, struct tileset_reader *readers, double *minlat, double *minlon, double *maxlat, double *maxlon, double *minlon2, double *maxlon2) {
++void dispatch_tasks(std::map<zxy, std::vector<std::string>> &tasks, std::vector<std::map<std::string, layermap_entry>> &layermaps, sqlite3 *outdb, const char *outdir, std::vector<std::string> &header, std::map<std::string, std::vector<std::string>> &mapping, sqlite3 *db, std::set<std::string> &exclude, std::set<std::string> &include, int ifmatched, std::set<std::string> &keep_layers, std::set<std::string> &remove_layers, json_object *filter, struct tileset_reader *readers, double *minlat, double *minlon, double *maxlat, double *maxlon, double *minlon2, double *maxlon2, std::vector<strategy> *strategies, std::vector<size_t> *oversized) {
+ 	std::vector<pthread_t> pthreads(CPUS);
+ 	std::vector<arg> args;
+ 
+@@ -955,6 +1223,22 @@ void dispatch_tasks(std::map<zxy, std::vector<std::string>> &tasks, std::vector<
+ 		*minlon2 = std::min(*minlon2, args[i].minlon2);
+ 		*maxlon2 = std::max(*maxlon2, args[i].maxlon2);
+ 
++		if (args[i].strategies.size() > strategies->size()) {
++			strategies->resize(args[i].strategies.size());
++		}
++
++		for (size_t z = 0; z < args[i].strategies.size(); z++) {
++			(*strategies)[z].dropped_as_needed += args[i].strategies[z].dropped_as_needed;
++		}
++
++		if (args[i].oversized.size() > oversized->size()) {
++			oversized->resize(args[i].oversized.size(), 0);
++		}
++
++		for (size_t z = 0; z < args[i].oversized.size(); z++) {
++			(*oversized)[z] = std::max((*oversized)[z], args[i].oversized[z]);
++		}
++
+ 		for (auto ai = args[i].outputs.begin(); ai != args[i].outputs.end(); ++ai) {
+ 			if (outdb != NULL) {
+ 				mbtiles_write_tile(outdb, ai->first.z, ai->first.x, ai->first.y, ai->second.data(), ai->second.size());
+@@ -1001,7 +1285,9 @@ void handle_strategies(const unsigned char *s, std::vector<strategy> *st) {
+ 						} else if (key == "tiny_polygons") {
+ 							(*st)[i].tiny_polygons += kv.value->number();
+ 						} else if (key == "tile_size_desired") {
+-							(*st)[i].tile_size += kv.value->number();
++							if (kv.value->number() > (*st)[i].tile_size) {
++								(*st)[i].tile_size = kv.value->number();
++							}
+ 						} else if (key == "feature_count_desired") {
+ 							(*st)[i].feature_count += kv.value->number();
+ 						}
+@@ -1061,6 +1347,7 @@ void decode(struct tileset_reader *readers, std::map<std::string, layermap_entry
+ 	}
+ 
+ 	std::map<zxy, std::vector<std::string>> tasks;
++	std::vector<size_t> oversized;
+ 	double minlat = INT_MAX;
+ 	double minlon = INT_MAX;
+ 	double maxlat = INT_MIN;
+@@ -1097,7 +1384,7 @@ void decode(struct tileset_reader *readers, std::map<std::string, layermap_entry
+ 
+ 		if (readers == NULL || readers->zoom != current.first.z || readers->x != current.first.x || readers->y != current.first.y) {
+ 			if (tasks.size() > 100 * CPUS) {
+-				dispatch_tasks(tasks, layermaps, outdb, outdir, header, mapping, db, exclude, include, ifmatched, keep_layers, remove_layers, filter, readers, &minlat, &minlon, &maxlat, &maxlon, &minlon2, &maxlon2);
++				dispatch_tasks(tasks, layermaps, outdb, outdir, header, mapping, db, exclude, include, ifmatched, keep_layers, remove_layers, filter, readers, &minlat, &minlon, &maxlat, &maxlon, &minlon2, &maxlon2, strategies, &oversized);
+ 				tasks.clear();
+ 			}
+ 		}
+@@ -1116,9 +1403,15 @@ void decode(struct tileset_reader *readers, std::map<std::string, layermap_entry
+ 		*rr = r;
+ 	}
+ 
+-	dispatch_tasks(tasks, layermaps, outdb, outdir, header, mapping, db, exclude, include, ifmatched, keep_layers, remove_layers, filter, readers, &minlat, &minlon, &maxlat, &maxlon, &minlon2, &maxlon2);
++	dispatch_tasks(tasks, layermaps, outdb, outdir, header, mapping, db, exclude, include, ifmatched, keep_layers, remove_layers, filter, readers, &minlat, &minlon, &maxlat, &maxlon, &minlon2, &maxlon2, strategies, &oversized);
+ 	layermap = merge_layermaps(layermaps);
+ 
++	for (size_t z = 0; z < strategies->size() && z < oversized.size(); z++) {
++		if ((*strategies)[z].dropped_as_needed > 0 && (*strategies)[z].tile_size < oversized[z]) {
++			(*strategies)[z].tile_size = oversized[z];
++		}
++	}
++
+ 	st->minlon = std::min(minlon, st->minlon);
+ 	st->maxlon = std::max(maxlon, st->maxlon);
+ 	st->minlat = std::min(minlat, st->minlat);
+@@ -1291,6 +1584,8 @@ static const struct option long_options[] = {
+ 	{"feature-filter", required_argument, 0, 'j'},
+ 
+ 	{"Setting or disabling tile size limits", 0, 0, 0},
++	{"maximum-tile-bytes", required_argument, 0, 'M'},
++	{"drop-smallest-as-needed", no_argument, 0, '~'},
+ 	{"no-tile-size-limit", no_argument, &pk, 1},
+ 	{"no-tile-compression", no_argument, &pC, 1},
+ 	{"no-tile-stats", no_argument, &pg, 1},
+@@ -1426,6 +1721,16 @@ int main(int argc, char **argv) {
+ 			minzoom = atoi(optarg);
+ 			break;
+ 
++		case 'M': {
++			long long bytes;
++			if (!is_integer(optarg, &bytes) || bytes < 0) {
++				fprintf(stderr, "%s: Maximum tile size must be a non-negative integer (got %s)\n", argv[0], optarg);
++				exit(EXIT_ARGS);
++			}
++			max_tile_size = bytes;
++			break;
++		}
++
+ 		case 'J':
+ 			filter = read_filter(optarg);
+ 			break;
+@@ -1535,6 +1840,8 @@ int main(int argc, char **argv) {
+ 				exclude_all_tile_attributes = true;
+ 			} else if (strcmp(opt, "exclude-all-tile-geometries") == 0) {
+ 				exclude_all_tile_geometries = true;
++			} else if (strcmp(opt, "drop-smallest-as-needed") == 0) {
++				drop_smallest_as_needed = true;
+ 			} else {
+ 				fprintf(stderr, "%s: Unrecognized option --%s\n", argv[0], opt);
+ 				exit(EXIT_ARGS);

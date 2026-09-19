@@ -2024,3 +2024,253 @@ reviewer-finding tests killed 4, 4 and 3 runs.
 **Prerequisite.** A `test.sh` that compiles at runtime rather than relying on build output baked
 into the image. Design for this from the first Dockerfile; retrofitting it after a batch is far
 more expensive than writing it that way.
+
+
+## Pattern 89 — Stated-but-untested probe battery (triage before an FP-driven redesign)
+
+**When.** The FP check flags a pass, or a batch reads 0% and you suspect the description, not the
+tests. Also before shipping a test a reviewer suggested.
+
+**Procedure.**
+1. List every behaviour sentence in meta.md. Mark each as tested (name the test) or stated-only.
+2. For each stated-only sentence write a probe: one input, one expected value, a few lines.
+3. Run every probe against every saved agent solution: fresh clone at BASE_COMMIT, apply that run's
+   `solution-patch.patch` to source files only, run a throwaway probe file.
+4. Count violators per sentence.
+
+```bash
+for d in agent-runs/<batch>/*/; do
+  rm -rf $S/r && git clone -q $CLONE $S/r && git -C $S/r checkout -q $BASE
+  git -C $S/r apply --include='src/*' "$d/solution-patch.patch"
+  cp probes.test.js $S/r/test/ && (cd $S/r && npx jest test/probes.test.js --json --outputFile=$S/$(basename $d).json)
+done
+# then tabulate failures per probe across runs
+```
+
+**Reading the table.** A sentence most agents violate is either a trap you must test (and pay for in
+the rate) or a clause to delete or scope. If NO agent is clean on every row, no clean pass exists
+under that description: delete clauses until at least one saved solution is clean on every
+remaining row, then re-derive the tests from the shorter spec.
+
+**Measured.** ray-optics-formula-conditionals batch 2 (lone pass FP-flagged): order-independent
+`and` narrowing 10/10 violators, nested-`if` value over-guard 8/10, invalid-only truth value 7/10,
+identity range 4/10, five other sentences 0/10. The redesign deleted the three worst clauses, and
+batch 3 produced a clean, accepted 1/10. The same battery priced a reviewer-suggested feasibility
+test at 14/21 failing and 0/21 clean, so it became a scoped sentence instead (L54).
+
+## Pattern 90 — Re-run "fails on base" after every fairness rewrite
+
+**Problem.** A fairness finding asks you to drop an assertion that pins something unstated. What is
+left often checks behaviour the repo already had, and the test goes green without the solution. The
+platform then counts a new test that passes on base, and reviewers read it as coverage that is not
+there.
+
+**Procedure.** After any edit that removes or loosens an assertion, apply `test.patch` alone to a clean
+base checkout and run new mode. Every new test must fail. For each one that passes, add one
+feature-only observable the contract states (the new layer exists, the new accessor returns the
+stated value), never a re-tightening of the assertion you just removed.
+
+**Measured.** worldengine-orographic-precipitation, two separate rounds: a calm-wind test pinned only
+pre-change precipitation values (added the all-zero `rainfall` layer check), and a humidity test lost
+its post-erosion inequality and kept only `humidity == (precipitation - 3*irrigation)/4`, base
+behaviour (added "the finished world carries a non-empty `rainfall` layer"). Both were caught by the
+clean-room run's `61 failed, 1 passed` / `64 failed, 1 passed` line, not by review.
+
+## Pattern 91 — One bind-mount RUN layer for a C++ build that must fit the environment start timeout
+
+**Problem.** The platform's environment start (600 s, two attempts) includes building the image. A
+C++ Dockerfile that does `COPY . /app`, builds tools, then `chmod -R a+rwX /app` pays an overlayfs
+copy-up of the whole tree on the chmod, because every file lives in a lower layer. Local runs use a
+cached image and never see it. Verify Solution fails with `EnvironmentStartTimeoutError`.
+
+**Procedure.**
+1. Time `docker build --no-cache` before the first batch. Anything near 600 s is a failure.
+2. Do copy, build and chmod in ONE layer:
+   ```dockerfile
+   RUN --mount=type=bind,source=.,target=/src \
+       cp -a /src/. /app/ \
+       && make cmake_setup && cd build && make -j2 <tools> \
+       && chmod -R a+rwX /app
+   ```
+3. Verify the resulting `/app` is identical to the old image (hash every file plus its mode) so the
+   change is environment-neutral for the solvers.
+
+`RUN --mount` needs BuildKit; the platform builds with `docker compose build`, which uses it.
+
+**Measured.** cwerg-bcopy-bzero-lowering: 704 s cold (chmod alone 261 s) to 413 s, `/app` identical
+across 3080 files, and the next batch built in all nine runs. (L62)
+
+## Pattern 92 — Timestamp-proof build in test.sh for compiled repos
+
+**When.** Any repo whose Dockerfile runs `make`/`cmake --build` into `/app`. The platform commits `/app`
+after the image build, so every object file and binary is a TRACKED file in the solver's sandbox.
+
+**Failure it prevents.** Agents `git restore` those outputs to keep their diff source-only. The restore
+gives them a newer mtime than the sources the agent edited, so the incremental `make` in test.sh
+rebuilds nothing, and the new suite runs the BASELINE binary: every new test fails, the evaluator
+flags a verifier blocker, and no per-test data survives.
+
+**Procedure.**
+```bash
+# test.sh, before any test runs: rebuild exactly what the tests execute, ignoring timestamps
+make -B -j"$(nproc)" tile-join tippecanoe tippecanoe-decode unit >/tmp/build.log 2>&1
+# or: rm -f tile-join tile-join.o mvt.o && make -j"$(nproc)"
+```
+Keep the existing build-failure fallback (a failing JUnit testcase carrying the build log tail).
+Confirm by restoring the tracked outputs after applying the solution and checking the new tests still
+exercise it.
+
+**Measured.** tippecanoe-tile-join-size-recourses: 9 of 10 trajectories restored build outputs, 7 runs
+were graded against a stale or unlinked binary, and 2 ENV-blocked flags had to be contested. The only
+run that never restored was the only pass (L63).
+
+## Pattern 93 — Probe the observation surface before relaxing a near-universal stated wall
+
+When most runs fail one test that a meta sentence plainly states, there are two stories: the agents
+violate the sentence, or the test reads a different surface than the sentence promises (the returned
+value vs a live object, a file vs an API). Only the second is unfair. Tell them apart with one probe on
+the saved near-miss patches before touching the suite.
+
+```python
+# clean container: base + a saved near-miss solution-patch + test.patch, then
+ret = pb.solve(status=status)            # the surface the contract promises: what the run returns
+live = pb.get_variables()['t']()         # the surface the test reads
+# pull the state vector out of ret, then compare both surfaces with each other and with the expectation
+```
+
+If the two surfaces are the same object and both are wrong, the wall is fair: keep it and move the rate
+with agent mix (L65) or another lever. If they disagree, the test reads the wrong surface; retarget the
+assertion (tests-only, so re-eval eligible). On sfepy-adaptive-stepping-accounting both near-miss
+patches returned the solved state through both surfaces, the requirement stayed, and the problem was
+accepted at 2/15 without cutting it.
+
+## Pattern 94 — Project a tests-only re-eval by replaying the batch's own patches
+
+A re-eval re-grades the last batch's solutions against the edited `test.patch` / `solution.patch`. You
+already hold those solutions (`agent-runs/<batch>/*/solution-patch.patch`), so the re-eval can be
+computed locally before you pay for it.
+
+```bash
+# fresh clone at BASE, the submission Dockerfile, the NEW test.patch, and every saved agent patch
+docker build -q -t replay .
+for r in runs/*.patch; do
+  docker run --rm --network none --user 1000:1000 replay bash -c \
+    "cd /app && git apply test.patch && git apply $r && ./test.sh --output_path /tmp/n.xml new | tail -1"
+done
+```
+
+Run the reference twice as uid 1000 and once as root in the same loop. Do not delete the image until
+the loop exits: removing it under a live `--rm` container turns the background command's exit status red.
+On mwparserfromhell-site-aware-parsing the replay matched the platform's failure count on all 19 runs the pool kept (L68). The pool
+dropped one projected passer, so state the projection as "N passes if the pool keeps every run". Use it
+only for tests-only changes; a meta.md edit changes what agents write, and no replay can measure that
+(L35).
+
+## Pattern 95 — Deterministic harness for a producer running on its own thread
+
+**When.** The feature's contract talks about a background producer (a decoder thread, a prefetcher, a
+worker pool): how often it seeks, what it has buffered when a command arrives, what it does at start.
+Quality reviews reject event-order assertions and internal constants (buffer sizes), and wall-clock
+settle loops read as flaky.
+
+**Build.**
+1. A fake producer that logs every call into a `Mutex<Vec<Event>>` plus a `Condvar`, so tests wait for
+   a condition ("at least N decodes", "a Blocked event") with a long timeout only as a failsafe.
+2. A gate with a CALL budget that blocks calls from any thread except the one that built the fake, and
+   logs `Blocked` when it stops. Budget 0 isolates work done synchronously inside construction/`play()`
+   (the startup seek budget); a small budget freezes the backlog while a command is sent.
+3. Compare, do not count: measure seeks against a plain configuration whose wraps land on the same
+   output frames, so buffer size cancels out. Check order only inside a window between two events that
+   every correct implementation must emit (one seek, then increasing decode positions, per pass).
+
+**The trap in the harness (L70).** The gate bounds producer CALLS, not OUTPUT. Any assertion on output
+behind the gate must stay under the worst-case yield of the budget, or render until the first gap.
+kira asserted 48 frames behind a 60-call gate, the reference's own ratio, and failed six correct runs.
+
+**Evidence.** kira-loop-crossfade: replaced two failed quality-review assertions (event order, a 16384
+buffer constant); stable across 3 plain runs and 5 runs under 2x CPU oversubscription; its startup test
+caught the reference's own double seek at start 3.
+
+## Pattern 96 — Shim counterfactual: read a compile-wiped batch before paying for another
+
+**When.** A batch reads 0% because every run fails ALL new tests with the same compile error on a symbol
+the solution adds (a static vs instance method, a parameter type, an enum payload). The batch measured
+nothing about difficulty, and the description fix that follows is solver-visible, so the next batch is
+full price with no re-eval.
+
+**Build.**
+1. Fresh clone at BASE per run: apply the agent's saved `solution-patch.patch`, then your `test.patch`.
+2. Insert a one-line adapter into the agent's code that maps the tested shape onto theirs, for example
+   `public static List<Path> files(Path p) { return load(p).files(); }`. Skip runs that already have
+   the tested shape.
+3. Run the new suite and record per-test failures with an XML parser, never a regex.
+
+**Read it as.** An upper-bound estimate of the next batch's rate and kill table. It cannot see what
+agents would write once the description changes (L35), and an adapter can hide a real semantic gap, so
+check each killer's failure message before trusting the table. Classify each killer as fair or
+under-specified while the description is still open, and fix every under-specified one in the same
+paid round.
+
+**Evidence.** planetiler-custommap-schema-composition: batch 1 0/8 on `files(Path)`. Shim replay: 2/8,
+top killer `remove_of_layer_added_by_the_same_file_is_an_error` 5/8, plus two under-specified cells
+(absolute `extends` in a string schema, a missing LAST list entry) fixed in meta before paying. Batch 2:
+3/10, same top killer 7/10, accepted.
+
+## Pattern 97 — Keep Verify Solution's test sets clean when the feature changes existing expectations
+
+**When.** The feature deliberately changes behaviour that existing repo tests pin, so some of those
+tests need new expectations; or the repo's test titles contain characters the grader uses in IDs.
+
+**Build.**
+1. Do not edit the existing spec file in place. Delete the superseded cases from it and re-create them,
+   with their new expectations, in your new spec file. The original file then stays in base mode,
+   where its untouched cases pass with and without the solution.
+2. Make every new-mode test fail on base. Rebuild any case where today's behaviour happens to produce
+   the new answer (reorder the declared variations, start from an interleaved allocation).
+3. `grep -c "::"` the generated JUnit. If repo titles contain it, normalise in test.sh after the runner
+   and confirm there are no duplicate `(classname, name)` pairs.
+4. Assert on the rendered output wherever the prose leaves the return shape open.
+
+**Evidence.** featurevisor-minimal-rebucketing: Verify Solution failed on 18 base-passing new-mode tests
+(10 of them untouched `traffic.spec.ts` cases), then on 314 phantom extras from `describe("... :: ...")`
+titles, then the Auto Review flagged a formatter return-shape pin that had cost 7 kill events. After
+all four fixes: 34/34 new tests failing on base, clean sets, approved.
+
+
+## Pattern 98 — When two review checkers contradict each other, let the description decide
+
+**When.** One checker (Solution Quality) demands a behaviour and a test for it; another (Test Quality)
+then rules that test unfair because the description does not state it. Deleting the test fails the
+first; keeping it fails the second.
+
+**Build.**
+1. Check whether the behaviour is a reasonable reading of the existing contract. If it is, add the
+   missing noun or clause to the ONE sentence that already covers the family (here: "an unknown key
+   in an event, condition, action or spawned object's mapping").
+2. Keep the test and the reference behaviour unchanged.
+3. Make the edit before the first batch, or accept that it forfeits re-eval for that round.
+
+**Evidence.** ir-sim-scenario-events: round 2 Solution Quality required creation-time `ValueError` for
+unknown spawn-template keys (the base only warns when the object is built); round 4 Test Quality ruled
+the test unfair. One added noun in meta.md cleared both; the final Auto Review scored the description
+3/3.
+
+## Pattern 99 — Seeded equivalence corpus against the repo's own evaluator
+
+**When.** The feature transforms something the repo can also evaluate (a datafile the SDK reads, an IR the
+interpreter runs, a query the engine executes), and the contract is "evaluates the same after the
+transformation".
+
+**How.**
+1. A deterministic PRNG (mulberry32 with fixed seeds) generates small but deep inputs: every operator,
+   empty containers, containers nested under operators, decided and undecided leaves.
+2. For each input and each of a few fixed partial contexts, compare the repo's evaluator on the original
+   (with the context merged) against the evaluator on the transformed output, over a small context grid.
+3. Group seeds into batches of about five and check that EVERY batch fails on base; a single seed can be
+   base-equivalent by chance.
+4. Keep hand-written shape tests beside it for what equivalence cannot see (what was removed).
+
+**Evidence.** featurevisor-target-specialization: 8 batches of 5 seeds. They caught the nested-list arm in 3
+of 20 runs and a `not` over a decided-false child, while twenty hand-written structural cells killed one run.
+The FP panels re-ran their own broader fuzzers and upheld every pass.
+

@@ -99,7 +99,7 @@ Top contributors go through 1-5 revision rounds before approval. This is normal 
 - Public repository on GitHub
 - At least 500 GitHub stars (platform floor). Our own HUNT ceiling is **10000** (relaxed from 5000 on 2026-08-04); 5000-10000 is a penalty band, not a free window — see `PICK-FILTER.md § Gate 10`
 - At least 1 commit in the last 12 months
-- Language: **TypeScript, JavaScript, Python, Go, Rust, Java/JVM, or C/C++**. (Java/JVM + C/C++ re-enabled — the 2026-05-14 disable was reverted; verified toolchains in `DOCKER.md`.)
+- Language: **TypeScript, JavaScript, Python, Go, Rust, Java/JVM, or C/C++**. (Java/JVM + C/C++ re-enabled — the 2026-05-14 disable was reverted; verified toolchains in `DOCKER.md`.) **⛔ Plain C is NOT eligible (platform picker 2026-09-19):** the supported language must be the repo's PRIMARY language or a MAJOR top-3 share by bytes (`gh api repos/O/R/languages`); tyfkda/xcc (C primary, TypeScript 4.9%) was refused. "C/C++" here means C++-primary repos that also contain C.
 - Production-level codebase
 - Permissive open-source license (see allowed list below). **If the repo carries MULTIPLE licenses, EVERY one must be in the allowed set — a single non-allowed license (even vendored/subdir) = whole-repo reject.** Verify all before investing. **READ the actual LICENSE file and match against the explicit allowlist — "OSI-approved" is NOT the test:** CC-BY (1.0-4.0) is ALLOWED though not OSI-approved, while **NCSA is a HARD disqualifier though it IS OSI-approved**, and any **conditional / rider BSD** (BSD text plus extra conditions) is a HARD disqualifier (community burns: linearmodels NCSA, pykalman conditional-BSD rider — both perfect picks killed on license).
 - No existing PR that already solves the problem

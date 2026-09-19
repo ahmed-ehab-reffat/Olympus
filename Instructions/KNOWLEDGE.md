@@ -936,3 +936,215 @@ inhabitation fixed point correctly. Effort spent hardening THAT bought nothing.
 
 **Long-horizon (batch 2, 10 Nova):** median 4 files, median +594 raw LOC, median 6.2M prompt
 tokens. `trajectory.json.steps` is a truncated summary (4 entries here) and is NOT a message count.
+
+
+## ray-optics-formula-conditionals (APPROVED Olympus 2026-09-14) — Nova and Vega blind spots
+
+Three batches: 10 Nova + 1 Vega (0/11), 10 Nova (1/10, FP-flagged), 9 Nova + 1 Vega (1/10, Vega).
+Batch 3, ranked by recurrence:
+
+1. **Identical operands estimated as independent intervals — 7/10** (5/10 and 5/11 in the earlier
+   batches, under different descriptions). Nova extends the interval estimator by combining two operand
+   ranges and never checks whether both sides are the same node, so `x < x` keeps a branch it can never
+   select. Every evaluator marked it described AND inferable. (F-26)
+2. **`or` narrowing copied from `and` — 6/10, up from 3/11.** Nova narrows the `or` TRUE branch with
+   the operands' restrictions. A clearer sentence made it worse, not better. (F-27)
+3. **Raw lowering over a wrapped operand — 6/10, and the sole failure of the 94/96 near-miss.** A valid
+   comparison lowered to plain f32 reads a maybe-invalid operand without `.value`. Several runs had
+   written an `asF32` helper in the same patch and did not call it on the new node. (F-10)
+4. **Repo equality idiom via subtraction — 3/10.** Nova tests equality as a nonzero guard on `a - b`,
+   which overflows for far-apart finite operands. The reference made the same mistake. (F-23 family)
+5. **Variadic call arguments keep the old parse production — 2/10.** `max`/`min` arguments still parse
+   at the additive level after the fixed-arity path was updated.
+
+**Literal grammar reading (batch 1, 11/11 including Vega).** When a qualifier can attach to two
+clauses, both Nova and Vega attach it to the nearest one.
+
+**Vega vs Nova.** Vega produced the only legitimate pass in 31 runs: 12 files, +713 raw LOC, on 2.9M
+prompt tokens, under half of Nova's batch-3 median (7 files, +531, 6.2M). Nova's one pass (batch 2)
+was a false positive. On a spec made of many small asymmetric rules, the heavier multi-file
+implementation cleared all four seams; no Nova run cleared more than three.
+
+**Not a blind spot:** parser precedence, the statement splitter, arity rejects, JS codegen, WGSL
+agreement and the derivative chain rule. 86 of 96 tests killed nothing.
+
+## worldengine-orographic-precipitation (APPROVED Olympus 2026-09-16) — Nova blind spots
+
+Two batches, 20 Nova runs: batch 1 1/10 by the grader with no clean pass, batch 2 2/10. Ranked by
+recurrence:
+
+1. **A two-part concept split into sibling container keys — 11/20 (7/10 in batch 2).** Nova stores
+   `wind_direction` and `wind_strength` as separate `layers` entries although the meta says "a wind
+   layer" and the repo has `LayerWithThresholds`. Values survive serialisation, the key does not, and
+   the failure surfaces as `KeyError: 'wind'` in round-trip tests. (F-28)
+2. **Placement prose read as a statement about existing steps — 10/10 in batch 1,** 0/10 once one
+   sentence stated the existing stages are kept. (L57)
+3. **Exact band-centre strength — 5/10 in batch 1** returned 0.9999999999999993: a test defect, not a
+   blind spot, fixed with a tolerance. (L59)
+4. **Whole-layer arrays written as cell-taking methods — 4/20,** 11-14 tests at once, graded
+   INTEGRATION_ERROR. (F-16 accessor variant)
+5. **Applicability guard written but not called — 3/20.** `is_applicable` is correct, `execute` stays
+   unconditional like the eight sibling simulations, so a supplied wind is overwritten. (F-29)
+
+**Not a blind spot:** latitude-band geometry, the closed-form steady state, wrap seams, warmth scaling,
+drawing, CLI output. The 24 transport tests killed 0 of 20 runs.
+
+**Effort (batch 2).** 11-12 files, +324 to +441 raw LOC, 3.5M-6.5M prompt tokens, 44-71 tool calls.
+
+## cwerg-bcopy-bzero-lowering (APPROVED Olympus 2026-09-16) — Nova and Vega blind spots
+
+Five solved batches, 50 runs (46 Nova, 3 Vega, 1 Orion). Accepted batch 6: Nova 2/9, Vega 1/1. Ranked
+by recurrence:
+
+1. **A new full-width consumer after an existing width pass — 10/10, 8/11, 7/10, 3/9, 2/10.** Nova
+   lowers `bzero`/`bcopy` correctly and never opens `FunRegWidthWidening`, so a U8 length that wrapped
+   to 0 is 256 once the optimizer widens it; the optimized C executable segfaults. Stating the rule in
+   meta.md lowered the rate but never removed it. (F-30)
+2. **C++ CFG edits that only the text renderer rejects — 9/10 (sentence missing), then 3/11, 2/10,
+   2/10.** Segfault in `-mode normal` on the large program, `-mode binary` fine. Graded
+   INTEGRATION_ERROR. (F-32)
+3. **Twin constant folders left alone — 2/10 in batch 6, identical 5 tests.** Nova changes lowering
+   and the C backend but not `eval.py`/`eval.cc`, so a folded S32 wrap prints `4294967294` in C++ and
+   `-2` in Python. (F-31)
+4. **`bcopy` derived from `bzero` advances only the destination — 1 run in each of batches 4, 5, 6.**
+   Copies the bug into both twins. (F-27 variant)
+5. **`bbl.inss.remove(ins)` against an identity-asserting `__eq__` — 2 of the first 5 in batch 1, 1/10
+   in batch 4.** (F-4)
+
+**Not a blind spot:** byte-order semantics for positive, zero and negative lengths, overlap order, all
+eight integer kinds on the native targets, plain C output. **Effort (batch 6):** 12-31 files, +784 to
++1214 raw LOC, 23M-42M prompt tokens; the Vega pass was the cheapest run at 23M.
+
+## tippecanoe-tile-join-size-recourses (APPROVED Olympus 2026-09-16) — Nova blind spots
+
+One batch, 10 Nova, 1 pass. Seven failing runs never had their source exercised (stale binaries), so
+this ranking comes from the evaluators' static reviews:
+
+1. **Restoring tracked build outputs after the last build — 9/10 runs.** Nova treats `.o` files and
+   binaries in `git status` as noise and `git restore`s them before finishing, which leaves the
+   workspace's binary older than its source. 7 were graded against the baseline binary. The one run
+   that never restored committed its objects instead, and was the pass. (L63)
+2. **Recording on the attempt, not the effect — 4/10** (plus one mirror run). An oversized tile with a
+   single feature cannot shed anything, yet `tile_size_desired` was written the moment the tile was
+   over the limit. (F-15)
+3. **Leaving the input reader's operator alone — 3/10.** Inherited `tile_size_desired` still summed in
+   `handle_strategies` while the new per-tile path took a maximum. (F-33)
+4. **A regression in the ordinary join path — 1/10** (segfaults, `mvt_type -13`).
+5. **One-feature-at-a-time shedding with a full re-encode — 1/10**, timed out at 1785 s on the
+   90,000-feature fixture.
+
+**The pass** used the least effort in the batch: 9.6M prompt tokens against a failing median of
+15.1M, 5 source files.
+
+**Not a blind spot (no attribution in 10 runs):** extent ranking for points, lines and polygons,
+merge-order ties, attribute-pool compaction, the output-only tilestats/zoom/bounds booking, compressed
+vs uncompressed measurement, and extent rescaling. Treat that with the static-review caveat above.
+
+## sfepy-adaptive-stepping-accounting (APPROVED Olympus 2026-09-16) — Nova, Orion and Vega blind spots
+
+- **Nova (0/11 with a result) saves a rollback snapshot by assignment.** `initial_vec = vec0` before a
+  solve that writes into `vec0`: 8 of the 9 Nova runs with per-test data (F-34), including both 116/117
+  runs. Neither passer made this mistake; both called `.copy()`.
+- **Nova clamps with `min()` where the contract is strict.** 6 of 9 let a hostile `adapt_fun` produce a
+  retry equal to the rejected attempt (F-10 hook cell). 6 of the 8 F-34 runs missed this too, so the
+  two misses travel together.
+- **Nova breaks a repo example while clearing the new suite.** The only Nova run at 117/117 drove
+  `linear_elastic_damping.py` through 439 retries to a singular factor (F-12).
+- **Vega (1/3) rewinds the step index with the state (F-35) and trusts a hook's final time.** One run
+  failed all three stop-before-advancing tests at 114/117, another let a hook end the run at 9.0 against
+  a final time of 4.0 at 116/117. No Vega run aliased the snapshot.
+- **Orion (1/1) is slow and complete.** 28.9M prompt tokens, more than twice any other run in the pool,
+  and a clean pass.
+
+## mwparserfromhell-site-aware-parsing (APPROVED Olympus 2026-09-18) — Nova, Orion and Vega blind spots
+
+- **Nova (2/13) takes the delegation shortcut and wins with it.** Both passes, and 4 of the 11 failing
+  Nova runs, forwarded C tokenization to the Python tokenizer when a site was given. The shortcut saves
+  the C arm but not the Python scanner: 9 of the 11 failing Nova runs failed the seeded parity corpus
+  (F-36), several by slicing the unread remainder back into the shared segment list.
+- **Vega (0/5) implements the C arm natively (4 of 5) and misses the setter path.** All 5 returned namespace 0
+  for `node.title = ":File:Foo.png"` while handling the colon on parsed links (F-10 two-path cell), and
+  3 of 5 kept `'\0'` as end of input in the C reader (F-37). Vega patches were the largest (526-626
+  added lines) at 3.9-8.2M prompt tokens, against Nova's 3.7-14.9M.
+- **Orion (0/1) mutates shared state and repairs in the builder.** It sliced `self._text` while scanning
+  the trail and returned `[link, Text(trail)]` for file and category links, losing characters on
+  backtrack and splitting text nodes (F-36, both branches).
+- **Nobody paired tag names by case folding.** 19 of 20 in batch 1 kept the base `lower()` pairing, which
+  is why that test was unfair rather than hard (L66).
+
+## kira-loop-crossfade (APPROVED Olympus 2026-09-18) — Nova blind spots
+
+- **Nova transcribes a fully stated audio contract.** 10 of 10 Nova runs built the public type, both
+  settings and handles, static and streaming blends, reverse mirror, seek wrapping, slices, easing, rate
+  parity, stereo, decoder seek budgets and baking: 13-14 source files, 276-412 effective lines, mean
+  54.3/55 tests.
+- **Streaming schedulers split three ways on buffering.** Several runs prepare the tail and head frames
+  of a fade before enqueueing (47 frames queued from 60 decoder calls against the reference's 48), one
+  queued 24. All preserved what they had buffered. A test that assumes one queue depth reads these as
+  failures (L69/L70).
+- **The one genuine miss: wrap arithmetic under a live region change** (1/10). After switching to a loop
+  that ends before the playhead, the run subtracted the full loop once and added the fade once, leaving
+  the position past the new end. The reference steps by (loop - fade) until inside. F-10 live-change cell.
+- **Nothing killed on the streaming decoder discipline.** At most one extra startup seek, one seek per
+  wrap and forward-only head decoding were all met by 10 of 10.
+
+## planetiler-custommap-schema-composition (APPROVED Olympus 2026-09-18) — Nova blind spots
+
+- **Nova validates a per-input rule against the running accumulator (F-38).** 7 of 10 runs checked
+  "removing an id the earlier files did not contribute" with `map.containsKey(id)` on the map they were
+  already mutating, so a layer added and removed in the same file passed. Three of them failed nothing
+  else out of 83.
+- **Nova drops a resource origin at the second consumer (F-9).** 3 of 10 resolved a standalone bundled
+  schema correctly in the loader, then re-resolved its `examples` string against a filesystem path in
+  the validator.
+- **"X returns ..." becomes an accessor.** With no static/instance stated, 8 of 8 made `files` an
+  instance method, 7 of them as a new record component on `SchemaConfig` (L72).
+- **Nova runs installs.** One run executed `mvn -o -pl planetiler-core -DskipTests install` without the
+  flatten profile and broke the offline verifier (L73).
+- **Passers wrote more than the reference.** The three passers measured 454-499 human-effective lines
+  against the reference's 316: none delegated or took a shortcut, and all added their own tests.
+- **Nothing killed on the stated merge rules.** Args settled after composition, layer positions,
+  raw-vs-accessor scalar inheritance, diamond dedup, cycle naming and depth-first order: 0 of 10.
+
+## featurevisor-minimal-rebucketing (APPROVED Olympus 2026-09-19) — agent blind spots
+
+- **Nova builds per-key records on plain objects (F-40).** 7 of 8 Nova runs lost the variation
+  `__proto__` from `getAllocationChanges`; six failed nothing else. Neither passer (Orion, Vega) did.
+- **Agents reuse the repo helper that sounds right (F-39).** Three independent runs, two Nova and one
+  Vega, refilled free space with `getUpdatedAvailableRangesAfterFilling`, which drops later ranges when
+  an earlier one is used up exactly.
+- **Stated algorithms are transcribed.** Lowest-first retention, declared-order refill, region cuts,
+  sort-and-merge and idempotent rebuilds were right in 11 of 11 runs.
+- **Representation varies when the prose allows it.** Five batch-1 runs returned a joined string or
+  took one change per call in `formatRebucketing`; both satisfied "one line each".
+- **Split:** Orion 1/1, Vega 1/2, Nova 0/8. Orion used the most prompt tokens (9.1M).
+
+
+## ir-sim-scenario-events (APPROVED Olympus 2026-09-19) — agent blind spots
+
+- **Runtime objects inherit constructor defaults the loader would have overridden (F-41).** 10 of 11
+  runs spawned a robot through the factory with ir-sim's default `group=0`, so a group-behavior-only
+  robot sat still. The loader gives every YAML entry its own group. Only Nova #3 rebuilt groups AND
+  gave the spawn its own.
+- **Lifecycle paths named in the prompt are handled.** All 11 re-armed events in `reset()`,
+  `reset(random=True)` and `reload()`, rewound ids for replay, kept the shared object list intact, and
+  tracked enter/leave every check once the description said so.
+- **Agents over-rewind ids exactly as the reference first did.** 11/11 reset the id counter to one
+  past the live objects, reissuing ids held by created-but-unadded objects (L76, untested).
+- **Agents refresh derived views eagerly.** 11/11 updated sensors right after a spawn, which is what
+  the reviewer later required; the early test pinned the opposite (L8).
+- **Epsilon habits leak into closed intervals.** 2 runs padded the region by 1e-12 and logged a leave
+  one step late on a trajectory that landed within float noise of the edge (L75).
+- **Split:** Nova 1/10, Vega 0/1, no Orion. The passer used the most prompt tokens (19.4M of a
+  9.3M-19.4M range).
+
+## featurevisor-target-specialization (APPROVED Olympus 2026-09-19)
+
+- **Nova rewrites the helper it finds, even when the task names another entry point.** 7 of 20 runs moved
+  three-valued logic into the repo's exported two-valued helpers and broke their specs, after passing every
+  new test. Reviewers called it a benign shared architectural blind spot, not ambiguity.
+- **Hand-written recursive evaluators drop implicit containers** (a bare list meaning AND under
+  `and`/`or`/`not`): 3/20 runs. Invisible to hand-written fixtures; visible to a seeded corpus.
+- **Stated per-kind match rules are transcribed.** "Judge each kind of entry by the rule the SDK uses"
+  gave force OR, global AND, rule-override precedence and requiredFeatures gating: 1 kill in 20 runs.
+- Agent split: Nova only, 2/10 then 3/10 legitimate; passers 61-91 messages.

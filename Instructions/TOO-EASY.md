@@ -23,13 +23,20 @@ Catalog of picks that were authored, batched, and SHELVED because they could not
 | **Famous-language-feature lane** (DERIVATIVE, generalises the row above) | a feature every language of this family eventually grows (guards, or-patterns, ranges, exhaustiveness, `@`-bindings, string interpolation, destructuring) in a small ML/scripting language, WHETHER OR NOT the tracker mentions it | the row above blames the ISSUE; the real magnet is the feature's FAME. Dropping the issue-backed half and picking an unticketed sibling in the same lane does NOT help: every author handed the repo looks at the same five things, and their submissions are invisible to any GitHub query. A clean SIX-CHECK is not evidence here | gluon-match-alternatives (dedupe `duplicate` 0.92 against 3 other gluon pattern submissions, after deliberately dropping issue #9 to dodge the narrower class); koto-nested-bindings (overlap `Blocker`, 52.8% of authored lines against an ACCEPTED task, no batch ever run - the hunt rated this class MEDIUM and cleared it on two mitigations, one of which authoring later deleted) |
 | **Maintainer-invited, PR-free lane in a competitor-visited repo** (DERIVATIVE — the numeric-library twin of the two rows above) | a scientific / numerical library where the maintainer has said "should be possible, not supported" in 2-3 issues or a discussion, the subsystem is cold, no PR exists, and the repo already shows one merged competitor-signature PR or a prior submission of ours | every hunt signal that ranks the lane first (cold code, invited feature, no PR, reproducible crash on base) is equally visible to every other author, and the platform pipeline is the only place their picks live. Three foreign scikit-fem submissions landed within eleven minutes on 2026-09-06; GitHub queries return clean on all of them. The dedupe compares the CORE (the generalised mapping); bolt-ons (orientation, smoothing, trace tags, guards) are rated incremental by default | scikit-fem-embedded-meshes (dedupe `derivative` 0.79 / conf 0.90, three days after a rival's identical lane; shelved after full authoring + Docker validation) |
 | **Repo publishes a support matrix** (DERIVATIVE — the sharpest form of the famous-feature rows above) | the target repo's README/docs carry a conformance or support TABLE of the standard it implements, with rows marked "Planned" / "Partially done" / an empty checkbox (CSS property tables, supported-opcode lists, spec-conformance checklists, "what works" matrices) | the table IS a public, pre-ranked, pre-filtered pick list. Every author handed the repo reads the same rows, and the "Planned" rows are exactly the authorable ones (defined behavior, absent implementation, maintainer-blessed). Collision odds are maximal and GitHub queries cannot see the collision, because the rivals' picks live only in the submission pipeline. **A roadmap row is NOT the maintainer-wants-it mitigation it looks like** — it is the strongest collision tell in the taxonomy, and reading it as fairness comfort inverts the signal | dropflow-min-max-sizing (overlap `Blocker`, 204/290 authored lines = 70.3% against an OLDER same-repo submission; the README's CSS table marked `max-height, max-width, min-height, min-width` as "Planned" and the audit logged that as a *mitigation*) |
-| **Open-but-unimplemented feature request** (DERIVATIVE) | a repo issue asking for a well-known language/spec feature, OPEN for years, zero comments, no PR | the SIX-CHECK reads clean precisely because nobody upstream engaged; but every problem author sees the same issue and picks it, so the prior art lives in the submission pipeline where GitHub queries cannot see it. Uncommented + unimplemented + famous = maximum collision odds | lol-html-sibling-combinators (dedupe `duplicate` 0.91) |
+| **Maintainer roadmap issue in a small proven repo** (DERIVATIVE — the tracker twin of the support-matrix row) | a small repo whose open issues are the maintainer's own terse to-do list ("implement X", "add opcode Y"), none commented, none with a PR; we already have an accepted pick from the same list | the list is short and every author who opens the repo reads all of it, so each open item is a first-come lane. An accepted pick from item N says nothing about item M: the pipeline holds rivals the SIX-CHECK cannot see. A scope gate that PASSED on the core slice is no protection either — the later re-run compared against an older candidate the first one never surfaced. Being a SUPERSET of the rival (more targets, a second implementation, parity) is read as elaboration, not a new core | cwerg-memory-passed-parameters (overlap `Blocker` after a clean first scope gate; 72/163 rival lines = 44.2%, 72/347 ours = 20.7%; rival = C++-only a64/x64 signature-rewrite pass for issue #3, ours = push/pop lowering on a32/a64/x64 in Python and C++. Same repo list as the ACCEPTED cwerg-bcopy-bzero-lowering, issue #45) |
+| **Reverse direction of a one-way converter** (DERIVATIVE, the converter-package twin of the support-matrix row) | a package converts format A to format B only (its README says so, its API is `aToB` / `aToBData`), and the pick is the missing `bToA`, however much selection, escaping or locale machinery the reverse genuinely needs | the reverse of an existing converter is the first thing every author reads off the package's own export list, and it is fully specified by the forward direction plus the round-trip law, so independent authors converge on the same core pipeline (resolve expressions, nest selectors, convert patterns, escape, serialize). Traps, coupled bug fixes and locale depth are rated "additions around that shared core". The hunt gate that softens "outsider-nameable" to a mitigation (09-09-B item 6) does NOT hold for this shape | messageformat-mf2-to-mf1 (overlap `Blocker`, 270/354 authored lines = 76.3% against TWO older candidates that each independently hold the MF2-to-MF1 core; killed at the core-slice precheck, no batch) |
+| **Open-but-unimplemented feature request** (DERIVATIVE) | a repo issue asking for a well-known language/spec feature, OPEN for years, zero comments, no PR | the SIX-CHECK reads clean precisely because nobody upstream engaged; but every problem author sees the same issue and picks it, so the prior art lives in the submission pipeline where GitHub queries cannot see it. Uncommented + unimplemented + famous = maximum collision odds | lol-html-sibling-combinators (dedupe `duplicate` 0.91); weasyprint-page-floats (overlap `Blocker`, 156/254 discounted lines = 61.4% and 103/254 = 40.6% against TWO older same-repo submissions, issue #259 open since 2016; rejected after 19 review rounds and one batch) |
 | **Scope-lever-doubles-the-collision-surface** (DERIVATIVE) | a pick that needs a SECOND feature bolted on to clear the LOC floor | the dedup engine matches on the CORE task; a bolted-on second feature does not differentiate, it just adds a second independent chance to collide with different prior art. Extras "change scope but not the central lesson" | orb-ring-role-preservation (dedupe `derivative` 0.70; core AND lever AND API each hit different prior art) |
 | **Spec-knowable predicate domain** | the feature's semantics are fixed by an RFC / standard the agent can DERIVE from first principles (IP-CIDR containment, date arithmetic, unicode classes, checksum families), and the only remaining work is threading it through the host language | distinct from saturated-reference-port: the agent has not memorised a library, it can simply RE-DERIVE the whole spec, so no fair test can ever split correct implementations. Difficulty collapses onto the WIRING (new enum variant through exhaustive matches, reporters, parser ordering), which is derivable from the repo's own existing variants. A differential harness will find NO fair discriminator | cfn-guard-cidr-operator (5/10 then 6/10 across two batches) |
 | **Textbook SQL-standard feature** (DERIVATIVE **or** TOO-EASY — same tell, two death mechanisms) | a named standard-SQL feature in a SQL engine: GROUPING SETS/ROLLUP/CUBE, window fns, CTE/recursive CTE, EXCEPT/INTERSECT, LATERAL, MERGE, PIVOT | the SQL standard fixes both the behavior AND the obvious data model, so independent AUTHORS converge on a near-identical feature core -> platform similarity/dedupe compares the CORE -> >0.90 DERIVATIVE flag (repo coldness does NOT protect; it guards maintainer/issue dedup, not another author picking the same famous feature). The SAME convergence also happens one level down: independent AGENTS solving it converge on the identical implementation because they already know the standard's semantics cold, so contract-stated fairness traps get satisfied as a side effect of implementing the well-known algorithm correctly -> TOO-EASY even with zero prior-art collision. Either way, no packaging change clears it | kitesql-grouping-sets (precheck 93.6%, derivative); gql-window-cumulative-rank (89% aggregate across 5 batches, too-easy — thoroughness-gate convergence, not a dedupe collision) |
+| **New value kind in a generic evaluator** (TOO-EASY even when LOC clears — the difficulty twin of the row below) | add a new kind of VALUE (fractions, decimals, a new numeric or scalar type) to an expression evaluator whose symbols, resolver, user functions, conditionals and macro/ruledef arguments all store values generically, plus builtins whose math the description has to state exactly | the generic storage carries the new variant through every other stage for free, so the only real work is the arm itself and a formula the spec must write out to be fair. LOC can be plentiful (a whole rational module) and still no trap exists: a differential harness finds no stage that quietly mishandles the new kind. Any lever whose WRONG version breaks the existing suite is self-revealing, because agents run that suite | customasm-exact-fractional-values (8/8 then 7/8 across two batches, 368 human-eff; 35 fair probes x 16 saved solutions found zero divergence outside the stated formula) |
 | **Machinery-absorbed capability** (UNDER-FLOOR, not too-easy) | the repo already owns a primitive that does the hard half of your capability (`Settle`, a generic walker, a resolver, a complete interface, an enum that already IS the identity key you need) and your fix is "call it at N sites" or "add a lookup in front of it" | the correct implementation is a 2-6 line call-through per site, so the whole feature lands far under the 200 effective-LOC floor no matter how many sites there are. Site COUNT does not buy LOC: N thin call-throughs is still thin, and genuine bolt-on companion features that route through the SAME absorbed primitive inherit its thinness rather than escaping it. Estimating "restructure the emission" before checking what the primitive already does overshoots by 3-5x, and trap-seam RICHNESS (F-9/F-10/F-18 all present) does not substitute for missing SIZE | canvas-fill-rule-backends (44 eff vs 200 floor; DESIGN.md sketched 213); iced-x86-pointer-data-dedup (126 eff after 2 genuine expansion rounds vs 200 floor; DESIGN.md sketched 180-220) |
+| **Textbook numerical algorithm already implemented in a SIBLING library** (EXCLUSIVITY, cross-repo) | the capability's hard core is a named textbook algorithm (arc-length/Crisfield continuation, and by extension Newmark, return mapping, Gauss-Kronrod, CQC, ...), and ANY public repo in the same language and domain has a working implementation, even with a different data model | the scope gate searches public code ACROSS repos and rules the pick not exclusive when the corrector/root-selection/loop can be cribbed, leaving "primarily integration and policy/status work". Checking only the target repo, its tracker and its parent/reference toolchain is not enough. **Pick-time check:** search GitHub code for the algorithm's signature formula in the language (`gh search code '<formula or function name>' --language=python`) and in the 3-5 nearest sibling libraries (sfepy -> jax-fem, scikit-fem, dolfinx, GetFEM, FEniCS, pyiron). One working hit = dead | sfepy-arc-length-continuation (JAX-FEM `solver.py:595` arc-length engine, 7/15 cases) |
 | **Repo is a PORT of a reference tool** (EXCLUSIVITY, repo-level — the strongest form of the row below) | the target repo vendors, ports or reimplements a canonical reference tool (pandapower vendors 69 PYPOWER files carrying PSERC's MATPOWER copyright; 25 more reference MATPOWER) | a port **inherits its parent's ENTIRE feature list as prior art**, so every capability the parent ships is dead in the child — and worse, the child's internal data structures are usually the parent's, so a solver can port the parent's implementation almost line-for-line (saturated-reference-port on top of the scope-gate reject). **Check this ONCE at repo level, not per capability**, and treat the parent's function list as a blocklist | pandapower continuation power flow (MATPOWER ships the whole `runcpf` + `cpf_*` family) |
 | **Sibling-ecosystem-tool implements the core algorithm** (EXCLUSIVITY / publicly-solved) | your target library parses/emits one half of a widely standardized binary or text format (SPIR-V, DWARF, ELF, WASM, a bytecode ISA, a protocol wire format) and there exists a separate, often reference-maintainer-published, tool for that SAME format that already performs the algorithm you are about to add | the same-repo GitHub PR/issue search (`CLAUDE.md § Exclusivity`) only ever looks inside the target repo; it cannot see a public implementation living in a DIFFERENT project. Format-standard ecosystems always grow a canonical toolchain (Khronos's SPIRV-Tools/SPIRV-Cross for SPIR-V, `llvm-dwarfdump`/`gimli` for DWARF, `wabt`/`binaryen` for WASM) that agents can be assumed to have seen; if that toolchain already ships your feature's core algorithm as a named pass or function, the Scope Gate rejects on sight, quoting its source, regardless of how much of the target repo's OWN history is clean | rspirv-decoration-group-resolution (SPIRV-Tools' `--flatten-decoration` optimizer pass performs the identical two-pass group-to-concrete-decoration expansion) |
+| **Maintainer-staged plan in a popular issue** (DERIVATIVE, set-level) | a busy, user-bumped issue where the maintainer publicly splits the feature into numbered stages ("1. read/write, 2. recompress, 3. reductions, 4. cropping/dedup"), the first stages shipped and the rest open with no PR | each remaining stage is its own pre-sized pick, so different rival authors take different stages. Building the union does not escape: the gate treats "stitches two older major implementation blocks" as a **set-level derivative** even when no single rival covers half. The welcome and the plan clear Gate 8 and mark the lane at the same time (hunt Stage 2d's worst case) | oxipng-apng-frame-optimization (overlap `Blocker` x3 at the core slice: 181/407 discounted lines = 44.5% against an older APNG-wide reduction submission, 199/407 = 48.9% against an older canvas/cropping one, set-level union ruled derivative; issue #551, open since 2023-08) |
+| **Reintroduces a capability the maintainer REMOVED** (PUBLICLY-SOLVED, unfixable) | the repo used to ship the capability and a release deliberately dropped it: a changelog/release note saying "X is no longer ...", "removed X", "dropped support for X", often next to a friendly "if you need X, let me know" | the scope gate treats the repo's OWN history as prior art: the removing commit and the release record prove the capability was public, and it rules reintroduction unfixable "regardless of whether the modern implementation uses a new ... mechanism". Corpus overlap, dedupe and every PR/issue query read clean, because the prior art is the repo's past, not a rival. **The invitation beside the removal is not a welcome, it is the removal record.** Pick-time check: grep the changelog and release notes for `no longer`, `removed`, `dropped`, `deprecated` and run `git log -S` on the capability's old API names before scoping | kira-frame-accurate-start-times (precheck `publicly-solved` Blocker on commit 4c29057a and `changelog.md` L102-L124 "Clocks are no longer sample accurate"; 0/206 corpus overlap; killed at the core slice) |
+| **Substrate-repair contract** (UNSOLVABLE-UNDER-REVIEW, the opposite failure to every row above) | the correct fix must REPAIR facts the host already records (decoder flags, recorded code flow, a cached IR, a symbol table), and some load-bearing fixture needs an instruction/node that base's substrate never records | agents build on the recorded substrate and do not repair it, so every fixture that depends on a dropped successor fails ~90%+ while its walker-layer twin costs a few runs. Stating the repair makes the test fair and lethal; leaving it unstated makes it an FP hole or a review finding, and a general soundness sentence keeps it in scope even after its specific clause is deleted. **Pick-time test: for each fixture, does base already record what the assertion walks?** | vivisect-noret-propagation (166 runs / 2 genuine passes; every candidate answer to the final review measured 0/21; Solution 3/3 Clean at shelving) |
 
 
 ### ⭐⭐⭐ RECOGNISER / POST-PASS-OVER-THE-PUBLIC-STREAM (added 2026-09-01-C — killed lyon T1 at the Phase-3 guard, AFTER it had cleared all 10 PICK-FILTER gates)
@@ -183,6 +190,150 @@ regardless of how good its trap seams look. Seam richness does NOT substitute fo
 **The unifying law (3x confirmed: petgraph, kysely, ironcalc):** difficulty and fairness pull in opposite directions for a single-subsystem, well-specified feature. The fairness gate forces you to state the contract / canonical form / rule; stating it hands the agent the answer. Genuine hardness must come from depth that SURVIVES full specification (cross-subsystem integration timing, a genuinely-new load-bearing algorithm, an interdependent multi-stage pipeline), never from a trap that only works while the spec hides something.
 
 ---
+
+## messageformat-mf2-to-mf1 (TypeScript, SHELVED 2026-09-19 - DERIVATIVE, overlap `Blocker` 270/354 = 76.3%)
+
+**Pick:** `messageToMF1(locale, msg)` in `@messageformat/icu-messageformat-1` (MF2 data model to ICU
+MF1 source, round-trip equal under `mf1ToMessage` for sparse variant lists, locale-valid plural
+keys), plus two pre-existing bugs found while building the round trip: `mf1ToMessageData` produced
+empty variants when a nested statement listed fewer cases than its siblings (a=p, b=x gave `""`
+where `@messageformat/core` gives `B`), and MF2 `selectPattern` looped forever when backtracking
+reached a selector already on its catch-all (3+ selectors). Hunt 09-19-D RANK 1.
+
+**Verdict (core-slice precheck, Step 4b):** *"270 of 354 authored subject lines (76.3%) re-deliver
+an older MF2-to-MF1 converter core already present independently in each of two older candidates
+... resolving MF2 expressions and declarations, nesting sparse selectors, converting patterns,
+escaping text, and serializing MF1. The subject's locale-sensitive synthesis and two selection
+repairs are additions around that shared core."*
+
+**Why the audit could not see it.** Exclusivity was clean on every instrument outside the platform:
+PRs/issues in all states on the canonical org, `git log --all -S` for the API names, changelogs, all
+branches, GitHub code search (one 0-star naive PGS-to-MF1 serializer, logged as a risk). The hunt
+log itself had flagged the lane as "outsider-nameable (reverse of mf1ToMessage)" and kept it on the
+softened-gate reading that nameability is a mitigation. Two rivals had already taken it.
+
+**What went right.** The precheck law was followed this time: the slice (287 human-eff, 10 tests,
+clean-room Docker) went up before the full suite, the generated corpus or any hardening round, so
+the Blocker cost one authoring session and no batch, where dropflow and koto cost full cycles.
+
+**Salvage.** None as a standalone pick: the two bug fixes are ~27 human-eff together and the
+reverse converter they were bundled with is the consumed core. The repro facts are recorded in the
+problem's `feedback.md` under `rejected/` in case a different lane in this repo needs them.
+
+**Law:** when a package's own export list shows a one-way converter, the reverse direction is a
+shared pick, not an invented one. Treat "outsider-nameable" as fatal for this shape and precheck it
+before anything else, exactly as done here.
+
+**Repo verdict:** messageformat's MF2-to-MF1 lane is CONSUMED (two older candidates). Other
+converter directions in the same monorepo (Fluent, XLIFF) carry the same reverse-direction magnet.
+
+## kira-frame-accurate-start-times (Rust, SHELVED 2026-09-18 - PUBLICLY-SOLVED, removed capability)
+
+Core slice (173 eff, 25 tests, clean-room and Docker green) making static and streaming sounds start
+on the exact frame their clock time or delay is reached inside an internal buffer. Precheck:
+`publicly-solved` Blocker. kira 0.10 replaced per-frame processing with buffered processing (commit
+4c29057a) and its changelog says "Clocks are no longer sample accurate ... if you find yourself needing
+sample-accurate clocks, let me know!". The gate: "reintroduction of a capability maintainers removed
+[is] unfixable, regardless of whether the modern implementation uses a new buffered-compatible
+mechanism." Overlap with other submissions was 0 of 206 lines.
+
+**What went wrong in the method.** The hunt quoted the changelog paragraph as a maintainer-welcomed
+lane (Stage 2d), and authoring found two public maintainer branches with the old per-frame design and
+filed them as mitigable prior art because they were never PRs. Both readings were wrong for the same
+reason: the evidence showed the capability had EXISTED in this repo, and the gate counts the repo's own
+past as public prior art.
+
+**Law.** A lane that restores something a release removed is dead at pick time, whatever the new
+mechanism and however warm the maintainer's note. Check the changelog for removals before reading it
+for invitations.
+
+## customasm-exact-fractional-values (Rust, SHELVED 2026-09-18 - 8/8 then 7/8, GENERIC-EVALUATOR ABSORPTION)
+
+**Repo:** hlorenzi/customasm (base a45db8ff). Feature: exact base-10 fractional literals held as
+reduced rationals, plus `$whole`, `$fract`, `$exponent`, `$mantissa` (normalize, round the remainder
+to N bits ties-to-even, carry into the exponent), exact `==`/`!=` across fractions and integers, and
+in round 2 exact `+ - * /` on fractional and mixed operands with integer division still truncating.
+Fully authored and validated: 368 human-eff over 10 files, 61 tests, clean-room green, flake-free,
+three Auto Review rounds cleared (Description 3/3, Solution 3/3 at the end).
+
+**Batches.** Batch 1 (50 tests): **8/8 Nova pass**, median 61 requests, FP clean. Batch 2 (61 tests,
+arithmetic lever): **7/8**. The single kill in 16 runs was a transcription error in the stated
+normalization formula (remainder not divided by 2^e for values >= 1). The arithmetic lever killed 0.
+
+**Why the arithmetic lever died.** Its natural wrong version (a promotion arm placed ahead of the
+integer arms) breaks 103 EXISTING tests at once. Agents run the base suite, so that failure is the
+loudest signal in the workspace, not a misdirecting one. Law: a trap whose wrong version reds the
+existing suite is self-revealing; it can only be counted as fairness, never as difficulty.
+
+**Why nothing else could work — measured, not argued.** Two differential harnesses over all 16 saved
+solutions on clean BASE checkouts:
+- 25 cross-stage probes (symbols, forward references, chains that change type between resolver
+  passes, `#fn`, `#if`/`#else`, `#const`, `$` and label arithmetic, local labels, `#ruledef` operands
+  single/negative/two-argument/forward/cascaded, `#subruledef`, a width taken from a later symbol):
+  **0 divergence** from the reference among batch-2 solutions. customasm stores every value
+  generically, so the new variant flows through every stage without any agent touching it.
+- 10 kernel edge probes checked against an independent Python oracle (1e-30 and 1e30 magnitudes,
+  carries at negative exponents, a carry from a negative value, an exact tie and a just-above-tie at
+  60 bits, a 200-bit mantissa of 0.1, ties produced by arithmetic): **every passer matched**. The
+  only divergence was the run that already failed.
+
+The formula is the one remaining seam, and it cannot be hidden: Auto Review asked for the
+normalization sentence to be made MORE explicit, and it was.
+
+**Tell at pick time.** "Add a new kind of value to an evaluator" is the missing-arm shape; check
+whether the evaluator's surroundings store values generically (a `Value` enum threaded through
+symbol tables, the resolver and macro arguments). If they do, the arm is absorbed and the task is
+the formula, which fairness forces you to state. The pick cleared the LOC floor, so the
+machinery-absorbed row (an UNDER-FLOOR death) did not catch it; the new taxonomy row above does.
+Artifacts in `rejected/customasm-exact-fractional-values` (fully validated; reference only).
+
+## sfepy-arc-length-continuation (Python, SHELVED 2026-09-17 - PUBLICLY-SOLVED, scope gate Blocker)
+
+Core slice (205 eff, 15 tests, clean-room green) of a `ts.arc_length` solver. Scope gate: publicly
+solved by JAX-FEM (`deepmodeling/jax-fem` `jax_fem/solver.py:595`, commit ee8c06e), which ships the
+arc-length corrector, quadratic root and alignment choice, continuation loop, step cap and exact-target
+polish, covering 7 of 15 graded cases. Corpus overlap was only 1.9% against the older sfepy task, so the
+platform's "25 submissions by 6 contributors" reuse warning was NOT the problem.
+
+**Law.** Every GitHub gate in the hunt (canonical-org PR search, issues, source grep, port check, reference
+toolchain) looked at sfepy or its domain's reference tool. None looked at SIBLING libraries in the same
+language. For a named textbook numerical algorithm, a sibling library's implementation is prior art even
+with a different data model, because the gate treats the numerics as the hard part and the sfepy wiring
+as integration. Pick capabilities whose hard part is the TARGET REPO'S OWN MODEL, and run a
+cross-repo code search for the algorithm's signature before building.
+
+## weasyprint-page-floats (Python, SHELVED 2026-09-15 - DERIVATIVE, overlap 61.4% + 40.6%)
+
+**Pick:** Kozea/WeasyPrint issue #259 (CSS Page Floats, `float: top | bottom`), open since 2016, never
+implemented upstream. Olympus, full authoring arc: 19 review rounds, one 10-Nova batch (0/9 graded pass at
+full scope, 501 eff), then narrowed to page floats only (301 eff, 75 tests, clean-room validated, Solution
+Quality 3/3 comprehensiveness) before the reject.
+
+**Reject:** overlap `Blocker` x2. An older same-repo submission covers 156/254 discounted subject lines
+(61.4%; 156/303 of its own work), a second covers 103/254 (40.6%; 103/231). Both implement the same engine:
+page-edge float collection, placement, stacking, fit-deferral and page re-layout. Upstream never shipped or
+declined page floats; Vivliostyle `page-floats.ts` (31/75 cases) and PagedJS fragmentainers `page-float.js`
+(4/75) were logged as partial public precursors only. The reviewer said policy and integration differences
+(narrowed rules, nested multicol, flex/grid handling) "do not restore corpus novelty".
+
+**ROOT CAUSE:** the open-but-unimplemented row again. A famous, years-old, maintainer-tagged layout feature in
+a popular Python PDF engine is the first thing every author handed WeasyPrint looks at. The SIX-CHECK was
+clean (no PR, no decline, no post-base commit) and could not see the two rival submissions, which live only
+in the pipeline. Narrowing the scope made it worse on paper: cutting column floats and integrations removed
+our own distinct lines and left the shared core as a larger share of what remained.
+
+**Reusable law:** when the pick IS a named spec module the target engine lacks (CSS Page Floats, Regions,
+Exclusions, GCPM features), assume another author already holds its core. Scope cuts after an overlap flag
+cannot help, because the dedupe measures the core. Decide exclusivity before authoring, not after the batch.
+
+**What was salvaged:**
+- `rejected/weasyprint-page-floats/` keeps the narrowed artifacts and batch-1 runs; the full-scope version
+  and the clean-room cell harness live in `worktrees/weasyprint-tools/` (`full-scope-backup/`, `cell.sh`,
+  `gen_patches.py`), which is git-ignored.
+- Measured failure shape for re-layout traps: 8/9 Nova runs deferred a late-found page float to the next page
+  instead of laying the current page out again (F-1 shape), and 45 tests died in every run.
+- The WeasyPrint `tests/draw` suite fails locally without HarfBuzz-Subset ("1 errors logged"); only the
+  container result counts for that repo.
 
 ## gluon-match-alternatives (Rust, SHELVED 2026-08-07 - DERIVATIVE, AI dedupe `duplicate` 0.92)
 
@@ -1289,6 +1440,7 @@ dead-pick ledger" section were skipped as duplicates during consolidation.
 
 - canvas-fill-rule-backends — shelved under LOC floor: 44 effective LOC vs 200 floor (213 sketched)
 - cfn-guard-cidr-operator — too easy: measured 60% pass rate exceeds the <=40% ceiling; CIDR/covered_by logic is maximally knowable, no fair test can lower it (genuine ceiling)
+- customasm-exact-fractional-values — too easy: 8/8 then 7/8 Nova across two batches; new value kind absorbed by a generic evaluator, differential harness found no fair discriminator outside the stated formula
 - customasm-asm-block-expr-substitution — blocked on two hard gates: effective LOC 167 (need 200), 1 file (need 2)
 - geo-hausdorff-distance — shelved under-floor: ~49 effective LOC vs floor
 - taffy-last-baseline — shelved as a flexbox-only derivative probe, 52 eff LOC by design, below the 250 floor; full grid+baseline-groups build never completed
@@ -1367,3 +1519,169 @@ permission.
 exclusivity-dead to public PR #34. The remaining README "Planned" rows (`display: table`,
 `transform`, `position: fixed`) are the same shared pick list and carry the same collision risk.
 Treat chearon/dropflow as AVOID.
+
+## vivisect-noret-propagation (Python, SHELVED 2026-09-13 - UNSOLVABLE-UNDER-REVIEW, 166 runs / 2 genuine passes)
+
+**Pick:** fix vivisect's no-return analysis so a terminal path counts as proof only when it genuinely
+cannot fall back out, and propagate no-return across the call graph to a fixed point
+(`noret.py`, new `noretprop.py`, `_cb_noflow` xref preservation in `base.py`, explicit trap flags in
+the i386/amd64/ARM/Thumb/AArch64 decoders, `propagateNoReturn` / immediate `addNoReturnVa`). Final
+artifact: 58 tests, 390 human-effective LOC across 14 files, clean-room Docker validated, 3x
+deterministic. 114 rounds.
+
+**Verdict:** the OPPOSITE of too-easy, shelved here because this file indexes `rejected/`. **166 real
+platform runs, 2 genuine passes**, both in batches 1-2 when the suite was 16 and 26 tests. Every
+apparent pass after that was adjudicated a false positive or carried a defect a reviewer then caught
+(batch 14 Nova #6, batch 18 Nova #9, batch 21 Nova #8, round-111 replay Vega #1). The final Auto
+Review scored Solution 3/3 Clean and Tests 1/3 on three coverage Highs, and every candidate answer to
+those Highs measured **0/21** on two fresh populations.
+
+**ROOT CAUSE 1 - the sound contract requires repairing the substrate, and agents build on it instead.**
+vivisect's own disassembly drops the successor after three instruction shapes: a store of the program
+counter (`str pc` decodes as NOFALL|BRANCH), a conditional call once its target is declared no-return
+(codeflow's `_cb_noflow` suppresses the fallthrough even for IF_COND), and x86 `into` (IF_NOFALL). The
+reference repairs all three in the decoders and codeflow. Agents walk the RECORDED instructions
+(`getLocations`) and, across twenty-one batches, essentially never edit `envi/`. Measured on 21 fresh
+runs: every test whose fixture depends on a dropped successor fails 15-20/21 (d5 `into; ret` 20/21,
+predicated call declared first 19/21), while the walker-layer twins of the same demands cost 2-6/21.
+The differential that proved it: hand each failing agent the successor base disassembly drops, re-grade,
+and 6 of 10 store-trap failures flip to pass.
+
+**ROOT CAUSE 2 - both review panels read the repairs as required, so there is no fair narrowing.**
+Round 111 cut the store axis together with its meta.md clause; Solution Quality failed round 112 on the
+same bug, grounded in a sentence that survived the cut ("A transfer is not evidence merely because its
+decode flags say it cannot fall through"). Round 114's Auto Review demanded location assertions that
+only a disassembly repair can satisfy, and the FP panel's "four candidate-only failures" on Nova #8
+were exactly those disassembly-dependent probes. A general soundness sentence ("every path through it
+reaches something that settles it") keeps every dropped-successor case in scope: **deleting a specific
+clause never deletes the requirement.** Stating the repair makes the test fair and lethal; leaving it
+unstated makes it an FP hole or a review finding.
+
+**ROOT CAUSE 3 - every hardening round was correct and the product was zero.** Scope grew 16 -> 135
+tests, was cut to 38, rebuilt to 83, cut to 44, and grew again as each (real) review finding added one
+more architecture-sensitive conjunct. Four scope-downs, 0 genuine passes in the last 144 runs. Batch 19
+measured it directly: cutting any single axis stayed 0/13; the near-miss tests differed run to run
+(each agent solved a different ~90%).
+
+**Reusable law - SUBSTRATE-REPAIR CONTRACT.** A capability whose correct implementation must repair the
+host's own recorded facts (decoder flags, recorded code flow, a cached IR) is not shippable when agents
+build on the recorded substrate rather than repairing it. Pick-time test: for every fixture the design
+needs, ask whether base ALREADY records the instruction/node the assertion depends on. If a
+load-bearing fixture needs something the substrate drops, and a review-grade reading of the contract
+implies it, the pick is dead - there is no wording that is both fair and solvable.
+
+**What was salvaged:**
+- The replay harness (`rejected/vivisect-noret-propagation/agent-runs/replay.sh`, `refplay.sh`)
+  reproduced platform grading exactly three times; re-grading saved solutions against a candidate suite
+  is the cheapest pre-batch steer available.
+- "Give the agent the missing substrate fact, then re-grade" is the fastest discriminator between a
+  description defect and real agent difficulty (round 113). Use it before any hardening or cutting.
+- Wording moves AWARENESS but not substrate repair: the store clause took explicit store handling from
+  ~4/13 agents to 11/11, while the store-trap pass rate barely moved.
+- Two measurement failures to never repeat: round 103 stripped `print` lines from a scratch test copy
+  and deleted the calls under test; round 111 checked "no test needs byte re-reading" at 56 tests and did
+  not re-check when round 112 restored tests that did.
+
+## cwerg-memory-passed-parameters (C++/Python, SHELVED 2026-09-19 - DERIVATIVE, overlap `Blocker` 72/163 rival lines = 44.2%)
+
+**Pick:** robertmuth/Cwerg issue #3 (maintainer roadmap): functions with more parameters than the
+target has argument registers, overflow passed through a caller-owned stack region whose address
+travels in the next free GPR. a32/a64/x64, Python spec and C++ port under byte-identical assembly.
+17 files, 349 human-effective LOC, 8 golden programs / 42 new cases, clean-room validated 3x.
+
+**Timeline:** first scope gate PASSED (0/310 overlap against two same-path candidates, one of them
+our own accepted bcopy pick) -> Auto Review R1 revision (Tests 1/3, Solution 1/3) -> R2 Approved
+with notes -> batch 1 **0/11** (8 Nova, 1 Orion, 2 Vega) -> R3 test-only fixes, local replay of all
+11 solutions projected **1/11** -> scope gate re-run: **Blocker**, *"older candidate already
+implements the same overflow-parameter caller-memory engine... adding Python, a32, parity, and
+broader edge coverage is a port/integration elaboration rather than a separate core task."* Not
+contestable. The same report's adjacency panel called the two "similar ideas rather than duplicates"
+(the rival rewrites IR signatures in a unit pass, C++ only, a64/x64); the Blocker still bound.
+
+**ROOT CAUSE - a roadmap issue is a shared pick list.** Cwerg's open issues are the maintainer's
+own terse to-do list, uncommented, no PRs. The hunt rated the magnet MEDIUM and leaned on the
+precedent that #45 (bcopy/bzero, same list) had been accepted. That precedent only proves #45 was
+free when we took it. Every author who opens the repo reads the same 24 lines.
+
+**ROOT CAUSE 2 - a passed scope gate is not a permanent verdict.** The core-slice precheck compared
+against the candidates it surfaced at that moment; the re-run, after two revision rounds and a paid
+batch, surfaced an older one. Budget for the gate to be re-evaluated at every submission.
+
+**LAW:** in a small repo whose tracker is a maintainer roadmap, treat each open roadmap item exactly
+like a "Planned" row in a support matrix: presumptively claimed. An invented lane built from the
+source tree's own seams (as the hunt skill already allows after tracker lanes die) is the safer
+pick in such a repo. Being a superset of a rival's core never restores exclusivity.
+
+**What was worth keeping (reusable for any future Cwerg lane):**
+- Ten pre-existing Cwerg defects mapped and reproduced on base (feedback.md in the rejected folder):
+  a32 forward narrow-param calls, a32/a64 no-spill local allocator ceilings, a32 Python global
+  allocator ignoring float param registers, x64 conv into spilled/same register, py/cc S16/U16
+  widening order, C++ EXTERN-redefinition parse bug, C++ 63-param off-by-one, x64 C++ 8th float
+  register (xmm8) miscompile, a32 C++ float-constant immediates, C++ accepting out-of-range consts.
+- Batch evidence: the fair walls that killed were xmm8 (6/11, agents copied C++'s 8 float regs),
+  the C++ 64-parameter parse (9/11), the x64 spill clobber of the incoming address, and a32 C++
+  float constants. Three fixture shapes were unfair (pre-existing allocator ceilings, forward
+  narrow calls) and were removed in R3.
+- Tooling: `worktrees/_cwerg_mpp/` (model-driven golden generator, mutation battery, per-agent
+  replay harness against saved runs).
+
+## dinit-depends-any-groups (C++, SHELVED 2026-09-19 - machinery-absorbed sub-floor, before any batch)
+
+davmac314/dinit (service manager), hunt RANK 1 (REPO-HUNT-2026-09-19 Part 2). Lane: `depends-any = a b c`
+dependency groups (dependent starts on the first STARTED member, fails only when every member failed,
+stopped/restarted/forced down with a member only when that member is the group's last STARTED one;
+pins, gentle-stop check, reload, dinit-check). Picker check passed. Full reference built in ~2 hours:
+8 files, **145 raw / 105 human-effective**, all 139 base tests green, 10 core tests.
+
+**The traps were real.** Four natural wrong designs, each killed by exactly its own discriminator:
+failure rule reading sibling states (the prop queue is LIFO, so a pinned-stopped member listed LAST
+fails before its siblings' queued starts run), a STOPPING sibling counted as up (dependent orphaned
+after a common dependency stops), the dependent stopped from the member's `stopped()` (member
+reaches STOPPED first), and groups merged across lines.
+
+**Root cause / LAW (MACHINERY-ABSORBED, third instance after kcl and iced-x86).** The audit sketched
+315-340 eff by listing every surface the contract touches (start, failure, stop, restart, force,
+stop ordering, pins, control, reload, checker). Every one of those surfaces already routes through
+ONE per-link decision (`is_hard()` in `stop_dependents`, the `failed_to_start` switch, the pin
+loops), so the whole kernel was three predicates, one switch arm and four call-site swaps. **A
+surface count is not a LOC estimate when the surfaces share a chokepoint.** The same property that
+made the traps interdependent (one shared kernel) made the diff small. Hunt Stage 3b must sketch
+against the CHOKEPOINT, not the surface list: count the distinct decision points the new semantic
+changes, not the behaviours it affects.
+
+Evidence kept: `rejected/dinit-depends-any-groups/DESIGN.md` (trap table), reference diff +
+`src/tests/anydeptests_88f904.cc` in `worktrees/dinit`. The traps (LIFO prop-queue failure timing,
+STOPPING-sibling classification) are reusable on any dinit lane that is big enough.
+
+## oxipng-apng-frame-optimization (Rust, SHELVED 2026-09-19 - DERIVATIVE, set-level overlap `Blocker` at the core slice)
+
+**Pick:** oxipng/oxipng (hunt 2026-09-19-E, best of sweep). APNG joint reductions (one IHDR/PLTE/tRNS
+decided over the default image and every frame, after cropping) plus frame cropping to the minimal
+rectangle that keeps both the displayed canvas and the canvas left for the next frame (dispose/blend
+kept, BACKGROUND frames keep the visible pixels they clear), exact delay-merging of frames that change
+nothing, acTL rewrite, `frame_reduction` option / `--nf`, timeline-comparing `sanity-checks` validator.
+Reference 342 human-eff / 7 files, 40 tests, clean room 3x, 12-mutation sweep all killed.
+
+**Reject (core-slice precheck, no batch):** three overlap Blockers. An older submission holds the
+"animation-wide color, bit-depth, palette, and frame re-encoding core" (181/407 discounted lines =
+44.5%, 65.8% of the rival's own lines); another holds "canvas simulation and changed-region cropping"
+(199/407 = 48.9%, ruled Medium on its own because the frame planners diverge); the union verdict:
+*"The submission stitches two older major implementation blocks; its merge/delay and integration
+residue does not make the recycled primary engines incidental."*
+
+**ROOT CAUSE:** the hunt flagged it correctly and the pick went ahead anyway. Issue #551 is busy and
+user-bumped, and andrews05 published the staged plan in it (stages 3 and 4 = exactly this lane). The
+dossier recorded that as Stage 2d's "welcomed, spec-named, long-lived" worst case; the pick proceeded
+on the strength of size (310-455 eff) and a clean GitHub exclusivity sweep, which cannot see the
+pipeline.
+
+**LAW (set-level derivative):** a pick that COMBINES two stages of a publicly staged plan is dead if
+each stage exists as a separate older submission, even when neither covers half of yours. Bolting the
+second stage on to "dilute" the first does not help; the gate unions the rivals. A maintainer's
+numbered roadmap inside an issue is a support matrix with the rows pre-sized.
+
+**What worked:** Step 4b. The core-slice precheck killed it before any batch, at the cost of one
+session. Evidence kept in `rejected/oxipng-apng-frame-optimization/` (DESIGN.md trap table, tests) and
+branch `spike` in `worktrees/oxipng`. Reusable: the dispose-aware minimal-rect rule and the
+state-equality merge rule are good traps for any animation format lane that is not already taken.
+

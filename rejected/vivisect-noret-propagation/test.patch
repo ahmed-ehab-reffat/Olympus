@@ -1,0 +1,1907 @@
+diff --git a/run_tests_6180ce.py b/run_tests_6180ce.py
+new file mode 100755
+index 0000000..73dd817
+--- /dev/null
++++ b/run_tests_6180ce.py
+@@ -0,0 +1,192 @@
++"""
++Test driver for test.sh. vivisect's own test suite mixes two file-naming conventions
++(test_foo.py and testfoo.py) and pytest's default collection only recognizes the first, so
++this uses unittest's discovery (matching the project's own CI config) instead.
++
++JUnit XML is written by a small in-house TestResult (below) rather than an external
++dependency, so writing a structured report never depends on anything but the standard
++library.
++
++BASE_PACKAGES covers vivisect and envi: no-return analysis lives in the former and the
++architecture decoders it reads instruction flags from live in the latter. It drops the vtrace
++package, whose tests attach to and single-step a real child process via ptrace: that can hang
++for an unbounded time in a container restricting ptrace, and its attach/detach timing is
++non-deterministic anyway.
++"""
++
++import sys
++import time
++import unittest
++import traceback
++import xml.sax.saxutils
++
++EXCLUDED_MODULES = {
++    # this driver's companion test module: the two run modes are disjoint, so the module
++    # loaded by name for 'new' must not also be picked up by the package walk
++    "vivisect.tests.testnoretprop6180ce",
++    # imports a Qt binding for GUI config widgets, which the headless analysis image does not
++    # install; it covers GUI configuration rather than analysis or instruction decoding
++    "envi.tests.test_qt_config",
++}
++
++# both packages are walked: an edit to a shared decoder that satisfies one instruction
++# encoding while breaking an unrelated one would otherwise go unnoticed here
++BASE_PACKAGES = ("vivisect", "envi")
++
++
++def _isExcluded(testId):
++    for excluded in EXCLUDED_MODULES:
++        # a module that fails to import surfaces as a synthetic _FailedTest whose own module
++        # is unittest.loader, not the real one, with the real module name as an id suffix
++        # instead; a module that imports fine but whose individual test methods fail only at
++        # run time keeps its real module name as an id prefix. Match either shape.
++        if testId == excluded or testId.endswith("." + excluded) or testId.startswith(excluded + "."):
++            return True
++    return False
++
++
++def _filterSuite(suite):
++    kept = unittest.TestSuite()
++    for item in suite:
++        if isinstance(item, unittest.TestSuite):
++            kept.addTest(_filterSuite(item))
++            continue
++        if _isExcluded(item.id()):
++            continue
++        kept.addTest(item)
++    return kept
++
++
++def loadBaseSuite():
++    loader = unittest.TestLoader()
++    combined = unittest.TestSuite()
++    for pkg in BASE_PACKAGES:
++        combined.addTest(loader.discover("%s/tests" % pkg, pattern="test*.py", top_level_dir="."))
++    return _filterSuite(combined)
++
++
++def loadNewSuite():
++    loader = unittest.TestLoader()
++    return loader.loadTestsFromName("vivisect.tests.testnoretprop6180ce")
++
++
++class _JUnitResult(unittest.TestResult):
++    """
++    Collects per-test outcomes (pass/failure/error/skip) with timing, including the real
++    traceback text unittest itself would print.
++    """
++
++    def __init__(self):
++        unittest.TestResult.__init__(self)
++        self.records = []
++        self._started = None
++
++    def startTest(self, test):
++        unittest.TestResult.startTest(self, test)
++        self._started = time.time()
++
++    def _elapsed(self):
++        return time.time() - self._started if self._started else 0.0
++
++    def addSuccess(self, test):
++        unittest.TestResult.addSuccess(self, test)
++        self.records.append((test, "pass", None, self._elapsed()))
++
++    def addFailure(self, test, err):
++        unittest.TestResult.addFailure(self, test, err)
++        self.records.append((test, "failure", self._exc_info_to_string(err, test), self._elapsed()))
++
++    def addError(self, test, err):
++        unittest.TestResult.addError(self, test, err)
++        self.records.append((test, "error", self._exc_info_to_string(err, test), self._elapsed()))
++
++    def addSkip(self, test, reason):
++        unittest.TestResult.addSkip(self, test, reason)
++        self.records.append((test, "skip", reason, self._elapsed()))
++
++
++def _writeJUnit(outputPath, records):
++    esc = xml.sax.saxutils.escape
++    failures = sum(1 for _, status, _, _ in records if status == "failure")
++    errors = sum(1 for _, status, _, _ in records if status == "error")
++    skipped = sum(1 for _, status, _, _ in records if status == "skip")
++
++    cases = []
++    for test, status, detail, elapsed in records:
++        testId = test.id()
++        classname, _, name = testId.rpartition(".")
++        classname = esc(classname or testId)
++        name = esc(name or testId)
++        if status == "pass":
++            cases.append('<testcase classname="%s" name="%s" time="%.3f" />' % (classname, name, elapsed))
++        elif status == "skip":
++            cases.append(
++                '<testcase classname="%s" name="%s" time="%.3f"><skipped message="%s" /></testcase>'
++                % (classname, name, elapsed, esc(str(detail)))
++            )
++        else:
++            tag = "failure" if status == "failure" else "error"
++            cases.append(
++                '<testcase classname="%s" name="%s" time="%.3f"><%s>%s</%s></testcase>'
++                % (classname, name, elapsed, tag, esc(detail), tag)
++            )
++
++    xmlText = (
++        '<?xml version="1.0" encoding="UTF-8"?>\n'
++        '<testsuites><testsuite name="run_tests_6180ce" tests="%d" failures="%d" errors="%d" skipped="%d">\n'
++        "%s\n</testsuite></testsuites>\n"
++    ) % (len(records), failures, errors, skipped, "\n".join(cases))
++    with open(outputPath, "w", encoding="utf-8") as fd:
++        fd.write(xmlText)
++
++
++def _writeCollectionFailureJUnit(outputPath, target, detail):
++    """
++    Write a single failing testcase named for the module the suite failed to collect
++    (`target`), carrying its traceback (`detail`), so a collection-time failure still produces
++    a parseable JUnit document under the failing module's own identity.
++    """
++    _writeJUnit(outputPath, [(_CollectionFailure(target), "error", detail, 0.0)])
++
++
++class _CollectionFailure:
++    def __init__(self, target):
++        self._target = target
++
++    def id(self):
++        return self._target
++
++
++def main():
++    if len(sys.argv) < 2 or sys.argv[1] not in ("base", "new"):
++        sys.stderr.write("usage: run_tests_6180ce.py base|new [output_path]\n")
++        sys.exit(2)
++
++    mode = sys.argv[1]
++    outputPath = sys.argv[2] if len(sys.argv) > 2 else None
++    target = "vivisect.tests.testnoretprop6180ce" if mode == "new" else ".".join(BASE_PACKAGES)
++
++    try:
++        suite = loadNewSuite() if mode == "new" else loadBaseSuite()
++    except Exception:
++        detail = traceback.format_exc()
++        sys.stderr.write(detail)
++        if outputPath:
++            _writeCollectionFailureJUnit(outputPath, target, detail)
++        sys.exit(1)
++
++    if outputPath:
++        result = _JUnitResult()
++        suite.run(result)
++        _writeJUnit(outputPath, result.records)
++        wasSuccessful = not result.failures and not result.errors
++    else:
++        runner = unittest.TextTestRunner(verbosity=2)
++        result = runner.run(suite)
++        wasSuccessful = result.wasSuccessful()
++
++    sys.exit(0 if wasSuccessful else 1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..1a82b97
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,45 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: test.sh [--output_path PATH] base|new" >&2
++  exit 2
++}
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      [ -n "$OUTPUT_PATH" ] || usage
++      shift
++      ;;
++    --output_path)
++      [ $# -ge 2 ] && [ -n "$2" ] || usage
++      OUTPUT_PATH="$2"
++      shift 2
++      ;;
++    base|new)
++      [ -z "$MODE" ] || usage
++      MODE="$1"
++      shift
++      ;;
++    *)
++      usage
++      ;;
++  esac
++done
++
++[ -n "$MODE" ] || usage
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")" || exit 1
++fi
++
++# vivisect's own suite mixes test_foo.py and testfoo.py naming; pytest's default collection
++# only recognizes the first, so this drives unittest's discovery directly (matching the
++# project's own CI config) via run_tests_6180ce.py, which also documents and applies the
++# package selection for each mode.
++python3 run_tests_6180ce.py "$MODE" "$OUTPUT_PATH"
++exit $?
+diff --git a/vivisect/tests/testnoretprop6180ce.py b/vivisect/tests/testnoretprop6180ce.py
+new file mode 100755
+index 0000000..b025f37
+--- /dev/null
++++ b/vivisect/tests/testnoretprop6180ce.py
+@@ -0,0 +1,1652 @@
++import sys
++import types
++import unittest
++
++import envi
++import vivisect
++import envi.const as e_const
++import vivisect.const as v_const
++import vivisect.impemu.monitor as v_imp_monitor
++
++RET = b"\xc3"
++HLT = b"\xf4"
++NOP = b"\x90"
++UD2 = b"\x0f\x0b"
++# the other two encodings x86 reserves as permanently undefined; the repo's own opcode
++# table gives all three the same INS_INVALIDOP class that ud2 has
++UD0 = b"\x0f\xff\xc0\x90"
++UD1 = b"\x0f\xb9\xc0\x90"
++# arm's own breakpoint, and an arithmetic write to pc: it goes to r0 plus 0x1000, so the
++# immediate it carries is an addend rather than the address it transfers to
++ARM_BKPT = (0xE1200070).to_bytes(4, "little")
++ARM_ADD_PC_R0_IMM = (0xE280FA01).to_bytes(4, "little")
++# bxne r0 -- a predicated branch through a register, so the instruction names no
++# destination at all for its taken side
++ARM_BXNE_R0 = (0x112FFF10).to_bytes(4, "little")
++# bkptne -- a breakpoint carrying a condition, so nothing happens at all when the
++# condition does not hold, and mvn pc, #0x1000, which writes the complement of the
++# immediate it carries into pc
++ARM_BKPTNE = (0x11200070).to_bytes(4, "little")
++ARM_MVN_PC_IMM = (0xE3E0FA01).to_bytes(4, "little")
++# str pc, [pc, #0] -- pc is the value being written OUT, to the word 8 bytes on
++ARM_STR_PC_PCREL = (0xE58FF000).to_bytes(4, "little")
++ARM_BX_LR = (0xE12FFF1E).to_bytes(4, "little")
++TEST_EAX_EAX = b"\x85\xc0"
++CALL_RAX = b"\xff\xd0"
++# cmovz eax, ebx -- an ordinary operation carrying a condition, not a branch
++CMOVZ_EAX_EBX = b"\x0f\x44\xc3"
++
++
++def callRel32(target, siteEnd):
++    return b"\xe8" + (target - siteEnd).to_bytes(4, "little", signed=True)
++
++
++def jzRel8(disp):
++    return b"\x74" + disp.to_bytes(1, "little", signed=True)
++
++
++def jzRel32(target, siteEnd):
++    return b"\x0f\x84" + (target - siteEnd).to_bytes(4, "little", signed=True)
++
++
++def jmpRel32(target, siteEnd):
++    return b"\xe9" + (target - siteEnd).to_bytes(4, "little", signed=True)
++
++
++def movRaxImm64(value):
++    return b"\x48\xb8" + value.to_bytes(8, "little")
++
++
++def movRcxImm64(value):
++    return b"\x48\xb9" + value.to_bytes(8, "little")
++
++
++CALL_RCX = b"\xff\xd1"
++JMP_RAX = b"\xff\xe0"
++
++
++def callMemRip(insnVa, ptrVa):
++    # FF /2, ModRM=00 010 101 (rip-relative), disp32 to ptrVa -- instruction is 6 bytes
++    disp = ptrVa - (insnVa + 6)
++    return b"\xff\x15" + disp.to_bytes(4, "little", signed=True)
++
++
++def filledBuf(size):
++    # int3-filled so any byte range codeflow reaches that we did not intend to be code
++    # halts disassembly instead of decoding as a plausible-looking instruction stream
++    return bytearray(b"\xcc" * size)
++
++
++def newWorkspace():
++    vw = vivisect.VivWorkspace()
++    vw.setMeta("Architecture", "amd64")
++    vw.setMeta("Platform", "linux")
++    vw.setMeta("Format", "blob")
++    vw.setMeta("DefaultCall", "sysvamd64call")
++    vw.addFuncAnalysisModule("vivisect.analysis.generic.codeblocks")
++    vw.addFuncAnalysisModule("vivisect.analysis.generic.noret")
++    return vw
++
++
++def newI386Workspace():
++    # INTO is illegal in long mode -- amd64's own disassembler rejects it outright, so
++    # exercising it needs a genuine 32-bit workspace, not newWorkspace()'s amd64 one
++    vw = vivisect.VivWorkspace()
++    vw.setMeta("Architecture", "i386")
++    vw.setMeta("Platform", "linux")
++    vw.setMeta("Format", "blob")
++    vw.addFuncAnalysisModule("vivisect.analysis.generic.codeblocks")
++    vw.addFuncAnalysisModule("vivisect.analysis.generic.noret")
++    return vw
++
++
++def newUnseededI386Workspace():
++    vw = vivisect.VivWorkspace()
++    vw.setMeta("Architecture", "i386")
++    vw.setMeta("Platform", "linux")
++    vw.setMeta("Format", "blob")
++    vw.addFuncAnalysisModule("vivisect.analysis.generic.codeblocks")
++    return vw
++
++
++def newUnseededArmWorkspace():
++    vw = vivisect.VivWorkspace()
++    vw.setMeta("Architecture", "arm")
++    vw.setMeta("Platform", "linux")
++    vw.setMeta("Format", "blob")
++    vw.setMeta("DefaultCall", "armcall")
++    vw.addFuncAnalysisModule("vivisect.analysis.generic.codeblocks")
++    return vw
++
++
++def newUnseededWorkspace():
++    # the blob/ihex/srec setups in vivisect.analysis register codeblocks but never the
++    # per-function noret pass, so nothing is ever examined before propagation runs -- only
++    # the PE and ELF setups add it
++    vw = vivisect.VivWorkspace()
++    vw.setMeta("Architecture", "amd64")
++    vw.setMeta("Platform", "linux")
++    vw.setMeta("Format", "blob")
++    vw.setMeta("DefaultCall", "sysvamd64call")
++    vw.addFuncAnalysisModule("vivisect.analysis.generic.codeblocks")
++    return vw
++
++
++def mapCode(vw, va, data, name="test"):
++    vw.addMemoryMap(va, 7, name, bytes(data))
++    vw.addSegment(va, len(data), name, name)
++
++
++def mapNonCode(vw, va, data, name="data"):
++    vw.addMemoryMap(va, e_const.MM_READ, name, bytes(data))
++    vw.addSegment(va, len(data), name, name)
++
++
++def mapUninitCode(vw, va, data, name="bss"):
++    vw.addMemoryMap(va, e_const.MM_RWX | e_const.MM_UNINIT, name, bytes(data))
++    vw.addSegment(va, len(data), name, name)
++
++
++def mapUninitData(vw, va, data, name="bss"):
++    vw.addMemoryMap(va, e_const.MM_READ | e_const.MM_WRITE | e_const.MM_UNINIT, name, bytes(data))
++    vw.addSegment(va, len(data), name, name)
++
++
++def assertNoReturn(test, vw, va, msg=""):
++    test.assertTrue(vw.isNoReturnVa(va), msg or ("expected 0x%x to be no-return" % va))
++
++
++def assertReturns(test, vw, va, msg=""):
++    test.assertFalse(vw.isNoReturnVa(va), msg or ("expected 0x%x to remain return-capable" % va))
++
++
++class NoReturnFalsePositiveTest(unittest.TestCase):
++    """
++    A terminal call to a function that has not been proven no-return -- including a plain,
++    ordinary, returning function -- must never by itself support a no-return conclusion.
++    """
++
++    def test_leaf_terminal_call_to_ordinary_function_is_not_noreturn(self):
++        vw = newWorkspace()
++        # each function lives in its own exactly-sized memory region: nothing is mapped
++        # after the call, so this is a genuine truncated-path leaf, not a call whose
++        # fallthrough happens to run into reachable filler bytes
++        normalVa = 0x1000
++        mapCode(vw, normalVa, RET, name="normal")
++
++        fVa = 0x1010
++        fBody = callRel32(normalVa, fVa + 5)
++        mapCode(vw, fVa, fBody, name="f")
++
++        vw.makeFunction(normalVa)
++        vw.makeFunction(fVa)
++        vw.propagateNoReturn()
++
++        assertReturns(self, vw, fVa)
++
++    def test_two_function_reference_cycle_with_no_exit_stays_return_capable(self):
++        vw = newWorkspace()
++        # each function lives in its own exactly-sized memory region -- see the comment
++        # above
++        pVa, qVa = 0x1000, 0x1010
++        pBody = callRel32(qVa, pVa + 5)
++        mapCode(vw, pVa, pBody, name="p")
++        qBody = callRel32(pVa, qVa + 5)
++        mapCode(vw, qVa, qBody, name="q")
++
++        vw.makeFunction(pVa)
++        vw.propagateNoReturn()
++
++        assertReturns(self, vw, pVa, "a pure reference cycle with no real exit must not be marked no-return")
++        assertReturns(self, vw, qVa, "a pure reference cycle with no real exit must not be marked no-return")
++
++    def test_three_function_reference_cycle_with_no_exit_stays_return_capable(self):
++        vw = newWorkspace()
++        # the same cycle one node longer, so the pair calling each other back and forth is
++        # not the only shape of it
++        pVa, qVa, rVa = 0x1000, 0x1010, 0x1020
++        pBody = callRel32(qVa, pVa + 5)
++        mapCode(vw, pVa, pBody, name="p")
++        qBody = callRel32(rVa, qVa + 5)
++        mapCode(vw, qVa, qBody, name="q")
++        rBody = callRel32(pVa, rVa + 5)
++        mapCode(vw, rVa, rBody, name="r")
++
++        vw.makeFunction(pVa)
++        vw.propagateNoReturn()
++
++        assertReturns(self, vw, pVa, "a three-function reference cycle with no real exit must not be marked no-return")
++        assertReturns(self, vw, qVa, "a three-function reference cycle with no real exit must not be marked no-return")
++        assertReturns(self, vw, rVa, "a three-function reference cycle with no real exit must not be marked no-return")
++
++    def test_terminal_path_truncated_by_unmapped_memory_is_not_noreturn(self):
++        vw = newWorkspace()
++        fVa = 0x1000
++        # ordinary instructions only -- no call, no return, no branch anywhere; the leaf
++        # exists purely because codeflow runs off the end of mapped memory
++        body = b"\x90\x90\x90"
++        mapCode(vw, fVa, body, name="f")
++
++        vw.makeFunction(fVa)
++
++        assertReturns(self, vw, fVa, "a path that merely runs out of mapped code is not evidence of no-return")
++
++    def test_x86_into_with_a_returning_fallthrough_is_not_noreturn(self):
++        vw = newI386Workspace()
++        # x86 INTO only traps when OF is set -- on every other path it falls straight
++        # through to whatever follows, exactly like any other conditional. It must be told
++        # apart from a genuine unconditional trap/halt the same way an architectural return
++        # must be, not treated as proof merely for lacking a fallthrough of its own.
++        fVa = 0x1000
++        body = b"\xce" + RET
++        mapCode(vw, fVa, body, name="f")
++
++        vw.makeFunction(fVa)
++
++        assertReturns(self, vw, fVa, "a conditional trap must never itself be evidence of no-return")
++
++    def test_x86_int1_debug_trap_is_independently_derived_noreturn(self):
++        vw = newUnseededI386Workspace()
++        # int1 (ICEBP, 0xf1) is the decoder's own debug-trap terminal, exactly the class
++        # int3 already is. Its operand-less form traps wherever it executes, so a function
++        # containing only it is proven no-return rather than merely escaping analysis.
++        trapVa = 0x1000
++        mapCode(vw, trapVa, b"\xf1", name="trap")
++
++        vw.makeFunction(trapVa)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {trapVa},
++            "nothing calls a trap-only function, so only a pass that examines every function can reach it at all",
++        )
++        assertNoReturn(
++            self, vw, trapVa, "an int1 debug trap is the same class of terminal as int3, so it is its own proof"
++        )
++
++    def test_x86_software_interrupt_with_an_operand_is_not_itself_a_trap(self):
++        vw = newI386Workspace()
++        # `int N` enters whatever handler is installed for N, which may well return. It is
++        # not self-evidently terminal the way int1 and int3 are, so it must stay unproven
++        # rather than being promoted to trap evidence alongside them.
++        fVa = 0x1000
++        mapCode(vw, fVa, b"\xcd\x21", name="f")
++
++        vw.makeFunction(fVa)
++
++        assertReturns(
++            self,
++            vw,
++            fVa,
++            "an arbitrary software interrupt is not a genuine trap and must not prove no-return on its own",
++        )
++
++    def test_x86_software_interrupt_on_a_different_vector_is_not_a_trap_either(self):
++        vw = newI386Workspace()
++        # a different interrupt number entirely: what disqualifies the instruction is
++        # carrying an operand at all, not which handler that operand happens to name
++        fVa = 0x1000
++        mapCode(vw, fVa, b"\xcd\x80", name="f")
++
++        vw.makeFunction(fVa)
++
++        assertReturns(
++            self,
++            vw,
++            fVa,
++            "every operand-carrying software interrupt transfers to a handler that may return, whichever vector it names",
++        )
++
++    def test_conditional_branch_to_proven_target_with_truncated_fallthrough_is_not_noreturn(self):
++        vw = newWorkspace()
++        exitVa = 0x1000
++        mapCode(vw, exitVa, UD2, name="exit")
++        vw.addNoReturnVa(exitVa)
++
++        # a function whose only instructions are test eax,eax ; jz <exitVa>, mapped so
++        # tightly that the fallthrough runs off the end of mapped memory -- the taken side
++        # leads to an already-proven no-return target, but a conditional branch is never
++        # itself evidence of no-return
++        fVa = 0x2000
++        head = TEST_EAX_EAX
++        jz = jzRel32(exitVa, fVa + len(head) + 6)
++        body = head + jz
++        mapCode(vw, fVa, body, name="f")
++
++        vw.makeFunction(fVa)
++
++        assertReturns(
++            self, vw, fVa, "a conditional branch to a proven no-return target must not itself make the caller no-return"
++        )
++
++
++class LocalBranchCycleTest(unittest.TestCase):
++    """
++    A walk that comes back to somewhere it has already been has not reached a terminal --
++    it has simply run out of new addresses. Nothing along the way trapped and nothing it
++    called was proven, so there is no evidence, and an empty proof is not a proof.
++    """
++
++    def test_a_bare_local_branch_cycle_proves_nothing(self):
++        vw = newWorkspace()
++        loopVa = 0x1000
++        mapCode(vw, loopVa, jmpRel32(loopVa, loopVa + 5), name="loop")
++
++        vw.makeFunction(loopVa)
++
++        assertReturns(
++            self,
++            vw,
++            loopVa,
++            "a jump back into the function's own body is ordinary control flow, so a cycle built only from it reaches no trap and proves no target -- it must not be concluded no-return",
++        )
++
++    def test_a_local_cycle_beside_a_trap_is_not_proven_by_that_trap(self):
++        vw = newWorkspace()
++        fVa = 0x1000
++        loopVa = fVa + 4
++        # test eax,eax / jz over the loop / loop: jmp loop / ud2 -- the branch not taken
++        # spins in the loop forever without ever reaching the trap that sits past it
++        body = TEST_EAX_EAX + jzRel8(5) + jmpRel32(loopVa, loopVa + 5) + UD2
++        mapCode(vw, fVa, body, name="f")
++
++        vw.makeFunction(fVa)
++
++        assertReturns(
++            self,
++            vw,
++            fVa,
++            "the trap only settles the path that reaches it -- the other side of the branch reaches nothing at all, so the function is not proven",
++        )
++
++    def test_a_local_cycle_beside_a_proven_call_is_not_proven_by_that_call(self):
++        vw = newWorkspace()
++        exitVa = 0x1000
++        mapCode(vw, exitVa, UD2, name="exit")
++
++        fVa = 0x2000
++        loopVa = fVa + 4
++        callVa = fVa + 9
++        body = TEST_EAX_EAX + jzRel8(5) + jmpRel32(loopVa, loopVa + 5) + callRel32(exitVa, callVa + 5)
++        mapCode(vw, fVa, body, name="f")
++
++        vw.makeFunction(fVa)
++        vw.addNoReturnVa(exitVa)
++
++        assertReturns(
++            self,
++            vw,
++            fVa,
++            "a proven call settles the path that reaches it exactly as a trap does, and exactly as narrowly",
++        )
++
++    def test_a_cycle_behind_a_proven_call_is_still_noreturn(self):
++        vw = newUnseededWorkspace()
++        exitVa = 0x1000
++        mapCode(vw, exitVa, UD2, name="exit")
++
++        fVa = 0x2000
++        call = callRel32(exitVa, fVa + 5)
++        mapCode(vw, fVa, call + jmpRel32(fVa + 5, fVa + 10), name="f")
++
++        vw.makeFunction(fVa)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {exitVa, fVa},
++            "the trap proves the callee on its own and the callee then proves the caller, both within the one pass",
++        )
++        assertNoReturn(
++            self,
++            vw,
++            fVa,
++            "the proven call closes the only path before the loop is ever reached, so the function is proven by that call rather than by running out of addresses",
++        )
++
++
++class NoReturnChainTest(unittest.TestCase):
++    """
++    A function whose only terminal call reaches a proven no-return function, directly or
++    through a chain of intermediate functions, is itself no-return.
++    """
++
++    def test_direct_declared_two_hop_chain(self):
++        vw = newWorkspace()
++        data = filledBuf(0x30)
++        exitVa = 0x1000
++        data[0:2] = UD2
++        bVa = 0x1010
++        data[0x10:0x15] = callRel32(exitVa, bVa + 5)
++        aVa = 0x1020
++        data[0x20:0x25] = callRel32(bVa, aVa + 5)
++        mapCode(vw, 0x1000, data)
++
++        vw.addNoReturnVa(exitVa)
++        vw.makeFunction(aVa)
++        vw.propagateNoReturn()
++
++        assertNoReturn(self, vw, bVa)
++        assertNoReturn(self, vw, aVa)
++
++    def test_three_hop_chain_and_a_genuinely_mixed_sibling(self):
++        vw = newWorkspace()
++        data = filledBuf(0x60)
++        exitVa = 0x1000
++        data[0:2] = UD2
++        cVa = 0x1010
++        data[0x10:0x15] = callRel32(exitVa, cVa + 5)
++        bVa = 0x1020
++        data[0x20:0x25] = callRel32(cVa, bVa + 5)
++        aVa = 0x1030
++        data[0x30:0x35] = callRel32(bVa, aVa + 5)
++        # MIXED: test eax,eax ; jz +7 ; call exit ; <pad> ; ret -- two distinct leaves, one
++        # of which genuinely returns, so MIXED must stay return-capable.
++        mixedVa = 0x1040
++        body = TEST_EAX_EAX + jzRel8(7) + callRel32(exitVa, mixedVa + 2 + 2 + 5)
++        body += b"\xcc" * (7 - 5) + RET
++        data[0x40 : 0x40 + len(body)] = body
++        mapCode(vw, 0x1000, data)
++
++        vw.addNoReturnVa(exitVa)
++        vw.makeFunction(aVa)
++        vw.makeFunction(mixedVa)
++        vw.propagateNoReturn()
++
++        assertNoReturn(self, vw, cVa)
++        assertNoReturn(self, vw, bVa)
++        assertNoReturn(self, vw, aVa)
++        assertReturns(self, vw, mixedVa, "a leaf with a genuine return must keep the function return-capable")
++
++    def test_all_terminal_paths_call_different_proven_noreturn_targets(self):
++        # both terminal paths reach their target through a register-indirect call rather than
++        # a direct one -- a direct call to an already-declared no-return target is descended
++        # into and resolved by codeflow's own recursion regardless of declaration order, which
++        # would make this pass without propagateNoReturn ever running
++        vw = newWorkspace()
++        exit1Va = 0x1000
++        exit2Va = 0x1010
++        mapCode(vw, exit1Va, UD2, name="exit1")
++        mapCode(vw, exit2Va, UD2, name="exit2")
++
++        fVa = 0x2000
++        head = TEST_EAX_EAX + jzRel8(12)
++        movRax = movRaxImm64(exit1Va)
++        branch1 = movRax + CALL_RAX
++        movRcx = movRcxImm64(exit2Va)
++        branch2 = movRcx + CALL_RCX
++        body = head + branch1 + branch2
++        mapCode(vw, fVa, body, name="f")
++        call1Va = fVa + len(head) + len(movRax)
++        call2Va = fVa + len(head) + len(branch1) + len(movRcx)
++
++        vw.makeFunction(fVa)
++        assertReturns(
++            self, vw, fVa, "unresolved indirect calls on every terminal path must not support a no-return conclusion"
++        )
++
++        vw.addNoReturnVa(exit1Va)
++        vw.addNoReturnVa(exit2Va)
++        assertReturns(self, vw, fVa, "declaring the targets alone must not retroactively change an unresolved caller")
++
++        vw.addXref(call1Va, exit1Va, v_const.REF_CODE, envi.BR_PROC)
++        vw.addXref(call2Va, exit2Va, v_const.REF_CODE, envi.BR_PROC)
++        assertReturns(self, vw, fVa, "resolving the targets alone must not retroactively change anything")
++
++        vw.propagateNoReturn()
++        assertNoReturn(
++            self, vw, fVa, "every terminal path calling a distinct proven no-return target must derive no-return"
++        )
++
++
++class ComputedTransferTest(unittest.TestCase):
++    """
++    A transfer whose destination is worked out from more than one source names that
++    destination nowhere. Whatever operand it carries is an addend, not a target, and a
++    conclusion drawn from reading one as the other would be about an address the
++    instruction never goes to.
++    """
++
++    def test_a_trap_behind_a_computed_transfer_is_outside_the_function(self):
++        vw = newUnseededArmWorkspace()
++        fVa = 0x2000
++        mapCode(vw, fVa, ARM_ADD_PC_R0_IMM + ARM_BKPT, name="f")
++
++        vw.makeFunction(fVa)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            set(),
++            "control leaves at the transfer, so the trap decoded behind it is on no path this function takes",
++        )
++        assertReturns(self, vw, fVa)
++
++    def test_a_computed_transfer_does_not_resolve_to_its_own_operand(self):
++        vw = newUnseededArmWorkspace()
++        exitVa = 0x1000
++        mapCode(vw, exitVa, ARM_BKPT, name="exit")
++
++        # add pc, r0, #0x1000 -- it goes to r0 plus 0x1000, and nothing here knows r0
++        fVa = 0x2000
++        mapCode(vw, fVa, ARM_ADD_PC_R0_IMM, name="f")
++
++        vw.makeFunction(exitVa)
++        vw.makeFunction(fVa)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {exitVa},
++            "the immediate this instruction carries happens to equal a proven address, which is a coincidence and not a destination",
++        )
++        assertReturns(self, vw, fVa, "nothing has established where this transfer goes, so it settles nothing")
++
++    def test_a_computed_transfer_settles_its_path_through_a_recorded_reference(self):
++        vw = newUnseededArmWorkspace()
++        exitVa = 0x3000
++        mapCode(vw, exitVa, ARM_BKPT, name="exit")
++
++        # the same instruction, and this time the workspace has recorded where it goes --
++        # to an address that is not the immediate it carries
++        fVa = 0x2000
++        mapCode(vw, fVa, ARM_ADD_PC_R0_IMM, name="f")
++
++        vw.makeFunction(exitVa)
++        vw.makeFunction(fVa)
++        vw.addXref(fVa, exitVa, v_const.REF_CODE)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {exitVa, fVa},
++            "the trap settles the destination, and a recorded reference is what resolves the transfer to it",
++        )
++        assertNoReturn(self, vw, fVa, "a transfer whose recorded destination is proven settles the path it sits on")
++
++    def test_a_computed_transfer_does_not_resolve_to_a_complemented_immediate(self):
++        vw = newUnseededArmWorkspace()
++        exitVa = 0x1000
++        mapCode(vw, exitVa, ARM_BKPT, name="exit")
++
++        # mvn pc, #0x1000 -- it goes to the complement of that immediate, so the immediate
++        # is no more its destination than an addend is
++        fVa = 0x2000
++        mapCode(vw, fVa, ARM_MVN_PC_IMM, name="f")
++
++        vw.makeFunction(exitVa)
++        vw.makeFunction(fVa)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {exitVa},
++            "one operand and a transformation of it are not the same address",
++        )
++        assertReturns(self, vw, fVa, "nothing has established where this transfer goes, so it settles nothing")
++
++
++class StoreOfProgramCounterTest(unittest.TestCase):
++    """
++    Writing the program counter OUT to memory is data flow, not a transfer. Control carries on to
++    the next address whatever that slot holds, so a declaration about the slot says nothing about
++    the function that stored there, and what sits behind the store is reachable code.
++    """
++
++    def test_a_store_of_the_program_counter_is_not_a_transfer(self):
++        vw = newUnseededArmWorkspace()
++        fVa = 0x2000
++        slotVa = fVa + 8
++        mapCode(vw, fVa, ARM_STR_PC_PCREL + ARM_BX_LR + (0x1000).to_bytes(4, "little"), name="f")
++
++        vw.makeFunction(fVa)
++
++        self.assertEqual(
++            vw.addNoReturnVa(slotVa),
++            set(),
++            "the store put pc into that slot rather than jumping through it, so declaring the slot proves nothing about the function",
++        )
++        assertReturns(self, vw, fVa, "the return behind the store is on the one path this function has")
++
++    def test_a_trap_behind_a_store_of_the_program_counter_settles_the_function(self):
++        vw = newUnseededArmWorkspace()
++        fVa = 0x2000
++        mapCode(vw, fVa, ARM_STR_PC_PCREL + ARM_BKPT + (0x1000).to_bytes(4, "little"), name="f")
++
++        vw.makeFunction(fVa)
++        vw.propagateNoReturn()
++
++        assertNoReturn(
++            self,
++            vw,
++            fVa,
++            "the store transfers nothing, so the trap behind it is on this function's one path and proves it",
++        )
++
++
++class PredicatedTrapTest(unittest.TestCase):
++    """
++    A trap that carries a condition executes nothing at all when that condition does not
++    hold, so the instruction after it is ordinary reachable code. Disassembly has to keep
++    that successor, and the function whose other path returns through it stays
++    return-capable.
++    """
++
++    def test_a_predicated_trap_keeps_the_instruction_after_it_reachable(self):
++        vw = newUnseededArmWorkspace()
++        fVa = 0x2000
++        mapCode(vw, fVa, ARM_BKPTNE + ARM_BX_LR, name="f")
++
++        vw.makeFunction(fVa)
++
++        retVa = fVa + 4
++        loc = vw.getLocation(retVa)
++        self.assertIsNotNone(loc, "the instruction after a predicated trap is reachable and has to be disassembled")
++        self.assertEqual(loc[v_const.L_LTYPE], v_const.LOC_OP)
++        self.assertEqual(vw.parseOpcode(retVa).mnem, "bx")
++
++        self.assertEqual(vw.propagateNoReturn(), set(), "the condition may not hold, and then this function returns")
++        assertReturns(self, vw, fVa, "a trap that fires only on a condition settles only the path it fires on")
++
++
++class PredicatedDataOperationTest(unittest.TestCase):
++    """
++    Whole architectures let an ordinary operation carry a condition. Such an instruction
++    computes something or nothing and then continues to the next address either way, so it
++    has no destination to resolve and no side that leaves. The instruction behind it is on
++    the one path this function has.
++    """
++
++    def test_a_predicated_data_operation_is_not_a_conditional_branch(self):
++        vw = newUnseededWorkspace()
++        fVa = 0x1000
++        mapCode(vw, fVa, CMOVZ_EAX_EBX + UD2, name="f")
++
++        vw.makeFunction(fVa)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {fVa},
++            "the conditional move is not a transfer, so the trap after it is the terminal of the only path here",
++        )
++        assertNoReturn(self, vw, fVa)
++
++
++class PredicatedDynamicBranchTest(unittest.TestCase):
++    """
++    A predicated branch through a register names no destination of its own. Where it goes is
++    exactly as resolvable, or not, as any other transfer's -- and resolving it is not the same
++    as proving it. Its fallthrough stays live either way, because the condition may simply not
++    hold.
++    """
++
++    def test_a_predicated_register_branch_to_a_returning_reference_settles_nothing(self):
++        vw = newUnseededArmWorkspace()
++        returnsVa = 0x1000
++        mapCode(vw, returnsVa, ARM_BX_LR, name="returns")
++
++        fVa = 0x2000
++        mapCode(vw, fVa, ARM_BXNE_R0 + ARM_BKPT, name="f")
++
++        vw.makeFunction(returnsVa)
++        vw.makeFunction(fVa)
++        vw.addXref(fVa, returnsVa, v_const.REF_CODE, envi.BR_PROC)
++
++        self.assertEqual(vw.propagateNoReturn(), set(), "resolving the taken side is not the same as proving it")
++        assertReturns(
++            self, vw, fVa, "the taken side comes back, so the trap on the fallthrough settles only its own path"
++        )
++
++
++class NoReturnMemoryIndirectTest(unittest.TestCase):
++    """
++    A terminal call through a memory-indirect (dereferenced) branch must resolve the
++    pointer to find its real target, the same as codeflow's own branch walker does, and
++    that target participates in chain and propagation exactly like a direct call target.
++    """
++
++    def test_memory_indirect_call_dereferences_to_the_real_target(self):
++        vw = newWorkspace()
++
++        # every function lives in its own exactly-sized memory region: a memory-indirect
++        # call's dereferenced target is itself descended into by codeflow (the same
++        # "deepest callback first" recursion a direct call gets), so SHARED can be fully
++        # examined before EXIT is declared no-return if its own region is not sized
++        # tightly, which would corrupt its block boundary the same way an ordinary
++        # out-of-order discovery would. EXIT's own body is left as an unresolved
++        # register-indirect call, not a bare trap, so recursively discovering it as its
++        # own function does not by itself prove it noreturn ahead of the real declaration.
++        exitVa = 0x1000
++        mapCode(vw, exitVa, CALL_RAX, name="exit")
++
++        sharedVa = 0x1010
++        sharedBody = callRel32(exitVa, sharedVa + 5)
++        mapCode(vw, sharedVa, sharedBody, name="shared")
++
++        ptrVa = 0x1020
++        mapCode(vw, ptrVa, sharedVa.to_bytes(8, "little"), name="ptr")
++
++        memVa = 0x2000
++        mapCode(vw, memVa, callMemRip(memVa, ptrVa), name="mem")
++
++        vw.makeFunction(memVa)
++        assertReturns(self, vw, memVa, "MEM must not be noreturn before EXIT is declared")
++
++        vw.addNoReturnVa(exitVa)
++        vw.makeFunction(sharedVa)
++        vw.propagateNoReturn()
++
++        assertNoReturn(self, vw, sharedVa)
++        assertNoReturn(
++            self, vw, memVa, "a memory-indirect call must resolve through the pointer to its real, now-noreturn target"
++        )
++
++    def test_memory_indirect_call_through_an_uninitialized_slot_resolves_to_nothing(self):
++        vw = newUnseededWorkspace()
++        exitVa = 0x1000
++        mapCode(vw, exitVa, UD2, name="exit")
++
++        # an ordinary bss function pointer: readable, but nothing has been stored in it
++        # yet, so the bytes the image carries there are not the target the call will take
++        slotVa = 0x3000
++        mapUninitData(vw, slotVa, exitVa.to_bytes(8, "little"), name="bss")
++
++        fVa = 0x2000
++        mapCode(vw, fVa, NOP + callMemRip(fVa + 1, slotVa) + RET, name="f")
++
++        vw.makeFunction(exitVa)
++        vw.makeFunction(fVa)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {exitVa},
++            "the destination proves itself, and the caller resolves to nothing that could carry it",
++        )
++        assertReturns(
++            self,
++            vw,
++            fVa,
++            "a slot with nothing stored in it settles no path, whatever its backing bytes happen to spell",
++        )
++
++
++class NoFlowXrefPreservationTest(unittest.TestCase):
++    """
++    When codeflow marks a call site no-fall because its target is already known noreturn,
++    every xref the disassembler originally recorded from that call site -- its branch xref
++    to the real target, and, for a dereferenced call, its own data xref to the slot -- must
++    survive, not just the no-fall flag on the call site's own location.
++    """
++
++    def test_call_site_marked_noflow_still_has_an_xref_to_its_real_target(self):
++        vw = newWorkspace()
++        data = filledBuf(0x20)
++        exitVa = 0x1000
++        data[0:2] = UD2
++        bVa = 0x1010
++        data[0x10:0x15] = callRel32(exitVa, bVa + 5)
++        mapCode(vw, 0x1000, data)
++
++        # EXIT declared noreturn before B is ever walked, so codeflow marks B's call site
++        # noflow synchronously while disassembling B -- exactly the case that used to lose
++        # the xref.
++        vw.addNoReturnVa(exitVa)
++        vw.makeFunction(bVa)
++
++        xrefs = vw.getXrefsFrom(bVa, rtype=v_const.REF_CODE)
++        self.assertEqual(len(xrefs), 1)
++        fromva, tova, reftype, rflags = xrefs[0]
++        self.assertEqual((fromva, tova), (bVa, exitVa))
++        self.assertTrue(rflags & envi.BR_PROC)
++        self.assertIn(bVa, vw.getCallers(exitVa))
++
++    def test_a_declared_slot_is_the_destination_even_when_it_stores_a_returning_one(self):
++        vw = newUnseededWorkspace()
++        returnsVa = 0x1000
++        mapCode(vw, returnsVa, RET, name="returns")
++
++        # an ordinary initialized pointer slot, not an import, holding the address of a
++        # function that plainly returns
++        slotVa = 0x3000
++        mapNonCode(vw, slotVa, returnsVa.to_bytes(8, "little"), name="table")
++
++        fVa = 0x2000
++        mapCode(vw, fVa, NOP + callMemRip(fVa + 1, slotVa) + RET, name="f")
++
++        vw.makeFunction(returnsVa)
++        vw.makeFunction(fVa)
++        assertReturns(self, vw, fVa, "nothing is declared yet, and what the slot stores comes back")
++
++        newlyMarked = vw.addNoReturnVa(slotVa)
++
++        self.assertEqual(
++            newlyMarked,
++            {fVa},
++            "the declaration is on the slot, so the slot is where the call goes as far as this analysis is concerned",
++        )
++        assertNoReturn(
++            self,
++            vw,
++            fVa,
++            "dereferencing past a declared slot to whatever it currently stores would find a returning function and lose the conclusion",
++        )
++
++    def test_memory_indirect_caller_stays_discoverable_after_the_slot_is_proven_late(self):
++        vw = newWorkspace()
++
++        importVa = 0x1000
++        mapCode(vw, importVa, filledBuf(8), name="imp")
++        vw.makeImport(importVa, "*", "exit")
++
++        callerVa = 0x2000
++        mapCode(vw, callerVa, callMemRip(callerVa, importVa), name="caller")
++        vw.makeFunction(callerVa)
++
++        xrefs = vw.getXrefsFrom(callerVa, rtype=v_const.REF_CODE)
++        self.assertEqual(len(xrefs), 1)
++        fromva, tova, reftype, rflags = xrefs[0]
++        self.assertEqual((fromva, tova), (callerVa, importVa))
++        self.assertTrue(rflags & envi.BR_DEREF)
++        self.assertIn(callerVa, vw.getCallers(importVa))
++        assertReturns(self, vw, callerVa, "the import slot is not yet proven no-return")
++
++        # the slot is declared only after the caller has already been analyzed -- a
++        # restoration that only special-cases direct relative calls would still lose this
++        # memory-indirect caller's own discoverability the moment its call site is
++        # rewritten no-flow, and propagateNoReturn would then never find it to re-derive
++        vw.addNoReturnApi("*.exit")
++        vw.propagateNoReturn()
++
++        self.assertIn(
++            callerVa,
++            vw.getCallers(importVa),
++            "the memory-indirect caller must remain discoverable as a caller of the now-proven slot",
++        )
++        assertNoReturn(self, vw, callerVa)
++
++    def test_a_rewritten_memory_indirect_call_site_keeps_the_exact_xrefs_it_had(self):
++        vw = newUnseededWorkspace()
++
++        exitVa = 0x1000
++        mapCode(vw, exitVa, UD2, name="exit")
++
++        # a plain (non-import) pointer slot: codeflow drops a branch into an import
++        # location outright, so only a plain slot reaches the synchronous rewrite at all
++        ptrVa = 0x1100
++        mapCode(vw, ptrVa, exitVa.to_bytes(8, "little"), name="ptr")
++
++        # the identical call at two sites, one decoded before the target is proven and one
++        # after. Only the second is rewritten, and the first is what its xrefs are held
++        # against -- so what has to survive is the disassembler's own record of this call,
++        # not a shape chosen here
++        earlyVa = 0x2000
++        mapCode(vw, earlyVa, callMemRip(earlyVa, ptrVa) + RET, name="early")
++        lateVa = 0x3000
++        mapCode(vw, lateVa, callMemRip(lateVa, ptrVa) + RET, name="late")
++
++        vw.makeFunction(exitVa)
++        vw.makeFunction(earlyVa)
++        self.assertIsNotNone(
++            vw.getLocation(earlyVa + 6),
++            "nothing was proven when this site was decoded, so the instruction behind it was disassembled",
++        )
++        untouched = sorted((tova, rtype, rflags) for fromva, tova, rtype, rflags in vw.getXrefsFrom(earlyVa))
++
++        vw.addNoReturnVa(exitVa)
++        vw.makeFunction(lateVa)
++
++        self.assertIsNone(
++            vw.getLocation(lateVa + 6),
++            "this site was decoded with its target already proven, so the fallthrough behind it was cut",
++        )
++        rewritten = sorted((tova, rtype, rflags) for fromva, tova, rtype, rflags in vw.getXrefsFrom(lateVa))
++
++        self.assertEqual(
++            rewritten,
++            untouched,
++            "a rewritten call site must be left holding exactly what the same call records when it is not rewritten",
++        )
++        self.assertEqual(len(rewritten), len(set(rewritten)), "and none of them duplicated")
++        self.assertIn(
++            lateVa, vw.getCallers(ptrVa), "so it stays discoverable through whichever of them recorded the call"
++        )
++        assertNoReturn(self, vw, lateVa)
++
++
++class NoReturnIdempotenceTest(unittest.TestCase):
++
++    def test_reanalysis_after_nothing_new_is_learned_changes_nothing(self):
++        vw = newWorkspace()
++        data = filledBuf(0x30)
++        exitVa = 0x1000
++        data[0:2] = UD2
++        bVa = 0x1010
++        data[0x10:0x15] = callRel32(exitVa, bVa + 5)
++        aVa = 0x1020
++        data[0x20:0x25] = callRel32(bVa, aVa + 5)
++        mapCode(vw, 0x1000, data)
++
++        vw.addNoReturnVa(exitVa)
++        vw.makeFunction(aVa)
++        vw.propagateNoReturn()
++
++        def snapshot():
++            return {fva for fva in vw.getFunctions() if vw.isNoReturnVa(fva)}
++
++        before = snapshot()
++        self.assertEqual(vw.propagateNoReturn(), set(), "nothing left to learn should mark nothing new")
++        after = snapshot()
++
++        self.assertEqual(before, after, "no-return membership must be unchanged by an information-free reanalysis")
++
++    def test_redeclaring_an_already_declared_address_with_its_chain_at_fixed_point_changes_nothing(self):
++        vw = newWorkspace()
++        data = filledBuf(0x30)
++        exitVa = 0x1000
++        data[0:2] = UD2
++        bVa = 0x1010
++        data[0x10:0x15] = callRel32(exitVa, bVa + 5)
++        aVa = 0x1020
++        data[0x20:0x25] = callRel32(bVa, aVa + 5)
++        mapCode(vw, 0x1000, data)
++
++        vw.addNoReturnVa(exitVa)
++        vw.makeFunction(aVa)
++        vw.propagateNoReturn()
++
++        def snapshot():
++            return {fva for fva in vw.getFunctions() if vw.isNoReturnVa(fva)}
++
++        before = snapshot()
++        newlyMarked = vw.addNoReturnVa(exitVa)
++        after = snapshot()
++
++        self.assertEqual(newlyMarked, set(), "redeclaring an address already at a fixed point must newly mark nothing")
++        self.assertEqual(
++            before,
++            after,
++            "no-return membership must be unchanged by redeclaring an address whose whole caller chain is already resolved",
++        )
++
++
++class PropagateNoReturnIsolationTest(unittest.TestCase):
++    """
++    propagateNoReturn re-runs only no-return re-derivation, not the rest of analysis: it
++    must never invoke an unrelated registered whole-workspace analysis module.
++    """
++
++    def test_propagate_no_return_does_not_invoke_other_analysis_modules(self):
++        modname = "vivisect.tests.sentinel6180ce"
++        calls = []
++        sentinel = types.ModuleType(modname)
++        sentinel.analyze = lambda vw: calls.append(vw)
++        sys.modules[modname] = sentinel
++        self.addCleanup(sys.modules.pop, modname, None)
++
++        vw = newWorkspace()
++        vw.addAnalysisModule(modname)
++
++        data = filledBuf(0x20)
++        exitVa = 0x1000
++        data[0:2] = UD2
++        bVa = 0x1010
++        data[0x10:0x15] = callRel32(exitVa, bVa + 5)
++        mapCode(vw, 0x1000, data)
++
++        vw.addNoReturnVa(exitVa)
++        vw.makeFunction(bVa)
++        vw.propagateNoReturn()
++
++        assertNoReturn(self, vw, bVa, "propagation itself must still have happened")
++        self.assertEqual(calls, [], "propagateNoReturn must not invoke unrelated analysis modules")
++
++
++class NoReturnMixedUnresolvedLeafTest(unittest.TestCase):
++    """
++    A function with one terminal call to a proven no-return target and another terminal
++    call to an ordinary, unproven target must stay return-capable, even though neither leaf
++    ends in an explicit return instruction.
++    """
++
++    def test_mixed_leaf_with_unresolved_ordinary_call_stays_return_capable(self):
++        vw = newWorkspace()
++        exitVa = 0x1000
++        mapCode(vw, exitVa, UD2, name="exit")
++        normalVa = 0x1010
++        mapCode(vw, normalVa, RET, name="normal")
++
++        mixedVa = 0x2000
++        head = TEST_EAX_EAX + jzRel8(7)
++        callExit = callRel32(exitVa, mixedVa + len(head) + 5)
++        pad = b"\xcc" * 2
++        callNormal = callRel32(normalVa, mixedVa + len(head) + len(callExit) + len(pad) + 5)
++        body = head + callExit + pad + callNormal
++        mapCode(vw, mixedVa, body, name="mixed")
++
++        vw.addNoReturnVa(exitVa)
++        vw.makeFunction(mixedVa)
++
++        assertReturns(self, vw, mixedVa, "an ordinary, unproven leaf must keep the function return-capable")
++
++
++class NoReturnAnchoredCycleTest(unittest.TestCase):
++    """
++    A mutually recursive cycle with no real exit, coexisting in the same workspace as an
++    unrelated, properly anchored chain to a proven no-return function, must not prevent that
++    anchored chain from resolving correctly, and the cycle itself must still not resolve.
++    """
++
++    def test_unrelated_cycle_does_not_block_anchored_chain_propagation(self):
++        vw = newWorkspace()
++
++        exitVa = 0x1000
++        mapCode(vw, exitVa, UD2, name="exit")
++        bVa = 0x1010
++        bBody = callRel32(exitVa, bVa + 5)
++        mapCode(vw, bVa, bBody, name="b")
++        aVa = 0x1020
++        aBody = callRel32(bVa, aVa + 5)
++        mapCode(vw, aVa, aBody, name="a")
++
++        # P and Q each live in their own exactly-sized memory region -- nothing is mapped
++        # after either call, so this is a genuine pure cycle, not one whose fallthrough
++        # happens to run into reachable filler bytes
++        pVa, qVa = 0x2000, 0x2010
++        pqBody = callRel32(qVa, pVa + 5)
++        mapCode(vw, pVa, pqBody, name="p")
++        qpBody = callRel32(pVa, qVa + 5)
++        mapCode(vw, qVa, qpBody, name="q")
++
++        vw.addNoReturnVa(exitVa)
++        vw.makeFunction(aVa)
++        vw.makeFunction(pVa)
++        vw.propagateNoReturn()
++
++        assertNoReturn(self, vw, bVa)
++        assertNoReturn(self, vw, aVa)
++        assertReturns(self, vw, pVa, "an unrelated cycle must not be marked no-return")
++        assertReturns(self, vw, qVa, "an unrelated cycle must not be marked no-return")
++
++
++class PartiallyProvenTransferBesideATrapTest(unittest.TestCase):
++    """
++    A transfer whose destinations are only PARTLY proven disproves the whole function, and
++    it must do so even when some other path of that same function ends in a genuine trap --
++    which is the arrangement where it matters, since the trap on the other path is then
++    sitting there to be mistaken for the whole proof.
++    """
++
++    def test_dispatch_with_a_returning_case_disproves_the_function_despite_a_trap_elsewhere(self):
++        vw = newWorkspace()
++        provenVa, retVa = 0x1000, 0x1010
++        mapCode(vw, provenVa, UD2, name="proven")
++        mapCode(vw, retVa, RET, name="returns")
++        vw.makeFunction(provenVa)
++        vw.makeFunction(retVa)
++
++        fVa = 0x2000
++        dispVa = fVa + 6
++        body = TEST_EAX_EAX + jzRel8(2) + UD2 + JMP_RAX
++        mapCode(vw, fVa, body, name="f")
++
++        vw.makeFunction(fVa)
++        vw.addXref(dispVa, provenVa, v_const.REF_CODE, envi.BR_COND)
++        vw.addXref(dispVa, retVa, v_const.REF_CODE, envi.BR_COND)
++
++        vw.addNoReturnVa(provenVa)
++        vw.propagateNoReturn()
++
++        assertReturns(
++            self,
++            vw,
++            fVa,
++            "one case of the dispatch returns, so that path can return -- the trap on the other path is not a proof of the whole function",
++        )
++
++    def test_unresolved_tail_jump_disproves_the_function_despite_a_trap_elsewhere(self):
++        vw = newWorkspace()
++
++        fVa = 0x2000
++        # the tail jump resolves to nothing at all -- no xref was ever recorded for it, so
++        # nothing says where it goes and nothing says it returns either
++        body = TEST_EAX_EAX + jzRel8(2) + UD2 + JMP_RAX
++        mapCode(vw, fVa, body, name="f")
++
++        vw.makeFunction(fVa)
++        vw.propagateNoReturn()
++
++        assertReturns(
++            self,
++            vw,
++            fVa,
++            "a tail jump that stays unresolved leaves that path capable of returning, so the trap on the other path is not a proof of the whole function",
++        )
++
++    def test_call_with_a_returning_destination_disproves_the_function_despite_a_trap_elsewhere(self):
++        vw = newWorkspace()
++        provenVa, retVa = 0x1000, 0x1010
++        mapCode(vw, provenVa, UD2, name="proven")
++        mapCode(vw, retVa, RET, name="returns")
++        vw.makeFunction(provenVa)
++        vw.makeFunction(retVa)
++
++        fVa = 0x2000
++        callVa = fVa + 6
++        body = TEST_EAX_EAX + jzRel8(2) + UD2 + CALL_RAX + RET
++        mapCode(vw, fVa, body, name="f")
++
++        vw.makeFunction(fVa)
++        vw.addXref(callVa, provenVa, v_const.REF_CODE, envi.BR_PROC)
++        vw.addXref(callVa, retVa, v_const.REF_CODE, envi.BR_PROC)
++
++        vw.addNoReturnVa(provenVa)
++        vw.propagateNoReturn()
++
++        assertReturns(
++            self,
++            vw,
++            fVa,
++            "the call may reach a destination that returns, so its fallthrough stays live and reaches the return -- the trap on the other path proves nothing about this one",
++        )
++
++
++class FullyProvenMultiDestinationTransferTest(unittest.TestCase):
++    """
++    The other half of the every-destination rule: a site whose destinations are ALL proven
++    settles its path, however many of them there are. Without this half, "every one of them"
++    would be satisfied by refusing any transfer with more than one destination at all.
++    """
++
++    def test_call_resolving_to_two_proven_destinations_settles_its_path(self):
++        vw = newWorkspace()
++        firstVa, secondVa = 0x1000, 0x1010
++        mapCode(vw, firstVa, UD2, name="first")
++        mapCode(vw, secondVa, UD2, name="second")
++        vw.makeFunction(firstVa)
++        vw.makeFunction(secondVa)
++        assertNoReturn(self, vw, firstVa, "each destination is settled by its own trap before anything else happens")
++        assertNoReturn(self, vw, secondVa)
++
++        fVa = 0x2000
++        mapCode(vw, fVa, CALL_RAX + RET, name="f")
++
++        vw.makeFunction(fVa)
++        assertReturns(self, vw, fVa, "nothing has resolved the call yet, so its fallthrough reaches the return")
++
++        vw.addXref(fVa, firstVa, v_const.REF_CODE, envi.BR_PROC)
++        vw.addXref(fVa, secondVa, v_const.REF_CODE, envi.BR_PROC)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {fVa},
++            "both destinations are proven, so wherever the call goes it does not come back and the return behind it is unreachable",
++        )
++        assertNoReturn(self, vw, fVa)
++
++    def test_dispatch_resolving_to_two_proven_cases_settles_its_path(self):
++        vw = newWorkspace()
++        firstVa, secondVa = 0x1000, 0x1010
++        mapCode(vw, firstVa, UD2, name="first")
++        mapCode(vw, secondVa, UD2, name="second")
++        vw.makeFunction(firstVa)
++        vw.makeFunction(secondVa)
++        assertNoReturn(self, vw, firstVa)
++        assertNoReturn(self, vw, secondVa)
++
++        fVa = 0x2000
++        mapCode(vw, fVa, JMP_RAX, name="f")
++
++        vw.makeFunction(fVa)
++        assertReturns(
++            self, vw, fVa, "an unresolved dispatch settles nothing, exactly as an unresolved tail jump does not"
++        )
++
++        vw.addXref(fVa, firstVa, v_const.REF_CODE, envi.BR_COND)
++        vw.addXref(fVa, secondVa, v_const.REF_CODE, envi.BR_COND)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {fVa},
++            "every case of the dispatch is proven, so the one path this function has is settled",
++        )
++        assertNoReturn(self, vw, fVa)
++
++
++class MixedDispatchFixedPointTest(unittest.TestCase):
++    """
++    One call reaches the fixed point. A dispatch with both an outgoing case and a case landing
++    back inside the dispatching function depends on what BOTH of them reach, so the outgoing
++    case being unproven when the dependencies are collected cannot end the collection:
++    whatever the local case calls is still a target this function comes to depend on, and
++    dropping it means nothing looks at this function again once that target is proven.
++    """
++
++    def test_one_call_reaches_a_caller_provable_only_through_a_local_case(self):
++        vw = newUnseededWorkspace()
++        rootVa = 0x1000
++        mapCode(vw, rootVa, UD2, name="root")
++
++        # a three-deep chain, so the local case's own dependency is proven strictly after
++        # the outgoing case is -- whichever order the two of them come up in
++        outVa = 0x1100
++        mapCode(vw, outVa, callRel32(rootVa, outVa + 5) + RET, name="out")
++        midVa = 0x1200
++        mapCode(vw, midVa, callRel32(outVa, midVa + 5) + RET, name="mid")
++        deepVa = 0x1300
++        mapCode(vw, deepVa, callRel32(midVa, deepVa + 5) + RET, name="deep")
++
++        fVa = 0x2000
++        caseVa = fVa + 2
++        mapCode(vw, fVa, JMP_RAX + CALL_RCX + RET, name="f")
++
++        for va in (rootVa, outVa, midVa, deepVa, fVa):
++            vw.makeFunction(va)
++
++        vw.addXref(fVa, outVa, v_const.REF_CODE, envi.BR_PROC)
++        vw.addXref(fVa, caseVa, v_const.REF_CODE)
++        vw.makeCode(caseVa)
++        vw.addXref(caseVa, deepVa, v_const.REF_CODE, envi.BR_PROC)
++        vw.analyzeFunction(fVa)
++        self.assertEqual(
++            vw.getFunction(caseVa),
++            fVa,
++            "the second case has to belong to the dispatching function, or it is not a local case at all",
++        )
++        self.assertEqual(
++            vw.getFunction(outVa), outVa, "the first case has to be a separate function, or it is not an outgoing one"
++        )
++
++        self.assertEqual(
++            vw.addNoReturnVa(rootVa),
++            {outVa, midVa, deepVa, fVa},
++            "every consequence of the declaration is derived by this one call, including the dispatcher whose remaining dependency is reached only through its local case",
++        )
++        self.assertEqual(vw.propagateNoReturn(), set(), "nothing is left for a second call to find")
++
++
++class OutgoingJumpProofTest(unittest.TestCase):
++    """
++    A jump that leaves the function is the same kind of terminal a call is: it settles the
++    path it sits on exactly when what it goes to is already proven, and not otherwise.
++    """
++
++    def test_direct_jump_out_to_a_returning_target_settles_nothing(self):
++        vw = newUnseededWorkspace()
++        returnsVa = 0x1000
++        mapCode(vw, returnsVa, RET, name="returns")
++
++        fVa = 0x2000
++        mapCode(vw, fVa, jmpRel32(returnsVa, fVa + 5), name="f")
++
++        vw.makeFunction(returnsVa)
++        vw.makeFunction(fVa)
++        self.assertNotEqual(
++            vw.getFunction(returnsVa),
++            fVa,
++            "the destination must be a separate function, or the jump would be ordinary local control flow",
++        )
++
++        self.assertEqual(
++            vw.propagateNoReturn(), set(), "the jump resolves to exactly one destination and that destination returns"
++        )
++        assertReturns(self, vw, fVa, "whatever a jump out reaches comes back if its destination does")
++
++    def test_direct_jump_out_to_a_proven_target_settles_its_path(self):
++        vw = newUnseededWorkspace()
++        exitVa = 0x1000
++        mapCode(vw, exitVa, UD2, name="exit")
++
++        fVa = 0x2000
++        mapCode(vw, fVa, jmpRel32(exitVa, fVa + 5), name="f")
++
++        vw.makeFunction(exitVa)
++        vw.makeFunction(fVa)
++        self.assertNotEqual(
++            vw.getFunction(exitVa),
++            fVa,
++            "the destination must be a separate function, or the jump would be ordinary local control flow",
++        )
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {exitVa, fVa},
++            "the trap settles the destination, and the destination then settles the jump that goes to it",
++        )
++        assertNoReturn(
++            self, vw, fVa, "a jump out to a proven no-return function is as much proof of its path as a call to one"
++        )
++
++    def test_a_register_jump_settles_its_path_through_a_procedural_reference(self):
++        vw = newUnseededWorkspace()
++        exitVa = 0x1000
++        mapCode(vw, exitVa, UD2, name="exit")
++
++        # the jump names no destination of its own, and the only record of where it goes
++        # carries the flag that says the edge leaves this function
++        fVa = 0x2000
++        mapCode(vw, fVa, JMP_RAX, name="f")
++
++        vw.makeFunction(exitVa)
++        vw.makeFunction(fVa)
++        vw.addXref(fVa, exitVa, v_const.REF_CODE, envi.BR_PROC)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {exitVa, fVa},
++            "a recorded code reference resolves this jump whatever it is flagged as, and its destination is proven",
++        )
++        assertNoReturn(self, vw, fVa)
++
++
++class UnresolvedCallFallthroughTest(unittest.TestCase):
++    """
++    A call nothing has resolved settles nothing, which is not the same as ending the path.
++    Whether the unknown callee returns or not, control that comes back from it carries on to
++    the next instruction, and a trap there settles the only path this function has.
++    """
++
++    def test_a_trap_behind_an_unresolved_call_settles_the_function(self):
++        vw = newUnseededWorkspace()
++        fVa = 0x2000
++        mapCode(vw, fVa, CALL_RAX + UD2, name="f")
++
++        vw.makeFunction(fVa)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {fVa},
++            "nothing says where the call goes, so the path it comes back to is the one that decides this function",
++        )
++        assertNoReturn(self, vw, fVa, "every way out of this function reaches the trap behind the call")
++
++
++class AddNoReturnVaAutoPropagatesTest(unittest.TestCase):
++    """
++    A manual addNoReturnVa call re-derives the whole graph immediately, the same way an
++    explicit propagateNoReturn call right after it would -- an interactive caller should
++    never have to remember the second step.
++    """
++
++    def test_declaring_an_address_with_no_callers_returns_an_empty_set(self):
++        vw = newWorkspace()
++        exitVa = 0x1000
++        mapCode(vw, exitVa, UD2, name="exit")
++
++        newlyMarked = vw.addNoReturnVa(exitVa)
++
++        self.assertEqual(
++            newlyMarked,
++            set(),
++            "declaring an address with no known callers must return an empty newly-marked set -- the declared address itself is never included",
++        )
++        assertNoReturn(self, vw, exitVa)
++
++    def test_manual_declaration_immediately_propagates_without_separate_call(self):
++        vw = newWorkspace()
++        exitVa = 0x1000
++        mapCode(vw, exitVa, UD2, name="exit")
++
++        bVa = 0x2000
++        mov = movRaxImm64(exitVa)
++        buf = mov + CALL_RAX
++        mapCode(vw, bVa, buf, name="b")
++        callVa = bVa + len(mov)
++
++        vw.makeFunction(bVa)
++        vw.addXref(callVa, exitVa, v_const.REF_CODE, envi.BR_PROC)
++        assertReturns(self, vw, bVa)
++
++        # no propagateNoReturn() call anywhere in this test -- addNoReturnVa alone must be
++        # enough
++        vw.addNoReturnVa(exitVa)
++        assertNoReturn(
++            self, vw, bVa, "addNoReturnVa must immediately re-derive the graph, not just record exitVa itself"
++        )
++
++    def test_declaring_the_deep_target_returns_every_newly_marked_caller_in_the_chain(self):
++        vw = newWorkspace()
++        exitVa = 0x1000
++        mapCode(vw, exitVa, UD2, name="exit")
++
++        middleVa = 0x2000
++        movMiddle = movRaxImm64(exitVa)
++        middleBuf = movMiddle + CALL_RAX
++        mapCode(vw, middleVa, middleBuf, name="middle")
++        middleCallVa = middleVa + len(movMiddle)
++
++        outerVa = 0x3000
++        movOuter = movRaxImm64(middleVa)
++        outerBuf = movOuter + CALL_RAX
++        mapCode(vw, outerVa, outerBuf, name="outer")
++        outerCallVa = outerVa + len(movOuter)
++
++        vw.makeFunction(middleVa)
++        vw.makeFunction(outerVa)
++        vw.addXref(middleCallVa, exitVa, v_const.REF_CODE, envi.BR_PROC)
++        vw.addXref(outerCallVa, middleVa, v_const.REF_CODE, envi.BR_PROC)
++        assertReturns(self, vw, middleVa)
++        assertReturns(self, vw, outerVa)
++
++        # both targets are already resolved before this single addNoReturnVa call -- it
++        # alone, with no propagateNoReturn() call anywhere, must walk the whole chain and
++        # report every function it newly proves, not just the deep target's own status
++        newlyMarked = vw.addNoReturnVa(exitVa)
++
++        self.assertEqual(newlyMarked, {middleVa, outerVa})
++        assertNoReturn(self, vw, middleVa)
++        assertNoReturn(self, vw, outerVa)
++
++
++class LateProvenCallWithDecodedFallthroughTest(unittest.TestCase):
++    """
++    A caller whose call site had an ordinary, already-decoded fallthrough at the time it was
++    first examined -- the common `call target; ret` shape -- must still become provable
++    noreturn once the target is proven noreturn afterward. Proof must be re-derived against
++    current knowledge by walking the instruction stream directly, not by trusting whichever
++    codeblock leaf codeflow happened to build when the target's status was still unknown.
++    """
++
++    def test_call_then_ret_becomes_noreturn_once_the_target_is_declared_afterward(self):
++        vw = newWorkspace()
++        exitVa = 0x1000
++        mapCode(vw, exitVa, UD2, name="exit")
++
++        # reached only through a register-indirect call, resolved later via addXref, so
++        # codeflow never recursively descends into exitVa while decoding callerVa -- the
++        # trailing RET is genuinely decoded and kept as part of callerVa's own codeblock
++        callerVa = 0x2000
++        mov = movRaxImm64(exitVa)
++        buf = mov + CALL_RAX + RET
++        mapCode(vw, callerVa, buf, name="caller")
++        callVa = callerVa + len(mov)
++
++        vw.makeFunction(callerVa)
++        assertReturns(self, vw, callerVa, "an unresolved indirect call followed by a real ret must stay return-capable")
++
++        vw.addXref(callVa, exitVa, v_const.REF_CODE, envi.BR_PROC)
++        assertReturns(self, vw, callerVa, "resolving the target alone must not retroactively change anything")
++
++        newlyMarked = vw.addNoReturnVa(exitVa)
++
++        self.assertIn(
++            callerVa,
++            newlyMarked,
++            "declaring the call target no-return must newly prove the caller, even though its own codeblock still ends in a decoded ret after the call",
++        )
++        assertNoReturn(self, vw, callerVa)
++
++
++class TrapOnlyTerminalTest(unittest.TestCase):
++    """
++    A terminal instruction that is itself an explicit non-fallthrough trap or halt (int3,
++    ud2, and similar) -- one with no return and no branch of its own -- is positive
++    noreturn evidence on its own, the same as codeflow's original leaf classification. This
++    must be told apart from a path that merely runs out of mapped code, which stays unproven.
++    """
++
++    def test_bare_trap_instruction_is_independently_derived_noreturn(self):
++        vw = newUnseededWorkspace()
++        trapVa = 0x1000
++        mapCode(vw, trapVa, b"\xcc", name="trap")
++
++        vw.makeFunction(trapVa)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {trapVa},
++            "a trap-only function calls nothing, so no walk outward from an already-proven address ever reaches it -- every function has to be examined",
++        )
++        assertNoReturn(
++            self,
++            vw,
++            trapVa,
++            "a function whose only instruction is an explicit trap must be independently derived no-return, without any direct addNoReturnVa declaration",
++        )
++
++    def test_bare_halt_instruction_is_independently_derived_noreturn(self):
++        vw = newUnseededWorkspace()
++        haltVa = 0x1000
++        mapCode(vw, haltVa, HLT, name="halt")
++
++        vw.makeFunction(haltVa)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {haltVa},
++            "a halt is the other half of the trap-or-halt rule and settles a path exactly as a trap does",
++        )
++        assertNoReturn(
++            self,
++            vw,
++            haltVa,
++            "an implementation that only knows the undefined-instruction and breakpoint encodings has not read the rule",
++        )
++
++    def test_the_other_undefined_instruction_encodings_are_traps_too(self):
++        # ud2 is the encoding everyone knows; x86 reserves two more for the same purpose and
++        # this repository's own opcode table puts all three in one class. A classifier built
++        # from a list of remembered spellings recognises the famous one and not its siblings
++        for name, encoding in (("ud0", UD0), ("ud1", UD1)):
++            vw = newUnseededWorkspace()
++            trapVa = 0x1000
++            mapCode(vw, trapVa, encoding, name=name)
++
++            vw.makeFunction(trapVa)
++
++            self.assertEqual(
++                vw.propagateNoReturn(),
++                {trapVa},
++                "%s is as permanently undefined as ud2 and settles a path the same way" % name,
++            )
++            assertNoReturn(self, vw, trapVa)
++
++    def test_a_trap_behind_a_call_to_an_ordinary_function_is_still_the_proof(self):
++        vw = newUnseededWorkspace()
++        ordinaryVa = 0x1000
++        mapCode(vw, ordinaryVa, RET, name="ordinary")
++
++        fVa = 0x2000
++        mapCode(vw, fVa, callRel32(ordinaryVa, fVa + 5) + UD2, name="f")
++
++        vw.makeFunction(ordinaryVa)
++        vw.makeFunction(fVa)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {fVa},
++            "a call that is not proven leaves its fallthrough live, and the trap sitting on that fallthrough settles the only path this function has",
++        )
++        assertNoReturn(
++            self,
++            vw,
++            fVa,
++            "nothing about the callee is being relied on, so this function is proven on its own terms and no walk outward from another address is needed to reach it",
++        )
++
++
++class MonotonicConclusionTest(unittest.TestCase):
++    """
++    A conclusion already reached stands. Re-derivation examines what this workspace does not
++    already know, so a function that was already proven is not revisited to be argued out of
++    it when the code under it changes afterward.
++    """
++
++    def test_a_conclusion_stands_after_its_own_body_gains_a_returning_path(self):
++        vw = newUnseededWorkspace()
++        exitVa = 0x1000
++        mapCode(vw, exitVa, UD2 + NOP, name="exit")
++
++        fVa = 0x2000
++        mapCode(vw, fVa, callRel32(exitVa, fVa + 5) + RET, name="f")
++
++        vw.makeFunction(exitVa)
++        vw.makeFunction(fVa)
++
++        self.assertEqual(vw.propagateNoReturn(), {exitVa, fVa})
++
++        vw.writeMemory(exitVa, RET + NOP)
++        self.assertEqual(
++            vw.parseOpcode(exitVa).mnem,
++            "ret",
++            "the body has to read differently now for the re-derivation below to have anything to see",
++        )
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            set(),
++            "nothing is newly marked, and nothing already marked is revisited to be argued out of",
++        )
++        assertNoReturn(self, vw, exitVa, "the conclusion was reached and is not withdrawn")
++        assertNoReturn(self, vw, fVa, "nor is anything that was concluded from it")
++
++
++class WalkStopsAtNonCodeMemoryTest(unittest.TestCase):
++    """
++    Running off the end of a function's own executable memory is not evidence of anything.
++    vw.parseOpcode reads through getByteDef, which asks only that an address be mapped, so
++    whatever bytes happen to sit in an adjacent data map decode into some instruction --
++    possibly a trap. Codeflow itself refuses to schedule a destination that is not
++    executable and initialized, and this re-derivation has to stop at the same boundary or
++    it manufactures proof out of data the processor would never have executed.
++    """
++
++    def test_a_trap_in_an_adjacent_non_executable_map_is_not_evidence(self):
++        vw = newWorkspace()
++        fva = 0x1000
++        mapCode(vw, fva, NOP, name="code")
++        mapNonCode(vw, fva + 1, UD2, name="data")
++
++        vw.makeFunction(fva)
++
++        assertReturns(
++            self,
++            vw,
++            fva,
++            "a trap sitting in a non-executable map is not code this function reaches, so it cannot prove the function no-return",
++        )
++
++    def test_the_same_trap_inside_executable_memory_is_evidence(self):
++        vw = newUnseededWorkspace()
++        fva = 0x1000
++        mapCode(vw, fva, NOP + UD2, name="code")
++
++        vw.makeFunction(fva)
++
++        self.assertEqual(
++            vw.propagateNoReturn(),
++            {fva},
++            "the trap settles the only path this function has, so a workspace-wide pass proves it with nothing else to go on",
++        )
++        assertNoReturn(
++            self, vw, fva, "the identical trap bytes reached through executable memory are ordinary trap-leaf evidence"
++        )
++
++    def test_a_trap_in_an_executable_but_uninitialized_map_is_not_evidence(self):
++        vw = newWorkspace()
++        fva = 0x1000
++        mapCode(vw, fva, NOP, name="code")
++        mapUninitCode(vw, fva + 1, UD2, name="bss")
++
++        vw.makeFunction(fva)
++
++        assertReturns(
++            self,
++            vw,
++            fva,
++            "an uninitialized map holds nothing this analysis may read as an instruction, exactly as codeflow treats it, even though it is executable",
++        )

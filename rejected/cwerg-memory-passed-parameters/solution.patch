@@ -1,0 +1,1073 @@
+diff --git a/BE/Base/lowering.cc b/BE/Base/lowering.cc
+index 46c5fec7..aaa7b614 100644
+--- a/BE/Base/lowering.cc
++++ b/BE/Base/lowering.cc
+@@ -729,8 +729,62 @@ void FunLimtiShiftAmounts(Fun fun, int width, std::vector<Ins>* inss) {
+   }
+ }
+ 
++void PushPopInterface::GetCpuRegsForInSignature(
++    unsigned count, const base::DK* kinds,
++    std::vector<base::CpuReg>* out) const {
++  std::vector<CpuReg> cpu_regs;
++  CpuReg mem_reg = SplitInSignature(count, kinds, &cpu_regs);
++  out->clear();
++  for (CpuReg cpu_reg : cpu_regs) {
++    if (!cpu_reg.isnull()) out->push_back(cpu_reg);
++  }
++  if (!mem_reg.isnull()) out->push_back(mem_reg);
++}
++
++namespace {
++
++struct Param {
++  CpuReg cpu_reg;
++  int offset;
++};
++
++const char kParamMemName[] = "$param_mem";
++
++// returns the parameters in reverse order and the size of the memory region
++uint32_t GetInParams(unsigned count, const DK* kinds,
++                     const PushPopInterface& ppif, CpuReg* mem_reg,
++                     std::vector<Param>* params) {
++  std::vector<CpuReg> cpu_regs;
++  *mem_reg = ppif.SplitInSignature(count, kinds, &cpu_regs);
++  params->clear();
++  uint32_t size = 0;
++  for (unsigned i = 0; i < count; ++i) {
++    if (!cpu_regs[i].isnull()) {
++      params->push_back(Param{cpu_regs[i], -1});
++      continue;
++    }
++    const uint32_t width = DKBitWidth(kinds[i]) / 8;
++    size = (size + width - 1) / width * width;
++    params->push_back(Param{cpu_regs[i], int(size)});
++    size += width;
++  }
++  std::reverse(params->begin(), params->end());
++  return size;
++}
++
++void AddOutParams(unsigned count, const DK* kinds,
++                  const PushPopInterface& ppif, std::vector<Param>* params) {
++  std::vector<CpuReg> cpu_regs;
++  ppif.GetCpuRegsForOutSignature(count, kinds, &cpu_regs);
++  std::reverse(cpu_regs.begin(), cpu_regs.end());
++  for (CpuReg cpu_reg : cpu_regs) params->push_back(Param{cpu_reg, -1});
++}
++
++}  // namespace
++
+ void FunPushargConversion(Fun fun, const PushPopInterface& ppif) {
+-  std::vector<CpuReg> parameter;
++  std::vector<Param> parameter;
++  std::vector<Param> callee_params;
+   for (Bbl bbl : FunBblIter(fun)) {
+     for (Ins ins : BblInsIterReverse(bbl)) {
+       if (InsOPC(ins) == OPC::PUSHARG) {
+@@ -740,52 +794,85 @@ void FunPushargConversion(Fun fun, const PushPopInterface& ppif) {
+         ASSERT(!parameter.empty(),
+                "possible undefined fun call in " << Name(fun));
+         Handle src = InsOperand(ins, 0);
+-        CpuReg cpu_reg = parameter.back();
++        const Param param = parameter.back();
+         parameter.pop_back();
+-        Reg reg = FunFindOrAddCpuReg(fun, cpu_reg, RegOrConstKind(src));
++        if (param.cpu_reg.isnull()) {
++          Stk stk = FunStkFind(fun, StrNew(kParamMemName));
++          InsInit(ins, OPC::ST_STK, false, stk,
++                  ConstNewACS(DK::S32, param.offset), src);
++          continue;
++        }
++        Reg reg = FunFindOrAddCpuReg(fun, param.cpu_reg, RegOrConstKind(src));
+         InsInit(ins, OPC::MOV, false, reg, src);
+         continue;
+       }
+ 
+       if (InsOpcode(ins).IsCall()) {
+         Fun callee = InsCallee(ins);
+-        ppif.GetCpuRegsForInSignature(FunNumInputTypes(callee),
+-                                      FunInputTypes(callee), &parameter);
+-        std::reverse(parameter.begin(), parameter.end());
++        CpuReg mem_reg;
++        const uint32_t size =
++            GetInParams(FunNumInputTypes(callee), FunInputTypes(callee), ppif,
++                        &mem_reg, &callee_params);
++        parameter = callee_params;
++        if (!mem_reg.isnull()) {
++          Str name = StrNew(kParamMemName);
++          Stk stk = FunStkFind(fun, name);
++          if (stk.isnull()) {
++            stk = StkNew(name, 8, size);
++            FunStkAdd(fun, stk);
++          }
++          StkSize(stk) = std::max(StkSize(stk), size);
++          Reg reg = FunFindOrAddCpuReg(fun, mem_reg, ppif.AddrKind());
++          BblInsInsertBefore(bbl, ins, InsNew(OPC::LEA_STK, false, reg, stk,
++                                         ConstNewACS(DK::S32, 0)));
++        }
+       } else if (InsOPC(ins) == OPC::RET) {
+-        ppif.GetCpuRegsForOutSignature(FunNumOutputTypes(fun),
+-                                       FunOutputTypes(fun), &parameter);
+-        std::reverse(parameter.begin(), parameter.end());
++        parameter.clear();
++        AddOutParams(FunNumOutputTypes(fun), FunOutputTypes(fun), ppif,
++                     &parameter);
+       }
+     }
+   }
+ }
+ 
+ void FunPopargConversion(Fun fun, const PushPopInterface& ppif) {
+-  std::vector<CpuReg> parameter;
+-  ppif.GetCpuRegsForInSignature(FunNumInputTypes(fun), FunInputTypes(fun),
+-                                &parameter);
+-  std::reverse(parameter.begin(), parameter.end());
++  std::vector<Param> parameter;
++  CpuReg mem_reg;
++  GetInParams(FunNumInputTypes(fun), FunInputTypes(fun), ppif, &mem_reg,
++              &parameter);
++  Reg mem_base;
++  if (!mem_reg.isnull()) {
++    mem_base = FunGetScratchReg(fun, ppif.AddrKind(), "param_mem", false);
++  }
+   for (Bbl bbl : FunBblIter(fun)) {
+     for (Ins ins : BblInsIter(bbl)) {
+       if (InsOPC(ins) == OPC::POPARG) {
+         ASSERT(!parameter.empty(), "pop-/push mismatch in " << Name(fun));
+         Reg dst = Reg(InsOperand(ins, 0));
+-        CpuReg cpu_reg = parameter.back();
++        const Param param = parameter.back();
+         parameter.pop_back();
+-        Reg reg = FunFindOrAddCpuReg(fun, cpu_reg, RegKind(dst));
++        if (param.cpu_reg.isnull()) {
++          InsInit(ins, OPC::LD, false, dst, mem_base,
++                  ConstNewACS(DK::S32, param.offset));
++          continue;
++        }
++        Reg reg = FunFindOrAddCpuReg(fun, param.cpu_reg, RegKind(dst));
+         InsInit(ins, OPC::MOV, false, dst, reg);
+         continue;
+       }
+ 
+       if (InsOpcode(ins).IsCall()) {
+         Fun callee = InsCallee(ins);
+-        ppif.GetCpuRegsForOutSignature(FunNumOutputTypes(callee),
+-                                       FunOutputTypes(callee), &parameter);
+-        std::reverse(parameter.begin(), parameter.end());
++        AddOutParams(FunNumOutputTypes(callee), FunOutputTypes(callee), ppif,
++                     &parameter);
+       }
+     }
+   }
++  if (!mem_reg.isnull()) {
++    Reg src = FunFindOrAddCpuReg(fun, mem_reg, ppif.AddrKind());
++    BblInsPrepend(FunBblList::Head(fun),
++                  InsNew(OPC::MOV, false, mem_base, src));
++  }
+ }
+ 
+ void FunSetInOutCpuRegs(Fun fun, const PushPopInterface& ppif) {
+diff --git a/BE/Base/lowering.h b/BE/Base/lowering.h
+index 84918100..cf764033 100644
+--- a/BE/Base/lowering.h
++++ b/BE/Base/lowering.h
+@@ -60,13 +60,20 @@ class RegConstCache {
+ 
+ extern void FunLimtiShiftAmounts(Fun fun, int width, std::vector<Ins>* inss);
+ 
++// Parameters which do not fit into registers are passed in memory:
++// the caller stores them into a stack region and passes its address
++// in the register returned by SplitInSignature.
+ struct PushPopInterface {
+-  virtual void GetCpuRegsForInSignature(
+-      unsigned count, const base::DK* kinds,
+-      std::vector<base::CpuReg>* out) const = 0;
++  // out receives a null CpuReg for each parameter passed in memory
++  virtual CpuReg SplitInSignature(unsigned count, const base::DK* kinds,
++                                  std::vector<base::CpuReg>* out) const = 0;
+   virtual void GetCpuRegsForOutSignature(
+       unsigned count, const base::DK* kinds,
+       std::vector<base::CpuReg>* out) const = 0;
++  virtual DK AddrKind() const = 0;
++
++  void GetCpuRegsForInSignature(unsigned count, const base::DK* kinds,
++                                std::vector<base::CpuReg>* out) const;
+ };
+ 
+ extern void FunPushargConversion(Fun fun, const PushPopInterface& ppif);
+diff --git a/BE/Base/lowering.py b/BE/Base/lowering.py
+index bb0630be..4e659c4c 100644
+--- a/BE/Base/lowering.py
++++ b/BE/Base/lowering.py
+@@ -13,7 +13,7 @@ Examples:
+       instruction set with sequence of equivalent instructions
+ """
+ 
+-from typing import List, Optional
++from typing import List, Optional, Tuple
+ 
+ from BE.Base import cfg
+ from BE.Base import ir
+@@ -629,21 +629,61 @@ def FunLimitShiftAmounts(fun: ir.Fun, width: int):
+ 
+ 
+ class PushPopInterface:
+-    """Used with FunPopargConversion and FunPushargConversion"""
++    """Used with FunPopargConversion and FunPushargConversion
++
++    Parameters which do not fit into registers are passed in memory:
++    the caller stores them into a stack region and passes its address
++    in the register returned by SplitInSignature.
++    """
++    ADDR_KIND = o.DK.A64
++    OFFSET_KIND = o.DK.S32
+ 
+     @classmethod
+-    def GetCpuRegsForInSignature(cls, kinds: List[o.DK]) -> List[ir.CpuReg]:
++    def SplitInSignature(cls, kinds: List[o.DK]) -> Tuple[
++            List[Optional[ir.CpuReg]], Optional[ir.CpuReg]]:
+         assert False, "To be implemented by subclass"
+ 
++    @classmethod
++    def GetCpuRegsForInSignature(cls, kinds: List[o.DK]) -> List[ir.CpuReg]:
++        cpu_regs, mem_reg = cls.SplitInSignature(kinds)
++        out = [r for r in cpu_regs if r is not None]
++        if mem_reg is not None:
++            out.append(mem_reg)
++        return out
++
+     @classmethod
+     def GetCpuRegsForOutSignature(cls, kinds: List[o.DK]) -> List[ir.CpuReg]:
+         assert False, "To be implemented by subclass"
+ 
+ 
++PARAM_MEM_NAME = "$param_mem"
++
++
++def _MemParamOffsets(kinds: List[o.DK], cpu_regs: List[Optional[ir.CpuReg]]) -> Tuple[List[Optional[int]], int]:
++    offsets = []
++    size = 0
++    for kind, cpu_reg in zip(kinds, cpu_regs):
++        if cpu_reg is not None:
++            offsets.append(None)
++            continue
++        width = kind.bitwidth() // 8
++        size = (size + width - 1) // width * width
++        offsets.append(size)
++        size += width
++    return offsets, size
++
++
++def _GetInParams(kinds: List[o.DK], iface: PushPopInterface):
++    cpu_regs, mem_reg = iface.SplitInSignature(kinds)
++    offsets, size = _MemParamOffsets(kinds, cpu_regs)
++    return list(zip(cpu_regs, offsets)), mem_reg, size
++
++
+ def _InsPopargConversion(ins: ir.Ins, fun: ir.Fun, iface: PushPopInterface,
+-                         params: List[ir.CpuReg]) -> Optional[List[ir.Ins]]:
++                         params: List, mem_base: Optional[ir.Reg]) -> Optional[List[ir.Ins]]:
+     """
+     This pass converts `poparg reg` -> `mov reg = arg_reg`
++    or `ld reg = mem_base offset` for parameters passed in memory
+ 
+     it must used in a forward pass over the Bbl and will update `param`
+     for use with the next Ins in the BBl. The initial value of `param`
+@@ -651,8 +691,10 @@ def _InsPopargConversion(ins: ir.Ins, fun: ir.Fun, iface: PushPopInterface,
+ 
+     """
+     if ins.opcode is o.POPARG:
+-        cpu_reg = params.pop(0)
++        cpu_reg, offset = params.pop(0)
+         dst = ins.operands[0]
++        if cpu_reg is None:
++            return [ir.Ins(o.LD, [dst, mem_base, ir.Const(iface.OFFSET_KIND, offset)], False)]
+         # assert dst.kind == cpu_reg.kind
+         reg = fun.FindOrAddCpuReg(cpu_reg, dst.kind)
+         return [ir.Ins(o.MOV, [dst, reg], False)]
+@@ -662,39 +704,60 @@ def _InsPopargConversion(ins: ir.Ins, fun: ir.Fun, iface: PushPopInterface,
+     if ins.opcode.is_call():
+         callee: ir.Fun = cfg.InsCallee(ins)
+         assert isinstance(callee, ir.Fun)
+-        params += iface.GetCpuRegsForOutSignature(callee.output_types)
++        params += [(r, None) for r in iface.GetCpuRegsForOutSignature(callee.output_types)]
+     return None
+ 
+ 
+ def FunPopargConversion(fun: ir.Fun, iface: PushPopInterface):
+-    return ir.FunGenericRewrite(fun, _InsPopargConversion,
+-                                iface=iface,
+-                                params=iface.GetCpuRegsForInSignature(fun.input_types))
++    params, mem_reg, _ = _GetInParams(fun.input_types, iface)
++    mem_base = None
++    if mem_reg is not None:
++        mem_base = fun.GetScratchReg(iface.ADDR_KIND, "param_mem", False)
++    count = ir.FunGenericRewrite(fun, _InsPopargConversion,
++                                 iface=iface, params=params, mem_base=mem_base)
++    if mem_base is not None:
++        src = fun.FindOrAddCpuReg(mem_reg, iface.ADDR_KIND)
++        fun.bbls[0].inss.insert(0, ir.Ins(o.MOV, [mem_base, src], False))
++    return count
+ 
+ 
+ def _InsPushargConversionReverse(ins: ir.Ins, fun: ir.Fun,
+                                  iface: PushPopInterface,
+-                                 params: List[ir.CpuReg]) -> Optional[
++                                 params: List) -> Optional[
+         List[ir.Ins]]:
+     """
+     This pass converts pusharg reg -> mov arg_reg = reg
++    or `st.stk param_mem offset = reg` for parameters passed in memory
+ 
+     Note:
+          * params is passed around between calls to this function
+          * pusharg's always precede calls or returns
++         * the replacement list is in reverse order
+     """
+     if ins.opcode is o.PUSHARG:
+-        cpu_reg = params.pop(0)
++        cpu_reg, offset = params.pop(0)
+         src = ins.operands[0]
++        if cpu_reg is None:
++            stk = fun.GetStk(PARAM_MEM_NAME)
++            return [ir.Ins(o.ST_STK, [stk, ir.Const(iface.OFFSET_KIND, offset), src], False)]
+         reg = fun.FindOrAddCpuReg(cpu_reg, src.kind)
+         return [ir.Ins(o.MOV, [reg, src], False)]
+     assert not params, f"params {params} should be empty at ins {ins} {ins.operands}"
+     if ins.opcode.is_call():
+         callee: ir.Fun = cfg.InsCallee(ins)
+         assert isinstance(callee, ir.Fun)
+-        params += iface.GetCpuRegsForInSignature(callee.input_types)
++        callee_params, mem_reg, size = _GetInParams(callee.input_types, iface)
++        params += callee_params
++        if mem_reg is not None:
++            stk = fun.MaybeGetStk(PARAM_MEM_NAME)
++            if stk is None:
++                stk = ir.Stk(PARAM_MEM_NAME, 8, size)
++                fun.AddStk(stk)
++            stk.count = max(stk.count, size)
++            reg = fun.FindOrAddCpuReg(mem_reg, iface.ADDR_KIND)
++            return [ins, ir.Ins(o.LEA_STK, [reg, stk, ir.Const(iface.OFFSET_KIND, 0)], False)]
+     elif ins.opcode is o.RET:
+-        params += iface.GetCpuRegsForOutSignature(fun.output_types)
++        params += [(r, None) for r in iface.GetCpuRegsForOutSignature(fun.output_types)]
+     return None
+ 
+ 
+diff --git a/BE/Base/serialize.cc b/BE/Base/serialize.cc
+index 18ddf7a5..c2291e13 100644
+--- a/BE/Base/serialize.cc
++++ b/BE/Base/serialize.cc
+@@ -24,9 +24,10 @@ int PopulateSig(const std::vector<std::string_view>& token, int start,
+     std::cerr << "unexpected vector start: " << token[start] << "\n";
+     return -1;
+   }
+-  for (int i = 0; i < MAX_PARAMETERS; ++i) {
++  for (int i = 0; i <= MAX_PARAMETERS; ++i) {
+     std::string_view s = token[start + 1 + i];
+     if (s[0] == ']') return i;
++    if (i == MAX_PARAMETERS) break;
+     sig[i] = DKFromString(s);
+     if (sig[i] == DK::INVALID) {
+       std::cerr << "cannot parse: " << s << "\n";
+diff --git a/BE/CodeGenA32/README.md b/BE/CodeGenA32/README.md
+index 247a16a7..3391fc8c 100644
+--- a/BE/CodeGenA32/README.md
++++ b/BE/CodeGenA32/README.md
+@@ -45,8 +45,9 @@ instruction selector. It encompasses the following steps:
+   then check if the integers immediates satisfies the constraints of the expansion.
+ * add `nop1` for those case where we likely need a scratch register 
+ * enforce Cwerg shift semantics
+-* TODO: move parameters that cannot be handled by calling convention
+-  onto stk 
++* parameters that do not fit into the argument registers of the calling convention
++  are passed in memory: the caller stores them into a stack region and passes its
++  address in the next free parameter GPR, the callee loads them from there
+ 
+ ### Global Register Allocation
+ 
+diff --git a/BE/CodeGenA32/isel_gen.cc b/BE/CodeGenA32/isel_gen.cc
+index c5b8b0cc..1b9114f3 100644
+--- a/BE/CodeGenA32/isel_gen.cc
++++ b/BE/CodeGenA32/isel_gen.cc
+@@ -120,6 +120,8 @@ uint8_t PatternMismatchesImmConstraints(const Pattern& pat,
+       if (imm_curb == IC::invalid) {
+         // we have an imm but need a reg - this can be accommodated.
+         out |= 1U << i;
++      } else if (DKFlavor(ConstKind(op)) == DK_FLAVOR_F) {
++        return MATCH_IMPOSSIBLE;
+       } else if (!ImmFitsCurb(imm_curb, ConstValueInt64(op), last_stack_offset,
+                               assume_stk_op_matches)) {
+         // imm does not not fit
+diff --git a/BE/CodeGenA32/legalize.cc b/BE/CodeGenA32/legalize.cc
+index 1633343f..3a626762 100644
+--- a/BE/CodeGenA32/legalize.cc
++++ b/BE/CodeGenA32/legalize.cc
+@@ -219,7 +219,7 @@ PoolMasks GetRegPoolsForGlobals(const FunRegStats& needed, uint32_t regs_lac,
+ 
+ }  // namespace
+ 
+-void PhaseLegalization(Fun fun, Unit unit, std::ostream* fout) {
++void PhaseLegalizationStep1(Fun fun, Unit unit, std::ostream* fout) {
+   std::vector<Ins> inss;
+   FunLimtiShiftAmounts(fun, 32, &inss);
+ 
+@@ -227,7 +227,10 @@ void PhaseLegalization(Fun fun, Unit unit, std::ostream* fout) {
+   FunRegWidthWidening(fun, DK::S8, DK::S32, &inss);
+   FunRegWidthWidening(fun, DK::U16, DK::U32, &inss);
+   FunRegWidthWidening(fun, DK::S16, DK::S32, &inss);
++}
+ 
++void PhaseLegalizationStep2(Fun fun, Unit unit, std::ostream* fout) {
++  std::vector<Ins> inss;
+   FunSetInOutCpuRegs(fun, *PushPopInterfaceA32);
+ 
+   if (FunKind(fun) != FUN_KIND::NORMAL) return;
+@@ -416,7 +419,10 @@ void LegalizeAll(Unit unit, bool verbose, std::ostream* fout) {
+     }
+   }
+   for (Fun fun : UnitFunIter(unit)) {
+-    PhaseLegalization(fun, unit, fout);
++    PhaseLegalizationStep1(fun, unit, fout);
++  }
++  for (Fun fun : UnitFunIter(unit)) {
++    PhaseLegalizationStep2(fun, unit, fout);
+   }
+ }
+ 
+diff --git a/BE/CodeGenA32/legalize.py b/BE/CodeGenA32/legalize.py
+index 21b84426..c8b1b6b4 100644
+--- a/BE/CodeGenA32/legalize.py
++++ b/BE/CodeGenA32/legalize.py
+@@ -237,16 +237,12 @@ def PhaseOptimize(fun: ir.Fun, unit: ir.Unit, opt_stats: Dict[str, int]):
+     optimize.FunOptBasic(fun, opt_stats, allow_conv_conversion=True)
+ 
+ 
+-def PhaseLegalization(fun: ir.Fun, unit: ir.Unit, _opt_stats: Dict[str, int]):
+-    """
+-    Does a lot of the heavily lifting so that the instruction selector can remain
+-    simple and table driven.
+-    * lift almost all regs to 32bit width
+-    * rewrite Ins that cannot be expanded
+-    * rewrite immediates that cannot be expanded (stack offsets which are not known yet
+-      are ignored and we rely on being able to select all (reasonable) stack offsets)
++def PhaseLegalizationStep1(fun: ir.Fun, unit: ir.Unit, _opt_stats: Dict[str, int]):
++    """this needs to happen for all funs BEFORE push arg conversions
+ 
+-    TODO: missing is a function to change calling signature so that
++    Note that funs are not necessarily procesed in call graph
++    topological order. If we do not do this ahead of time a call
++    might processed seeing the wrong parameter types for the callee.
+     """
+     # shifts on A32 are saturating but Cwerg requires (mod <bitwidth>)
+     lowering.FunLimitShiftAmounts(fun, 32)
+@@ -256,6 +252,15 @@ def PhaseLegalization(fun: ir.Fun, unit: ir.Unit, _opt_stats: Dict[str, int]):
+     lowering.FunRegWidthWidening(fun, o.DK.S16, o.DK.S32)
+     lowering.FunRegWidthWidening(fun, o.DK.U16, o.DK.U32)
+ 
++
++def PhaseLegalizationStep2(fun: ir.Fun, unit: ir.Unit, _opt_stats: Dict[str, int]):
++    """
++    Does a lot of the heavily lifting so that the instruction selector can remain
++    simple and table driven.
++    * rewrite Ins that cannot be expanded
++    * rewrite immediates that cannot be expanded (stack offsets which are not known yet
++      are ignored and we rely on being able to select all (reasonable) stack offsets)
++    """
+     fun.cpu_live_in = regs.PushPopInterface.GetCpuRegsForInSignature(
+         fun.input_types)
+     fun.cpu_live_out = regs.PushPopInterface.GetCpuRegsForOutSignature(
+@@ -445,7 +450,10 @@ def LegalizeAll(unit: ir.Unit, opt_stats, verbose=False):
+             PhaseOptimize(fun, unit, opt_stats)
+ 
+     for fun in unit.funs:
+-        PhaseLegalization(fun, unit, opt_stats)
++        PhaseLegalizationStep1(fun, unit, opt_stats)
++
++    for fun in unit.funs:
++        PhaseLegalizationStep2(fun, unit, opt_stats)
+ 
+ 
+ def RegAllocGlobal(unit: ir.Unit, opt_stats, fout, verbose=False):
+diff --git a/BE/CodeGenA32/regs.cc b/BE/CodeGenA32/regs.cc
+index bc59dc24..af14b49e 100644
+--- a/BE/CodeGenA32/regs.cc
++++ b/BE/CodeGenA32/regs.cc
+@@ -307,9 +307,11 @@ ArmFltRegRange ArmGetFltRegRanges(uint32_t flt_mask) {
+   return {start, count};
+ }
+ 
+-void GetCpuRegsForSignature(unsigned count,
+-                            const DK* kinds,
+-                            std::vector<CpuReg>* out) {
++// out receives a null CpuReg for each parameter which does not fit
++unsigned GetCpuRegsForSignature(unsigned count,
++                                const DK* kinds,
++                                unsigned num_gpr,
++                                std::vector<CpuReg>* out) {
+   out->clear();
+   unsigned next_gpr = 0;
+   unsigned next_flt = 0;
+@@ -319,42 +321,65 @@ void GetCpuRegsForSignature(unsigned count,
+       case DK::C32:
+       case DK::S32:
+       case DK::U32:
+-        CHECK(next_gpr < GPR_PARAM_REGS.size(), "too many gpr regs "
+-                                                     << next_gpr << " vs "
+-                                                     << GPR_PARAM_REGS.size());
+-        out->push_back(GPR_PARAM_REGS[next_gpr]);
+-        ++next_gpr;
++        if (next_gpr < num_gpr) {
++          out->push_back(GPR_PARAM_REGS[next_gpr]);
++          ++next_gpr;
++        } else {
++          out->push_back(CpuReg());
++        }
+         break;
+       case DK::R32:
+-        CHECK(next_flt < FLT_PARAM_REGS.size(), "");
+-        out->push_back(FLT_PARAM_REGS[next_flt]);
+-        ++next_flt;
++        if (next_flt < FLT_PARAM_REGS.size()) {
++          out->push_back(FLT_PARAM_REGS[next_flt]);
++          ++next_flt;
++        } else {
++          out->push_back(CpuReg());
++        }
+         break;
+       case DK::R64:
+         if ((next_flt & 1U) == 1) ++next_flt;
+-        CHECK(next_flt / 2 < DBL_PARAM_REGS.size(), "");
+-        out->push_back(DBL_PARAM_REGS[next_flt / 2]);
+-        next_flt += 2;
++        if (next_flt / 2 < DBL_PARAM_REGS.size()) {
++          out->push_back(DBL_PARAM_REGS[next_flt / 2]);
++          next_flt += 2;
++        } else {
++          out->push_back(CpuReg());
++        }
+         break;
+       default:
++        CHECK(false, "unexpected reg type " << EnumToString(kinds[i]));
+         break;
+     }
+   }
++  return next_gpr;
+ }
+ 
+-struct PushPopInterfaceA64 : base::PushPopInterface {
+-  void GetCpuRegsForInSignature(unsigned count,
+-                                const base::DK* kinds,
+-                                std::vector<base::CpuReg>* out) const override {
+-    return GetCpuRegsForSignature(count, kinds, out);
++bool HasMemParam(const std::vector<CpuReg>& cpu_regs) {
++  for (CpuReg cpu_reg : cpu_regs) {
++    if (cpu_reg.isnull()) return true;
++  }
++  return false;
++}
++
++struct PushPopInterfaceA32 : base::PushPopInterface {
++  CpuReg SplitInSignature(unsigned count,
++                          const base::DK* kinds,
++                          std::vector<base::CpuReg>* out) const override {
++    GetCpuRegsForSignature(count, kinds, GPR_PARAM_REGS.size(), out);
++    if (!HasMemParam(*out)) return CpuReg();
++    const unsigned next_gpr =
++        GetCpuRegsForSignature(count, kinds, GPR_PARAM_REGS.size() - 1, out);
++    return GPR_PARAM_REGS[next_gpr];
+   }
+ 
+   void GetCpuRegsForOutSignature(
+       unsigned count,
+       const base::DK* kinds,
+       std::vector<base::CpuReg>* out) const override {
+-    return GetCpuRegsForSignature(count, kinds, out);
++    GetCpuRegsForSignature(count, kinds, GPR_PARAM_REGS.size(), out);
++    CHECK(!HasMemParam(*out), "too many results");
+   }
++
++  DK AddrKind() const override { return DK::A32; }
+ } PushPopInterfaceA32Impl;
+ 
+ }  // namespace
+diff --git a/BE/CodeGenA32/regs.py b/BE/CodeGenA32/regs.py
+index ad3e6365..1ab3c4de 100644
+--- a/BE/CodeGenA32/regs.py
++++ b/BE/CodeGenA32/regs.py
+@@ -101,29 +101,32 @@ def ArmGetFltRegRanges(x: int) -> Tuple[ir.CpuReg, int]:
+     return FLT_REGS[start], count
+ 
+ 
+-def _GetCpuRegsForSignature(kinds: List[o.DK]) -> List[ir.CpuReg]:
++def _GetCpuRegsForSignature(kinds: List[o.DK], num_gpr: int) -> Tuple[
++        List[Optional[ir.CpuReg]], int]:
++    """Returns None for the parameters which do not fit into registers"""
+     gpr = 0
+     flt = 0
+     out = []
+     for k in kinds:
++        cpu_reg = None
+         if k == o.DK.R32:
+-            assert flt < len(FLT_PARAMETER_REGS)
+-            cpu_reg = FLT_PARAMETER_REGS[flt]
+-            flt += 1
++            if flt < len(FLT_PARAMETER_REGS):
++                cpu_reg = FLT_PARAMETER_REGS[flt]
++                flt += 1
+         elif k == o.DK.R64:
+             # we are wasting a reg here. Can be avoided by moving f64 before all f32 params
+             if flt & 1 == 1:
+                 flt += 1
+-            assert flt // 2 < len(DBL_PARAMETER_REGS)
+-            cpu_reg = DBL_PARAMETER_REGS[flt // 2]
+-            flt += 2
++            if flt // 2 < len(DBL_PARAMETER_REGS):
++                cpu_reg = DBL_PARAMETER_REGS[flt // 2]
++                flt += 2
+         else:
+             assert k in {o.DK.C32, o.DK.S32, o.DK.A32, o.DK.U32}, f"unexpected reg type: {k}"
+-            assert gpr <= len(GPR_PARAMETER_REGS)
+-            cpu_reg = GPR_PARAMETER_REGS[gpr]
+-            gpr += 1
++            if gpr < num_gpr:
++                cpu_reg = GPR_PARAMETER_REGS[gpr]
++                gpr += 1
+         out.append(cpu_reg)
+-    return out
++    return out, gpr
+ 
+ 
+ class PushPopInterface(lowering.PushPopInterface):
+@@ -131,14 +134,22 @@ class PushPopInterface(lowering.PushPopInterface):
+ 
+     Has all the calling-convention logic
+     """
++    ADDR_KIND = o.DK.A32
+ 
+     @classmethod
+-    def GetCpuRegsForInSignature(cls, kinds: List[o.DK]) -> List[ir.CpuReg]:
+-        return _GetCpuRegsForSignature(kinds)
++    def SplitInSignature(cls, kinds: List[o.DK]) -> Tuple[
++            List[Optional[ir.CpuReg]], Optional[ir.CpuReg]]:
++        out, _ = _GetCpuRegsForSignature(kinds, len(GPR_PARAMETER_REGS))
++        if None not in out:
++            return out, None
++        out, gpr = _GetCpuRegsForSignature(kinds, len(GPR_PARAMETER_REGS) - 1)
++        return out, GPR_PARAMETER_REGS[gpr]
+ 
+     @classmethod
+     def GetCpuRegsForOutSignature(cls, kinds: List[o.DK]) -> List[ir.CpuReg]:
+-        return _GetCpuRegsForSignature(kinds)
++        out, _ = _GetCpuRegsForSignature(kinds, len(GPR_PARAMETER_REGS))
++        assert None not in out, "too many results"
++        return out
+ 
+ 
+ class CpuRegPool(reg_alloc.RegPool):
+diff --git a/BE/CodeGenA64/README.md b/BE/CodeGenA64/README.md
+index 8605db5f..b5c6b70f 100644
+--- a/BE/CodeGenA64/README.md
++++ b/BE/CodeGenA64/README.md
+@@ -41,8 +41,9 @@ instruction selector. It encompasses the following steps:
+   received the immediate via a `mov` (see `InsArm32RewriteOutOfBoundsImmediates`)
+   This is done by using the instruction selector to find the best expansion match and
+   then check if the integers immediates satisfies the constraints of the expansion.
+-* TODO: move parameters that cannot be handled by calling convention
+-  onto stk 
++* parameters that do not fit into the argument registers of the calling convention
++  are passed in memory: the caller stores them into a stack region and passes its
++  address in the next free parameter GPR, the callee loads them from there
+ 
+ ### Global Register Allocation
+ 
+diff --git a/BE/CodeGenA64/legalize.cc b/BE/CodeGenA64/legalize.cc
+index a1e8fa25..b048017c 100644
+--- a/BE/CodeGenA64/legalize.cc
++++ b/BE/CodeGenA64/legalize.cc
+@@ -376,6 +376,8 @@ void LegalizeAll(Unit unit, bool verbose, std::ostream* fout) {
+ 
+   for (Fun fun : UnitFunIter(unit)) {
+     PhaseLegalizationStep1(fun, unit, fout);
++  }
++  for (Fun fun : UnitFunIter(unit)) {
+     PhaseLegalizationStep2(fun, unit, fout);
+   }
+ }
+diff --git a/BE/CodeGenA64/regs.cc b/BE/CodeGenA64/regs.cc
+index 90ed250f..0a3d2fc1 100644
+--- a/BE/CodeGenA64/regs.cc
++++ b/BE/CodeGenA64/regs.cc
+@@ -300,9 +300,11 @@ CpuRegMasks FunCpuRegStats(Fun fun) {
+   return {gpr_mask, flt_mask};
+ }
+ 
+-void GetCpuRegsForSignature(unsigned count,
+-                            const DK* kinds,
+-                            std::vector<CpuReg>* out) {
++// out receives a null CpuReg for each parameter which does not fit
++unsigned GetCpuRegsForSignature(unsigned count,
++                                const DK* kinds,
++                                unsigned num_gpr,
++                                std::vector<CpuReg>* out) {
+   out->clear();
+   unsigned next_gpr = 0;
+   unsigned next_flt = 0;
+@@ -312,49 +314,59 @@ void GetCpuRegsForSignature(unsigned count,
+       case DK::U64:
+       case DK::A64:
+       case DK::C64:
+-        ASSERT(next_gpr < GPR_PARAM_REGS.size(), "too many gpr32 regs "
+-                                                     << next_gpr << " vs "
+-                                                     << GPR_PARAM_REGS.size());
+-        out->push_back(GPR_PARAM_REGS[next_gpr]);
+-        ++next_gpr;
+-        break;
+       case DK::S32:
+       case DK::U32:
+-        ASSERT(next_gpr < GPR_PARAM_REGS.size(), "too many gpr64 regs "
+-                                                     << next_gpr << " vs "
+-                                                     << GPR_PARAM_REGS.size());
+-        out->push_back(GPR_PARAM_REGS[next_gpr]);
+-        ++next_gpr;
++        if (next_gpr < num_gpr) {
++          out->push_back(GPR_PARAM_REGS[next_gpr]);
++          ++next_gpr;
++        } else {
++          out->push_back(CpuReg());
++        }
+         break;
+       case DK::R32:
+-        ASSERT(next_flt < FLT_PARAM_REGS.size(), "");
+-        out->push_back(FLT_PARAM_REGS[next_flt]);
+-        ++next_flt;
+-        break;
+       case DK::R64:
+-        ASSERT(next_flt < FLT_PARAM_REGS.size(), "");
+-        out->push_back(FLT_PARAM_REGS[next_flt]);
+-        ++next_flt;
++        if (next_flt < FLT_PARAM_REGS.size()) {
++          out->push_back(FLT_PARAM_REGS[next_flt]);
++          ++next_flt;
++        } else {
++          out->push_back(CpuReg());
++        }
+         break;
+       default:
++        ASSERT(false, "unexpected reg type " << EnumToString(kinds[i]));
+         break;
+     }
+   }
++  return next_gpr;
++}
++
++bool HasMemParam(const std::vector<CpuReg>& cpu_regs) {
++  for (CpuReg cpu_reg : cpu_regs) {
++    if (cpu_reg.isnull()) return true;
++  }
++  return false;
+ }
+ 
+ struct PushPopInterfaceA64 : base::PushPopInterface {
+-  void GetCpuRegsForInSignature(unsigned count,
+-                                const base::DK* kinds,
+-                                std::vector<base::CpuReg>* out) const override {
+-    return GetCpuRegsForSignature(count, kinds, out);
++  CpuReg SplitInSignature(unsigned count,
++                          const base::DK* kinds,
++                          std::vector<base::CpuReg>* out) const override {
++    GetCpuRegsForSignature(count, kinds, GPR_PARAM_REGS.size(), out);
++    if (!HasMemParam(*out)) return CpuReg();
++    const unsigned next_gpr =
++        GetCpuRegsForSignature(count, kinds, GPR_PARAM_REGS.size() - 1, out);
++    return GPR_PARAM_REGS[next_gpr];
+   }
+ 
+   void GetCpuRegsForOutSignature(
+       unsigned count,
+       const base::DK* kinds,
+       std::vector<base::CpuReg>* out) const override {
+-    return GetCpuRegsForSignature(count, kinds, out);
++    GetCpuRegsForSignature(count, kinds, GPR_PARAM_REGS.size(), out);
++    ASSERT(!HasMemParam(*out), "too many results");
+   }
++
++  DK AddrKind() const override { return DK::A64; }
+ } PushPopInterfaceA64Impl;
+ 
+ }  // namespace
+diff --git a/BE/CodeGenA64/regs.py b/BE/CodeGenA64/regs.py
+index a3df1bdc..9a8d5f7c 100644
+--- a/BE/CodeGenA64/regs.py
++++ b/BE/CodeGenA64/regs.py
+@@ -2,6 +2,7 @@ from BE.Base import cfg
+ from BE.Base import ir
+ from BE.Base import liveness
+ from IR import opcode_tab as o
++from BE.Base import lowering
+ from BE.Base import reg_alloc
+ from BE.Base import serialize
+ 
+@@ -100,40 +101,48 @@ _KIND_TO_CPU_REG_LIST = {
+ 
+ 
+ # Same for input and output refs
+-def _GetCpuRegsForSignature(kinds: List[o.DK]) -> List[ir.CpuReg]:
++def _GetCpuRegsForSignature(kinds: List[o.DK], num_gpr: int) -> Tuple[
++        List[Optional[ir.CpuReg]], int]:
++    """Returns None for the parameters which do not fit into registers"""
+     next_gpr = 0
+     next_flt = 0
+     out = []
+     for k in kinds:
++        cpu_reg = None
+         if k in {o.DK.R32, o.DK.R64}:
+-            assert next_flt < len(
+-                _FLT_PARAMETER_REGS), "too many flt arguments"
+-            cpu_reg = _FLT_PARAMETER_REGS[next_flt]
+-            next_flt += 1
++            if next_flt < len(_FLT_PARAMETER_REGS):
++                cpu_reg = _FLT_PARAMETER_REGS[next_flt]
++                next_flt += 1
+         else:
+             assert k in {o.DK.S32, o.DK.U32, o.DK.C64,
+                          o.DK.S64, o.DK.A64, o.DK.U64}, f"unexpected reg type {k}"
+-            assert next_gpr <= len(
+-                _GPR_PARAMETER_REGS), "too many gpr arguments"
+-            cpu_reg = _GPR_PARAMETER_REGS[next_gpr]
+-            next_gpr += 1
++            if next_gpr < num_gpr:
++                cpu_reg = _GPR_PARAMETER_REGS[next_gpr]
++                next_gpr += 1
+         out.append(cpu_reg)
+-    return out
++    return out, next_gpr
+ 
+ 
+-class PushPopInterface:
++class PushPopInterface(lowering.PushPopInterface):
+     """Used with FunPopargConversion and FunPushargConversion
+ 
+     Has all the calling-convention logic
+     """
+ 
+     @classmethod
+-    def GetCpuRegsForInSignature(cls, kinds: List[o.DK]) -> List[ir.CpuReg]:
+-        return _GetCpuRegsForSignature(kinds)
++    def SplitInSignature(cls, kinds: List[o.DK]) -> Tuple[
++            List[Optional[ir.CpuReg]], Optional[ir.CpuReg]]:
++        out, _ = _GetCpuRegsForSignature(kinds, len(_GPR_PARAMETER_REGS))
++        if None not in out:
++            return out, None
++        out, next_gpr = _GetCpuRegsForSignature(kinds, len(_GPR_PARAMETER_REGS) - 1)
++        return out, _GPR_PARAMETER_REGS[next_gpr]
+ 
+     @classmethod
+     def GetCpuRegsForOutSignature(cls, kinds: List[o.DK]) -> List[ir.CpuReg]:
+-        return _GetCpuRegsForSignature(kinds)
++        out, _ = _GetCpuRegsForSignature(kinds, len(_GPR_PARAMETER_REGS))
++        assert None not in out, "too many results"
++        return out
+ 
+ 
+ class CpuRegPool(reg_alloc.RegPool):
+diff --git a/BE/CodeGenX64/README.md b/BE/CodeGenX64/README.md
+index 8e60cb63..a5122d82 100644
+--- a/BE/CodeGenX64/README.md
++++ b/BE/CodeGenX64/README.md
+@@ -47,8 +47,9 @@ Legalization encompasses the following steps:
+   of CPU regs `rcx` and `rdx`.
+ * deal with out of range immediates
+ * 3-address code to 2-address code conversion
+-* TODO: move parameters that cannot be handled by calling convention
+-  onto stk 
++* parameters that do not fit into the argument registers of the calling convention
++  are passed in memory: the caller stores them into a stack region and passes its
++  address in the next free parameter GPR, the callee loads them from there
+ 
+ #### 3-Address Code to 2-Address Code Conversion
+ 
+diff --git a/BE/CodeGenX64/regs.cc b/BE/CodeGenX64/regs.cc
+index 8b74bb2b..1b78a742 100644
+--- a/BE/CodeGenX64/regs.cc
++++ b/BE/CodeGenX64/regs.cc
+@@ -18,7 +18,7 @@ std::array<CpuReg, 16> GPR_REGS;
+ std::array<CpuReg, 16> FLT_REGS;
+ std::array<CpuReg, 9> GPR_IN_REGS;
+ std::array<CpuReg, 9> GPR_OUT_REGS;
+-std::array<CpuReg, 8> FLT_IN_OUT_REGS;
++std::array<CpuReg, 7> FLT_IN_OUT_REGS;
+ 
+ base::DK_MAP DK_TO_CPU_REG_KIND_MAP;
+ 
+@@ -68,11 +68,13 @@ CpuRegMasks FunCpuRegStats(Fun fun) {
+   return {gpr_mask, flt_mask};
+ }
+ 
+-void GetCpuRegsForSignature(unsigned count,
+-                            const DK* kinds,
+-                            const std::array<CpuReg, 9>& gpr_regs,
+-                            const std::array<CpuReg, 8>& flt_regs,
+-                            std::vector<CpuReg>* out) {
++// out receives a null CpuReg for each parameter which does not fit
++unsigned GetCpuRegsForSignature(unsigned count,
++                                const DK* kinds,
++                                const CpuReg* gpr_regs,
++                                unsigned num_gpr,
++                                const std::array<CpuReg, 7>& flt_regs,
++                                std::vector<CpuReg>* out) {
+   out->clear();
+   unsigned next_gpr = 0;
+   unsigned next_flt = 0;
+@@ -88,39 +90,60 @@ void GetCpuRegsForSignature(unsigned count,
+       case DK::U16:
+       case DK::S8:
+       case DK::U8:
+-        ASSERT(next_gpr < gpr_regs.size(),
+-               "too many gpr64 regs " << next_gpr << " vs " << gpr_regs.size());
+-        out->push_back(gpr_regs[next_gpr]);
+-        ++next_gpr;
++        if (next_gpr < num_gpr) {
++          out->push_back(gpr_regs[next_gpr]);
++          ++next_gpr;
++        } else {
++          out->push_back(CpuReg());
++        }
+         break;
+       case DK::R32:
+       case DK::R64:
+-        ASSERT(next_flt < flt_regs.size(), "");
+-        out->push_back(flt_regs[next_flt]);
+-        ++next_flt;
++        if (next_flt < flt_regs.size()) {
++          out->push_back(flt_regs[next_flt]);
++          ++next_flt;
++        } else {
++          out->push_back(CpuReg());
++        }
+         break;
+       default:
+         ASSERT(false, "invalid DK " << EnumToString(kinds[i]));
+         break;
+     }
+   }
++  return next_gpr;
++}
++
++bool HasMemParam(const std::vector<CpuReg>& cpu_regs) {
++  for (CpuReg cpu_reg : cpu_regs) {
++    if (cpu_reg.isnull()) return true;
++  }
++  return false;
+ }
+ 
+ struct PushPopInterfaceX64 : base::PushPopInterface {
+-  void GetCpuRegsForInSignature(unsigned count,
+-                                const base::DK* kinds,
+-                                std::vector<base::CpuReg>* out) const override {
+-    return GetCpuRegsForSignature(count, kinds, GPR_IN_REGS, FLT_IN_OUT_REGS,
+-                                  out);
++  CpuReg SplitInSignature(unsigned count,
++                          const base::DK* kinds,
++                          std::vector<base::CpuReg>* out) const override {
++    GetCpuRegsForSignature(count, kinds, GPR_IN_REGS.data(), GPR_IN_REGS.size(),
++                           FLT_IN_OUT_REGS, out);
++    if (!HasMemParam(*out)) return CpuReg();
++    const unsigned next_gpr =
++        GetCpuRegsForSignature(count, kinds, GPR_IN_REGS.data(),
++                               GPR_IN_REGS.size() - 1, FLT_IN_OUT_REGS, out);
++    return GPR_IN_REGS[next_gpr];
+   }
+ 
+   void GetCpuRegsForOutSignature(
+       unsigned count,
+       const base::DK* kinds,
+       std::vector<base::CpuReg>* out) const override {
+-    return GetCpuRegsForSignature(count, kinds, GPR_OUT_REGS, FLT_IN_OUT_REGS,
+-                                  out);
++    GetCpuRegsForSignature(count, kinds, GPR_OUT_REGS.data(),
++                           GPR_OUT_REGS.size(), FLT_IN_OUT_REGS, out);
++    ASSERT(!HasMemParam(*out), "too many results");
+   }
++
++  DK AddrKind() const override { return DK::A64; }
+ } PushPopInterfaceX64Impl;
+ 
+ }  // namespace
+@@ -456,7 +479,6 @@ void InitCodeGenX64() {
+   FLT_IN_OUT_REGS[4] = FLT_REGS[5];
+   FLT_IN_OUT_REGS[5] = FLT_REGS[6];
+   FLT_IN_OUT_REGS[6] = FLT_REGS[7];
+-  FLT_IN_OUT_REGS[7] = FLT_REGS[8];
+ 
+   // ==================================================
+   for (unsigned i = 0; i < DK_TO_CPU_REG_KIND_MAP.size(); ++i) {
+diff --git a/BE/CodeGenX64/regs.py b/BE/CodeGenX64/regs.py
+index 60d12b1d..f0f3c547 100644
+--- a/BE/CodeGenX64/regs.py
++++ b/BE/CodeGenX64/regs.py
+@@ -1,6 +1,6 @@
+ import dataclasses
+ import enum
+-from typing import List, Tuple
++from typing import List, Optional, Tuple
+ 
+ from BE.Base import ir
+ from BE.Base import liveness
+@@ -121,33 +121,43 @@ def MaskToFltRegs(mask: int) -> List[ir.CpuReg]:
+ 
+ 
+ def _GetCpuRegsForSignature(kinds: List[o.DK], gpr_regs: List[ir.CpuReg],
+-                            flt_regs: List[ir.CpuReg]) -> List[ir.CpuReg]:
++                            flt_regs: List[ir.CpuReg]) -> Tuple[
++        List[Optional[ir.CpuReg]], int]:
++    """Returns None for the parameters which do not fit into registers"""
+     out = []
+     next_gpr = 0
+     next_flt = 0
+     for k in kinds:
++        cpu_reg = None
+         if k in {o.DK.R32, o.DK.R64}:
+-            assert next_flt < len(flt_regs), f"too many float args: {next_flt}"
+-            cpu_reg = flt_regs[next_flt]
+-            next_flt += 1
++            if next_flt < len(flt_regs):
++                cpu_reg = flt_regs[next_flt]
++                next_flt += 1
+         else:
+-            assert next_gpr < len(gpr_regs), f"too many gpr args: {next_gpr}"
+-            cpu_reg = gpr_regs[next_gpr]
+-            next_gpr += 1
++            if next_gpr < len(gpr_regs):
++                cpu_reg = gpr_regs[next_gpr]
++                next_gpr += 1
+         out.append(cpu_reg)
+-    return out
++    return out, next_gpr
+ 
+ 
+ class PushPopInterface(lowering.PushPopInterface):
+     """Used with FunPopargConversion and FunPushargConversion"""
+ 
+     @classmethod
+-    def GetCpuRegsForInSignature(cls, kinds: List[o.DK]) -> List[ir.CpuReg]:
+-        return _GetCpuRegsForSignature(kinds, _GPR_IN_REGS, _FLT_IN_OUT_REGS)
++    def SplitInSignature(cls, kinds: List[o.DK]) -> Tuple[
++            List[Optional[ir.CpuReg]], Optional[ir.CpuReg]]:
++        out, _ = _GetCpuRegsForSignature(kinds, _GPR_IN_REGS, _FLT_IN_OUT_REGS)
++        if None not in out:
++            return out, None
++        out, next_gpr = _GetCpuRegsForSignature(kinds, _GPR_IN_REGS[:-1], _FLT_IN_OUT_REGS)
++        return out, _GPR_IN_REGS[next_gpr]
+ 
+     @classmethod
+     def GetCpuRegsForOutSignature(cls, kinds: List[o.DK]) -> List[ir.CpuReg]:
+-        return _GetCpuRegsForSignature(kinds, _GPR_OUT_REGS, _FLT_IN_OUT_REGS)
++        out, _ = _GetCpuRegsForSignature(kinds, _GPR_OUT_REGS, _FLT_IN_OUT_REGS)
++        assert None not in out, "too many results"
++        return out
+ 
+ 
+ class CpuRegPool(reg_alloc.RegPool):

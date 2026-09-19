@@ -2927,3 +2927,279 @@ Four runs failed ONLY the F-24 pair, at 85/87.
 - One test was dropped for fairness rather than for the band: asserting `id()` on a name that has
   not been registered yet demands behaviour base does not have (base throws) and meta.md never
   states. It killed 3 agents and was still the wrong test.
+
+
+## ray-optics-formula-conditionals (APPROVED Olympus 2026-09-14)
+
+**Outcome.** Accepted at 1/10 (batch 3, Vega). Batch 1 0/11, batch 2 1/10 with the pass FP-flagged.
+
+**Shape + stats.** O-Pipeline-hard, JavaScript, ricktu288/ray-optics formula engine. A new node family
+(comparisons, `if`, `and`, `or`, `not`) through the parser and statement splitter, closure evaluator,
+JS generator, WGSL generator (raw vs wrapped lowering), symbolic derivative (switching sets) and
+interval range estimator (truth sets, branch pruning, parameter narrowing). 7 files, 329 effective
+LOC, 96 jest tests, meta.md 499 words.
+
+**Decisive difficulty drivers (measured, batch 3).** Only 10 of 96 tests killed anything:
+
+| Kills | Test | Source |
+|---|---|---|
+| 7 | `self_comparison_branch_is_unselectable` | Solution Quality finding vs the reference, round 4 (F-26) |
+| 7 | `an_invalid_parameter_does_not_revive_an_impossible_branch` | Solution Quality finding, round 5 (F-26, same seven runs) |
+| 6 | `disjunction_does_not_narrow_the_true_branch` | designed before batch 1 (F-27) |
+| 6 | `wgsl_raw_lowering_reads_wrapped_operands_as_values` | designed before batch 1 (F-10) |
+| 5 | `wgsl_types_agree_across_the_new_lowerings` | from the round-2 rewrite of ten unfair WGSL tests (F-10) |
+| 3 | `far_apart_operands_are_not_a_switching_point` | Solution Quality finding, round 10 (F-23 family) |
+| 2 | `comparison_inside_a_function_argument` | designed, parser positions (F-10 grammar cell) |
+| 2 | `disjunction_narrowing_composes_through_a_dependent_comparison` | Test Quality coverage advisory (F-27) |
+| 1 | `disjunction_narrows_the_false_branch` | designed (F-27) |
+| 1 | `random_conditional_ranges_are_sound` | designed, seeded soundness oracle |
+
+Near-miss: Nova #9 at 94/96, failing only the two F-10 WGSL tests.
+
+**Iteration lessons.**
+- Local re-grade harness: a fresh clone at base, each agent's `solution-patch.patch` applied to `src`
+  only, `jest --json`. Every V0 count reproduced the platform exactly, which made the route-B
+  prediction and the batch-2 probe battery trustworthy.
+- The host has 7.6 GB. Parallel jest and Docker builds were OOM-killed; the clean-room script pins
+  `--cpuset-cpus=0-1`, waits for 3 GB available, and checks the image exists before every run.
+- The jest JUnit reporter puts the file path in `classname`; parse test identity from `name`.
+- The WGSL was checked by translating it to JavaScript (name-agnostic, inputs through `Math.fround`)
+  and running it, plus an in-process syntax check. The earlier `naga-wasi-cli` test failed Verify
+  Solution on the platform twice (L56).
+- The description walls in batch 1 were found by reading the failing ASSERTION LINES, not the test
+  names: all 10 unanimous failures were NaN assertions on a bare comparison at its switching point.
+
+## worldengine-orographic-precipitation (APPROVED Olympus 2026-09-16)
+
+**Outcome.** Accepted at 2/10 (batch 2, Nova #1 and #2). Batch 1 read 1/10 by the grader, but both
+65/65 runs carried the same `Step.plates` regression, so 0/10 clean. The batch-2 FP panel had one judge
+dissent (double-normalised `base_field`) that the adjudicator overruled.
+
+**Shape + stats.** O-Composite-add, Python, Mindwerks/worldengine at b2adbb67. Wind bands by row-centre
+latitude with mountain halving, cyclic row moisture transport solved in closed form, rainfall layer
+blended into precipitation, `winds` step, both serialisers, equality, wind and rainfall maps, CLI info,
+docs. 14 files, 251 human-effective LOC, 66 pytest tests, meta.md ~490 words.
+
+**Decisive difficulty drivers (measured, batch 2).** 14 of 66 tests killed anything:
+
+| Kills | Test | Source |
+|---|---|---|
+| 8 | `test_hdf5_round_trip_keeps_direction_and_strength` | designed serialiser trap; F-28 x6, F-16 x2 |
+| 8 | `test_protobuf_round_trip_keeps_direction_and_strength` | same |
+| 7 | `test_generated_world_round_trips_with_wind_in_both_formats` | designed; F-28 x7 |
+| 4 | `test_a_supplied_wind_is_kept_by_execute` | round-1 reference bug (L50); F-29 x2, F-16 x2 |
+| 2 each | nine pipeline, equality and CLI tests | F-16 accessor runs only (incl. the reviewer-driven plates and supplied-wind-through-steps tests) |
+| 1 | `test_precipitation_keeps_the_rain_field_as_the_rainfall_layer` | missing `rainfall_at` (one run) |
+
+Near-misses: four runs at 63/66, failing only the three round-trip tests.
+
+**Iteration lessons.**
+- The first platform build failed rebuild-safety (fixture clone on a moving branch). Pin by SHA from the start.
+- `World_pb2.py` was regenerated with the official protoc 33.1 binary to match base's gencode 6.33.1; no grpcio-tools release bundles 33.1 (1.81.1 bundles 33.5).
+- Agent patches replayed through a bind-mounted clean image (Pattern 88) showed the new plates test killed all ten batch-1 runs, and that the float fix flipped none.
+- Parallel tool calls sharing one shell can misfire `cd`; use absolute paths and `git -C`.
+
+## cwerg-bcopy-bzero-lowering (APPROVED Olympus 2026-09-16)
+
+**Outcome.** Accepted at 3/10 (batch 6: Nova #3, Nova #5, Vega). All three FP panels had one judge
+dissent, all overruled: signed-DIV folding parity (pre-existing, not reached by the fixtures), a C
+backend local-name collision with a hand-built register name (same class as the base `{fun}_result`),
+and narrow signed DIV before `bzero` (pre-existing). Auto Review approved: Description 3/3, Tests 2/3
+(no direct constant-zero `bcopy`), Solution 3/3.
+
+**Shape + stats.** O-Pipeline-hard, C++ + Python, robertmuth/Cwerg at 3bc94f7c. Shared byte-loop
+lowering in `lowering.py`/`lowering.cc`, wired into six legalizers; C backend loops; opcode table,
+generated C++ and C bindings, docs; fixed-width folding in both evaluators and wrap-safe C emission;
+DIV/REM/CNTPOP narrowing in width widening. 19 files, 690 human-effective LOC, 23 golden cases over
+three programs (`bulkmem .32`, `.64`, `bulkwrap .64n`), 122 base cases, meta.md 293 words.
+
+**Decisive difficulty drivers (measured, batch 6).** 18 of 23 cases killed something, 32 events:
+
+| Kills | Case | Source |
+|---|---|---|
+| 3 each | `.64n` parity a64, parity x64, cc x64 | F-31 x2 (Nova #2, #7), F-32 x1 on parity (Nova #1); cc x64 incl. Nova #4 |
+| 3 each | `.64` C opt, optcc | F-30 (Nova #6, #9), plus Nova #4 |
+| 2 each | `.64` parity a64, x64 | F-32 (Nova #1, #8) |
+| 2 each | `.64n` optcc, optimizer parity | F-31 (Nova #2, #7) |
+| 1 each | 9 native py/cc cases | Nova #4, source cursor never advanced |
+| 0 | `.64` / `.64n` plain C, `.64n` opt, `.64` optimizer parity, `.32` parity | — |
+
+Near-misses: Nova #6, #8, #9 at 21/23.
+
+**Iteration lessons.**
+- 30 rounds, 5 solved batches. Two walls were description defects found by batch 1 (multiplicity sentence trimmed, narrow wrap unstated); one was a parity-only program reaching a pre-existing bug (11/11).
+- Reviewer demands and solvability conflicted at batch 5 (0/9). Docker replay of the nine saved solutions over two candidate suites chose the accepted one.
+- The Dockerfile passed every local check and failed Verify Solution on the 600 s environment start.
+
+## tippecanoe-tile-join-size-recourses (APPROVED Olympus 2026-09-16)
+
+**Outcome.** Accepted at 1/10 (Nova rd79de2m), first batch. Final Auto Review: Description 3/3,
+Tests 2/3 (the `-e` directory output was never exercised), Solution 3/3.
+
+**Shape + stats.** O-Composite-add, C++, felt/tippecanoe `tile-join`. Size-limit options, cross-layer
+feature shedding by extent with merge-order ties, attribute-pool compaction, output-only
+tilestats/zoom/bounds booking, `strategies` accounting with inherited values. 5 files, 294 effective
+LOC, 49 tests driven from Python over the CLI plus 36 repo checks (16 make targets, 19 Catch2 units, one
+golden-file check).
+
+**Decisive difficulty drivers (evaluator attributions; the JUnit files are void, see below).**
+
+| Runs | Cause | Origin |
+|---|---|---|
+| 4 (+1 mirror) | strategies written for a tile that shed nothing (F-15) | Auto Review round 8 test gap + S1 finding against the reference |
+| 3 | inherited `tile_size_desired` summed, not maximized (F-33) | Solution Quality round 3 finding against the reference |
+| 1 | segfaults in ordinary joins | — |
+| 1 | per-feature full re-encode, timeout | — |
+
+**Iteration lessons.**
+- 7 of 10 runs were graded against a stale `tile-join` because agents restored tracked build outputs
+  (L63). Two were flagged ENV-blocked; both contests quoted the restore call and were upheld.
+- The clean-room script lives at `worktrees/_tj_tools/cleanroom.sh` after the scratchpad was wiped. It
+  asserts the clone root, checks patch markers, and reverts in both orders.
+- Every Docker image on the host vanished between sessions; the base image was re-pulled at the same
+  digest and nothing was pruned from this session.
+- tile-join orders same-tile inputs by raw tile bytes (`tileset_reader::operator<`), not argv.
+- `allow-existing-test` needs `TIPPECANOE_MAX_THREADS=8`; above 8 threads its golden `cmp` fails.
+- Mutation scripts (`mutants.sh`, `mutants7.sh`, `mutants8.sh`) backed up the source, planted each
+  reviewer-described wrong implementation, and verified a byte-exact restore.
+
+## sfepy-adaptive-stepping-accounting (APPROVED Olympus 2026-09-16)
+
+**Outcome.** Accepted at 2/15 (Orion 1/1, Vega 1/3, Nova 0/11). Auto Review: Description 3/3, Tests
+2/3 (T4 medium, empty `StepLog` queries), Solution 3/3. Both FP adjudicators upheld both passes over
+one dissenting judge each.
+
+**Shape + stats.** O-Composite-extend over a solver family (`ts.simple`, `ts.adaptive`, five
+elastodynamics solvers, five step controllers). 4 files, 290 human-effective LOC; the passers added
+460 and 673 lines. 117 tests. meta.md 444 words.
+
+**Decisive difficulty drivers.** F-34 (8/13, sole failure of both 116/117 near-misses), the F-10
+hostile-hook cell (7/13, sole failure of a 116/117 Vega), F-35 (2/13, sole failure of a 114/117 Vega),
+and F-12 on a repo example (the only Nova run to clear the new suite).
+
+**Iteration lessons.** Review rounds R9 to R62 and eleven batches. Two lanes were cut after repeated
+zeros: the elastodynamics cache trap (R35) and restart save/load (R60). Both top killers were first
+found as defects in the reference (R21, R27, R36). The last zero (batch 10, 0/12) was fair by probe,
+and appending four stronger-agent runs produced the passes.
+
+## mwparserfromhell-site-aware-parsing (APPROVED Olympus 2026-09-18)
+
+**Outcome.** Accepted at 2/19 (Nova 2/13, Orion 0/1, Vega 0/5) on a re-eval of batch 1, which read 0/20.
+Auto Review 3/3 on Description, Tests and Solution. Both FP adjudicators upheld both passes; one judge's
+dissent (`<Σ>a</ς>` pairing) was ruled pre-existing and outside the stated scope.
+
+**Shape + stats.** O-Composite-extend across twin tokenizers (Python and C extension): a `SiteInfo`
+profile for linktrails, namespaces and recognised tags. 14 files, 405 human-effective LOC; the two
+passers added 311 and 293 lines (221 human-effective for the leaner). 98 test functions / 190 cases,
+most parametrized over both tokenizers. meta.md 292 words.
+
+**Decisive difficulty drivers.** F-36 (11/19; the seeded parity corpus was the sole failure of four
+189/190 runs), F-37 (7/19, C arm only), the F-10 colon-on-reassignment cell (5/19, sole failure of two
+Vega runs), F-7 tag contexts (2/19). All three leading killers came from reviewer rounds or were bugs in
+my own reference first.
+
+**Iteration lessons.** R1-R8 were precheck and Auto Review rounds: private-internals assertions, a
+leaked token class in the repo's parametrized token test, the C NUL sentinel, the uid-1000 build, casefold
+recognition and pairing, recursive `parse` inputs, attribute-bearing tags. R9 dropped the pairing test
+after batch 1 read 0/20 (L66). Both passes delegate the C arm (L67).
+
+## kira-loop-crossfade (APPROVED Olympus 2026-09-18)
+
+**Outcome.** Accepted at 3/10 Nova (batch 1). A finalize replay with one test's fixed buffered prefix
+made queue-depth-independent passes six of the seven failures, so the fair measurement is 9/10.
+
+**Shape and stats.** Rust (tesselode/kira, 3d6421e3). O-Composite-add: `LoopCrossfade` public type with
+`NONE`/conversions; settings, handles and commands on static and streaming sounds; shortened wrap in the
+shared transport; static blend before the resampler; streaming head frames decoded after each wrap and
+kept for the pass with at most one extra startup seek; `bake_loop_crossfade`. Reference 11 files,
+237 human-effective LOC; agents 13-14 source files, 276-412. Tests 33 at first submit, 55 at acceptance.
+
+**Decisive difficulty drivers.** Genuine: one F-10 cell (live region change x shortened wrap), 1/10.
+Counterfeit: the streaming region-update test's 48-frame prefix behind a 60-call decoder gate, 6/10.
+
+**Iteration lessons.** Seven review rounds before the batch: meta API shapes (R2); per-test build-fail
+fallback and a startup double-seek reference bug (R3); rate, handle-type, decoder-trace and
+buffered-update coverage plus the event-driven harness (R4); streaming clamp, reverse seeks, stereo
+(R5); eased handle updates, live streaming seek, 4 Hz seconds, easing matrix, and two seek tests that
+passed with the seek ignored (R6); baked `EndOfAudio` representation (R7).
+
+## planetiler-custommap-schema-composition (APPROVED Olympus 2026-09-18)
+
+**Outcome.** Accepted at 3/10 Nova (batch 2). Batch 1 read 0/8 and measured nothing: every run failed
+to compile the test class on an unstated static `SchemaConfig.files(Path)`. The FP panel upheld all three
+passes, overruling two judge dissents on unstated edges (a directory named `power.yml`, an absolute
+`/samples/` examples path).
+
+**Shape and stats.** Java (onthegomap/planetiler, 546486f6, issue #1148). O-Composite-add plus a second
+entry point: `extends` with bundled-sample parents, static `SchemaConfig.load(List<Path>)` and
+`SchemaConfig.files(Path)`, per-field merge rules, layer `remove`, inline composed examples, comma-list
+`--schema` for generation and verification, validator watch set. Reference 7 files, 316 human-effective
+LOC; passers 454-499. Tests 60 at first draft, 83 at acceptance.
+
+**Decisive difficulty drivers.** F-38 same-file add-then-remove (7/10) and F-9 standalone bundled
+examples in the validator (3/10). Both began as Solution Quality findings against the reference.
+
+**Iteration lessons.** R1: four reference bugs, nine over-specified assertions dropped or pinned in
+meta, test class moved to reach the validator. R2: Windows separator in bundled lookup. R3: validator
+comma list and examples watch provenance. R4: standalone bundled examples, locale-free CLI presence
+check. R5: string-loaded parents immune to cwd files. R6: multi-root watch coverage, JUnit write
+checks, bundled alias dedup. After batch 1: call shapes named, missing listed file and absolute string
+paths stated, Maven self-repair in test.sh. Docker validated as root and uid 1000 from R1b on.
+
+## featurevisor-minimal-rebucketing (APPROVED Olympus 2026-09-19)
+
+**Outcome.** Accepted at 2/11 (Orion, Vega) on a re-eval of batch 1 after a tests-only Auto Review
+round. Both passes upheld by the FP panel with fuzzing against the reference.
+
+**Shape and stats.** TypeScript (featurevisor/featurevisor, b88f398, v3.11.0). O-Algorithm-correctness
+on the repo's own model: `getTraffic` reallocates with minimum disruption (region = first `percentage`
+of the ordered slot ranges; keep each variation's lowest in-region buckets up to target; refill
+lowest-first in declared order; sort and merge), plus `getAllocationChanges`, an optional `rebucketing`
+collector in `buildDatafile`, and `formatRebucketing` printed per environment. Reference 4 files, 164
+human-effective (207 platform); passers 239 and 251. Tests: 13 at the core slice, 34 at acceptance.
+
+**Decisive difficulty drivers.** F-40 `__proto__` in the per-variation record (7/11) and F-39 reuse of
+the repo's lossy free-range helper (3/11). Both were reference bugs first.
+
+**Iteration lessons.** Scope gate on a slice; three quality and Verify Solution rounds with no batch
+(zero override, brittle label, new-mode purity, `::` IDs); one tests-only Auto Review round whose
+replay matched the re-eval run for run.
+
+
+## ir-sim-scenario-events (APPROVED Olympus 2026-09-19)
+
+**Outcome.** Accepted at 1/11 on a re-eval of batch 1 (10 Nova + 1 Vega). Auto Review Approved:
+description 3/3, tests 2/3 (no mixed-name spawn-numbering cell), solution 3/3 (docs tree omission). FP
+panel upheld the single pass over one judge's dissent on created-but-unadded ids.
+
+**Shape and stats.** Python (hanruihua/ir-sim, e4a60f9). O-Composite-add: an `events:` YAML section with
+nine condition kinds and four actions, checked at the end of every step; `env.event_log`; reset,
+random reset and reload undo and re-arm. 3 source files + docs, 363 human-effective, 90 tests, meta.md
+494 words.
+
+**Decisive difficulty drivers.** F-41 (10/11): a spawned robot driven only by `group_behavior` must
+become its own group, as every YAML entry does in the loader. F-42 (2/11): two deletions restored in
+the wrong order. Closed-rectangle epsilon (2/11).
+
+**Iteration lessons.** Six quality rounds and eleven reference bugs before the first batch. Batch 1 was
+0/11 because of one unfair sensor-timing pin (11/11); removing it, plus the Auto Review fixes, was a
+tests-and-solution change graded by re-eval at 1/11, exactly as the local replay predicted. The
+id-rewind regression test the Auto Review asked for would have killed 11/11 and was withheld (L76).
+
+## featurevisor-target-specialization (APPROVED Olympus 2026-09-19)
+
+**Outcome.** Accepted 2026-09-19 at 3/10 (batch 2); batch 1 read 2/10 with Revision Requested.
+
+**Shape + stats.** O-Algorithm-correctness. `applyContextToDatafile` becomes a three-valued specializer:
+conditions decided only where the Target context has a value at the attribute path, decided conditions
+and segments folded with SDK semantics, first-match lists pruned by each list's SDK rule, exactly the
+referenced segments kept. 2 source files, 232 human-effective; 33 new tests (8 of them seeded
+equivalence batches), 2 base guards, 24 superseded repo specs removed; meta.md 319 words.
+
+**Decisive drivers.** F-12 exported-helper regression (3/10, 4/10); F-43 nested-list arm (2/10, 1/10);
+`not` over a decided-false child (1/10); global AND (1/10, batch 1 only).
+
+**Iteration lessons.** Picked after dinit died at 105 eff. Batch-1 review found the scalar-JSON parser bug
+in the reference (shared by 10/10 runs); fixed, five tests added, root cause named in meta.md, fresh batch.
+Batch-2 review's remaining coverage notes (operators beyond the six generated; requiredFeatures with a false
+selector on global/variation overrides) were accepted as Medium.

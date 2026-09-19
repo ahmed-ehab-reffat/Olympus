@@ -1,0 +1,1241 @@
+diff --git a/crates/kira/tests/loop_crossfade_8bca64.rs b/crates/kira/tests/loop_crossfade_8bca64.rs
+new file mode 100644
+index 0000000..a81076b
+--- /dev/null
++++ b/crates/kira/tests/loop_crossfade_8bca64.rs
+@@ -0,0 +1,1124 @@
++use std::{
++	sync::{Arc, Condvar, Mutex},
++	thread::{self, ThreadId},
++	time::{Duration, Instant},
++};
++
++use kira::{
++	AudioManager, AudioManagerSettings, Decibels, Easing, Frame, Panning, PlaybackRate, StartTime, Tween,
++	backend::{Backend, Renderer},
++	sound::{
++		EndPosition, LoopCrossfade, PlaybackPosition, Region,
++		static_sound::{StaticSoundData, StaticSoundSettings},
++		streaming::{Decoder, StreamingSoundData, StreamingSoundHandle, StreamingSoundSettings},
++	},
++};
++
++struct CaptureBackend {
++	renderer: Option<Renderer>,
++}
++
++impl Backend for CaptureBackend {
++	type Settings = ();
++	type Error = ();
++
++	fn setup(_settings: (), _internal_buffer_size: usize) -> Result<(Self, u32), ()> {
++		Ok((Self { renderer: None }, 1))
++	}
++
++	fn start(&mut self, renderer: Renderer) -> Result<(), ()> {
++		self.renderer = Some(renderer);
++		Ok(())
++	}
++}
++
++impl CaptureBackend {
++	fn render_stereo(&mut self, num_frames: usize) -> Vec<(f32, f32)> {
++		let renderer = self.renderer.as_mut().unwrap();
++		let mut out = vec![0.0; num_frames * 2];
++		for chunk in out.chunks_mut(2) {
++			renderer.on_start_processing();
++			renderer.process(chunk, 2);
++		}
++		out.chunks(2).map(|c| (c[0], c[1])).collect()
++	}
++
++	fn render(&mut self, num_frames: usize) -> Vec<f32> {
++		self.render_stereo(num_frames).into_iter().map(|(left, _)| left).collect()
++	}
++}
++
++fn manager() -> AudioManager<CaptureBackend> {
++	AudioManager::new(AudioManagerSettings {
++		internal_buffer_size: 1,
++		backend_settings: (),
++		..Default::default()
++	})
++	.unwrap()
++}
++
++const VALUES: [u32; 20] = [
++	106, 178, 231, 38, 33, 3, 232, 104, 254, 255, 193, 218, 121, 191, 134, 45, 60, 240, 42, 203,
++];
++
++fn value(i: usize) -> f32 {
++	VALUES[i] as f32 / 256.0
++}
++
++fn weight(step: usize, fade: usize) -> f32 {
++	(step as f64 / fade as f64) as f32
++}
++
++fn close(a: f32, b: f32) -> bool {
++	(a - b).abs() <= 1e-5
++}
++
++fn same(actual: &[f32], expected: &[f32]) -> bool {
++	actual.len() == expected.len() && actual.iter().zip(expected).all(|(a, e)| close(*a, *e))
++}
++
++fn ends_with_passes(out: &[f32], pass: &[f32]) -> bool {
++	let passes = [pass, pass].concat();
++	out.len() >= passes.len() + pass.len() && out[out.len() - passes.len() - pass.len()..].windows(passes.len()).any(|w| same(w, &passes))
++}
++
++fn has(frames: &[f32], frame: f32) -> bool {
++	frames.iter().any(|f| close(*f, frame))
++}
++
++fn settles_to(actual: &[f32], expected: &[f32], within: usize) {
++	for offset in 0..=within {
++		if actual.len() >= offset + expected.len() && same(&actual[offset..offset + expected.len()], expected) {
++			return;
++		}
++	}
++	panic!("expected sequence not found within {within} frames\nactual {actual:?}\nexpected {expected:?}");
++}
++
++fn frames(n: usize) -> Vec<Frame> {
++	(0..n).map(|i| Frame::from_mono(value(i))).collect()
++}
++
++fn data(n: usize, settings: StaticSoundSettings) -> StaticSoundData {
++	StaticSoundData {
++		sample_rate: 1,
++		frames: frames(n).into(),
++		settings,
++		slice: None,
++	}
++}
++
++fn samples(range: std::ops::Range<usize>) -> Region {
++	Region {
++		start: PlaybackPosition::Samples(range.start),
++		end: EndPosition::Custom(PlaybackPosition::Samples(range.end)),
++	}
++}
++
++fn resolved_loop(sound: &StaticSoundData) -> Option<(usize, usize)> {
++	let frames_at = |position: PlaybackPosition| match position {
++		PlaybackPosition::Samples(samples) => samples,
++		PlaybackPosition::Seconds(seconds) => (seconds * sound.sample_rate as f64).round() as usize,
++	};
++	sound.settings.loop_region.map(|region| {
++		let end = match region.end {
++			EndPosition::EndOfAudio => sound.num_frames(),
++			EndPosition::Custom(end) => frames_at(end),
++		};
++		(frames_at(region.start), end)
++	})
++}
++
++fn crossfade(frames: usize) -> LoopCrossfade {
++	LoopCrossfade::from(PlaybackPosition::Samples(frames))
++}
++
++fn blend(before: f32, past: f32, weight: f32) -> f32 {
++	before * (1.0 - weight) + past * weight
++}
++
++fn linear_pass(loop_start: usize, loop_end: usize, fade: usize) -> Vec<f32> {
++	rule_pass(loop_start, loop_end, fade, |x| x)
++}
++
++fn rule_pass(loop_start: usize, loop_end: usize, fade: usize, easing: impl Fn(f64) -> f64) -> Vec<f32> {
++	let mut pass: Vec<f32> = (loop_start + fade..loop_end - fade).map(value).collect();
++	for step in 0..fade {
++		let w = easing(step as f64 / fade as f64) as f32;
++		pass.push(blend(value(loop_end - fade + step), value(loop_start + step), w));
++	}
++	pass
++}
++
++fn play_static(sound: StaticSoundData, num_frames: usize) -> Vec<f32> {
++	let mut manager = manager();
++	manager.play(sound).unwrap();
++	manager.backend_mut().render(num_frames)
++}
++
++fn assert_output(actual: &[f32], expected: &[f32]) {
++	assert_eq!(actual.len(), expected.len());
++	for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
++		assert!(close(*a, *e), "frame {i}: got {a}, expected {e}\nactual {actual:?}\nexpected {expected:?}");
++	}
++}
++
++fn repeated(prefix: &[f32], pass: &[f32], total: usize) -> Vec<f32> {
++	let mut out = prefix.to_vec();
++	while out.len() < total {
++		out.extend_from_slice(pass);
++	}
++	out.truncate(total);
++	out
++}
++
++fn values(indices: impl IntoIterator<Item = usize>) -> Vec<f32> {
++	indices.into_iter().map(value).collect()
++}
++
++#[derive(Debug, Clone, Copy, PartialEq)]
++enum DecoderEvent {
++	Seek(usize),
++	Decode(usize),
++	Blocked,
++}
++
++struct DecoderLog {
++	events: Mutex<Vec<DecoderEvent>>,
++	changed: Condvar,
++}
++
++impl DecoderLog {
++	fn push(&self, event: DecoderEvent) {
++		self.events.lock().unwrap().push(event);
++		self.changed.notify_all();
++	}
++
++	fn snapshot(&self) -> Vec<DecoderEvent> {
++		self.events.lock().unwrap().clone()
++	}
++
++	fn wait_until(&self, done: impl Fn(&[DecoderEvent]) -> bool) -> Vec<DecoderEvent> {
++		let deadline = Instant::now() + Duration::from_secs(60);
++		let mut events = self.events.lock().unwrap();
++		while !done(&events) {
++			let now = Instant::now();
++			assert!(now < deadline, "decoder never reached the expected state: {} events", events.len());
++			events = self.changed.wait_timeout(events, deadline - now).unwrap().0;
++		}
++		events.clone()
++	}
++}
++
++fn decodes(events: &[DecoderEvent]) -> usize {
++	events.iter().filter(|e| matches!(e, DecoderEvent::Decode(_))).count()
++}
++
++fn seeks(events: &[DecoderEvent]) -> usize {
++	events.iter().filter(|e| matches!(e, DecoderEvent::Seek(_))).count()
++}
++
++struct Gate {
++	calls_left: Mutex<Option<usize>>,
++	opened: Condvar,
++}
++
++impl Gate {
++	fn open(&self) {
++		*self.calls_left.lock().unwrap() = None;
++		self.opened.notify_all();
++	}
++}
++
++struct RecordingDecoder {
++	sample_rate: u32,
++	frames: Vec<Frame>,
++	current: usize,
++	log: Arc<DecoderLog>,
++	gate: Arc<Gate>,
++	owner: ThreadId,
++}
++
++impl RecordingDecoder {
++	fn pass_gate(&self) {
++		if thread::current().id() == self.owner {
++			return;
++		}
++		let mut calls_left = self.gate.calls_left.lock().unwrap();
++		if *calls_left == Some(0) {
++			self.log.push(DecoderEvent::Blocked);
++			while *calls_left == Some(0) {
++				calls_left = self.gate.opened.wait(calls_left).unwrap();
++			}
++		}
++		if let Some(left) = calls_left.as_mut() {
++			*left -= 1;
++		}
++	}
++}
++
++const PACKET: usize = 3;
++
++impl Decoder for RecordingDecoder {
++	type Error = ();
++
++	fn sample_rate(&self) -> u32 {
++		self.sample_rate
++	}
++
++	fn num_frames(&self) -> usize {
++		self.frames.len()
++	}
++
++	fn decode(&mut self) -> Result<Vec<Frame>, ()> {
++		self.pass_gate();
++		self.log.push(DecoderEvent::Decode(self.current));
++		let mut packet = vec![];
++		for _ in 0..PACKET {
++			if self.current >= self.frames.len() {
++				break;
++			}
++			packet.push(self.frames[self.current]);
++			self.current += 1;
++		}
++		Ok(packet)
++	}
++
++	fn seek(&mut self, index: usize) -> Result<usize, ()> {
++		self.pass_gate();
++		self.current = index / PACKET * PACKET;
++		self.log.push(DecoderEvent::Seek(self.current));
++		Ok(self.current)
++	}
++}
++
++fn decoded_sound(frames: Vec<Frame>, settings: StreamingSoundSettings, calls: Option<usize>) -> (StreamingSoundData<()>, Arc<DecoderLog>, Arc<Gate>) {
++	decoded_sound_at(1, frames, settings, calls)
++}
++
++fn decoded_sound_at(sample_rate: u32, frames: Vec<Frame>, settings: StreamingSoundSettings, calls: Option<usize>) -> (StreamingSoundData<()>, Arc<DecoderLog>, Arc<Gate>) {
++	let log = Arc::new(DecoderLog {
++		events: Mutex::new(vec![]),
++		changed: Condvar::new(),
++	});
++	let gate = Arc::new(Gate {
++		calls_left: Mutex::new(calls),
++		opened: Condvar::new(),
++	});
++	let decoder = RecordingDecoder {
++		sample_rate,
++		frames,
++		current: 0,
++		log: log.clone(),
++		gate: gate.clone(),
++		owner: thread::current().id(),
++	};
++	(StreamingSoundData::from_decoder(decoder).with_settings(settings), log, gate)
++}
++
++fn streaming(n: usize, settings: StreamingSoundSettings) -> (StreamingSoundData<()>, Arc<DecoderLog>) {
++	let (sound, log, _) = decoded_sound(frames(n), settings, None);
++	(sound, log)
++}
++
++fn seeks_before_the_decoder_thread_runs(settings: StreamingSoundSettings) -> usize {
++	let (sound, log, gate) = decoded_sound(frames(10), settings, Some(0));
++	let mut manager = manager();
++	let _handle = manager.play(sound).unwrap();
++	let seeks = seeks(&log.snapshot());
++	gate.open();
++	seeks
++}
++
++fn render_streaming(manager: &mut AudioManager<CaptureBackend>, num_frames: usize) -> Vec<f32> {
++	let mut out = vec![];
++	let start = Instant::now();
++	while out.len() < num_frames {
++		let frame = manager.backend_mut().render(1)[0];
++		if frame != 0.0 || !out.is_empty() {
++			out.push(frame);
++		}
++		assert!(start.elapsed() < Duration::from_secs(60), "streaming sound never produced audio");
++	}
++	out
++}
++
++fn wait_for_frames(log: &DecoderLog, num_frames: usize) {
++	log.wait_until(|events| decodes(events) >= 4 * num_frames + 32);
++}
++
++fn render_until(manager: &mut AudioManager<CaptureBackend>, done: impl Fn(&[f32]) -> bool) -> Vec<f32> {
++	let mut out = vec![];
++	let start = Instant::now();
++	while !done(&out) {
++		out.extend(render_streaming(manager, 256));
++		assert!(start.elapsed() < Duration::from_secs(60), "expected audio never played: {:?}", &out[out.len().saturating_sub(16)..]);
++	}
++	out
++}
++
++fn play_streaming(handle_out: &mut Option<StreamingSoundHandle<()>>, sound: StreamingSoundData<()>, log: &DecoderLog, num_frames: usize) -> (AudioManager<CaptureBackend>, Vec<f32>) {
++	let mut manager = manager();
++	let handle = manager.play(sound).unwrap();
++	wait_for_frames(log, num_frames);
++	let out = render_streaming(&mut manager, num_frames);
++	*handle_out = Some(handle);
++	(manager, out)
++}
++
++mod static_forward {
++	use super::*;
++
++	#[test]
++	fn blends_the_last_frames_of_the_loop_and_lands_past_the_head() {
++		let sound = data(10, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(2)));
++		let out = play_static(sound, 22);
++		let pass = linear_pass(2, 8, 2);
++		assert_output(&pass, &[value(4), value(5), value(6), blend(value(7), value(3), 0.5)]);
++		assert_output(&out, &repeated(&values(0..4), &pass, 22));
++	}
++
++	#[test]
++	fn crossfade_given_in_seconds() {
++		let sound = data(10, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(2.0));
++		let out = play_static(sound, 14);
++		assert_output(&out, &repeated(&values(0..4), &linear_pass(2, 8, 2), 14));
++	}
++
++	#[test]
++	fn zero_crossfade_plays_exactly_as_before() {
++		let sound = data(10, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(0.0));
++		let out = play_static(sound, 20);
++		assert_output(&out, &repeated(&values(0..2), &values(2..8), 20));
++	}
++
++	#[test]
++	fn seconds_are_converted_with_the_sample_rate() {
++		let at_four_hz = |loop_crossfade: LoopCrossfade| StaticSoundData {
++			sample_rate: 4,
++			frames: frames(20).into(),
++			settings: StaticSoundSettings::new().loop_region(samples(4..16)).loop_crossfade(loop_crossfade),
++			slice: None,
++		};
++		for seconds in [0.5, 0.6] {
++			let from_seconds = at_four_hz(LoopCrossfade::from(seconds));
++			let two_frames = at_four_hz(crossfade(2));
++			assert_output(&play_static(from_seconds.clone(), 60), &play_static(two_frames.clone(), 60));
++			let baked = from_seconds.bake_loop_crossfade();
++			assert_eq!(baked.frames, two_frames.clone().bake_loop_crossfade().frames);
++			assert_eq!(resolved_loop(&baked), Some((6, 16)));
++		}
++		let at_three_hz = StaticSoundData {
++			sample_rate: 3,
++			frames: frames(20).into(),
++			settings: StaticSoundSettings::new().loop_region(samples(4..16)).loop_crossfade(1.0),
++			slice: None,
++		};
++		let mut three_frames = at_three_hz.clone();
++		three_frames.settings.loop_crossfade = crossfade(3);
++		assert_output(&play_static(at_three_hz.clone(), 60), &play_static(three_frames, 60));
++		assert_eq!(resolved_loop(&at_three_hz.bake_loop_crossfade()), Some((7, 16)));
++	}
++
++	#[test]
++	fn crossfade_without_loop_region_changes_nothing() {
++		let sound = data(6, StaticSoundSettings::new().loop_crossfade(crossfade(3)));
++		let out = play_static(sound, 6);
++		assert_output(&out, &values(0..6));
++	}
++
++	#[test]
++	fn longer_than_half_the_loop_is_shortened_to_half() {
++		let sound = data(12, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(5)));
++		let out = play_static(sound, 20);
++		assert_output(&out, &repeated(&values(0..5), &linear_pass(2, 8, 3), 20));
++		let odd = data(12, StaticSoundSettings::new().loop_region(samples(1..8)).loop_crossfade(crossfade(4)));
++		let out = play_static(odd, 20);
++		assert_output(&out, &repeated(&values(0..4), &linear_pass(1, 8, 3), 20));
++	}
++
++	#[test]
++	fn loop_to_end_of_audio_blends_with_the_last_frames() {
++		let sound = data(8, StaticSoundSettings::new().loop_region(Region { start: PlaybackPosition::Samples(2), end: EndPosition::EndOfAudio }).loop_crossfade(crossfade(2)));
++		let out = play_static(sound, 18);
++		assert_output(&out, &repeated(&values(0..4), &linear_pass(2, 8, 2), 18));
++	}
++
++	#[test]
++	fn loop_inside_a_slice_is_relative_to_the_slice() {
++		let sound = data(14, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(2))).slice(samples(3..13));
++		let out = play_static(sound, 18);
++		let pass = rule_pass(5, 11, 2, |x| x);
++		assert_output(&out, &repeated(&values(3..7), &pass, 18));
++	}
++
++	#[test]
++	fn second_pass_repeats_the_same_blend() {
++		let sound = data(10, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(2)));
++		let out = play_static(sound, 4 + 4 * 5);
++		let pass = linear_pass(2, 8, 2);
++		for p in 0..5 {
++			assert_output(&out[4 + p * 4..4 + (p + 1) * 4], &pass);
++		}
++	}
++}
++
++mod easing {
++	use super::*;
++
++	fn in_out(power: impl Fn(f64) -> f64) -> impl Fn(f64) -> f64 {
++		move |x| {
++			let x = x * 2.0;
++			if x < 1.0 { 0.5 * power(x) } else { 0.5 * (1.0 - power(2.0 - x)) + 0.5 }
++		}
++	}
++
++	#[test]
++	fn in_out_and_float_power_easings_follow_their_curves() {
++		let curves: [(Easing, Box<dyn Fn(f64) -> f64>); 4] = [
++			(Easing::InOutPowi(3), Box::new(in_out(|x| x.powi(3)))),
++			(Easing::InPowf(1.5), Box::new(|x: f64| x.powf(1.5))),
++			(Easing::OutPowf(2.5), Box::new(|x: f64| 1.0 - (1.0 - x).powf(2.5))),
++			(Easing::InOutPowf(1.5), Box::new(in_out(|x| x.powf(1.5)))),
++		];
++		for (easing, curve) in curves {
++			let sound = data(16, StaticSoundSettings::new().loop_region(samples(2..14)).loop_crossfade(LoopCrossfade { duration: PlaybackPosition::Samples(6), easing }));
++			let out = play_static(sound, 32);
++			assert_output(&out, &repeated(&values(0..8), &rule_pass(2, 14, 6, &curve), 32));
++		}
++	}
++
++	#[test]
++	fn in_powi_two_weights_the_head_by_the_square() {
++		let sound = data(12, StaticSoundSettings::new().loop_region(samples(2..10)).loop_crossfade(LoopCrossfade { duration: PlaybackPosition::Samples(4), easing: Easing::InPowi(2) }));
++		let out = play_static(sound, 30);
++		assert_output(&out, &repeated(&values(0..6), &rule_pass(2, 10, 4, |x| x * x), 30));
++	}
++
++	#[test]
++	fn out_powi_two_weights_the_head_by_one_minus_the_square_of_the_rest() {
++		let sound = data(12, StaticSoundSettings::new().loop_region(samples(2..10)).loop_crossfade(LoopCrossfade { duration: PlaybackPosition::Samples(4), easing: Easing::OutPowi(2) }));
++		let out = play_static(sound, 30);
++		assert_output(&out, &repeated(&values(0..6), &rule_pass(2, 10, 4, |x| 1.0 - (1.0 - x) * (1.0 - x)), 30));
++	}
++}
++
++mod reverse {
++	use super::*;
++
++	fn reverse_pass(loop_start: usize, loop_end: usize, fade: usize) -> Vec<f32> {
++		let mut pass: Vec<f32> = (loop_start + fade..loop_end - fade).rev().map(value).collect();
++		for step in 0..fade {
++			let w = weight(step, fade);
++			pass.push(blend(value(loop_start + fade - 1 - step), value(loop_end - 1 - step), w));
++		}
++		pass
++	}
++
++	#[test]
++	fn reverse_blends_the_mirror_window_and_wraps_before_the_tail() {
++		let sound = data(10, StaticSoundSettings::new().reverse(true).loop_region(samples(2..8)).loop_crossfade(crossfade(2)));
++		let out = play_static(sound, 26);
++		let pass = reverse_pass(2, 8, 2);
++		assert_output(&pass, &[value(5), value(4), value(3), blend(value(2), value(6), 0.5)]);
++		assert_output(&out, &repeated(&values((6..10).rev()), &pass, 26));
++	}
++
++	#[test]
++	fn negative_playback_rate_blends_the_mirror_window() {
++		let sound = data(10, StaticSoundSettings::new().start_position(PlaybackPosition::Samples(9)).playback_rate(PlaybackRate(-1.0)).loop_region(samples(2..8)).loop_crossfade(crossfade(2)));
++		let out = play_static(sound, 26);
++		assert_output(&out, &repeated(&values((6..10).rev()), &reverse_pass(2, 8, 2), 26));
++	}
++
++	#[test]
++	fn seeks_while_reversed_blend_the_mirror_window_and_wrap_by_whole_loop_lengths() {
++		let pass = reverse_pass(2, 8, 3);
++		for (played, target, queued, landed) in [
++			(2, 3.0, values(9..14), vec![pass[1], pass[2], pass[0], pass[1], pass[2], pass[0]]),
++			(20, 0.0, vec![], vec![value(6), value(5), pass[0], pass[1], pass[2], pass[0]]),
++			(20, 11.0, vec![], vec![value(5), pass[0], pass[1], pass[2], pass[0], pass[1]]),
++		] {
++			let mut manager = manager();
++			let mut handle = manager.play(data(14, StaticSoundSettings::new().reverse(true).loop_region(samples(2..8)).loop_crossfade(crossfade(3)))).unwrap();
++			manager.backend_mut().render(played);
++			handle.seek_to(target);
++			let out = manager.backend_mut().render(16);
++			settles_to(&out, &landed, 4);
++			let heard: Vec<f32> = [queued.as_slice(), landed.as_slice(), pass.as_slice()].concat();
++			assert!(out.iter().all(|frame| has(&heard, *frame)), "seek to {target}: {out:?}");
++		}
++	}
++
++	#[test]
++	fn reversed_and_negative_rate_play_forward() {
++		let sound = data(10, StaticSoundSettings::new().reverse(true).start_position(PlaybackPosition::Samples(9)).playback_rate(PlaybackRate(-1.0)).loop_region(samples(2..8)).loop_crossfade(crossfade(2)));
++		let out = play_static(sound, 22);
++		assert_output(&out, &repeated(&values(0..4), &linear_pass(2, 8, 2), 22));
++	}
++}
++
++mod rate {
++	use super::*;
++
++	#[test]
++	fn double_rate_only_ever_plays_blended_or_pure_loop_frames() {
++		let sound = data(20, StaticSoundSettings::new().playback_rate(PlaybackRate(2.0)).loop_region(samples(4..16)).loop_crossfade(crossfade(4)));
++		let out = play_static(sound, 60);
++		let pass = linear_pass(4, 16, 4);
++		let allowed: Vec<f32> = values(0..16).into_iter().chain(pass.iter().copied()).collect();
++		for (i, frame) in out.iter().enumerate() {
++			assert!(has(&allowed, *frame), "frame {i} = {frame} is not a source or blended frame");
++		}
++		let blended: Vec<f32> = pass[pass.len() - 4..].to_vec();
++		assert!(out.iter().any(|f| has(&blended[1..], *f)), "no blended frame was played: {out:?}");
++		assert!(!out[16..].iter().any(|f| has(&values(4..8), *f)), "head frames replayed after the first pass: {out:?}");
++	}
++
++	#[test]
++	fn live_crossfade_matches_the_baked_frames_at_non_unit_rates() {
++		for rate in [2.0, 1.5, 0.5, 3.0] {
++			let sound = data(20, StaticSoundSettings::new().playback_rate(PlaybackRate(rate)).loop_region(samples(4..16)).loop_crossfade(crossfade(4)));
++			let baked = sound.clone().bake_loop_crossfade();
++			assert_output(&play_static(sound, 80), &play_static(baked, 80));
++		}
++	}
++}
++
++mod seeks_and_changes {
++	use super::*;
++
++	#[test]
++	fn seek_into_the_fade_blends_from_that_frame() {
++		let mut manager = manager();
++		let mut handle = manager.play(data(10, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(2)))).unwrap();
++		let first = manager.backend_mut().render(2);
++		assert_output(&first, &values(0..2));
++		handle.seek_to(7.0);
++		let out = manager.backend_mut().render(14);
++		let pass = linear_pass(2, 8, 2);
++		settles_to(&out, &[blend(value(7), value(3), 0.5), pass[0], pass[1], pass[2], pass[3], pass[0], pass[1], pass[2], pass[3]], 4);
++		let heard = [values(2..5), pass].concat();
++		assert!(out.iter().all(|frame| has(&heard, *frame)), "{out:?}");
++	}
++
++	#[test]
++	fn seek_past_the_loop_end_wraps_by_whole_loop_lengths() {
++		let mut manager = manager();
++		let mut handle = manager.play(data(20, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(2)))).unwrap();
++		manager.backend_mut().render(12);
++		handle.seek_to(15.0);
++		let out = manager.backend_mut().render(12);
++		let pass = linear_pass(2, 8, 2);
++		settles_to(&out, &[value(3), pass[0], pass[1], pass[2], pass[3], pass[0], pass[1], pass[2]], 4);
++		assert!(!has(&out, value(15)) && !has(&out, value(9)), "{out:?}");
++	}
++
++	#[test]
++	fn set_loop_crossfade_mid_pass_applies_from_the_next_frame() {
++		let mut manager = manager();
++		let mut handle = manager.play(data(10, StaticSoundSettings::new().loop_region(samples(2..8)))).unwrap();
++		let first = manager.backend_mut().render(5);
++		assert_output(&first, &values(0..5));
++		handle.set_loop_crossfade(PlaybackPosition::Samples(2));
++		let out = manager.backend_mut().render(16);
++		let pass = linear_pass(2, 8, 2);
++		settles_to(&out, &[pass[0], pass[1], pass[2], pass[3], pass[0], pass[1], pass[2], pass[3]], 8);
++		assert!(out[8..].iter().all(|f| has(&pass, *f)), "{out:?}");
++		handle.set_loop_crossfade(LoopCrossfade::NONE);
++		let out = manager.backend_mut().render(16);
++		settles_to(&out, &[value(7), value(2), value(3), value(4), value(5), value(6), value(7), value(2)], 8);
++		assert!(!has(&out[8..], pass[3]), "{out:?}");
++	}
++
++	#[test]
++	fn set_loop_crossfade_with_an_easing_applies_its_weights() {
++		let mut manager = manager();
++		let mut handle = manager.play(data(12, StaticSoundSettings::new().loop_region(samples(2..10)))).unwrap();
++		manager.backend_mut().render(3);
++		handle.set_loop_crossfade(LoopCrossfade { duration: PlaybackPosition::Samples(4), easing: Easing::InPowi(2) });
++		let out = manager.backend_mut().render(30);
++		let pass = rule_pass(2, 10, 4, |x| x * x);
++		settles_to(&out, &[pass.as_slice(), pass.as_slice()].concat(), 16);
++		let heard = [values(3..10), pass].concat();
++		assert!(out.iter().all(|frame| has(&heard, *frame)), "{out:?}");
++	}
++
++	#[test]
++	fn set_loop_region_mid_pass_uses_the_new_weights_and_clamp() {
++		let mut manager = manager();
++		let mut handle = manager.play(data(14, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(3)))).unwrap();
++		let first = manager.backend_mut().render(3);
++		assert_output(&first, &values(0..3));
++		handle.set_loop_region(samples(4..12));
++		let out = manager.backend_mut().render(20);
++		let pass = linear_pass(4, 12, 3);
++		settles_to(&out, &[pass.as_slice(), pass.as_slice()].concat(), 10);
++		assert!(!has(&out[6..], linear_pass(2, 8, 3)[2]), "{out:?}");
++		handle.set_loop_region(samples(9..11));
++		let out = manager.backend_mut().render(12);
++		settles_to(&out, &[value(10), value(10), value(10), value(10)], 8);
++	}
++
++	#[test]
++	fn seek_below_the_loop_start_wraps_forward_by_whole_loop_lengths() {
++		let mut manager = manager();
++		let mut handle = manager.play(data(14, StaticSoundSettings::new().loop_region(samples(6..12)).loop_crossfade(crossfade(2)))).unwrap();
++		manager.backend_mut().render(13);
++		handle.seek_to(1.0);
++		let out = manager.backend_mut().render(16);
++		let pass = linear_pass(6, 12, 2);
++		settles_to(&out, &[value(7), pass[0], pass[1], pass[2], pass[3], pass[0]], 4);
++		assert!(!has(&out, value(1)), "{out:?}");
++	}
++
++	#[test]
++	fn seek_to_each_fade_step_blends_with_its_own_weight() {
++		let pass = linear_pass(2, 8, 3);
++		for (target, step) in [(6.0, 1), (7.0, 2)] {
++			let mut manager = manager();
++			let mut handle = manager.play(data(10, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(3)))).unwrap();
++			manager.backend_mut().render(2);
++			handle.seek_to(target);
++			let out = manager.backend_mut().render(14);
++			settles_to(&out, &[&pass[step..], pass.as_slice(), pass.as_slice()].concat(), 4);
++			let heard = [values(2..5), pass.clone()].concat();
++			assert!(out.iter().all(|frame| has(&heard, *frame)), "seek to {target}: {out:?}");
++		}
++	}
++
++	#[test]
++	fn removing_the_loop_region_plays_to_the_end() {
++		let mut manager = manager();
++		let mut handle = manager.play(data(10, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(2)))).unwrap();
++		manager.backend_mut().render(8);
++		handle.set_loop_region(None);
++		let out = manager.backend_mut().render(12);
++		settles_to(&out, &[value(6), value(7), value(8), value(9)], 8);
++		assert!(out.ends_with(&[value(9)]) || out.ends_with(&[0.0]), "{out:?}");
++	}
++}
++
++mod chunking {
++	use super::*;
++
++	#[test]
++	fn blend_straddling_the_internal_buffer_is_per_source_frame() {
++		let mut manager = AudioManager::<CaptureBackend>::new(AudioManagerSettings {
++			internal_buffer_size: 3,
++			backend_settings: (),
++			..Default::default()
++		})
++		.unwrap();
++		manager.play(data(12, StaticSoundSettings::new().loop_region(samples(2..10)).loop_crossfade(crossfade(4)))).unwrap();
++		let renderer = manager.backend_mut().renderer.as_mut().unwrap();
++		let mut out = vec![0.0; 30 * 2];
++		for chunk in out.chunks_mut(6) {
++			renderer.on_start_processing();
++			renderer.process(chunk, 2);
++		}
++		let left: Vec<f32> = out.chunks(2).map(|c| c[0]).collect();
++		assert_output(&left, &repeated(&values(0..6), &linear_pass(2, 10, 4), 30));
++	}
++}
++
++mod bake {
++	use super::*;
++
++	#[test]
++	fn baked_frames_follow_the_rule_and_the_loop_moves_past_the_head() {
++		let sound = data(10, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(2)));
++		let baked = sound.bake_loop_crossfade();
++		assert_eq!(baked.num_frames(), 10);
++		let expected: Vec<f32> = values(0..6).into_iter().chain([value(6), blend(value(7), value(3), 0.5)]).chain(values(8..10)).collect();
++		let actual: Vec<f32> = (0..10).map(|i| baked.frame_at_index(i).unwrap().left).collect();
++		assert_output(&actual, &expected);
++		assert_eq!(resolved_loop(&baked), Some((4, 8)));
++		assert_eq!(baked.settings.loop_crossfade, LoopCrossfade::NONE);
++		assert_eq!(baked.sample_rate, 1);
++	}
++
++	#[test]
++	fn playing_baked_data_matches_the_live_crossfade() {
++		let sound = data(12, StaticSoundSettings::new().loop_region(samples(2..10)).loop_crossfade(LoopCrossfade { duration: PlaybackPosition::Samples(3), easing: Easing::InPowi(2) }));
++		let live = play_static(sound.clone(), 40);
++		let baked = play_static(sound.bake_loop_crossfade(), 40);
++		assert_output(&baked, &live);
++	}
++
++	#[test]
++	fn baking_resolves_the_slice_and_keeps_other_settings() {
++		let sound = data(16, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(2)).playback_rate(PlaybackRate(2.0))).slice(samples(3..13));
++		let baked = sound.bake_loop_crossfade();
++		assert_eq!(baked.num_frames(), 10);
++		assert_eq!(baked.slice, None);
++		assert_eq!(baked.settings.playback_rate, sound.settings.playback_rate);
++		assert_eq!(baked.frame_at_index(0), sound.frame_at_index(0));
++		assert!(close(baked.frame_at_index(7).unwrap().left, blend(value(10), value(6), 0.5)));
++		assert_eq!(resolved_loop(&baked), Some((4, 8)));
++	}
++
++	#[test]
++	fn baking_keeps_every_other_setting() {
++		let sound = data(10, StaticSoundSettings::new().start_time(StartTime::Delayed(Duration::from_secs(1))).start_position(PlaybackPosition::Samples(3)).reverse(true).volume(Decibels(-6.0)).playback_rate(PlaybackRate(1.5)).panning(Panning(-0.5)).fade_in_tween(Tween::default()).loop_region(samples(2..8)).loop_crossfade(crossfade(2)));
++		let baked = sound.clone().bake_loop_crossfade();
++		assert_eq!(resolved_loop(&baked), Some((4, 8)));
++		let expected = StaticSoundSettings {
++			loop_region: None,
++			loop_crossfade: LoopCrossfade::NONE,
++			..sound.settings
++		};
++		assert_eq!(StaticSoundSettings { loop_region: None, ..baked.settings }, expected);
++		assert_eq!(baked.sample_rate, sound.sample_rate);
++		assert_eq!(baked.num_frames(), sound.num_frames());
++	}
++
++	#[test]
++	fn baking_without_loop_or_crossfade_is_an_identical_copy() {
++		let plain = data(10, StaticSoundSettings::new().loop_crossfade(crossfade(3)));
++		assert_eq!(plain.bake_loop_crossfade(), plain);
++		let looped = data(10, StaticSoundSettings::new().loop_region(samples(2..8)));
++		assert_eq!(looped.bake_loop_crossfade(), looped);
++	}
++
++	#[test]
++	fn baking_shortens_a_crossfade_longer_than_half_the_loop() {
++		let long = data(12, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(5)));
++		let half = data(12, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(3)));
++		let baked = long.bake_loop_crossfade();
++		assert_eq!(baked, half.bake_loop_crossfade());
++		assert_eq!(resolved_loop(&baked), Some((5, 8)));
++		assert_output(&play_static(baked, 30), &play_static(long, 30));
++	}
++
++	#[test]
++	fn baking_to_the_end_of_audio() {
++		let sound = data(8, StaticSoundSettings::new().loop_region(Region { start: PlaybackPosition::Samples(2), end: EndPosition::EndOfAudio }).loop_crossfade(crossfade(2)));
++		let baked = sound.bake_loop_crossfade();
++		assert_eq!(baked.num_frames(), 8);
++		assert!(close(baked.frame_at_index(7).unwrap().left, blend(value(7), value(3), 0.5)));
++		assert_eq!(resolved_loop(&baked), Some((4, 8)));
++		let live = play_static(sound, 30);
++		let replay = play_static(baked, 30);
++		assert_output(&replay, &live);
++	}
++}
++
++mod streaming_sounds {
++	use super::*;
++
++	#[test]
++	fn streaming_blend_matches_the_rule() {
++		let (sound, log) = streaming(10, StreamingSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(2.0));
++		let mut handle = None;
++		let (_manager, out) = play_streaming(&mut handle, sound, &log, 22);
++		assert_output(&out, &repeated(&values(0..4), &linear_pass(2, 8, 2), 22));
++	}
++
++	#[test]
++	fn streaming_crossfade_longer_than_half_the_loop_is_shortened_to_half() {
++		let (sound, log) = streaming(12, StreamingSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(5)));
++		let mut handle = None;
++		let (_manager, out) = play_streaming(&mut handle, sound, &log, 20);
++		assert_output(&out, &repeated(&values(0..5), &linear_pass(2, 8, 3), 20));
++		let (odd, odd_log) = streaming(12, StreamingSoundSettings::new().loop_region(samples(1..8)).loop_crossfade(crossfade(4)));
++		let mut odd_handle = None;
++		let (_odd_manager, out) = play_streaming(&mut odd_handle, odd, &odd_log, 20);
++		assert_output(&out, &repeated(&values(0..4), &linear_pass(1, 8, 3), 20));
++	}
++
++	#[test]
++	fn streaming_zero_crossfade_is_unchanged() {
++		let (sound, log) = streaming(10, StreamingSoundSettings::new().loop_region(samples(2..8)));
++		let mut handle = None;
++		let (_manager, out) = play_streaming(&mut handle, sound, &log, 20);
++		assert_output(&out, &repeated(&values(0..2), &values(2..8), 20));
++	}
++
++	#[test]
++	fn streaming_loop_to_end_of_audio_with_easing() {
++		let (sound, log) = streaming(9, StreamingSoundSettings::new().loop_region(Region { start: PlaybackPosition::Samples(1), end: EndPosition::EndOfAudio }).loop_crossfade(LoopCrossfade { duration: PlaybackPosition::Samples(4), easing: Easing::InPowi(2) }));
++		let mut handle = None;
++		let (_manager, out) = play_streaming(&mut handle, sound, &log, 30);
++		assert_output(&out, &repeated(&values(0..5), &rule_pass(1, 9, 4, |x| x * x), 30));
++	}
++
++	#[test]
++	fn streaming_wraps_seek_once_and_decode_forward() {
++		let last_packet = DecoderEvent::Decode(6);
++		for start in [0, 3, 6] {
++			let (sound, log) = streaming(10, StreamingSoundSettings::new().start_position(PlaybackPosition::Samples(start)).loop_region(samples(2..8)).loop_crossfade(crossfade(2)));
++			let mut manager = manager();
++			let _handle = manager.play(sound).unwrap();
++			let events = log.wait_until(|events| events.iter().filter(|e| **e == last_packet).count() >= 8);
++			let passes: Vec<usize> = events.iter().enumerate().filter(|(_, e)| **e == last_packet).map(|(i, _)| i).collect();
++			assert!(seeks(&events[..passes[0]]) <= 2, "start {start}: {:?}", &events[..passes[0]]);
++			for pass in passes.windows(2) {
++				let wrap = &events[pass[0] + 1..pass[1]];
++				assert_eq!(seeks(wrap), 1, "start {start}: {wrap:?}");
++				let positions: Vec<usize> = wrap.iter().filter_map(|e| if let DecoderEvent::Decode(position) = e { Some(*position) } else { None }).collect();
++				assert!(positions.windows(2).all(|w| w[0] < w[1]), "start {start}: {wrap:?}");
++			}
++		}
++	}
++
++	#[test]
++	fn streaming_startup_costs_at_most_one_extra_seek_from_any_start_position() {
++		for start in 0..8 {
++			let seeks = seeks_before_the_decoder_thread_runs(StreamingSoundSettings::new().start_position(PlaybackPosition::Samples(start)).loop_region(samples(2..8)).loop_crossfade(crossfade(2)));
++			let plain_seeks = seeks_before_the_decoder_thread_runs(StreamingSoundSettings::new().start_position(PlaybackPosition::Samples(start)).loop_region(samples(2..8)));
++			assert!(seeks <= plain_seeks + 1, "start {start}: {seeks} seeks to start with the crossfade against {plain_seeks} without");
++		}
++	}
++
++	#[test]
++	fn streaming_start_inside_the_fade_blends_from_that_frame() {
++		let (sound, log) = streaming(10, StreamingSoundSettings::new().start_position(PlaybackPosition::Samples(6)).loop_region(samples(2..8)).loop_crossfade(crossfade(2)));
++		let mut handle = None;
++		let (_manager, out) = play_streaming(&mut handle, sound, &log, 9);
++		let pass = linear_pass(2, 8, 2);
++		assert_output(&out, &[value(6), blend(value(7), value(3), 0.5), pass[0], pass[1], pass[2], pass[3], pass[0], pass[1], pass[2]]);
++	}
++
++	#[test]
++	fn streaming_start_before_the_fade_on_a_packet_boundary() {
++		let (sound, log) = streaming(10, StreamingSoundSettings::new().start_position(PlaybackPosition::Samples(3)).loop_region(samples(2..8)).loop_crossfade(crossfade(2)));
++		let mut handle = None;
++		let (_manager, out) = play_streaming(&mut handle, sound, &log, 13);
++		let pass = linear_pass(2, 8, 2);
++		assert_output(&out, &repeated(&[value(3), pass[0], pass[1], pass[2], pass[3]], &pass, 13));
++	}
++
++	#[test]
++	fn streaming_loop_inside_a_slice_is_relative_to_the_slice() {
++		let (sound, log) = streaming(14, StreamingSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(2)));
++		let mut handle = None;
++		let (_manager, out) = play_streaming(&mut handle, sound.slice(samples(3..13)), &log, 18);
++		assert_output(&out, &repeated(&values(3..7), &rule_pass(5, 11, 2, |x| x), 18));
++	}
++
++	#[test]
++	fn streaming_seek_past_the_loop_end_wraps_by_whole_loop_lengths() {
++		let (sound, log) = streaming(20, StreamingSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(2)));
++		let mut manager = manager();
++		let mut handle = manager.play(sound).unwrap();
++		wait_for_frames(&log, 12);
++		render_streaming(&mut manager, 12);
++		handle.seek_to(15.0);
++		let pass = linear_pass(2, 8, 2);
++		let landed = [value(3), pass[0], pass[1], pass[2], pass[3], pass[0]];
++		let out = render_until(&mut manager, |out| out.windows(landed.len()).any(|w| same(w, &landed)));
++		assert!(!has(&out, value(15)) && !has(&out, value(9)), "seek played frames past the loop");
++	}
++
++	#[test]
++	fn streaming_set_loop_crossfade_keeps_the_buffered_audio_then_applies() {
++		let (sound, log, gate) = decoded_sound(frames(10), StreamingSoundSettings::new().loop_region(samples(2..8)), Some(60));
++		let mut manager = manager();
++		let mut handle = manager.play(sound).unwrap();
++		log.wait_until(|events| events.contains(&DecoderEvent::Blocked));
++		handle.set_loop_crossfade(PlaybackPosition::Samples(2));
++		let buffered = render_streaming(&mut manager, 64);
++		assert_output(&buffered, &repeated(&values(0..2), &values(2..8), 64));
++		gate.open();
++		let pass = linear_pass(2, 8, 2);
++		render_until(&mut manager, |out| ends_with_passes(out, &pass));
++	}
++
++	#[test]
++	fn streaming_set_loop_crossfade_with_an_easing_applies_its_weights() {
++		let (sound, log, gate) = decoded_sound(frames(12), StreamingSoundSettings::new().loop_region(samples(2..10)), Some(60));
++		let mut manager = manager();
++		let mut handle = manager.play(sound).unwrap();
++		log.wait_until(|events| events.contains(&DecoderEvent::Blocked));
++		handle.set_loop_crossfade(LoopCrossfade { duration: PlaybackPosition::Samples(4), easing: Easing::InPowi(2) });
++		let buffered = render_streaming(&mut manager, 64);
++		assert_output(&buffered, &repeated(&values(0..2), &values(2..10), 64));
++		gate.open();
++		let pass = rule_pass(2, 10, 4, |x| x * x);
++		render_until(&mut manager, |out| ends_with_passes(out, &pass));
++	}
++
++	#[test]
++	fn streaming_seek_into_the_fade_blends_from_that_frame() {
++		let pass = linear_pass(2, 14, 3);
++		for (target, step) in [(12.0, 1), (13.0, 2)] {
++			let (sound, log, gate) = decoded_sound(frames(16), StreamingSoundSettings::new().loop_region(samples(2..14)).loop_crossfade(crossfade(3)), Some(1));
++			let mut manager = manager();
++			let mut handle = manager.play(sound).unwrap();
++			log.wait_until(|events| events.contains(&DecoderEvent::Blocked));
++			handle.seek_to(target);
++			gate.open();
++			wait_for_frames(&log, 32);
++			let out = render_streaming(&mut manager, 32);
++			let landed = [&pass[pass.len() - 3 + step..], pass.as_slice()].concat();
++			let landing = out.windows(landed.len()).position(|w| same(w, &landed));
++			assert!(matches!(landing, Some(at) if at <= 6 && same(&out[..at], &values(0..at))), "seek to {target}: {out:?}");
++			let heard = [values(0..6), pass.clone()].concat();
++			assert!(out.iter().all(|frame| has(&heard, *frame)), "seek to {target}: {out:?}");
++		}
++	}
++
++	#[test]
++	fn streaming_seconds_are_converted_with_the_sample_rate() {
++		let mut outputs = vec![];
++		for loop_crossfade in [LoopCrossfade::from(0.5), crossfade(2)] {
++			let (sound, log, _) = decoded_sound_at(4, frames(20), StreamingSoundSettings::new().loop_region(samples(4..16)).loop_crossfade(loop_crossfade), None);
++			let mut handle = None;
++			let (_manager, out) = play_streaming(&mut handle, sound, &log, 40);
++			outputs.push(out);
++		}
++		assert_output(&outputs[0], &outputs[1]);
++	}
++
++	#[test]
++	fn streaming_set_loop_region_keeps_the_buffered_audio_then_uses_new_weights() {
++		let (sound, log, gate) = decoded_sound(frames(14), StreamingSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(3)), Some(60));
++		let mut manager = manager();
++		let mut handle = manager.play(sound).unwrap();
++		log.wait_until(|events| events.contains(&DecoderEvent::Blocked));
++		handle.set_loop_region(samples(4..12));
++		let buffered = render_streaming(&mut manager, 48);
++		assert_output(&buffered, &repeated(&values(0..5), &linear_pass(2, 8, 3), 48));
++		gate.open();
++		let pass = linear_pass(4, 12, 3);
++		render_until(&mut manager, |out| ends_with_passes(out, &pass));
++	}
++
++	#[test]
++	fn streaming_playback_rate_applies_to_the_blended_frames() {
++		let baked = data(10, StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(2))).bake_loop_crossfade();
++		let baked_frames: Vec<Frame> = (0..10).map(|i| baked.frame_at_index(i).unwrap()).collect();
++		for rate in [2.0, 1.5, 0.5] {
++			let (live, live_log) = streaming(10, StreamingSoundSettings::new().playback_rate(PlaybackRate(rate)).loop_region(samples(2..8)).loop_crossfade(crossfade(2)));
++			let (plain, plain_log, _) = decoded_sound(baked_frames.clone(), StreamingSoundSettings::new().playback_rate(PlaybackRate(rate)).loop_region(samples(4..8)), None);
++			let mut live_handle = None;
++			let (_live_manager, live_out) = play_streaming(&mut live_handle, live, &live_log, 60);
++			let mut plain_handle = None;
++			let (_plain_manager, plain_out) = play_streaming(&mut plain_handle, plain, &plain_log, 60);
++			assert_output(&live_out, &plain_out);
++		}
++	}
++}
++
++mod api {
++	use super::*;
++
++	#[test]
++	fn none_is_a_zero_linear_crossfade_and_the_settings_default() {
++		assert!(matches!(LoopCrossfade::NONE.duration, PlaybackPosition::Samples(0)) || LoopCrossfade::NONE.duration == PlaybackPosition::Seconds(0.0));
++		assert_eq!(LoopCrossfade::NONE.easing, Easing::Linear);
++		assert_eq!(StaticSoundSettings::new().loop_crossfade, LoopCrossfade::NONE);
++		assert_eq!(StaticSoundSettings::default().loop_crossfade, LoopCrossfade::NONE);
++		assert_eq!(StreamingSoundSettings::new().loop_crossfade, LoopCrossfade::NONE);
++		assert_eq!(StreamingSoundSettings::default().loop_crossfade, LoopCrossfade::NONE);
++	}
++
++	#[test]
++	fn settings_and_handles_take_seconds_positions_and_crossfades() {
++		let linear = |duration| LoopCrossfade { duration, easing: Easing::Linear };
++		let eased = LoopCrossfade { duration: PlaybackPosition::Samples(2), easing: Easing::InPowi(2) };
++		assert_eq!(LoopCrossfade::from(PlaybackPosition::Samples(3)), linear(PlaybackPosition::Samples(3)));
++		assert_eq!(LoopCrossfade::from(0.25), linear(PlaybackPosition::Seconds(0.25)));
++		assert_eq!(StaticSoundSettings::new().loop_crossfade(0.25).loop_crossfade, linear(PlaybackPosition::Seconds(0.25)));
++		assert_eq!(StaticSoundSettings::new().loop_crossfade(PlaybackPosition::Samples(3)).loop_crossfade, linear(PlaybackPosition::Samples(3)));
++		assert_eq!(StaticSoundSettings::new().loop_crossfade(eased).loop_crossfade, eased);
++		assert_eq!(StreamingSoundSettings::new().loop_crossfade(0.25).loop_crossfade, linear(PlaybackPosition::Seconds(0.25)));
++		assert_eq!(StreamingSoundSettings::new().loop_crossfade(PlaybackPosition::Samples(3)).loop_crossfade, linear(PlaybackPosition::Samples(3)));
++		assert_eq!(StreamingSoundSettings::new().loop_crossfade(eased).loop_crossfade, eased);
++		let mut manager = manager();
++		let mut static_handle = manager.play(data(10, StaticSoundSettings::new())).unwrap();
++		static_handle.set_loop_crossfade(0.25);
++		static_handle.set_loop_crossfade(PlaybackPosition::Samples(3));
++		static_handle.set_loop_crossfade(eased);
++		let (sound, _log) = streaming(10, StreamingSoundSettings::new());
++		let mut streaming_handle = manager.play(sound).unwrap();
++		streaming_handle.set_loop_crossfade(0.25);
++		streaming_handle.set_loop_crossfade(PlaybackPosition::Samples(3));
++		streaming_handle.set_loop_crossfade(eased);
++	}
++}
++
++mod stereo {
++	use super::*;
++
++	fn right(i: usize) -> f32 {
++		value(19 - i)
++	}
++
++	fn stereo_frames(n: usize) -> Vec<Frame> {
++		(0..n).map(|i| Frame::new(value(i), right(i))).collect()
++	}
++
++	fn channel(sample: impl Fn(usize) -> f32, loop_start: usize, loop_end: usize, fade: usize, total: usize) -> Vec<f32> {
++		let mut pass: Vec<f32> = (loop_start + fade..loop_end - fade).map(&sample).collect();
++		for step in 0..fade {
++			pass.push(blend(sample(loop_end - fade + step), sample(loop_start + step), weight(step, fade)));
++		}
++		let prefix: Vec<f32> = (0..loop_start + fade).map(&sample).collect();
++		repeated(&prefix, &pass, total)
++	}
++
++	fn assert_channels(out: &[(f32, f32)], loop_start: usize, loop_end: usize, fade: usize) {
++		let left: Vec<f32> = out.iter().map(|f| f.0).collect();
++		let right_out: Vec<f32> = out.iter().map(|f| f.1).collect();
++		assert_output(&left, &channel(value, loop_start, loop_end, fade, out.len()));
++		assert_output(&right_out, &channel(right, loop_start, loop_end, fade, out.len()));
++	}
++
++	#[test]
++	fn static_crossfade_blends_both_channels() {
++		for fade in [2, 3] {
++			let sound = StaticSoundData {
++				sample_rate: 1,
++				frames: stereo_frames(10).into(),
++				settings: StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(fade)),
++				slice: None,
++			};
++			let mut manager = manager();
++			manager.play(sound).unwrap();
++			assert_channels(&manager.backend_mut().render_stereo(24), 2, 8, fade);
++		}
++	}
++
++	#[test]
++	fn streaming_crossfade_blends_both_channels() {
++		for fade in [2, 3] {
++			let (sound, log, _) = decoded_sound(stereo_frames(10), StreamingSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(fade)), None);
++			let mut manager = manager();
++			let _handle = manager.play(sound).unwrap();
++			wait_for_frames(&log, 24);
++			let mut out = vec![];
++			let start = Instant::now();
++			while out.len() < 24 {
++				let frame = manager.backend_mut().render_stereo(1)[0];
++				if frame != (0.0, 0.0) || !out.is_empty() {
++					out.push(frame);
++				}
++				assert!(start.elapsed() < Duration::from_secs(60), "streaming sound never produced audio");
++			}
++			assert_channels(&out, 2, 8, fade);
++		}
++	}
++
++	#[test]
++	fn baked_frames_blend_both_channels() {
++		for fade in [2, 3] {
++			let sound = StaticSoundData {
++				sample_rate: 1,
++				frames: stereo_frames(10).into(),
++				settings: StaticSoundSettings::new().loop_region(samples(2..8)).loop_crossfade(crossfade(fade)),
++				slice: None,
++			};
++			let baked = sound.bake_loop_crossfade();
++			for (sample, pick) in [(value as fn(usize) -> f32, (|f: Frame| f.left) as fn(Frame) -> f32), (right, |f: Frame| f.right)] {
++				let actual: Vec<f32> = (0..10).map(|i| pick(baked.frame_at_index(i).unwrap())).collect();
++				let mut expected: Vec<f32> = (0..10).map(sample).collect();
++				for step in 0..fade {
++					expected[8 - fade + step] = blend(sample(8 - fade + step), sample(2 + step), weight(step, fade));
++				}
++				assert_output(&actual, &expected);
++			}
++		}
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..60e2dcf
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,105 @@
++#!/usr/bin/env bash
++set -uo pipefail
++export PATH="/opt/cargo/bin:/root/.cargo/bin:$PATH"; export CARGO_INCREMENTAL=0; export RUSTC_BOOTSTRAP=1
++FEATURES="symphonia,wav,ogg,vorbis,flac,mp3,pcm"
++MODE=""; OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++TEST_JSON="$(mktemp)"; TEST_ERR="$(mktemp)"; STATUS=0
++# The cpal backend is not built (it needs the ALSA headers, which the image does not have), so the
++# sync_send integration test, which imports kira::backend::cpal, is not part of either mode.
++case "$MODE" in
++  base) cargo test -p kira --no-default-features --features "$FEATURES" --lib --test change_sample_rate --test streaming_sound_stops_on_error -- -Z unstable-options --format json --report-time > "$TEST_JSON" 2> "$TEST_ERR"; STATUS=$? ;;
++  new)  cargo test -p kira --no-default-features --features "$FEATURES" --test loop_crossfade_8bca64 -- -Z unstable-options --format json --report-time > "$TEST_JSON" 2> "$TEST_ERR"; STATUS=$? ;;
++esac
++cat "$TEST_ERR" >&2
++NEW_TESTS="api none_is_a_zero_linear_crossfade_and_the_settings_default
++api settings_and_handles_take_seconds_positions_and_crossfades
++bake baked_frames_follow_the_rule_and_the_loop_moves_past_the_head
++bake baking_keeps_every_other_setting
++bake baking_resolves_the_slice_and_keeps_other_settings
++bake baking_shortens_a_crossfade_longer_than_half_the_loop
++bake baking_to_the_end_of_audio
++bake baking_without_loop_or_crossfade_is_an_identical_copy
++bake playing_baked_data_matches_the_live_crossfade
++chunking blend_straddling_the_internal_buffer_is_per_source_frame
++easing in_out_and_float_power_easings_follow_their_curves
++easing in_powi_two_weights_the_head_by_the_square
++easing out_powi_two_weights_the_head_by_one_minus_the_square_of_the_rest
++rate double_rate_only_ever_plays_blended_or_pure_loop_frames
++rate live_crossfade_matches_the_baked_frames_at_non_unit_rates
++reverse negative_playback_rate_blends_the_mirror_window
++reverse reverse_blends_the_mirror_window_and_wraps_before_the_tail
++reverse reversed_and_negative_rate_play_forward
++reverse seeks_while_reversed_blend_the_mirror_window_and_wrap_by_whole_loop_lengths
++seeks_and_changes removing_the_loop_region_plays_to_the_end
++seeks_and_changes seek_below_the_loop_start_wraps_forward_by_whole_loop_lengths
++seeks_and_changes seek_into_the_fade_blends_from_that_frame
++seeks_and_changes seek_past_the_loop_end_wraps_by_whole_loop_lengths
++seeks_and_changes seek_to_each_fade_step_blends_with_its_own_weight
++seeks_and_changes set_loop_crossfade_mid_pass_applies_from_the_next_frame
++seeks_and_changes set_loop_crossfade_with_an_easing_applies_its_weights
++seeks_and_changes set_loop_region_mid_pass_uses_the_new_weights_and_clamp
++static_forward blends_the_last_frames_of_the_loop_and_lands_past_the_head
++static_forward crossfade_given_in_seconds
++static_forward crossfade_without_loop_region_changes_nothing
++static_forward longer_than_half_the_loop_is_shortened_to_half
++static_forward loop_inside_a_slice_is_relative_to_the_slice
++static_forward loop_to_end_of_audio_blends_with_the_last_frames
++static_forward second_pass_repeats_the_same_blend
++static_forward seconds_are_converted_with_the_sample_rate
++static_forward zero_crossfade_plays_exactly_as_before
++stereo baked_frames_blend_both_channels
++stereo static_crossfade_blends_both_channels
++stereo streaming_crossfade_blends_both_channels
++streaming_sounds streaming_blend_matches_the_rule
++streaming_sounds streaming_crossfade_longer_than_half_the_loop_is_shortened_to_half
++streaming_sounds streaming_loop_inside_a_slice_is_relative_to_the_slice
++streaming_sounds streaming_loop_to_end_of_audio_with_easing
++streaming_sounds streaming_playback_rate_applies_to_the_blended_frames
++streaming_sounds streaming_seconds_are_converted_with_the_sample_rate
++streaming_sounds streaming_seek_into_the_fade_blends_from_that_frame
++streaming_sounds streaming_seek_past_the_loop_end_wraps_by_whole_loop_lengths
++streaming_sounds streaming_set_loop_crossfade_keeps_the_buffered_audio_then_applies
++streaming_sounds streaming_set_loop_crossfade_with_an_easing_applies_its_weights
++streaming_sounds streaming_set_loop_region_keeps_the_buffered_audio_then_uses_new_weights
++streaming_sounds streaming_start_before_the_fade_on_a_packet_boundary
++streaming_sounds streaming_start_inside_the_fade_blends_from_that_frame
++streaming_sounds streaming_startup_costs_at_most_one_extra_seek_from_any_start_position
++streaming_sounds streaming_wraps_seek_once_and_decode_forward
++streaming_sounds streaming_zero_crossfade_is_unchanged"
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  cargo2junit < "$TEST_JSON" > "$OUTPUT_PATH" 2>/dev/null || true
++  if ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++    [ "$STATUS" -eq 0 ] && STATUS=1
++    sanitized=$( { cat "$TEST_ERR"; cat "$TEST_JSON"; } | tail -c 4000 | sed -e 's/]]>/]]]]><![CDATA[>/g')
++    if [ "$MODE" = "new" ]; then
++      count=0; cases=""
++      while read -r class name; do
++        [ -n "$name" ] || continue
++        count=$((count + 1))
++        cases="${cases}    <testcase name=\"${name}\" classname=\"${class}\"><failure message=\"build failed\"><![CDATA[${sanitized}]]></failure></testcase>
++"
++      done <<< "$NEW_TESTS"
++    else
++      count=1
++      cases="    <testcase name=\"compilation\" classname=\"cargo-test\"><failure message=\"build failed\"><![CDATA[${sanitized}]]></failure></testcase>
++"
++    fi
++    {
++      printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n'
++      printf '  <testsuite name="cargo test #0" tests="%s" failures="%s" errors="0">\n' "$count" "$count"
++      printf '%s' "$cases"
++      printf '  </testsuite>\n</testsuites>\n'
++    } > "$OUTPUT_PATH"
++  fi
++fi
++exit $STATUS

@@ -1,0 +1,306 @@
+diff --git a/sfepy/solvers/ts.py b/sfepy/solvers/ts.py
+index 4b1f50ac..ab823efa 100644
+--- a/sfepy/solvers/ts.py
++++ b/sfepy/solvers/ts.py
+@@ -204,6 +204,30 @@ class VariableTimeStepper(TimeStepper):
+ 
+         self.n_step = self.step + 1
+ 
++    def set_time(self, time):
++        """
++        Move the current step to `time` without advancing.
++        """
++        if self.step > 0:
++            self.dt = time - self.times[self.step - 1]
++
++        self.time = time
++        self.times[self.step] = time
++        self.normalize_time()
++
++    def advance_to(self, time):
++        """
++        Advance to a new step at `time`, which may lie before the current one.
++        """
++        self.dt = time - self.time
++        self.step += 1
++        self.time = time
++        self.normalize_time()
++
++        self.times.append(time)
++
++        self.n_step = self.step + 1
++
+     def iter_from(self, step):
+         self.set_step(step=step)
+ 
+diff --git a/sfepy/solvers/ts_solvers.py b/sfepy/solvers/ts_solvers.py
+index c486fc39..ac438e6b 100644
+--- a/sfepy/solvers/ts_solvers.py
++++ b/sfepy/solvers/ts_solvers.py
+@@ -6,7 +6,8 @@ from functools import partial
+ import os.path as osp
+ import numpy as nm
+ 
+-from sfepy.base.base import (get_default, output, assert_, Struct)
++from sfepy.base.base import (get_default, output, assert_, Struct,
++                              IndexedStruct)
+ from sfepy.base.timing import Timer
+ from sfepy.linalg.utils import output_array_stats
+ from sfepy.solvers.solvers import TimeSteppingSolver, NonlinearSolver
+@@ -381,6 +382,256 @@ class AdaptiveTimeSteppingSolver(SimpleTimeSteppingSolver):
+                               ts.step + 1, ts.n_step),
+                verbose=self.verbose)
+ 
++def select_arc_length_root(vec_a, vec_b, dvec, dlam, ds, psi):
++    """
++    Return the corrector load factor increment satisfying the arc-length
++    constraint, or None if the constraint has no real root.
++    """
++    vec_c = dvec + vec_a
++    psi2 = psi**2
++    a1 = nm.dot(vec_b, vec_b) + psi2
++    a2 = 2.0 * (nm.dot(vec_b, vec_c) + psi2 * dlam)
++    a3 = nm.dot(vec_c, vec_c) + psi2 * dlam**2 - ds**2
++
++    disc = a2**2 - 4.0 * a1 * a3
++    if disc < 0.0:
++        return None
++
++    sq = nm.sqrt(disc)
++    roots = [(-a2 + sq) / (2.0 * a1), (-a2 - sq) / (2.0 * a1)]
++
++    def alignment(ddlam):
++        new_dvec = vec_c + ddlam * vec_b
++        return nm.dot(new_dvec, dvec) + psi2 * (dlam + ddlam) * dlam
++
++    return max(roots, key=alignment)
++
++class ArcLengthSolver(TimeSteppingSolver):
++    """
++    Quasistatic path following with the arc-length method.
++
++    The time plays the role of the load factor, so all time-dependent data of
++    the problem follow it, and the solution path can pass limit points where
++    the load factor decreases.
++    """
++    name = 'ts.arc_length'
++
++    _parameters = [
++        ('t0', 'float', 0.0, False,
++         'The initial load factor.'),
++        ('t1', 'float', 1.0, False,
++         'The target load factor.'),
++        ('ds', 'float', 0.1, False,
++         'The initial arc length.'),
++        ('ds_min', 'float', 1e-6, False,
++         'The minimum arc length.'),
++        ('ds_max', 'float', None, False,
++         'The maximum arc length, defaults to `ds`.'),
++        ('ds_red_factor', 'float', 0.5, False,
++         'The arc length reduction factor after a failed step.'),
++        ('ds_inc_factor', 'float', 1.5, False,
++         'The arc length increase factor after an easy step.'),
++        ('ds_inc_on_iter', 'int', 3, False,
++         """Increase the arc length if the corrector converged in at most this
++            number of iterations."""),
++        ('psi', 'float', 1.0, False,
++         'The load factor weight in the arc-length constraint.'),
++        ('i_max', 'int', 20, False,
++         'The maximum number of corrector iterations.'),
++        ('eps_a', 'float', 1e-10, False,
++         'The absolute residual norm tolerance of the corrector.'),
++        ('max_steps', 'int', 1000, False,
++         'The maximum number of path steps.'),
++        ('t_min', 'float', None, False,
++         'The lowest load factor allowed on the path.'),
++        ('t_max', 'float', None, False,
++         'The highest load factor allowed on the path.'),
++        ('quasistatic', 'bool', True, False,
++         'Kept for compatibility with other time-stepping solvers.'),
++    ]
++
++    def __init__(self, conf, nls=None, context=None, **kwargs):
++        TimeSteppingSolver.__init__(self, conf, nls=nls, context=context,
++                                    **kwargs)
++        if not (self.conf.ds > 0.0):
++            raise ValueError('arc length ds must be positive!')
++
++        if self.conf.t1 == self.conf.t0:
++            raise ValueError('arc length t1 must differ from t0!')
++
++        self.ts = VariableTimeStepper(self.conf.t0, self.conf.t1,
++                                      dt=self.conf.ds, is_quasistatic=True)
++        self.format = '====== load factor %e (ds %e, step %d) ====='
++        self.verbose = self.conf.verbose
++
++    def eval_at(self, ts, nls, prestep_fun, vec, lam):
++        ts.set_time(lam)
++        prestep_fun(ts, vec)
++        return nls.fun(vec)
++
++    def load_derivative(self, ts, nls, prestep_fun, vec, lam, vec_r):
++        h = 1e-7 * max(1.0, abs(lam))
++        vec_rh = self.eval_at(ts, nls, prestep_fun, vec, lam + h)
++        self.eval_at(ts, nls, prestep_fun, vec, lam)
++        return (vec_rh - vec_r) / h
++
++    def solve_linear(self, nls, vec_rhs, mtx):
++        return nls.lin_solver(vec_rhs, x0=None, mtx=mtx)
++
++    def predict(self, ts, nls, prestep_fun, vec, lam, direction, ds):
++        conf = self.conf
++        vec_r = self.eval_at(ts, nls, prestep_fun, vec, lam)
++        mtx = nls.fun_grad(vec)
++        vec_q = self.load_derivative(ts, nls, prestep_fun, vec, lam, vec_r)
++        vec_t = self.solve_linear(nls, -vec_q, mtx)
++
++        if direction is None:
++            sign = 1.0 if conf.t1 > conf.t0 else -1.0
++
++        else:
++            dvec0, dlam0 = direction
++            dot = nm.dot(vec_t, dvec0) + conf.psi**2 * dlam0
++            sign = 1.0 if dot >= 0.0 else -1.0
++
++        dlam = sign * ds / nm.sqrt(nm.dot(vec_t, vec_t) + conf.psi**2)
++        return dlam * vec_t, dlam
++
++    def correct(self, ts, nls, prestep_fun, vec0, lam0, dvec, dlam, ds):
++        conf = self.conf
++        for it in range(conf.i_max + 1):
++            vec = vec0 + dvec
++            lam = lam0 + dlam
++            vec_r = self.eval_at(ts, nls, prestep_fun, vec, lam)
++            err = nm.linalg.norm(vec_r)
++            if not nm.isfinite(err):
++                return None
++
++            if err <= conf.eps_a:
++                return vec, lam, it
++
++            if it == conf.i_max:
++                return None
++
++            mtx = nls.fun_grad(vec)
++            vec_q = self.load_derivative(ts, nls, prestep_fun, vec, lam,
++                                         vec_r)
++            vec_a = self.solve_linear(nls, -vec_r, mtx)
++            vec_b = self.solve_linear(nls, -vec_q, mtx)
++            ddlam = select_arc_length_root(vec_a, vec_b, dvec, dlam, ds,
++                                           conf.psi)
++            if ddlam is None:
++                return None
++
++            dvec = dvec + vec_a + ddlam * vec_b
++            dlam = dlam + ddlam
++
++    def land(self, ts, nls, prestep_fun, vec, lam):
++        ts.set_time(lam)
++        prestep_fun(ts, vec)
++        status = IndexedStruct()
++        vec = nls(vec, status=status)
++        if status.condition != 0:
++            return None
++
++        return vec, status.n_iter
++
++    def output_step_info(self, ts, ds):
++        output(self.format % (ts.time, ds, ts.step), verbose=self.verbose)
++
++    @standard_ts_call
++    def __call__(self, vec0=None, nls=None, init_fun=None, prestep_fun=None,
++                 poststep_fun=None, status=None, **kwargs):
++        """
++        Follow the solution path from `t0` towards `t1`.
++        """
++        conf = self.conf
++        ts = self.ts
++        ds_max = get_default(conf.ds_max, conf.ds)
++
++        vec0 = init_fun(ts, vec0)
++        ts.set_step(0)
++        prestep_fun(ts, vec0)
++        vec = nls(vec0)
++        lam = conf.t0
++
++        path = [Struct(step=0, time=lam, ds=0.0, n_iter=0)]
++        limit_points = []
++        self.output_step_info(ts, 0.0)
++        poststep_fun(ts, vec)
++
++        ds = conf.ds
++        direction = None
++        termination = 'max_steps'
++        target_sign = nm.sign(conf.t1 - conf.t0)
++
++        while len(path) <= conf.max_steps:
++            dvec, dlam = self.predict(ts, nls, prestep_fun, vec, lam,
++                                      direction, ds)
++            out = self.correct(ts, nls, prestep_fun, vec, lam, dvec, dlam,
++                               ds)
++            if out is None:
++                ds *= conf.ds_red_factor
++                if ds < conf.ds_min:
++                    termination = 'step_floor'
++                    break
++
++                continue
++
++            new_vec, new_lam, n_iter = out
++            step_ds = ds
++            is_last = nm.sign(new_lam - conf.t1) != -target_sign
++            if is_last:
++                landed = self.land(ts, nls, prestep_fun, new_vec, conf.t1)
++                if landed is None:
++                    ds *= conf.ds_red_factor
++                    if ds < conf.ds_min:
++                        termination = 'step_floor'
++                        break
++
++                    continue
++
++                new_vec, n_iter = landed
++                new_lam = conf.t1
++                dv = new_vec - vec
++                step_ds = nm.sqrt(nm.dot(dv, dv)
++                                  + conf.psi**2 * (new_lam - lam)**2)
++
++            if (((conf.t_min is not None) and (new_lam < conf.t_min))
++                or ((conf.t_max is not None) and (new_lam > conf.t_max))):
++                termination = 'out_of_range'
++                break
++
++            new_dir = (new_vec - vec, new_lam - lam)
++            if (direction is not None) and (direction[1] * new_dir[1] < 0.0):
++                limit_points.append(path[-1].step)
++
++            direction = new_dir
++            vec, lam = new_vec, new_lam
++
++            ts.advance_to(lam)
++            prestep_fun(ts, vec)
++            path.append(Struct(step=ts.step, time=lam, ds=step_ds,
++                               n_iter=n_iter))
++            self.output_step_info(ts, step_ds)
++            poststep_fun(ts, vec)
++
++            if is_last:
++                termination = 'completed'
++                break
++
++            if n_iter <= conf.ds_inc_on_iter:
++                ds = min(ds * conf.ds_inc_factor, ds_max)
++
++        ts.set_time(lam)
++        prestep_fun(ts, vec)
++
++        if status is not None:
++            status['path'] = path
++            status['limit_points'] = limit_points
++            status['termination'] = termination
++
++        return vec
++
+ #
+ # Elastodynamics solvers.
+ #

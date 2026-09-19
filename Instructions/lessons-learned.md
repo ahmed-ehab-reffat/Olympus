@@ -1526,3 +1526,235 @@ the only difference is one test helper.
 - **Advisory description trims are not free.** The same "remove this clause" suggestion arrived in
   three consecutive rounds for a sentence that four tests depended on. Grep the suite before
   accepting a trim; Description scored 3/3 with the clause kept.
+
+
+## ray-optics-formula-conditionals (APPROVED Olympus 2026-09-14)
+
+- **Split a rule sentence with two subjects and one qualifier (L52).** "The derivative of a
+  comparison ... is 0, and the derivative of `if` is ..., except on the switching set" failed 10
+  tests in 11 of 11 runs: every agent bound "except" to `if` alone. The evaluators called it fair.
+  Move each qualifier onto the other subject; if the meaning changes, split the sentence.
+- **A regression test for every reviewer finding is a trap stack (L55).** Eleven precheck rounds,
+  thirteen real reference bugs, a test for each: batch 1 read 0/11, and removing both description
+  walls in a local re-grade still left 0/11. A reference fix does not have to become a graded
+  requirement.
+- **After an FP flag, shrink the spec before touching the tests (L53).** Probe every saved solution
+  against every stated-but-untested sentence. On batch 2 no agent was clean on all of them, so no
+  clean pass existed under that description. Deleting three clauses gave a clean pass next batch.
+- **Precision findings get scope, not tests (L54).** f32 rounding and analysis completeness were both
+  closed by narrowing a promise in meta.md. The test first written for the feasibility finding failed
+  14 of 21 saved solutions.
+- **No test may shell out to a Dockerfile-installed tool (L56).** A `naga-wasi-cli` check passed every
+  local clean-room and failed Verify Solution twice on the platform.
+- **JUnit from this jest setup puts the FILE PATH in `classname`.** Mine the `name` attribute, or every
+  test collapses into one key.
+- **Every recovery here touched meta.md, so all three batches were full price.** Route A (tests only,
+  Re-eval eligible) was built and measured, then blocked by the FP check. On a dense spec, expect the
+  first batch to force a description change, and freeze nothing else until it has.
+
+## worldengine-orographic-precipitation (APPROVED Olympus 2026-09-16)
+
+- **Placement prose rewrites existing steps (L57).** "A new winds step between plates and
+  precipitations" made all ten batch-1 agents strip the later stages from `Step.plates`, which at base
+  runs the whole pipeline. One sentence saying existing steps keep their stages, plus an end-to-end
+  plates test, fixed it (0/10 next batch).
+- **Make the Dockerfile rebuild-safe on the first draft.** The first platform build failed "not
+  rebuild-safe" because a fixture repo was cloned from a moving branch. Fetch by SHA
+  (`git fetch --depth 1 <url> <sha>` and assert `rev-parse`) and pin every pip install.
+- **Regenerate generated code with base's generator version and the repo formatter.** `World_pb2.py`
+  from the newest grpcio-tools raised the protobuf runtime floor (gencode 7.35.1 against base 6.33.1)
+  and was not ruff-formatted: two High Solution Quality findings. Use the protoc release matching the
+  base gencode header.
+- **Re-check "fails on base" after every fairness rewrite.** Twice a test reduced to repo behaviour
+  that predates the feature and went green without the solution.
+- **Pin an exposed intermediate against a golden from base, not against the implementation itself.**
+  A combination test that used the implementation's own `base_field` let a double-normalised variant
+  pass 66/66 and drew an FP-judge dissent.
+- **A grader PASS can carry a regression.** Batch 1's two 65/65 runs had the identical `Step.plates`
+  hunk; one was graded PASS_LEGITIMATE, the other FAIL_REGRESSION. Read every passer's diff for edits
+  outside the feature (L37).
+
+## cwerg-bcopy-bzero-lowering (APPROVED Olympus 2026-09-16)
+
+- **A parity promise between twin implementations is a review magnet (L60).** Python and C++ had to
+  emit identical text, so Solution Quality kept finding pre-existing py/cc and C-undefined-behaviour
+  divergences: about nine over rounds 10-27. Fix every one in the reference. Test only the ones the
+  feature's own operands reach. Adding float-DIV parity and narrow DIV/REM chains took batch 5 to 0/9.
+- **Before trimming meta.md on a concision finding, check which test leans on the sentence (L26).**
+  Cutting "work wherever they appear, however many times" left a 40-occurrence program with nothing
+  to trace to, and batch 1 read 9/10 on it.
+- **Bisect a test that kills everyone against the near-miss's own patch (L61).** A parity-only
+  coverage program killed 11/11 through a pre-existing callee-parameter widening bug. My first bisect
+  measured BASE because `git apply ... | head` gave the apply a SIGPIPE; grep for the agent's own
+  symbols before trusting a bisect.
+- **Time a cold `docker build --no-cache` (L62).** The platform's 600 s environment start includes
+  the build. 704 s failed Verify Solution with `EnvironmentStartTimeoutError`; one bind-mount RUN
+  layer took it to 413 s.
+- **Docker replay of saved solutions settled a reviewer-vs-solvability conflict.** The strict control
+  reproduced the platform's failures for 9/9 runs, so the replay rate for each candidate suite (3/9)
+  could be trusted. The accepted batch read 3/10.
+- **Keep tooling and backups outside the scratchpad.** The scratchpad was wiped mid-session and a
+  revert silently failed; `worktrees/<repo>-tools/` survived.
+
+## tippecanoe-tile-join-size-recourses (APPROVED Olympus 2026-09-16)
+
+- **In a compiled repo, make test.sh's build timestamp-proof (L63).** The Dockerfile's `.o` files and
+  binaries are tracked in the solver's sandbox. 9 of 10 agents `git restore`d them for a clean diff, a
+  plain `make` then reused the baseline `tile-join`, and 7 runs were graded against it. Use
+  `make -B <targets>` (or delete those outputs) before the tests run.
+- **Every F2P node must fail on base, with no exceptions for "preservation cells".** Two tests that
+  only re-checked existing behaviour failed Verify Solution. Give each one an assertion only the
+  feature can satisfy (a new flag, or metadata the base gets wrong).
+- **A repo golden test can depend on the host's thread count.** `allow-existing-test` matched only at
+  8 or fewer tippecanoe threads; the platform host has more. Pinning `TIPPECANOE_MAX_THREADS=8` in
+  test.sh fixed it without excluding the test.
+- **An adapter over the repo's own test runner is test surface.** Catch2 reports uncaught exceptions
+  as `<error>`, not `<failure>`, and a parsed report must never outrank a nonzero exit. Prove it by
+  making one repo test throw.
+- **When the repo's own producer cannot reach a case, hand-encode the fixture.** tippecanoe only writes
+  power-of-two layer extents, which never truncate on rescale; a 30-line MVT encoder plus a minimal
+  `.mbtiles` reached the extent-3 case a reviewer named.
+- **Derive merge order from the tool's output, never from argv.** tile-join orders same-tile inputs by
+  comparing raw tile bytes. The tie test reads the order off its own guard and accepts either.
+- **Mutation-check every coverage gap a reviewer names.** Planting exactly the wrong implementation the
+  review described (summed sizes, per-worker overwrite, per-layer ties, parsed-but-ignored option)
+  confirmed each new test killed it and that the old test did not.
+- **Contest an ENV-blocked flag with the trajectory call, not an argument.** Both contests quoted the
+  `git restore -- ... tile-join tile-join.o ...` command and its position after the last build; both
+  were upheld.
+
+## sfepy-adaptive-stepping-accounting (APPROVED Olympus 2026-09-16)
+
+- **Mine only the latest batch folder, and fingerprint runs first (L64).** The platform pool is
+  cumulative: the accepted folder re-listed the previous twelve runs under new numbers and appended
+  four. Added LOC and prompt tokens matched to the digit.
+- **A Nova 0% is not a solvability verdict when the near-misses fail stated sentences (L65).** Eleven
+  Nova runs never passed, two at 116/117; four appended runs gave both passes (Orion, Vega). Probe that
+  the near-misses truly violate the sentence, then buy stronger agents instead of cutting it.
+- **Cut an unreachable lane; do not document its base bugs.** Stating two pre-existing restart bugs in
+  meta.md (R48, R56) left batches 8 and 9 at 0/8 and 0/9. Removing the lane (19 tests, two sentences,
+  one solution file) produced near-misses in the next batch.
+- **A rollback contract over an in-place solver is a free lead wall (F-34).** 8 of 13 runs returned an
+  aliased snapshot. Test the case where nothing was accepted and the rejected solve still moved the
+  iterate.
+- **Defend a short hostile-input clause against concision reviews.** "whatever `adapt_fun` sets" was
+  flagged for removal three times and carried 7 of 13 kills.
+- **Your own docstrings are review surface.** A Solution Quality high and two FP-judge dissents read
+  the `adapt_fun` docstring we added (the built-in floor described as the floor) instead of the code.
+  Measure the claim, decline it, fix the prose.
+- **Archive exactly what was accepted.** Every accepted run executed 117 cases, so the R62 empty-log
+  test was never in the accepted artifact; the archived `test.patch` is the accepted one.
+
+## mwparserfromhell-site-aware-parsing (APPROVED Olympus 2026-09-18)
+
+- **Triage every reviewer finding about PRE-EXISTING behaviour before writing its test (L66).** Fix it
+  in the reference always; test it only if meta.md already states it. The `<ß>x</SS>` pairing test (a
+  Solution Quality finding on base code) failed 19 of 20 runs identically and read 0/20 on its own.
+- **A 0% with one near-universal same-reason failure is a fairness defect first.** Read what the
+  evaluators quote, compare it with the exact meta sentence, and find the runs whose ONLY failure is
+  that test. Here three runs were blocked by it alone.
+- **Replay before paying for a re-eval (L68).** Saved patches, the submission image, `--network none`,
+  uid 1000: the replay matched the platform re-eval's failure count on every run it kept. The pool
+  dropped one projected passer, so quote the projection against the pool.
+- **Read the passers' diffs, not just their verdicts.** Both passes made the C tokenizer call the Python
+  one (L67). It is accepted, so it is not an FP, but it means the second arm was never a trap.
+- **Validate the image as uid 1000.** Auto Review's offline non-root check failed the reference on a
+  root-owned `/app` while every root run was green; `chmod -R a+rwX /app` plus `safe.directory` fixed it,
+  and a build failure in test.sh now writes one failing JUnit case with the log.
+
+## kira-loop-crossfade (APPROVED Olympus 2026-09-18)
+
+- **Replay a same-index kill cluster before believing the pass rate (L69).** Six of seven failures hit
+  one test at frame 47 (one at 24) reading 0.0. Evaluators and the FP panel called all six fair. With
+  the required buffered prefix lowered from 48 to 12, all six agent patches passed 55/55. Accepted at
+  3/10; the fair suite reads 9/10.
+- **Do not gate one resource and assert on another (L70).** A 60-decoder-call gate plus a 48-frame
+  assertion is the reference's queueing ratio, not a contract. Round 1 had already removed a hard-coded
+  16384 buffer size for the same reason; the gate brought it back as a ratio.
+- **Run the action-ignored mutant on every "eventually" test (L71).** Four seek tests passed with the
+  seek ignored or unblended, because a loop plays the expected steady state anyway and kira repeats the
+  landing frame after a seek. Seek after the first pass, and require every heard value to be legitimate.
+- **Generate the Rust build-fail fallback's test list from a real run.** Verify Solution failed on a
+  single `cargo-test.compilation` node; cargo2junit's classname is the module path (`bake`,
+  `streaming_sounds`), and the fallback must emit every (classname, name) pair. TESTS.md has had this
+  since lyon-arcs-join; I wrote the old single-node fallback anyway.
+- **Replace event-order and internal-constant assertions with paired or gated measurements.** Seek
+  budgets became a comparison against a plain loop whose wraps land on the same output frames, plus a
+  count taken inside `play()` while a test decoder gate holds the decoder thread. Both are exact and
+  deterministic under 2x CPU oversubscription.
+- **Six tests-only review rounds (33 to 55 tests) bought FP armour, not difficulty.** None of the
+  reviewer-requested tests killed a run genuinely; the adjudicators cited them to uphold all three passes.
+
+## planetiler-custommap-schema-composition (APPROVED Olympus 2026-09-18)
+
+- **State the full call shape of every new API a test calls (L72).** "`SchemaConfig.files` returns the
+  contributing files" read as an instance accessor to 8 of 8 agents; the tests called a static
+  `files(Path)`, and one compile error in the shared test class wiped all 83 tests in every run. Batch 1
+  measured nothing. Grep test.patch for each new symbol before the first batch.
+- **A compile-wiped batch is recoverable offline (Pattern 96).** A one-line adapter to the tested shape,
+  applied over each saved patch, read 2/8 with the top killer at 5/8. The paid batch after the fix read
+  3/10 with the same top killer at 7/10.
+- **Validate the Docker image as uid 1000 as well as root.** Root-only validation hid three separate
+  blockers on a Maven reactor (DOCKER.md): a root-owned `/app`, git's dubious-ownership check killing
+  the buildnumber plugin, and root-owned `target/` trees the resource copy cannot timestamp.
+- **The grader runs in the agent's container (L73).** One agent installed an unflattened POM into the
+  local Maven repo and broke offline grading. test.sh now recognises the `${revision}` signature,
+  reinstalls offline with `-Pflatten`, and retries once.
+- **Each validator fix created the next finding (L51).** Accepting bundled names in the validator
+  exposed cwd-relative examples resolution; inlining examples eagerly to fix that stopped `--watch`
+  registering a missing or malformed spec file. Register dependencies before parsing them.
+- **Never `rm -rf` the directory the shell is standing in.** A clean-room rebuild started from inside
+  the old clean room: `git clone` failed on `getcwd`, and every later command ran nowhere. Start every
+  clean-room script with an absolute `cd` to a stable directory.
+
+## featurevisor-minimal-rebucketing (APPROVED Olympus 2026-09-19)
+
+- **A textbook algorithm is only exclusive if no sibling library ships it.** The pick before this one
+  (sfepy arc-length) cleared every repo-level gate and died at the scope gate: JAX-FEM already had the
+  corrector and loop. featurevisor passed because its hard part is the repo's own range model. Run the
+  sibling-library code search at hunt time (olympus-hunt Stage 3b).
+- **Take the core-slice precheck before building scope.** The gate passed on a 160-eff slice; every
+  later round was quality and harness work, none of it wasted on a dead pick.
+- **Verify Solution checks set hygiene, not just f2p.** Three separate failures: 18 new-mode tests that
+  already passed on base (editing an existing spec file drags its untouched cases into new mode), 314
+  phantom "extras" from repo test titles containing the grader's `::` separator, and a formatter test
+  that pinned a return shape the prose left open (Pattern 97).
+- **Fix inherited bugs you touch.** The zero rule-weight override was read with a truthiness check in
+  the repo's own code; the reference copied it and Solution Quality failed it.
+- **A tests-only Auto Review round is a re-eval, and the replay predicts it.** Six coverage and harness
+  findings cost one re-eval; the local replay said 2/11 with the same failing tests, and it was.
+- **LOC read lower on the hook than on the platform.** 164 human-effective by the hook, 207 by the
+  platform counter, passers 239 and 251; the Auto Review called the reference "well over the floor".
+
+
+## ir-sim-scenario-events (APPROVED Olympus 2026-09-19)
+
+- **Softened hunt rules found this repo.** A maintainer who builds with AI and ships weekly was a
+  reject under the old rules; as a lane-volatility note it produced an accepted pick. Re-check the
+  commit stream at submit, as the rule says.
+- **Six quality rounds before any batch were almost all reference bugs.** Eleven defects came from
+  Solution Quality, Test Quality and Auto Review; none from my own suite. Budget the rounds as
+  reference work, and take every finding into the reference.
+- **Two checkers can contradict each other.** Solution Quality required creation-time validation of
+  spawn templates; Test Quality then called that test unfair. The description decided it: one more
+  noun in the validation sentence (Pattern 98).
+- **A reviewer-requested regression test can zero the batch.** The id-rewind test killed 11/11 in the
+  replay, so the fix shipped without it (L76). The FP panel still probed the passer on it and the
+  adjudicator ruled the probe unfair.
+- **Keep tooling out of /tmp.** The venv under the session temp dir was wiped overnight; the rebuilt one
+  lives in `worktrees/_probe/`.
+- **Replay before every re-eval.** The saved batch-1 patches predicted the accepted re-eval exactly:
+  1/11, same failing tests in every run (L68).
+
+## featurevisor-target-specialization (APPROVED Olympus 2026-09-19)
+
+- **A reviewer's High finding in your reference can be a bug every agent shares.** The scalar-JSON
+  condition parser (`JSON.stringify("*")` from the builder) was in 10/10 batch-1 solutions and the
+  reference. Replay the saved runs against the regression test BEFORE choosing re-eval: here it would
+  have read 0/10. One meta clause naming the root cause plus a fresh batch read 3/10 (L77).
+- **Removing superseded repo specs is survivable but costs one cheat verdict per batch (L78).** 24 specs
+  pinned the old broadening behaviour; one run per batch "fixed" them itself and was graded PASS_CHEATED.
+- **Clean-room Docker needs a real clone.** A `git worktree` puts a `.git` pointer file to a host path in
+  the build context, so `git apply` inside the container fails.
+- **Assert what the contract states, not the residual it leaves.** Exact residual trees (`{not:["beta"]}`)
+  were relaxed to kept-key sets; the SDK-equivalence check covers correctness of the residual.

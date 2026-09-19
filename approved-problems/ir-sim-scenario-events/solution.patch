@@ -1,0 +1,616 @@
+diff --git a/docs/source/yaml_config/configuration.md b/docs/source/yaml_config/configuration.md
+index f92f467..2fe604e 100644
+--- a/docs/source/yaml_config/configuration.md
++++ b/docs/source/yaml_config/configuration.md
+@@ -6,7 +6,7 @@ The configuration file is a YAML file to initialize the environment. It contains
+ 
+ ## Configuration Overview
+ 
+-A complete IR-SIM scene is described by up to five top-level keys: `world`, `robot`, `obstacle`, `gui`, and `custom`. **`robot` and `obstacle` accept the same per-object keys**, while factory defaults can differ by object type and kinematics, such as `role`, color, state dimension, and image description. Expand the interactive tree below to explore every key with its type and default; every key is optional unless its default is `unset`. Click a section's **full docs ›** link to jump to the detailed description.
++A complete IR-SIM scene is described by up to six top-level keys: `world`, `robot`, `obstacle`, `gui`, `custom`, and `events`. **`robot` and `obstacle` accept the same per-object keys**, while factory defaults can differ by object type and kinematics, such as `role`, color, state dimension, and image description. Expand the interactive tree below to explore every key with its type and default; every key is optional unless its default is `unset`. Click a section's **full docs ›** link to jump to the detailed description.
+ 
+ In a combined configuration for multiple simulators, these keys may be nested under an optional top-level `irsim` mapping. IR-SIM reads and validates that mapping while leaving sibling simulator sections untouched. The filename passed to `irsim.make()` and used by `env.reload()` does not change.
+ 
+@@ -1715,6 +1715,33 @@ step_time = env.config["world"]["step_time"]
+ 
+ Nothing inside `custom` is validated, nesting is free, and the section defaults to `{}` when the scenario omits it. `env.reload()` re-reads it with the rest of the file.
+ 
++## Events Configuration
++
++(events-parameters)=
++### Scenario Events
++
++`events` lets a scenario change itself while it runs. It is a list; each event pairs a `when` condition with a `do` action (or a list of actions) and is checked at the end of every step that advances the simulation, after collisions and arrivals are updated.
++
++```yaml
++events:
++  - name: release
++    when: {all: [{time: 2.0}, {not: {collision: robot_0}}]}
++    do:
++      - spawn: {obstacle: {name: crate, shape: {name: 'circle', radius: 0.3}, state: [5, 5, 0]}}
++      - goal: {object: robot_0, goal: [9, 9, 0]}
++  - when: {enter: {object: robot_0, region: [4, 4, 6, 6]}}
++    repeat: true
++    cooldown: 10
++    do: {delete: crate_1}
++```
++
++- `name` (str/`event_<index>`): Name recorded in `env.event_log`.
++- `repeat` (bool/`False`), `cooldown` (int/`1`), `delay` (int/`0`): A repeating event fires again once at least `cooldown` steps have passed; `delay` runs the actions that many steps after firing.
++- Conditions: `time`, `arrive`, `collision`, `distance: {objects: [a, b], below: d}`, `enter`/`leave: {object, region: [xmin, ymin, xmax, ymax]}`, and `all`, `any`, `not` to combine them. A condition about a missing object is false.
++- Actions: `spawn: {robot: {...}}` or `spawn: {obstacle: {...}}` with the keys of a `robot`/`obstacle` entry, `delete: <name>`, `goal: {object, goal}` and `pause: true`.
++
++Unknown keys raise `ValueError` when the environment is created. `env.event_log` lists `(time, name)` for every run of an event's actions. `env.reset()` removes what events spawned, brings back what they deleted and starts every event over; `env.reset(random=True)` and `env.reload()` start the events over as well.
++
+ ## Configuration Examples
+ 
+ Let's explore various configuration examples to demonstrate the flexibility and power of IR-SIM:
+diff --git a/irsim/env/env_base.py b/irsim/env/env_base.py
+index c5d2f01..ee5454b 100644
+--- a/irsim/env/env_base.py
++++ b/irsim/env/env_base.py
+@@ -28,6 +28,7 @@ from irsim.config.env_param import EnvParam
+ from irsim.config.path_param import PathManager
+ from irsim.config.world_param import WorldParam
+ from irsim.env.env_config import EnvConfig
++from irsim.env.env_events import EventManager
+ from irsim.gui.mouse_control import MouseControl
+ from irsim.lib import random_generate_polygon
+ from irsim.msg import ObjectState, Odometry, WorldState
+@@ -223,6 +224,8 @@ class EnvBase:
+         self.build_tree()
+         self._env_param.objects = self._objects
+         self.validate_unique_names()
++        self._events = EventManager.from_parse(self.env_config.parse["events"])
++        self._events.bind(self)
+ 
+         self.keyboard = None
+         self.mouse = None
+@@ -398,6 +401,7 @@ class EnvBase:
+         self._objects_sensor_step()
+         self._world.step(self.objects)
+         self._status_step()
++        self._events.step(self)
+ 
+     def _objects_step(self, action: list[Any], sensor_step: bool = True) -> None:
+         """Advance all objects by one step with corresponding actions.
+@@ -541,12 +545,13 @@ class EnvBase:
+         """
+         Assign the group action to the action list.
+         """
+-        group_actions = [
+-            ga for group in self._object_groups for ga in group.gen_group_vel()
+-        ]
+-        for i, (a, ga) in enumerate(zip(action, group_actions, strict=False)):
+-            if a is None and ga is not None:
+-                action[i] = ga
++        positions = {id(obj): i for i, obj in enumerate(self.objects)}
++        for group in self._object_groups:
++            group_actions = group.gen_group_vel()
++            for member, ga in zip(group.members, group_actions, strict=False):
++                i = positions.get(id(member))
++                if i is not None and i < len(action) and action[i] is None:
++                    action[i] = ga
+ 
+         return action
+ 
+@@ -889,9 +894,11 @@ class EnvBase:
+             self._rebuild_from_cached_parse()
+             return
+ 
++        self._events.undo(self)
+         self._reset_all()
+         self._world.reset()
+         self.refresh()
++        self._events.rearm_positions(self)
+         self.reset_plot()
+         self.set_status("Reset")
+         self.pause_flag = False
+@@ -1052,8 +1059,8 @@ class EnvBase:
+             world_name (str): Optional name/path of the world YAML to reload.
+                 If ``None``, the previous YAML file is used.
+         """
+-        self._restart_object_ids()
+         self.reset()
++        self._restart_object_ids()
+         if self._env_plot is not None:
+             self._env_plot.clear_components("all", self.objects)
+         (
+@@ -1070,6 +1077,8 @@ class EnvBase:
+         self.build_tree()
+         self.validate_unique_names()
+         self._env_param.objects = self._objects
++        self._events = EventManager.from_parse(self.env_config.parse["events"])
++        self._events.bind(self)
+         self.reload_flag = False
+ 
+     def _rebuild_from_cached_parse(self) -> None:
+@@ -1097,6 +1106,8 @@ class EnvBase:
+         self.build_tree()
+         self.validate_unique_names()
+         self._env_param.objects = self._objects
++        self._events = EventManager.from_parse(self.env_config.parse["events"])
++        self._events.bind(self)
+         self.set_status("Reset")
+         self.pause_flag = False
+         self.debug_flag = False
+@@ -1649,7 +1660,7 @@ class EnvBase:
+ 
+         Returns:
+             dict: Parsed configuration, keyed by section - ``world``, ``gui``,
+-            ``robot``, ``obstacle`` and ``custom``.
++            ``robot``, ``obstacle``, ``custom`` and ``events``.
+ 
+         Example:
+             >>> env.config["world"]["step_time"]
+@@ -1673,6 +1684,16 @@ class EnvBase:
+         """
+         return self._world.status
+ 
++    @property
++    def event_log(self) -> list[tuple[float, str]]:
++        """
++        Get the runs of scenario events since the environment was built or last reset.
++
++        Returns:
++            list: ``(time, event name)`` pairs, one per run of an event's actions.
++        """
++        return self._events.log
++
+     @property
+     def robot(self) -> ObjectBase:
+         """
+diff --git a/irsim/env/env_config.py b/irsim/env/env_config.py
+index 48a11f7..316074a 100644
+--- a/irsim/env/env_config.py
++++ b/irsim/env/env_config.py
+@@ -65,6 +65,7 @@ class EnvConfig:
+             # carry the values a user's own code needs beside the ones IR-SIM
+             # interprets.
+             "custom": {},
++            "events": [],
+         }
+ 
+         self.world_file_path = self.world_file_path
+diff --git a/irsim/env/env_events.py b/irsim/env/env_events.py
+new file mode 100644
+index 0000000..b5954a5
+--- /dev/null
++++ b/irsim/env/env_events.py
+@@ -0,0 +1,436 @@
++"""Scenario events declared in the ``events`` section of a world YAML.
++
++An event pairs a condition over the simulation state with actions that change
++the scene. Events are checked at the end of every step that advances the
++simulation, and everything they change is undone by ``EnvBase.reset``.
++"""
++
++from __future__ import annotations
++
++import copy
++import difflib
++import itertools
++from dataclasses import dataclass, field
++from typing import TYPE_CHECKING, Any
++
++import numpy as np
++
++from irsim.world.object_base import ObjectBase
++from irsim.world.object_group import ObjectGroup
++
++if TYPE_CHECKING:
++    from irsim.env.env_base import EnvBase
++
++EVENT_KEYS = ("name", "when", "do", "repeat", "cooldown", "delay")
++CONDITION_KEYS = (
++    "time",
++    "arrive",
++    "collision",
++    "enter",
++    "leave",
++    "distance",
++    "all",
++    "any",
++    "not",
++)
++ACTION_KEYS = ("spawn", "delete", "goal", "pause")
++SPAWN_ROLES = ("robot", "obstacle")
++SPAWN_KEYS = tuple(sorted(ObjectBase._VALID_PARAMS - {"role"}))
++
++
++def _unknown_key_error(kind: str, key: Any, valid: tuple[str, ...]) -> ValueError:
++    """Build the error for a key that is not part of the event schema."""
++    matches = difflib.get_close_matches(str(key), valid, n=3, cutoff=0.6)
++    if matches:
++        hint = f". Did you mean: {', '.join(matches)}?"
++    else:
++        hint = f". Valid keys: {', '.join(valid)}"
++    return ValueError(f"Unknown event {kind} '{key}'{hint}")
++
++
++def _single_entry(kind: str, spec: Any, valid: tuple[str, ...]) -> tuple[str, Any]:
++    """Return the only ``(key, value)`` pair of a condition or action mapping."""
++    if not isinstance(spec, dict) or len(spec) != 1:
++        raise ValueError(
++            f"An event {kind} must be a mapping with one key, got {spec!r}"
++        )
++    key, value = next(iter(spec.items()))
++    if key not in valid:
++        raise _unknown_key_error(kind, key, valid)
++    return key, value
++
++
++def _payload(kind: str, value: Any, keys: tuple[str, ...]) -> dict[str, Any]:
++    """Check that a condition or action argument has exactly ``keys``."""
++    if not isinstance(value, dict):
++        raise ValueError(f"'{kind}' needs a mapping with {', '.join(keys)}")
++    for key in value:
++        if key not in keys:
++            raise _unknown_key_error(f"'{kind}' key", key, keys)
++    missing = [key for key in keys if key not in value]
++    if missing:
++        raise ValueError(f"'{kind}' is missing {', '.join(missing)}")
++    return value
++
++
++def _number(kind: str, value: Any) -> float:
++    """Read a numeric argument of a condition."""
++    if isinstance(value, bool) or not isinstance(value, int | float):
++        raise ValueError(f"'{kind}' needs a number, got {value!r}")
++    return float(value)
++
++
++def _name(kind: str, value: Any) -> str:
++    """Read an object name argument."""
++    if not isinstance(value, str):
++        raise ValueError(f"'{kind}' needs an object name, got {value!r}")
++    return value
++
++
++def _region(value: Any) -> tuple[float, float, float, float]:
++    """Validate a ``[xmin, ymin, xmax, ymax]`` region."""
++    if not isinstance(value, list | tuple) or len(value) != 4:
++        raise ValueError(
++            f"An event region must be [xmin, ymin, xmax, ymax], got {value!r}"
++        )
++    xmin, ymin, xmax, ymax = (_number("region", v) for v in value)
++    return xmin, ymin, xmax, ymax
++
++
++def parse_condition(spec: Any) -> tuple[str, Any]:
++    """Validate a condition mapping and return it as a ``(kind, argument)`` tree."""
++    kind, value = _single_entry("condition", spec, CONDITION_KEYS)
++    if kind in ("all", "any"):
++        if not isinstance(value, list) or not value:
++            raise ValueError(f"'{kind}' needs a non-empty list of conditions")
++        return kind, [parse_condition(item) for item in value]
++    if kind == "not":
++        return kind, parse_condition(value)
++    if kind == "time":
++        return kind, _number(kind, value)
++    if kind in ("arrive", "collision"):
++        return kind, _name(kind, value)
++    if kind in ("enter", "leave"):
++        value = _payload(kind, value, ("object", "region"))
++        return kind, (_name(kind, value["object"]), _region(value["region"]))
++    value = _payload(kind, value, ("objects", "below"))
++    names = value["objects"]
++    if not isinstance(names, list | tuple) or len(names) != 2:
++        raise ValueError("'distance' needs exactly two object names")
++    first, second = (_name(kind, name) for name in names)
++    return kind, (first, second, _number(kind, value["below"]))
++
++
++def parse_action(spec: Any) -> tuple[str, Any]:
++    """Validate an action mapping and return it as ``(kind, argument)``."""
++    kind, value = _single_entry("action", spec, ACTION_KEYS)
++    if kind == "spawn":
++        role, template = _single_entry("spawn role", value, SPAWN_ROLES)
++        if not isinstance(template, dict):
++            raise ValueError("A spawned object must be given as a mapping")
++        for key in template:
++            if key not in SPAWN_KEYS:
++                raise _unknown_key_error(f"'{role}' key", key, SPAWN_KEYS)
++        return kind, (role, template)
++    if kind == "goal":
++        value = _payload(kind, value, ("object", "goal"))
++        return kind, (_name(kind, value["object"]), value["goal"])
++    if kind == "delete":
++        return kind, _name(kind, value)
++    if not isinstance(value, bool):
++        raise ValueError(f"'pause' takes true or false, got {value!r}")
++    return kind, value
++
++
++def _non_negative_steps(value: Any, key: str, minimum: int) -> int:
++    """Validate a step count of an event."""
++    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
++        raise ValueError(f"Event '{key}' must be an integer of at least {minimum}")
++    return value
++
++
++@dataclass
++class ScenarioEvent:
++    """One validated event of the ``events`` section."""
++
++    name: str
++    condition: tuple[str, Any]
++    actions: list[tuple[str, Any]]
++    repeat: bool = False
++    cooldown: int = 1
++    delay: int = 0
++    armed: bool = True
++    last_fired: int | None = None
++    spawn_count: int = 0
++
++    @classmethod
++    def from_spec(cls, index: int, spec: Any) -> ScenarioEvent:
++        """Validate one entry of the ``events`` list."""
++        if not isinstance(spec, dict):
++            raise ValueError(f"Event {index} must be a mapping, got {spec!r}")
++        for key in spec:
++            if key not in EVENT_KEYS:
++                raise _unknown_key_error("key", key, EVENT_KEYS)
++        if "when" not in spec or "do" not in spec:
++            raise ValueError(f"Event {index} needs both 'when' and 'do'")
++        actions = spec["do"] if isinstance(spec["do"], list) else [spec["do"]]
++        if not actions:
++            raise ValueError(f"Event {index} has no actions")
++        return cls(
++            name=str(spec.get("name", f"event_{index}")),
++            condition=parse_condition(spec["when"]),
++            actions=[parse_action(action) for action in actions],
++            repeat=bool(spec.get("repeat", False)),
++            cooldown=_non_negative_steps(spec.get("cooldown", 1), "cooldown", 0),
++            delay=_non_negative_steps(spec.get("delay", 0), "delay", 0),
++        )
++
++    def rearm(self) -> None:
++        """Forget every firing, so the event behaves as in a fresh run."""
++        self.armed = True
++        self.last_fired = None
++        self.spawn_count = 0
++
++    def due(self, count: int) -> bool:
++        """Whether the event may fire at the check of step ``count``."""
++        if not self.armed:
++            return False
++        return self.last_fired is None or count - self.last_fired >= self.cooldown
++
++
++class _IdAllocator:
++    """Hands out object ids, remembering the highest one given outside spawns.
++
++    Objects created through ``env.create_robot`` or ``env.create_obstacle``
++    keep their id even before they are added, so a reset may only rewind the
++    ids that events handed to the objects they spawned.
++    """
++
++    def __init__(self, start: int) -> None:
++        self._ids = itertools.count(start)
++        self.spawning = False
++        self.external_next = start
++
++    def __iter__(self) -> _IdAllocator:
++        return self
++
++    def __next__(self) -> int:
++        value = next(self._ids)
++        if not self.spawning:
++            self.external_next = max(self.external_next, value + 1)
++        return value
++
++
++@dataclass
++class _Pending:
++    """Actions of a delayed firing, waiting for their step."""
++
++    run_at: int
++    event: ScenarioEvent
++
++
++@dataclass
++class EventManager:
++    """Checks the scenario events of an environment and undoes their effects.
++
++    The manager keeps what its events changed in the scene: the objects they
++    spawned, the objects they deleted with the place each one had in the
++    object list, and the id the scene hands out next, so that
++    ``EnvBase.reset`` can return the scene to the state it was built in.
++    """
++
++    events: list[ScenarioEvent] = field(default_factory=list)
++    log: list[tuple[float, str]] = field(default_factory=list)
++    _pending: list[_Pending] = field(default_factory=list)
++    _spawned: list[ObjectBase] = field(default_factory=list)
++    _deleted: list[tuple[int, ObjectBase]] = field(default_factory=list)
++    _positions: dict[int, np.ndarray] = field(default_factory=dict)
++    _ids: _IdAllocator = field(default_factory=lambda: _IdAllocator(0))
++    _pause: bool = False
++
++    @classmethod
++    def from_parse(cls, raw: Any) -> EventManager:
++        """Build a manager from the raw ``events`` section of a world YAML."""
++        if not isinstance(raw, list):
++            raise ValueError("The 'events' section must be a list of events")
++        return cls(
++            events=[ScenarioEvent.from_spec(i, spec) for i, spec in enumerate(raw)]
++        )
++
++    def bind(self, env: EnvBase) -> None:
++        """Start tracking a freshly built scene of ``env``."""
++        self._ids = _IdAllocator(next(env.env_param.id_iter))
++        env.env_param.id_iter = self._ids
++        self._remember_positions(env)
++
++    def step(self, env: EnvBase) -> None:
++        """Run the delayed actions that are due, then check every event in order."""
++        count = env.world_param.count
++        due = [pending for pending in self._pending if pending.run_at <= count]
++        self._pending = [pending for pending in self._pending if pending.run_at > count]
++        for pending in due:
++            self._run(env, pending.event)
++
++        for event in self.events:
++            if not event.due(count) or not self._holds(env, event.condition):
++                continue
++            event.last_fired = count
++            event.armed = event.repeat
++            if event.delay:
++                self._pending.append(_Pending(count + event.delay, event))
++            else:
++                self._run(env, event)
++
++        self._remember_positions(env)
++        if self._pause:
++            self._pause = False
++            env.pause()
++
++    def undo(self, env: EnvBase) -> None:
++        """Remove what the events spawned and bring back what they deleted."""
++        objects = env.objects
++        for obj in self._spawned:
++            if any(item is obj for item in objects):
++                obj.plot_clear()
++                objects.remove(obj)
++
++        spawned_ids = {id(obj) for obj in self._spawned}
++        for index, obj in reversed(self._deleted):
++            if id(obj) in spawned_ids:
++                continue
++            objects.insert(min(index, len(objects)), obj)
++
++        next_id = max([self._ids.external_next] + [obj.id + 1 for obj in objects])
++        self._ids = _IdAllocator(next_id)
++        env.env_param.id_iter = self._ids
++
++        self._spawned.clear()
++        self._deleted.clear()
++        self._pending.clear()
++        self._pause = False
++        self.log.clear()
++        for event in self.events:
++            event.rearm()
++        _sync_groups(env)
++        env.build_tree()
++
++    def rearm_positions(self, env: EnvBase) -> None:
++        """Take the current object positions as the start of the next check."""
++        self._positions.clear()
++        self._remember_positions(env)
++
++    def _remember_positions(self, env: EnvBase) -> None:
++        self._positions = {obj.id: _centre(obj) for obj in env.objects}
++
++    def _run(self, env: EnvBase, event: ScenarioEvent) -> None:
++        for kind, argument in event.actions:
++            if kind == "spawn":
++                self._spawn(env, event, *argument)
++            elif kind == "delete":
++                self._delete(env, argument)
++            elif kind == "goal":
++                target = env.get_object_by_name(argument[0])
++                if target is not None:
++                    target.set_goal(argument[1])
++            elif argument:
++                self._pause = True
++        changed = any(kind in ("spawn", "delete") for kind, _ in event.actions)
++        if changed:
++            _sync_groups(env)
++        env.build_tree()
++        if changed:
++            env._objects_sensor_step()
++        env._status_step()
++        self.log.append((env.time, event.name))
++
++    def _spawn(
++        self, env: EnvBase, event: ScenarioEvent, role: str, template: dict
++    ) -> None:
++        spec = copy.deepcopy(template)
++        number = int(spec.get("number", 1))
++        if "name" in spec:
++            base = spec["name"]
++            spec["name"] = [
++                f"{base}_{event.spawn_count + i + 1}" for i in range(number)
++            ]
++            event.spawn_count += number
++        spec.setdefault(
++            "group", max((obj.group for obj in env.objects), default=-1) + 1
++        )
++        self._ids.spawning = True
++        try:
++            created = env.object_factory.create_object(role, **spec)
++        finally:
++            self._ids.spawning = False
++        env.add_objects(created)
++        self._spawned.extend(created)
++
++    def _delete(self, env: EnvBase, name: str) -> None:
++        objects = env.objects
++        for index, obj in enumerate(objects):
++            if obj.name == name:
++                self._deleted.append((index, obj))
++                env.delete_object(obj.id)
++                return
++
++    def _holds(self, env: EnvBase, condition: tuple[str, Any]) -> bool:
++        kind, argument = condition
++        if kind == "all":
++            return all(self._holds(env, item) for item in argument)
++        if kind == "any":
++            return any(self._holds(env, item) for item in argument)
++        if kind == "not":
++            return not self._holds(env, argument)
++        if kind == "time":
++            return env.time >= argument
++        if kind in ("arrive", "collision"):
++            obj = env.get_object_by_name(argument)
++            if obj is None:
++                return False
++            return bool(obj.arrive if kind == "arrive" else obj.collision)
++        if kind in ("enter", "leave"):
++            obj = env.get_object_by_name(argument[0])
++            if obj is None:
++                return False
++            before = self._positions.get(obj.id)
++            now_inside = _inside(_centre(obj), argument[1])
++            was_inside = now_inside if before is None else _inside(before, argument[1])
++            if kind == "enter":
++                return now_inside and not was_inside
++            return was_inside and not now_inside
++        first = env.get_object_by_name(argument[0])
++        second = env.get_object_by_name(argument[1])
++        if first is None or second is None:
++            return False
++        gap = np.linalg.norm(_centre(first) - _centre(second))
++        return bool(gap < argument[2])
++
++
++def _sync_groups(env: EnvBase) -> None:
++    """Rebuild the object groups of ``env`` from its current objects.
++
++    A group whose members are unchanged keeps its group behavior and state.
++    """
++    current = {group.group_id: group for group in env._object_groups}
++    groups = []
++    for gid in sorted({obj.group for obj in env.objects}):
++        members = [obj for obj in env.objects if obj.group == gid]
++        group = current.get(gid)
++        if (
++            group is None
++            or len(group.members) != len(members)
++            or any(a is not b for a, b in zip(group.members, members, strict=True))
++        ):
++            group = ObjectGroup(members, gid)
++        groups.append(group)
++    env._object_groups = groups
++
++
++def _centre(obj: ObjectBase) -> np.ndarray:
++    """The centre of an object's current geometry."""
++    return np.asarray(obj.centroid, dtype=float).reshape(-1)[:2]
++
++
++def _inside(point: np.ndarray, region: tuple[float, float, float, float]) -> bool:
++    xmin, ymin, xmax, ymax = region
++    return bool(xmin <= point[0] <= xmax and ymin <= point[1] <= ymax)

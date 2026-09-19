@@ -1,0 +1,907 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..bb90f05
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,31 @@
++#!/bin/bash
++set -uo pipefail
++cd "$(dirname "$0")"
++[ -f .venv/bin/activate ] && source .venv/bin/activate
++
++OUTPUT_PATH=""
++MODE=""
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path) OUTPUT_PATH="$2"; shift 2 ;;
++    base|new) MODE="$1"; shift ;;
++    *) shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++JUNIT_FLAG=""
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  JUNIT_FLAG="--junitxml=$OUTPUT_PATH"
++fi
++
++case "$MODE" in
++  base)
++    python -m pytest tests --ignore=tests/orographic_0d1f9c_test.py -v -p no:cacheprovider $JUNIT_FLAG
++    ;;
++  new)
++    python -m pytest tests/orographic_0d1f9c_test.py -v -p no:cacheprovider $JUNIT_FLAG
++    ;;
++esac
+diff --git a/tests/orographic_0d1f9c_test.py b/tests/orographic_0d1f9c_test.py
+new file mode 100644
+index 0000000..494e526
+--- /dev/null
++++ b/tests/orographic_0d1f9c_test.py
+@@ -0,0 +1,864 @@
++import contextlib
++import io
++import os
++import sys
++import tempfile
++import unittest
++
++import numpy
++import pytest
++
++from tests.draw_test import TestBase
++from worldengine.cli.main import main
++from worldengine.generation import generate_world
++from worldengine.hdf5_serialization import load_world_to_hdf5, save_world_to_hdf5
++from worldengine.image_io import PNGReader, PNGWriter
++from worldengine.model.world import GenerationParameters, Size, World
++from worldengine.simulations.basic import find_threshold_f
++from worldengine.simulations.precipitation import PrecipitationSimulation
++from worldengine.simulations.temperature import TemperatureSimulation
++from worldengine.step import Step
++
++try:
++    from worldengine.draw import draw_rainfall, draw_rainfall_on_file, draw_wind, draw_wind_on_file
++    from worldengine.simulations.moisture import transport_moisture
++    from worldengine.simulations.wind import WindSimulation
++except ImportError:
++    draw_rainfall = draw_rainfall_on_file = draw_wind = draw_wind_on_file = None
++    transport_moisture = None
++    WindSimulation = None
++
++SEA = 1.0
++MOUNTAIN = 3.0
++LOW = 1.5
++RIDGE = 2.5
++PEAK = 3.0
++OCEAN = "OCEAN"
++
++
++def make_world(rows, name="orographic", seed=7, step=None, warmth=None):
++    height = len(rows)
++    width = len(rows[0])
++    elevation = numpy.full((height, width), LOW, dtype=float)
++    ocean = numpy.zeros((height, width), dtype=bool)
++    for y, row in enumerate(rows):
++        for x, cell in enumerate(row):
++            if cell == OCEAN:
++                ocean[y, x] = True
++            elif isinstance(cell, tuple):
++                ocean[y, x] = True
++                elevation[y, x] = cell[0]
++            else:
++                elevation[y, x] = cell
++    w = World(name, Size(width, height), seed, GenerationParameters(0, SEA, step or Step.full()))
++    w.elevation = (elevation, [("sea", SEA), ("plain", 2.0), ("hill", MOUNTAIN), ("mountain", None)])
++    w.ocean = ocean
++    w.plates = numpy.zeros((height, width), dtype=int)
++    w.sea_depth = numpy.zeros((height, width), dtype=float)
++    if warmth is None:
++        warmth = numpy.where(ocean, 1.0, 0.0)
++        if warmth.min() == warmth.max():
++            warmth[0, 0] = 1.0 - warmth[0, 0]
++    w.temperature = (
++        numpy.asarray(warmth, dtype=float),
++        [
++            ("polar", 0.1),
++            ("alpine", 0.2),
++            ("boreal", 0.3),
++            ("cool", 0.4),
++            ("warm", 0.5),
++            ("subtropical", 0.6),
++            ("tropical", None),
++        ],
++    )
++    return w
++
++
++def band_world(height, width):
++    return make_world([[OCEAN] + [LOW] * (width - 1)] * height)
++
++
++def uniform_wind(world, direction, strength):
++    d = numpy.full((world.height, world.width), direction, dtype=int)
++    s = numpy.full((world.height, world.width), strength, dtype=float)
++    return d, s
++
++
++def east(world, strength=1.0):
++    return uniform_wind(world, 1, strength)
++
++
++def west(world, strength=1.0):
++    return uniform_wind(world, -1, strength)
++
++
++def calm(world):
++    return uniform_wind(world, 1, 0.0)
++
++
++def rescale(field):
++    low = field.min()
++    high = field.max()
++    return ((field - low) / (high - low)) * 2 - 1
++
++
++def rain_for(rows, wind):
++    w = make_world(rows)
++    w.wind = wind(w)
++    return transport_moisture(w)
++
++
++def with_temperature(w, seed=7):
++    TemperatureSimulation().execute(w, seed)
++    return w
++
++
++def assert_rows(test, actual, expected):
++    numpy.testing.assert_allclose(actual, numpy.asarray(expected, dtype=float), rtol=0, atol=1e-9)
++
++
++def assert_wind_at(test, world, pos, direction, strength):
++    actual_direction, actual_strength = world.wind_at(pos)
++    test.assertEqual(actual_direction, direction)
++    test.assertAlmostEqual(actual_strength, strength, places=9)
++
++
++class TestPrevailingWind(unittest.TestCase):
++    def test_height_six_gives_three_full_strength_bands_per_hemisphere(self):
++        direction, strength = WindSimulation.prevailing(band_world(6, 3))
++        assert_rows(self, direction[:, 0], [-1, 1, -1, -1, 1, -1])
++        assert_rows(self, strength[:, 0], [1, 1, 1, 1, 1, 1])
++
++    def test_height_three_rows_sit_on_band_edges_and_are_calm(self):
++        direction, strength = WindSimulation.prevailing(band_world(3, 2))
++        self.assertEqual(direction[1, 0], -1)
++        assert_rows(self, strength[:, 0], [0, 0, 0])
++
++    def test_height_twelve_rows_sit_halfway_to_band_centres(self):
++        direction, strength = WindSimulation.prevailing(band_world(12, 1))
++        assert_rows(self, direction[:, 0], [-1, -1, 1, 1, -1, -1, -1, -1, 1, 1, -1, -1])
++        assert_rows(self, strength[:, 0], [0.5] * 12)
++
++    def test_height_twenty_four_strength_rises_toward_band_centres(self):
++        direction, strength = WindSimulation.prevailing(band_world(24, 1))
++        north = [0.25, 0.75, 0.75, 0.25] * 3
++        assert_rows(self, strength[:, 0], north + north[::-1])
++        assert_rows(self, direction[:12, 0], [-1] * 4 + [1] * 4 + [-1] * 4)
++        assert_rows(self, direction[12:, 0], [-1] * 4 + [1] * 4 + [-1] * 4)
++
++    def test_equator_row_is_calm_for_odd_heights(self):
++        direction, strength = WindSimulation.prevailing(band_world(5, 4))
++        self.assertAlmostEqual(strength[2, 0], 0.0, places=9)
++        self.assertEqual(direction[2, 0], -1)
++
++    def test_rows_are_constant_across_columns_and_independent_of_width(self):
++        narrow = WindSimulation.prevailing(band_world(24, 2))
++        wide = WindSimulation.prevailing(band_world(24, 9))
++        for y in range(24):
++            self.assertTrue(numpy.all(wide[0][y] == wide[0][y, 0]))
++            self.assertTrue(numpy.all(wide[1][y] == wide[1][y, 0]))
++            self.assertEqual(narrow[0][y, 0], wide[0][y, 0])
++            self.assertAlmostEqual(narrow[1][y, 0], wide[1][y, 0], places=12)
++
++    def test_direction_values_and_strength_range(self):
++        direction, strength = WindSimulation.prevailing(band_world(37, 5))
++        self.assertEqual(set(numpy.unique(direction).tolist()), {-1, 1})
++        self.assertTrue(numpy.all(strength >= 0.0))
++        self.assertTrue(numpy.all(strength <= 1.0))
++        self.assertEqual(direction.shape, (37, 5))
++        self.assertEqual(strength.shape, (37, 5))
++
++    def test_execute_stores_the_prevailing_wind_on_the_world(self):
++        w = make_world([[OCEAN, LOW, LOW]] * 6)
++        self.assertFalse(w.has_wind())
++        WindSimulation().execute(w, 3)
++        self.assertTrue(w.has_wind())
++        direction, strength = WindSimulation.prevailing(band_world(6, 3))
++        assert_rows(self, w.wind_direction, direction)
++        assert_rows(self, w.wind_strength, strength)
++        assert_wind_at(self, w, (2, 1), 1, 1.0)
++        assert_wind_at(self, w, (0, 0), -1, 1.0)
++
++    def test_a_supplied_wind_is_kept_by_execute(self):
++        w = make_world([[OCEAN, LOW, LOW]] * 6)
++        w.wind = west(w, 0.5)
++        self.assertFalse(WindSimulation.is_applicable(w))
++        WindSimulation().execute(w, 3)
++        assert_rows(self, w.wind_direction, numpy.full((6, 3), -1))
++        assert_rows(self, w.wind_strength, numpy.full((6, 3), 0.5))
++
++    def test_strength_is_halved_over_mountains_on_land_only(self):
++        w = make_world([[OCEAN, LOW, PEAK, 3.5, RIDGE, (PEAK,)]] * 6)
++        direction, strength = WindSimulation.prevailing(w)
++        assert_rows(self, strength[0], [1, 1, 0.5, 0.5, 1, 1])
++        assert_rows(self, strength[1], [1, 1, 0.5, 0.5, 1, 1])
++        assert_rows(self, direction[0], [-1] * 6)
++        w = make_world([[OCEAN, LOW, PEAK]] * 24)
++        direction, strength = WindSimulation.prevailing(w)
++        assert_rows(self, strength[:, 2], numpy.array(([0.25, 0.75, 0.75, 0.25] * 3) * 2) * 0.5)
++        assert_rows(self, strength[:, 1], ([0.25, 0.75, 0.75, 0.25] * 3) * 2)
++
++    def test_wind_setter_rejects_wrong_shapes(self):
++        w = make_world([[OCEAN, LOW, LOW]] * 2)
++        with self.assertRaises(Exception):
++            w.wind = (numpy.ones((3, 3), dtype=int), numpy.ones((2, 3)))
++        with self.assertRaises(Exception):
++            w.wind = (numpy.ones((2, 3), dtype=int), numpy.ones((2, 2)))
++        self.assertFalse(w.has_wind())
++
++
++class TestTransportMoisture(unittest.TestCase):
++    def test_ocean_then_flat_land_eastward_decays_by_a_quarter(self):
++        rain = rain_for([[OCEAN, LOW, LOW, LOW]], east)
++        assert_rows(self, rain[0], [0, 0.25, 0.1875, 0.140625])
++
++    def test_climb_of_half_the_span_raises_the_share_to_three_quarters(self):
++        rain = rain_for([[OCEAN, LOW, RIDGE, LOW]], east)
++        assert_rows(self, rain[0], [0, 0.25, 0.5625, 0.046875])
++
++    def test_climb_is_measured_from_the_cell_the_parcel_left(self):
++        rain = rain_for([[OCEAN, LOW, RIDGE, RIDGE, LOW]], east)
++        assert_rows(self, rain[0], [0, 0.25, 0.5625, 0.046875, 0.03515625])
++        rain = rain_for([[LOW, RIDGE, RIDGE, LOW, OCEAN]], west)
++        assert_rows(self, rain[0], [0.03515625, 0.046875, 0.5625, 0.25, 0])
++
++    def test_descent_counts_as_no_climb(self):
++        rain = rain_for([[OCEAN, RIDGE, LOW, LOW]], east)
++        assert_rows(self, rain[0], [0, 0.75, 0.0625, 0.046875])
++
++    def test_climb_of_three_quarters_or_more_drains_the_parcel(self):
++        rain = rain_for([[OCEAN, PEAK, LOW, LOW]], east)
++        assert_rows(self, rain[0], [0, 1.0, 0, 0])
++        rain = rain_for([[OCEAN, 3.5, LOW]], east)
++        assert_rows(self, rain[0], [0, 1.0, 0])
++
++    def test_climbing_out_of_the_ocean_counts(self):
++        rain = rain_for([[(0.5,), LOW]], east)
++        assert_rows(self, rain[0], [0, 0.75])
++
++    def test_westward_wind_mirrors_the_eastward_case(self):
++        rain = rain_for([[LOW, RIDGE, LOW, OCEAN]], west)
++        assert_rows(self, rain[0], [0.046875, 0.5625, 0.25, 0])
++
++    def test_wrap_seam_eastward_ridge_at_column_zero(self):
++        rain = rain_for([[RIDGE, LOW, LOW, OCEAN]], east)
++        assert_rows(self, rain[0], [0.75, 0.0625, 0.046875, 0])
++
++    def test_wrap_seam_westward_ridge_at_last_column(self):
++        rain = rain_for([[OCEAN, LOW, LOW, RIDGE]], west)
++        assert_rows(self, rain[0], [0, 0.046875, 0.0625, 0.75])
++
++    def test_steady_state_row_land_before_ocean(self):
++        rain = rain_for([[LOW, LOW, OCEAN, LOW]], east)
++        assert_rows(self, rain[0], [0.1875, 0.140625, 0, 0.25])
++
++    def test_steady_state_row_land_before_ocean_westward(self):
++        rain = rain_for([[LOW, OCEAN, LOW, LOW]], west)
++        assert_rows(self, rain[0], [0.25, 0, 0.140625, 0.1875])
++
++    def test_half_strength_scales_uptake_and_rain(self):
++        rain = rain_for([[OCEAN, LOW, LOW]], lambda w: east(w, 0.5))
++        assert_rows(self, rain[0], [0, 8 / 79, 7 / 79])
++
++    def test_weak_wind_settles_to_the_steady_state_eastward(self):
++        rain = rain_for([[OCEAN, LOW, RIDGE, LOW, LOW]], lambda w: east(w, 0.2))
++        assert_rows(self, rain[0], [0, 2000 / 83397, 1900 / 27799, 1615 / 83397, 6137 / 333588])
++
++    def test_weak_wind_settles_to_the_steady_state_westward(self):
++        rain = rain_for([[LOW, LOW, RIDGE, LOW, OCEAN]], lambda w: west(w, 0.2))
++        assert_rows(self, rain[0], [6137 / 333588, 1615 / 83397, 1900 / 27799, 2000 / 83397, 0])
++
++    def test_cold_seas_give_up_less_moisture(self):
++        w = make_world([[OCEAN, LOW, OCEAN, LOW]], warmth=numpy.array([[1.0, 0.0, 0.5, 0.0]]))
++        w.wind = east(w)
++        assert_rows(self, transport_moisture(w)[0], [0, 0.25, 0, 0.21875])
++        w = make_world([[OCEAN, LOW, OCEAN, LOW]], warmth=numpy.array([[3.0, 1.0, 2.0, 1.0]]))
++        w.wind = east(w)
++        assert_rows(self, transport_moisture(w)[0], [0, 0.25, 0, 0.21875])
++
++    def test_coldest_sea_gives_nothing_and_land_warmth_is_ignored(self):
++        w = make_world([[OCEAN, LOW, LOW, OCEAN]], warmth=numpy.array([[0.0, 1.0, 0.5, 1.0]]))
++        w.wind = east(w)
++        assert_rows(self, transport_moisture(w)[0], [0, 0.25, 0.1875, 0])
++
++    def test_one_temperature_everywhere_counts_every_sea_as_warmest(self):
++        w = make_world([[OCEAN, LOW, LOW, LOW]], warmth=numpy.full((1, 4), 0.5))
++        w.wind = east(w, 0.5)
++        assert_rows(self, transport_moisture(w)[0], [0, 64 / 681, 56 / 681, 49 / 681])
++        w = make_world([[OCEAN, LOW, LOW, LOW]], warmth=numpy.full((1, 4), 0.0))
++        w.wind = east(w)
++        assert_rows(self, transport_moisture(w)[0], [0, 0.25, 0.1875, 0.140625])
++
++    def test_calm_row_drops_nothing(self):
++        rain = rain_for([[OCEAN, RIDGE, LOW]], calm)
++        assert_rows(self, rain[0], [0, 0, 0])
++
++    def test_row_without_ocean_drops_nothing(self):
++        rain = rain_for([[LOW, RIDGE, LOW, PEAK]], east)
++        assert_rows(self, rain[0], [0, 0, 0, 0])
++
++    def test_row_without_land_drops_nothing(self):
++        rain = rain_for([[OCEAN, OCEAN, OCEAN]], west)
++        assert_rows(self, rain[0], [0, 0, 0])
++
++    def test_rows_are_transported_independently(self):
++        w = make_world([[OCEAN, LOW, RIDGE, LOW], [LOW, RIDGE, LOW, OCEAN], [OCEAN, RIDGE, LOW, LOW]])
++        direction = numpy.array([[1] * 4, [-1] * 4, [1] * 4])
++        strength = numpy.array([[1.0] * 4, [1.0] * 4, [0.0] * 4])
++        w.wind = (direction, strength)
++        rain = transport_moisture(w)
++        assert_rows(self, rain[0], [0, 0.25, 0.5625, 0.046875])
++        assert_rows(self, rain[1], [0.046875, 0.5625, 0.25, 0])
++        assert_rows(self, rain[2], [0, 0, 0, 0])
++
++    def test_strength_is_read_per_cell(self):
++        w = make_world([[OCEAN, LOW, LOW]])
++        w.wind = (numpy.array([[1, 1, 1]]), numpy.array([[1.0, 0.5, 1.0]]))
++        assert_rows(self, transport_moisture(w)[0], [0, 0.125, 0.21875])
++
++    def test_span_runs_from_sea_level_to_the_mountain_start(self):
++        w = make_world([[OCEAN, RIDGE, LOW]])
++        w.elevation = (
++            w.layers["elevation"].data,
++            [("sea", SEA), ("plain", 1.5), ("hill", MOUNTAIN), ("mountain", None)],
++        )
++        w.wind = east(w)
++        assert_rows(self, transport_moisture(w)[0], [0, 0.75, 0.0625])
++
++    def test_rain_stays_within_the_unit_interval(self):
++        rng = numpy.random.RandomState(11)
++        rows = []
++        for y in range(8):
++            rows.append([OCEAN if rng.rand() < 0.3 else float(SEA + rng.rand() * 3.0) for x in range(9)])
++        w = make_world(rows, warmth=rng.rand(8, 9))
++        WindSimulation().execute(w, 1)
++        rain = transport_moisture(w)
++        self.assertTrue(numpy.all(rain >= 0.0))
++        self.assertTrue(numpy.all(rain <= 1.0))
++        self.assertEqual(rain.shape, (8, 9))
++
++
++class TestPrecipitation(unittest.TestCase):
++    def ridge_world(self, seed=7):
++        w = make_world([[OCEAN, LOW, RIDGE, LOW], [LOW, RIDGE, LOW, OCEAN]] * 3, seed=seed)
++        return with_temperature(w, seed)
++
++    def test_base_field_lies_within_the_unit_interval(self):
++        w = self.ridge_world()
++        field = PrecipitationSimulation.base_field(7, w)
++        self.assertEqual(field.shape, (6, 4))
++        self.assertTrue(numpy.all(field >= 0.0))
++        self.assertTrue(numpy.all(field <= 1.0))
++        self.assertGreater(field.max() - field.min(), 0.0)
++
++    def test_base_field_with_one_temperature_everywhere_is_finite_plain_noise(self):
++        w = make_world([[OCEAN, LOW, RIDGE, LOW, LOW, OCEAN]] * 6, warmth=numpy.full((6, 6), 0.3))
++        field = PrecipitationSimulation.base_field(3, w)
++        self.assertTrue(numpy.all(numpy.isfinite(field)))
++        self.assertAlmostEqual(field.min(), 0.0, places=12)
++        self.assertAlmostEqual(field.max(), 1.0, places=12)
++        w.wind = east(w, 0.5)
++        PrecipitationSimulation().execute(w, 3)
++        self.assertTrue(numpy.all(numpy.isfinite(w.rainfall)))
++        self.assertTrue(numpy.all(numpy.isfinite(w.precipitation)))
++
++    def test_one_cell_world_stays_finite(self):
++        for cell in (LOW, OCEAN):
++            w = make_world([[cell]])
++            field = PrecipitationSimulation.base_field(3, w)
++            self.assertTrue(numpy.all(numpy.isfinite(field)))
++            self.assertTrue(numpy.all((field >= 0.0) & (field <= 1.0)))
++            w.wind = east(w)
++            PrecipitationSimulation().execute(w, 3)
++            self.assertTrue(numpy.all(numpy.isfinite(w.precipitation)))
++            self.assertTrue(numpy.all((w.precipitation >= -1.0) & (w.precipitation <= 1.0)))
++            self.assertTrue(numpy.all(numpy.isfinite(w.rainfall)))
++
++    def test_calm_wind_gives_the_precipitation_from_before_winds(self):
++        rows = [[OCEAN, LOW, RIDGE, PEAK, LOW, OCEAN, OCEAN, LOW, RIDGE, LOW]] * 4 + [
++            [LOW, OCEAN, OCEAN, LOW, PEAK, RIDGE, LOW, OCEAN, LOW, LOW]
++        ] * 4
++        w = with_temperature(make_world(rows))
++        w.wind = calm(w)
++        PrecipitationSimulation().execute(w, 5)
++        self.assertTrue(w.has_rainfall())
++        assert_rows(self, w.rainfall, numpy.zeros((8, 10)))
++        expected = {
++            (0, 0): -0.6981563512402814,
++            (1, 3): -0.7809833432429005,
++            (3, 8): 0.9926089039796335,
++            (4, 1): -0.3912529688243147,
++            (6, 5): -0.6699005431773916,
++            (7, 9): -1.0,
++        }
++        for (y, x), value in expected.items():
++            self.assertAlmostEqual(w.precipitation[y, x], value, places=9)
++
++    def test_precipitation_is_the_rescaled_sum_of_base_field_and_rain(self):
++        w = self.ridge_world()
++        w.wind = east(w)
++        PrecipitationSimulation().execute(w, 7)
++        expected = rescale(PrecipitationSimulation.base_field(7, w) + transport_moisture(w))
++        numpy.testing.assert_allclose(w.precipitation, expected, rtol=0, atol=1e-12)
++        self.assertAlmostEqual(w.precipitation.min(), -1.0, places=12)
++        self.assertAlmostEqual(w.precipitation.max(), 1.0, places=12)
++
++    def test_precipitation_keeps_the_rain_field_as_the_rainfall_layer(self):
++        w = self.ridge_world()
++        w.wind = east(w)
++        self.assertFalse(w.has_rainfall())
++        PrecipitationSimulation().execute(w, 7)
++        self.assertTrue(w.has_rainfall())
++        numpy.testing.assert_allclose(w.rainfall, transport_moisture(w), rtol=0, atol=1e-12)
++        self.assertEqual(w.rainfall_at((2, 0)), float(w.rainfall[0, 2]))
++        self.assertGreater(w.rainfall_at((2, 0)), w.rainfall_at((3, 0)))
++        self.assertAlmostEqual(w.rainfall_at((0, 0)), 0.0, places=9)
++        w.rainfall = numpy.zeros((6, 4))
++        self.assertAlmostEqual(w.rainfall_at((2, 0)), 0.0, places=9)
++        with self.assertRaises(Exception):
++            w.rainfall = numpy.zeros((6, 5))
++
++    def test_thresholds_come_from_the_combined_field(self):
++        w = self.ridge_world()
++        w.wind = west(w)
++        PrecipitationSimulation().execute(w, 7)
++        combined = rescale(PrecipitationSimulation.base_field(7, w) + transport_moisture(w))
++        ocean = w.layers["ocean"].data
++        ths = w.precipitations_thresholds()
++        self.assertEqual([t[0] for t in ths], ["low", "med", "hig"])
++        self.assertAlmostEqual(ths[0][1], find_threshold_f(combined, 0.75, ocean), places=12)
++        self.assertAlmostEqual(ths[1][1], find_threshold_f(combined, 0.3, ocean), places=12)
++
++    def test_calm_supplied_wind_reproduces_the_plain_noise_precipitation(self):
++        w = self.ridge_world()
++        w.wind = calm(w)
++        PrecipitationSimulation().execute(w, 7)
++        expected = rescale(PrecipitationSimulation.base_field(7, w))
++        numpy.testing.assert_allclose(w.precipitation, expected, rtol=0, atol=1e-12)
++
++    def test_supplied_wind_drives_precipitation(self):
++        eastward = self.ridge_world()
++        eastward.wind = east(eastward)
++        westward = self.ridge_world()
++        westward.wind = west(westward)
++        PrecipitationSimulation().execute(eastward, 7)
++        PrecipitationSimulation().execute(westward, 7)
++        self.assertFalse(numpy.allclose(eastward.precipitation, westward.precipitation))
++        numpy.testing.assert_allclose(
++            eastward.precipitation,
++            rescale(PrecipitationSimulation.base_field(7, eastward) + transport_moisture(eastward)),
++            rtol=0,
++            atol=1e-12,
++        )
++        numpy.testing.assert_allclose(
++            westward.precipitation,
++            rescale(PrecipitationSimulation.base_field(7, westward) + transport_moisture(westward)),
++            rtol=0,
++            atol=1e-12,
++        )
++
++    def test_precipitations_step_produces_wind_and_no_erosion(self):
++        w = self.ridge_world()
++        generate_world(w, "precipitations")
++        self.assertTrue(w.has_wind())
++        self.assertTrue(w.has_precipitations())
++        self.assertFalse(w.has_watermap())
++        self.assertFalse(w.has_humidity())
++        direction, strength = WindSimulation.prevailing(w)
++        assert_rows(self, w.wind_direction, direction)
++        assert_rows(self, w.wind_strength, strength)
++
++    def test_winds_step_stops_after_the_wind_layer(self):
++        w = make_world([[OCEAN, LOW, RIDGE, LOW]] * 6, step=Step.get_by_name("winds"))
++        del w.layers["temperature"]
++        generate_world(w, "winds")
++        self.assertTrue(w.has_wind())
++        self.assertFalse(w.has_temperature())
++        self.assertFalse(w.has_precipitations())
++        direction, strength = WindSimulation.prevailing(w)
++        assert_rows(self, w.wind_direction, direction)
++        assert_rows(self, w.wind_strength, strength)
++        self.assertEqual(Step.get_by_name("winds"), Step.winds())
++        self.assertNotEqual(Step.winds(), Step.precipitations())
++        back = World.protobuf_unserialize(w.protobuf_serialize())
++        self.assertEqual(back.step, Step.winds())
++        self.assertEqual(w, back)
++
++    def test_supplied_wind_survives_the_precipitations_and_plates_steps(self):
++        rows = [[OCEAN, LOW, RIDGE, LOW], [LOW, RIDGE, LOW, OCEAN]] * 3
++        direction = numpy.array([[1, -1, 1, -1], [-1, -1, 1, 1]] * 3)
++        strength = numpy.array([[0.1, 0.35, 0.6, 0.85], [0.9, 0.65, 0.4, 0.15]] * 3)
++        for name in ("precipitations", "plates"):
++            w = make_world(rows, step=Step.get_by_name(name))
++            w.wind = (direction, strength)
++            generate_world(w, name)
++            self.assertTrue(w.has_precipitations())
++            assert_rows(self, w.wind_direction, direction)
++            assert_rows(self, w.wind_strength, strength)
++
++    def test_plates_step_keeps_every_later_stage_and_adds_wind(self):
++        rows = [[OCEAN, LOW, RIDGE, LOW], [LOW, RIDGE, LOW, OCEAN]] * 3
++        plates = make_world(rows, step=Step.plates())
++        generate_world(plates, "plates")
++        full = make_world(rows)
++        generate_world(full, "full")
++        for w in (plates, full):
++            self.assertTrue(w.has_wind())
++            self.assertTrue(w.has_rainfall())
++            self.assertTrue(w.has_precipitations())
++            self.assertTrue(w.has_watermap())
++            self.assertTrue(w.has_humidity())
++            self.assertTrue(w.has_biome())
++        assert_rows(self, plates.wind_strength, full.wind_strength)
++        assert_rows(self, plates.precipitation, full.precipitation)
++        assert_rows(self, plates.humidity, full.humidity)
++        self.assertEqual(plates.layers["biome"].data.tolist(), full.layers["biome"].data.tolist())
++
++    def test_supplied_westward_seam_survives_the_full_pipeline(self):
++        rows = [[LOW, LOW, RIDGE, OCEAN], [OCEAN, LOW, LOW, RIDGE]] * 3
++        windy = make_world(rows)
++        windy.wind = west(windy)
++        generate_world(windy, "full")
++        still = make_world(rows)
++        still.wind = calm(still)
++        generate_world(still, "full")
++        self.assertTrue(windy.has_humidity())
++        self.assertTrue(windy.has_biome())
++        assert_rows(self, windy.wind_direction, numpy.full((6, 4), -1))
++        assert_rows(self, windy.wind_strength, numpy.ones((6, 4)))
++        assert_rows(self, windy.temperature, still.temperature)
++        rain = windy.rainfall
++        self.assertGreater(rain[1, 3], rain[1, 2])
++        self.assertGreater(rain[1, 2], rain[1, 1])
++        self.assertAlmostEqual(rain[1, 0], 0.0, places=9)
++        columns = numpy.column_stack([still.precipitation.ravel(), rain.ravel(), numpy.ones(rain.size)])
++        coefficients = numpy.linalg.lstsq(columns, windy.precipitation.ravel(), rcond=None)[0]
++        numpy.testing.assert_allclose(columns @ coefficients, windy.precipitation.ravel(), rtol=0, atol=1e-9)
++
++    def test_full_pipeline_precipitation_reaches_humidity(self):
++        w = make_world([[OCEAN, LOW, RIDGE, LOW], [LOW, RIDGE, LOW, OCEAN]] * 3)
++        generate_world(w, "full")
++        self.assertTrue(w.has_rainfall())
++        self.assertGreater(w.rainfall.max(), 0.0)
++        expected = (w.precipitation - 3 * w.layers["irrigation"].data) / 4
++        numpy.testing.assert_allclose(w.humidity, expected, rtol=0, atol=1e-12)
++
++
++class TestSerialization(unittest.TestCase):
++    def wind_world(self):
++        w = make_world([[OCEAN, LOW, RIDGE, LOW], [LOW, RIDGE, LOW, OCEAN]] * 3)
++        w.wind = (numpy.array([[1, 1, 1, 1], [-1, -1, -1, -1]] * 3), numpy.array([[0.25, 0.5, 0.75, 1.0]] * 6))
++        w.rainfall = numpy.array([[0.0, 0.125, 0.25, 0.0625]] * 6)
++        return w
++
++    def test_protobuf_round_trip_keeps_direction_and_strength(self):
++        w = self.wind_world()
++        back = World.protobuf_unserialize(w.protobuf_serialize())
++        self.assertTrue(back.has_wind())
++        assert_rows(self, back.wind_direction, w.wind_direction)
++        assert_rows(self, back.wind_strength, w.wind_strength)
++        assert_wind_at(self, back, (3, 1), -1, 1.0)
++        self.assertEqual(set(w.layers.keys()), set(back.layers.keys()))
++        self.assertEqual(w.layers["wind"], back.layers["wind"])
++        self.assertTrue(back.has_rainfall())
++        assert_rows(self, back.rainfall, w.rainfall)
++        self.assertEqual(back.rainfall_at((2, 5)), 0.25)
++        self.assertEqual(w, back)
++
++    def test_hdf5_round_trip_keeps_direction_and_strength(self):
++        w = self.wind_world()
++        handle, filename = tempfile.mkstemp(suffix=".world")
++        os.close(handle)
++        try:
++            save_world_to_hdf5(w, filename)
++            back = load_world_to_hdf5(filename)
++        finally:
++            os.remove(filename)
++        self.assertTrue(back.has_wind())
++        assert_rows(self, back.wind_direction, w.wind_direction)
++        assert_rows(self, back.wind_strength, w.wind_strength)
++        self.assertEqual(set(w.layers.keys()), set(back.layers.keys()))
++        self.assertEqual(w.layers["wind"], back.layers["wind"])
++        assert_wind_at(self, back, (0, 0), 1, 0.25)
++        self.assertTrue(back.has_rainfall())
++        assert_rows(self, back.rainfall, w.rainfall)
++        self.assertEqual(w.layers["rainfall"], back.layers["rainfall"])
++
++    def test_world_without_wind_round_trips_without_wind(self):
++        w = make_world([[OCEAN, LOW, RIDGE, LOW]] * 2)
++        back = World.protobuf_unserialize(w.protobuf_serialize())
++        self.assertFalse(back.has_wind())
++        self.assertFalse(back.has_rainfall())
++        self.assertEqual(w, back)
++        handle, filename = tempfile.mkstemp(suffix=".world")
++        os.close(handle)
++        try:
++            save_world_to_hdf5(w, filename)
++            back = load_world_to_hdf5(filename)
++        finally:
++            os.remove(filename)
++        self.assertFalse(back.has_wind())
++        self.assertFalse(back.has_rainfall())
++        self.assertEqual(set(w.layers.keys()), set(back.layers.keys()))
++
++    def test_worlds_differing_only_in_wind_are_not_equal(self):
++        a = self.wind_world()
++        b = self.wind_world()
++        self.assertEqual(a, b)
++        strength = b.wind_strength.copy()
++        strength[0, 0] = 0.0
++        b.wind = (b.wind_direction, strength)
++        self.assertNotEqual(a, b)
++        c = self.wind_world()
++        direction = c.wind_direction.copy()
++        direction[0, 0] = -1
++        c.wind = (direction, c.wind_strength)
++        self.assertNotEqual(a, c)
++        d = make_world([[OCEAN, LOW, RIDGE, LOW], [LOW, RIDGE, LOW, OCEAN]] * 3)
++        self.assertNotEqual(a, d)
++        e = self.wind_world()
++        rainfall = e.rainfall.copy()
++        rainfall[0, 1] = 0.5
++        e.rainfall = rainfall
++        self.assertNotEqual(a, e)
++
++    def test_generated_world_round_trips_with_wind_in_both_formats(self):
++        w = make_world([[OCEAN, LOW, RIDGE, LOW], [LOW, RIDGE, LOW, OCEAN]] * 3)
++        generate_world(w, "full")
++        back = World.protobuf_unserialize(w.protobuf_serialize())
++        self.assertEqual(w.layers["wind"], back.layers["wind"])
++        self.assertEqual(w, back)
++        handle, filename = tempfile.mkstemp(suffix=".world")
++        os.close(handle)
++        try:
++            save_world_to_hdf5(w, filename)
++            back = load_world_to_hdf5(filename)
++        finally:
++            os.remove(filename)
++        self.assertEqual(w.layers["wind"], back.layers["wind"])
++        self.assertEqual(w.layers["precipitation"], back.layers["precipitation"])
++        self.assertEqual(w.layers["rainfall"], back.layers["rainfall"])
++        self.assertEqual(set(w.layers.keys()), set(back.layers.keys()))
++
++
++class TestOldFiles(TestBase):
++    def test_world_file_written_before_winds_loads_without_them(self):
++        w = World.open_protobuf("%s/seed_28070.world" % self.tests_data_dir)
++        self.assertFalse(w.has_wind())
++        self.assertFalse(w.has_rainfall())
++        self.assertNotIn("wind", w.layers)
++        self.assertTrue(w.has_precipitations())
++        back = World.protobuf_unserialize(w.protobuf_serialize())
++        self.assertFalse(back.has_wind())
++        self.assertEqual(w, back)
++
++
++class TestWindMap(unittest.TestCase):
++    def painted(self, black_and_white=False):
++        w = make_world([[OCEAN, LOW, LOW]] * 4)
++        w.wind = (
++            numpy.array([[1] * 3, [-1] * 3, [1] * 3, [-1] * 3]),
++            numpy.array([[1.0] * 3, [0.5] * 3, [0.0] * 3, [0.2] * 3]),
++        )
++        target = PNGWriter.rgba_from_dimensions(w.width, w.height)
++        draw_wind(w, target, black_and_white)
++        return target
++
++    def test_eastward_rows_use_the_red_channel(self):
++        target = self.painted()
++        for x in range(3):
++            self.assertEqual(list(target[0, x]), [255, 0, 0, 255])
++            self.assertEqual(list(target[2, x]), [0, 0, 0, 255])
++
++    def test_westward_rows_use_the_blue_channel(self):
++        target = self.painted()
++        for x in range(3):
++            self.assertEqual(list(target[1, x]), [0, 0, 128, 255])
++            self.assertEqual(list(target[3, x]), [0, 0, 51, 255])
++
++    def test_black_and_white_map_uses_all_three_channels(self):
++        target = self.painted(black_and_white=True)
++        self.assertEqual(list(target[0, 0]), [255, 255, 255, 255])
++        self.assertEqual(list(target[1, 1]), [128, 128, 128, 255])
++        self.assertEqual(list(target[2, 2]), [0, 0, 0, 255])
++        self.assertEqual(list(target[3, 0]), [51, 51, 51, 255])
++
++    def test_draw_wind_on_file_writes_a_readable_image(self):
++        w = band_world(6, 3)
++        WindSimulation().execute(w, 1)
++        handle, filename = tempfile.mkstemp(suffix=".png")
++        os.close(handle)
++        try:
++            draw_wind_on_file(w, filename)
++            image = PNGReader(filename)
++        finally:
++            os.remove(filename)
++        self.assertEqual(image.array.shape, (6, 3, 4))
++        self.assertEqual(list(image[0, 0]), [0, 0, 255, 255])
++        self.assertEqual(list(image[1, 0]), [255, 0, 0, 255])
++
++    def test_draw_wind_on_file_in_black_and_white(self):
++        w = make_world([[OCEAN, LOW, LOW]] * 4)
++        w.wind = (
++            numpy.array([[1] * 3, [-1] * 3, [1] * 3, [-1] * 3]),
++            numpy.array([[1.0] * 3, [0.5] * 3, [0.0] * 3, [0.2] * 3]),
++        )
++        handle, filename = tempfile.mkstemp(suffix=".png")
++        os.close(handle)
++        try:
++            draw_wind_on_file(w, filename, True)
++            image = PNGReader(filename)
++        finally:
++            os.remove(filename)
++        self.assertEqual(list(image[0, 1]), [255, 255, 255, 255])
++        self.assertEqual(list(image[1, 1]), [128, 128, 128, 255])
++        self.assertEqual(list(image[3, 2]), [51, 51, 51, 255])
++
++
++class TestRainfallMap(unittest.TestCase):
++    def test_rainfall_map_is_grey_scaled_to_255(self):
++        w = make_world([[OCEAN, LOW, LOW]] * 2)
++        w.rainfall = numpy.array([[0.0, 0.5, 1.0], [0.2, 0.75, 0.001]])
++        target = PNGWriter.rgba_from_dimensions(w.width, w.height)
++        draw_rainfall(w, target)
++        self.assertEqual(list(target[0, 0]), [0, 0, 0, 255])
++        self.assertEqual(list(target[0, 1]), [128, 128, 128, 255])
++        self.assertEqual(list(target[0, 2]), [255, 255, 255, 255])
++        self.assertEqual(list(target[1, 0]), [51, 51, 51, 255])
++        self.assertEqual(list(target[1, 1]), [191, 191, 191, 255])
++        self.assertEqual(list(target[1, 2]), [0, 0, 0, 255])
++
++    def test_draw_rainfall_on_file_writes_a_readable_image(self):
++        w = make_world([[OCEAN, LOW, RIDGE, LOW]] * 2)
++        w.wind = east(w)
++        w.rainfall = transport_moisture(w)
++        handle, filename = tempfile.mkstemp(suffix=".png")
++        os.close(handle)
++        try:
++            draw_rainfall_on_file(w, filename)
++            image = PNGReader(filename)
++        finally:
++            os.remove(filename)
++        self.assertEqual(image.array.shape, (2, 4, 4))
++        self.assertEqual(list(image[0, 1]), [64, 64, 64, 255])
++        self.assertEqual(list(image[1, 2]), [143, 143, 143, 255])
++
++
++class TestCLI(TestBase):
++    @pytest.mark.skipif(sys.platform == "win32", reason="PyPlatec has known issues on Windows")
++    def test_generation_writes_the_wind_map_and_info_reports_winds(self):
++        output_dir = tempfile.mkdtemp()
++        sys.argv = [
++            "python",
++            "-s",
++            "5",
++            "-x",
++            "16",
++            "-y",
++            "12",
++            "-q",
++            "2",
++            "-o",
++            output_dir,
++            "-n",
++            "windy",
++            "--step",
++            "winds",
++        ]
++        with contextlib.redirect_stdout(io.StringIO()):
++            main()
++        wind_png = os.path.join(output_dir, "windy_wind.png")
++        self.assertTrue(os.path.isfile(wind_png))
++        image = PNGReader(wind_png)
++        self.assertEqual(image.array.shape, (12, 16, 4))
++        generated = World.open_protobuf(os.path.join(output_dir, "windy.world"))
++        self.assertTrue(generated.has_wind())
++        self.assertFalse(generated.has_precipitations())
++        direction, strength = WindSimulation.prevailing(generated)
++        assert_rows(self, generated.wind_direction, direction)
++        assert_rows(self, generated.wind_strength, strength)
++        for y in (0, 2):
++            for x in (0, 5):
++                value = int(numpy.rint(255 * strength[y, x]))
++                expected = [value, 0, 0, 255] if direction[y, x] > 0 else [0, 0, value, 255]
++                self.assertEqual(list(image[y, x]), expected)
++        self.assertFalse(os.path.isfile(os.path.join(output_dir, "windy_precipitation.png")))
++        self.assertFalse(os.path.isfile(os.path.join(output_dir, "windy_rainfall.png")))
++        self.assertFalse(generated.has_rainfall())
++        sys.argv = ["python", "info", os.path.join(output_dir, "windy.world")]
++        captured = io.StringIO()
++        with contextlib.redirect_stdout(captured):
++            main()
++        self.assertRegex(captured.getvalue(), r"has wind\s*: True")
++        self.assertRegex(captured.getvalue(), r"has rainfall\s*: False")
++        sys.argv = ["python", "info", self.world]
++        captured = io.StringIO()
++        with contextlib.redirect_stdout(captured):
++            main()
++        self.assertRegex(captured.getvalue(), r"has wind\s*: False")
++        self.assertRegex(captured.getvalue(), r"has rainfall\s*: False")
++
++    @pytest.mark.skipif(sys.platform == "win32", reason="PyPlatec has known issues on Windows")
++    def test_winds_step_in_black_and_white_writes_a_grey_wind_map(self):
++        output_dir = tempfile.mkdtemp()
++        sys.argv = [
++            "python",
++            "-s",
++            "5",
++            "-x",
++            "16",
++            "-y",
++            "12",
++            "-q",
++            "2",
++            "-o",
++            output_dir,
++            "-n",
++            "grey",
++            "--step",
++            "winds",
++            "--bw",
++        ]
++        with contextlib.redirect_stdout(io.StringIO()):
++            main()
++        generated = World.open_protobuf(os.path.join(output_dir, "grey.world"))
++        image = PNGReader(os.path.join(output_dir, "grey_wind.png"))
++        self.assertEqual(image.array.shape, (12, 16, 4))
++        for y in (0, 2, 7):
++            for x in (0, 5, 13):
++                value = int(numpy.rint(255 * generated.wind_strength[y, x]))
++                self.assertEqual(list(image[y, x]), [value, value, value, 255])
++        self.assertGreater(generated.wind_strength.max(), 0.0)
++
++    @pytest.mark.skipif(sys.platform == "win32", reason="PyPlatec has known issues on Windows")
++    def test_full_generation_writes_the_rainfall_map(self):
++        output_dir = tempfile.mkdtemp()
++        sys.argv = ["python", "-s", "9", "-x", "16", "-y", "12", "-q", "2", "-o", output_dir, "-n", "rainy"]
++        with contextlib.redirect_stdout(io.StringIO()):
++            main()
++        generated = World.open_protobuf(os.path.join(output_dir, "rainy.world"))
++        self.assertTrue(generated.has_rainfall())
++        self.assertTrue(generated.has_wind())
++        self.assertTrue(numpy.all(generated.rainfall >= 0.0))
++        self.assertTrue(numpy.all(generated.rainfall <= 1.0))
++        self.assertGreater(generated.rainfall.max(), 0.0)
++        image = PNGReader(os.path.join(output_dir, "rainy_rainfall.png"))
++        self.assertEqual(image.array.shape, (12, 16, 4))
++        for y in (1, 7):
++            for x in (3, 11):
++                value = int(numpy.rint(255 * generated.rainfall[y, x]))
++                self.assertEqual(list(image[y, x]), [value, value, value, 255])
++        self.assertTrue(os.path.isfile(os.path.join(output_dir, "rainy_wind.png")))
++        sys.argv = ["python", "info", os.path.join(output_dir, "rainy.world")]
++        captured = io.StringIO()
++        with contextlib.redirect_stdout(captured):
++            main()
++        self.assertRegex(captured.getvalue(), r"has rainfall\s*: True")
++
++    def setUp(self):
++        super().setUp()
++        self.world = "%s/seed_28070.world" % self.tests_data_dir
++
++
++if __name__ == "__main__":
++    unittest.main()

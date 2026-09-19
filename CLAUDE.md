@@ -40,17 +40,23 @@ Latest admin update. These OVERRIDE the 2026-06-26 caps and EVERY older tier / b
 
 ---
 
-## ⚠️ RULE UPDATE 2026-08-31 — pass-rate ceiling raised to <= 50%
+## ⚠️ RULE UPDATE 2026-09-16 — pass-rate ceiling LOWERED back to <= 40%
 
-Platform raised the Olympus pass-rate MAXIMUM from 40% to **50%**. This OVERRIDES the 40% figure in
-the 2026-07 SPRINT block below and every older 20% / 30% / 40% cap anywhere in this repo.
+Platform lowered the Olympus pass-rate MAXIMUM from 50% back to **40%**. This OVERRIDES the
+2026-08-31 block it replaces (which had raised it to 50%) and every older 20% / 30% / 50% cap
+anywhere in this repo. The 2026-07 SPRINT figure (<= 40%) is live again.
 
-- **Approvable = solvable through <= 50% pass.** 0% = reject (unsolvable) is unchanged; > 50% =
+- **Approvable = solvable through <= 40% pass.** 0% = reject (unsolvable) is unchanged; > 40% =
   reject (too easy).
 - **This is a CEILING, not a target.** Per the PRIME DIRECTIVE, still design to the HARD / low-pass
-  edge: payout scales with difficulty, so a 50% submission is approvable but paid at the bottom of
+  edge: payout scales with difficulty, so a 40% submission is approvable but paid at the bottom of
   the band, and it has ZERO margin against batch-to-batch variance (measured on
   vrp-tsplib-edge-weight-types: the same artifact ran 22% in batch 9 and 50% in batch 11).
+- **A batch that read "in band" under the 50% cap may now be a too-easy reject.** Anything measured
+  at 41-50% while the 50% ceiling was live (2026-08-31 to 2026-09-16) is NOT approvable as-is —
+  harden it (`olympus-harden`) and re-measure. Historical pass rates recorded in
+  `approved-problems/`, `Instructions/`, and `failure-patterns.md` are facts about past runs, not
+  current targets.
 - Everything else in the 2026-07 SPRINT block (>= 2 files, >= 40 agent messages, >= 200 effective
   LOC, $150-350 payout, mandatory FP Check) is unchanged.
 
@@ -109,7 +115,7 @@ normal batch token price**, and much faster because nothing is solved.
   the platform telling you your lever was a description delta and the replay number would have been
   a lie.** Do not hunt for a workaround; pay for the fresh batch.
 - **The two expensive disambiguations are now cheap:**
-  - **Too easy (>50%):** tighten tests / add the discriminator, re-eval, watch the rate drop on the
+  - **Too easy (>40%):** tighten tests / add the discriminator, re-eval, watch the rate drop on the
     same solution population. Tests-only levers (F-10 cross-product cells, compound interleaves,
     per-requirement discriminators) are the cheap lane precisely because they need zero new meta.
   - **Reads unsolvable (0%):** relax or DROP the over-strict axis (L32, the gluon printer-axis move),
@@ -121,13 +127,13 @@ normal batch token price**, and much faster because nothing is solved.
   Token Rules`: solver-visible fixes still batch up, test-side fixes no longer have to.
 - **It does NOT re-roll batch variance.** A re-eval is a PAIRED re-measurement over ONE fixed set of
   solutions, so it cannot show the 22%-vs-50% swing the same artifact produced across batches
-  (vrp-tsplib-edge-weight-types). Near the 50% ceiling, and for the number you actually submit on, a
+  (vrp-tsplib-edge-weight-types). Near the 40% ceiling, and for the number you actually submit on, a
   fresh batch is still the evidence. **Re-eval to STEER, a fresh batch to CONFIRM.**
 - **FP Check fix-direction now carries a ~3.3x cost asymmetry.** Strengthening a test is
   re-eval-eligible; fixing the ambiguous description sentence is not. Take the fix the FP flag
   actually calls for, never the cheap one, but do ALL description-side work in one round before
-  paying for the batch. UNCONFIRMED: whether the FP panel itself re-runs under re-eval. Check on
-  first use and record the answer here.
+  paying for the batch. CONFIRMED 2026-09-18 (mwparserfromhell-site-aware-parsing): the FP panel
+  produced fresh adjudications for the passes of a re-eval batch, which was then accepted.
 
 ---
 
@@ -672,7 +678,7 @@ Olympus solvability **cannot be bypassed**. If 0% across runs, redesign or downg
 
 **A batch may MIX agents** — the 10-run solvability gate does not require 10 of the same agent (e.g. 2 Orion + 8 Nova is a valid batch). Mix to control cost: put the expensive agent where it discriminates and fill the rest with the cheap one.
 
-**⭐ Budget consequence — design to a pass rate you can AFFORD to measure.** At 24-32 tokens/run a 10-run batch costs 240-320 tokens, and a problem designed at the ~10% band is statistically indistinguishable from 0% (unsolvable = reject) in any batch small enough to afford. When only expensive agents are unlocked, target the middle of the band (~25-35%), which shows a pass within 3-4 runs and still keeps margin under the 50% ceiling. When cheap Nova is available, mix it in and the low-pass edge becomes measurable again. Do NOT burn a second full batch just to disambiguate 0% from 10%.
+**⭐ Budget consequence — design to a pass rate you can AFFORD to measure.** At 24-32 tokens/run a 10-run batch costs 240-320 tokens, and a problem designed at the ~10% band is statistically indistinguishable from 0% (unsolvable = reject) in any batch small enough to afford. When only expensive agents are unlocked, target the middle of the band (~20-30%), which shows a pass within 3-4 runs and still keeps margin under the 40% ceiling. When cheap Nova is available, mix it in and the low-pass edge becomes measurable again. Do NOT burn a second full batch just to disambiguate 0% from 10%.
 
 **⭐ Re-eval changes the ITERATION half of this math (2026-09-03).** The FIRST batch is still full price, but every later round that touches only `test.patch` / `solution.patch` re-grades at ~30% (a 10-Orion batch: 240 tokens down to ~72). So the expensive thing is now the SOLVER-VISIBLE surface, not the number of rounds: settle `meta.md` + Dockerfile + base commit before the first batch, then steer with re-eval. It is a paired re-measurement on a fixed solution set, so it steers but does not confirm — see `## ⚠️ RULE UPDATE 2026-09-03`.
 

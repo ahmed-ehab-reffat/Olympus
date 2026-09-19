@@ -1,0 +1,16 @@
+---
+Repository: https://github.com/Mindwerks/worldengine
+Issue: N/A
+Commit: b2adbb674afb381232097f126e548a8c133e4633
+Language: Python
+Category: feature-request
+Title: Add prevailing winds and orographic precipitation to the climate pipeline
+---
+
+# Add prevailing winds and orographic precipitation to the climate pipeline
+
+Add prevailing winds and orographic precipitation to the climate pipeline. Give every world a wind layer with a direction and a strength per cell. A row's latitude is the row's centre measured from the north pole. The distance from the equator splits each hemisphere into three equal bands: the bands nearest the equator and the pole blow westward, the middle band eastward, eastward meaning increasing column index. Strength rises linearly from zero at a band's edges to one at its centre, and is halved on land at or above the elevation where mountains start. `WindSimulation` sits beside the other simulations, its `prevailing` method returns both arrays for a world, and the world gets a `wind` setter taking them plus `wind_direction`, `wind_strength`, `has_wind` and `wind_at`, which returns a cell's direction and strength as a tuple. Direction is 1 eastward and -1 westward.
+
+Moisture travels along each row in its wind direction. A cell's warmth is its temperature scaled between the world's coldest and warmest cell, or one when all cells share a temperature. Over an ocean cell a parcel takes up a share of the moisture it lacks equal to strength times warmth, and drops nothing. Over a land cell it drops a share of what it carries equal to strength times the smaller of one and a quarter plus its climb. The climb is the elevation gained from the cell it just left, zero when descending, divided by the distance from sea level to where mountains start. The rain lands on the cell being crossed. Rows are loops: what leaves the last column enters the first, and the moisture entering each cell is the steady state of a parcel circling the row forever, the amount one more lap would bring back unchanged. `transport_moisture` in a new moisture module returns that rain field, between zero and one. The precipitation simulation keeps that field on the world as a `rainfall` layer with `has_rainfall` and `rainfall_at`. Expose the warmth-curved noise as `PrecipitationSimulation.base_field(seed, world)`, returning values between zero and one. The rain field is added to it with equal weight before the final rescaling to minus one to one, so the thresholds and every later stage see the combined field. Calm winds everywhere give today's precipitation.
+
+A new winds step stops after the wind layer. The plates, precipitations and full steps keep every stage they run today and also produce winds, and a world that already carries winds keeps them. Winds and rainfall round-trip through the protobuf and HDF5 formats and take part in world equality, and world files written before them still load and report neither. `draw_wind` paints each cell with the strength scaled to 255 and rounded, red for eastward cells, blue for westward, all three channels in black and white mode, and `draw_rainfall` paints the rainfall the same way in grey. Generation writes both maps with the wind and rainfall suffixes, and the info operation reports whether a world has each.

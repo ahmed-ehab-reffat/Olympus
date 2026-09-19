@@ -1,0 +1,759 @@
+diff --git a/crates/kira/src/sound.rs b/crates/kira/src/sound.rs
+index 53e5a75..dfc9145 100644
+--- a/crates/kira/src/sound.rs
++++ b/crates/kira/src/sound.rs
+@@ -32,7 +32,7 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
+ pub use error::*;
+ pub use playback_position::*;
+ 
+-use crate::{frame::Frame, info::Info};
++use crate::{Easing, frame::Frame, info::Info};
+ 
+ /// A source of audio that is loaded, but not yet playing.
+ pub trait SoundData {
+@@ -192,6 +192,57 @@ impl IntoOptionalRegion for Option<Region> {
+ 	}
+ }
+ 
++/// A crossfade applied where a loop region wraps around.
++///
++/// The last frames before the wrap are blended with the frames
++/// just past it, and the wrap then lands past those frames.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct LoopCrossfade {
++	/// How much audio is blended across the wrap.
++	pub duration: PlaybackPosition,
++	/// The curve of the blend.
++	pub easing: Easing,
++}
++
++impl LoopCrossfade {
++	/// No crossfade.
++	pub const NONE: Self = Self {
++		duration: PlaybackPosition::Samples(0),
++		easing: Easing::Linear,
++	};
++
++	pub(crate) fn frames(self, sample_rate: u32) -> usize {
++		self.duration.into_samples(sample_rate)
++	}
++}
++
++impl Default for LoopCrossfade {
++	fn default() -> Self {
++		Self::NONE
++	}
++}
++
++impl From<PlaybackPosition> for LoopCrossfade {
++	fn from(duration: PlaybackPosition) -> Self {
++		Self {
++			duration,
++			easing: Easing::Linear,
++		}
++	}
++}
++
++impl From<f64> for LoopCrossfade {
++	fn from(seconds: f64) -> Self {
++		PlaybackPosition::Seconds(seconds).into()
++	}
++}
++
++impl From<std::time::Duration> for LoopCrossfade {
++	fn from(duration: std::time::Duration) -> Self {
++		PlaybackPosition::Seconds(duration.as_secs_f64()).into()
++	}
++}
++
+ /// The ending time of a region of audio.
+ #[derive(Debug, Clone, Copy, PartialEq, Default)]
+ #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+diff --git a/crates/kira/src/sound/static_sound.rs b/crates/kira/src/sound/static_sound.rs
+index 15bb969..b444739 100644
+--- a/crates/kira/src/sound/static_sound.rs
++++ b/crates/kira/src/sound/static_sound.rs
+@@ -34,13 +34,14 @@ use crate::{
+ 	command_writers_and_readers, tween::Tween,
+ };
+ 
+-use super::Region;
++use super::{LoopCrossfade, Region};
+ 
+ command_writers_and_readers! {
+ 	set_volume: ValueChangeCommand<Decibels>,
+ 	set_playback_rate: ValueChangeCommand<PlaybackRate>,
+ 	set_panning: ValueChangeCommand<Panning>,
+ 	set_loop_region: Option<Region>,
++	set_loop_crossfade: LoopCrossfade,
+ 	pause: Tween,
+ 	resume: (StartTime, Tween),
+ 	stop: Tween,
+diff --git a/crates/kira/src/sound/static_sound/data.rs b/crates/kira/src/sound/static_sound/data.rs
+index c789c40..9c335cf 100644
+--- a/crates/kira/src/sound/static_sound/data.rs
++++ b/crates/kira/src/sound/static_sound/data.rs
+@@ -13,7 +13,10 @@ use std::{
+ use crate::{
+ 	Decibels, Panning, PlaybackRate, StartTime, Tween, Value,
+ 	frame::Frame,
+-	sound::{EndPosition, IntoOptionalRegion, PlaybackPosition, Region, Sound, SoundData},
++	sound::{
++		EndPosition, IntoOptionalRegion, LoopCrossfade, PlaybackPosition, Region, Sound, SoundData,
++		transport::blend_frames,
++	},
+ };
+ 
+ use super::{
+@@ -370,6 +373,63 @@ impl StaticSoundData {
+ 		new
+ 	}
+ 
++	/// Returns a copy of the sound with the loop region already crossfaded.
++	///
++	/// The frames before the wrap are blended into the audio itself, the
++	/// loop region starts one crossfade later and is one crossfade shorter,
++	/// and the crossfade setting is reset, so playing the result loops
++	/// exactly like the original does with its live crossfade.
++	#[must_use = "This method returns a modified StaticSoundData and does not mutate the original value"]
++	pub fn bake_loop_crossfade(&self) -> Self {
++		let num_frames = self.num_frames();
++		let Some(Region { start, end }) = self.settings.loop_region else {
++			return self.clone();
++		};
++		let loop_start = start.into_samples(self.sample_rate);
++		let loop_end = match end {
++			EndPosition::EndOfAudio => num_frames,
++			EndPosition::Custom(end) => end.into_samples(self.sample_rate),
++		};
++		let length = loop_end.saturating_sub(loop_start);
++		let crossfade = self
++			.settings
++			.loop_crossfade
++			.frames(self.sample_rate)
++			.min(length / 2);
++		if crossfade == 0 {
++			return self.clone();
++		}
++		let frame = |index: usize| self.frame_at_index(index).unwrap_or_default();
++		let mut frames = Vec::with_capacity(num_frames);
++		frames.extend((0..loop_end - crossfade).map(frame));
++		for step in 0..crossfade {
++			let weight = self
++				.settings
++				.loop_crossfade
++				.easing
++				.apply(step as f64 / crossfade as f64) as f32;
++			frames.push(blend_frames(
++				frame(loop_end - crossfade + step),
++				frame(loop_start + step),
++				weight,
++			));
++		}
++		frames.extend((loop_end..num_frames).map(frame));
++		Self {
++			sample_rate: self.sample_rate,
++			frames: frames.into(),
++			settings: StaticSoundSettings {
++				loop_region: Some(Region {
++					start: PlaybackPosition::Samples(loop_start + crossfade),
++					end: EndPosition::Custom(PlaybackPosition::Samples(loop_end)),
++				}),
++				loop_crossfade: LoopCrossfade::NONE,
++				..self.settings
++			},
++			slice: None,
++		}
++	}
++
+ 	pub(super) fn split(self) -> (StaticSound, StaticSoundHandle) {
+ 		let (command_writers, command_readers) = command_writers_and_readers();
+ 		let sound = StaticSound::new(self, command_readers);
+diff --git a/crates/kira/src/sound/static_sound/handle.rs b/crates/kira/src/sound/static_sound/handle.rs
+index 1aecf1c..ae19dc4 100644
+--- a/crates/kira/src/sound/static_sound/handle.rs
++++ b/crates/kira/src/sound/static_sound/handle.rs
+@@ -3,7 +3,7 @@ use std::sync::Arc;
+ use crate::{
+ 	Decibels, Panning, PlaybackRate, StartTime, Tween,
+ 	command::handle_param_setters,
+-	sound::{IntoOptionalRegion, PlaybackState},
++	sound::{IntoOptionalRegion, LoopCrossfade, PlaybackState},
+ };
+ 
+ use super::{CommandWriters, sound::Shared};
+@@ -285,6 +285,13 @@ impl StaticSoundHandle {
+ 			.write(loop_region.into_optional_region())
+ 	}
+ 
++	/// Sets the crossfade applied where the loop region wraps around.
++	pub fn set_loop_crossfade(&mut self, loop_crossfade: impl Into<LoopCrossfade>) {
++		self.command_writers
++			.set_loop_crossfade
++			.write(loop_crossfade.into())
++	}
++
+ 	/// Fades out the sound to silence with the given tween and then
+ 	/// pauses playback.
+ 	pub fn pause(&mut self, tween: Tween) {
+diff --git a/crates/kira/src/sound/static_sound/settings.rs b/crates/kira/src/sound/static_sound/settings.rs
+index 787db62..633bd74 100644
+--- a/crates/kira/src/sound/static_sound/settings.rs
++++ b/crates/kira/src/sound/static_sound/settings.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+ 	Decibels, Panning, PlaybackRate, StartTime, Tween, Value,
+-	sound::{IntoOptionalRegion, PlaybackPosition, Region},
++	sound::{IntoOptionalRegion, LoopCrossfade, PlaybackPosition, Region},
+ };
+ 
+ /// Settings for a static sound.
+@@ -12,6 +12,8 @@ pub struct StaticSoundSettings {
+ 	pub start_position: PlaybackPosition,
+ 	/// The portion of the sound that should be looped.
+ 	pub loop_region: Option<Region>,
++	/// The crossfade applied where the loop region wraps around.
++	pub loop_crossfade: LoopCrossfade,
+ 	/// Whether the sound should be played in reverse.
+ 	pub reverse: bool,
+ 	/// The volume of the sound.
+@@ -37,6 +39,7 @@ impl StaticSoundSettings {
+ 			start_position: PlaybackPosition::Seconds(0.0),
+ 			reverse: false,
+ 			loop_region: None,
++			loop_crossfade: LoopCrossfade::NONE,
+ 			volume: Value::Fixed(Decibels::IDENTITY),
+ 			playback_rate: Value::Fixed(PlaybackRate(1.0)),
+ 			panning: Value::Fixed(Panning::CENTER),
+@@ -77,6 +80,15 @@ impl StaticSoundSettings {
+ 		}
+ 	}
+ 
++	/** Sets the crossfade applied where the loop region wraps around. */
++	#[must_use = "This method consumes self and returns a modified StaticSoundSettings, so the return value should be used"]
++	pub fn loop_crossfade(self, loop_crossfade: impl Into<LoopCrossfade>) -> Self {
++		Self {
++			loop_crossfade: loop_crossfade.into(),
++			..self
++		}
++	}
++
+ 	/** Sets the volume of the sound. */
+ 	#[must_use = "This method consumes self and returns a modified StaticSoundSettings, so the return value should be used"]
+ 	pub fn volume(self, volume: impl Into<Value<Decibels>>) -> Self {
+diff --git a/crates/kira/src/sound/static_sound/sound.rs b/crates/kira/src/sound/static_sound/sound.rs
+index 4c1e3d6..98821ea 100644
+--- a/crates/kira/src/sound/static_sound/sound.rs
++++ b/crates/kira/src/sound/static_sound/sound.rs
+@@ -14,7 +14,10 @@ use crate::{
+ 	frame::Frame,
+ 	info::Info,
+ 	playback_state_manager::PlaybackStateManager,
+-	sound::{PlaybackState, Sound, transport::Transport},
++	sound::{
++		PlaybackState, Sound,
++		transport::{Crossfade, Transport, blend_frames},
++	},
+ };
+ 
+ use self::resampler::Resampler;
+@@ -31,6 +34,7 @@ pub(super) struct StaticSound {
+ 	start_time: StartTime,
+ 	resampler: Resampler,
+ 	transport: Transport,
++	crossfade: Crossfade,
+ 	fractional_position: f64,
+ 	volume: Parameter<Decibels>,
+ 	playback_rate: Parameter<PlaybackRate>,
+@@ -49,6 +53,7 @@ impl StaticSound {
+ 			data.sample_rate,
+ 			data.num_frames(),
+ 		);
++		let crossfade = Crossfade::new(settings.loop_crossfade, data.sample_rate, &transport);
+ 		let starting_frame_index = transport.position;
+ 		let position = starting_frame_index as f64 / data.sample_rate as f64;
+ 		let mut sound = Self {
+@@ -61,6 +66,7 @@ impl StaticSound {
+ 			start_time: settings.start_time,
+ 			resampler: Resampler::new(starting_frame_index),
+ 			transport,
++			crossfade,
+ 			fractional_position: 0.0,
+ 			volume: Parameter::new(settings.volume, Decibels::IDENTITY),
+ 			playback_rate: Parameter::new(settings.playback_rate, PlaybackRate(1.0)),
+@@ -116,10 +122,13 @@ impl StaticSound {
+ 	fn update_position(&mut self) {
+ 		self.push_frame_to_resampler();
+ 		if self.is_playing_backwards() {
+-			self.transport.decrement_position();
+-		} else {
+ 			self.transport
+-				.increment_position(num_frames(&self.frames, self.slice));
++				.decrement_position_crossfaded(self.crossfade.frames);
++		} else {
++			self.transport.increment_position_crossfaded(
++				num_frames(&self.frames, self.slice),
++				self.crossfade.frames,
++			);
+ 		}
+ 		if !self.transport.playing && self.resampler.empty() {
+ 			self.playback_state_manager.mark_as_stopped();
+@@ -138,8 +147,18 @@ impl StaticSound {
+ 	}
+ 
+ 	fn push_frame_to_resampler(&mut self) {
++		let backwards = self.is_playing_backwards();
+ 		let frame = self.transport.playing.then(|| {
+-			frame_at_index(self.transport.position, &self.frames, self.slice).unwrap_or_default()
++			let frame =
++				frame_at_index(self.transport.position, &self.frames, self.slice).unwrap_or_default();
++			match self.crossfade.pair(&self.transport, backwards) {
++				Some((past_wrap, weight)) => blend_frames(
++					frame,
++					frame_at_index(past_wrap, &self.frames, self.slice).unwrap_or_default(),
++					weight,
++				),
++				None => frame,
++			}
+ 		});
+ 		self.resampler.push_frame(frame, self.transport.position);
+ 	}
+@@ -164,6 +183,10 @@ impl StaticSound {
+ 				self.sample_rate,
+ 				num_frames(&self.frames, self.slice),
+ 			);
++			self.crossfade.update(&self.transport);
++		}
++		if let Some(loop_crossfade) = self.command_readers.set_loop_crossfade.read() {
++			self.crossfade.set(loop_crossfade, &self.transport);
+ 		}
+ 		if let Some(tween) = self.command_readers.pause.read() {
+ 			self.pause(tween);
+diff --git a/crates/kira/src/sound/streaming.rs b/crates/kira/src/sound/streaming.rs
+index 808b2f7..223b9b6 100644
+--- a/crates/kira/src/sound/streaming.rs
++++ b/crates/kira/src/sound/streaming.rs
+@@ -38,7 +38,7 @@ use crate::{
+ 	command::{CommandReader, CommandWriter, ValueChangeCommand, command_writer_and_reader},
+ };
+ 
+-use super::Region;
++use super::{LoopCrossfade, Region};
+ 
+ #[derive(Debug)]
+ pub(crate) struct CommandWriters {
+@@ -46,6 +46,7 @@ pub(crate) struct CommandWriters {
+ 	set_playback_rate: CommandWriter<ValueChangeCommand<PlaybackRate>>,
+ 	set_panning: CommandWriter<ValueChangeCommand<Panning>>,
+ 	set_loop_region: CommandWriter<Option<Region>>,
++	set_loop_crossfade: CommandWriter<LoopCrossfade>,
+ 	pause: CommandWriter<Tween>,
+ 	resume: CommandWriter<(StartTime, Tween)>,
+ 	stop: CommandWriter<Tween>,
+@@ -67,6 +68,7 @@ pub(crate) struct CommandReaders {
+ #[derive(Debug)]
+ pub(crate) struct DecodeSchedulerCommandReaders {
+ 	set_loop_region: CommandReader<Option<Region>>,
++	set_loop_crossfade: CommandReader<LoopCrossfade>,
+ 	seek_by: CommandReader<f64>,
+ 	seek_to: CommandReader<f64>,
+ }
+@@ -81,6 +83,7 @@ fn command_writers_and_readers() -> (
+ 	let (set_playback_rate_writer, set_playback_rate_reader) = command_writer_and_reader();
+ 	let (set_panning_writer, set_panning_reader) = command_writer_and_reader();
+ 	let (set_loop_region_writer, set_loop_region_reader) = command_writer_and_reader();
++	let (set_loop_crossfade_writer, set_loop_crossfade_reader) = command_writer_and_reader();
+ 	let (pause_writer, pause_reader) = command_writer_and_reader();
+ 	let (resume_writer, resume_reader) = command_writer_and_reader();
+ 	let (stop_writer, stop_reader) = command_writer_and_reader();
+@@ -93,6 +96,7 @@ fn command_writers_and_readers() -> (
+ 			set_playback_rate: set_playback_rate_writer,
+ 			set_panning: set_panning_writer,
+ 			set_loop_region: set_loop_region_writer,
++			set_loop_crossfade: set_loop_crossfade_writer,
+ 			pause: pause_writer,
+ 			resume: resume_writer,
+ 			stop: stop_writer,
+@@ -111,6 +115,7 @@ fn command_writers_and_readers() -> (
+ 		},
+ 		DecodeSchedulerCommandReaders {
+ 			set_loop_region: set_loop_region_reader,
++			set_loop_crossfade: set_loop_crossfade_reader,
+ 			seek_by: seek_by_reader,
+ 			seek_to: seek_to_reader,
+ 		},
+diff --git a/crates/kira/src/sound/streaming/handle.rs b/crates/kira/src/sound/streaming/handle.rs
+index cf55869..f40f1df 100644
+--- a/crates/kira/src/sound/streaming/handle.rs
++++ b/crates/kira/src/sound/streaming/handle.rs
+@@ -6,7 +6,7 @@ use std::{
+ use crate::{
+ 	Decibels, Panning, PlaybackRate, StartTime, Tween,
+ 	command::handle_param_setters,
+-	sound::{IntoOptionalRegion, PlaybackState},
++	sound::{IntoOptionalRegion, LoopCrossfade, PlaybackState},
+ };
+ use rtrb::Consumer;
+ 
+@@ -289,6 +289,13 @@ impl<Error> StreamingSoundHandle<Error> {
+ 			.write(loop_region.into_optional_region())
+ 	}
+ 
++	/// Sets the crossfade applied where the loop region wraps around.
++	pub fn set_loop_crossfade(&mut self, loop_crossfade: impl Into<LoopCrossfade>) {
++		self.command_writers
++			.set_loop_crossfade
++			.write(loop_crossfade.into())
++	}
++
+ 	/// Fades out the sound to silence with the given tween and then
+ 	/// pauses playback.
+ 	pub fn pause(&mut self, tween: Tween) {
+diff --git a/crates/kira/src/sound/streaming/settings.rs b/crates/kira/src/sound/streaming/settings.rs
+index 642f433..9d786cb 100644
+--- a/crates/kira/src/sound/streaming/settings.rs
++++ b/crates/kira/src/sound/streaming/settings.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+ 	Decibels, Panning, PlaybackRate, StartTime, Tween, Value,
+-	sound::{IntoOptionalRegion, PlaybackPosition, Region},
++	sound::{IntoOptionalRegion, LoopCrossfade, PlaybackPosition, Region},
+ };
+ 
+ /// Settings for a streaming sound.
+@@ -12,6 +12,8 @@ pub struct StreamingSoundSettings {
+ 	pub start_position: PlaybackPosition,
+ 	/// The portion of the sound that should be looped.
+ 	pub loop_region: Option<Region>,
++	/// The crossfade applied where the loop region wraps around.
++	pub loop_crossfade: LoopCrossfade,
+ 	/// The volume of the sound.
+ 	pub volume: Value<Decibels>,
+ 	/// The playback rate of the sound.
+@@ -34,6 +36,7 @@ impl StreamingSoundSettings {
+ 			start_time: StartTime::Immediate,
+ 			start_position: PlaybackPosition::Seconds(0.0),
+ 			loop_region: None,
++			loop_crossfade: LoopCrossfade::NONE,
+ 			volume: Value::Fixed(Decibels::IDENTITY),
+ 			playback_rate: Value::Fixed(PlaybackRate(1.0)),
+ 			panning: Value::Fixed(Panning::CENTER),
+@@ -68,6 +71,15 @@ impl StreamingSoundSettings {
+ 		}
+ 	}
+ 
++	/** Sets the crossfade applied where the loop region wraps around. */
++	#[must_use = "This method consumes self and returns a modified StreamingSoundSettings, so the return value should be used"]
++	pub fn loop_crossfade(self, loop_crossfade: impl Into<LoopCrossfade>) -> Self {
++		Self {
++			loop_crossfade: loop_crossfade.into(),
++			..self
++		}
++	}
++
+ 	/** Sets the volume of the sound. */
+ 	#[must_use = "This method consumes self and returns a modified StreamingSoundSettings, so the return value should be used"]
+ 	pub fn volume(self, volume: impl Into<Value<Decibels>>) -> Self {
+diff --git a/crates/kira/src/sound/streaming/sound/decode_scheduler.rs b/crates/kira/src/sound/streaming/sound/decode_scheduler.rs
+index d342841..890cd78 100644
+--- a/crates/kira/src/sound/streaming/sound/decode_scheduler.rs
++++ b/crates/kira/src/sound/streaming/sound/decode_scheduler.rs
+@@ -8,7 +8,7 @@ use crate::{
+ 	sound::{
+ 		PlaybackState,
+ 		streaming::{DecodeSchedulerCommandReaders, StreamingSoundSettings, decoder::Decoder},
+-		transport::Transport,
++		transport::{Crossfade, Transport, blend_frames},
+ 	},
+ };
+ use rtrb::{Consumer, Producer, RingBuffer};
+@@ -30,6 +30,9 @@ pub(crate) struct DecodeScheduler<Error: Send + 'static> {
+ 	slice: Option<(usize, usize)>,
+ 	num_frames: usize,
+ 	transport: Transport,
++	crossfade: Crossfade,
++	head_frames: Vec<Frame>,
++	head_frames_valid: bool,
+ 	decoder_current_frame_index: usize,
+ 	decoded_chunk: Option<DecodedChunk>,
+ 	command_readers: DecodeSchedulerCommandReaders,
+@@ -40,7 +43,7 @@ pub(crate) struct DecodeScheduler<Error: Send + 'static> {
+ 
+ impl<Error: Send + 'static> DecodeScheduler<Error> {
+ 	pub(crate) fn new(
+-		mut decoder: Box<dyn Decoder<Error = Error>>,
++		decoder: Box<dyn Decoder<Error = Error>>,
+ 		slice: Option<(usize, usize)>,
+ 		settings: StreamingSoundSettings,
+ 		shared: Arc<Shared>,
+@@ -63,26 +66,31 @@ impl<Error: Send + 'static> DecodeScheduler<Error> {
+ 			decoder.num_frames()
+ 		};
+ 		let start_position = settings.start_position.into_samples(sample_rate);
+-		let decoder_current_frame_index = decoder.seek(start_position)?;
+-		let scheduler = Self {
++		let transport = Transport::new(
++			start_position,
++			settings.loop_region,
++			false,
++			sample_rate,
++			num_frames,
++		);
++		let crossfade = Crossfade::new(settings.loop_crossfade, sample_rate, &transport);
++		let mut scheduler = Self {
+ 			decoder,
+ 			sample_rate,
+ 			slice,
+ 			num_frames,
+-			transport: Transport::new(
+-				start_position,
+-				settings.loop_region,
+-				false,
+-				sample_rate,
+-				num_frames,
+-			),
+-			decoder_current_frame_index,
++			transport,
++			crossfade,
++			head_frames: vec![],
++			head_frames_valid: false,
++			decoder_current_frame_index: 0,
+ 			decoded_chunk: None,
+ 			command_readers,
+ 			frame_producer,
+ 			error_producer,
+ 			shared,
+ 		};
++		scheduler.prepare_head_frames(start_position)?;
+ 		Ok((scheduler, frame_consumer))
+ 	}
+ 
+@@ -122,6 +130,12 @@ impl<Error: Send + 'static> DecodeScheduler<Error> {
+ 		if let Some(loop_region) = self.command_readers.set_loop_region.read() {
+ 			self.transport
+ 				.set_loop_region(loop_region, self.sample_rate, self.num_frames);
++			self.crossfade.update(&self.transport);
++			self.head_frames_valid = false;
++		}
++		if let Some(loop_crossfade) = self.command_readers.set_loop_crossfade.read() {
++			self.crossfade.set(loop_crossfade, &self.transport);
++			self.head_frames_valid = false;
+ 		}
+ 		if let Some(amount) = self.command_readers.seek_by.read() {
+ 			self.seek_by(amount)?;
+@@ -129,14 +143,21 @@ impl<Error: Send + 'static> DecodeScheduler<Error> {
+ 		if let Some(position) = self.command_readers.seek_to.read() {
+ 			self.seek_to(position)?;
+ 		}
+-		let frame = self.frame_at_index(self.transport.position)?;
++		self.ensure_head_frames()?;
++		let index = self.transport.position;
++		let mut frame = self.frame_at_index(index)?;
++		if let Some((past_wrap, weight)) = self.crossfade.pair(&self.transport, false) {
++			let loop_start = self.transport.loop_region.map(|(start, _)| start).unwrap_or(0);
++			frame = blend_frames(frame, self.head_frames[past_wrap - loop_start], weight);
++		}
+ 		self.frame_producer
+-			.push(TimestampedFrame {
+-				frame,
+-				index: self.transport.position,
+-			})
++			.push(TimestampedFrame { frame, index })
+ 			.expect("could not push frame to frame producer");
+-		self.transport.increment_position(self.num_frames);
++		self.transport
++			.increment_position_crossfaded(self.num_frames, self.crossfade.frames);
++		if self.transport.position < index {
++			self.fetch_head_frames()?;
++		}
+ 		if !self.transport.playing {
+ 			self.shared.reached_end.store(true, Ordering::SeqCst);
+ 			return Ok(NextStep::End);
+@@ -144,6 +165,53 @@ impl<Error: Send + 'static> DecodeScheduler<Error> {
+ 		Ok(NextStep::Continue)
+ 	}
+ 
++	/// Decodes the frames just past the loop wrap before the decoder
++	/// seeks to the start position, so starting playback costs at most
++	/// one seek more than it does without a crossfade.
++	fn prepare_head_frames(&mut self, start_position: usize) -> Result<(), Error> {
++		if self.crossfade.frames > 0 {
++			if let Some((loop_start, _)) = self.transport.loop_region {
++				let slice_start = self.slice.map(|(start, _)| start).unwrap_or(0);
++				self.decoder_current_frame_index = self.decoder.seek(slice_start + loop_start)?;
++			}
++		}
++		self.fetch_head_frames()?;
++		self.decoder_current_frame_index = self.decoder.seek(start_position)?;
++		self.decoded_chunk = None;
++		Ok(())
++	}
++
++	/// Makes sure the frames just past the loop wrap are decoded and
++	/// kept for the current pass, seeking the decoder back to the
++	/// current position afterwards.
++	fn ensure_head_frames(&mut self) -> Result<(), Error> {
++		if self.head_frames_valid || self.crossfade.frames == 0 {
++			self.head_frames_valid = true;
++			return Ok(());
++		}
++		self.fetch_head_frames()?;
++		let position = self.transport.position;
++		if position < self.decoder_current_frame_index {
++			self.decoder_current_frame_index = self.decoder.seek(position)?;
++			self.decoded_chunk = None;
++		}
++		Ok(())
++	}
++
++	/// Decodes the frames just past the loop wrap in order, starting
++	/// from the loop start.
++	fn fetch_head_frames(&mut self) -> Result<(), Error> {
++		self.head_frames.clear();
++		if let Some((loop_start, _)) = self.transport.loop_region {
++			for i in 0..self.crossfade.frames {
++				let frame = self.frame_at_index(loop_start + i)?;
++				self.head_frames.push(frame);
++			}
++		}
++		self.head_frames_valid = true;
++		Ok(())
++	}
++
+ 	fn frame_at_index(&mut self, index: usize) -> Result<Frame, Error> {
+ 		let start = self.slice.map(|(start, _)| start).unwrap_or(0);
+ 		let end = self.slice.map(|(_, end)| end).unwrap_or(self.num_frames);
+diff --git a/crates/kira/src/sound/transport.rs b/crates/kira/src/sound/transport.rs
+index a897674..76261b1 100644
+--- a/crates/kira/src/sound/transport.rs
++++ b/crates/kira/src/sound/transport.rs
+@@ -1,4 +1,6 @@
+-use super::{EndPosition, Region};
++use crate::frame::Frame;
++
++use super::{EndPosition, LoopCrossfade, Region};
+ 
+ #[cfg(test)]
+ mod test;
+@@ -55,14 +57,21 @@ impl Transport {
+ 		});
+ 	}
+ 
++	#[cfg(test)]
+ 	pub fn increment_position(&mut self, num_frames: usize) {
++		self.increment_position_crossfaded(num_frames, 0);
++	}
++
++	/// Advances the position by one frame. When the position wraps around
++	/// the loop region, it lands `crossfade_frames` past the loop start.
++	pub fn increment_position_crossfaded(&mut self, num_frames: usize, crossfade_frames: usize) {
+ 		if !self.playing {
+ 			return;
+ 		}
+ 		self.position += 1;
+ 		if let Some((loop_start, loop_end)) = self.loop_region {
+ 			while self.position >= loop_end {
+-				self.position -= loop_end - loop_start;
++				self.position -= loop_end - loop_start - crossfade_frames;
+ 			}
+ 		}
+ 		if self.position >= num_frames {
+@@ -70,13 +79,21 @@ impl Transport {
+ 		}
+ 	}
+ 
++	#[cfg(test)]
+ 	pub fn decrement_position(&mut self) {
++		self.decrement_position_crossfaded(0);
++	}
++
++	/// Moves the position back by one frame. When the position wraps around
++	/// the loop region, it lands `crossfade_frames` before the last frame
++	/// of the loop.
++	pub fn decrement_position_crossfaded(&mut self, crossfade_frames: usize) {
+ 		if !self.playing {
+ 			return;
+ 		}
+ 		if let Some((loop_start, loop_end)) = self.loop_region {
+ 			while self.position <= loop_start {
+-				self.position += loop_end - loop_start;
++				self.position += loop_end - loop_start - crossfade_frames;
+ 			}
+ 		}
+ 		if self.position == 0 {
+@@ -104,3 +121,75 @@ impl Transport {
+ 		}
+ 	}
+ }
++
++/// The crossfade applied to a [`Transport`]'s loop region.
++pub struct Crossfade {
++	settings: LoopCrossfade,
++	sample_rate: u32,
++	/// The number of frames blended across the wrap, clamped to half
++	/// the loop region.
++	pub frames: usize,
++}
++
++impl Crossfade {
++	#[must_use]
++	pub fn new(settings: LoopCrossfade, sample_rate: u32, transport: &Transport) -> Self {
++		let mut crossfade = Self {
++			settings,
++			sample_rate,
++			frames: 0,
++		};
++		crossfade.update(transport);
++		crossfade
++	}
++
++	pub fn set(&mut self, settings: LoopCrossfade, transport: &Transport) {
++		self.settings = settings;
++		self.update(transport);
++	}
++
++	/// Recomputes the crossfade length for the transport's current loop region.
++	pub fn update(&mut self, transport: &Transport) {
++		self.frames = match transport.loop_region {
++			Some((loop_start, loop_end)) => {
++				let half = loop_end.saturating_sub(loop_start) / 2;
++				self.settings.frames(self.sample_rate).min(half)
++			}
++			None => 0,
++		};
++	}
++
++	/// If the transport's position lies in the crossfade window for the given
++	/// direction of travel, returns the index of the frame past the wrap it is
++	/// blended with and the weight of that frame.
++	#[must_use]
++	pub fn pair(&self, transport: &Transport, backwards: bool) -> Option<(usize, f32)> {
++		let (loop_start, loop_end) = transport.loop_region?;
++		let length = self.frames;
++		if length == 0 {
++			return None;
++		}
++		let position = transport.position;
++		let (step, past_wrap) = if backwards {
++			let window_end = loop_start + length;
++			if position < loop_start || position >= window_end {
++				return None;
++			}
++			let step = window_end - 1 - position;
++			(step, loop_end - 1 - step)
++		} else {
++			let window_start = loop_end - length;
++			if position < window_start || position >= loop_end {
++				return None;
++			}
++			let step = position - window_start;
++			(step, loop_start + step)
++		};
++		let weight = self.settings.easing.apply(step as f64 / length as f64) as f32;
++		Some((past_wrap, weight))
++	}
++}
++
++pub fn blend_frames(before_wrap: Frame, past_wrap: Frame, weight: f32) -> Frame {
++	before_wrap * (1.0 - weight) + past_wrap * weight
++}

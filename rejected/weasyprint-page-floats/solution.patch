@@ -1,0 +1,701 @@
+diff --git a/weasyprint/css/computed_values.py b/weasyprint/css/computed_values.py
+index 2fbb56d..645295c 100644
+--- a/weasyprint/css/computed_values.py
++++ b/weasyprint/css/computed_values.py
+@@ -554,8 +554,18 @@ def compute_float(style, name, value):
+     position = style.specified['position']
+     if position in ('absolute', 'fixed') or position[0] in ('running()', 'note()'):
+         return 'none'
+-    else:
+-        return value
++    elif value in ('top', 'bottom'):
++        # Page floats need the page as reference, out-of-flow ancestors don't
++        # provide one.
++        parent_style = style.parent_style
++        while parent_style is not None:
++            position = parent_style['position']
++            if (position in ('absolute', 'fixed') or
++                    position[0] in ('running()', 'note()') or
++                    parent_style['float'] != 'none'):
++                return 'left'
++            parent_style = parent_style.parent_style
++    return value
+ 
+ 
+ @register_computer('font-size')
+diff --git a/weasyprint/css/validation/properties.py b/weasyprint/css/validation/properties.py
+index 26b7e1f..0d0237d 100644
+--- a/weasyprint/css/validation/properties.py
++++ b/weasyprint/css/validation/properties.py
+@@ -791,7 +791,8 @@ def display(tokens):
+ def float_(keyword):  # XXX do not hide the "float" builtin
+     """``float`` property validation."""
+     return keyword in (
+-        'left', 'right', 'inline-start', 'inline-end', 'footnote', 'none')
++        'left', 'right', 'inline-start', 'inline-end', 'top', 'bottom', 'footnote',
++        'none')
+ 
+ 
+ @property()
+diff --git a/weasyprint/formatting_structure/boxes.py b/weasyprint/formatting_structure/boxes.py
+index 1222874..f6c2d85 100644
+--- a/weasyprint/formatting_structure/boxes.py
++++ b/weasyprint/formatting_structure/boxes.py
+@@ -297,6 +297,10 @@ class Box:
+         """Return whether this box is floated."""
+         return self.style['float'] in ('left', 'right', 'inline-start', 'inline-end')
+ 
++    def is_page_floated(self):
++        """Return whether this box is a page float."""
++        return self.style['float'] in ('top', 'bottom')
++
+     def is_footnote(self):
+         """Return whether this box is a footnote."""
+         return self.style['float'] == 'footnote'
+@@ -316,8 +320,9 @@ class Box:
+     def is_in_normal_flow(self):
+         """Return whether this box is in normal flow."""
+         return not (
+-            self.is_floated() or self.is_absolutely_positioned() or
+-            self.is_running() or self.is_footnote() or self.is_note())
++            self.is_floated() or self.is_page_floated() or
++            self.is_absolutely_positioned() or self.is_running() or
++            self.is_footnote() or self.is_note())
+ 
+     def is_monolithic(self):
+         """Return whether this box is monolithic."""
+@@ -334,6 +339,7 @@ class Box:
+         # See https://www.w3.org/TR/CSS2/visuren.html#block-formatting
+         return (
+             self.is_floated() or
++            self.is_page_floated() or
+             self.is_absolutely_positioned() or
+             self.is_column or
+             (isinstance(self, BlockContainerBox) and not isinstance(self, BlockBox)) or
+diff --git a/weasyprint/formatting_structure/build.py b/weasyprint/formatting_structure/build.py
+index b10301f..aba48c5 100644
+--- a/weasyprint/formatting_structure/build.py
++++ b/weasyprint/formatting_structure/build.py
+@@ -1047,6 +1047,7 @@ def flex_children(box, children):
+         flex_children = []
+         for child in children:
+             child.is_floated = lambda: False
++            child.is_page_floated = lambda: False
+             if child.is_in_normal_flow():
+                 child.is_flex_item = True
+             if isinstance(child, boxes.TextBox) and not child.text.strip(' '):
+@@ -1081,6 +1082,7 @@ def grid_children(box, children):
+     if isinstance(box, boxes.GridContainerBox):
+         grid_children = []
+         for child in children:
++            child.is_page_floated = lambda: False
+             if child.is_in_normal_flow():
+                 child.is_grid_item = True
+             if isinstance(child, boxes.TextBox) and not child.text.strip(' '):
+diff --git a/weasyprint/layout/__init__.py b/weasyprint/layout/__init__.py
+index 54d7288..d38b669 100644
+--- a/weasyprint/layout/__init__.py
++++ b/weasyprint/layout/__init__.py
+@@ -250,6 +250,11 @@ class LayoutContext:
+         self.forced_break = False
+         self.broken_out_of_flow = {}
+         self.in_column = False
++        self.page_floats = {}
++        self.consumed_page_floats = set()
++        self.deferred_page_floats = []
++        self.page_float_shapes = []
++        self.in_page_float = False
+ 
+         # Cache
+         self.tables = {}
+@@ -417,9 +422,12 @@ class LayoutContext:
+         if self.current_footnote_area.children:
+             footnote_area = build.create_anonymous_boxes(
+                 self.current_footnote_area.deepcopy())
++            # The footnote area is laid out in its own area, not beside page floats.
++            page_float_shapes, self.page_float_shapes = self.page_float_shapes, []
+             footnote_area = block_level_layout(
+                 self, footnote_area, -inf, None,
+                 self.current_footnote_area.page)[0]
++            self.page_float_shapes = page_float_shapes
+             self.current_footnote_area.height = footnote_area.height
+             if not self.in_column:
+                 self.page_bottom -= footnote_area.margin_height()
+diff --git a/weasyprint/layout/block.py b/weasyprint/layout/block.py
+index e7a43fc..41139ee 100644
+--- a/weasyprint/layout/block.py
++++ b/weasyprint/layout/block.py
+@@ -295,6 +295,12 @@ def _out_of_flow_layout(context, box, index, child, new_children,
+                     new_children[:], resume_at = result
+                     new_child = None
+ 
++    # Page float layout: create placeholder, the float is laid out by the page.
++    elif child.is_page_floated():
++        new_child = placeholder = AbsolutePlaceholder(child)
++        placeholder.index = index
++        new_children.append(placeholder)
++
+     # Running element layout.
+     elif child.is_running() or child.is_note():
+         context.add_running_element(child)
+@@ -732,7 +738,9 @@ def block_container_layout(context, box, bottom_space, skip_stack, page_is_empty
+             last_child = find_last_class_a_break_point_child(new_children)
+             if last_child is not None:
+                 page_break = block_level_page_break(last_child, child)
+-                page_name = block_level_page_name(last_child, child)
++                page_name = (
++                    None if context.in_page_float
++                    else block_level_page_name(last_child, child))
+                 if page_name or force_page_break(page_break, context):
+                     next_page = {'break': page_break, 'page': page_name}
+                     resume_at = {index: None}
+@@ -1120,6 +1128,9 @@ def avoid_page_break(page_break, context):
+ 
+ def force_page_break(page_break, context):
+     """Test whether we should force breaks."""
++    if context.in_page_float:
++        # Page floats are never split.
++        return False
+     if context.in_column:
+         return page_break in (
+             'page', 'left', 'right', 'recto', 'verso', 'column')
+diff --git a/weasyprint/layout/column.py b/weasyprint/layout/column.py
+index 909d3f1..c6afc21 100644
+--- a/weasyprint/layout/column.py
++++ b/weasyprint/layout/column.py
+@@ -28,6 +28,21 @@ def columns_layout(context, box, bottom_space, skip_stack, containing_block,
+     box = box.copy_with_children(box.children)
+     box.position_y += collapse_margin(adjoining_margins)
+ 
++    # Columns don't overlap page floats: they start below the top ones and end
++    # above the bottom ones.
++    resolve_percentages(box, containing_block)
++    float_bottoms = [
++        shape.position_y + shape.margin_height()
++        for shape in context.page_float_shapes if shape.style['float'] == 'top']
++    if float_bottoms:
++        box.position_y += max(0, max(float_bottoms) - box.content_box_y())
++    float_tops = [
++        shape.position_y for shape in context.page_float_shapes
++        if shape.style['float'] == 'bottom']
++    if float_tops:
++        bottom_space = original_bottom_space = max(
++            bottom_space, context.page_bottom - min(float_tops))
++
+     # Set height if defined
+     if height != 'auto' and height.unit != '%':
+         assert height.unit.lower() == 'px'
+diff --git a/weasyprint/layout/float.py b/weasyprint/layout/float.py
+index d25b4b8..e562d12 100644
+--- a/weasyprint/layout/float.py
++++ b/weasyprint/layout/float.py
+@@ -1,5 +1,6 @@
+ """Layout for floating boxes."""
+ 
++from math import inf
+ from sys import maxsize
+ 
+ from ..formatting_structure import boxes
+@@ -84,6 +85,114 @@ def float_layout(context, box, containing_block, absolute_boxes, fixed_boxes,
+     return box, resume_at
+ 
+ 
++def page_float_key(box):
++    """Return a key identifying the page float ``box`` across its copies."""
++    return (box.element, box.element_tag)
++
++
++def remove_page_float_placeholders(box):
++    """Remove the page float placeholders in ``box``.
++
++    Return the boxes of the removed placeholders.
++
++    """
++    from .absolute import AbsolutePlaceholder
++
++    found = []
++    children = []
++    for child in box.children:
++        if isinstance(child, AbsolutePlaceholder):
++            if child._box.is_page_floated():
++                found.append(child._box)
++                continue
++        elif isinstance(child, boxes.ParentBox):
++            found.extend(remove_page_float_placeholders(child))
++        children.append(child)
++    box.children = children
++    return found
++
++
++def page_float_layout(context, box, containing_block, position_y, absolute_boxes,
++                      fixed_boxes):
++    """Lay out the page float ``box`` with its margin top at ``position_y``."""
++    from .block import block_container_layout
++    from .flex import flex_layout
++    from .grid import grid_layout
++
++    box = box.deepcopy()
++    cb_width, cb_height = (containing_block.width, containing_block.height)
++    if cb_height == 'auto':
++        cb_height = containing_block.position_y - containing_block.content_box_y()
++    resolve_percentages(box, (cb_width, cb_height))
++    resolve_position_percentages(box, (cb_width, cb_height))
++    for side in ('left', 'right', 'top', 'bottom'):
++        if getattr(box, f'margin_{side}') == 'auto':
++            setattr(box, f'margin_{side}', 0)
++    box.position_x = containing_block.content_box_x()
++    box.position_y = position_y
++
++    if isinstance(box, boxes.BlockReplacedBox):
++        inline_replaced_box_width_height(box, containing_block)
++    elif box.width == 'auto':
++        float_width(box, context, containing_block)
++    if box.is_table_wrapper:
++        table_wrapper_width(context, box, (cb_width, cb_height))
++
++    original_in_page_float = context.in_page_float
++    context.in_page_float = True
++    if isinstance(box, boxes.BlockContainerBox):
++        box, _, _, _, _, _ = block_container_layout(
++            context, box, bottom_space=-inf, skip_stack=None, page_is_empty=True,
++            absolute_boxes=absolute_boxes, fixed_boxes=fixed_boxes,
++            adjoining_margins=None, first_letter_style=None, first_line_style=None,
++            discard=False, max_lines=None)
++    elif isinstance(box, boxes.FlexContainerBox):
++        box, _, _, _, _ = flex_layout(
++            context, box, bottom_space=-inf, skip_stack=None,
++            containing_block=containing_block, page_is_empty=True,
++            absolute_boxes=absolute_boxes, fixed_boxes=fixed_boxes, discard=False)
++    elif isinstance(box, boxes.GridContainerBox):
++        box, _, _, _, _ = grid_layout(
++            context, box, bottom_space=-inf, skip_stack=None,
++            containing_block=containing_block, page_is_empty=True,
++            absolute_boxes=absolute_boxes, fixed_boxes=fixed_boxes)
++    context.in_page_float = original_in_page_float
++    return box
++
++
++def page_floats_layout(context, floats, containing_block, top, bottom, max_height,
++                       absolute_boxes, fixed_boxes):
++    """Lay out ``floats`` at the top and bottom of ``containing_block``.
++
++    Return the laid out top floats, the laid out bottom floats, and the floats
++    that don't fit between ``top`` and ``bottom``.
++
++    """
++    from .block import remove_placeholders
++
++    reference_top = top
++    top_floats = []
++    bottom_floats = []
++    deferred = []
++    for box in floats:
++        new_box = page_float_layout(
++            context, box, containing_block, top, absolute_boxes, fixed_boxes)
++        height = new_box.margin_height()
++        if height > bottom - top and height <= max_height:
++            remove_placeholders(context, [new_box], absolute_boxes, fixed_boxes)
++            deferred.append(box)
++        elif box.style['float'] == 'top':
++            context.excluded_shapes.append(new_box)
++            top_floats.append(new_box)
++            top += height
++        else:
++            bottom = max(bottom - height, reference_top)
++            new_box.translate(dy=bottom - new_box.position_y)
++            context.excluded_shapes.append(new_box)
++            bottom_floats.append(new_box)
++    return top_floats, bottom_floats, deferred
++
++
+ def find_float_position(context, box, containing_block):
+     """Get the right position of the float ``box``."""
+     # See https://www.w3.org/TR/CSS2/visuren.html#float-position
+@@ -91,9 +200,12 @@ def find_float_position(context, box, containing_block):
+     # Point 4 is already handled as box.position_y is set according to the
+     # containing box top position, with collapsing margins handled
+ 
+-    # Points 5 and 6, box.position_y is set to the highest position_y possible
+-    if context.excluded_shapes:
+-        highest_y = context.excluded_shapes[-1].position_y
++    # Points 5 and 6, box.position_y is set to the highest position_y possible,
++    # page floats are pinned to the edges of their reference and don't count
++    float_shapes = [
++        shape for shape in context.excluded_shapes if not shape.is_page_floated()]
++    if float_shapes:
++        highest_y = float_shapes[-1].position_y
+         if box.position_y < highest_y:
+             box.translate(0, highest_y - box.position_y)
+ 
+@@ -129,6 +241,8 @@ def get_clearance(context, box, direction, collapsed_margin=0):
+             float_value = 'left' if direction == 'ltr' else 'right'
+         if float_value == 'inline-end':
+             float_value = 'left' if direction == 'rtl' else 'right'
++        if float_value in ('top', 'bottom'):
++            float_value = 'left'
+         return clear_value in (float_value, 'both')
+ 
+     # Box should be after shape that’s broken on this page.
+@@ -157,7 +271,7 @@ def avoid_collisions(context, box, containing_block, outer=True):
+     if box.border_height() == 0 and box.is_floated():
+         return 0, position_y, containing_block.width
+ 
+-    left_keywords = ['left']
++    left_keywords = ['left', 'top', 'bottom']
+     right_keywords = ['right']
+     if containing_block.style['direction'] == 'ltr':
+         left_keywords.append('inline-start')
+@@ -226,6 +340,7 @@ def avoid_collisions(context, box, containing_block, outer=True):
+     # - element establishing new formatting contexts
+     assert (
+         box.is_floated() or
++        box.is_page_floated() or
+         isinstance(box, boxes.LineBox) or
+         box.is_table_wrapper or
+         isinstance(box, boxes.BlockReplacedBox) or
+diff --git a/weasyprint/layout/grid.py b/weasyprint/layout/grid.py
+index d371cf5..f82e724 100644
+--- a/weasyprint/layout/grid.py
++++ b/weasyprint/layout/grid.py
+@@ -572,10 +572,29 @@ def _resolve_tracks_sizes(sizing_functions, box_size, children_positions,
+     return tracks_sizes
+ 
+ 
++def _skip_stack_key(skip_stack):
++    """Return a hashable key identifying ``skip_stack``."""
++    if skip_stack is None:
++        return None
++    return tuple(sorted(
++        (key, _skip_stack_key(value)) for key, value in skip_stack.items()))
++
++
+ def grid_layout(context, box, bottom_space, skip_stack, containing_block,
+                 page_is_empty, absolute_boxes, fixed_boxes):
+     context.create_block_formatting_context(box)
+ 
++    # Advancements are rewritten by each fragment for the next one, start from
++    # the ones recorded for this resume point so that laying the same fragment
++    # out again gives the same result.
++    source_box = box
++    if skip_stack is not None:
++        recorded = getattr(box, 'fragment_advancements', {}).get(
++            _skip_stack_key(skip_stack))
++        if recorded is not None:
++            box.advancements.clear()
++            box.advancements.update(recorded)
++
+     if skip_stack and box.style['box_decoration_break'] != 'clone':
+         box.remove_decoration(start=True, end=False)
+ 
+@@ -1449,5 +1468,9 @@ def grid_layout(context, box, bottom_space, skip_stack, containing_block,
+         box.remove_decoration(start=False, end=True)
+         box.height -= box.margin_bottom + box.border_bottom_width + box.padding_bottom
+ 
++    if not hasattr(source_box, 'fragment_advancements'):
++        source_box.fragment_advancements = {}
++    source_box.fragment_advancements[_skip_stack_key(resume_at)] = advancements.copy()
++
+     context.finish_block_formatting_context(box)
+     return box, resume_at, next_page, [], False
+diff --git a/weasyprint/layout/inline.py b/weasyprint/layout/inline.py
+index 345b28d..1a62429 100644
+--- a/weasyprint/layout/inline.py
++++ b/weasyprint/layout/inline.py
+@@ -626,6 +626,12 @@ def _out_of_flow_layout(context, box, containing_block, index, child,
+                 if float_align:
+                     old_child.translate(dx=dx)
+ 
++    elif child.is_page_floated():
++        child.position_x = position_x
++        placeholder = AbsolutePlaceholder(child)
++        line_placeholders.append(placeholder)
++        waiting_children.append((index, placeholder, child))
++
+     elif child.is_running() or child.is_note():
+         context.add_running_element(child)
+ 
+diff --git a/weasyprint/layout/page.py b/weasyprint/layout/page.py
+index eadbd2d..508ec26 100644
+--- a/weasyprint/layout/page.py
++++ b/weasyprint/layout/page.py
+@@ -8,7 +8,12 @@ from ..formatting_structure import boxes, build
+ from ..logger import PROGRESS_LOGGER
+ from .absolute import absolute_box_layout, absolute_layout
+ from .block import block_container_layout, block_level_layout
+-from .float import float_layout
++from .float import (
++    float_layout,
++    page_float_key,
++    page_floats_layout,
++    remove_page_float_placeholders,
++)
+ from .min_max import handle_min_max_height, handle_min_max_width
+ from .percent import resolve_percentages
+ from .preferred import max_content_width, min_content_width
+@@ -659,74 +664,132 @@ def make_page(context, root_box, page_type, resume_at, page_number,
+             context, note_area, page, positioned_boxes, bottom_space=0,
+             skip_stack=None)
+ 
+-    # Display out-of-flow boxes broken on the previous page.
++    # Out-of-flow boxes broken on the previous page are displayed with the
++    # in-flow content below, after the page floats they have to avoid.
+     # TODO: we shouldn’t separate broken in-flow and out-of-flow layout.
+     page_is_empty = True
+     adjoining_margins = []
+     positioned_boxes = []  # Mixed absolute and fixed
+-    out_of_flow_boxes = []
+-    excluded_shapes = defaultdict(list)
+-    broken_out_of_flow = {}
+-    context_out_of_flow = context.broken_out_of_flow.values()
+-    context.broken_out_of_flow = broken_out_of_flow
+-    for box, containing_block, context_box, skip_stack in context_out_of_flow:
+-        if context_box:
+-            context.create_block_formatting_context(context_box)
+-        box.position_y = root_box.content_box_y()
+-        if box.is_floated():
+-            out_of_flow_box, out_of_flow_resume_at = float_layout(
+-                context, box, containing_block, positioned_boxes,
+-                positioned_boxes, 0, skip_stack)
+-            excluded_shapes[context_box].append(out_of_flow_box)
+-        else:
+-            assert box.is_absolutely_positioned()
+-            out_of_flow_box, out_of_flow_resume_at = absolute_box_layout(
+-                context, box, containing_block, positioned_boxes, 0,
+-                skip_stack)
+-        out_of_flow_boxes.append(out_of_flow_box)
+-        page_is_empty = False
+-        if out_of_flow_resume_at:
+-            context.add_broken_out_of_flow(
+-                out_of_flow_box, box, containing_block, out_of_flow_resume_at)
+-        if context_box:
+-            context.finish_block_formatting_context()
++    broken_out_of_flow = list(context.broken_out_of_flow.values())
++    context.broken_out_of_flow = {}
+ 
+-    # Set excluded shapes from broken out-of-flow for in-flow content.
+-    for context_box, shapes in excluded_shapes.items():
+-        context._excluded_shapes[context_box] = shapes
+-
+-    # Display in-flow content.
++    # Display in-flow content, and lay out the page again each time page floats
++    # are found, as they are placed before the in-flow content of the page.
+     initial_root_box = root_box
+     initial_resume_at = resume_at
+     previous_running_elements = {
+         name: running_elements.get(page_number)
+         for name, running_elements in context.running_elements.items()}
+-    for running_elements in context.running_elements.values():
+-        running_elements.pop(page_number, None)
+     notes = (
+         element for elements in previous_running_elements.values()
+         for element in (elements or ()) if element.is_note())
+     context.rendered_notes.extend(notes)
+-    root_box, resume_at, next_page, _, _, _ = block_level_layout(
+-        context, root_box, 0, resume_at, initial_containing_block,
+-        page_is_empty, positioned_boxes, positioned_boxes, adjoining_margins)
+-    if not root_box:
+-        # In-flow page rendering didn’t progress, only out-of-flow did. Render empty box
+-        # at skip_stack and force fragmentation to make the root box and its descendants
+-        # cover the whole page height.
+-        assert not page_is_empty
+-        box = parent = initial_root_box = initial_root_box.deepcopy()
+-        skip_stack = initial_resume_at
+-        while skip_stack and len(skip_stack) == 1:
+-            (skip, skip_stack), = skip_stack.items()
+-            box, parent = box.children[skip], box
+-        parent.children = []
+-        parent.force_fragmentation = True
+-        root_box, _, _, _, _, _ = block_level_layout(
+-            context, initial_root_box, 0, initial_resume_at, initial_containing_block,
+-            True, positioned_boxes, positioned_boxes, adjoining_margins)
++
++    page_floats = context.page_floats
++    for number in [number for number in page_floats if number >= page_number]:
++        del page_floats[number]
++    context.consumed_page_floats = set().union(
++        *(placed for placed, _ in page_floats.values()))
++    _, inherited = page_floats.get(page_number - 1, (None, []))
++    inherited_floats = list(inherited)
++    anchored_floats = []
++    moved_floats = []
++    dropped_keys = set()
++    saved_state = (
++        context.footnotes.copy(), context.current_page_footnotes.copy(),
++        context.reported_footnotes.copy(), footnote_area.height,
++        context.page_bottom, dict(context.broken_out_of_flow),
++        positioned_boxes.copy(), {
++            key: (value.copy() if isinstance(value, list) else value)
++            for key, value in context._excluded_shapes.items()})
++    footnote_reservation = 0
++    while True:
++        (context.footnotes, context.current_page_footnotes,
++         context.reported_footnotes, footnote_area.height, context.page_bottom,
++         context.broken_out_of_flow, positioned_boxes[:], context._excluded_shapes,
++         ) = (
++             saved_state[0].copy(), saved_state[1].copy(), saved_state[2].copy(),
++             saved_state[3], saved_state[4], dict(saved_state[5]),
++             saved_state[6], {
++                 key: (value.copy() if isinstance(value, list) else value)
++                 for key, value in saved_state[7].items()})
++        footnote_area.children = context.current_page_footnotes
++        for running_elements in context.running_elements.values():
++            running_elements.pop(page_number, None)
++        root_box = initial_root_box
+         resume_at = initial_resume_at
+-    root_box.children = out_of_flow_boxes + root_box.children
++        waiting_floats = inherited_floats + anchored_floats
++        page_bottom = context.page_bottom
++        top_floats, bottom_floats, context.deferred_page_floats = (
++            page_floats_layout(
++                context, waiting_floats, page, root_box.position_y,
++                page_bottom - footnote_reservation, page.height, positioned_boxes,
++                positioned_boxes))
++        context.page_float_shapes = top_floats + bottom_floats
++        out_of_flow_boxes = _broken_out_of_flow_layout(
++            context, broken_out_of_flow, root_box, positioned_boxes)
++        pass_is_empty = page_is_empty and not (
++            out_of_flow_boxes or top_floats or bottom_floats)
++        root_box, resume_at, next_page, _, _, _ = block_level_layout(
++            context, root_box, 0, resume_at, initial_containing_block,
++            pass_is_empty, positioned_boxes, positioned_boxes, adjoining_margins)
++        if not root_box:
++            # In-flow page rendering didn’t progress, only out-of-flow did. Render
++            # empty box at skip_stack and force fragmentation to make the root box
++            # and its descendants cover the whole page height.
++            assert not pass_is_empty
++            box = parent = empty_root_box = initial_root_box.deepcopy()
++            skip_stack = initial_resume_at
++            while skip_stack and len(skip_stack) == 1:
++                (skip, skip_stack), = skip_stack.items()
++                box, parent = box.children[skip], box
++            parent.children = []
++            parent.force_fragmentation = True
++            root_box, _, _, _, _, _ = block_level_layout(
++                context, empty_root_box, 0, initial_resume_at,
++                initial_containing_block, True, positioned_boxes, positioned_boxes,
++                adjoining_margins)
++            resume_at = initial_resume_at
++        found = [
++            float_box for box in (*out_of_flow_boxes, root_box)
++            for float_box in remove_page_float_placeholders(box)]
++        found_keys = {page_float_key(box) for box in found}
++        stale = [
++            box for box in anchored_floats
++            if page_float_key(box) not in found_keys]
++        if stale:
++            # These floats' anchors have moved to another page, place them there.
++            dropped_keys.update(page_float_key(box) for box in stale)
++            anchored_floats = [
++                box for box in anchored_floats
++                if page_float_key(box) not in dropped_keys]
++            moved_floats.extend(stale)
++            continue
++        known = (
++            context.consumed_page_floats | dropped_keys |
++            {page_float_key(box) for box in waiting_floats})
++        new_floats = []
++        for box in found:
++            key = page_float_key(box)
++            if key not in known:
++                known.add(key)
++                new_floats.append(box)
++        if new_floats:
++            anchored_floats.extend(new_floats)
++            continue
++        if bottom_floats and page_bottom - context.page_bottom > footnote_reservation:
++            # The footnote area grew under the bottom floats, reserve it and
++            # place them again above it.
++            footnote_reservation = page_bottom - context.page_bottom
++            continue
++        break
++    context.page_float_shapes = []
++    context.deferred_page_floats.extend(moved_floats)
++    root_box.children = (
++        out_of_flow_boxes + top_floats + bottom_floats + root_box.children)
++    page_floats[page_number] = ({
++        page_float_key(box) for box in root_box.descendants()
++        if box.is_page_floated()}, context.deferred_page_floats)
+     running_elements = {
+         name: running_elements.get(page_number)
+         for name, running_elements in context.running_elements.items()}
+@@ -864,6 +927,43 @@ def make_page(context, root_box, page_type, resume_at, page_number,
+     return page, resume_at, next_page
+ 
+ 
++def _broken_out_of_flow_layout(context, broken_out_of_flow, root_box,
++                               positioned_boxes):
++    """Lay out the out-of-flow boxes broken on the previous page."""
++    out_of_flow_boxes = []
++    excluded_shapes = defaultdict(list)
++    for box, containing_block, context_box, skip_stack in broken_out_of_flow:
++        if context_box:
++            context.create_block_formatting_context(context_box)
++        box.position_y = root_box.content_box_y()
++        if box.is_floated():
++            out_of_flow_box, out_of_flow_resume_at = float_layout(
++                context, box, containing_block, positioned_boxes,
++                positioned_boxes, 0, skip_stack)
++            excluded_shapes[context_box].append(out_of_flow_box)
++        else:
++            assert box.is_absolutely_positioned()
++            out_of_flow_box, out_of_flow_resume_at = absolute_box_layout(
++                context, box, containing_block, positioned_boxes, 0,
++                skip_stack)
++        out_of_flow_boxes.append(out_of_flow_box)
++        if out_of_flow_resume_at:
++            context.add_broken_out_of_flow(
++                out_of_flow_box, box, containing_block, out_of_flow_resume_at)
++        if context_box:
++            context.finish_block_formatting_context()
++
++    # Set excluded shapes from broken out-of-flow for in-flow content, keeping
++    # the page floats already placed in the same formatting context.
++    for context_box, shapes in excluded_shapes.items():
++        existing = context._excluded_shapes.get(context_box)
++        if isinstance(existing, list):
++            existing.extend(shapes)
++        else:
++            context._excluded_shapes[context_box] = shapes
++    return out_of_flow_boxes
++
++
+ def set_page_type_computed_styles(page_type, html, style_for):
+     """Set style for page types and pseudo-types matching ``page_type``."""
+     style_for.add_page_declarations(page_type)
+@@ -982,10 +1082,11 @@ def remake_page(index, context, root_box, html):
+         next_page_side = 'right' if direction_ltr ^ break_verso else 'left'
+     else:
+         next_page_side = None
++    deferred_floats = context.page_floats.get(index, (None, []))[1]
+     blank = bool(
+         (next_page_side == 'left' and right_page) or
+         (next_page_side == 'right' and not right_page) or
+-        (context.reported_footnotes and resume_at is None))
++        ((context.reported_footnotes or deferred_floats) and resume_at is None))
+     side = 'right' if right_page else 'left'
+     page_groups = page_state[3]
+     name = _update_page_groups(page_groups, resume_at, next_page, root_box, blank)
+@@ -1058,7 +1159,9 @@ def make_all_pages(context, root_box, html, pages):
+             remake_state['anchors'] = []
+             remake_state['content_lookups'] = []
+             page, resume_at = remake_page(i, context, root_box, html)
+-            reported_footnotes = context.reported_footnotes
++            reported_footnotes = (
++                context.reported_footnotes or
++                context.page_floats.get(i + 1, (None, []))[1])
+             yield page
+         else:
+             PROGRESS_LOGGER.info(
+diff --git a/weasyprint/stacking.py b/weasyprint/stacking.py
+index 0cd0302..85527d8 100644
+--- a/weasyprint/stacking.py
++++ b/weasyprint/stacking.py
+@@ -90,7 +90,7 @@ def _dispatch(box, page, child_contexts, blocks, floats, blocks_and_cells):
+         index = len(child_contexts)
+         stacking_context = StackingContext.from_box(box, page, child_contexts)
+         child_contexts.insert(index, stacking_context)
+-    elif box.is_floated():
++    elif box.is_floated() or box.is_page_floated():
+         floats.append(StackingContext.from_box(box, page, child_contexts))
+     elif isinstance(box, stacking_classes):
+         # Have this fake stacking context be part of the "normal" box tree,

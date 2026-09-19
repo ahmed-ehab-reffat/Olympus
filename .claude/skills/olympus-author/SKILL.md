@@ -201,6 +201,12 @@ corpus and its own measured `failure-patterns.md`.
 
 ---
 
+**A Nova zero is not a solvability verdict (L65).** On sfepy-adaptive-stepping-accounting Nova went
+0/11 with two runs at 116/117, and four runs appended to the pool (Orion, two Vega, one Nova) produced
+both passes. When a Nova-heavy batch reads 0% and the near-misses fail stated sentences, probe that
+they truly violate them, then add Orion or Vega runs before cutting a requirement. The pool is
+cumulative (L64): a later batch folder re-lists earlier runs under new numbers.
+
 ## 8-Step Workflow
 
 ### Step 0 — Pick Repo
@@ -212,6 +218,7 @@ corpus and its own measured `failure-patterns.md`.
 | Language | TS/JS/Python/Go/Rust |
 | License | MIT, BSD, Apache, Boost, CC-BY (NOT GPL/AGPL) |
 | Architecture | Multi-package, behavioral testing through public APIs |
+| Platform picker | **The repo must be selectable in the platform picker.** Some repos are reserved against data contamination and refused outright, and a reservation can appear after the repo was usable (scriggo, 2026-09-17). Have the user check BEFORE Step 1. See `SATURATED-REPOS.md § A0` |
 
 ```bash
 # ALWAYS clone into worktrees/
@@ -281,6 +288,23 @@ deferred placeholder that the public API hands back to callers; agents scope its
 own pass — 4/10 + 4/10). Neither costs a design decision; they are consequences of the pass you are
 already asking for.
 
+**Three more come FREE with any "add operators to an expression language that already has a static
+analysis" pick: F-26** (the analysis combines two operand estimates, so identical operands are
+treated as independent — 7/10 on ray-optics), **F-27** (a dual pair of combinators, where agents
+copy the narrowing polarity from the first onto the second — 6/10) and the **F-10 lowering cell**
+(codegen picks a representation per node from the analysis, and a valid node over a maybe-invalid
+operand is the near-miss decider — 6/10, sole failure of the 94/96 run). Budget the DESCRIPTION for
+the FP check while you pick them (L53): every behaviour sentence is either a stacked trap or FP
+exposure.
+
+**Two more come FREE with any "graceful degradation plus accounting" pick** (a recourse that can
+drop, skip or truncate work, reported in metadata the tool already carries): **F-15, accounting
+variant** (agents record on the ATTEMPT, so a recourse that could not act still writes an entry —
+4/10 on tippecanoe) and **F-33** (the feature redefines a field the repo already merges from its
+inputs, and agents leave the reader's base operator in place — 3/10). On that pick the machinery
+itself (ranking, pool compaction, output bookkeeping) drew no failures at all; plan the band on the
+accounting cells, and count the machinery as LOC and FP insurance (L58).
+
 **Step B-bis — FAILURE-PATTERN TARGETING (`failure-patterns.md` § 1, mandatory):** the arsenal
 class in Step B says what KIND of trap it is; this step says whether anyone has ever measured
 that kind killing an agent. Name the F-id(s) the candidate targets and check the precondition
@@ -318,7 +342,91 @@ with a file:line citation, not a hunch.
   of 9 failing runs on customasm-derived-bank-layout and the sole cluster behind both near-misses.
   Direct A-to-B chains discriminate nothing. **Never state an iteration-count or unbounded-length
   promise** - that exact clause was ruled a functional false positive.
+- **F-28 is the lead trap for a data-model feature.** If the repo keeps its concepts in a keyed
+  container (`World.layers`, a component registry) and already ships a composite value type for
+  multi-part concepts, name the new concept in the SINGULAR with its components and one setter taking
+  both, then test it by container key after a serialisation round trip. Measured 7/10 on
+  worldengine-orographic-precipitation and the sole failure of all four near-misses: agents split it
+  into sibling keys. Grep for the existing composite type first; without it the check is an unfair
+  representation pin (L49).
+- **The numerical kernel is not a trap (L58).** A formula stated in full gets transcribed, even a
+  closed-form fixed point: worldengine's 24 transport tests killed 0 of 20 runs. Count the kernel as
+  LOC and FP insurance and put the trap budget into the integration shape: container representation
+  (F-28), accessor form (F-16), lifecycle guards (F-29).
+- **A twin-implementation compiler gives three walls in code the agent did not write (F-30, F-31,
+  F-32).** If the repo has a Python spec and a C++ port under an identical-output convention, a new
+  instruction consuming a value at full width meets the existing width pass (F-30: 10/10 before the
+  rule was stated, still 2/10 in the accepted batch), the twins' constant folders (F-31: 2/10) and
+  the C++ CFG bookkeeping at scale (F-32: 2/10). Run ONE golden program through every pipeline the
+  repo already runs (plain, optimized, each target, text and binary). Test only arithmetic the
+  feature's operand reaches (L60): cwerg read 0/9 with float-DIV and narrow-DIV tests, 3/10 without.
 
+- **F-34 comes free with any rollback over an in-place solver.** If the repo's solve step writes its
+  iterate into the state vector it was handed (sfepy's Newton does), a contract that returns "the state
+  it held before its first solve" is a lead wall: 8 of 13 runs saved the snapshot by assignment and
+  returned the solved values, including both 116/117 near-misses. Test the nothing-accepted case, with
+  a rejected solve that still moves the iterate; the accepted-then-stopped case cannot see it. In the
+  same sentence, "stops before advancing" adds **F-35** (2/13), and "whatever `adapt_fun` sets" adds a
+  hostile-hook **F-10** cell (7/13). Confirm the in-place write with a file:line citation first.
+- **F-36 comes with any trailing-run feature on a marker-split tokenizer.** If the tokenizer reads a
+  regex-split segment list and backtracks by index (mwparserfromhell's does), a feature that absorbs
+  "the longest run of X characters immediately after" a construct is a lead wall when X is
+  caller-chosen: 11/19 runs, and the sole failure of four 189/190 near-misses. Test a marker inside
+  the run, a run ending mid-word, a failed-route re-parse, the reject branch followed by more text, and
+  ship a SEEDED generated corpus comparing twins with exact round trip. If the repo's C reader returns
+  `'\0'` at end of input, one test with NUL in the set adds **F-37** (7/19).
+- **Twin arms under "identical output" are one arm plus a forwarding stub (L67).** Both passers on
+  mwparserfromhell made the C tokenizer call the Python one, and the FP panel upheld it. Do not put
+  the second arm's machinery in the trap matrix, and check the LOC floor against a delegating passer.
+- **A test for a reviewer-flagged PRE-EXISTING behaviour needs a meta sentence first (L66).** Fix the
+  base behaviour in the reference, but test it only if meta.md already states it. One such test read
+  19/20 identical kills and took mwparserfromhell to 0/20.
+- **F-38 comes with any layered-input feature that lets one input add AND remove.** If a removal (or
+  override) marker may only target what EARLIER inputs contributed, validating it against the map
+  being mutated lets a same-input addition be removed: 7/10 on planetiler, the sole failure of three
+  82/83 near-misses, every evaluator calling the sentence clear. Write one provenance clause ("an id
+  the earlier files did not contribute") and one add-then-remove test, and keep remove-then-re-add
+  legal. A second consumer that re-resolves references on its own (validator, watcher) adds an F-9
+  origin cell (3/10).
+- **Name the full call shape of every new API the tests call (L72).** "`SchemaConfig.files` returns
+  ..." read as an instance accessor to 8/8 agents, and one compile error in the shared test class
+  wiped all 83 tests in every run. Write "a new static `SchemaConfig.files(Path)`". Before the first
+  batch, grep test.patch for each new symbol and check meta.md states that exact shape.
+- **F-39 comes free wherever the feature drives a repo helper into a regime its callers never use.**
+  featurevisor's `getUpdatedAvailableRangesAfterFilling` drops untouched later ranges when a fill
+  exactly uses up an earlier one; rebucketing refills a discontiguous free set, so reuse loses space.
+  3/11, three independent implementations, and my own first kernel did the same. Do not name the
+  helper. State the observable rule ("walked in order", "lowest first") and test a case where an
+  earlier range is used up EXACTLY.
+- **F-40 is one test in any TS/JS feature that reports a record keyed by user strings.** A plain `{}`
+  loses `__proto__`: 7/11 on featurevisor, six of them failing nothing else. It is fair when the repo
+  types the key as `string`, but reviewers call a band carried by it "overstated" (L74), so pair it
+  with a core killer.
+- **F-12 has an exported-helper form, and it was featurevisor-target-specialization's top killer.** If
+  the natural design changes a helper the repo exports AND tests on its own (`applyContextToConditions`
+  with 4,000 lines of specs), keep the helper and its specs in base mode and put your new logic beside
+  it. 7 of 20 runs rewrote the helper, passed every new test and failed its specs. Name only the entry
+  point in meta.md; never mention the helpers.
+- **F-43 comes with any feature that makes the agent evaluate or rewrite the repo's expressions
+  itself.** Implicit containers (a bare list meaning AND) nested under named operators get dropped from
+  hand-written recursion: 3 runs across 2 batches. Only a SEEDED corpus compared against the repo's own
+  evaluator caught it (Pattern 99); twenty hand-written structural cells killed one run between them.
+- **A reviewer-found reference bug that every run shares is a description fix (L76, L77).** State its
+  root cause in one clause and re-batch; the clause takes it to 0/N, so budget the band elsewhere.
+- **A merge rulebook stated in full is transcribed (L58).** On planetiler the args fixed point, layer
+  position rule, raw-vs-accessor scalar inheritance, diamond dedup and cycle naming killed 0/10; both
+  kills came from reviewer findings against the reference (L50). Spend hardening on provenance and
+  origin cells, not on more merge rules.
+- **F-41 comes with any "create objects at runtime" feature in an engine whose loader injects a
+  per-entry attribute.** ir-sim's YAML loader makes every entry its own group; its public factory
+  defaults `group=0`. A spawned robot driven only by `group_behavior` then joins group 0 and never
+  moves: 10/11, the sole failure of six 89/90 near-misses. Promise that runtime objects are ordinary
+  members of everything the engine does, test one that relies ONLY on the keyed dispatch, and never
+  name the attribute. Diff the loader's factory call against the factory signature to find it.
+- **A lifecycle the prompt names path by path is transcribed (ir-sim, 0/11 on eleven reproduced
+  mutants).** Three reset paths, an id rewind, a shared list indexed by a spatial tree and lazy edge
+  tracking all died once the description named `reset()`, `reset(random=True)` and `reload()`. Budget
+  them as FP insurance and LOC, not as band.
 - **F-10 is not optional.** If the contract has two form axes (one with multiplicity, one with
   polarity), you MUST test the off-diagonal cell. On neva it was the sole failure of both 20/21
   near-misses and the difference between a 20% and a 40% batch. It costs ~20 test lines and no
@@ -570,6 +678,8 @@ Wrong Logic % constraint: <25%. ≥25% → Olympus territory. Downgrade trap or 
 - [ ] Every trap names an F-id from `failure-patterns.md` (or is flagged as an unmeasured guess)
 - [ ] Traps sit on DIFFERENT axes, and at least one is interdependent with another
 - [ ] § 11b cross-product matrix filled in, every off-diagonal cell has a test (F-10)
+- [ ] Stage-placement audit (L57): no sentence places a new stage "between" existing ones without saying the existing steps keep every stage they run today
+- [ ] Float audit (L59): no exact equality on a value a formula produces, even at a mathematically exact point
 - [ ] **Sibling-API audit (F-20): does this feature add a variant of an existing entry point? If
       so, name the new rule's scope by naming ONLY the new API, and add a test of the OLD api in
       both directions. Confirm the base suite passes with the old behaviour broken — if it fails,
@@ -585,6 +695,8 @@ Wrong Logic % constraint: <25%. ≥25% → Olympus territory. Downgrade trap or 
 - [ ] **Placeholder-lifetime audit (F-25): does the feature force a deferred handle, and can the
       caller store it? Gate its resolution on whether the DATA exists, never on a phase flag (L51),
       and test a retained reference reused in a later registration plus one that closes a cycle.**
+- [ ] **Inherited-aggregate audit (F-33): does the feature change what a field the repo already reads back from its inputs MEANS (a maximum where the reader sums, a union where it overwrites)? Name the reader and its operator, and test two inputs carrying distinct values plus one single-input case where the inherited value is smaller.**
+- [ ] **Attempt-vs-effect audit (F-15 accounting): for every "record what the recourse did" rule, test the degenerate attempt (one item that cannot be dropped, with and without inherited records), and a zoom/group where only a DIFFERENT member acted.**
 - [ ] **Reference-bug harvest (L50): list every defect a reviewer found in YOUR reference and ask
       of each whether a test would discriminate. Each one that got a test on dfu-derived-recursion
       became a measured killer (4, 4 and 3 of 10). Replay against the saved passers first (L40).**
@@ -598,10 +710,44 @@ Wrong Logic % constraint: <25%. ≥25% → Olympus territory. Downgrade trap or 
       only the value is stated. This is FP-panel armour — an adjudicator cited exactly such a helper
       to reject a dissenting judge's false-positive probe — and on rocketpy it was worth the entire
       band: the same ten solutions read 0/10 with the pin and 1/10 without it.**
+- [ ] **Qualifier-attachment check (L52): for every sentence with two subjects, move each "except" /
+      "including" / "unless" onto the other subject and ask whether the meaning changes. If it
+      does, split the sentence. One such sentence failed 11 of 11 runs on ray-optics.**
+- [ ] **Stated-but-untested audit (L53): list every behaviour sentence in meta.md that no test
+      pins. Each is FP exposure, and each one you test is another stacked trap. If the list is long,
+      delete sentences, not tests.**
+- [ ] **Harvest budget (L55): count the tests added for reviewer findings. More than ~4 independent
+      ones multiply toward 0% (ray-optics batch 1: 0/11 with the unfair walls removed). Keep those
+      sharing a root cause with a designed trap; fix the rest in the reference only. Answer
+      precision findings (float width, completeness of an analysis) with a scoped sentence (L54).**
+- [ ] **In-process validation (L56): no test shells out to a tool the Dockerfile installs. A
+      `naga-wasi-cli` check passed every local clean-room and failed Verify Solution twice.**
+- [ ] **Throttle/assert audit (L70): for every test that gates a producer (decoder calls, packets,
+      allocations) and then asserts on what comes out, check the assertion counts something the gate
+      bounds in the WORST case, not what your reference happens to yield. kira: a 60-call gate with a
+      48-frame assertion failed six correct schedulers at frame 47 and was the whole accepted band.**
+- [ ] **Action-ignored mutant (L71): for every "eventually settles to X" test, delete the action
+      (seek, command, update) from the reference and rerun. If the test still passes, X also happens
+      without the action. kira: 4 of 4 such seek tests passed with the seek ignored.**
 - [ ] **Unbounded-promise audit (L44/L45): does any sentence promise a bound on iterations, passes,
       or chain LENGTH? If so, cut it to the capability ("a bank may be placed at the end of a bank
       defined later") — an unbounded performance promise is a false-positive generator, because a
       passer that is correct at every tested size fails it at some larger one.**
+- [ ] **Twin-parity scope (L60): if the contract promises identical output between two
+      implementations, list every pre-existing divergence review finds, fix each in the reference,
+      and confirm NO fixture reaches one the feature does not need. cwerg: two such tests took a
+      batch to 0/9; without them 3/10, accepted.**
+- [ ] **Cold build under 600 s (L62): time `docker build --no-cache`. The platform's environment
+      start includes the image build; do COPY + build + `chmod -R` in one `RUN --mount=type=bind`
+      layer (cwerg: 704 s to 413 s).**
+- [ ] **Loader-attribute audit (F-41): if the feature creates objects at runtime, diff the batch
+      loader's call into the factory against the factory's public signature. Every argument the loader
+      injects per entry (group index, owner, id) is a seam; test one object that depends only on it.**
+- [ ] **Shared-reference-bug rule (L76): a reviewer-found reference bug that the local replay shows
+      every agent shares (N/N) gets a reference fix and NO test unless meta.md already states the
+      behaviour. Replay before adding the regression test a reviewer asks for.**
+- [ ] **Float-exact boundaries (L75): every inclusive/strict boundary cell uses squares at dyadic
+      coordinates, never circles (buffered-polygon centroids) or a trajectory that lands on the edge.**
 - [ ] **Stated-noun list (L46): write down every noun meta.md actually names. Any fixture whose
       subject is NOT on that list is a gate on unstated behaviour — fix the reference instead.**
 - [ ] **Form-parity audit (F-18): if the domain has two lexical spellings of one concept, every
@@ -721,6 +867,12 @@ Verify offline: `docker run --rm --network none --user 1000:1000 -v /tmp/out:/ou
 **Assertions:**
 - Strong: `assert_eq!` on tree/list/string outputs; `expect_error(input, "alternative")` substring-match for errors
 - Weak (flagged): `is_ok()`, `length > 0`, `toBeDefined()`, exact full-message error match
+
+**Compiled repos: make the build timestamp-proof (L63).** The Dockerfile's build outputs are tracked
+files in the solver's sandbox, and agents `git restore` them to keep a clean diff. A plain `make` then
+sees nothing to rebuild and grades the BASELINE binary: tippecanoe had 7 of 10 runs graded stale, every
+JUnit file read all-fail, and two runs had to be contested as ENV-blocked. In test.sh, run
+`make -B <the targets the tests execute>` (or delete those tracked outputs first) before any test.
 
 **test.sh requirements:**
 - `#!/usr/bin/env bash` + `set -uo pipefail`
@@ -954,21 +1106,27 @@ Mars: 1–3 rounds. Olympus: 3–5 rounds. >5 on Mars = playbook patterns not fo
    now succeeds. Needs a resolver whose throw the repo's own suite does not cover. Costs ONE clause
    naming the semantic difference — never "keep throwing", never the exception name. The most
    reproducible lever measured: same 8/10, four levers apart.
-4. **A shared-helper side effect on the output channel (F-19)** — **36/52 runs across 4 batches
+4. **A composite concept split into sibling container keys (F-28)** — **7/10 on
+   worldengine-orographic-precipitation (after 4/10), and the SOLE failure of all four 63/66
+   near-misses.** Agents store each component of a two-part concept under its own key; every accessor
+   and serialised value works and only the container key dies after a round trip, so the failure
+   points at the serialisers. Needs an existing composite value type in the repo. Costs the singular
+   noun in the meta and ~3 round-trip tests.
+5. **A shared-helper side effect on the output channel (F-19)** — **36/52 runs across 4 batches
    (69%), the most DURABLE lever measured**: it survived three fairness rounds, a Verify Solution
    round and an FP panel without ever being ruled unfair, and never dropped below 50%. Needs a
    library entry point writing to a global channel plus a new command emitting structured output
    there. Its durability comes from the fix living in a dependency the agent was RIGHT to pick, so
    disclosing the contract does not disclose the fix. Assert from a subprocess test.
-5. **A cross-stage resolution drop (F-9)** — 6/10 on neva, and the cheapest source of
+6. **A cross-stage resolution drop (F-9)** — 6/10 on neva, and the cheapest source of
    INTERDEPENDENCE: one root cause breaks every capability at once, so you get stacking without
    bolting on a second mechanism.
-6. **A token-form parity cell (F-18)** — one rule, two lexical spellings. 22 of 37 kills on gluon
+7. **A token-form parity cell (F-18)** — one rule, two lexical spellings. 22 of 37 kills on gluon
    for one test per position and no new description words.
-7. **A capability cross-product cell (F-10)** — the band decider. On neva it was the sole failure
+8. **A capability cross-product cell (F-10)** — the band decider. On neva it was the sole failure
    of both 20/21 near-misses; without it the batch reads 40% instead of 20%. ~20 test lines,
    zero description words. Ship it in every problem that has two axes.
-8. **A repo-idiomatic wrapper that narrows your stated input domain (F-23)** — **6/10 on
+9. **A repo-idiomatic wrapper that narrows your stated input domain (F-23)** — **6/10 on
    rocketpy, reproducible across two batches AND two solver families (Nova and Orion both fell to
    it).** State a broad contract ("a number or a callable receiving X"), then rely on the repo's own
    pervasive scalar-or-callable container being STRICTER than that sentence: agents delegate
@@ -976,7 +1134,7 @@ Mars: 1–3 rounds. Olympus: 3–5 rounds. >5 on Mars = playbook patterns not fo
    file they never touched. Zero description words, ~30 test lines. **Budget it as BINARY** — every
    failing run failed every killing cell, so the measured counterfactual for softening it was
    0/10 -> 56%, over the ceiling. It has no middle setting.
-9. **Type-check shortcut for an unobservable interface (F-21)** — **5/10 on datafixerupper, the
+10. **Type-check shortcut for an unobservable interface (F-21)** — **5/10 on datafixerupper, the
    top killer and the SOLE failure of the closest near-miss (172/173).** When your rule quantifies
    over the outcome of an object reached through an interface with no accessor, agents downcast to
    the repo's own abstract base to read the field. State the rule over the INTERFACE with a
@@ -984,32 +1142,32 @@ Mars: 1–3 rounds. Olympus: 3–5 rounds. >5 on Mars = playbook patterns not fo
    conforming implementation OUTSIDE that base class. Costs a ~30-line test helper and zero
    description words. Grep the interface for a getter first — if one exists, the honest
    implementation is a one-liner and the pattern is dead.
-10. **Proxy-metric drift (F-17)** — **8/10 on lyon-fill-internal-vertices, the top killer and the
+11. **Proxy-metric drift (F-17)** — **8/10 on lyon-fill-internal-vertices, the top killer and the
    sole failure of both near-misses.** Write every test helper in the CONTRACT's vocabulary, not the
    cheapest structural one. When the contract says something geometric/semantic and your helper
    computes something topological/syntactic, author and agent adopt the same wrong abstraction and
    the suite is blind to the exact gap it exists to measure. Verify the direct check reports zero
    false hits against your own reference before shipping it.
-11. **Discard-unit granularity (F-13)** — **6/10 on rust-minidump, the top killer measured on that
+12. **Discard-unit granularity (F-13)** — **6/10 on rust-minidump, the top killer measured on that
    problem**, and 3 of the 6 were sole-failure near-misses at 48/49. Needs a two-tier format (base
    declaration + amendment rows) and a validity rule an amendment alone can break. State the rule
    with the FORMAT's noun and put the violation in an amendment row.
-12. **Arming-vs-firing condition (F-15)** — 4/10 on rust-minidump. Any "allow one, stop at the
+13. **Arming-vs-firing condition (F-15)** — 4/10 on rust-minidump. Any "allow one, stop at the
    second" rule. **The discriminating fixture is the ONE-event case** asserting nothing happened;
    the two-event case passes under both readings and killed zero (L25).
-13. **Declared-vs-derived terminal state (F-14)** — 3/10 on rust-minidump. Add a stop reason that
+14. **Declared-vs-derived terminal state (F-14)** — 3/10 on rust-minidump. Add a stop reason that
    means "someone declared it" to a subsystem that already has several "cannot continue" exits.
    Couple the output rule to the ORDINARY state so a merged implementation breaks output too.
-14. **Precision wording** — 52% of failures are MISSED_REQUIREMENT. "subjects" vs "commits",
+15. **Precision wording** — 52% of failures are MISSED_REQUIREMENT. "subjects" vs "commits",
    "unbounded" vs "non-aggregated", "map_top_down" vs "map_bottom_up".
-15. **A joint fixed point across quantity kinds (F-22)** — 8 of 9 failing runs on
+16. **A joint fixed point across quantity kinds (F-22)** — 8 of 9 failing runs on
    customasm-derived-bank-layout, and the whole of both near-misses. Free interdependence: one root
    cause breaks every capability that routes through the other kinds. Needs an existing
    iterate-to-stability resolver in the repo.
-16. **File count** — more files = more exploration = more messages and LOC. Note this moves SCOPE
+17. **File count** — more files = more exploration = more messages and LOC. Note this moves SCOPE
    and payout, not pass rate.
-17. **Interacting requirements** — 10+ at Olympus Good, 15+ at Excellent.
-18. **Codebase-inferable requirement** (0–1 max — visible in code, not description).
+18. **Interacting requirements** — 10+ at Olympus Good, 15+ at Excellent.
+19. **Codebase-inferable requirement** (0–1 max — visible in code, not description).
 
 - **Placeholder validity window narrower than the caller's (F-25)** — **4/10 + 4/10 on
   dfu-derived-recursion**, in the same batch as F-24 and free alongside it: the pass that creates
@@ -1021,6 +1179,25 @@ Mars: 1–3 rounds. Olympus: 3–5 rounds. >5 on Mars = playbook patterns not fo
 - **Unparameterised-setter inference gap (F-16)** — 4/10, but it is a COMPILE error that measures no
   understanding of the feature. Bonus only, never the lead trap, and only where the repo already has
   a boolean `with_*` setter making the shape inferable.
+- **Correlated operands estimated as independent intervals (F-26)** — **7/10 on
+  ray-optics-formula-conditionals**, after 5/10 and 5/11 in two earlier batches: the most stable
+  killer on that problem across three different descriptions. Needs an estimator over a node-sharing
+  IR and a new operator exact on identical operands. State the consequence ("a branch the condition's
+  estimated range cannot select contributes nothing"), test `x < x` and a shared subexpression, never
+  write "identical operands".
+- **Dual-combinator polarity (F-27)** — **6/10 on ray-optics**, and it ROSE from 3/11 to 6/10 as the
+  description got shorter and clearer. Agents copy `and`'s true-branch narrowing onto `or`. One
+  sentence names both polarities with one verb; test the `or` true branch with a hazard reachable
+  through only one operand.
+- **Low-bits invariant of an existing pass vs a new full-width consumer (F-30)** — **10/10, 8/11,
+  7/10, 3/9, 2/10 across five cwerg batches**, the lead wall, and still killing after meta stated it
+  ("stays true when the program is optimized first"), because the fix lives in a pass the agent
+  never opened. Needs a width/promotion pass that runs on some pipelines only.
+- **Twin constant folders with different host integer semantics (F-31)** — **2/10 on cwerg with an
+  identical 5-test set.** Needs Python + C++ twins under parity. Fixture overflowing constant
+  arithmetic feeding the new instruction; nothing the feature does not reach.
+- **Scale-only CFG malformation (F-32)** — **2-3 per batch on cwerg** once multiplicity is stated.
+  One program with dozens of occurrences through the strict text path.
 
 **What does NOT move the pass rate, measured:**
 
@@ -1051,6 +1228,30 @@ compliance overhead.**
 **Wrong Logic ≥25% signals subtle algorithmic trap (O-Algorithm shapes). Hardest problems sit at 0–10% pass rate.**
 
 ---
+20. **Accounting beside a recourse (F-15 accounting variant, F-33)** — **4/10 and 3/10 on
+   tippecanoe-tile-join-size-recourses, together 7 of the 9 failures, while the reduction machinery
+   drew none.** Record-on-attempt (a recourse that could not act still writes a metadata entry) and a
+   base merge operator left in the input reader (inherited values summed where the contract says
+   largest). Both were bugs in the reference first. Costs one clause each and three tests.
+21. **A `__proto__` key in a string-keyed record (F-40)** — **7/11 on featurevisor, the sole failure
+   of six 33/34 near-misses.** One test, zero description words beyond "per variation value". Narrow:
+   the Auto Review filed the batch as a High difficulty discrepancy while approving it (L74).
+23. **An exported helper whose own specs pin the old contract (F-12, exported variant)** — **3/10 and
+   4/10 on featurevisor-target-specialization, 7 of 20 runs that passed every new test.** Not authored:
+   the reference left the helpers alone. Check at design time which exported helpers the natural design
+   rewrites, and keep their spec files in base mode.
+24. **The implicit-AND list arm in a hand-written evaluator (F-43)** — **2/10 then 1/10**, caught only by
+   a seeded equivalence corpus against the repo's own evaluator.
+22. **A repo helper whose lossy path only the new regime reaches (F-39)** — **3/11 on featurevisor,
+   independent of F-40**, which is what kept that batch from reading as one special key. Prove the
+   bug in a scratch test before designing around it.
+21. **A runtime creation path that skips a loader-injected attribute (F-41)** — **10/11 on
+   ir-sim-scenario-events**, the sole failure of six 89/90 near-misses. The loader gives every entry its
+   own group; the factory defaults it; a group-behavior-only spawn sits still. Found by a Solution Quality
+   review of the reference (L50). Zero description words; it decided the band alone, so pair it.
+22. **Several positional deletions undone in the wrong order (F-42)** — 2/11 on ir-sim. One fixture that
+   deletes two items at different positions in one pass.
+
 
 ## Pre-Submit Checklist (Composite)
 
@@ -1067,6 +1268,10 @@ compliance overhead.**
 - [ ] **MANDATORY flakiness gate** — full suite (base + new) run 3-5x; pass/fail deterministic + identical every run. No timing/ordering (map/set iteration, parallel races)/unseeded-RNG/network/clock/FS-time/resource-contention dependence. Flaky baseline OR flaky new test = reject (if baseline known-flaky, scope base mode to solution-relevant tests + document). See `TESTS.md § Avoiding Flaky Tests`.
 - [ ] test.sh is executable (mode 100755 in patch)
 - [ ] test.sh accepts `--output_path`, position-independent
+- [ ] **Every new-mode test fails on base.** Editing an existing spec file drags its untouched cases into new mode; move superseded cases into the NEW spec file and leave the original in base mode (featurevisor Verify Solution FAIL, 18 base-passing new-mode tests)
+- [ ] **No `::` in any JUnit `classname`/`name`.** The grader keys tests as `classname::name`; repo titles that already contain `::` become phantom unmatched "extras" (`before_extras_not_skipped`, 314 on featurevisor). Normalise in test.sh after the runner and check for duplicate IDs
+- [ ] **Output-representation tests read the RENDERED result** (lines, printed text) unless meta.md fixes the return type; a joined string and a per-change formatter both satisfy "one line each" (L48/L49)
+- [ ] **No-XML fallback carries the runner's diagnostic** in a failing testcase and forces a nonzero exit
 - [ ] Build-failure fallback present (Rust)
 - [ ] No `//` comments inside test bodies (unless repo convention)
 - [ ] Tests run offline (`--network none`)
@@ -1284,9 +1489,10 @@ See `Olympus/Instructions/PROMPTS.md`:
 
 ## ⚠️ Environment constraints (this workstation)
 
-- **NO LOCAL DOCKER.** Do not attempt to build or run the image; do not report the Dockerfile as
-  verified. Write it to the `DOCKER.md` pattern, verify statically, and record Docker validation as
-  owed to the platform run. Everything else is validated locally.
+- **DOCKER IS AVAILABLE (since 2026-08-25).** Build the submission's Dockerfile and run
+  `test.sh base` / `test.sh new` inside the container as uid 1000 with `--network none` (clean
+  room). Remove only your own image tag afterwards (`docker rmi <tag>`); never `docker system prune`
+  or builder prune on this machine (the containerd image store loses shared base images).
 - **WATCH DISK.** `cargo`/`go` target dirs dominate (measured 1-5G each vs a 3-32M clone). Run
   `df -h /home` before a long build, prefer `cargo test -p <crate>` over `--workspace`, and delete
   `worktrees/<repo>/target` as soon as a measurement is done. A build has already filled this disk

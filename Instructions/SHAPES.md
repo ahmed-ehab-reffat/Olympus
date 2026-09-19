@@ -448,3 +448,106 @@ dominant cluster. A band carried by a SEMANTIC distinction reproduces; compare v
 
 **Cost warning.** Four Auto Review rounds and seven reference defects, four of them self-inflicted
 by the previous round's fix. Deferred resolution has a long self-inflicted tail — see L51.
+
+
+## O-Pipeline-hard confirmed on an IR NODE-FAMILY pick — ray-optics-formula-conditionals (APPROVED Olympus 2026-09-14, 1/10)
+
+**The sub-shape: add a node family to an IR that several independent passes consume.** Here one
+formula DAG feeds a parser, two evaluators, a JS generator, a WGSL generator, a symbolic derivative
+and an interval range estimator. Batch 3's 40 kill events by consumer:
+
+| Consumer | Kill events | Pattern |
+|---|---|---|
+| Interval range estimator | 24 | F-26 identical operands, F-27 `or` polarity, one soundness oracle |
+| WGSL generator | 11 | F-10 valid node over a maybe-invalid operand |
+| Symbolic derivative | 3 | F-23 family (subtraction-based equality overflows) |
+| Parser | 2 | F-10 variadic-argument grammar cell |
+| Evaluators, JS generator | 0 | — |
+
+**Pick this shape only when the IR has a static-analysis consumer.** Without one the node family is
+breadth: 7 files and 329 effective LOC, but the parser, evaluators and JS codegen killed 2 events
+between them. **Cost warning:** the description hits the word cap fast, and a dense spec has no clean
+pass under the FP check (L53).
+
+## O-Composite-add confirmed on a SIMULATION-LAYER pick — worldengine-orographic-precipitation (APPROVED Olympus 2026-09-16, 2/10)
+
+**The sub-shape: add a physical layer to a simulation pipeline whose world model is a keyed layer
+container.** Batch 2's 46 kill events by subsystem:
+
+| Subsystem | Kill events | Pattern |
+|---|---|---|
+| Serialisation round trips + equality | 25 | F-28 container key, F-16 accessor form |
+| Precipitation stage / generation steps | 11 | F-16 accessor form, one missing accessor |
+| Wind model API | 6 | F-29 guard, F-16 |
+| CLI maps and info | 4 | F-16 |
+| Moisture transport (24 tests) | 0 | — |
+| Drawing | 0 | — |
+
+**Pick it when the model has a composite value type** (here `LayerWithThresholds` /
+`LayerWithQuantiles`). Without one the physics is breadth: it supplies the LOC and none of the band.
+
+## O-Pipeline-hard confirmed on a TWIN-IMPLEMENTATION COMPILER pick — cwerg-bcopy-bzero-lowering (APPROVED Olympus 2026-09-16, 3/10)
+
+**The sub-shape: a new IR instruction in a compiler written twice (Python spec + C++ port) under an
+identical-output convention.** Batch 6's 32 kill events by pipeline:
+
+| Pipeline | Kill events | Pattern |
+|---|---|---|
+| Native wrap program (py/cc/parity) + its C and optimizer paths | 16 | F-31 folders, F-32 at scale, one broken loop |
+| Optimized C on the main program | 6 | F-30 width pass |
+| Python/C++ assembly parity, main program | 4 | F-32 |
+| Native py/cc execution | 6 | one run's source cursor |
+| Plain C output | 0 | — |
+
+**Pick it when the repo already runs every program through several pipelines** (here plain and
+optimized C, three targets, text and binary). The feature is the same everywhere; the difficulty is
+in the pipelines. Budget the parity promise's review cost (L60).
+
+## O-Composite-extend confirmed on a SOLVER-FAMILY ACCOUNTING pick — sfepy-adaptive-stepping-accounting (APPROVED Olympus 2026-09-16, 2/15)
+
+One accounting contract threaded through every existing solver path (first-order simple and adaptive,
+five elastodynamics solvers) and the controllers they call. The shape held its band only after scope was
+cut twice: each extra lane (restart files, a matrix cache) added a wall in base code, not in the
+feature. The band lived in the stop and retry path all solvers share (F-34, F-10 hook cell, F-35), not in
+per-solver breadth: 87 of 117 tests killed nobody. Budget per-solver tests as FP insurance and put the
+traps where the solvers converge.
+
+## O-Composite-extend confirmed on a TWIN-IMPLEMENTATION pick — mwparserfromhell-site-aware-parsing (APPROVED Olympus 2026-09-18, 2/19)
+
+A parsing profile threaded through a Python tokenizer and its C-extension twin under an identical-trees
+contract. The second arm did not double the difficulty: both passers forwarded C to Python when a site was
+given, and the FP panel accepted it (L67). The band lived in the SHARED scanning logic and the C reader's
+sentinel (F-36, F-37) and in a two-path property cell (F-10), not in reimplementing the feature twice.
+Budget a twin shape as one arm plus a forwarding stub, and check the LOC floor against that passer.
+
+## O-Composite-add on a two-path playback feature — kira-loop-crossfade (APPROVED Olympus 2026-09-18, 3/10, fair 9/10)
+
+A feature added to both a synchronous path (static sound, pre-resampler) and an asynchronous one
+(streaming, decoder thread) with a shared transport rule reads EASY when every rule is local and stated:
+Nova implemented both paths in 10 of 10 runs. The asynchronous path adds test-harness risk (queue depth,
+thread scheduling), not agent difficulty. Only the composition cell (live update x shortened wrap)
+killed. For this shape, design the trap matrix on cross-path and live-update cells, not on per-path rules.
+
+## O-Composite-add on a layered-config composition feature — planetiler-custommap-schema-composition (APPROVED Olympus 2026-09-18, 3/10)
+
+Config inheritance (a file extends others, merged per field) reads EASY rule by rule: every stated merge
+rule was implemented by 10 of 10 runs. Difficulty lives in two places only: provenance (what counts as
+inherited when one input both adds and removes, F-38) and origin (a second consumer re-resolving a
+reference that came from a bundled resource, F-9). For this shape, state the merge rules briefly, spend
+the trap design on provenance and origin cells, and name every new static API's full signature.
+
+## O-Algorithm-correctness on a stated allocation algorithm — featurevisor-minimal-rebucketing (APPROVED Olympus 2026-09-19, 2/11)
+
+When the contract states the algorithm step by step (retain lowest-first, refill in declared order,
+sort and merge), the algorithm itself is transcribed: 0 of 11 failed any kernel cell. For this shape,
+state the rules plainly and find the difficulty outside the prose: a repo helper the new regime drives
+into its lossy path (F-39) and host-language edges in the reported structures (F-40).
+
+
+## O-Composite-add as a declarative config section in a simulator — ir-sim-scenario-events (APPROVED Olympus 2026-09-19, 1/11)
+
+Confirms O-Composite-add outside compilers: a new top-level YAML section whose semantics run inside the
+existing step loop (conditions, actions, timing, undo on reset). Profile: one new module (~300 eff)
+plus lifecycle wiring (~60 eff), ~90 tests, a ~490-word description that pins every semantic. The
+lifecycle wiring the prompt names is transcribed; the band sits in an integration default the loader
+supplies implicitly (F-41).

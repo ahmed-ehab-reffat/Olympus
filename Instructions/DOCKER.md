@@ -607,6 +607,27 @@ Historical Java + C++ author guide (reference only): <https://docs.google.com/do
 
 ---
 
+
+### Maven reactors: non-root and agent-proof (planetiler-custommap-schema-composition, 2026-09-17)
+
+Three blockers appear only when the container runs as a non-root user, and the platform does run as
+non-root. Validate every image both as root and with `--user 1000:1000`; require identical results.
+
+1. `/app` from `COPY . .` is root-owned 755. test.sh cannot move the new test file aside for base mode,
+   and `git apply` cannot write. Fix: end the build RUN with `chmod -R a+rwX /opt/m2 /app`.
+2. git refuses `/app/.git` for a non-owner (dubious ownership), and `buildnumber-maven-plugin` shells out
+   to `git log`, failing the whole build before any test. Fix: `RUN git config --system --add
+   safe.directory '*'` before the COPY.
+3. `target/` trees built during the image build are root-owned; `maven-resources-plugin` sets the
+   last-modified time when it copies resources over them, which only the owner may do. Fix: delete the
+   module `target/` directories at the end of the build RUN. Installed artifacts still resolve from the
+   local repo.
+
+The grader runs inside the agent's container (L73). An agent that runs a plain `mvn install` in a
+reactor using a flatten profile leaves an unflattened POM whose parent version is `${revision}`, and
+the offline test run fails to resolve anything. test.sh should grep its log for that signature,
+reinstall the module offline with the profile, and retry once.
+
 ## Slim Image Pre-Installed Tools
 
 Never reinstall these:

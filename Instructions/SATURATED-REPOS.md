@@ -29,6 +29,18 @@ Caps recap (admin 2026): ≤6 per repo per author, ≤3 per repo per week, globa
 
 ---
 
+## A0. PLATFORM-RESERVED (repo cannot be selected at all — data contamination)
+
+A different wall from saturation. The platform's repository picker refuses the repo with: *"This
+repository can't be selected — it's reserved to prevent data contamination. Choose a different
+repository."* There is no sub count, no warning tier and no appeal. No GitHub query or local file can
+predict it. **The only check is to try selecting the repo in the platform picker at PICK time, before
+any design work.**
+
+| Repo | Reserved seen | Note |
+|---|---|---|
+| [open2b/scriggo](https://github.com/open2b/scriggo) | 2026-09-17 | Killed `rejected/scriggo-attribute-escaping-contexts` after DESIGN + a validated core slice (patches, clean room x3, Docker as uid 1000). ⚠️ The same repo was selectable on 2026-07-21 (`scriggo-range-iterators` got as far as a derivative verdict), so **a reservation can be added AFTER a repo has been usable.** An earlier successful selection proves nothing; re-check in the picker for every new pick. |
+
 ## A. GLOBAL-SATURATED (platform-flagged over-used — all authors)
 
 | Repo | Subs (platform) | Stars | Note |
@@ -41,6 +53,12 @@ Caps recap (admin 2026): ≤6 per repo per author, ≤3 per repo per week, globa
 | [rhaiscript/rhai](https://github.com/rhaiscript/rhai) | derivative-saturated | 5474 | Recon-DEAD 2026-07-11 (not platform-count, our gate): a clean general-purpose embedded scripting-engine VM = the EXACT author-obvious class THE PATTERN names (goja/gopher-lua/risor/tengo/expr/cel). Confirmed via a fully-validated spread-operator Olympus (261eff/48 tests) killed **DERIVATIVE across 2 rounds (88%→82%)** vs a prior-author pipeline twin the GitHub SIX-CHECK could not see. The 5 dedup candidates prove the whole SYNTAX-SUGAR space is taken: spread (2+), destructuring/rest-patterns in let/const/for (3+), tuple type. Pipeline operator `\|>` is maintainer **wontfix** (PR #1061 CLOSED, issue #1062 CLOSED). Remaining deep gaps are shallow (mixed-numeric only `sort()` rejects; max/min/contains/dedup/eq already coerce) or pattern-adjacent (switch value-binding ~ destructuring). Do NOT author rhai syntax/collection features; a non-derivative pick would need an INVENTED deep-engine wrinkle (optimizer/dispatch/closure correctness bug) AND still carries the invisible pipeline-collision risk of any author-obvious VM. Prefer an obscure-domain deep engine instead. |
 
 **Presumed-saturated (famous, NOT yet platform-verified — check before investing):** dgraph-io/badger (15.7k★), dream-num/univer (13.3k★), gopher-lua (6.9k★), apache/calcite (5.1k★ — the flagship JVM SQL query planner = textbook "SQL-tool class" author-obviousness, same class as sqlglot 62-DEAD; ALSO a prior build-verified structural-law collapse for gap-fills — verify platform sub-count before investing), and any household-name clean VM / SQL tool / policy-config lang.
+
+**Platform reuse warnings seen (softer tier, repo still eligible):**
+
+| Repo | Subs (platform) | Contributors | Seen | Note |
+|---|---|---|---|---|
+| [sfepy/sfepy](https://github.com/sfepy/sfepy) | 25 | 6 others | 2026-09-17 | "already been used in 25 submissions by 6 other contributors ... proceed at your own risk". Eligible, BSD-3. Our 2 approved subs predate it. GitHub competitor-signature screen was CLEAN, so the reuse is invisible to PR-author profiling. `rejected/sfepy-arc-length-continuation` died PUBLICLY-SOLVED (JAX-FEM arc-length), but corpus overlap was only 1.9%: the reuse count did not bite. Lane dead: arc-length continuation. |
 
 When the platform shows a "this repository is heavily over-used" warning for a repo you were about to pick, ADD IT HERE (repo + sub-count + stars + the warning text) and pick a different repo.
 
@@ -61,7 +79,7 @@ risor (902★) is the most over-used repo seen — the star-proxy is FALSE. The 
 
 | Repo | Contested subsystem | Evidence |
 |---|---|---|
-| [open2b/scriggo](https://github.com/open2b/scriggo) | **Go LANGUAGE core** (checker/emitter/VM) | Platform derivative-verdict 2026-07-21: a prior sub is a broad "recent-Go-language-completion" upgrade covering **range-over-int + range-over-func iterators + min/max/clear builtins + labeled break/continue + per-iteration loop-var semantics**. Killed `rejected/scriggo-range-iterators` (fully built + Docker-validated) as DERIVATIVE. Any missing-Go-language-feature pick in scriggo (interfaces/methods/generics next) is HIGH derivative risk — the same author is actively completing the language. Scriggo's TEMPLATE engine (auto-escaping contexts / render-show pipeline / macro-render / markdown-conversion) is a DIFFERENT surface and may be open, but treat the language core as contested. |
+| [open2b/scriggo](https://github.com/open2b/scriggo) | **⛔ WHOLE REPO RESERVED 2026-09-17, see § A0.** Historical: Go LANGUAGE core (checker/emitter/VM) | Platform derivative-verdict 2026-07-21: a prior sub is a broad "recent-Go-language-completion" upgrade covering **range-over-int + range-over-func iterators + min/max/clear builtins + labeled break/continue + per-iteration loop-var semantics**. Killed `rejected/scriggo-range-iterators` (fully built + Docker-validated) as DERIVATIVE. Any missing-Go-language-feature pick in scriggo (interfaces/methods/generics next) is HIGH derivative risk — the same author is actively completing the language. Scriggo's TEMPLATE engine (auto-escaping contexts / render-show pipeline / macro-render / markdown-conversion) is a DIFFERENT surface and may be open, but treat the language core as contested. |
 
 | [m4b/goblin](https://github.com/m4b/goblin) | **`src/mach/` import/fixup resolution (`imports()`, `bind_opcodes`, chained-fixups)** | Scope Gate reject 2026-08-20 (`goblin-macho-chained-fixups`, `derivative`, "narrower derivative of older accepted candidate"): a prior accepted submission already implements `LC_DYLD_CHAINED_FIXUPS` parsing at `goblin::mach::chained_fixups` — the pointer-chain walker, import-table decoder, bind resolution, and `MachO::imports()` integration — on the exact same files. Fully built + validated (18 tests, 3x deterministic, correct fail-to-pass on base) before the reject landed; not curable by rewording, since the entire pick IS the chained-fixups core. |
 | [cloudflare/lol-html](https://github.com/cloudflare/lol-html) | **`src/selectors_vm/` (the CSS selector matcher)** | AI-Dedupe 2026-08-01: `duplicate` 0.80/0.91 conf against an older same-author-pipeline sub implementing the SAME `+`/`~` + `:is()`/`:where()` work at the SAME five files. TWO more older subs (`similar_idea` 0.76 / 0.73) independently add `:is()`/`:where()` to the same VM, one going further with combinator-bearing alternatives, ancestor hoisting and complex `:not()`. Killed `rejected/lol-html-sibling-combinators` (fully built + validated: 292 eff, 66 f2p, 8 traps reproduced). At least 3 prior authors own this subsystem. The remaining unimplemented selector forms (`:nth-child(of S)`, namespaced selectors, `:empty`) touch the same parser/ast/compiler/stack surfaces and will flag the same way; `:has()` + `:last-child`/`:only-child` are maintainer-declined or streaming-impossible (issue #145). The REPO is otherwise fine and uncontested outside this subsystem - rewriter / rewritable_units / transform_stream / parser state machine are open. |
@@ -89,7 +107,7 @@ untouched surface, and pick elsewhere in the same repo if the seams are good. Do
 | [SamiPerttu/fundsp](https://github.com/SamiPerttu/fundsp) | 2026-08-05: **DOCKER-INFEASIBLE — dead on `[dev-dependencies]`, not on quality.** ★1180, MIT/Apache-2.0, 31.3k src LOC across 50+ modules (clears the ~30k repo-fit proxy, unlike jd), a real S5 dual-path seam (`AudioNode` static/typenum-arity vs `AudioUnit` dynamic vs `Net` graph), unusual non-author-obvious domain, 54 commits/12mo, 3 peripheral open PRs. Everything about the repo reads authorable. **The kill: `cargo test` cannot run without system C libraries.** The `[dev-dependencies]` block carries `cpal` + `midir` (-> `alsa-sys`, needs `libasound2-dev`), `plotters` (-> `yeslogic-fontconfig-sys`, needs `libfontconfig1-dev`) and `eframe` (X11/wayland stack). **Cargo builds the ENTIRE dev-dependency graph for ANY test target — verified locally that even `cargo test --lib --no-run` fails on both `alsa-sys` and `yeslogic-fontconfig-sys`.** `olympus-base-rust` will not carry those headers, and installing them needs network at build time, which the Dockerfile rules forbid. The only workaround is editing `Cargo.toml` to strip dev-deps, which is a build-config change reviewers flag (and L11 is precisely about a Cargo.toml dev-dep escaping patch scope). Secondary concerns, never reached: float-tolerance assertions and typenum-generic channel arity make behavioral tests awkward; the Jan-2026 commit burst was capability-consuming (convolution engine, resampling, sequencer inputs, node-tree introspection). | ⭐ NEW MECHANICAL GATE: for Rust, read `[dev-dependencies]` at HUNT time, not at Docker time. A pure-Rust `[dependencies]` block proves nothing — audio (`cpal`/`midir`/`rodio`), GUI (`eframe`/`winit`), and plotting (`plotters`) dev-deps drag in `-sys` crates that make the whole repo untestable in our base images. Added to `olympus-hunt` Requirement 5. |
 | [josephburnett/jd](https://github.com/josephburnett/jd) | 2026-08-05: NOT saturated, NOT blocked, quota 0/6, and every REPO gate passes — recorded so the next hunt does not re-derive the finding. MIT (read in full), pure Go, 2 deps, ★2291, core cold since 2026-03-01, no open PR on any core diff file, baseline deterministic 3/3 in 9s (only constant failure is `internal/web/ui` importing `syscall/js` off-wasm). Seams are real and citable: F-9 (`newPathSetKeys` path.go:26 resolves identity at diff time; `Patch` receives no options), F-2 (doc-stated diff/patch round-trip invariant node.go:35-42), F-10 (5 container walkers x strict/merge strategy), F-6, F-3, F-8. **It dies on the FEATURE space, not the repo — the taffy / golang-geo / rust-bio absorption profile.** Two independent kills: (1) **repo-fit LOC proxy**: 6.8k total LOC, ~4.5k core, ONE Go package — far under PICK-FILTER's ~30k floor, and the `JsonNode` interface (10 implementors, `diff`/`patch`/`equals`/`hashCode` all already generic) means every candidate capability is a plug-in, not new machinery. Feb-2026 saw a Claude-assisted 100%-coverage + published-`spec/` sweep, so the cheap gaps are closed. (2) **PROBED and found NO behavioral f2p gap** at the hypothesised asymmetry: `patch()` takes no `*options` (patch_common.go:26) and its equality check calls the public `Equals` with zero options (patch_common.go:57), which looked like a live cross-stage drop — but four probes (precision round-trip, SET permutation, nested-set-inside-removed-value, SET+keys reparse) ALL behave correctly, because jd's design deliberately embeds semantics in the PATH (`{}` set, `[]` multiset, `{"id":..}` set-keys) and `pathAhead.next()` re-derives the options at each level. The architecture is self-consistent; there is nothing observably wrong to fix. **Remaining candidates are all externally-named (Stage 2b magnets):** wildcard/recursive-descent PathOptions (glob; note `PathAllKeys`/`PathAllValues` are declared at path.go:11,16 and never constructed — vestigial, so the author intended it), diff reversal (`patch -R`), three-way merge (git), multi-document YAML (#43, external spec), case-insensitive keys (#123, plug-in ~80 LOC). **Also do NOT pick issue #82** (set-key path indexing) — the owner published the fix location (`appendIndex`), the fix, and the test gap in the comments. | A small, fully-generic, spec-published library: the walkers are complete, so capabilities plug in below the floor. ⭐ Confirms the rule that a cold core + great seams + clean exclusivity is NOT sufficient — measure the MISSING MACHINERY before ranking a repo, and treat a sub-10k-LOC single-package repo as presumed-absorbing. |
 | [tdewolff/canvas](https://github.com/tdewolff/canvas) | 2026-08-07: NOT saturated, NOT blocked, quota 0/6, and EVERY repo gate passes - recorded so the next geometry sweep does not re-derive it. MIT (read in full), Go, ★1825, 20 open issues, only 3 open PRs (none on the fill-emission path), scoped suite deterministic 3/3 in under a second, ~37k LOC. **Gate 1 was CONFIRMED BY MEASUREMENT, not inferred:** `FillRule` has four values (`NonZero`/`EvenOdd`/`Positive`/`Negative`), `path.go:26` documents all four as user-facing, `FillRule.Fills` and `Path.Settle` implement all four - and every emitter collapses them to the SVG/PDF two-value binary, each differently (`rasterizer.go:110` `SetWinding(fr == NonZero)` flips Positive to the EvenOdd answer; pdf/ps/svg fall back to NonZero; `htmlcanvas`/`tex` ignore `FillRule` entirely). A clockwise square under `Positive` must paint nothing and all four backends painted it. **It dies on the LOC floor: the complete, correct, suite-green implementation across 7 files measured 44 effective LOC against the 200 floor** (raw 65). DESIGN.md sketched 213 meaningful; reality was 5x lower. Cause is MACHINERY ABSORPTION - `Path.Settle` already resolves any fill rule to a non-overlapping equivalent, so the correct per-backend fix is 2-6 lines (compute a `fillData`, guard the combined `B` operator on `FillRule.Native()`, swap one variable). There is nothing to build because the repo already built it. Artifacts kept at `rejected/canvas-fill-rule-backends/`. **REPO STATUS: ALIVE AND RECOMMENDED — only the fill-rule LANE is dead.** REVISIT: any lane needing machinery the repo does NOT own. **Untouched large surface: the `Renderer` interface has NO clipping at all** (`Size`/`RenderPath`/`RenderText`/`RenderImage` only), so clip-path support is genuinely new machinery across the protocol and all six backends (PDF `W`/`W*`, PS `clip`/`eoclip`, SVG `<clipPath>`, rasterizer masking), with open bugs #314/#348 (`Clip` vs `coordSystem`) as live Gate-1 evidence. Also untouched: the SVG parser reads `fill`/`stroke-*`/`transform` but NOT `fill-rule` (F-2 round-trip seam); `text/linebreak.go` Knuth vs Greedy dual path (S5). | ⭐ The repo is otherwise an excellent target and the fill-rule gap is REAL - do not re-pick it, but do not write the repo off either. Untouched larger surface: **the `Renderer` interface has no clipping at all** (`Size`/`RenderPath`/`RenderText`/`RenderImage` only), so clip-path support would be genuinely NEW machinery across the protocol and every backend (PDF `W`/`W*`, PS `clip`/`eoclip`, SVG `<clipPath>`, rasterizer masking) - plus open bugs #314/#348 on `Clip` vs `coordSystem` are live Gate-1 evidence. Also note the SVG parser reads `fill`/`stroke-*`/`transform` but NOT `fill-rule`, an F-2 round-trip seam. ⚠️ `go.mod` pulls glfw/fyne/gioui/go-webp/go-avif but ONLY `renderers/{fyne,gio,opengl}` and `examples/` import them; the core and the other backends build and test with no system headers. |
-| [hlorenzi/customasm](https://github.com/hlorenzi/customasm) | 2026-07-30: NOT saturated and NOT blocked - listed here only so the next hunt does not re-derive the finding. `rejected/customasm-asm-block-expr-substitution` was built + fully validated then died at the long-horizon floor (167 eff / 1 file vs 200 / 2). Cause was ORACLE-ABSORPTION: the mature resolver/evaluator stack absorbed 4 of 8 sketched line items, so a 318-LOC sketch measured 167. | The REPO is a good target (cold, pure-Rust, 3 deps, 691-test 0.26s suite, real fixpoint resolver, harness runs every fixture under 2 optimization variants for free S5 coverage). Only small picks die. Pick something with a genuinely LARGE missing core (relocatable output + linking, issue #48), not an extension that plugs into the existing resolver. Full case study in TOO-EASY.md. |
+| [hlorenzi/customasm](https://github.com/hlorenzi/customasm) | 2026-07-30: NOT saturated and NOT blocked - listed here only so the next hunt does not re-derive the finding. `rejected/customasm-asm-block-expr-substitution` was built + fully validated then died at the long-horizon floor (167 eff / 1 file vs 200 / 2). Cause was ORACLE-ABSORPTION: the mature resolver/evaluator stack absorbed 4 of 8 sketched line items, so a 318-LOC sketch measured 167. | The REPO is a good target (cold, pure-Rust, 3 deps, 691-test 0.26s suite, real fixpoint resolver, harness runs every fixture under 2 optimization variants for free S5 coverage). Only small picks die. Pick something with a genuinely LARGE missing core, not an extension that plugs into the existing resolver. **AMENDED 2026-09-16: do NOT take issue #48 (relocatable output + linking), which this line used to nominate.** The thread was read in full: five commenters propose four mutually incompatible designs (ELF with external relocation rules; customasm itself as the linker; an `#obj <format> {}` block; a C-style object-file model), and hlorenzi prefers a fifth (*"I'd rather have something akin to the Rust compiler, where it reads and considers the entire project as a whole, than to have a C-like compiler"*). A fair <=500-word behavioural spec over that is unachievable and the FP Check would be brutal, since an agent picking a different-but-reasonable design passes or fails for reasons the description cannot pin. **The lane actually taken instead: exact fractional values + precision-on-demand decomposition in `src/expr` (`problems/customasm-exact-fractional-values`).** Verified absent - `Value` has no fractional arm, `grep` for f32/f64/float across `src` returns only substring noise, `BigInt` is integer-only, the number lexer has no fraction path; ~563 effective LOC over 10 files; exclusivity clean on seven feature-class PR searches in all states; maintainer POSITIVE on record in issue #233 (2025-12-01) for the user-definable-encoding direction with the precision passed into the decomposition. Quota after it: 4 of 6. Carried risk: the lane is maintainer-invited, cold and PR-free in a repo we already hold three submissions in, which is the named derivative shape - the core-slice precheck is a hard gate before any differentiating scope. Full case study in TOO-EASY.md. **AMENDED 2026-09-18: that fractional lane is DEAD too, on difficulty this time, not LOC** (368 eff, 10 files, 8/8 then 7/8 Nova; `rejected/customasm-exact-fractional-values`). Two customasm deaths, one mechanism: the evaluator stores values generically, so anything plugged into `src/expr` is carried through symbols, the resolver, `#fn`, `#if` and ruledef operands for free. A differential harness over 16 saved solutions found no stage that mishandles a new value kind. Picks that EXTEND the expression evaluator are dead here in both directions (too small, or too easy); only a large missing core OUTSIDE `src/expr` is worth trying. |
 | [tamasfe/taplo](https://github.com/tamasfe/taplo) | 2026-08-23: **PLATFORM-INVISIBLE DERIVATIVE — the whole "structural insert/remove via DOM `Rewrite` API" capability lane is taken by an older/parallel same-repo submission we cannot see locally.** `rejected/taplo-dom-structural-edit` was built end to end (298 eff LOC, 36 tests, all 5 claimed traps confirmed by real mutation-sweep, clean local apply/reverse/flakiness validation, zero local self-collision hits in `problems/`/`rejected/`/`approved-problems/`/`diamond-problems/`) and rejected at platform review as `overlap`: an older candidate already covers `insert_entry`/`remove_entry`/`insert_array_value`/`remove_array_value` PLUS inline-table-member insert/remove, dotted-key path CREATION (auto-vivifying intermediate tables), table-removal-cascade (removing a table drops everything it holds), and empties-a-table-keeps-the-header semantics — a strict superset of this pick's scope. Quoted from the reviewer: "Setting a missing one creates it in the innermost table on its path, after its last entry, before nested headers, indented like the line above. Leftover steps become a dotted key... Removing drops the entry's line with the comments directly above it, keeps the header of a table it empties, and takes a member's or element's separator; removing a table drops all it holds." Also already noted: `taplo-reorder-comment-preservation` (comment preservation during key reorder) is separately dead, publicly-solved upstream. | ⭐ Two dead lanes now cover BOTH halves of taplo's DOM mutation surface (comment-preserving reorder AND structural insert/remove) — a third pick in "edit the DOM and preserve formatting" is very likely to re-collide even though our OWN dedup checks (Stage 2b, local dirs, GitHub SIX-CHECK) all read clean, because the collision lives in the platform's cross-author submission pipeline, which this workspace cannot query. `Rewrite` in taplo is now a used-up subsystem for Olympus purposes; if re-picking this repo, target the FORMATTER, LINTER, SCHEMA VALIDATOR, or LSP subsystems instead of `dom::rewrite`/`dom::mod`, and expect that even those may already be taken — the derivative-magnet risk applies with equal force to any "obvious next capability" on a small, well-scoped public API cluster like taplo's `Rewrite`, regardless of how cold the file looked in our own commit/PR audit. |
 
 | [olofk/fusesoc](https://github.com/olofk/fusesoc) | 2026-08-07-C (first PYTHON sweep): NOT saturated, NOT blocked, quota 0/6 — recorded so the next Python hunt does not re-derive it. BSD-2-Clause, ★1444, obscure FPGA/ASIC build-abstraction domain (not the author-obvious class), 74 commits/12mo, **G-PY2 CLEAN** (no numpy/scipy/lxml/pandas anywhere — deps are edalize/pyparsing/pyyaml/pydantic/simplesat/fastjsonschema/argcomplete). Real staged pipeline on paper: CAPI2 core files -> dependency resolution -> flow/target/parameter/fileset resolution -> backend generation, with a genuine two-tier `_append` inheritance form at `fusesoc/capi2/inheritance.py` (F-13 shape). **Two kills:** (1) **6,545 total Python LOC** — the jd profile, far under the ~30k repo-fit proxy; (2) **the machinery that would carry a pick lives in OTHER REPOS** — the SAT dependency solver is the separate `simplesat` package, the backend generators are the separate `edalize` package, so fusesoc itself is glue. Also open PR #778 already owns the `..._append` merge lane and #734 the runtime-validation lane. | ⭐ NEW PYTHON LAW: machinery absorption in Python happens at the **REPO boundary**, not inside a file. Python's packaging culture pushes heavy engines into separate installable distributions, so a repo can present a full pipeline in its module tree while importing every hard part. At hunt time, check total LOC AND read the dependency list for siblings that own the algorithms. Prefer monorepo-style engines over composable single-purpose libraries. |
@@ -664,6 +682,50 @@ limit" gap at `tile-join.cpp:884`. Gap reproduced on base in the platform image.
 - **NOTE:** `youdie006` (recorded signature account, ~16 repos) holds a fork and filed one README
   link fix (#400). One doc-only visit, outside the lane — a note, not a reject.
 
+### B2-WEASYPRINT. Kozea/WeasyPrint — LANE LEDGER (repo ALIVE; the CSS Page Floats lane is HELD by two foreign submissions)
+
+- **What died:** `float: top | bottom` page floats (issue #259), shelved 2026-09-15 as
+  `rejected/weasyprint-page-floats`. Overlap `Blocker` against two OLDER same-repo submissions from other
+  authors: 61.4% and 40.6% of discounted lines, both in the page-float placement / deferral / re-layout engine.
+- **Why:** open-but-unimplemented famous feature (TOO-EASY.md row). Every GitHub check was clean; the rivals
+  exist only in the submission pipeline.
+- **Treat as taken:** page floats, column floats / `float-reference`, and anything whose core is the
+  make_page float scheduler (float deferral, page re-layout for late floats). Assume the other CSS modules
+  WeasyPrint lacks (Regions, Exclusions, GCPM extras) are equally author-obvious.
+- **Untouched (as far as we know):** nothing verified. Two other authors are active in the layout engine,
+  so any layout pick carries high overlap odds.
+- **Measurements worth keeping:** base d21889a, Python + pango/harfbuzz/ghostscript Dockerfile at
+  `rejected/weasyprint-page-floats/Dockerfile` (image built and validated); base targets
+  `tests/layout tests/css tests/test_boxes.py tests/test_stacking.py tests/test_html.py` are deterministic
+  (3341 in the container) after deselecting `test_breaking_linebox_regression_6/10/13` and `test_font_stretch`;
+  `tests/draw` needs HarfBuzz-Subset or every render logs an error. Quota: 1 of 6 used.
+- **REVISIT condition:** only for a non-layout subsystem (PDF output, CSS parsing, fonts) after a dedupe
+  pre-check, never for another float or fragmentation feature.
+
+### B2-KIRA. tesselode/kira — LANE LEDGER (⛔ DO-NOT-PICK as of 2026-09-18: 1 approved sub, every surveyed lane dead)
+
+Proven repo (`approved-problems/kira-loop-crossfade`, MIT OR Apache-2.0, ★1060, quota 1/6 used plus
+one precheck reject). Mechanics are paid for: Pattern A Docker with cpal gated off (222 s cold build),
+94 lib + 2 integration tests deterministic, capture-`Backend` test harness in the approved test.patch.
+
+| Lane | Verdict |
+|---|---|
+| Loop crossfade | ours, APPROVED |
+| Frame/sample-accurate clock and delay starts (#116, #136) | **DEAD, publicly-solved (removed capability).** 0.10 removed it (commit 4c29057a, `changelog.md` L102-L124). Precheck Blocker 2026-09-18 on the core slice (`rejected/kira-frame-accurate-start-times`). Public per-frame branches `buffers*`, `v0.10-buffered-rewrite` also exist |
+| Runtime delay-time change (changelog "please make a PR!") | same removal paragraph ("can no longer have its delay time changed") = removed capability, and a textbook fractional delay line |
+| Audio events #97, stop_at #150, amplitude tweens #114, phase vocoder #90 | dead at the crossfade DESIGN (derivable wiring / absorbed / one helper / famous DSP) |
+| Doppler | open PR #115 |
+| Send-to-send routing, `Mapping` extensions, listener-distance effects | textbook graph work / missing arm under 150 eff / already `Value::FromListenerDistance` |
+
+### B2-RAYOPTICS. ricktu288/ray-optics — LANE LEDGER (1 approved sub; handle-to-module lane DEAD, too easy)
+
+| Lane | Verdict |
+|---|---|
+| Formula conditionals | ours, APPROVED |
+| Handle-to-module conversion with control-point-relative templates (`Scene.convertHandleToModule`) | **DEAD 2026-09-18, spike: correct-in-repo-reference chokepoint.** The contract is "the instance moves/rotates/scales as the Handle would", and every object's own `move`/`rotate`/`scale` is the answer key. A ~50-line generic prober (translate by x, by y, rotate 90°, scale 2 about the centre; pair x/y leaves by their rotation; angle leaves wrapped with `mod(..., 360)`; length leaves by scale) reproduced the Handle on Mirror, IdealLens focal length, TextLabel angle and font size, Drawing strokes, GrinGlass origin, CircleGlass and ArcMirror under move, rotate, scale and a composition, 4/4. One insight clears every per-type cell, and the leanest passer would sit near 100 eff. Evidence: `worktrees/_hunt/agents/ray-optics-probe-shortcut.test.js` |
+| Spectrum detector, version migration, primitive/GRIN core, ROADMAP module features, covariance analysis | dead at the 09-18-C audit (missing arm / table rows / maintainer programme / public pick list / self-collision) |
+| Module import merge (`app.js mergeModulesFromMap` does not rewrite nested references) | WEAK, UI layer, ~150 eff |
+
 ### B3. LIVE-CORE (Gate 5 — the target subsystem is an active maintainer workstream)
 
 Recorded at hunt 2026-08-04-B (`REPO-HUNT-2026-08-04-B.md`). All three pass license / stars /
@@ -962,6 +1024,251 @@ Ran after the same day's RANK 1 (DataFixerUpper) was authored. RANK 1 out of thi
 | dartsim/dart, simbody/simbody | vendored-licence risk / AI-sweep | Eigen (MPL/LGPL) under vendored dirs; simbody also shows "Running Copilot Code Review" on `master` |
 | lifting-bits/rellic, binsync, CreuSAT | harness-infeasible | need LLVM, IDA/Ghidra, or a proof toolchain inside the image |
 
+### B3-novies. 2026-09-16 full-band re-triage — 8,897 rows profiled, 9 lane audits (full dossier: `repo-hunt-logs/REPO-HUNT-2026-09-16.md`)
+
+The 12-month history profile now covers **8,897** of the cached band's rows (`worktrees/_hunt/`:
+`hist.jsonl` 1,911 + `hist_sci.jsonl` 396 + `hist_topic.jsonl` 652 + `hist_wide.jsonl` 6,334). The
+dead list was rebuilt to **3,104 slugs** (`deadlist_all.txt`) by adding bare `owner/repo` tokens, not
+just `github.com/` URLs. Do NOT re-fetch any of this; re-run `triage3.py` with a different positive
+regex instead.
+
+- **deepcharles/ruptures ★2083 — ⛔ EXCLUSIVITY-DEAD, do not re-pick.** BSD-2, 20 PR-free issues,
+  6 commits/12mo, 2,959 LOC, light deps, a real cost-function x search-method x penalty-mode
+  cross-product — and dead anyway. Open PR **#383 "fix: PELT pruning with minimum segment lengths"
+  (2026-09-14)** implements the exact pruning-under-length-constraint interaction any trap thesis
+  here rests on; #376 adds Wild Binary Segmentation, #375 EDivisive, #326 and #32 new cost functions.
+  **The reusable law:** a popular library whose maintainer merged ONE PR in 12 months is a derivative
+  MAGNET, not a quiet opportunity — the obvious features accumulate as public, readable PR diffs,
+  which is precisely what the exclusivity gate rejects on. Prefer "maintained but consuming a
+  different lane" over "dormant with a full PR queue".
+- **probml/dynamax ★1006 — derivative + occupied.** Companion code to a famous textbook (maximum
+  training saturation); open PRs occupy input-driven HMMs (#452), spectral learning (#437),
+  nonlinear-SSM input dims (#442), filter return values (#435).
+- **lightkurve/lightkurve ★532 — absorption.** The science is astropy's (`LombScargle`,
+  `BoxLeastSquares`); the repo's own hot lanes are search/query and FITS readers; remote-data tests.
+- **EmuKit/emukit ★675 — Requirement 7.** `Tests` and `Coverage` both `failure` on the default branch.
+- **freebayes/freebayes ★877 — Requirement 7.** Only stale-issue bot workflows; nothing runs the suite.
+- **VLSIDA/OpenRAM ★1136 — Requirement 7.** `regress.yml` exists but no run of it appears on any
+  branch; recent runs are `deploy`/`pages` only.
+- **Genivia/RE-flex ★598 — maintainer-owned + harness.** The headline gap (native capture groups) is
+  claimed then deprecated by the sole maintainer in #95; five releases in 12 months with zero new
+  capabilities and ~2-day bug closes; the entire suite is one fail-fast `rtest` binary registered as
+  a single ctest, so `test.sh base` would have no granularity.
+- **pisa-engine/pisa ★1056 — derivative.** Capabilities named by IR literature (WAND, MaxScore,
+  block-max); maintainer PRs open since 2018-2021.
+- **quantumlib/Stim ★817 — capability-consuming.** `Strilanc` is mid-build on the `stimflow`
+  subsystem and authors most core commits.
+- **acoular/acoular — the B2-ACOULAR ledger below needs a second warning.** Re-measured 2026-09-16:
+  a research team (`artpelling`, `esarradj`, `gherold`, `adku1173`, `Narges825`, `siavashzaid`,
+  `MSzBerlin`, `stebuech`) is now shipping capabilities across the beamforming core — CMF problem/
+  solver interfaces (#661, #667), sparse Bayesian learning (#617), PolarGrid (#646), notch filters
+  (#636), `TimeOut` (#663), CSM eigendecomposition (#662). `tbeamform.py` 7 commits/12mo and
+  `trajectory.py` 3 are still comparatively cold, but any propagation-model -> steering-vector ->
+  time-domain-beamformer pick is the SAME subsystem class as our approved `acoular-reflecting-panels`
+  (the comrak self-collision shape). Author here only on a lane that avoids that path.
+- **⛔ ott-jax/ott — LANE LEDGER, the cost-scale lane is ABSORBED (run through olympus-author Phase 1/3
+  the same day; no folder created, no code written).** The seams are all real and cited, but the
+  capability is not: `Geometry.mean_cost_matrix` / `std_cost_matrix` are already written through
+  `apply_cost` / `apply_square_cost` so they work for low-rank and online geometries, each `Grid`
+  slice is an ordinary `PointCloud`, so the exact separable decompositions are one-liners; and
+  `share_epsilon` in `sinkhorn_divergence.py:237` is a ready-made ~10-line template for a
+  `share_scale_cost` twin. The only genuinely new algorithm (a non-materialising median over an
+  implicit cost matrix) is a PERFORMANCE claim and cannot be fairly tested anywhere except `Grid`.
+  Fullest defensible scope sketched at ~270 raw / **~200-220 effective, at the floor with no buffer**.
+  Every other cold-half capability is a literature name (partial OT #614, bottleneck assignment #648,
+  Bregman/Frechet k-means, convolutional grid barycenters, structured multi-marginal Sinkhorn) and
+  several ship in POT. **Repo is not dead; this LANE is.** Two assets worth reusing if it is ever
+  re-picked: `Grid` enforces non-materialisation with an exception (`grid.py:322`/`329`), which turns
+  a performance claim into a testable one; and `Grid.geometries` (`grid.py:114`) drops `scale_cost`,
+  so the obvious one-line forward-it-to-each-slice fix is wrong and is invisible on the 1-D and
+  symmetric grids agents self-test with. Also recorded: `TICost.barycenter` (`costs.py:262`) returns
+  the arithmetic mean for every translation-invariant cost, which is correct only for squared
+  Euclidean — a real latent bug, currently unreachable from `k_means` but reached by the free-support
+  barycenter.
+- **⛔ pymatting/pymatting — LANE LEDGER, multilevel alpha is ABSORBED.** `preconditioner/vcycle.py`
+  already builds the full pyramid: a 3x3 weighted restriction (`make_P`), Galerkin coarsening, Jacobi
+  pre/post smoothing, direct coarse solve. A coarse-to-fine alpha path is a call-through. With 4,843
+  source LOC total, the floor is unreachable without a second invented capability, which is the
+  scope-lever-doubles-the-collision-surface class. Repo mechanics remain excellent (MIT, zero open
+  PRs, lightest offline Docker screened this month) if someone finds a lane with real missing math.
+- **Second-pass screens, same day (olympus-author re-entry after ott and pymatting died).** All
+  rejected before any code:
+  | Repo | ★ | Gate | Evidence |
+  |---|---|---|---|
+  | pvlib/pvlib-python | 1666 | **stale-PR-blanketed + named-model derivative** | 15 open PRs publish capability diffs across the whole feature space (diffuse IAM #2845/#2847, `marion_diffuse_tracking` #2824, Sandia inverter fitting #2817, SEDES2 spectral #2616, Muneer transposition #2184, Michalsky solar position #2167, series-connected IV curves #2718, mismatch combine #1781, MPPT for mismatched devices #1923, OND translator #1888, logwright SDE solvers #1884, linear shade #1725, SMARTS spectra #858), several open since 2020-2023. Every pvlib capability is a NAMED published model (Perez, Hay-Davies, Muneer, King, De Soto, SAPM), which is the spec-knowable death class. `dylanpulver` also appears here and on lightkurve — two unrelated niche scientific libraries |
+  | surrealdb/surrealkv | 551 | capability-consuming | `arriqaaq` shipping compaction, L0 read staleness, prefetch partitions, a commit pipeline; 100 commits/12mo; only 5 PR-free issues |
+  | erikgrinaker/toydb | 7283 | dormant + educational | 0 open issues, 11 commits/12mo, and a famous teaching repo at 7.3k stars |
+  | informalsystems/quint | 1670 | live maintainers | 100 commits/12mo; we hold `quint-temporal-properties`; PR queue is a typo-fix farm, not competitors, but the core is the team's own workstream |
+  | mmcloughlin/avo | 2990 | lane occupied | 13 commits/12mo and 74 issues read well, but `dominikh` has open PRs on virtual-register liveness (#481) and `MarkUndefined` (#480) — that is our approved `avo-register-spilling` lane — and `BobDu` #492 + `lizthegrey` #486 hold the register and arm64-printer lanes |
+  | asticode/go-astits | 617 | thin + published diffs | 5 PR-free issues; long-open PRs #40 (6x optimisation), #37 (truncated PES), #27 (multi-section PSI) already publish the obvious capability diffs |
+  | jhillyerd/enmime · moov-io/ach | 518 · 564 | spec-knowable | MIME and NACHA are external standards an agent can re-derive; `adamdecaf` is also capability-consuming on ach at 100 commits/12mo |
+  | amaranth-lang/amaranth | 2085 | RFC-gated (already in this file) | Confirmed live: the open queue is WIP RFC implementations (#1670 RFC 74, #1578 and #1005 both RFC 41). The capability space is governed by the RFC process, so any invented capability contradicts Gate 8 |
+  | cloudflare/wirefilter | 1158 | **self-collision** | MIT, 17 issues, 49 commits/12mo, an 18.3k-LOC filter-language compiler with exactly the corpus-winning shape (lex -> parse -> typed AST -> scheme registry -> compiled filter -> execution context). But our approved `wirefilter-dynamic-operands` already took expressions-as-operands, comparisons over collections, computed indices, map/array equality and the mapping semantics — i.e. most of `field_expr.rs` (3,353 LOC), `index_expr.rs` and `logical_expr.rs`. What is left (functions, list matcher, scheme) sits beside open PRs #197 typed per-function parser settings and #188 visitor methods. Keep on file: the repo shape is right and quota is 5, so a lane in `functions/` or the type system could work for someone willing to prove it does not touch the operand/indexing space |
+  | beartype/beartype | 3496 | capability-consuming | 100 commits/12mo by an extremely active maintainer across 109 issues |
+  | itchyny/gojq | 3804 | spec-knowable + thin | the jq language is an external spec an agent re-derives; only 8 PR-free issues |
+  | smoltcp-rs/smoltcp | 4600 | spec-knowable + burst | every capability is RFC-defined; `Aditya-9-6` filed three surgical PRs across IPv6 SLAAC, DHCP option 42 and TCP idle-abort in one window |
+  | mdeloof/statig | 799 | near-corpse | 3 commits and 6 PR-free issues in 12 months |
+  | seladb/PcapPlusPlus | 3138 | quota + spec + live draft | 4 of 6 used; packet formats are external specs; `seladb` has a DRAFT "Packet serialization" PR open |
+  | OpenMDAO · chaospy · SALib · UQpy · anastruct · compas | - | gates | NOASSERTION licence; 0 commits/12mo; already in this file; under the 500-star floor; LGPL-3.0; under the star floor |
+  | bab2min/tomotopy · Genivia/ugrep · hyrise/hyrise · ddemidov/amgcl | - | mixed | tomotopy's only default-branch workflow is doc generation (test workflow is PR-only) and it was last pushed 2026-02; ugrep is the same sole maintainer as RE-flex with 7 issues and a ~2-day bug-close cadence; hyrise carries a university course's group PRs; amgcl's algebraic-multigrid capability class collides with our approved `pyamg-aggressive-coarsening` |
+  | calyxir/calyx | 612 | see B2-CALYX above | Re-read, not re-probed. The structural warning stands: an academic repo that publicly triages its own gaps has no unclaimed lane findable by reading the source |
+
+- **Deep-audit kills, 2026-09-16-C.** Five repos taken to a full audit (gates, Docker, competitor
+  profiling, lane heat, absorption sketch per lane). All five: NO LANE. Full reasoning in the hunt log.
+  | Repo | ★ | Killed by | One-line evidence |
+  |---|---|---|---|
+  | **marcelm/cutadapt** | 587 | **exclusivity + AI farm account** | Mechanically superb - MIT, 102 PR-free issues, 0 quota, and a Cython source build proven end-to-end inside `olympus-base-python` (704/704 in 10.85s, three identical runs). Dead anyway: its three deep lanes all carry published diffs on the core files - error-rate model (#893: `_align.pyx`, `align.py`, `adapters.py`, `kmer_heuristic.py`), info-file provenance (#894, against marcelm's own 4.5-year-old #518), alignment scoring (#891: `_align.pyx +71/-19`). Two of those are from **`cindykrafft`, whose PR body reads "Generated by Claude Code"**, filed as a two-day in-lane burst with a self-filed issue. What remains is absorbed by design: nine adapter classes in 407 lines all subclassing one generic `SingleAdapter` and varying only `EndSkip` flags, so a tenth is ~25 eff |
+  | **tanghaibao/jcvi** | 928 | **no coupling + absorption** | Nine of ten modules are independent `ActionDispatcher` script collections; the single coupled pipeline (`ScaffoldOO` in `assembly/allmaps.py`) is exactly where `copilot-swe-agent` landed #834 and the new signature account `latent-9` landed #858. The tracker's best lane (#751 auto-layout) needs no new algorithm - GA ordering is `compara/synteny.py:795`, the orientation operator is `algorithms/ec.py:75`, flip rendering is `graphics/ribbon.py:472`, and karyotype already threads a reversed-seqid set - leaving ~120-160 eff for something the issue body credits to Mummer4 and Dgenies. Docker cost is the worst seen: 30 runtime deps, two Cython extensions, module-level `wand`/`pytesseract`, CI that `apt-get install`s ImageMagick |
+  | **wokwi/rp2040js** | 526 | **exclusivity + competitor + no timing model** | Eight PRs carry published diffs across `pio.ts`, `dma.ts`, `sio.ts`, `ssi.ts`, `gpio-pin.ts`, `uart.ts`, `pwm.ts`. `avionicharshit-byte` (17 followers, 30 surgical fixes across duckdb/zstd/fmt/nlohmann-json in four weeks) landed the most recent substantive commit into `pwm.ts`. And the emulator has **no timing model in which emergent behaviour could exist**: `clkSys` is a hardcoded constant read by three sites, `RPClocks`' divisors are consumed nowhere, and PIO runs on `setTimeout(...,0)` outside the simulation clock. The clock lane also duplicates the central mechanic of our approved `avr8js-sleep-power-management` from the same maintainer's sibling repo |
+  | **qulacs/qulacs** | 528 | **sibling convergence + unbuildable offline + flaky** | Pristine exclusivity (one open PR, a student adding a gate) and a real hole - Pauli grouping sketches at 330-380 eff - but Qiskit ships `group_commuting` (8 code hits) and `openfermion` is already in qulacs' own test deps. `CMakeLists.txt:163-213` fetches Eigen, googletest and pybind11 over the network at configure/build time with no system fallback; 69 TUs compile twice; CI needs 5.5 min with a warm ccache. Baseline is flaky by the mandatory gate: `utility.hpp:64-67` seeds from `std::random_device`, bare `rand()` in `test/util/util.hpp`, unseeded `set_Haar_random_state()` 19x/17x/16x. Capability work has moved to the same maintainers' successor `qulacs/scaluq` |
+  | **VirusTotal/yara-x** | 1280 | competitor swarm | `king-tero` (recorded signature) holds **eleven open perf PRs** filed 2026-08-27 to 08-30 across parser, wasm, compiler, scanner and regex, plus two merged feature PRs. Our two approved subs remain; the engine is not available |
+  Also gated and rejected this pass: `expr-lang/expr` (`ChrisJr404` PR #986 and a merged `SAY-5` commit - two recorded signatures), `cue-lang/cue` / `apple/pkl` / `google/jsonnet` (100+ commits/12mo, corporate teams), `scalesim-project/SCALE-Sim` and `PoseLib/PoseLib` (both run "Running Copilot Code Review" on the default branch; PoseLib's five open PRs are all new solvers), `schibsted/jslt` (see above), `SanPen/GridCal` and `PowerGridModel/power-grid-model` (MPL-2.0, outside the licence allowlist), `evalf/nutils` / `mjhoptics/ray-optics` / `e2nIEE/pandapipes` (under the 500-star floor - the deep-niche engineering libraries almost all are).
+- **Deep-audit kills, 2026-09-16-D** (the zero-capability-shipping shortlist - repos alive but
+  shipping NO feature commits, which is the ideal profile for an invented pick). All NO LANE:
+  | Repo | ★ | Killed by |
+  |---|---|---|
+  | **failsafe-go/failsafe-go** | 2249 | Plain reverse-fold decorator chain (`executor.go:252`); every policy is a `PreExecute`/`PostExecute` pair over a shared-but-read-only kernel, so no local change cascades - `bulkhead` is a whole policy in 39 lines. Superset of resilience4j/Polly already; three nameable lanes all publicly solved and 50-55 eff. Two AI accounts (`carlosflorencio` bio "AI Agents Manager", `StevenACoffman`) have in-lane open PRs; 14 of 20 issues maintainer-owned; no injectable clock (43 real sleeps) |
+  | **jcmgray/quimb** | 667 | Maintainer ships ~25 capability PRs in 6mo (~1.4 commits/day); triple author-controlled sibling absorption (cotengra owns 100% of contraction path via a 339-line `functools.wraps` shim, symmray owns symmetry/fermionic, autoray owns backends); unitaryHACK26 burst merged the circuit lanes; TDVP and W^II both die on TeNPy reference ports |
+  | **pysal/momepy** | 634 | Best engineering profile measured (BSD-3, zero-RNG determinism, pyogrio bundles GDAL so pip-installs offline, 2.65s suite) but a curated catalogue not an engine - `convexity` is 38 lines of which ONE is code, so no character-lane approaches 250 eff without "add N functions"; the one dense subsystem (`preprocessing.py`) is deprecated into the maintainer's own `neatnet`. `binggao1230` (sig line 2) merged #763, `rodricksz4h5` open in-lane #772 with an LLM admission, issue #369 farmed twice |
+  | **pyatv (postlund/pyatv)** | 1173 | Real coupled core (the `Relayer`/facade with no protocol-withdrawal path, a genuine gap) but it is maintainer-owned: 48 of 226 open issues are postlund's own, and #2081 "facade does not consider takeover for features" is literally his reminder-to-self covering the lane. calyx roadmap pattern |
+  | **CrossHair** | 1328 | Maintainer ships symbolic-coverage commits weekly and runs agents on the tracker (`AGENTS.md` dev-philosophy commit) |
+  | **js-confuser, iguana, ergogen, ArM astc (pending), palette, lettre, tomlkit** | - | js-confuser + iguana single-maintainer capability streams (CFF flattening; JSON DOM parser #386); palette + lettre both carry `ChrisJr404` in-lane PRs; tomlkit 29 open PRs (stale-blanketed) |
+- **★ TWO METHOD UPGRADES (2026-09-16-D), folded into the hunt skill:**
+  1. **Author-controlled sibling packages are a distinct, under-detected ABSORPTION class.** quimb ->
+     {cotengra, autoray, symmray} and momepy -> neatnet both hollow out the repo's most nameable
+     lanes into packages the SAME maintainer controls, while star count, CI and issue volume stay
+     healthy. Detector: read `pyproject.toml` deps + optional-extras for packages sharing the
+     maintainer's org/handle, then grep source for deprecation notices pointing at them.
+  2. **GDAL/geospatial is NO LONGER a Docker blocker.** `pyogrio` wheels bundle GDAL 3.12.4, so the
+     whole geopandas stack (geopandas, libpysal, shapely 2, momepy) pip-installs offline with no
+     system libs, no conda, no compiler. Measured: 45 momepy tests pass in 2.65s inside
+     `olympus-base-python`. Stop excluding geospatial repos on the GDAL fear.
+- **★ NEW SIGNATURE ACCOUNTS (added to `worktrees/_hunt/sig_accounts.txt`, now 26).**- **★ NEW SIGNATURE ACCOUNTS (added to `worktrees/_hunt/sig_accounts.txt`, now 26).** `latent-9`
+  (created 2026-06-23, 11 followers, 148 repos, **467 PRs**, mostly the byte-identical title "fix(apiquery):
+  encode float32 query values at float32 precision" across ~25 unrelated niche Go SDKs; touched jcvi),
+  `cindykrafft` (6 followers, PR body literally "Generated by Claude Code", two in-lane cutadapt PRs in
+  two days plus a self-filed issue), `avionicharshit-byte` (17 followers, 30 surgical fixes across
+  duckdb / zstd / openzl / nlohmann-json / cpp-httplib / fmtlib / livekit in four weeks after a 20-repo
+  watch sweep; merged in-lane into rp2040js `pwm.ts`). **All three are agent-driven and all three were
+  invisible to every filter except PR-author profiling** - run Stage 2b-bis on every finalist.
+
+- **Third-pass kills, 2026-09-16-C** (after profiling the 11,342 band rows that a lossy description
+  regex had excluded from every earlier history sweep - see the hunt log):
+  | Repo | ★ | Gate | Evidence |
+  |---|---|---|---|
+  | **schibsted/jslt** | 702 | ⛔ **REPO PUBLISHES ITS PICK LIST** | Otherwise the best shape found all week: Apache-2.0, Java, its OWN JSON query/transformation language (not a spec), a genuine four-stage pipeline (parse -> scope resolve -> `computeMatchContexts` static analysis -> optimise -> evaluate), 7,401 core LOC, ONE runtime dependency (jackson-databind), 96 PR-free issues, `Java CI with Gradle` green on master, and maintenance-only for 12 months (7 commits, all Jackson upgrades). It dies on `ideas/`: a committed folder of **eight unimplemented features with design sketches attached** - time functions, the `..` operator, `.foo` on arrays, predicates, the `filter` macro, a query API, group-by, aggregate functions - plus an "Implemented ideas" section. That is the dropflow death class exactly: a public, pre-ranked, pre-filtered candidate list where each row also carries a published solution sketch. Three of the twelve open PRs (#384 filter macro, #357 min/max, #350 regex replace) already sit on those rows |
+  | ergogen/ergogen | 1571 | dormant + stale-PR-blanketed | A real config-to-geometry pipeline for keyboard layouts, MIT, 20 PR-free issues. But last push 2025-11-02 (ages out of the activity gate within weeks) and **20 open PRs going back to 2023**, several publishing capability diffs (#163 circle/arc resolution, #159 OpenJSCAD, #147 case-outline extrusion, #110 circles from three points, #113 SVG outline injection). Same profile that killed ruptures and pvlib |
+  | LaihoE/demoparser | 719 | AI sweep + competitor burst | CI runs "Running Copilot Code Review" on the default branch, one recent `Test: failure`, and PRs #347 and #348 are two different accounts on the SAME delta-encoded-usercmd lane in the same window |
+  | scverse/PyDESeq2 | 761 | port law | Mechanically excellent (MIT, 32 issues, CI green, pushed daily) but it is by its own description "a Python implementation of the DESeq2 pipeline", so it inherits the R reference package's entire feature list as prior art |
+  | K0lb3/UnityPy · vcflib · pygae/clifford · artivis/manif | - | thin or aging | 15 and 18 PR-free issues; clifford last pushed 2025-10-18 and manif has 7 commits/12mo |
+
+- **★ SEARCH-SPACE COVERAGE IS NOW COMPLETE (2026-09-16-B). Do not re-fetch any of it.** The two
+  slices the cached band structurally could not contain were swept and BOTH returned zero authorable
+  candidates. (1) **Languages GitHub does not classify as ours** - Jupyter Notebook, Cython, TeX,
+  CMake, Shell, HTML, Makefile, 500-6000 stars, permissive, alive: 1,464 rows cached as
+  `worktrees/_hunt/band_misc.jsonl`, 25 engine-shaped, 0 authorable. The blind spot is real but the
+  repos inside it are paper companions, workflows and courses, not engines; the one genuine hit,
+  `arviz-devs/arviz`, is named published statistics. (2) **Stars above 6000** - never queried, since
+  the band was `stars:500..6000` while the platform floor is 500 with no ceiling: 3,299 rows plus 181
+  C++ cached as `band_hi.jsonl`, 120 engine-shaped, 0 authorable, because the slice is famous
+  infrastructure and named standards end to end (rust, typst, polars, tree-sitter, antlr, duckdb,
+  simdjson, flatbuffers, brotli, quiche, numba, datafusion, closure-compiler). This CONFIRMS the
+  existing ">5000 stars with a famous spec" kill rule rather than refining it. Dead list rebuilt and
+  unioned to 3,147 slugs as `deadlist_v3.txt`.
+- **★ THE CONSTRAINT HAS MOVED FROM SCREENING TO DISCOVERY (2026-09-16-B).** Measured across both of
+  today's hunts: the cold-start path produced ZERO authorable picks from ~5,000 freshly fetched repos
+  and ~30 audited candidates, while the proven-pool path produced one scope-locked, built and
+  validated submission on the first serious attempt (`customasm-exact-fractional-values`, 404
+  effective LOC on its core slice; later shelved too-easy on 2026-09-18 at 8/8 then 7/8, so that path
+  produced a BUILT pick, not an approvable one, and a proven repo does not make a lane hard). The six repos in this file recorded as "NOT saturated, NOT
+  blocked, repo gates ALL PASS" were all re-read and every one already carries a written
+  feature-space kill, so the ledger holds no unspent credit either. **Ask "which repo that we already
+  know hosts a capability we have not taken", not "which repo is clean".**
+- **cloudflare/wirefilter - LANE LEDGER (repo ALIVE, 1 sub, 5 quota free, shape is right, two lanes
+  dead).** MIT, 1158 stars, 17 PR-free issues, 49 commits/12mo, competitor-free, and an 18.3k-LOC
+  filter-language compiler with the architecture the approved corpus rewards. Audited 2026-09-16-B:
+  (1) `functions/` is FRAMEWORK-ABSORBED - a rich `FunctionDefinition` trait with
+  `check_param`/`return_type`/`arg_count`/`compile`, constant-vs-variable argument kinds, optional
+  and variadic params and a type-erased context, but exactly ONE concrete function ships (`concat`),
+  so "add functions" is the missing-arm shape by construction; (2) compile-time folding of an
+  all-literal call is a post-pass over the public AST, the recogniser death class; (3) our approved
+  `wirefilter-dynamic-operands` already consumed expressions-as-operands, comparisons over
+  collections, computed indices, map/array equality and the mapping semantics, i.e. most of
+  `field_expr.rs` (3,353 lines), `index_expr.rs` and `logical_expr.rs`. Keep on file for shape and
+  quota; a third lane has not been found.
+
+- **★ THE TRANSFERABLE LAW (2026-09-16).** Cold + well-factored is exactly the profile of a repo whose
+  remaining capabilities are ABSORBED — a library is cold BECAUSE its abstractions already cover its
+  domain, and every hunt signal that ranks a lane first (cold dirs, no open PRs, clean dedup) selects
+  for that. **The hunt ranks AVAILABILITY; the absorption sketch measures SIZE; they are
+  anti-correlated.** Sketch the diff in effective LOC against the nearest existing sibling during the
+  HUNT for the RANK 1 candidate's named lane. It is the same ten minutes either way, and it was the
+  deciding number for both repos here.
+- **The ~100 wide-screen survivors** are overwhelmingly parsers of famous formats (semver, TOML, XML,
+  CSV, cron, iCal, ASN.1, BSON, KDL, plist), CLI/arg libraries or web tooling — all spec-named, the
+  dead class in `TOO-EASY.md`. The band is mined out for that shape.
+
+### B3-decies. 2026-09-18 no-verdict pool repos (full dossier: `repo-hunt-logs/REPO-HUNT-2026-09-18.md`)
+
+- **iwe-org/iwe** — DEAD, capability-consuming: solo maintainer ships a feature nearly weekly (query
+  schema, key filters, MCP, Claude Code integration); 38 of the last 40 PRs are his.
+- **kaleidawave/ezno** — DEAD, dormancy magnet: 2 commits/12mo beside 10 open PRs.
+- **erikgrinaker/toydb** — DEAD, kill-list row (★7283, SQL).
+- **boombuler/barcode** — DEAD, every lane is a named symbology spec.
+- **Mindwerks/worldengine** — WEAK for a second pick: our approved sub holds the climate pipeline,
+  erosion (#270) and winds (#217) carry public PR diffs, the rest is textbook-named (Holdridge biomes,
+  flow accumulation). Not blocked, just no lane found.
+- **robertmuth/Cwerg** — ALIVE, repo still pickable (1 accepted sub). **Lane dead 2026-09-19:** issue #3
+  (overflow parameters through caller memory) is held by an OLDER foreign submission; our
+  `cwerg-memory-passed-parameters` got an overlap `Blocker` after passing the first scope gate
+  (`rejected/`, `TOO-EASY.md`). Treat the rest of Cwerg's open-issue roadmap (#2 tailcalls, #33
+  rotate, #10 a32 64-bit ints, #6 line opcode, ...) as presumptively claimed; prefer an invented lane
+  from the source tree. Ten pre-existing Cwerg defects are mapped in that folder's feedback.md.
+
+### B3-undecies. 2026-09-18-B parked-lead audits + fresh-entrant sweep (full dossier: `repo-hunt-logs/REPO-HUNT-2026-09-18-B.md`)
+
+- **synthetichealth/synthea** — ⛔ LICENCE-DEAD (vendored): `lib/sbscl/` is LGPL-3.0 (Systems Biology
+  Simulation Core Library jar), compiled in at `build.gradle:133`, imported by `engine/State.java`.
+  Top-level Apache-2.0 label is correct and misleading. Java twin of the pmp-library lesson: scan
+  `find . -name '*.jar'` and `lib*/*/` for LICENSE files at Stage 1.
+- **textX/textX** — COMPETITOR-VISITED: `santhreal` (#444) and `chuenchen309` (#445), one day apart in
+  July 2026, both already in the agate swarm row. Coldest lane (scoping / multi-pass resolution) was
+  untouched, but two signature accounts = reject under 2b-bis. HEAD also needs an unreleased Arpeggio 3.
+- **wilsonzlin/minify-html** — DEAD, Requirement 7: none of 7 workflows runs tests (tag-triggered
+  build/publish only), plus a dormancy magnet (13 unmerged PRs incl. #277 template syntax, #262).
+- **scribbletune/scribbletune** — DEAD, no lane: ~2.4k LOC src; the one deep lane (layering clips into
+  one MIDI timeline, #154) has a public diff in closed PR #48; the real nested-tuplet drift gap
+  (`src/clip.ts:100-107`) is ~50-80 eff.
+- **mitex-rs/mitex** — WEAK FALLBACK: the macro-engine scoping + definition-export lane reproduces
+  (group leaks, `\iffalse` defs, `\newcommand{\a}{\a}` hang), but the repo-own export half is
+  ~105-145 eff and the scoping/expansion-limit half is public in KaTeX (`Namespace.ts`,
+  `MacroExpander.ts`). Dossier `worktrees/_hunt/agents/mitex-0918.md`.
+- **heitzmann/gdstk** — NO LANE (audited 2026-09-18-B, still 499★). Mechanics clean (BSL-1.0 incl.
+  vendored Clipper, qhull/zlib are system deps, CI green, no signature accounts). Lanes: hierarchy
+  instance query / partial flatten (#301/#264/#236) is absorbed by `Reference::transform` +
+  `Repetition::transform` and has public user code in #264; OASIS repetition compaction (#281) is
+  spec-named, done publicly by KLayout's writer, and a size (cost) claim; repetition-aware booleans
+  (#191) are a uniform wrap; skewed-AREF read (#299, `library.cpp:1175`) is a ~5-line fix. The rest of
+  the tracker is bug reports against a mature API. Do not re-audit when it crosses 500.
+- **pcodec/pcodec** (497★), **phonopy/phonopy** (496★, 300 maintainer commits/12mo), **retool**,
+  **gffread**, **XenosRecomp** (no test CI), **pydlm** (4 commits/12mo, no test CI) — dead or under floor.
+- **hanruihua/ir-sim** — ALIVE, 1/6 used: `ir-sim-scenario-events` ACCEPTED 2026-09-19 (1/11). The
+  events/scenario lane is now ours (self-collision). Untouched lanes: planners, sensors (fmcw), maps/fog,
+  behaviors. Loader-injected group index is a proven seam (F-41) for any other runtime-object feature.
+
+### B3-duodecies. 2026-09-18-D sibling-workspace proven repos (full dossier: `repo-hunt-logs/REPO-HUNT-2026-09-18-D.md`)
+
+| Repo | Verdict |
+|---|---|
+| seladb/PcapPlusPlus | CLOSED at 4/6: two signature accounts; remaining lanes under open PRs, our own picks, or RFC-named |
+| microsoft/maker.js | spent after box joinery: no code commits in 90d, public feature branches, chain API shortcut |
+| rmk-rs/rmk | spent after 2 picks: daily maintainer AI sweep over the engine |
+| h5py/h5py | numpy/zarr shortcuts clear every high-level lane; three signature accounts |
+| AcademySoftwareFoundation/openexr | deep encode = inverse of the decoder, ~90 eff shortcut; maintainer core rewrite branch |
+| cgohlke/tifffile | no test CI |
+| spf13/afero | dormant, 32 open PRs |
+| AmrDeveloper/GQL | dormant, SQL-shaped |
+
 ## C. RECENCY-DEAD (no commits in trailing 12 months — fails the activity gate)
 
 Repo compliance can PASS on stars + license + "active maintenance" wording yet still FAIL the hard
@@ -1138,3 +1445,85 @@ the "Merged dead-pick ledger" section above were skipped as duplicates during co
 - cantools-bus-latency — shelved: a concurrent session was authoring an overlapping cantools timing feature (bus_load/simulate_schedule/response_times) in the same timing domain
 - customasm-section-placement — reused repo: customasm already carries an approved #for submission, breaking the standing brand-new-repo preference; discontinued at the user's direction before implementation
 - goblin-macho-chained-fixups — derivative, Scope Gate reject (2026-08-20): "narrower derivative of older accepted candidate", which already implements the same `LC_DYLD_CHAINED_FIXUPS` parser at `goblin::mach::chained_fixups`, import-table decoder, pointer-chain walker, bind-to-import resolution, and `MachO::imports()` integration on the same files (`src/mach/chained_fixups.rs` new + `src/mach/mod.rs` integration) — this submission "can be produced largely by trimming that implementation." Full solution + 18-test suite built, validated (3x deterministic, 16/18 fail-to-pass on base), and description-hardened before the reject landed; not curable by rewording or adding a trap, since the entire pick IS the chained-fixups core. Treat goblin Mach-O chained-fixups / `imports()` as DEAD; a future goblin pick needs a different subsystem (elf/, pe/, archive/) or a different Mach-O capability untouched by this core (not exports/bind/chained-fixups).
+
+## F. MAINTAINER-DECLINED LANE (repo is healthy; the only deep lane is refused in the tracker)
+
+| Repo | Stars | Lane refused | Evidence |
+|---|---|---|---|
+| [benjamn/recast](https://github.com/benjamn/recast) | 5252 | **Reusing original source for untouched siblings when an array/object child is inserted, removed or reordered** (`lib/patcher.ts` `findArrayReprints` matches strictly by index and bails on any length change) | [#429](https://github.com/benjamn/recast/issues/429) CLOSED by `benjamn`: "This is working as designed [...] Inserting new elements into a sequence like an `ArrayExpression` or `ObjectExpression` requires rerunning the pretty-printer for the parent node [...] There's no reasonable way to print just the inserted child plus a leading or trailing comma, without making the child's pretty-printer implementation partly responsible for the parent's syntax." Points to #226 as the alternative. |
+
+recast otherwise cleared EVERY gate on 2026-09-16 — MIT, zero capability commits in 53 commits/12mo,
+no competitor accounts, pure-JS deps, and a baseline of 792 passing / 0 failing / ~3s / identical on
+3 runs. The rest of the repo is one large `genericPrintNoParens` dispatch (missing-arm death class)
+plus a sourcemap lane the maintainer consumed in PR #1433, so no redesign inside it survives.
+
+**★ METHOD UPGRADE — run the closed-issue philosophy scan on the LANE before you measure the
+baseline.** Both the green-baseline gate and the zero-capability-commits filter passed here on a
+repo whose only deep lane was already refused. Two `gh issue view` calls cost less than an `npm ci`
+plus a full suite build. Order the audit: lane thesis -> closed-issue philosophy scan -> baseline.
+
+## G. LANE-OPEN NOTES (repo contested in one subsystem, open in another)
+
+- **⛔ SUPERSEDED 2026-09-17: scriggo is PLATFORM-RESERVED (§ A0). The template-engine lane below cannot be submitted.**
+- **[open2b/scriggo](https://github.com/open2b/scriggo)** — the Go LANGUAGE CORE is contested (see
+  § B entry) and, independently, scriggo's own `test/compare` skip list is a **published gap matrix
+  with issue numbers**: method declaration/definition 62 skips (#194, #458), interface definition 28
+  (#218), `unsafe` 18 (#288), `runtime` 8 (#524). Every deep language-core gap is publicly filed and
+  maintainer-owned. **The TEMPLATE engine is open and confirmed so on 2026-09-16:** the contextual
+  autoescaper has no sub-format dispatch on attribute NAME, so `style="..."` gets no CSS escaping
+  (while the `<style>` ELEMENT path does) and `on*` handlers get no JS escaping. Nothing in the
+  tracker claims it; issue #971 shows the context behaviour is not even documented. Scope-locked as
+  the 2026-09-16-C pick. Full dossier: `Instructions/repo-hunt-logs/REPO-HUNT-2026-09-16-C.md`.
+
+## H. PLAIN-C SLICE, FIRST AUDITS (2026-09-19)
+
+⛔ **Whole section void for picking: the platform picker refuses C-primary repos** ("No supported language is a primary or major part of this repo (top: C)"), tested on xcc (TypeScript 2nd at 4.9%). The verdicts below stand only as a record. A C-primary repo is eligible only if a supported language is a MAJOR share by bytes.
+
+The cached band held 995 plain-C repos no triage had profiled (earlier triages admitted C++ only).
+First screen of 20 plus 4 lane audits; log `Instructions/repo-hunt-logs/REPO-HUNT-2026-09-19.md`.
+
+| Repo | Verdict | Killer |
+|---|---|---|
+| udem-dlteam/pnut | DEAD (licence) | vendored GPL-2.0 `examples/c4.c`, compiled by CI; GPL bash .debs in `kit/` |
+| vtereshkov/umka-lang | DEAD (Req 7) | only workflow builds, never tests; memory lane on public `gc` branch, embedding lane in a public fork, optimizer is the maintainer's current work. Weak fallback if Req 7 waived: relocatable compiled images (~620 eff, but a ~70-line recompile shortcut and tracker magnets #49/#43/#187) |
+| jgaeddert/liquid-dsp | DEAD (absorption) | best lane (frame start indices across synchronizers) is accounting with a ~100-line shortcut; interleaver/qsource/_copy lanes absorbed; dsssframe/qdsync under open PRs |
+| lily, cone | DEAD (Req 7) | no workflows |
+| c-ray, berry | DEAD (Req 7) | CI failing on default branch |
+| vlm/asn1c | DEAD | `shakespark` X.691 fix burst, 35 open PRs |
+| HaxeFoundation/hashlink | DEAD | two open AArch64 JIT backend PRs, copilot setup |
+| mm2/Little-CMS | AVOID | copilot-swe-agent PRs, ICC spec-named lanes |
+| dstogov/ir | WATCH | ★504 (at the floor); two open RISC-V backend PRs |
+| tyfkda/xcc | DEAD (platform language gate) | was RANK 1 (frame-reusing tail calls, ~300 eff, F2P on 3 targets); picker blocked: C primary, TypeScript 4.9% |
+
+**Part 2 (keyword-gap slice, 2026-09-19):** mswjs/data DEAD (every lane shortcut / prior art /
+v0-removal; log § Part 2). davmac314/dinit `depends-any` SHELVED (machinery-absorbed: reference 105 human-eff; TOO-EASY.md § dinit-depends-any-groups; the LIFO prop-queue and STOPPING-sibling traps are reusable on a bigger dinit lane), featurevisor second lane RANK 2
+(Target-context specialization), Cysharp/csbindgen FALLBACK (repr(C) layout). md2pptx DEAD Req 7.
+
+**Sweep C (2026-09-19, four niches, log `REPO-HUNT-2026-09-19-C.md`):** 306 slugs screened, reasons in
+`worktrees/_hunt/agents/*-0919C.md`. Notable: jupyter/nbdime DEAD (diff composition spiked at 135
+human-eff, one idea passes all property cases); FabricMC/fabric-loader DEAD (solver lane live,
+quilt-loader sibling prior art); pf4j DEAD (§ F: multi-version refused #189); tach DEAD (one decision
+point); orbitdb DEAD (counter/feed store removal record); pagefind AVOID (company roadmap, #1038
+removal record); bpampuch/pdfmake FALLBACK-MAGNET (footnotes, #2133 open since 2020);
+awslabs/diagram-as-code FALLBACK (grid direction, ~220 eff).
+
+**Sweep D (2026-09-19, softened gates, log `REPO-HUNT-2026-09-19-D.md`):** messageformat/messageformat
+RANK 1 (MF2->MF1 conversion). **Shelved same day: MF2->MF1 lane CONSUMED, precheck overlap Blocker
+76.3% against TWO older candidates (`rejected/messageformat-mf2-to-mf1`, TOO-EASY.md "Reverse direction of
+a one-way converter"). Treat the repo's other converter directions (Fluent, XLIFF) as the same magnet.** graphhopper/graphhopper DEAD on licence (vendored LGPL-3.0
+`ContourBuilder.java`). lmfit, RESTler, JQF, mountebank, PyFR, particles, simupy, digitaljs DEAD
+(shortcut / prior art / no suite). nkaz001/hftbacktest FALLBACK (stop orders, nameable).
+
+**Sweep E (2026-09-19, storage / physical science / optimisation+statistics / documents+VCS+imaging,
+log `REPO-HUNT-2026-09-19-E.md`):** ~190 slugs screened, reasons in `worktrees/_hunt/agents/*-0919E.md`.
+oxipng/oxipng BEST-OF-SWEEP (APNG joint reductions + frame crop/dedup; #551 magnet, maintainer
+adjacent). libspatialindex FALLBACK (temporal kNN, MIT despite LGPL history note). nglviewer/ngl
+FALLBACK-weak (triclinic PBC, lean under floor). statsmodels statespace compose near-dead (pymc-extras
+sibling ships block-diag assembly). cvxpy / dowhy / jMetal / ketcher / OpenMS AVOID (AI sweeps);
+pymatgen absorbed (pymatgen-core); cartopy DEAD (red CI); skyfield frame lanes under open PRs.
+- **oxipng/oxipng — APNG lanes DEAD (2026-09-19, `rejected/oxipng-apng-frame-optimization`).** Overlap
+  Blocker at the core slice: older submissions hold APNG-wide reductions and canvas/changed-region
+  cropping separately, and the union is a set-level derivative. Issue #551's staged plan (stages 3-4) is
+  claimed. Repo itself NOT dead (MIT, 100% Rust, CI green, base 296 tests deterministic, Docker cold
+  build 296 s with the Pattern A Dockerfile in the rejected folder); any other lane must be invented from
+  the source tree and must not touch APNG frames or reductions.
