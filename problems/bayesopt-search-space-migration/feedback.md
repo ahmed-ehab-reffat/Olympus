@@ -1,6 +1,6 @@
 # feedback.md - bayesopt-search-space-migration
 
-NEXT (human): round-5 artifact (meta + solution + tests all changed 2026-09-24) needs prechecks, then a FULL new batch (meta changed, no re-eval).
+NEXT (human): round-6 artifact (solution + tests changed 2026-09-24; meta unchanged since round 5, still never batched) needs prechecks, then a FULL batch.
 
 Repo: bayesian-optimization/BayesianOptimization (MIT, 8,714 stars), base af8b928 (master HEAD 2026-08-21).
 Hunt: Instructions/repo-hunt-logs/REPO-HUNT-2026-09-23-E.md (RANK 1). Mode: factory SLICE.
@@ -156,4 +156,21 @@ Hunt: Instructions/repo-hunt-logs/REPO-HUNT-2026-09-23-E.md (RANK 1). Mode: fact
     ties 2.5/-1.5/3.5/0.5 -> 2/-2/4/0; queued probes through an integer retype; numpy + negative reals carried.
 - Predicted: the 5 GPHedge-only runs now see the rule; risk of landing near the 40% ceiling. No fair extra lever found by probing.
 - Tests 72 cases. Host full suite with solution: 239 passed.
+
+## Auto Review round 6 (2026-09-24): Description 3/3, Tests 1/3, Solution 1/3
+- S1 x3: non-finite numbers. _real_number now rejects NaN/+-inf (np.isfinite after float()) -> integer inf fill raises ValueError
+  (was OverflowError), NaN/inf registered points dropped, NaN queued probe dropped. meta unchanged ("real number" already excludes them).
+- T3/T4 x3, fixed through get_acquisition_params() (the public serialization API save_state uses; the reviewer suggested it) and
+  only representation-free values (gains vector, decoded pending values):
+  - warmed GPHedge (3 suggest+probe rounds, gains asserted nonzero) + queue; add/remove round trip -> full acquisition params
+    equal the untouched twin, then same course. Plain and ConstantLiar(GPHedge).
+  - attribution: after removing one category, the gain change over the next suggestion is > 900 at the surviving candidate's
+    acquisition and exactly 0 at the other, both positions.
+  - ConstantLiar coincide: carried pending values == the suggestions' rounded ys, earliest-unique when duplicates are off, all when on.
+- Advisories taken: queued probes (incl. one outside the narrowed bounds) through both undo tests; malformed definition
+  (single category) rollback vs twin.
+- Named mutants: gains reset, compact-first-slots, liar always/never dedup, no finite check: all KILLED.
+- Risk noted: the first precheck grader objected to reading acquisition state; these reads go through the public
+  get_acquisition_params() only.
+- Tests 82 cases. Host full suite: 249 passed. human-effective 242.
 
