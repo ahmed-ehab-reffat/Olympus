@@ -1,0 +1,667 @@
+diff --git a/core/src/main/java/org/teavm/model/analysis/MethodSummaries.java b/core/src/main/java/org/teavm/model/analysis/MethodSummaries.java
+new file mode 100644
+index 0000000..b30bade
+--- /dev/null
++++ b/core/src/main/java/org/teavm/model/analysis/MethodSummaries.java
+@@ -0,0 +1,311 @@
++/*
++ *  Copyright 2026 Alexey Andreev.
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.teavm.model.analysis;
++
++import java.util.ArrayDeque;
++import java.util.Collections;
++import java.util.Deque;
++import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import org.teavm.model.BasicBlock;
++import org.teavm.model.ClassHierarchy;
++import org.teavm.model.ClassReader;
++import org.teavm.model.ElementModifier;
++import org.teavm.model.FieldReference;
++import org.teavm.model.Instruction;
++import org.teavm.model.InvokeDynamicInstruction;
++import org.teavm.model.ListableClassReaderSource;
++import org.teavm.model.MethodDescriptor;
++import org.teavm.model.MethodReader;
++import org.teavm.model.MethodReference;
++import org.teavm.model.Program;
++import org.teavm.model.ValueType;
++import org.teavm.model.instructions.ExitInstruction;
++import org.teavm.model.instructions.InitClassInstruction;
++import org.teavm.model.instructions.InvocationType;
++import org.teavm.model.instructions.InvokeInstruction;
++import org.teavm.model.instructions.PutFieldInstruction;
++import org.teavm.model.util.ProgramUtils;
++
++public class MethodSummaries {
++    private static final MethodDescriptor CLINIT = new MethodDescriptor("<clinit>", ValueType.VOID);
++    private final ListableClassReaderSource classes;
++    private final ClassHierarchy hierarchy;
++    private final Map<MethodReference, Summary> summaries = new LinkedHashMap<>();
++    private final Map<CallKey, List<MethodReference>> targetCache = new HashMap<>();
++    private final Map<MethodReference, Set<MethodReference>> callers = new HashMap<>();
++
++    private MethodSummaries(ListableClassReaderSource classes) {
++        this.classes = classes;
++        hierarchy = new ClassHierarchy(classes);
++    }
++
++    public static MethodSummaries build(ListableClassReaderSource classes) {
++        var result = new MethodSummaries(classes);
++        result.collectMethods();
++        result.collectCallers();
++        result.propagate();
++        return result;
++    }
++
++    public boolean neverReturnsNull(InvocationType type, MethodReference method) {
++        var targets = targets(type, method);
++        if (targets == null) {
++            return false;
++        }
++        for (var target : targets) {
++            if (!summaries.get(target).neverNull) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    public Set<FieldReference> getWrittenFields(InvocationType type, MethodReference method) {
++        var targets = targets(type, method);
++        if (targets == null) {
++            return null;
++        }
++        var result = new LinkedHashSet<FieldReference>();
++        for (var target : targets) {
++            var written = summaries.get(target).writtenFields;
++            if (written == null) {
++                return null;
++            }
++            result.addAll(written);
++        }
++        return Collections.unmodifiableSet(result);
++    }
++
++    public Set<FieldReference> getInitializerWrittenFields(String className) {
++        var cls = classes.get(className);
++        if (cls == null) {
++            return null;
++        }
++        var initializer = cls.getMethod(CLINIT);
++        if (initializer == null) {
++            return Collections.emptySet();
++        }
++        return getWrittenFields(InvocationType.SPECIAL, initializer.getReference());
++    }
++
++    private void collectMethods() {
++        for (var className : classes.getClassNames()) {
++            var cls = classes.get(className);
++            for (var method : cls.getMethods()) {
++                if (method.getProgram() != null) {
++                    summaries.put(method.getReference(), new Summary(method));
++                }
++            }
++        }
++    }
++
++    private void collectCallers() {
++        for (var summary : summaries.values()) {
++            var caller = summary.method.getReference();
++            for (BasicBlock block : summary.program.getBasicBlocks()) {
++                for (Instruction instruction : block) {
++                    List<MethodReference> callees = null;
++                    if (instruction instanceof InvokeInstruction) {
++                        var invoke = (InvokeInstruction) instruction;
++                        callees = targets(invoke.getType(), invoke.getMethod());
++                    } else if (instruction instanceof InitClassInstruction) {
++                        callees = initializerTargets(((InitClassInstruction) instruction).getClassName());
++                    }
++                    if (callees != null) {
++                        for (var callee : callees) {
++                            callers.computeIfAbsent(callee, k -> new LinkedHashSet<>()).add(caller);
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    private void propagate() {
++        Deque<MethodReference> queue = new ArrayDeque<>(summaries.keySet());
++        Set<MethodReference> queued = new LinkedHashSet<>(summaries.keySet());
++        while (!queue.isEmpty()) {
++            var method = queue.removeFirst();
++            queued.remove(method);
++            var summary = summaries.get(method);
++            if (updateWrittenFields(summary) | updateNeverNull(summary)) {
++                for (var caller : callers.getOrDefault(method, Collections.emptySet())) {
++                    if (queued.add(caller)) {
++                        queue.addLast(caller);
++                    }
++                }
++            }
++        }
++    }
++
++    private boolean updateWrittenFields(Summary summary) {
++        if (summary.writtenFields == null) {
++            return false;
++        }
++        var written = computeWrittenFields(summary.program);
++        if (written == null) {
++            summary.writtenFields = null;
++            return true;
++        }
++        return summary.writtenFields.addAll(written);
++    }
++
++    private Set<FieldReference> computeWrittenFields(Program program) {
++        var result = new LinkedHashSet<FieldReference>();
++        for (BasicBlock block : program.getBasicBlocks()) {
++            for (Instruction instruction : block) {
++                Set<FieldReference> written;
++                if (instruction instanceof PutFieldInstruction) {
++                    written = Set.of(((PutFieldInstruction) instruction).getField());
++                } else if (instruction instanceof InvokeInstruction) {
++                    var invoke = (InvokeInstruction) instruction;
++                    written = getWrittenFields(invoke.getType(), invoke.getMethod());
++                } else if (instruction instanceof InitClassInstruction) {
++                    written = getInitializerWrittenFields(((InitClassInstruction) instruction).getClassName());
++                } else if (instruction instanceof InvokeDynamicInstruction) {
++                    written = null;
++                } else {
++                    continue;
++                }
++                if (written == null) {
++                    return null;
++                }
++                result.addAll(written);
++            }
++        }
++        return result;
++    }
++
++    private boolean updateNeverNull(Summary summary) {
++        if (!summary.neverNull || provesNonNullResult(summary)) {
++            return false;
++        }
++        summary.neverNull = false;
++        return true;
++    }
++
++    private boolean provesNonNullResult(Summary summary) {
++        var program = ProgramUtils.copy(summary.program);
++        var nullness = NullnessInformation.build(program, summary.method.getDescriptor(), this);
++        for (BasicBlock block : program.getBasicBlocks()) {
++            var last = block.getLastInstruction();
++            if (last instanceof ExitInstruction) {
++                var value = ((ExitInstruction) last).getValueToReturn();
++                if (value != null && !nullness.isNotNull(value)) {
++                    return false;
++                }
++            }
++        }
++        return true;
++    }
++
++    private List<MethodReference> initializerTargets(String className) {
++        var cls = classes.get(className);
++        if (cls == null) {
++            return null;
++        }
++        var initializer = cls.getMethod(CLINIT);
++        return initializer != null ? targets(InvocationType.SPECIAL, initializer.getReference()) : List.of();
++    }
++
++    private List<MethodReference> targets(InvocationType type, MethodReference method) {
++        var key = new CallKey(type, method);
++        if (targetCache.containsKey(key)) {
++            return targetCache.get(key);
++        }
++        var result = type == InvocationType.VIRTUAL ? virtualTargets(method) : specialTargets(method);
++        targetCache.put(key, result);
++        return result;
++    }
++
++    private List<MethodReference> specialTargets(MethodReference method) {
++        var resolved = classes.resolve(method);
++        if (resolved == null || !summaries.containsKey(resolved.getReference())) {
++            return null;
++        }
++        return List.of(resolved.getReference());
++    }
++
++    private List<MethodReference> virtualTargets(MethodReference method) {
++        if (classes.resolve(method) == null) {
++            return null;
++        }
++        var result = new LinkedHashSet<MethodReference>();
++        for (var className : classes.getClassNames()) {
++            ClassReader cls = classes.get(className);
++            if (cls.hasModifier(ElementModifier.ABSTRACT) || cls.hasModifier(ElementModifier.INTERFACE)
++                    || !hierarchy.isSuperType(method.getClassName(), className, false)) {
++                continue;
++            }
++            MethodReader implementation = classes.resolveImplementation(className, method.getDescriptor());
++            if (implementation == null || !summaries.containsKey(implementation.getReference())) {
++                return null;
++            }
++            result.add(implementation.getReference());
++        }
++        return List.copyOf(result);
++    }
++
++    private static boolean returnsReference(MethodReader method) {
++        var type = method.getResultType();
++        return type instanceof ValueType.Object || type instanceof ValueType.Array;
++    }
++
++    static class Summary {
++        final MethodReader method;
++        final Program program;
++        boolean neverNull;
++        Set<FieldReference> writtenFields = new LinkedHashSet<>();
++
++        Summary(MethodReader method) {
++            this.method = method;
++            program = ProgramUtils.copy(method.getProgram());
++            neverNull = returnsReference(method);
++        }
++    }
++
++    static class CallKey {
++        final InvocationType type;
++        final MethodReference method;
++
++        CallKey(InvocationType type, MethodReference method) {
++            this.type = type;
++            this.method = method;
++        }
++
++        @Override
++        public boolean equals(Object o) {
++            if (this == o) {
++                return true;
++            }
++            if (!(o instanceof CallKey)) {
++                return false;
++            }
++            var that = (CallKey) o;
++            return type == that.type && method.equals(that.method);
++        }
++
++        @Override
++        public int hashCode() {
++            return type.hashCode() * 31 + method.hashCode();
++        }
++    }
++}
+diff --git a/core/src/main/java/org/teavm/model/analysis/NullnessInformation.java b/core/src/main/java/org/teavm/model/analysis/NullnessInformation.java
+index b34744a..d427768 100644
+--- a/core/src/main/java/org/teavm/model/analysis/NullnessInformation.java
++++ b/core/src/main/java/org/teavm/model/analysis/NullnessInformation.java
+@@ -90,7 +90,12 @@ public class NullnessInformation {
+     }
+ 
+     public static NullnessInformation build(Program program, MethodDescriptor methodDescriptor) {
+-        NullnessInformationBuilder builder = new NullnessInformationBuilder(program, methodDescriptor);
++        return build(program, methodDescriptor, null);
++    }
++
++    public static NullnessInformation build(Program program, MethodDescriptor methodDescriptor,
++            MethodSummaries summaries) {
++        NullnessInformationBuilder builder = new NullnessInformationBuilder(program, methodDescriptor, summaries);
+         builder.build();
+         return new NullnessInformation(program, builder.synthesizedVariables, builder.phiUpdater, builder.statuses);
+     }
+diff --git a/core/src/main/java/org/teavm/model/analysis/NullnessInformationBuilder.java b/core/src/main/java/org/teavm/model/analysis/NullnessInformationBuilder.java
+index a6b6825..4f5f668 100644
+--- a/core/src/main/java/org/teavm/model/analysis/NullnessInformationBuilder.java
++++ b/core/src/main/java/org/teavm/model/analysis/NullnessInformationBuilder.java
+@@ -61,6 +61,7 @@ import org.teavm.model.util.PhiUpdater;
+ class NullnessInformationBuilder {
+     private Program program;
+     private MethodDescriptor methodDescriptor;
++    private MethodSummaries summaries;
+     BitSet synthesizedVariables = new BitSet();
+     PhiUpdater phiUpdater;
+     private List<NullCheckInstruction> notNullInstructions = new ArrayList<>();
+@@ -69,9 +70,10 @@ class NullnessInformationBuilder {
+     Nullness[] statuses;
+     private int[][] variablePairs;
+ 
+-    NullnessInformationBuilder(Program program, MethodDescriptor methodDescriptor) {
++    NullnessInformationBuilder(Program program, MethodDescriptor methodDescriptor, MethodSummaries summaries) {
+         this.program = program;
+         this.methodDescriptor = methodDescriptor;
++        this.summaries = summaries;
+     }
+ 
+     void build() {
+@@ -219,7 +221,7 @@ class NullnessInformationBuilder {
+     }
+ 
+     private void initNullness(IntDeque queue) {
+-        NullnessInitVisitor visitor = new NullnessInitVisitor(queue);
++        NullnessInitVisitor visitor = new NullnessInitVisitor(queue, summaries);
+         for (BasicBlock block : program.getBasicBlocks()) {
+             for (Instruction instruction : block) {
+                 instruction.acceptVisitor(visitor);
+@@ -462,9 +464,20 @@ class NullnessInformationBuilder {
+ 
+     static class NullnessInitVisitor extends AbstractInstructionVisitor {
+         private IntDeque queue;
++        private MethodSummaries summaries;
+ 
+-        NullnessInitVisitor(IntDeque queue) {
++        NullnessInitVisitor(IntDeque queue, MethodSummaries summaries) {
+             this.queue = queue;
++            this.summaries = summaries;
++        }
++
++        @Override
++        public void visit(InvokeInstruction insn) {
++            if (summaries != null && insn.getReceiver() != null
++                    && summaries.neverReturnsNull(insn.getType(), insn.getMethod())) {
++                queue.addLast(insn.getReceiver().getIndex());
++                queue.addLast(1);
++            }
+         }
+ 
+         @Override
+diff --git a/core/src/main/java/org/teavm/model/optimization/ConstantConditionElimination.java b/core/src/main/java/org/teavm/model/optimization/ConstantConditionElimination.java
+index 03d662b..17882d0 100644
+--- a/core/src/main/java/org/teavm/model/optimization/ConstantConditionElimination.java
++++ b/core/src/main/java/org/teavm/model/optimization/ConstantConditionElimination.java
+@@ -20,6 +20,7 @@ import org.teavm.model.Instruction;
+ import org.teavm.model.MethodDescriptor;
+ import org.teavm.model.Phi;
+ import org.teavm.model.Program;
++import org.teavm.model.analysis.MethodSummaries;
+ import org.teavm.model.analysis.NullnessInformation;
+ import org.teavm.model.instructions.BinaryBranchingCondition;
+ import org.teavm.model.instructions.BinaryBranchingInstruction;
+@@ -36,13 +37,17 @@ public class ConstantConditionElimination implements MethodOptimization {
+ 
+     @Override
+     public boolean optimize(MethodOptimizationContext context, Program program) {
+-        return optimize(context.getMethod().getDescriptor(), program);
++        return optimize(context.getMethod().getDescriptor(), program, context.getMethodSummaries());
+     }
+ 
+     public boolean optimize(MethodDescriptor descriptor, Program program) {
++        return optimize(descriptor, program, null);
++    }
++
++    private boolean optimize(MethodDescriptor descriptor, Program program, MethodSummaries summaries) {
+         constants = new int[program.variableCount()];
+         constantDefined = new boolean[program.variableCount()];
+-        nullness = NullnessInformation.build(program, descriptor);
++        nullness = NullnessInformation.build(program, descriptor, summaries);
+ 
+         for (int i = 0; i < program.basicBlockCount(); ++i) {
+             BasicBlock block = program.basicBlockAt(i);
+diff --git a/core/src/main/java/org/teavm/model/optimization/LoopInvariantMotion.java b/core/src/main/java/org/teavm/model/optimization/LoopInvariantMotion.java
+index 98a7dfc..ecf2b70 100644
+--- a/core/src/main/java/org/teavm/model/optimization/LoopInvariantMotion.java
++++ b/core/src/main/java/org/teavm/model/optimization/LoopInvariantMotion.java
+@@ -55,7 +55,8 @@ public class LoopInvariantMotion implements MethodOptimization {
+ 
+     @Override
+     public boolean optimize(MethodOptimizationContext context, Program program) {
+-        NullnessInformation nullness = NullnessInformation.build(program, context.getMethod().getDescriptor());
++        NullnessInformation nullness = NullnessInformation.build(program, context.getMethod().getDescriptor(),
++                context.getMethodSummaries());
+ 
+         boolean affected = false;
+         this.program = program;
+diff --git a/core/src/main/java/org/teavm/model/optimization/MethodOptimizationContext.java b/core/src/main/java/org/teavm/model/optimization/MethodOptimizationContext.java
+index c62ce20..a008ad6 100644
+--- a/core/src/main/java/org/teavm/model/optimization/MethodOptimizationContext.java
++++ b/core/src/main/java/org/teavm/model/optimization/MethodOptimizationContext.java
+@@ -19,6 +19,7 @@ import org.teavm.dependency.DependencyInfo;
+ import org.teavm.model.ClassHierarchy;
+ import org.teavm.model.ClassReaderSource;
+ import org.teavm.model.MethodReader;
++import org.teavm.model.analysis.MethodSummaries;
+ 
+ public interface MethodOptimizationContext {
+     MethodReader getMethod();
+@@ -28,4 +29,8 @@ public interface MethodOptimizationContext {
+     ClassReaderSource getClassSource();
+ 
+     ClassHierarchy getHierarchy();
++
++    default MethodSummaries getMethodSummaries() {
++        return null;
++    }
+ }
+diff --git a/core/src/main/java/org/teavm/model/optimization/RedundantNullCheckElimination.java b/core/src/main/java/org/teavm/model/optimization/RedundantNullCheckElimination.java
+index 7dffcc8..e9f8763 100644
+--- a/core/src/main/java/org/teavm/model/optimization/RedundantNullCheckElimination.java
++++ b/core/src/main/java/org/teavm/model/optimization/RedundantNullCheckElimination.java
+@@ -26,7 +26,8 @@ import org.teavm.model.util.ProgramUtils;
+ public class RedundantNullCheckElimination implements MethodOptimization {
+     @Override
+     public boolean optimize(MethodOptimizationContext context, Program program) {
+-        NullnessInformation nullness = NullnessInformation.build(program, context.getMethod().getDescriptor());
++        NullnessInformation nullness = NullnessInformation.build(program, context.getMethod().getDescriptor(),
++                context.getMethodSummaries());
+ 
+         boolean hasChanges = false;
+         for (BasicBlock block : program.getBasicBlocks()) {
+diff --git a/core/src/main/java/org/teavm/model/optimization/RepeatedFieldReadElimination.java b/core/src/main/java/org/teavm/model/optimization/RepeatedFieldReadElimination.java
+index f84e2e9..3bd9850 100644
+--- a/core/src/main/java/org/teavm/model/optimization/RepeatedFieldReadElimination.java
++++ b/core/src/main/java/org/teavm/model/optimization/RepeatedFieldReadElimination.java
+@@ -44,9 +44,11 @@ import org.teavm.model.Instruction;
+ import org.teavm.model.Program;
+ import org.teavm.model.TryCatchBlock;
+ import org.teavm.model.analysis.AliasAnalysis;
++import org.teavm.model.analysis.MethodSummaries;
+ import org.teavm.model.instructions.AbstractInstructionVisitor;
+ import org.teavm.model.instructions.AssignInstruction;
+ import org.teavm.model.instructions.GetFieldInstruction;
++import org.teavm.model.instructions.InitClassInstruction;
+ import org.teavm.model.instructions.InvokeInstruction;
+ import org.teavm.model.instructions.PutFieldInstruction;
+ import org.teavm.model.util.ProgramUtils;
+@@ -54,7 +56,9 @@ import org.teavm.model.util.ProgramUtils;
+ public class RepeatedFieldReadElimination implements MethodOptimization {
+     private static final int ENTER = 0;
+     private static final int EXIT = 1;
++    private static final int ALL_INSTANCES = -2;
+     private ClassReaderSource classSource;
++    private MethodSummaries summaries;
+     private boolean[] everythingInvalid;
+     private List<IntObjectHashMap<Set<FieldReference>>> invalidFields = new ArrayList<>();
+     private AliasAnalysis aliasAnalysis;
+@@ -63,6 +67,7 @@ public class RepeatedFieldReadElimination implements MethodOptimization {
+     @Override
+     public boolean optimize(MethodOptimizationContext context, Program program) {
+         classSource = context.getClassSource();
++        summaries = context.getMethodSummaries();
+         Graph cfg = ProgramUtils.buildControlFlowGraph(program);
+         DominatorTree dom = GraphUtils.buildDominatorTree(cfg);
+         aliasAnalysis = new AliasAnalysis();
+@@ -80,7 +85,7 @@ public class RepeatedFieldReadElimination implements MethodOptimization {
+         IntObjectMap<ObjectIntMap<FieldReference>> cacheVars = new IntObjectHashMap<>();
+         Deque<State> stateStack = new ArrayDeque<>();
+         Graph domGraph;
+-        InstructionAnalyzer instructionAnalyzer = new InstructionAnalyzer();
++        InstructionAnalyzer instructionAnalyzer = new InstructionAnalyzer(summaries);
+ 
+         Traversal(Program program, DominatorTree dom, Graph cfg) {
+             this.program = program;
+@@ -117,6 +122,10 @@ public class RepeatedFieldReadElimination implements MethodOptimization {
+                     instruction.acceptVisitor(instructionAnalyzer);
+                     if (instructionAnalyzer.invalidatesAll) {
+                         invalidateAllFields();
++                    } else if (instructionAnalyzer.invalidatedFields != null) {
++                        for (FieldReference field : instructionAnalyzer.invalidatedFields) {
++                            invalidateFieldOnAllInstances(field);
++                        }
+                     } else if (instructionAnalyzer.invalidatedField != null) {
+                         FieldReference field = instructionAnalyzer.invalidatedField;
+                         int instance = instructionAnalyzer.instance;
+@@ -147,7 +156,11 @@ public class RepeatedFieldReadElimination implements MethodOptimization {
+                 for (IntObjectCursor<Set<FieldReference>> cursor : invalidFieldsByBlock) {
+                     int instance = cursor.key;
+                     for (FieldReference field : cursor.value) {
+-                        invalidateField(instance, field);
++                        if (instance == ALL_INSTANCES) {
++                            invalidateFieldOnAllInstances(field);
++                        } else {
++                            invalidateField(instance, field);
++                        }
+                     }
+                 }
+             }
+@@ -327,7 +340,7 @@ public class RepeatedFieldReadElimination implements MethodOptimization {
+         }
+ 
+         IntArrayDeque worklist = new IntArrayDeque();
+-        InstructionAnalyzer instructionAnalyzer = new InstructionAnalyzer();
++        InstructionAnalyzer instructionAnalyzer = new InstructionAnalyzer(summaries);
+         for (BasicBlock block : program.getBasicBlocks()) {
+             int[] frontiers = domFrontiers[block.getIndex()];
+             if (frontiers.length == 0) {
+@@ -347,6 +360,12 @@ public class RepeatedFieldReadElimination implements MethodOptimization {
+                         allInvalid = true;
+                         fieldsToInvalidate.clear();
+                         break;
++                    } else if (instructionAnalyzer.invalidatedFields != null) {
++                        for (FieldReference field : instructionAnalyzer.invalidatedFields) {
++                            if (!isVolatile(field)) {
++                                fieldsToInvalidate.add(new FieldAndInstance(field, ALL_INSTANCES));
++                            }
++                        }
+                     } else if (instructionAnalyzer.invalidatedField != null
+                             && !isVolatile(instructionAnalyzer.invalidatedField)) {
+                         fieldsToInvalidate.add(new FieldAndInstance(instructionAnalyzer.invalidatedField,
+@@ -404,13 +423,20 @@ public class RepeatedFieldReadElimination implements MethodOptimization {
+     }
+ 
+     static class InstructionAnalyzer extends AbstractInstructionVisitor {
++        private final MethodSummaries summaries;
+         boolean invalidatesAll;
++        Set<FieldReference> invalidatedFields;
+         FieldReference invalidatedField;
+         int instance;
+         int newValue;
+ 
++        InstructionAnalyzer(MethodSummaries summaries) {
++            this.summaries = summaries;
++        }
++
+         void reset() {
+             invalidatesAll = false;
++            invalidatedFields = null;
+             invalidatedField = null;
+             instance = -1;
+         }
+@@ -424,7 +450,26 @@ public class RepeatedFieldReadElimination implements MethodOptimization {
+ 
+         @Override
+         public void visit(InvokeInstruction insn) {
+-            invalidatesAll = true;
++            if (summaries == null) {
++                invalidatesAll = true;
++            } else {
++                invalidate(summaries.getWrittenFields(insn.getType(), insn.getMethod()));
++            }
++        }
++
++        @Override
++        public void visit(InitClassInstruction insn) {
++            if (summaries != null) {
++                invalidate(summaries.getInitializerWrittenFields(insn.getClassName()));
++            }
++        }
++
++        private void invalidate(Set<FieldReference> fields) {
++            if (fields == null) {
++                invalidatesAll = true;
++            } else {
++                invalidatedFields = fields;
++            }
+         }
+     }
+ 
+diff --git a/core/src/main/java/org/teavm/vm/TeaVM.java b/core/src/main/java/org/teavm/vm/TeaVM.java
+index 272f53e..5d7a41a 100644
+--- a/core/src/main/java/org/teavm/vm/TeaVM.java
++++ b/core/src/main/java/org/teavm/vm/TeaVM.java
+@@ -73,6 +73,7 @@ import org.teavm.model.ProgramCache;
+ import org.teavm.model.ValueType;
+ import org.teavm.model.analysis.ClassInitializerAnalysis;
+ import org.teavm.model.analysis.ClassInitializerInfo;
++import org.teavm.model.analysis.MethodSummaries;
+ import org.teavm.model.instructions.ExitInstruction;
+ import org.teavm.model.instructions.InitClassInstruction;
+ import org.teavm.model.instructions.InvokeInstruction;
+@@ -162,6 +163,7 @@ public class TeaVM implements TeaVMHost, ServiceRepository {
+     private Set<? extends MethodReference> virtualMethods;
+     private AnnotationAwareCacheStatus cacheStatus;
+     private ProgramDependencyExtractor programDependencyExtractor = new ProgramDependencyExtractor();
++    private MethodSummaries methodSummaries;
+     private List<Predicate<MethodReference>> additionalVirtualMethods = new ArrayList<>();
+     private int lastKnownClasses;
+     private int compileProgressReportStart;
+@@ -444,12 +446,14 @@ public class TeaVM implements TeaVMHost, ServiceRepository {
+ 
+         boolean isLazy = optimizationLevel == TeaVMOptimizationLevel.SIMPLE;
+         ListableClassHolderSource classSet;
++        methodSummaries = null;
+         if (isLazy) {
+             classInitializerInfo = ClassInitializerInfo.EMPTY;
+             target.setController(targetController);
+-            target.analyzeBeforeOptimizations(new ListableClassReaderSourceAdapter(
+-                    dependencyAnalyzer.getClassSource(),
+-                    new LinkedHashSet<>(dependencyAnalyzer.getReachableClasses())));
++            var reachableClasses = new ListableClassReaderSourceAdapter(dependencyAnalyzer.getClassSource(),
++                    new LinkedHashSet<>(dependencyAnalyzer.getReachableClasses()));
++            target.analyzeBeforeOptimizations(reachableClasses);
++            methodSummaries = MethodSummaries.build(reachableClasses);
+             initCompileProgress(1000);
+             classSet = lazyPipeline();
+         } else {
+@@ -530,6 +534,7 @@ public class TeaVM implements TeaVMHost, ServiceRepository {
+         if (wasCancelled()) {
+             return null;
+         }
++        methodSummaries = MethodSummaries.build(classSet);
+ 
+         target.analyzeBeforeOptimizations(new ListableClassReaderSourceAdapter(
+                 dependencyAnalyzer.getClassSource(),
+@@ -835,6 +840,11 @@ public class TeaVM implements TeaVMHost, ServiceRepository {
+         public ClassHierarchy getHierarchy() {
+             return dependencyAnalyzer.getClassHierarchy();
+         }
++
++        @Override
++        public MethodSummaries getMethodSummaries() {
++            return methodSummaries;
++        }
+     }
+ 
+     private List<MethodOptimization> getOptimizations() {

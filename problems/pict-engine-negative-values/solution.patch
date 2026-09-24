@@ -1,0 +1,912 @@
+diff --git a/api/deriver.cpp b/api/deriver.cpp
+index 4107126..738b7ec 100644
+--- a/api/deriver.cpp
++++ b/api/deriver.cpp
+@@ -291,6 +291,10 @@ void ExclusionDeriver::DeriveExclusions()
+ 
+     // Add pointers to referencing exclusions to each parameter
+     // for_each(m_exclusions.begin(), m_exclusions.end(), AddExclusionParamBackPtrs);
++    for( Parameter* param : m_parameters )
++    {
++        param->ClearExclusions();
++    }
+     for( ExclusionCollection::iterator ie = m_exclusions.begin(); ie != m_exclusions.end(); ++ie )
+     {
+         AddExclusionParamBackPtrs( ie );
+diff --git a/api/generator.h b/api/generator.h
+index 0fcb9c1..6553ff3 100644
+--- a/api/generator.h
++++ b/api/generator.h
+@@ -387,6 +387,9 @@ public:
+     void SetOrder( int Order ) { m_order = Order; }
+     void SetWeights( std::vector<int> Weights );
+ 
++    bool SetNegative( int n );
++    bool IsNegative( int n ) const;
++
+     const std::wstring& GetName() const { return m_name; }
+     ExclIterCollection& GetExclusions() { return m_exclusions; }
+ 
+@@ -473,6 +476,7 @@ private:
+     ParamResult           m_result;
+ 
+     std::vector<int>      m_valueWeights;
++    std::vector<bool>     m_negativeValues;
+ 
+     Task*  m_task = nullptr;
+ 
+@@ -656,6 +660,13 @@ public:
+     // this has to be called right before generation starts
+     void PrepareForGeneration();
+ 
++    // generates the whole model hierarchy, negative values included
++    void Generate( std::function<void( Model* )> prepareModel = nullptr );
++
++    ParamCollection& GetResultParameters() { return( m_resultParameters ); }
++    long GetTotalCombinationsCount()     { return( m_totalCombinations ); }
++    long GetRemainingCombinationsCount() { return( m_remainingCombinations ); }
++
+     void AllocWorkbuf( int Size );
+ 
+     int* GetWorkbuf() { return( m_workbuf ); }
+@@ -696,7 +707,10 @@ public:
+         model->WireTask( this );
+     }
+ 
+-    size_t GetTotalParameterCount() { return( m_rootModel->GetAllParametersCount() ); }
++    size_t GetTotalParameterCount()
++    {
++        return( m_resultParameters.empty() ? m_rootModel->GetAllParametersCount() : m_resultParameters.size() );
++    }
+ 
+     void SetAbortCallback( AbortCallbackFunc func ) { m_abortCallback = func; }
+     
+@@ -743,6 +757,33 @@ private:
+     bool findParamInSubtree( Parameter* param, Model* root );
+     void deriveExclusions();
+ 
++    struct ModelState
++    {
++        Model*              model;
++        ParamCollection     parameters;
++        ExclusionCollection exclusions;
++        RowSeedCollection   rowSeeds;
++    };
++
++    std::vector<ModelState>                   m_savedModels;
++    std::vector<std::pair<Parameter*, int>>   m_savedOrders;
++    ExclusionCollection                       m_savedExclusions;
++    RowSeedCollection                         m_savedRowSeeds;
++    ParamCollection                           m_resultParameters;
++    long                                      m_totalCombinations     = 0;
++    long                                      m_remainingCombinations = 0;
++
++    void saveState( Model* model );
++    void restoreState();
++    void generatePhase( ExclusionCollection& phaseExclusions,
++                        std::function<void( Model* )>& prepareModel,
++                        std::map<Model*, ResultCollection>* partnerRows );
++    void generateModel( Model* model,
++                        std::function<void( Model* )>& prepareModel,
++                        std::map<Model*, ResultCollection>* partnerRows );
++    bool rowHasNegativeValue( const ResultRow& row );
++    bool entireParameterExcluded();
++
+     // a global workspace shared by multiple objects
+     int* m_workbuf = nullptr;
+ 
+diff --git a/api/parameter.cpp b/api/parameter.cpp
+index e563a5e..e91e9a8 100644
+--- a/api/parameter.cpp
++++ b/api/parameter.cpp
+@@ -149,6 +149,34 @@ void Parameter::SetWeights( vector<int> weights )
+     m_valueWeights = weights;
+ }
+ 
++//
++// a parameter must keep at least one value that is not negative
++//
++bool Parameter::SetNegative( int n )
++{
++    if( n < 0 || n >= m_valueCount ) return( false );
++    if( IsNegative( n ) ) return( true );
++
++    int negativeCount = 0;
++    for( int value = 0; value < m_valueCount; ++value )
++    {
++        if( IsNegative( value ) ) ++negativeCount;
++    }
++    if( negativeCount + 1 >= m_valueCount ) return( false );
++
++    m_negativeValues.resize( m_valueCount, false );
++    m_negativeValues[ n ] = true;
++    return( true );
++}
++
++//
++//
++//
++bool Parameter::IsNegative( int n ) const
++{
++    return( 0 <= n && n < static_cast<int>( m_negativeValues.size() ) && m_negativeValues[ n ] );
++}
++
+ //
+ // Return the parameter collection of the pseudoparameter's underlying Model
+ //
+diff --git a/api/pict.def b/api/pict.def
+index 799dcd5..83b2f19 100644
+--- a/api/pict.def
++++ b/api/pict.def
+@@ -5,6 +5,8 @@ EXPORTS
+     PictAddExclusion
+     PictAddSeed
+     PictGenerate
++    PictSetNegativeValue
++    PictGetResultParameter
+     PictAttachChildModel
+     PictAllocateResultBuffer
+     PictFreeResultBuffer
+diff --git a/api/pictapi.cpp b/api/pictapi.cpp
+index 1f44b6d..fff70f5 100644
+--- a/api/pictapi.cpp
++++ b/api/pictapi.cpp
+@@ -1,4 +1,5 @@
+ #include <algorithm>
++#include <atomic>
+ #include <thread>
+ using namespace std;
+ 
+@@ -6,12 +7,13 @@ using namespace std;
+ #include "generator.h"
+ using namespace pictcore;
+ 
++#define NO_CONST_HANDLE(X) const_cast< void * >( X )
++
+ //
+-// forward declarations
++// exclusions and seeds tell parameters apart by sequence, so parameters of
++// different models of one hierarchy must never share one
+ //
+-void generate( Model* model );
+-
+-#define NO_CONST_HANDLE(X) const_cast< void * >( X )
++static atomic<int> nextParameterSequence( 1 );
+ 
+ //
+ //
+@@ -139,18 +141,7 @@ PictGenerate
+     Task* taskObj = static_cast<Task*>( NO_CONST_HANDLE( task ));
+     try
+     {
+-        taskObj->PrepareForGeneration();
+-    }
+-    catch( ... )
+-    {
+-        return( PICT_GENERATION_ERROR );
+-    }
+-    
+-    Model* root = taskObj->GetRootModel();
+-    taskObj->SeedRandom( static_cast<unsigned int>( root->GetRandomSeed() ) );
+-    try
+-    {
+-        generate( root );
++        taskObj->Generate();
+     }
+     catch( GenerationError e )
+     {
+@@ -166,9 +157,49 @@ PictGenerate
+             return( PICT_GENERATION_ERROR );
+         }
+     }
++    catch( ... )
++    {
++        return( PICT_GENERATION_ERROR );
++    }
++    return( PICT_SUCCESS );
++}
++
++//
++//
++//
++PICT_RET_CODE
++API_SPEC
++PictSetNegativeValue
++    (
++    IN const PICT_HANDLE parameter,
++    IN       PICT_VALUE  valueIndex
++    )
++{
++    Parameter* param = static_cast<Parameter*>( NO_CONST_HANDLE( parameter ));
++    if( valueIndex >= static_cast<PICT_VALUE>( param->GetValueCount() )
++     || !param->SetNegative( static_cast<int>( valueIndex ) ) )
++    {
++        return( PICT_INVALID_VALUE );
++    }
+     return( PICT_SUCCESS );
+ }
+ 
++//
++//
++//
++PICT_HANDLE
++API_SPEC
++PictGetResultParameter
++    (
++    IN const PICT_HANDLE task,
++    IN       size_t      column
++    )
++{
++    Task* taskObj = static_cast<Task*>( NO_CONST_HANDLE( task ));
++    ParamCollection& params = taskObj->GetResultParameters();
++    return( column < params.size() ? static_cast<PICT_HANDLE>( params[ column ] ) : nullptr );
++}
++
+ //
+ //
+ //
+@@ -288,7 +319,7 @@ PictAddParameter
+     Model* modelObj = static_cast<Model*>( NO_CONST_HANDLE( model ));
+ 
+     Parameter* param = new Parameter( order,
+-                                      static_cast<int>( modelObj->GetParameters().size() + 1 ),
++                                      nextParameterSequence++,
+                                       static_cast<int>( valueCount ),
+                                       L"",
+                                       false );
+@@ -373,8 +404,12 @@ PictDeleteModel
+     Model* modelObj = static_cast<Model*>( NO_CONST_HANDLE( model ));
+ 
+     // delete all params first
+-    // since GetParameters() will return all params for this and all submodels, do it here
+-    for( Parameter* param : modelObj->GetParameters() )
++    // generation leaves each model with its own params, so walk all submodels
++    ParamCollection params;
++    modelObj->GetAllParameters( params );
++    sort( params.begin(), params.end() );
++    params.erase( unique( params.begin(), params.end() ), params.end() );
++    for( Parameter* param : params )
+     {
+         delete( param );
+     }
+@@ -383,14 +418,3 @@ PictDeleteModel
+     delete( modelObj );
+ }
+ 
+-//
+-//
+-//
+-void generate( Model* model )
+-{
+-    for ( Model* subModel : model->GetSubmodels() )
+-    {
+-        generate(subModel);
+-    }
+-    model->Generate();
+-}
+diff --git a/api/pictapi.h b/api/pictapi.h
+index 55f9745..a71e77f 100644
+--- a/api/pictapi.h
++++ b/api/pictapi.h
+@@ -52,6 +52,7 @@ typedef struct _PICT_SEED_ITEM
+ #define PICT_SUCCESS          0x00000000
+ #define PICT_OUT_OF_MEMORY    0xc0000001
+ #define PICT_GENERATION_ERROR 0xc0000002
++#define PICT_INVALID_VALUE    0xc0000003
+ 
+ //
+ // Defaults
+@@ -201,6 +202,55 @@ PictGenerate
+     IN const PICT_HANDLE task
+     );
+ 
++// ////////////////////////////////////////////////////////////////////////////
++//
++// Marks one value of a parameter as negative (out-of-range). A test case never
++// holds two negative values and each negative value is combined only with
++// values that are not negative. A parameter keeps at least one value that is
++// not negative.
++//
++// Parameters:
++//   parameter   Valid handle of a parameter
++//   valueIndex  Zero-based index of the value
++//
++// Returns:
++//   PICT_SUCCESS
++//   PICT_INVALID_VALUE  The index is out of range or the value is the last one
++//                       of the parameter that is not negative
++//
++// ////////////////////////////////////////////////////////////////////////////
++
++PICT_RET_CODE
++API_SPEC
++PictSetNegativeValue
++    (
++    IN const PICT_HANDLE parameter,
++    IN       PICT_VALUE  valueIndex
++    );
++
++// ////////////////////////////////////////////////////////////////////////////
++//
++// Returns the parameter whose values are reported in a given column of the
++// result rows produced by the last call to PictGenerate.
++//
++// Parameters:
++//   task    Valid handle to a task
++//   column  Zero-based column index
++//
++// Returns:
++//   Non-nullptr  The parameter reported in that column
++//   nullptr      No such column
++//
++// ////////////////////////////////////////////////////////////////////////////
++
++PICT_HANDLE
++API_SPEC
++PictGetResultParameter
++    (
++    IN const PICT_HANDLE task,
++    IN       size_t      column
++    );
++
+ // ////////////////////////////////////////////////////////////////////////////
+ //
+ // A helper function. Allocates and returns a pointer to a buffer big enough to
+diff --git a/api/task.cpp b/api/task.cpp
+index e7ae062..b135449 100644
+--- a/api/task.cpp
++++ b/api/task.cpp
+@@ -87,6 +87,211 @@ void Task::PrepareForGeneration()
+     m_rootModel->AddRowSeeds( m_rowSeeds.begin(), m_rowSeeds.end() );
+ }
+ 
++//
++// generation consumes and rewrites the state of every model in the hierarchy,
++// so it is captured before the first phase and put back between phases
++//
++void Task::saveState( Model* model )
++{
++    m_savedModels.push_back( { model, model->GetParameters(), model->GetExclusions(), model->GetRowSeeds() } );
++    for( auto & param : model->GetParameters() )
++    {
++        m_savedOrders.push_back( std::make_pair( param, param->GetOrder() ) );
++    }
++    for( auto & submodel : model->GetSubmodels() )
++    {
++        saveState( submodel );
++    }
++}
++
++//
++//
++//
++void Task::restoreState()
++{
++    for( auto & state : m_savedModels )
++    {
++        state.model->GetParameters() = state.parameters;
++        state.model->GetExclusions() = state.exclusions;
++        state.model->GetRowSeeds()   = state.rowSeeds;
++    }
++    for( auto & order : m_savedOrders )
++    {
++        order.first->SetOrder( order.second );
++    }
++    m_exclusions = m_savedExclusions;
++    m_rowSeeds   = m_savedRowSeeds;
++}
++
++//
++//
++//
++void Task::generateModel( Model* model,
++                          std::function<void( Model* )>& prepareModel,
++                          std::map<Model*, ResultCollection>* partnerRows )
++{
++    for( auto & submodel : model->GetSubmodels() )
++    {
++        generateModel( submodel, prepareModel, partnerRows );
++    }
++
++    if( prepareModel ) prepareModel( model );
++    model->Generate();
++
++    m_totalCombinations     += model->GetTotalCombinationsCount();
++    m_remainingCombinations += model->GetRemainingCombinationsCount();
++
++    // a row of a submodel that carries a negative value can only be combined
++    // with rows of its siblings that carry none; guarantee those exist
++    if( nullptr != partnerRows && model != m_rootModel )
++    {
++        ResultCollection& results = model->GetResults();
++        std::set<ResultRow> present( results.begin(), results.end() );
++        for( auto & row : ( *partnerRows )[ model ] )
++        {
++            if( present.insert( row ).second )
++            {
++                results.push_back( row );
++            }
++        }
++    }
++}
++
++//
++//
++//
++void Task::generatePhase( ExclusionCollection& phaseExclusions,
++                          std::function<void( Model* )>& prepareModel,
++                          std::map<Model*, ResultCollection>* partnerRows )
++{
++    restoreState();
++    __insert( m_exclusions, phaseExclusions.begin(), phaseExclusions.end() );
++    PrepareForGeneration();
++    if( entireParameterExcluded() )
++    {
++        throw GenerationError( __FILE__, __LINE__, ErrorType::GenerationFailure );
++    }
++    SeedRandom( static_cast<unsigned int>( m_rootModel->GetRandomSeed() ) );
++    generateModel( m_rootModel, prepareModel, partnerRows );
++}
++
++//
++// after derivation an empty exclusion, or one value-sized exclusion per value
++// of some parameter, means no test case can be built at all
++//
++bool Task::entireParameterExcluded()
++{
++    std::map<Parameter*, int> excludedValues;
++    for( auto & exclusion : m_exclusions )
++    {
++        if( exclusion.empty() ) return( true );
++        if( 1 == exclusion.size() )
++        {
++            Parameter* param = exclusion.begin()->first;
++            if( ++excludedValues[ param ] >= param->GetValueCount() ) return( true );
++        }
++    }
++    return( false );
++}
++
++//
++//
++//
++bool Task::rowHasNegativeValue( const ResultRow& row )
++{
++    ParamCollection& params = m_rootModel->GetParameters();
++    for( size_t col = 0; col < row.size() && col < params.size(); ++col )
++    {
++        if( Parameter::UndefinedValue != row[ col ] && params[ col ]->IsNegative( static_cast<int>( row[ col ] ) ) )
++        {
++            return( true );
++        }
++    }
++    return( false );
++}
++
++//
++// positive test cases come from the hierarchy with negative values excluded,
++// negative ones from a second pass where no two negative values meet
++//
++void Task::Generate( std::function<void( Model* )> prepareModel )
++{
++    m_savedModels.clear();
++    m_savedOrders.clear();
++    m_resultParameters.clear();
++    saveState( m_rootModel );
++    m_savedExclusions = m_exclusions;
++    m_savedRowSeeds   = m_rowSeeds;
++    m_totalCombinations = m_remainingCombinations = 0;
++
++    ParamCollection params;
++    m_rootModel->GetAllParameters( params );
++    std::sort( params.begin(), params.end() );
++    params.erase( std::unique( params.begin(), params.end() ), params.end() );
++
++    ExclusionCollection positiveExclusions;
++    ExclusionCollection maskingExclusions;
++    for( size_t p1 = 0; p1 < params.size(); ++p1 )
++    {
++        for( int v1 = 0; v1 < params[ p1 ]->GetValueCount(); ++v1 )
++        {
++            if( !params[ p1 ]->IsNegative( v1 ) ) continue;
++
++            Exclusion single;
++            single.insert( std::make_pair( params[ p1 ], v1 ) );
++            positiveExclusions.insert( single );
++
++            for( size_t p2 = p1 + 1; p2 < params.size(); ++p2 )
++            {
++                for( int v2 = 0; v2 < params[ p2 ]->GetValueCount(); ++v2 )
++                {
++                    if( !params[ p2 ]->IsNegative( v2 ) ) continue;
++
++                    Exclusion pair;
++                    pair.insert( std::make_pair( params[ p1 ], v1 ) );
++                    pair.insert( std::make_pair( params[ p2 ], v2 ) );
++                    maskingExclusions.insert( pair );
++                }
++            }
++        }
++    }
++
++    try
++    {
++        generatePhase( positiveExclusions, prepareModel, nullptr );
++
++        if( !positiveExclusions.empty() )
++        {
++            ResultCollection positiveRows = m_rootModel->GetResults();
++            std::map<Model*, ResultCollection> partnerRows;
++            for( auto & state : m_savedModels )
++            {
++                partnerRows[ state.model ] = state.model->GetResults();
++            }
++
++            generatePhase( maskingExclusions, prepareModel, &partnerRows );
++
++            ResultCollection& results = m_rootModel->GetResults();
++            for( auto & row : results )
++            {
++                if( rowHasNegativeValue( row ) )
++                {
++                    positiveRows.push_back( row );
++                }
++            }
++            results = positiveRows;
++        }
++    }
++    catch( ... )
++    {
++        restoreState();
++        throw;
++    }
++
++    m_resultParameters = m_rootModel->GetParameters();
++    restoreState();
++}
++
+ //
+ //
+ //
+diff --git a/cli/gcd.cpp b/cli/gcd.cpp
+index 4a1ae71..475b880 100644
+--- a/cli/gcd.cpp
++++ b/cli/gcd.cpp
+@@ -9,7 +9,7 @@ namespace pictcli_gcd
+ //
+ //
+ //
+-ErrorCode GcdRunner::generateResults( IN CModelData& modelData, IN bool justNegative )
++ErrorCode GcdRunner::generateResults( IN CModelData& modelData )
+ {
+     // translate all data to gcd-readable format, build exclusions etc.
+     CGcdData gcdData( modelData );
+@@ -34,42 +34,21 @@ ErrorCode GcdRunner::generateResults( IN CModelData& modelData, IN bool justNega
+     // run the generation from bottom up
+     Model* model = gcdData.GetRootModel();
+     model->SetRandomSeed( modelData.RandSeed );
+-    model->GetTask()->SeedRandom( static_cast<unsigned int>( modelData.RandSeed ) );
+     try
+     {
+-        for( auto & submodel : model->GetSubmodels() )
++        model->GetTask()->Generate( [&]( Model* current )
+         {
+             // each submodel may assign different order to parameters
+-            if( !gcdData.FixParamOrder( submodel ))
+-            {
+-                return( ErrorCode::ErrorCode_BadModel );
+-            }
++            gcdData.FixParamOrder( current );
+ 
+             if( modelData.Verbose )
+             {
+                 modelData.PrintModelContents( L"*** AFTER ORDER IS FIXED ***" );
+             }
++        } );
+ 
+-            submodel->Generate();
+-        
+-            modelData.AddToTotalCombinationsCount( submodel->GetTotalCombinationsCount() );
+-            modelData.AddToRemainingCombinationsCount( submodel->GetRemainingCombinationsCount() );
+-        }
+-
+-        if( !gcdData.FixParamOrder( model ))
+-        {
+-            return( ErrorCode::ErrorCode_BadModel );
+-        }
+-
+-        if( modelData.Verbose )
+-        {
+-            modelData.PrintModelContents( L"*** AFTER ORDER IS FIXED ***" );
+-        }
+-
+-        model->Generate();
+-
+-        modelData.AddToTotalCombinationsCount( model->GetTotalCombinationsCount() );
+-        modelData.AddToRemainingCombinationsCount( model->GetRemainingCombinationsCount() );
++        modelData.AddToTotalCombinationsCount( model->GetTask()->GetTotalCombinationsCount() );
++        modelData.AddToRemainingCombinationsCount( model->GetTask()->GetRemainingCombinationsCount() );
+ 
+         if( modelData.Verbose )
+         {
+@@ -100,7 +79,7 @@ ErrorCode GcdRunner::generateResults( IN CModelData& modelData, IN bool justNega
+         return( ErrorCode::ErrorCode_GenerationError );
+     }
+ 
+-    translateResults( modelData, model->GetResults(), justNegative );
++    translateResults( modelData, model->GetResults() );
+ 
+     return( ErrorCode::ErrorCode_Success );
+ }
+@@ -109,8 +88,7 @@ ErrorCode GcdRunner::generateResults( IN CModelData& modelData, IN bool justNega
+ //
+ //
+ void GcdRunner::translateResults( IN CModelData&       modelData,
+-                                  IN ResultCollection& resultCollection,
+-                                  IN bool              justNegative )
++                                  IN ResultCollection& resultCollection )
+ {
+     for( auto & row : resultCollection )
+     {
+@@ -141,11 +119,8 @@ void GcdRunner::translateResults( IN CModelData&       modelData,
+             decoratedRowText.push_back( decoratedName );
+         }
+ 
+-        if( !justNegative || ( justNegative && isNegativeTestCase ))
+-        {
+-            CRow testCase( rowText, decoratedRowText, isNegativeTestCase );
+-            _result.TestCases.push_back( testCase );
+-        }
++        CRow testCase( rowText, decoratedRowText, isNegativeTestCase );
++        _result.TestCases.push_back( testCase );
+     }
+ }
+ 
+@@ -154,34 +129,7 @@ void GcdRunner::translateResults( IN CModelData&       modelData,
+ //
+ ErrorCode GcdRunner::Generate()
+ {
+-    // we have to run production twice: once for positive and once negative values
+-
+-    // make a copy
+-    CModelData modelData2 = _modelData;
+-
+-    // the "positive" run; remove all negative values 
+-    if( _modelData.HasNegativeValues() )
+-    {
+-        _modelData.RemoveNegativeValues();
+-    }
+-
+-    ErrorCode err = generateResults( _modelData, false );
+-    if( FAILED( err )) return( err );
+-
+-    // the "negative" run; only if any negative values exist
+-    if( modelData2.HasNegativeValues() )
+-    {
+-        // if negative values exist then positive run may have already warned about 
+-        // non-existing problems with the constraints, discard the set of warnings
+-        // as a new one will be produced and we don't want any dupliactes
+-        _result.SolverWarnings.clear();
+-        _result.SingleItemExclusions.clear();
+-
+-        err = generateResults( modelData2, true );
+-        if( FAILED( err )) return( err );
+-    }
+-
+-    return( ErrorCode::ErrorCode_Success );
++    return( generateResults( _modelData ) );
+ }
+ 
+ }
+diff --git a/cli/gcd.h b/cli/gcd.h
+index 37f6d46..762c0e6 100644
+--- a/cli/gcd.h
++++ b/cli/gcd.h
+@@ -18,12 +18,10 @@ private:
+     CModelData& _modelData;
+     CResult     _result;
+ 
+-    ErrorCode generateResults( IN CModelData& modelData,
+-                               IN bool justNegative );
+-    
++    ErrorCode generateResults( IN CModelData& modelData );
++
+     void translateResults( IN CModelData& modelData,
+-                           IN ResultCollection& resultCollection,
+-                           IN bool justNegative );
++                           IN ResultCollection& resultCollection );
+ };
+ 
+ }
+\ No newline at end of file
+diff --git a/cli/gcdmodel.cpp b/cli/gcdmodel.cpp
+index fac291b..7d5f846 100644
+--- a/cli/gcdmodel.cpp
++++ b/cli/gcdmodel.cpp
+@@ -29,10 +29,19 @@ bool CGcdData::CheckEntireParameterExcluded()
+         }
+     }
+ 
+-    // if any of the params in the map contains all elements then the entire parameter is excluded
++    // if any of the params in the map contains all elements then the entire parameter is excluded;
++    // negative values never make up for excluded positive ones
+     for( auto & parameter : paramMap )
+     {
+-        if( ( parameter.first )->GetValueCount() == static_cast<int> ( parameter.second.size() ))
++        int remaining = 0;
++        for( int value = 0; value < ( parameter.first )->GetValueCount(); ++value )
++        {
++            if( parameter.second.find( value ) == parameter.second.end() && !( parameter.first )->IsNegative( value ) )
++            {
++                ++remaining;
++            }
++        }
++        if( 0 == remaining )
+         {
+             auto found = _modelData.FindParameterByGcdPointer( parameter.first );
+             assert( found != _modelData.Parameters.end() );
+@@ -169,9 +178,13 @@ ErrorCode CGcdData::TranslateToGCD()
+         // find out and assign weights to values
+         // we don't have to care for the clean-up of the structure, Parameter's destructor will clean it
+         vector< int > weightVector;
+-        for( auto & value : param.Values )
++        for( size_t vidx = 0; vidx < param.Values.size(); ++vidx )
+         {
+-            weightVector.push_back( value.GetWeight() );
++            weightVector.push_back( param.Values[ vidx ].GetWeight() );
++            if( !param.Values[ vidx ].IsPositive() )
++            {
++                gcdParam->SetNegative( static_cast<int>( vidx ) );
++            }
+         }
+         gcdParam->SetWeights( weightVector );
+ 
+@@ -270,9 +283,6 @@ ErrorCode CGcdData::TranslateToGCD()
+         return( ErrorCode::ErrorCode_BadModel );
+     }
+     
+-    // add exclusions for negative values
+-    addExclusionsForNegativeRun();
+-
+     // add user-specified exclusions now
+     
+     // parse the constraints and make exclusions out of them
+@@ -535,42 +545,4 @@ bool CGcdData::fixModelAndSubmodelOrder()
+     return( true );
+ }
+ 
+-//
+-// negative runs are accomplished by adding synthetic exclusions such that
+-// no two negative values can co-exist in one test case
+-//
+-void CGcdData::addExclusionsForNegativeRun()
+-{
+-    for( size_t param1Idx = 0; param1Idx < _modelData.Parameters.size(); ++param1Idx )
+-    {
+-        CModelParameter& param1 = _modelData.Parameters[ param1Idx ];
+-
+-        for( size_t val1Idx = 0; val1Idx < param1.Values.size(); ++val1Idx )
+-        {
+-            CModelValue& val1 = param1.Values[ val1Idx ];
+-
+-            if( !val1.IsPositive() )
+-            {
+-                for( size_t param2Idx = param1Idx + 1; param2Idx < _modelData.Parameters.size(); ++param2Idx )
+-                {
+-                    CModelParameter& param2 = _modelData.Parameters[ param2Idx ];
+-
+-                    for( size_t val2Idx = 0; val2Idx < param2.Values.size(); ++val2Idx )
+-                    {
+-                        CModelValue& val2 = param2.Values[ val2Idx ];
+-
+-                        if( !val2.IsPositive() )
+-                        {
+-                            Exclusion excl;
+-                            excl.insert( make_pair( Parameters[ param1Idx ], (int) val1Idx ) );
+-                            excl.insert( make_pair( Parameters[ param2Idx ], (int) val2Idx ) );
+-                            Exclusions.insert( excl );
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-    }
+-}
+-
+ }
+diff --git a/cli/gcdmodel.h b/cli/gcdmodel.h
+index 31657b9..1ca8c0f 100644
+--- a/cli/gcdmodel.h
++++ b/cli/gcdmodel.h
+@@ -94,7 +94,6 @@ private:
+     wstrings    _constraintWarnings;
+ 
+     bool fixModelAndSubmodelOrder();
+-    void addExclusionsForNegativeRun();
+ };
+ 
+ }
+\ No newline at end of file
+diff --git a/cli/model.cpp b/cli/model.cpp
+index c592796..7ae1134 100644
+--- a/cli/model.cpp
++++ b/cli/model.cpp
+@@ -138,29 +138,6 @@ wstring CModelData::GetConstraintText( unsigned int index )
+     return( constraints[ index ] + TEXT_TokenConstraintEnd );
+ }
+ 
+-//
+-//
+-//
+-void CModelData::RemoveNegativeValues()
+-{
+-    for( auto & param : Parameters )
+-    {
+-        vector< CModelValue > newValues;
+-        for( auto & value : param.Values )
+-        {
+-            bool positive = value.IsPositive();
+-            if( positive )
+-            {
+-                CModelValue newValue( static_cast<wstrings&> ( value.GetAllNames() ),
+-                                      value.GetWeight(), positive );
+-                newValues.push_back( newValue );
+-            }
+-        }
+-        param.Values = newValues;
+-    }
+-    m_hasNegativeValues = false;
+-}
+-
+ //
+ //
+ //
+diff --git a/cli/model.h b/cli/model.h
+index 551cd73..4c25d42 100644
+--- a/cli/model.h
++++ b/cli/model.h
+@@ -134,7 +134,6 @@ public:
+         MaxApproxTries(1000),
+         RowSeedsFile(L""),
+         ConstraintPredicates(L""),
+-        m_hasNegativeValues(false),
+         m_encoding(EncodingType::ANSI),
+         m_totalCombinations(0),
+         m_remainingCombinations(0) {}
+@@ -149,13 +148,10 @@ public:
+     std::vector< CModelParameter >::iterator FindParameterByGcdPointer( Parameter* Pointer );
+ 
+     std::wstring GetConstraintText( unsigned int index );
+-    bool HasNegativeValues()   { return( m_hasNegativeValues ); }
+     EncodingType GetEncoding() { return( m_encoding ); }
+     void AddToTotalCombinationsCount    ( size_t n ) { m_totalCombinations += n; }
+     void AddToRemainingCombinationsCount( size_t n ) { m_remainingCombinations += n; }
+ 
+-    void RemoveNegativeValues();
+-
+     bool ValidateParams();
+     bool ValidateRowSeeds();
+ 
+@@ -163,7 +159,6 @@ public:
+     void PrintStatistics();
+     
+ private:
+-    bool            m_hasNegativeValues;
+     EncodingType    m_encoding;              // io encoding determined based on input file
+     size_t          m_totalCombinations;     // number of combinations PICT dealt with in this run
+     size_t          m_remainingCombinations; // number of uncovered combinations (Preview and Approximate)
+diff --git a/cli/mparser.cpp b/cli/mparser.cpp
+index 71c9e65..13061bb 100644
+--- a/cli/mparser.cpp
++++ b/cli/mparser.cpp
+@@ -231,10 +231,6 @@ bool CModelData::readParameter( wstring& line )
+                 }
+             }
+ 
+-            if ( ! positive ) 
+-            {
+-                m_hasNegativeValues = true;
+-            }
+             CModelValue value( names, weight, positive );
+             parameter.Values.push_back( value );
+         }

@@ -1498,3 +1498,94 @@ no per-test difficulty could be measured (L63).
   separately tested helper.** 7/20 kills, zero description words.
 - **Do not count on stated per-kind rules.** Force OR vs global AND vs rule-override precedence read as a
   strong F-3/F-10 design and killed 1 of 20.
+
+## csbindgen-struct-layout-fidelity (APPROVED Olympus 2026-09-21)
+
+- **Composition beats breadth.** 70 F2P cells over ~30 stated rules; 63 killed nobody. The batch was
+  decided by three families: rule x rule composition (F-44, 7/10), scalar-to-aggregate path reuse
+  (F-45, 3/10) and source-model reuse on the target side (F-46, 2/10).
+- **The difficult cell can be the one fairness forces you to keep.** F-44 was dropped for solvability,
+  restored because its fixtures were FP traps, and became the lead trap.
+- **A full host-language semantic in the contract is not difficulty, it is an unbounded review surface
+  (L80).** It produced 11 FAIL rounds and zero measured passes; the accepted problem does not have it.
+
+## libspatialindex-tpr-temporal-knn (APPROVED Olympus 2026-09-21)
+
+- **A derivable core has no fair wall of its own.** Three fully stated geometry kernels read 7/10; 57
+  probes, 16 reviewer-suggested tests and 4 composition cells killed zero passers. Coverage suggestions
+  are free difficulty only while the passing population still diverges.
+- **Discarded state is where prose cannot reach (F-47).** Entry expiry forced changes to the node page,
+  node bounds and reload that no geometry reasoning implies. It moved the rate 70% to 42% and carried the
+  lead wall (4/12). The piecewise kernels it also required killed 0/12.
+- **Stack a cheap second wall on the same runs.** F-48 (legacy `Point` acceptance, 3/12) landed on runs
+  that also failed F-47, so neither wall alone decided them.
+- **An internal validator in your test is not a wall (L82).** It read as 0/10 and was nine-tenths my
+  own assertion.
+
+## siliconcompiler-flist-roundtrip (APPROVED Olympus 2026-09-23)
+
+**Confirmed anti-agent pattern: flatten a graph on write, require it rebuilt on read.**
+
+A serialized form that lists every node flat, with the parent/child relation carried inside each
+record, defeats the natural reading loop. Agents walk the records and attach each named node to the
+object the read was called on; every node and every field comes back correct, and the graph is still
+wrong by one extra root edge per transitive child. Measured 7/10, and the sole failure of five runs at
+56/57.
+
+Two design requirements make it measurable, and neither is the edge rule itself:
+
+1. **Three levels minimum.** On a root with siblings, re-parenting is indistinguishable from correct.
+   The discriminating assertion is the MIDDLE node's own edge list.
+2. **A separate rule for leftovers** ("a record nothing references attaches to the named fileset"), so
+   that blanket attachment to the root is visibly not the rule.
+
+State ownership once, plainly, and never name the repo's `add_dep`-equivalent. Do not clarify further:
+measured by replay, spelling the ownership rule out took the batch to 9/11.
+
+## pyfakefs-block-inode-accounting (APPROVED Olympus 2026-09-23)
+
+**Confirmed anti-agent pattern: make the resource capable of "unlimited" and make it report a number.**
+
+A stats call (`statvfs`) has to return finite `f_files` / `f_blocks` even when the mount is unlimited.
+Agents compute that reporting figure once and reuse it as the allocation ceiling, or tie it to the
+other axis ("no more inodes than blocks"). Every stated rule is met and a write just past the reported
+figure is refused. Measured 2/10 as the sole failure of two near-misses (F-50).
+
+It pairs with a second free one on any accounting pick: **account what is stored, where the repo's
+getter reports something else on one platform.** pyfakefs reports `st_size == 0` for Windows symlinks,
+and the repo's own test pins it; agents sized by `stat` (F-51, 3/11, 5/12, 1/10).
+
+Design requirements: one test just past the reported figure on each axis (bytes, inodes,
+reconfiguration back to unlimited), and one test on the non-default OS type asserting the stored
+quantity in accounting and in every report.
+
+## pyocd-sequence-expression-kernel (APPROVED Olympus 2026-09-24)
+
+Confirmed on an expression engine with several consumers of one operator table:
+
+- **F-52 — two stacked boundaries with different rules.** Put a full-domain rule at a delegate seam
+  and a narrowing rule at the operation below it, in adjacent sentences, and observe the seam with a
+  recording delegate. 2/10, both near-misses failing nothing else. It works only once the seam rule is
+  concrete; stated abstractly, the same tests killed 7/11 by under-reducing.
+- **F-31 without a second language.** A constant folder and an interpreter are twins. Agents fix the
+  one the feature points at and keep the other's old rewrites (2/10), helped when the repo's own tests
+  pin the old rewrites (F-12).
+- **What did NOT add difficulty:** a static value-kind checker (strings, void calls, variadic
+  arguments, conditional branches, string-returning calls), two literal-vs-variable matrices, AP/DP
+  register widths and byte-response decoding all killed 0/10. Eleven review rounds of coverage bought
+  none of the band.
+
+## teavm-method-summaries (APPROVED Olympus 2026-09-24)
+
+Confirmed on a compiler analysis consumed by several optimizer passes:
+
+- **F-53 — the direction of a fixed point.** An all-paths fact (never returns null) over a recursive
+  call graph must start optimistic. 4/10 started pessimistic, three as their only failure, with the
+  requirement stated outright. Stating it did not defuse it (L94).
+- **F-54 — a frozen legacy path next to a new handler.** When the new mode handles a case the base pass
+  ignores, agents make the old path handle it too. One off-path test, 2/10.
+- **F-55 — a wildcard key through a deferred path.** A pass that stores per-variable keys for a join
+  replays them through the per-variable API; an "all instances" sentinel crashes there. Test the
+  straight line and the join separately, 2/10.
+- **What did NOT add difficulty:** dispatch resolution, unknown bodies, invokedynamic, array returns,
+  `<clinit>` propagation and the end-to-end TeaVM wiring all killed 0/10. 21 of 26 tests killed nobody.

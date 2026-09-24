@@ -1123,3 +1123,189 @@ all 10 runs shared. Re-eval with its test would have read 0/10, so one meta clau
 root cause takes it to 0/N), L78 (removed repo specs draw one cheat verdict per batch), Pattern 99 (seeded
 equivalence corpus), the chokepoint LOC rule in olympus-hunt Stage 3b.
 
+## csbindgen-struct-layout-fidelity (Rust / csbindgen C# struct emission) — ACCEPTED 2026-09-21, 1/10
+
+**What made it hard.** Make every struct and union csbindgen writes to C# have the size and field offsets
+of its Rust type. The builder read `#[repr]` only to decide export; `packed`, `packed(N)` and `align(N)`
+were ignored and arrays of structs, pointers or enums became byte placeholders. The feature is a Rust
+`repr(C)` layout engine for a 64-bit target (aliases, enum reprs, niche Options, zero-size fields,
+bindgen bitfields, unions, the Rust-vs-.NET `Int128` alignment gap) plus an emitter that picks the plainest
+C# layout .NET will match: Sequential, Sequential+Pack, or Explicit with Size and a FieldOffset on every
+field. 6 files, 402 human-effective LOC, 70 new tests whose expected offsets come from Rust's own
+`size_of`/`offset_of!`.
+
+**What broke it.** Seven of ten runs composed alias resolution and pointer-to-array lowering in the wrong
+order: `fixed byte* p`, a pointer level lost or doubled (F-44). Three kept the scalar `MarshalAs` on
+`fixed bool` buffers (F-45). Two computed nested C# alignment from Rust data and over-promoted containers
+to Explicit (F-46). One matched `NonZero*` by name. 63 of 70 new tests killed nobody.
+
+**The fixes, and what each cost.** Batch 1 (0/11) died on an unstated `*const Option<fn>` spelling. Batch 2
+(0/11) died on an aligned enum that panicked the base parser and an unstated declaration-pruning rule;
+the FP panel then voided all three re-graded passes because scoping fixtures were generated but never
+asserted. Eleven Solution Quality rounds chased Rust module-scoping corners until the scoping sentence and
+const-name array lengths were cut from the contract; the next Auto Review approved 3/3/3. Batch 3 (0/16)
+showed two single-cell clusters: `c_float`/`c_double` missing from an enumerated list (7/16) and the
+niche-Option array rule split across two sentences (8/16). Naming both in meta.md took them to 1/10 and
+0/10, and batch 4 was accepted at 1/10.
+
+**Carried forward**: F-44, F-45, F-46 (new), L79 (assert every generated fixture or delete it), L80 (a
+contract promising a host-language semantic in full ratchets review), L81 (an enumerated list reads as
+exhaustive), L77 and L76 confirmed, Pattern 100 (dual-runtime ABI oracle), the fixture-assertion,
+enumeration and host-semantics audits in olympus-author § 14.
+
+
+## libspatialindex-tpr-temporal-knn (C++ / libspatialindex TPR-tree temporal queries) — ACCEPTED 2026-09-21, 5/12
+
+**What made it hard.** Implement the TPR-tree's two stubs (`nearestNeighborQuery` in both overloads,
+`selfJoinQuery`) and make its three range queries answer over a closed time interval, for four shape kinds
+and single instants. The kernels are minimum box distance over an interval, same-instant overlap of three
+moving boxes and every-instant containment, each piecewise-affine. Stored entries stop moving at the end
+of their insertion interval, and the base tree dropped that end time twice: `insertData` overwrote it with
+infinity and the node page never stored it. 8 files, 350 human-effective LOC, 73 new tests against
+exhaustive oracles on deep random trees.
+
+**What broke it.** Four of twelve runs lost the entry lifetime somewhere between the leaf and the disk:
+node-bound pruning on deep trees, end times lost on insert, or an unversioned page that an evaluator failed
+despite 73/73 (F-47). Three kept `pointLocationQuery` answering a plain `Point` the contract now rejects
+(F-48), all on runs that also failed F-47. The geometry itself decided nothing: 35 of 73 tests killed
+nobody, including both tests written to split the kernels at a stop instant.
+
+**The fixes, and what each cost.** Batch 1 (7/10) was pure geometry and too easy; 16 extra tests (every
+reviewer suggestion) replayed 7/10 -> 7/10 and a 57-cell probe found no difference between passers and
+the reference. One sentence about entry lifetime reached the page format and node bounds. Batch 2 read
+0/10, but nine of ten blockers were my own `isIndexValid()` assertion; without it the same solutions
+replayed 5/10. Six review rounds then fixed nine reference bugs (negative `max_dist`, instant moving shapes,
+k = 0, same-time stopped-entry pruning, page versioning twice, reversed intervals on insert and delete,
+mutations accepting any timed shape) without moving the band. Batch 3 read 5/12 with one pass voided by
+the FP panel; its re-eval was FP-clean and accepted.
+
+**Carried forward**: F-47, F-48 (new), L82 (never assert the repo's self-check once the feature changes
+what it checks), L83 (probe convergence means look for discarded state), L84 (a widened record gets
+probed for old-format loading; version per record), Pattern 101 (convergence triage), the self-check and
+persisted-layout audits in olympus-author.
+
+## siliconcompiler-flist-roundtrip (Python / EDA build-system schema) — ACCEPTED 2/10
+
+**What made it hard.** `write_fileset` flattens a design's dependency graph into one Verilog file list
+and `read_fileset` rebuilds a single design with no dependencies at all. The task is to make that pair
+lossless: mark the boundaries the walk destroys, carry the whole fileset payload, follow `-f`/`-F`
+sub-lists with their different path bases, and rebuild the graph. One test carried the band. Reading a
+FLAT record list whose edges live inside the records, **7 of 10 runs re-parented the graph onto the
+object the read was called on** — every parsed name became a direct dependency of the root, on top of
+the correct nested edge. Five shipped that as their only defect at 56/57. A three-level fixture is what
+makes it visible; on a root with siblings the wrong implementation is indistinguishable from correct.
+
+**The fixes, and what each cost.** Eight static gate rounds (Description 3/3, Solution 3/3) preceded
+the first batch, which read **0/11** — the ratchet failure this workspace had already seen once. Mining
+it showed three of the four causes were mine: a test HELPER calling `Design.get_filetypes()`, an
+accessor only the reference defined, raised `AttributeError` in 5-7 tests in every run and masked tests
+the agents had right; one sentence wrote `-G` in the same grammatical frame as the space-separated
+flags, so all 11 emitted `-G NAME=v` (4 tests, 9-11/11, identical diff); and a `file://` data-root case
+a Solution Quality round had added killed 11/11. Replaying all 11 saved patches against each candidate
+repair priced them: unfair-only 0/11, plus cutting the `file://` wall 3/11, plus clarifying the
+ownership sentence **9/11** — so that last sentence was deliberately left exactly as written. Batch 2
+measured 2/10. Seven reference bugs were found by review before any batch; exactly one (a marker-only
+group must still materialise its fileset) became a measured killer, at 2/10.
+
+**Carried forward**: F-49 (new), L85 (a 0% batch is a claim about the artifact — mine it first), L86
+(price every candidate cut by replay), L87 (explicitness is a measurable dial, 6/11 -> 0/10 on one
+sentence), L88 (a surviving mutation is a test-gap signal and produced this band's decider),
+Pattern 102 (repair a 0% batch by replay), the graph-depth audit in olympus-author and the F-49 seam
+probe in olympus-hunt.
+
+## pyfakefs-block-inode-accounting (Python / fake filesystem accounting) — ACCEPTED 2026-09-23, 5/10
+
+**What made it hard.** pyfakefs mounts track bytes only. The task adds whole-block and inode
+accounting with a reserve, a `statvfs` on `FakeFilesystem` and `FakeOsModule`, `mount_usages()`, a
+`du`-style `tree_usage()`, and limits that survive `reset`. The stated per-operation rules were
+transcribed; the band came from three things the contract implies but never spells out. **Imports
+inherit the new rollback (F-20, 3/10):** `add_real_directory` already builds parents through
+`create_dir`, so making `create_dir` all-or-nothing rolled back parents the contract keeps, with no
+agent refactor. **"Unlimited" reported as a figure and then enforced (F-50, 2/10).** **A Windows
+symlink sized by `stat`, which reports 0 (F-51, 1/10).** 108 of 117 tests killed nothing.
+
+**The fixes, and what each cost.** Eight clean gate rounds preceded batch 1, and it read **0/11**:
+each Solution Quality round had asked for one more rollback path, and six tests killed 11 of 11. Nine
+tests were cut, but the sentence promising them stayed and the next review scored the gap; cut tests,
+contract and reference together. Batch 2 read **0/12** because the new carve-out named only the stepwise
+helpers, and five unchanged rollback tests went from 0/11 to 9-10/12 kills. Two appended Vega runs
+gave 1/14, and the FP panel voided that pass: nothing tested setting a bounded mount back to
+unlimited. A probe of all 14 saved patches showed 12/14 already did it right, so the test went in.
+Naming both sides of the carve-out, and naming the type a distant pronoun meant (10/11 kills), gave
+batch 3 **5/10**. That is above the 40% ceiling, and the human reviewer accepted it. There were 27
+reference bugs over 18 rounds, none found by a batch. One remained at acceptance: `create_file` rolls
+back only on `OSError`.
+
+**Carried forward**: F-50 and F-51 (new), F-20 repo-helper evidence, L89 (name both sides of a
+carve-out), L90 (gate-found reference bugs are the near-miss killers), L91 (Solution Quality ratchets
+into unsolvable), Pattern 103 (boundary table), candidate C-6, the F-50/F-51 seam probes in
+olympus-hunt and the three audits in olympus-author.
+
+## pyocd-sequence-expression-kernel (Python / pyOCD debug-sequence expression engine) — ACCEPTED 2026-09-24, 5/10
+
+**What made it hard.** pyOCD evaluates CMSIS debug-sequence expressions with a parse-time constant
+folder and an interpreter that share one operator table but disagree: the folder deletes operands
+that call functions, nothing short-circuits, and values are unbounded Python ints. The task gives
+them one model (unsigned 64-bit values, left-to-right order, effects preserved, stated transfer
+widths) across the folder, interpreter, semantic checker, control predicates and the sequence-function
+delegate. The per-operator rules were transcribed. The band came from where two places each hold part
+of one rule: **the delegate seam and the operation below it (F-52, 2/10)** - agents narrowed
+`Write32`'s value before calling the delegate, 146/150 with nothing else failing - and **the folder
+and the interpreter (F-31, 2/10)**, where agents fixed the interpreter and kept the folder's old
+`x || 0 -> x` and `0 - x -> x`. A third cause was an accident: tests passed `tms=3` to JTAG, a value
+the probe documents as 0 or 1, and 3/10 masked it (L92). 141 of 150 tests killed nothing.
+
+**The fixes, and what each cost.** The 107-LOC slice failed Solution Quality on a deleted
+"dead code" normalisation and compound-assignment order, and each later round found one more site
+the value rule seemed to promise (control predicates, variadic arguments, declarations, JTAG byte
+responses, `DAP_WriteABORT`, string-returning delegates). Batch 1 read **0/11**: one rule a review had
+added, "a predicate must produce a value", killed 8/11 and was both near-misses' only failure.
+Replaying the 11 saved patches picked that cut (2/11) over a broader one that fell under the LOC floor.
+After that, every requested test was replayed before shipping; three replayed at 0/11 and were
+withheld or cut, and the undocumented one (bytes) was instead stated in meta.md with an example,
+after which it killed 0/10. A general transfer principle kept drawing new sites until it became a
+closed list, and three rounds went to a `-> str` delegate the repo does not have. Two boundary clauses
+rewritten as concrete consequences took their tests from 6-7/11 to 0/10. Batch 2 read **5/10**,
+above the 40% ceiling, and the human reviewer accepted it. Eleven reference bugs, all found by gates.
+One Low remained: a bounded while-loop test keeps a 5 s timeout.
+
+**Carried forward**: F-52 (new), F-20 argument-level and F-31 folder/interpreter evidence, L92
+(non-governed arguments get in-contract values; read the assertion diff), L93 (reviewer-invented
+inputs), evidence on L35/L85/L86/L87/L91 and counter-evidence on L90, Pattern 104 (replay gate for
+review-requested tests), the F-52 seam probe in olympus-hunt, two audits in olympus-author and three
+diagnosis rows in olympus-harden.
+
+
+## teavm-method-summaries (Java / TeaVM compiler: whole-program method summaries) — ACCEPTED 2026-09-24, 4/10
+
+**What made it hard.** TeaVM optimizes each method on its own: a call result is never known to be
+non-null, and `RepeatedFieldReadElimination` forgets every cached read at any call. The task adds
+`MethodSummaries`, a whole-program analysis of never-null returns and written-field sets
+(SPECIAL/VIRTUAL dispatch, unknown bodies, `<clinit>` effects, invokedynamic), feeds it to four
+existing passes, and wires it into both TeaVM pipelines. The scope was obvious: all ten runs touched
+the reference's exact nine files. The band came from **the direction of the fixed point (F-53,
+4/10)**: agents started never-null at false and promoted, so a jointly never-null recursive cycle
+never bootstrapped. Three runs at 25/26 failed only that, although meta.md said "recursion and
+mutual recursion lose nothing" outright. Two smaller cells: **the no-summaries path "fixed" at
+`initClass` (F-54, 2/10)**, where base keeps cached reads and agents made the old path forget them
+too, and **an "all instances" sentinel sent through the per-instance alias call (F-55, 2/10)**. 21
+of 26 tests killed nothing.
+
+**The fixes, and what each cost.** Four platform gate rounds, no batch until acceptance. (1) The
+Dockerfile check failed a BuildKit bind mount; `COPY --chown` plus chmod of directories and root-owned
+outputs only kept the cold build at 431 s. (2) Verify Solution failed a synthetic
+`compile_test_sources` id outside f2p/p2p (the fallback now writes one failing case per `@Test`), and
+Solution Quality found a VIRTUAL call to an absent class reading as never-null and write-free.
+(3) Solution Quality found `SIMPLE`, TeaVM's default level, never built summaries: its lazy pipeline
+was unwired. A real `TeaVM.build` with a stub target, looped over every optimization level, now pins
+it. (4) Auto Review gave Tests 1/3 for "once per build" (unobservable, dropped from meta.md) and
+untested invokedynamic and array returns (stated and tested). The 11 gate-requested tests killed
+0/10. Accepted at 40% with Auto Review Approved 3/2/2. Three Mediums remain open: direct
+invokedynamic does not invalidate RFRE caches (pre-existing, demoted), no unanchored recursive-cycle
+test, stale XML after an early runner failure.
+
+**Carried forward**: F-53, F-54, F-55 (new), L94 (a stated direction still traps), L95 (gate-found
+tests land where agents converge), L96 (no unobservable frequency in the contract), evidence on L17,
+L62 (bind mount now a Dockerfile-check FAIL) and counter-evidence on L90, Pattern 105 (stub-backend
+driver test), the F-53/54/55 seam probe in olympus-hunt, a lever and two checklist audits in
+olympus-author, two diagnosis rows in olympus-harden.

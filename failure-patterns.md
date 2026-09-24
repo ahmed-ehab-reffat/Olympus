@@ -510,6 +510,15 @@ applied the deferral to `Select`. Arithmetically decisive: the two 100/102 near-
 ceiling**; with it, **2/10 = 20%**. Evaluators graded these `FAIL_REGRESSION`, not
 `FAIL_MISSED_REQUIREMENT` -- the only two regression verdicts in the batch. ir-sim-scenario-events: **0/11** on "objects added with `add_object` stay" across an event undo; stated in one sentence, nobody over-reset.
 
+Also `pyfakefs-block-inode-accounting`: **3/10 runs** (accepted batch). The feature makes
+`create_dir` all-or-nothing, while the contract keeps `add_real_directory` stepwise; both import
+paths build their target's ancestors THROUGH `create_dir`, so a deep import that runs out of inodes
+takes back ancestors it should keep. Evaluator on Nova_8: *"adds an OSError cleanup loop in
+create_dir that removes all newly created directories, and leaves _create_fake_from_real_dir calling
+create_dir(target_path)"*. The reference had the identical bug until Solution Quality found it (R17),
+and the probe of batch-2 solutions showed 3/14 more. The shared helper was the REPO's, not the
+agent's, which is the variant worth knowing: no refactor is needed for the leak.
+
 Also `datafixerupper-derived-recursion`: base wraps every registered template in
 `DSL.named(name, ...)`, so type identity carries the registered name; rebuilding the assembly path
 dropped that wrapper and two structurally identical recursive types became indistinguishable to
@@ -517,6 +526,14 @@ dropped that wrapper and two structurally identical recursive types became indis
 `a_fix_targeting_one_recursive_type_leaves_its_twin_alone`. No base test covered the wrapper --
 the reference lost it too, and only a reviewer caught it. Generalises F-20 beyond sibling APIs:
 ANY rewrite of an assembly path can drop untested behaviour the path was carrying.
+
+Also `pyocd-sequence-expression-kernel`: **3/10 runs** in the accepted batch plus Vega in batch 1,
+at ARGUMENT level: the width rule for `DAP_JTAG_Sequence`'s sent bits leaked onto the sibling `tms`
+argument, which base forwards to the probe unchanged. **This one was an accident.** The tests passed
+`tms=3`, outside the probe API's documented "Either 0 or 1", and the CMSIS-DAP layer itself does
+`tms & 1`, so the agents' masking was defensible. Evaluators still judged it fair (calls are
+observable; base forwards `tms` untouched). Verbatim, Nova #5: *"masks the TMS argument from 3 to 1
+before calling the probe"*. It was the SOLE failure of one near-miss (147/150). See L92.
 
 **Precondition.** The repo has an existing public API whose behaviour is documented in prose
 (README / guide / doc comment) but NOT covered by its own test suite, and your feature adds a
@@ -931,6 +948,15 @@ set** (`.64n` a64/x64 parity, x64 cc, optcc, optimizer parity) and nothing else;
 lowering and CodeGenC but does not change BE/Base/eval.py or BE/Base/eval.cc, while the failures show
 4294967294 versus -2 and 4294967298 versus 2 in optimized IR."* Both marked described AND inferable.
 Came from an Auto Review High coverage finding (round 25), L17/L22 again.
+
+Also `pyocd-sequence-expression-kernel`: **2/10 runs** in the accepted batch, with no host-language
+difference: the twins are a parse-time constant folder and the interpreter, both consumers of one
+operator table. Agents moved the value semantics into the interpreter and left the folder's old
+identities (`x || 0 -> x`, `0 - x -> x`). The repo's OWN fold table encoded exactly those identities
+(test.patch deletes three rows), so a solver reading the base tests was pointed at the wrong answer
+(F-12). Verbatim, Nova #1: *"_ConstantFolder.binary_expr still returns the left operand for x || 0
+and the right operand for 0 - x"*. Both runs also hit the `tms` accident (F-20), so F-31 decided
+neither alone.
 
 **Precondition.** Twin implementations under a parity contract, differing host integer (or float)
 semantics, and a feature whose operand can be a FOLDED constant that the new consumer emits without
@@ -1367,6 +1393,435 @@ compared against the repo's own evaluator (Pattern 99); hand-written cases put l
 never catch it.
 
 **Arsenal mapping.** HARDENING A3 (reuse-the-machinery missing arm), found by P1-style property tests.
+
+---
+
+### F-44. Two type rewrites composed out of order: alias resolution × pointer lowering ★ lead trap on csbindgen-struct-layout-fidelity (7/10)
+
+**Mechanism.** The feature has two independent rewrites of a type: follow aliases to their target, and
+lower a raw pointer to an array into a pointer to the array's innermost element. Each is easy alone.
+Composed, the order matters: the alias has to be resolved BEFORE the pointer decides whether its
+pointee is an array, and resolution must keep the pointer DEPTH while stripping only the array
+layers. Agents resolve the alias at the outer name and then hand the target to the array renderer
+(`fixed byte* p`), lose or duplicate a pointer level (`ushort***` for `ushort**`), or classify an
+alias-to-pointer as a fixed-buffer element.
+
+**Why it misdirects.** Every direct form passes: `*const [u8; 4]` lowers correctly and a plain alias
+resolves correctly. The failure only appears when a raw pointer's pointee is an alias, or an alias's
+target is a raw pointer to an array, and the output is a wrong C# SPELLING, not a crash, far from the
+function where the two rules meet.
+
+**Evidence.** csbindgen-struct-layout-fidelity: batch 3 **6/16**, batch 4 **7/10** (the most-failed
+axis in the accepted batch; failures spread across `aliases_to_raw_pointers_are_lowered`,
+`pointers_follow_aliases_to_arrays_and_functions`, `pointers_to_arrays_units_and_functions`). Verbatim:
+*"It also emits aliased raw pointers to arrays as invalid fixed-buffer forms such as fixed byte* p
+instead of byte* p."* (batch 4); *"PtrKinds emits ushort*** and int*** where the expected C# types are
+ushort** and int**, and AliasPtrs similarly emits float*** instead of float**."* (batch 3);
+*"to_csharp_string resolves an aliased pointer into use_type and then calls use_type…"* (the run that
+recursed into a stack overflow). Evaluators: mentioned in the description, inferable from code.
+
+**Precondition.** A code generator whose type model already has aliases AND pointer/array wrappers, and
+a feature that adds a second rewrite on top of an existing one (lowering, flattening, niche erasure).
+
+**How to build.** State both rules once each, never their combination ("aliases are followed wherever a
+type appears", "a raw pointer to an array points to the innermost element"). Then test the composition
+cells: pointer-to-alias-of-array, alias-of-pointer-to-array, alias-of-pointer inside an array, and one
+pointer-to-pointer level, each asserting the exact emitted type.
+
+**Arsenal mapping.** HARDENING F-10 cross-product cell (rule × rule), misdirecting because the output is
+a plausible-looking spelling.
+
+---
+
+### F-45. A scalar-only decoration leaks onto the aggregate form — 6 runs across 2 batches on csbindgen-struct-layout-fidelity
+
+**Mechanism.** The existing emitter decorates a scalar field (`[MarshalAs(UnmanagedType.U1)]` before a
+C# `bool`). The new feature adds an aggregate form of the same element (a `fixed bool` buffer). Agents
+route the new form through the scalar emission path and keep the decoration. On a fixed buffer the
+attribute compiles but makes the struct unmarshalable (`Marshal.SizeOf` throws).
+
+**Why it misdirects.** The field type, length and position are all correct; only one prefix differs, and
+the repo's own legacy array path (which never decorated) is the only precedent.
+
+**Evidence.** csbindgen-struct-layout-fidelity: batch 3 **3/16**, batch 4 **3/10**. Verbatim: *"rs:155-162
+applies the bool MarshalAs attribute before formatting a PlannedFieldKind::FixedArray."*; *"fixed bool
+buffers gain an unwanted MarshalAs attribute"*. The Auto Review classed it "shared blind spot" and kept
+it: the repo's pre-existing fixed-array path shows the convention.
+
+**Precondition.** An emitter with per-kind decoration (attributes, annotations, casts) and a feature that
+adds an aggregate or wrapped variant of a decorated kind.
+
+**How to build.** Include the decorated element type in the aggregate fixture matrix (here `[bool; 3]`
+alongside the numeric primitives) and assert the exact line. Verify on the real runtime that the
+decorated form is actually wrong before relying on it (here: .NET 8 `Marshal.SizeOf` throws).
+
+**Arsenal mapping.** HARDENING A3 (reuse-the-machinery wrong arm).
+
+---
+
+### F-46. The comparison's second side computed with the first side's model — 7 runs across 2 batches on csbindgen-struct-layout-fidelity
+
+**Mechanism.** The feature decides by comparing two layouts: the source language's (Rust) and the one the
+target runtime will actually produce (.NET). Agents compute the target side from source-side data: a
+nested struct's C# alignment taken from its Rust alignment, an explicit union's C# size taken as its raw
+field extent instead of the emitted `Size`, or C# offsets filled in from Rust offsets. The comparison
+then says "differs" where the runtime would agree (over-promotion to Explicit) or "matches" where it
+would not.
+
+**Why it misdirects.** The container's own fields are right; the wrong input is the NESTED type's
+target-side layout, computed one level down and reused.
+
+**Evidence.** csbindgen-struct-layout-fidelity: batch 3 **5/16**, batch 4 **2/10**, all on the P2P guard
+`container_of_sized_union_at_its_rust_offset_keeps_sequential` plus its A16 sibling. Verbatim: *"it
+compares C# layout offsets against offsets it populated from the Rust layout"*; *"A union whose emitted
+C# declaration receives Size = S is reported to parent layout calculation with the raw field size
+instead, causing WideThenUnion to become explicit unexpectedly."*
+
+**Precondition.** A feature whose output choice depends on comparing two models of the same data (source
+ABI vs target ABI, schema vs wire format, logical vs physical plan).
+
+**How to build.** Write the target-side rule for NESTED values explicitly in meta ("use the layout .NET
+gives the emitted C# type"), then add P2P guards where a nested type became Explicit but its container
+must stay Sequential. The guards cost nothing to pass for a correct solution and kill the reuse.
+
+**Arsenal mapping.** HARDENING over-promotion guard (P2P cross-product), L-series "guards are free".
+
+---
+
+### F-47. New per-entry state the repo's persistence and aggregate bounds were never built to carry ★ lead wall on libspatialindex-tpr-temporal-knn (4/12), found by probe convergence
+
+**Mechanism.** The feature gives each stored entry a property the old model did not have (here: a moment
+after which the entry stops moving). The repo already has fields for it on the value type, but the
+STORAGE and AGGREGATION layers throw it away: `Node::storeToByteArray` never wrote an entry's end time,
+`loadFromByteArray` hard-coded it to infinity (the author's commented-out read/write lines were still in
+the file), `insertData` overwrote it with infinity, and the node-bound maintenance combined children with
+unclamped extrapolation. Every one of those was correct while nothing could stop. A correct solution must
+carry the new state through all of them: keep it on insert, persist it per record, clamp position AND
+rate in every predicate, and keep an aggregate bound sound when a child stops under a still-moving parent.
+
+**Why it misdirects.** The local geometry is easy and gets written first, and point evaluation looks right
+everywhere. The losses surface far from their cause: a silently missing id on a DEEP tree (node bounds),
+an entry that keeps moving after a reload (page format), a crash when an older index is opened (no layout
+marker). Nothing in the failing assertion names the serialisation or the bound.
+
+**Evidence.** libspatialindex-tpr-temporal-knn, accepted 12-run pool (10 Nova + 2 Orion): **4/12 runs** on
+this axis - three on integration (*"incorrect stopped-entry pruning"*; *"is not robust for deep trees
+containing stopped entries"*; *"incorrect overlap logic and lost finite end-times"*) and one on
+persistence, a run that passed all 73 new and 27 baseline tests and was STILL failed by its evaluator:
+*"Node::loadFromByteArray always reads that extra field and does not inspect a format/version flag."* The
+two deep stopped-entry scenes were the joint top killers (4/12 each). Measured lift from introducing the
+axis: batch 1 (no expiry) read 7/10; the accepted batch read 5/12.
+
+Designed layers that killed NOBODY in the accepted pool: containment split at stop instants
+(`ContainmentSeesAnEntryStopInsideTheInterval`, 0/12) and a single-piece distance solver
+(`NearestFindsTheClosestApproachBeforeAnEntryStops`, 0/12). The piecewise KERNELS were transcribed (L58);
+the band came from the STATE layers.
+
+**Precondition.** A persisted, indexed structure (tree pages, a WAL, a cache with an on-disk form) whose
+value type already has a field the store drops or hard-codes on load. Tell: a commented-out
+`memcpy`/`read` of a field, or a load path that assigns a sentinel (`max()`, `INF`, `None`) to a field
+the write path never mentions.
+
+**How to build.** State the new state behaviourally ("an entry moves until its insertion shape's end time
+and holds its position from then on") and nothing about storage. Test it on a deep random tree against an
+exhaustive oracle, after a close-and-reopen, and through the public C API. Do NOT pin the store's own
+self-check (L82).
+
+**Arsenal mapping.** L58 escape hatch ("look where prose cannot reach"); the discarded-state lever (L83).
+
+---
+
+### F-48. The feature narrows an existing entry point, and agents keep its old convenience ★ 3/12 on libspatialindex-tpr-temporal-knn, three capable runs
+
+**Mechanism.** The base `pointLocationQuery(const Point&)` wrapped any plain `Point` in a static `Region` and
+answered. The contract made it temporal: only the four time shapes are accepted and "a shape of any other
+kind" is rejected. Agents rebuilt the method on the new machinery but kept the legacy path, synthesising
+a current-time query for a raw `Point` instead of throwing.
+
+**Why it misdirects.** The signature still takes a `Point`, the old code path still compiles, and keeping
+existing behaviour feels like the safe, backwards-compatible choice. The rejection rule is stated once, in
+the validation paragraph, far from the sentence that describes point location.
+
+**Evidence.** libspatialindex-tpr-temporal-knn: **3/12** (Nova, Nova, Orion), each also failing an F-47
+cell, so the two walls stacked on the same runs. Verbatim: *"accepts an untimed point-location query"*;
+*"acceptance of an unsupported plain Point query"*; *"acceptance of an invalid raw Point query"*. The Auto
+Review filed it as a *"shared blind spot ... rather than an unfair hidden expectation"* because the
+contract states the boundary explicitly. Batch 1 had it too (1/10) before the contract said "any other kind".
+
+**Precondition.** An existing public method whose parameter type is broader than what the new contract
+accepts (base class in the signature, subclass required by the feature), and whose base implementation
+already does something useful with the broad type.
+
+**How to build.** One general rejection sentence covering every entry point ("a shape of any other kind is
+rejected, whether ... query or mutation"), plus one test passing the base type to the narrowed method.
+Zero extra description words if the rejection rule already exists.
+
+**Arsenal mapping.** F-20's mirror image (F-20 leaks the new rule onto a sibling; F-48 leaks the old rule
+past the new contract); F-10 validation cell.
+
+---
+
+### F-49. A deserialized graph re-parented onto the root: every node registered on the reading object instead of the one whose record referenced it ★ lead trap on siliconcompiler-flist-roundtrip (7/10), the sole failure of five 56/57 near-misses
+
+**Mechanism.** The feature writes a graph out as a FLAT sequence of records, one per node, with the
+parent/child relation carried by a marker INSIDE each record (`// sc-depfileset <design> <fileset>`
+inside the group that owns the edge). Reading it back, the natural loop walks the flat sequence and
+registers each named node on the object the read was called on. That reconstructs every node and every
+file correctly, and it even records the nested edge itself; what it adds is an EXTRA direct edge from
+the root to a transitive child. `head -> middle -> tail` comes back as `head -> {middle, tail}` with
+`middle -> tail` also present, so nothing is missing and the graph is still wrong.
+
+**Why it misdirects.** The flat serialized form has no nesting to imitate, so "read each record and
+attach it" feels like the shape of the data. The contract's own reconstruction paragraph names the
+reading design repeatedly (the prologue goes to its fileset, its own group merges into it, unreferenced
+groups attach to it), which primes attaching everything to it. Nothing in the failing assertion points
+at edge ownership: the diff is one extra name in a dependency list
+(`assert ['tail', 'middle'] == ['middle']`), long after the parse, while every file, marker, filetype
+and data root is right. Five runs shipped this as their only defect at 56/57.
+
+**Evidence.** siliconcompiler-flist-roundtrip, accepted 10-Nova batch: **7/10 runs**, and the SOLE
+failure of five of them (56/57). Evaluator wording, independently across runs: *"reconstructed nested
+dependencies with an extra direct root edge"*; *"nested dependencies are flattened onto the reading
+design"*; *"adds a transitive dependency directly to the reading design"*; *"missed nested dependency
+ownership during marked-list reconstruction."* Every one recorded
+`was_mentioned_in_description: true` and `description_clear: true`, and Auto Review classified the
+convergence `shared_blind_spot` rather than an unfair test, because the contract assigns each marker
+to "the group that carries it". Both passing runs cleared it.
+
+**Precondition.** A repo that serialises a DAG or tree as a flat record list where the edges live
+inside the records, and a public read entry point called ON one node of that graph (so there is an
+obvious wrong object to attach to). Tell: the writer already walks the graph depth-first and flattens
+it, and the reader currently produces a single object with no edges at all.
+
+**How to build.** Two things are needed and neither is the edge rule itself. (1) A fixture at least
+THREE levels deep: on a two-level graph (root plus siblings) re-parenting onto the root is
+indistinguishable from correct, which is why a sibling-shaped suite measures nothing here. (2) A
+separate rule for the leftovers ("a group that no marker references attaches to the fileset the
+argument names") so that attaching everything to the root is visibly not the rule. State the ownership
+clause once, plainly, and never say which object to call the repo's `add_dep` on.
+
+**Arsenal mapping.** S2 composition of documented rules; adjacent to F-28 (a composite concept split
+across container keys) in that the data is all present and only its ATTACHMENT is wrong.
+
+---
+
+### F-50. A value synthesised to REPORT an unlimited resource is enforced as a real LIMIT ★ 2/10 on pyfakefs-block-inode-accounting, and 4 runs on an earlier artifact
+
+**Mechanism.** The contract has an "unlimited" setting (`total_size=None`, `inode_count=None`) and
+ALSO requires the stats surface to report a finite number for it (a fixed placeholder capacity; an
+unlimited inode count "reports as many inodes as blocks"). The natural implementation computes that
+reporting figure once, in one helper, and then the allocation path calls the same helper to decide
+whether a request fits. The placeholder silently becomes a ceiling: a file larger than the reported
+total is refused, or the second empty file on a one-block mount raises ENOSPC because the reported
+inode count was the block count.
+
+**Why it misdirects.** Every reporting test passes, because the reported value is exactly right.
+Every ordinary allocation test passes too, because real tests allocate far below the placeholder.
+The failure needs a request that exceeds the REPORTED number on a mount that was declared unlimited,
+which reads like an edge case rather than the core of what "unlimited" means. The reference author
+makes the same mistake: this workspace's reference shipped it twice before a batch (a 1 TiB byte
+placeholder that refused `st_size=UNLIMITED_SIZE + 1`, then `set_disk_usage(None)` rejecting a mount
+already past the placeholder), both caught by Solution Quality.
+
+**Evidence.** pyfakefs-block-inode-accounting accepted batch: **2/10 runs**, two different axes of
+the same mechanism. Nova_10 (sole failure, 116/117): *"an unlimited inode count is incorrectly treated
+as limited by the block count ... `_check_available` sets `total_inodes = total_blocks` when
+`inode_count is None`"*. Nova_3: *"total_size=None means nothing is refused for lack of space"* was
+missed on reconfiguration. Both recorded `was_mentioned_in_description: true`. Earlier artifact
+(batch 2): `setting_no_limit_again_keeps_what_the_mount_holds` 3/12 and
+`an_unlimited_mount_takes_more_than_the_total_it_reports` 1/12.
+
+**Precondition.** A resource with an unlimited mode AND a reporting API that must return a finite
+number for it (`statvfs`, `disk_usage`, a quota view, a pool's `capacity()`). Tell: the repo already
+returns a hard-coded large constant for "unlimited" in its reporting path.
+
+**How to build.** State both halves in adjacent sentences so neither is inferred: "no operation is
+refused for lack of space" and "the reported total is a fixed placeholder". Then test each axis with a
+request just PAST the reported figure: one byte over the byte placeholder, one inode over the
+block-derived inode count, and the reconfiguration path (`set_disk_usage(None)` on a mount already
+holding more than the placeholder). Clamp reported counts at zero, since the tracked side is genuinely
+unbounded.
+
+**Arsenal mapping.** S2 contract-stated / fix-hidden; sibling of F-24 (a sentinel replacing a real
+behaviour), but here the sentinel is correct for reporting and wrong only when reused for admission.
+
+---
+
+### F-51. A platform-branched presentation size used as the stored size ★ 3/11, 5/12, 1/10 across three batches on pyfakefs-block-inode-accounting
+
+**Mechanism.** The repo's size field is not the stored length on every platform: pyfakefs's
+`FakeStatResult.st_size` deliberately returns 0 for a symbolic link on a Windows fake filesystem,
+while the link path is still stored in the object. The feature charges storage for "the path it
+holds". Agents charge the right blocks at creation (the content length is computed locally) but read
+`size` / `st_size` again when RELEASING or REPORTING, so the Windows link frees nothing on removal and
+`tree_usage` reports zero bytes for it.
+
+**Why it misdirects.** The POSIX symlink tests all pass, and so does the Windows creation check. The
+failing assertion is a zero in a usage report on an OS-type the rest of the suite never switches to.
+The repo's own test (`test_lstat_size_windows`) asserts the zero, so reading the codebase REINFORCES
+the wrong source of truth.
+
+**Evidence.** pyfakefs-block-inode-accounting: `a_symlink_is_charged_for_its_path_where_stat_reports_nothing`
+killed **3/11** (batch 1), **5/12** (batch 2) and **1/10** (accepted batch 3, Nova_6's sole failure:
+*"its tree_usage calculation reports zero bytes for a Windows symlink whose mount accounting correctly
+charges one block"*). In batch 2 it was the sole failure of the run one test from passing. The
+reference shipped the same leak; Solution Quality found it at R4.
+
+**Precondition.** A size, length or count field with an OS-type or mode branch in its GETTER, and a
+feature that must account the real stored quantity. Tell: `if ... is_windows: return 0` (or similar)
+inside a property that the rest of the code treats as the object's size.
+
+**How to build.** Say what is charged in storage terms ("the path it holds, not its target") and add
+one test on the non-default OS-type that asserts stat shows zero AND the mount shows one block AND
+`tree_usage` shows one block AND removal gives it back. Toggle the OS type BEFORE configuring the
+mount; switching it resets the filesystem.
+
+**Arsenal mapping.** S2 contract-stated / fix-hidden; the codebase-inferable half of F-17 (a proxy
+the repo itself presents as the real quantity).
+
+---
+
+### F-52. Two stacked boundaries with different rules collapsed onto the nearer one ★ 2/10 on pyocd-sequence-expression-kernel, the sole failure of both runs
+
+**Mechanism.** The contract states one rule at an outer boundary and a narrower rule one layer
+down. pyocd: a sequence function *receives the unsigned 64-bit form of every value it is passed*,
+and `Write32` *reduces the word it writes to 32 bits*. The outer boundary is where the agent is
+already editing (the interpreter's call path); the inner one is a different file (the delegate's
+write functions). Agents apply the narrowing at the outer boundary, before the delegate is called,
+so the delegate receives `0xffffffff` where the contract says `0xffffffffffffffff`.
+
+**Why it misdirects.** Every transfer-width test still passes: the hardware write gets 32 bits
+either way. Only tests that observe the delegate's INPUT through a recording delegate fail, and the
+diff reads as a value-domain bug (`0xffffffff` vs `WORD_MASK`), not as a choice of layer. An agent's
+own tests, written against the real delegate, cannot see it.
+
+**Evidence.** `pyocd-sequence-expression-kernel` accepted batch: **Nova #7 and Nova #2, 146/150,
+the identical 4-test set and nothing else** (`test_call_arguments_are_evaluated_left_to_right`,
+`test_a_function_argument_is_a_value_of_the_domain`,
+`test_a_call_made_as_a_statement_receives_values_of_the_domain`,
+`test_the_last_statement_decides_a_predicate`). Verbatim, Nova #7: *"Interpreter.fncall adds width
+masks before impl(*fn_args), whereas the reference applies those masks inside
+DebugSequenceCommonFunctions."* Nova #2: *"adds _prepare_fn_args() and masks args[1] for
+write32/writeap/writeaccessap/writedp"*. Both judged described AND inferable. The killing test was
+built for Solution Quality's round-1 finding ("function results are not reduced"), which was the
+OPPOSITE error: see the L90 counter-evidence.
+
+**Precondition.** A call chain with an observable seam between two layers (a pluggable delegate,
+driver or backend interface whose input the tests can record), and a narrowing that belongs to the
+concrete operation below the seam, not to the seam itself.
+
+**How to build.** State both rules in adjacent sentences: the full-domain rule at the seam, the
+narrowing at the operation. Test the seam with a recording delegate AND the operation with the real
+implementation over a mock. One sentence, and it only works once the seam rule is CONCRETE (L87):
+batch 1, where the seam rule was abstract, failed the same tests by UNDER-reducing (7/11).
+
+**Arsenal mapping.** HARDENING S6 / the F-9 family (stage placement). F-9 drops a normalisation
+across a stage boundary; F-52 applies a narrowing one stage too EARLY.
+
+---
+
+### F-53. A must-property over the call graph solved from the pessimistic side ★ lead trap on teavm-method-summaries (4/10), the sole failure of three 25/26 near-misses
+
+**Mechanism.** A fact that must hold on EVERY path through a recursive call graph (a method never
+returns null, never throws, always terminates) is a greatest fixed point: start every method at
+"true" and knock facts down until nothing changes. Agents start at "false" and promote a method only
+once its callees are already proven, which is the least fixed point. It agrees on every acyclic
+fixture and on every cycle that contains a null path. On a cycle whose members are jointly never-null
+it never bootstraps: each member waits for the other.
+
+**Why it misdirects.** Promotion-only is the natural reading of "prove it before you use it", and it
+is what a sound per-method analysis does. It is also correct for the DUAL property the same feature
+computes (written fields grow from empty; there least is right), so an agent who got the write sets
+right by construction carries the same shape over to nullness. The failing assertion is a bare
+`assertTrue` on one query, and it reads as a nullness-analysis gap, not as a direction error.
+
+**Evidence.** `teavm-method-summaries` accepted batch: **4/10 (Nova #1, #4, #7 at 25/26 with nothing
+else failing, #3 at 23/26)**, all on `neverNullHoldsThroughMutualRecursion`. Verbatim, Nova #1:
+*"initializes Summary.neverReturnsNull to false and only sets it true inside `if
+(!summary.neverReturnsNull && canProveNonNull(...))`, which cannot bootstrap this cycle."* Nova #7:
+*"initializes neverReturnsNull to false and only sets it true after proving a method, so each member
+of a mutually recursive cycle observes the other as nullable."* All four judged described AND
+inferable. The sentence that states it was explicit: *"The facts are the most precise ones that hold
+for all methods at once, so recursion and mutual recursion lose nothing by themselves."* Explicit
+prose did not transmit the direction (L94).
+
+**Precondition.** A whole-program analysis that computes a MUST fact (an all-paths property) over a
+call graph with cycles, next to a MAY fact (a union) computed by the same pass. The repo must already
+have the per-method analysis the fact is proven with, so the only new decision is where the
+iteration starts.
+
+**How to build.** One cycle of two methods where one member also has an anchored non-null exit (a
+`new`), and a sibling cycle where a null reaches one member, so both directions are pinned. State the
+"most precise facts for all methods at once" sentence. Auto Review later asked for an UNANCHORED pure
+cycle too; that separates optimistic from anchor-seeded SCC solvers, which this batch did not show.
+
+**Arsenal mapping.** HARDENING S-tier fixed-point family (F-2, F-22). F-22 is about WHICH quantities
+share the fixed point; F-53 is about which END it starts from.
+
+---
+
+### F-54. The compatibility path "fixes" a legacy unsoundness the contract preserves — 2/10 on teavm-method-summaries
+
+**Mechanism.** The feature adds a new input (here, summaries) and states that without it every pass
+behaves as it does today. Building the feature exposes a latent bug in today's behaviour: the base
+`RepeatedFieldReadElimination` keeps cached field reads across an `initClass`, although the class
+initializer may write them. Agents who add the new `initClass` handler make it conservative on BOTH
+paths, so the no-summaries path now forgets every read at `initClass` and no longer matches today.
+
+**Why it misdirects.** The change is a soundness fix, and it reads as responsible engineering. Nothing
+in the agent's own tests catches it, because nobody writes a test that asserts the OLD, weaker output.
+The failing diff shows `field Counter.value` where `@a` was expected, which looks like the optimizer
+being too cautious, not like a broken compatibility promise.
+
+**Evidence.** `teavm-method-summaries` accepted batch: **Nova #6 at 25/26 (sole failure) and Nova #2**,
+both on `withoutSummariesEveryPassBehavesAsBefore`. Verbatim, Nova #6: *"The baseline
+RepeatedFieldReadElimination InstructionAnalyzer only overrides PutFieldInstruction and
+InvokeInstruction; it has no InitClassInstruction handler. The agent patch adds a handler that sets
+invalidatesAll = true when methodSummaries == null."* The test came from a platform coverage
+suggestion ("Null-summary fallback"), not from the design, and it was also the old M20 mutant survivor.
+
+**Precondition.** An opt-in feature whose off-state is promised unchanged, where the on-state has to
+handle an instruction or case the base code silently ignores, and ignoring it is (at least
+arguably) wrong.
+
+**How to build.** One sentence ("with no X every pass behaves as it does today") and one test on the
+off path that asserts today's output across the newly handled case. Mutation-check it: a
+"conservative on both paths" mutant must die.
+
+**Arsenal mapping.** F-12 family (repo behaviour as a discriminating axis), from the other side: F-12
+keeps repo TESTS passing; F-54 keeps an untested repo BEHAVIOUR unchanged when the agent has a reason
+to improve it.
+
+---
+
+### F-55. A wildcard sentinel routed into an existing per-variable entry point — 2/10 on teavm-method-summaries
+
+**Mechanism.** The feature needs a new notion that the existing data model has no slot for ("this
+field on EVERY instance"). Agents encode it as an out-of-band value in the existing slot (instance
+variable `-2`) and pass it through the existing per-instance path, which indexes an array by that
+variable (`AliasAnalysis.affectsEverything(instance)`). The reference and all four passers used the
+same `-2` sentinel, and branched on it before the existing call.
+
+**Why it misdirects.** The straight-line path is where the agent looks. The same sentinel is also
+stored for the dominance-frontier join and replayed later through the generic
+`invalidateField(instance, field)`, so a fix at one site leaves the other. The failure is an
+`ArrayIndexOutOfBoundsException` deep in alias analysis, far from the new code.
+
+**Evidence.** `teavm-method-summaries` accepted batch: **Nova #2 and Nova #3**, both killed by `Index -2
+out of bounds for length 6` at `AliasAnalysis.affectsEverything` from `invalidateField`, on both
+`fieldReadsSurviveACallThatDoesNotWriteThem` (straight line) and
+`aCallInOneBranchForgetsItsFieldsAfterTheJoin` (join). Neither run had any other RFRE failure.
+
+**Precondition.** An existing pass keyed by a variable or node index, with a second, deferred path
+(join, frontier, replay queue) that stores the key and dispatches on it later, and a feature that
+needs a key meaning "all of them".
+
+**How to build.** Test the new "all" case on the straight-line path AND across a join, in separate
+tests. Free if the pass already has both paths.
+
+**Arsenal mapping.** A sibling of F-24 and F-37 (sentinel family). F-24 swaps a hard failure for a
+sentinel; F-37 collides an in-band sentinel with real input; F-55 leaks an out-of-band sentinel into
+an existing index-keyed API.
 
 ---
 
@@ -2561,7 +3016,7 @@ failure was agent-attributed; no run marked unfair. Median failing Nova: 15 file
 4. **The Docker build counts toward the platform's 600 s environment start (L62).** Verify Solution
    failed with `EnvironmentStartTimeoutError` while every local run was green. Tool build plus
    `chmod -R` over a lower COPY layer took 704 s; one `RUN --mount=type=bind` layer took 413 s with a
-   byte-identical `/app`.
+   byte-identical `/app`. (The bind mount is now itself a Dockerfile-check FAIL; see L62 for the COPY form.)
 5. **A concision trim deleted the multiplicity sentence and batch 1 read 9/10 on it (L26, second
    problem).** Restored after batch 1; the same wall then killed 2-3 per batch, fairly.
 6. **Killed nothing (L15).** `bulkmem.c` plain `.64` and `.64n`, `.64n` optimized C, `.64` optimizer
@@ -2928,6 +3383,309 @@ sets, a missing requiredFeatures-only case (Nova_10 passed with the bug), missin
 rule and global overrides. Harness: a git worktree's `.git` pointer file broke `git apply` inside the
 container (failed loudly, rebuilt from a real clone).
 
+### csbindgen-struct-layout-fidelity (Rust / FFI binding generator, Rust→C# ABI layout) — ACCEPTED
+
+| | |
+|---|---|
+| Shape | O-Algorithm-correctness across a parser → new layout engine → emitter pipeline; the output choice (Sequential / Pack / Explicit) is decided by comparing a Rust `repr(C)` layout against the layout .NET gives the emitted C# |
+| Final artifact | 6 production files (new `layout.rs`), **402 human-eff** (peaked at 598 before narrowing), 96 tests = 70 F2P + 23 P2P + 3 repo lib; meta 488 words |
+| Pass-rate history | batch 1 **0/11** (unfair `*const Option<fn>` cell) · batch 2 **0/11** (unfair aligned-enum 11/11 by panic, unstated dependency cell 7/11) · local re-grades 1→3/11 · **FP panel voided all 3 "passes"** (unasserted fixtures) · FP-clean R19 re-grade 0/11 · contract NARROWED (module scoping + const-name lengths removed) · batch 3 **0/16** (`c_float` unstated 7/16, niche-Option array 8/16) · two meta clauses · batch 4 **1/10 → accepted** |
+| Patterns used | measured: **F-44** (7/10, new, lead), **F-45** (3/10, new), **F-46** (2/10, new), L6 name-prefix NonZero (1/10) · designed walls that killed 0 in batch 4: Int128/.NET alignment, zero-size fields, unions, bitfield storage, packed/align, transitive promotion — 63/70 new tests killed nobody |
+| Agent split | batch 4: 10 Nova, 1 pass (Nova #8). batch 3: 15 Nova + Vega, 0 passes; Vega never passed in any batch |
+
+**Why it held.** One composition cell family (F-44: alias resolution × pointer-to-array lowering)
+killed 7/10 on its own; F-45 and F-46 took the rest. The irony worth recording: F-44's cells were
+DROPPED in R14 as "fair but most-missed" to buy solvability, then RESTORED in R19 because the FP panel
+counted their unasserted fixtures against us. The cell that had to be kept for fairness ended up
+being the difficulty.
+
+**What the batches taught.**
+- **An unasserted generated fixture is an FP trap** (L79). Four rounds of "fix the solution, skip the
+  test only the reference passes" left scoping fixtures generated but unchecked; the FP panel ruled
+  3/3 passes false positives on exactly those fixtures.
+- **A contract sentence that promises a host-language semantic in full turns Solution Quality into an
+  unbounded ratchet** (L80). "A const or alias name resolves in the module that uses it" produced 11
+  consecutive FAILs, each a narrower name-resolution corner (const scope → alias scope → alias keying →
+  `super::` paths → emitter scope → dependency graph → NonZero identity). Deleting the sentence ended
+  it: the next Auto Review approved 3/3/3.
+- **An enumerated list in a contract reads as exhaustive** (L81). The scalar sentence named four 8-byte
+  C types; 7/16 agents treated `c_float`/`c_double` as unsupported. Naming them: 1/10.
+- **L77 confirmed.** The niche-Option array rule was derivable from two sentences and killed 8/16; one
+  clause stating the combination took it to 0/10.
+- **L76 confirmed three more times.** Aligned-enum panic (11/11), declaration pruning (7/11) and the
+  generated Rust-wrapper spelling (Test Quality) were all real reference bugs whose TESTS were unfair
+  because meta never stated the behaviour. Fix the solution; ship the test only when meta states it.
+
+**Reference bugs found.** ~30 across 25 review rounds, every one a would-be FP: Int128 C# alignment;
+zero-size nested/trailing fields; `()` fields; pointers to non-path pointees; pointer aliases (×3);
+unions without `repr`; `usize`/`isize` enum bases; 128-bit enums; `Option` layout for non-niche
+payloads; const lengths (literal, scope, `u64::MAX` panic); `NonZero*` by prefix; aligned-enum parse
+panic (base bug); dependency recursion; nested-array Rust wrapper rendering; Pack=16 vs .NET; and five
+module-scoping holes that the narrowing deleted rather than fixed.
+
+
+### libspatialindex-tpr-temporal-knn (C++ / TPR-tree spatio-temporal index: kernels, nearest-neighbour, self-join, range queries, node persistence, C API) — ACCEPTED 2026-09-21
+
+| | |
+|---|---|
+| Shape | O-Algorithm-correctness plus a state-carrying integration layer: implement the two TPR-tree stubs (`nearestNeighborQuery`, `selfJoinQuery`), make the range queries temporal over four shape kinds, and give stored entries a finite end of motion that must survive the node page, node bounds and reload |
+| Final artifact | 8 production files, **350 human-eff**, 73 F2P tests + 27 base; meta 490 words |
+| Pass-rate history | batch 1 **7/10** (pure geometry, too easy) · round 1: 16 coverage tests replayed **7/10 → 7/10**, 57-cell probe **0 divergence** among passers · round 2: entry-expiry wall (meta delta) · batch 2 **0/10**, but 9/10 blocked by my own `isIndexValid()` assertion; removed, replay **5/10** · rounds 3-6: nine review findings fixed, replay stays 5/10 · batch 3 **5/12** (FP panel voided one pass, 4/12) · batch 4 = re-eval of the same 12 solutions, FP clean, **5/12 → accepted** |
+| Patterns used | measured: **F-47** (4/12, new, lead), **F-48** (3/12, new), self-join feasibility across motion pieces (2/12, two different mechanisms, not promoted), nearest-distance optimiser edges (2/12, two different mechanisms, not promoted) · designed walls that killed 0: containment split at stop instants, single-piece distance solver, the whole validation matrix, comparator parity, k=0, ascending order - 35/73 tests killed nobody |
+| Agent split | accepted pool: Nova 4/10, Orion 1/2. Batch 1: Nova 7/10. Batch 2: Nova 0/10 (unfair assertion) |
+
+**Why it held.** Not the geometry. Batch 1 shipped three fully stated kernels (minimum distance over an
+interval, same-instant overlap, every-instant containment) and 7/10 transcribed them; a 57-cell
+differential probe then found zero behavioural difference between the reference and any passer. The band
+came from F-47: state the repo writes nowhere and reads back as a sentinel, which no amount of geometry
+reasoning recovers. F-48 stacked on the same runs.
+
+**What the batches taught.**
+- **Probe convergence means the derivable surface is exhausted, not that the pick is dead** (L83). Three
+  searches (57 probes, 16 reviewer-suggested coverage tests, 4 composition cells) killed zero passers;
+  the next lever was a field `Node.cc` never persisted, and it moved 70% to 42%.
+- **Reviewer coverage suggestions bought nothing here.** All six advisory suggestions plus both Auto
+  Review follow-ups were written and replayed: 0 new kills. L17 holds only while the passing population
+  still diverges.
+- **Asserting the repo's own self-consistency checker zeroed a batch** (L82). `isIndexValid()` demands
+  exact equality with its own recomputation of node bounds; 9 of batch 2's 10 blocking failures were that
+  assertion, and the same solutions replayed at 5/10 without it.
+- **A persisted-layout change is a live FP seam even when the prompt says nothing** (L84). A 73/73 run was
+  failed by its evaluator for an unversioned page, and FP judges probed legacy loading on four more passers
+  across two batches, upheld once, over-ruled three times. Header-level versioning was itself a reference
+  bug (it silently dropped the end time of NEW inserts into a reopened old tree); per-record versioning
+  through the node type word fixed it.
+- **Broadening a contract sentence is a promise the reference must keep on every path.** Widening the
+  rejection sentence to cover `insertData`/`deleteData` immediately produced a Solution Quality FAIL: the
+  mutation path accepted any `ITimeShape`. Route every entry point through one normaliser.
+
+**Reference bugs found.** 9 from review, each a would-be FP: negative `max_dist` treated as a cap;
+single-instant moving shapes worked around only in the C wrappers; `k == 0` visiting zero-distance
+entries; stopped entries pruned when inserted beside an identical mover at the same time; unversioned
+page format; header-level legacy mode dropping new end times; `deleteData` moving current time backward on
+a reversed interval; `insertData` accepting a reversed interval; mutations accepting any `ITimeShape`.
+Plus one self-found before the batch (an instant interval collapsed to a single motion piece).
+
+---
+
+### siliconcompiler-flist-roundtrip (Python / EDA build-system schema) — ACCEPTED
+
+| | |
+|---|---|
+| Shape | O-Composite-extend. An existing flattening aggregation (`get_fileset` walk + `__write_flist` emission + `__read_flist` parse) extended so the structure the flattening destroys survives a write/read round trip |
+| Final artifact | 3 files (`design.py`, `schema_support/pathschema.py`, `schema_support/filesetschema.py`), 324 human-effective LOC, 57 new tests + 5 base-mode preservation tests |
+| Pass-rate history | batch 1 **0/11** (10 Nova + 1 Vega) → repair round → batch 2 **2/10** (20%) |
+| Patterns used | **F-49** (lead, 7/10), F-9 (emission chokepoint), F-12 (private `__get_fileset` signature pinned by a repo test), F-20 (flat output preserved), F-10 (include × marker-scope cells) |
+| Agent split | Nova 2/10 in the accepted batch. No Orion in either batch; the one Vega (batch 1) failed |
+
+**Why it held.** One trap carried it and nothing else came close: F-49 killed 7 of 10 and was the sole
+failure of five runs at 56/57. A second, much smaller axis (a marked group with no content must still
+materialise its fileset) took 2 more. Everything else in a 57-test suite killed nothing. The band was
+therefore decided by ONE test on a THREE-level fixture; the same trap is invisible on the two-level
+sibling graphs the rest of the suite used.
+
+**What the batches taught.**
+
+- **A 0% first batch is not automatically a difficulty verdict — mine it before touching the design.**
+  Batch 1 read 0/11 and three of the four causes were mine: a test helper calling an accessor only the
+  reference defined (masked 5-7 tests per run), one ambiguous spelling sentence (4 tests, 9-11/11,
+  identical failure), and a `file://` data-root case a review round had added (11/11). Only after
+  removing those did the real trap become visible underneath. See L85, L86, L87.
+- **Replay the saved patches to choose what to cut.** Re-running all 11 batch-1 patches against each
+  candidate suite in the platform image priced every option: fixing the helper and the spelling alone
+  still read 0/11; also cutting the `file://` case read 3/11; additionally clarifying the ownership
+  sentence read **9/11**. The last number is why that sentence was left exactly as written — it was the
+  only thing standing between the artifact and a too-easy reject. Live batch 2 then measured 2/10,
+  against a 3/11 projection.
+- **Explicitness is a dial with a measured setting.** The same pre-existing-data-root test killed 6 of
+  11 while the contract said "a root registered earlier", and **0 of 10** after the sentence named both
+  kinds of existing root. Nothing in the code changed. Wording moved that axis from a band contributor
+  to a free pass.
+- **The passers used ONE source file; the reference used three.** Both passing patches (465 and 513
+  raw, ~275-325 effective) changed only `design.py`. Splitting the reference across `pathschema.py` and
+  `filesetschema.py` satisfied the file-count floor but described nothing agents had to do.
+
+**Reference bugs found.** Seven, all by review rounds before any batch, and exactly one became a
+measured killer:
+
+1. Empty marked group never materialised its fileset, so a dependency reference to it raised — **became a 2/10 killer**.
+2. Hierarchy output reused the flat writer's de-duplication, so one path stored under two filetypes lost an entry.
+3. A `sc-fileset` marker cleared the active filetype.
+4. File type not inherited into a pulled-in list.
+5. An include that opened its own group lost its insertion point (`a.v, c.v, b.v`).
+6. The data-root allocator ignored roots the design already had.
+7. `file://`-spelled roots were not reused — later cut from tests, contract and reference together.
+
+### pyfakefs-block-inode-accounting (Python / fake filesystem: block, inode and reserve accounting) — ACCEPTED
+
+| | |
+|---|---|
+| Shape | O-Composite-add. Whole-block and inode accounting added to an existing byte-only mount model, reported through a new `statvfs` on two surfaces, with reserves, `mount_usages()` and a `du`-style `tree_usage()` |
+| Final artifact | 4 files (`fake_file.py`, `fake_filesystem.py`, `fake_os.py`, `docs/modules.rst`), 334 human-effective LOC, 117 new tests + 4 base-mode deselects |
+| Pass-rate history | batch 1 **0/11** (10 Nova + 1 Vega) → cut 9 tests → batch 2 **0/12**, +2 Vega = 1/14, the pass adjudicated **FP** → wording + FP fixes → batch 3 **5/10** (accepted) |
+| Patterns used | **F-20** (lead, 3/10), **F-50** (2/10), **F-51** (1/10), F-10 (reserve × rename, open-fd × unlink cells), F-12 (repo tests pin byte-exact accounting at block size 1) |
+| Agent split | Accepted batch: Nova 5/10, no Orion or Vega. Vega batch 2: 0/4 genuine (one FP). Batch 1: Vega 0/1 |
+
+**Why it held.** Three independent causes, each the sole failure of a near-miss: stepwise imports
+inheriting `create_dir`'s rollback (F-20, 3/10), an "unlimited" reporting figure enforced as a limit
+(F-50, 2/10) and a Windows symlink sized by `stat` (F-51, 1/10). 108 of 117 tests killed nothing. The
+accepted rate, **5/10 = 50%**, is ABOVE the 40% ceiling this workspace records, and a human reviewer
+accepted it anyway; Auto Review called it "hard but fair ... failures were near-misses on explicitly
+stated lifecycle details". Record the fact; do not treat it as a ceiling change.
+
+**What the batches taught.**
+
+- **Eight clean gate rounds, then 0/11.** Description 3/3 and Solution & Code 3/3 were reached before
+  any batch ran. Every Solution Quality round added a requirement ("your contract promises atomicity,
+  so this path must roll back too"), each individually fair; their sum was five distinct recursive
+  undo mechanisms, and six tests killed 11 of 11. See L91.
+- **Cutting tests alone does not cut a requirement.** Batch 1's cut dropped nine tests but kept the
+  sentence promising them and the code implementing them; the next Auto Review scored Tests 1/3 for
+  missing coverage of that promise. Cut tests, contract and reference together.
+- **A one-sided carve-out moves unrelated tests.** Batch 2 named only the stepwise helpers
+  (`os.makedirs`, `Path.mkdir(parents=True)`, ...). With tests and solution unchanged, the five
+  single-object `create_dir`/`create_file` rollback tests went from **0/11** kills to **9-10/12**:
+  `create_dir('/a/b/c')` builds parents like `makedirs`, so agents filed it on the stepwise side.
+  Naming BOTH sides took the same five to **0/10** in batch 3. See L89.
+- **A pronoun three sentences from its antecedent killed 10/11.** "`mount_usages()` returns it for
+  every mount" produced `(0, 0)` pairs; naming the type (`os.statvfs_result`) took it to 0/10.
+- **An FP is a hole in your suite, and the saved patches price the fix.** Batch 2's only pass could
+  never turn a bounded mount unlimited again: "None keeps the current value" was written for four
+  options and the primary argument had no test for its own None. Applying all 14 saved patches and
+  probing showed 12/14 already reset correctly, so the new test was a fair discriminator, not a wall.
+  Every later test addition was probed the same way before it was written.
+- **Two authored walls decayed to zero.** Reserve-crossing renames and the unlinked-open-file resize
+  each killed 4/12 in batch 2 and **0/10** in batch 3.
+- **All three near-miss killers were reference bugs the gates had found first.** See L90.
+- **Validate as an unmapped UID.** The offline validator runs as a non-root UID with no passwd entry;
+  `test_owner_and_group_posix` passed for root and 1000 and failed for it, costing a Tests Blocker.
+
+**Reference bugs found.** Twenty-seven over eighteen review rounds, none by a batch. The ones that
+predict agent failure became F-20, F-50 and F-51; the rest, in short: `set_large_file_size` released
+before charging; `statvfs` absent from `FakeOsModule.dir()`; a rename releasing and re-charging (data
+loss under a reserve); `change_disk_usage` losing its documented signed-byte semantics; a 1 TiB
+placeholder enforced as a cap; negative `f_ffree` / `f_blocks`; `reset` unable to keep `inode_count=0`
+because the temp dir charged first; lazy rollback re-entering the lazy load; charges attributed to the
+new device after mounting over a directory; an unlinked open file's `ftruncate` subtracting twice;
+component-blind `startswith` mount matching (a base bug newly exposed); the leaf mode forwarded to
+`makedirs` parents; an unrounded placeholder for non-power-of-two block sizes; a mount root reused from
+an existing directory keeping its old charge. **One remained at acceptance:** `create_file` rolls back
+only on `OSError`, so a `UnicodeEncodeError` from `encoding="ascii"` leaves the file and its parents.
+
+---
+
+### pyocd-sequence-expression-kernel (Python / debug-sequence expression engine: value domain, effects, transfer widths) — ACCEPTED
+
+| | |
+|---|---|
+| Shape | O-Pipeline-hard. One unsigned-64 evaluation model shared by a parse-time constant folder, the interpreter, the semantic checker, the control-predicate loop and the sequence-function delegate |
+| Final artifact | 4 files (`values.py` new, `sequences.py`, `scope.py`, `functions.py`), 243 human-effective LOC, 150 new test cases (90 functions) + a 3-row deletion in the repo's own fold table |
+| Pass-rate history | batch 1 **0/11** (10 Nova + 1 Vega) → cut the control-predicate rule, made two boundary clauses concrete → six more review rounds (JTAG bytes stated literally, closed transfer list, the string-return split) → batch 2 **5/10** (accepted) |
+| Patterns used | **F-52** (2/10, sole failure of both), **F-20** at argument level (3/10, one alone — accidental), **F-31** folder/interpreter twins (2/10, compound), F-10 (literal × operator matrix), F-12 (the repo's own fold table encoded three wrong identities) |
+| Agent split | Accepted batch: Nova 5/10, no Orion or Vega. Batch 1: Nova 0/10, Vega 0/1 |
+
+**Why it held.** Three causes, each the sole failure of at least one near-miss: collapsing two
+stacked boundaries onto the nearer one (F-52, Nova #7 and #2 at 146/150), the `tms` accident (F-20,
+Nova #5 at 147/150), and stale folder identities (F-31, twice, always with `tms`). 141 of 150 tests
+killed nothing. The accepted rate, **5/10 = 50%**, is above the recorded 40% ceiling and was
+human-accepted, the same as pyfakefs. Record it; do not treat it as a ceiling change.
+
+**What the batches taught.**
+
+- **Batch 1 was one rule.** Three tests for "a predicate must produce a value", added in review round 3
+  to answer a reviewer, killed 8/11 and were BOTH near-misses' only failure. Replaying the saved
+  patches picked the cut exactly (2/11 predicted) instead of the broader axis first tried, which fell to
+  172 effective LOC, under the floor (L85, L86).
+- **A concrete consequence sentence moves an axis, and then its mirror appears.** "A variable set to a
+  negative value reads back as its unsigned form, and a sequence function receives the unsigned form
+  of every value it is passed" took the scope test from **6/11 to 0/10** and under-reduction at the
+  call boundary from **7/11 to 0/10**. Once concrete, 2/10 over-applied the rule one layer too early
+  (F-52). Explicitness does not remove a boundary; it trades the error for its reflection (L87).
+- **The replay is blind to description changes, in both directions.** The byte-response test failed
+  every replayed batch-1 patch; stated in meta.md with one example ("the bytes 0x34 0x12 are the
+  value 0x1234") it killed **0/10**. The replay projected 2/11 for the final suite; the batch read
+  5/10 (L35).
+- **The one run-deciding trap nobody designed was an accident.** Tests passed `tms=3` to JTAG, a value
+  the probe API documents as 0 or 1 and the CMSIS-DAP layer masks itself. 3/10 plus Vega in batch 1.
+  I had read Vega's batch-1 failure from the test NAMES as "JTAG width" and that framed a
+  keep-or-cut decision; the assertion diff said `tms 1 != 3` (L92).
+- **Eleven review rounds bought almost no difficulty.** Of the ~100 test cases added after the core
+  slice, only the round-1 argument-domain test killed anyone, and it caught the opposite of the error
+  it was written for. Every static-validation test, both literal matrices, the AP/DP widths and the
+  byte test killed nothing (L90 counter-evidence, L91).
+- **Reviewer-invented inputs cost rounds, not difficulty.** Rounds 8, 10 and 11 argued over a `-> str`
+  sequence function that the repo does not have (23 return `int`, 16 return `None`). Resolved by
+  doing both in the solution and keeping the contract silent on the one case tests could not afford;
+  its tests killed 0/10 (L93).
+- **A general principle keeps finding sites; a closed list ends it.** "Transfers keep only the bits
+  their width names" drew `DAP_WriteABORT` twice (once via the scoping phrase "the Write functions",
+  which it matched by name) and then read-side masking. Replaced by the exact functions the solution
+  reduces.
+
+**Reference bugs found.** Eleven, all by review gates, none by a batch: a function result never
+reduced (deleted as "dead code" in the slice because the scope store normalised, but a result
+reaches comparisons and shift counts without a store); compound assignment reading its target after
+the right-hand side; control predicates bypassing the value check; variadic arguments bypassing it;
+declaration predicates; JTAG TDO arriving as bytes from a real CMSIS-DAP probe; a `-> str` result
+classified as a value; `DAP_WriteABORT` unmasked (resolved by scope, not code); a string-returning
+statement crashing (introduced by me in round 9); three redundant normalisation points found by
+mutation; and a string-argument sentence that banned `Message`'s own format string (description).
+**One remained at acceptance:** a Low - the three-iteration while-loop test keeps a 5 s wall-clock
+timeout that its read budget makes unnecessary.
+
+---
+
+### teavm-method-summaries (Java / TeaVM compiler: whole-program method summaries for the per-method optimizer) — ACCEPTED
+
+| | |
+|---|---|
+| Shape | O-Pipeline-hard / O-Algorithm-correctness. New whole-program analysis (never-null returns + written-field sets, SPECIAL/VIRTUAL dispatch, `<clinit>` effects, simultaneous fixed point) consumed by four existing optimizer passes and wired into both TeaVM pipelines |
+| Final artifact | 9 files (`MethodSummaries.java` new, `NullnessInformation(Builder)`, `MethodOptimizationContext`, RNCE, CCE, LIM, RFRE, `TeaVM.java`), 298 human-effective LOC, 26 new tests, 213 base tests |
+| Pass-rate history | four platform gate rounds, no batch before acceptance (Dockerfile bind mount FAIL; Verify Solution + Solution Quality FAIL; Solution Quality FAIL; Auto Review Tests 1/3) → batch 1 **4/10** (accepted, Auto Review Approved 3/2/2) |
+| Patterns used | **F-53** (4/10, lead, sole failure of three near-misses), **F-54** (2/10, one sole), **F-55** (2/10, compound), F-10 (straight-line × join) |
+| Agent split | Nova 4/10. No Orion, Vega or Castor |
+
+**Why it held.** One fixed-point direction decided the band: three of the four near-misses
+failed only the mutual-recursion test. The rest came from the compatibility path (F-54) and the
+all-instances sentinel (F-55). Every run touched exactly the reference's nine source files, so the
+difficulty was not finding the scope. **21 of 26 tests killed nothing.** 4/10 = 40% sits exactly on
+the ceiling: accepted, zero margin (at 22%/50% batch variance, the next batch could read too easy).
+
+**What the batch taught.**
+
+- **An explicit sentence did not transmit an algorithm's direction (L94).** "The most precise facts
+  that hold for all methods at once, so recursion and mutual recursion lose nothing" is as direct as
+  prose gets, and 4/10 still solved from the pessimistic end. All four were judged described AND
+  inferable. This is the rare lever that stays hard after it is stated.
+- **Every reference bug a gate found got a test, and those tests killed nothing (L90 counter-evidence,
+  second problem).** Solution Quality found two real reference bugs (a VIRTUAL call to an absent class
+  read as never-null and write-free; `SIMPLE`, TeaVM's default level, never built summaries). Auto
+  Review asked for invokedynamic, arrays, a second optimized method, missing-class `initClass`, unknown
+  calls in RFRE. 11 tests, 0 kills. Every agent got all of them right.
+- **The one coverage-suggestion test that killed asserted the OLD behaviour (F-54, L17).** "Null-summary
+  fallback" became `withoutSummariesEveryPassBehavesAsBefore`, 2/10, one sole failure.
+- **Driver wiring is testable (Pattern 105).** "TeaVM passes summaries to every method" was flagged
+  untested twice; a real `TeaVM.build` with a stub target and a looped `TeaVMOptimizationLevel` covered
+  both pipelines in 37 s. It then killed 0/10, but it was the only thing that made the Solution Quality
+  finding about `SIMPLE` non-regressible.
+- **An unobservable frequency in the contract cost a Tests band (L96).** "Once per build" drew a High
+  "untested" finding; the only discriminator was a bytecode agent counting the factory, which would
+  also fail an agent building through its own overload. Dropped from meta.md.
+- **Passers wrote more than the reference.** Median passing production diff ~425 effective lines
+  (Auto Review) against the reference's 298; prompt tokens 12.9M-20.4M for passers, 9.5M-18.0M for
+  failers.
+
+**Reference bugs found.** Four by gates, plus harness bugs: (1) VIRTUAL call to a class absent from the
+set got an empty target list, so "never null / writes nothing" held vacuously (Solution Quality R2);
+(2) `SIMPLE` lazy pipeline never built summaries (Solution Quality R3); (3) direct `InvokeDynamicInstruction`
+not invalidating RFRE caches in summary-aware mode, straight line and join (Auto Review at acceptance,
+demoted to Medium as pre-existing, **still open**); (4) no test for an UNANCHORED recursive cycle (Auto
+Review, Medium, **open**). Harness: a BuildKit bind-mount Dockerfile (FAIL, needs COPY), a new-mode
+compile fallback that emitted a synthetic id outside f2p/p2p (Verify Solution FAIL), and stale XML
+surviving an early runner failure (Medium, **open**).
+
+---
+
 ## 3. CROSS-PROBLEM LAWS
 
 | # | Law | Evidence |
@@ -2937,7 +3695,7 @@ container (failed loudly, rebuilt from a real clone).
 | L3 | **Scattered singleton failures mean the domain is separable — stop stacking traps.** | pulldown's 4 failures had 4 causes and no lever; adding rules would not have moved it |
 | L4 | **Diverse failure causes at a low rate = healthy. One shared cause = unfair.** | calyx runs13: 6 failures, 6 root causes, all agent-fault |
 | L5 | **The second axis of a one-sentence rule is free difficulty.** | calyx `@fixed_signature` ref cells, 28% kill |
-| L6 | **Name-based shortcuts pass name-shaped suites.** Include one instance whose name breaks the pattern. | calyx v7 `std_mult_pipe`; costs zero pass-rate |
+| L6 | **Name-based shortcuts pass name-shaped suites.** Include one instance whose name breaks the pattern. | calyx v7 `std_mult_pipe`; costs zero pass-rate; csbindgen-struct-layout-fidelity: 1/10 treated any `NonZero*`-named struct as a niche integer (sole failure of an otherwise 70/70 run) |
 | L7 | **Hardening surfaces your own reference bugs — 3 per problem, both times.** Every one would have shipped as an FP. | pulldown ×3, calyx ×3+ |
 | L8 | **A test that pins where an ambiguity resolves is unfair even if your reference is right.** | pulldown removed 4 such tests |
 | L9 | **An absolute meta sentence plus an unstated implementation exception costs a review round.** State exceptions in the same sentence. | calyx, three times |
@@ -2948,7 +3706,7 @@ container (failed loudly, rebuilt from a real clone).
 | L14 | **A false positive is not always "the reference is buggy" — verify the reference before touching the solution.** A candidate's own extra defensive check can be the actual bug; the real gap is often that the hidden suite never exercised the input that exposes it. | lyon-arcs-join: candidate added `!miter_limit.is_finite() -> None`; reference verified bug-free by direct probe (infinity == 1e6 output); fix was 3 new tests, zero solution changes |
 | L15 | **Mutation-kill counts do not predict agent-kill counts.** Mutations measure what your tests can DETECT; a batch measures what agents actually get WRONG. Build mutation coverage for FP protection; build composition cells (F-10) for difficulty. Never justify a hardening round on mutation evidence alone. | neva: the WaitAll barrier took mutation V10 from 0/12 to 2/15 and killed 0 of 10 agents; the trap that decided the band killed only 2 mutations. rust-minidump: the baseline-preservation axis was justified on "it reds 11 existing tests" and produced **0 baseline failures across 10/10 runs**. worldengine-orographic-precipitation: four of six DESIGN § 11 traps (wrap seam, steady state, mountain-start span, blend placement) killed 0 of 20 runs; the serialiser trap killed 11/20 through a mechanism I did not predict (F-28) |
 | L16 | **One test usually decides the band.** Redundant tests still earn their place (fairness, FP insurance, coverage review), but hardening effort belongs on the un-tested intersections, not on more instances of a covered axis. | neva: 20 of 21 tests changed no outcome; the F-10 cell alone separated 2/10 from 4/10. datafixerupper-ordered-alternatives batch 9: **156 of 173 tests (90%) killed nothing**, 17 carried the band, and one of those 17 decided it. worldengine batch 2: 52 of 66 killed nothing, and three round-trip tests carried 23 of 46 kill events |
-| L17 | **Reviewer coverage suggestions are free difficulty — take them.** They are written to close fairness gaps, and a fairness gap is by definition a behaviour the contract states but nothing tests, which is exactly where an agent can be wrong for free. | neva: the decisive test came from a Test Fairness coverage suggestion, not from the trap design |
+| L17 | **Reviewer coverage suggestions are free difficulty — take them.** They are written to close fairness gaps, and a fairness gap is by definition a behaviour the contract states but nothing tests, which is exactly where an agent can be wrong for free. | neva: the decisive test came from a Test Fairness coverage suggestion, not from the trap design **teavm-method-summaries:** 1 of 9 coverage-suggestion tests killed (null-summary fallback, 2/10, F-54); the rest 0 |
 | L18 | **Refines L4 — a shared failure cause is unfair only when NO agent cleared it.** The test is reachability, not diversity. Check: did anyone pass? did near-misses get everything else? did the evaluators mark `description_clear: true`? was the FP panel clean? If yes, one dominant cause is a legitimate design wall (F-1/F-9 family), not a hidden requirement. | neva: 6 of 8 failures on one root cause, 2 passes + 2 at 20/21, accepted |
 | L19 | **A wall that contradicts the repo's own published docs is a fairness bug that happens to be hard.** Concede it; do not buy it back by writing the contradiction into the meta. | neva: injected-dependency port remapping was the sole failure of 4 agents in an earlier round, and died to one line of the repo's own book |
 | L20 | **A single-seam problem is BIMODAL: its pass rate is a coin flip, not a difficulty.** If one decision gates every killer test, batches swing wildly while the artifact only improves. The tell is a per-test kill table where the killers are perfectly correlated — every failing run fails the IDENTICAL set. Adding tests to that seam cannot stabilise it; they all die together. Fix by adding a lever whose failures are INDEPENDENT of the seam, and confirm via a kill table with two separated clusters. | customasm: 0/13 -> 90% -> 20% -> 57% -> 9%; agent-runs 3 had 3 failures on the identical 13 tests; the accepted batch showed a near-miss cluster (1-2 fails) and a deep cluster (18-19) |
@@ -2966,7 +3724,7 @@ container (failed loudly, rebuilt from a real clone).
 | L33 | **A mutation battery scoped to your NEW tests cannot see a baseline-preservation trap, and its silence reads as proof the requirement is vacuous.** An S3 trap's discriminator is an EXISTING test by construction, so run every mutation against BASE mode too. Corollary: "no fixture I own catches it" is a statement about your problem configuration, not about the repo. | sfepy-adaptive-stepping-accounting: removing the final-step clamp's `clear_lin_solver` left all 74 new tests green across four probed configurations (explicit/implicit stepper, cached/plain matrices, presolve on/off, `maxdiff = 0.0` every time), so the sentence was cut from meta.md and the code deleted as dead. The next base run returned **220 passed, 1 failed** on the repo's own `test_ed_solvers`, which uses `use_presolve: True` over five ED solvers. The trap was real; my own problem used the EXPLICIT velocity-Verlet solver with presolve off, where a stale factorization cannot change the answer |
 | L32 | **A counterfactual over an old batch is valid only while the test suite is unchanged. Once it changes, run the differential harness instead.** Subtracting test names from an old failure list silently assumes the artifact the agents faced is the artifact you are shipping. | gluon-format-comments: projected 2/12 from batch-1 data after adding 11 tests, and batch 2 returned 0/14. Re-projected by APPLYING the near-miss runs' own patches to the reduced suite (two scored 37/37), and the next batch returned a legitimate pass |
 | L34 | **A fairness disclosure is a difficulty DEBIT that settles one batch later.** Every clarification you write to clear a fairness flag also hands the fix for whatever trap that sentence was hiding. The edit looks locally correct and the collapse is invisible until the next batch. Pay the debt in the SAME round: when you disclose, add an orthogonal trap alongside it. | vrp-tsplib: three consecutive fairness rounds (DISPLAY_DATA_TYPE scoping, header-ordering, GEO restatement) took the display-data cluster 2/9 -> 0/10 and GEO 1/9 -> 0/10, leaving ONE surviving trap and a 50% batch. Also customasm L21, where the fairness fix and the difficulty collapse arrived together |
-| L35 | **The differential harness measures a TEST-suite delta; it cannot measure a DESCRIPTION delta.** Replaying old passing patches through a hardened suite counts every agent who did not know the new rule -- but the next batch reads the new meta.md and most will implement it. Treat the harness kill count as an UPPER BOUND. When the hardening added a description sentence, discount it hard; when it only added tests for already-stated behavior, trust it. Refines L32, which prescribes the harness without bounding it. | vrp-tsplib: the ascending-node-order lever killed 3 of batch 11's 5 passing patches in the harness and **0 of 10** in batch 12. Those five never read the ordering sentence; the next ten did. **Largest instance measured:** datafixerupper-ordered-alternatives iteration 67 replayed both batch-8 passers against the reduced suite and BOTH failed (5 and 3 of 173), projecting **0/10 = unsolvable-reject**; batch 9 returned **5/10**. The projection was 50 points low because the round had rewritten the contract those two solutions were built against — when the description delta is a DELETION, the harness is not merely an upper bound, it is nearly uninformative |
+| L35 | **The differential harness measures a TEST-suite delta; it cannot measure a DESCRIPTION delta.** Replaying old passing patches through a hardened suite counts every agent who did not know the new rule -- but the next batch reads the new meta.md and most will implement it. Treat the harness kill count as an UPPER BOUND. When the hardening added a description sentence, discount it hard; when it only added tests for already-stated behavior, trust it. Refines L32, which prescribes the harness without bounding it. | vrp-tsplib: the ascending-node-order lever killed 3 of batch 11's 5 passing patches in the harness and **0 of 10** in batch 12. Those five never read the ordering sentence; the next ten did. **Largest instance measured:** datafixerupper-ordered-alternatives iteration 67 replayed both batch-8 passers against the reduced suite and BOTH failed (5 and 3 of 173), projecting **0/10 = unsolvable-reject**; batch 9 returned **5/10**. The projection was 50 points low because the round had rewritten the contract those two solutions were built against — when the description delta is a DELETION, the harness is not merely an upper bound, it is nearly uninformative **pyocd-sequence-expression-kernel:** the replay projected 2/11 for the final suite (0/11 with the byte test); batch 2 read **5/10**, and the byte-response test that failed every replayed patch killed **0/10** once meta.md stated the byte form with an example. |
 | L36 | **Stale no longer means re-run: a tests-only round re-grades at ~30% via RE-EVAL, and the button's presence is the L35 test.** Editing `test.patch` / `solution.patch` leaves the agents' solving valid (same prompt, same repo), so the platform re-runs grading + evaluation over the last batch's solutions for roughly 30% of batch price. Editing `meta.md` / title / environment invalidates the solving and there is no button. Consequences: freeze the solver-visible surface BEFORE the first batch and iterate tests after it; never fire a smoke run while a re-eval is pending (any fresh run dismisses the offer); and treat re-eval as PAIRED steering over one fixed solution set, not a fresh sample — it cannot re-roll the batch variance that made one artifact read 22% and 50%. Operationalizes L32 (the differential harness, now run by the real grader) and mechanizes L35 (no button = your lever was a description delta). | Platform update 2026-09-03. Local precedent: gluon-format-comments needed a full batch to learn that dropping one printer axis turned 0/12 into a legitimate pass (L32); vrp-tsplib needed batch 12 to learn the harness had over-counted 3 kills to 0 (L35). Both are now re-eval-shaped questions |
 | L37 | **An FP panel's defect report is DIFFICULTY, not just fairness debt — harvest it as a trap.** L17 says reviewer coverage suggestions are free difficulty; this is stronger. A false-positive finding names a behaviour a passing agent got WRONG, which is by construction a live discriminator, and the fix is a test you can write in an afternoon. Treat every FP report as a trap proposal, and re-read EVERY passer's diff for the same defect class -- the panel names the instance it can see, not the class. | go-workflows: the FP panel flagged one passer's `Select` regression; reading the other passers found the IDENTICAL defect in a second run the panel cleared (true FP count 2 of 3, not 1). The guard written from it became F-20 and decided the band (8/10, both near-misses). The trap I designed myself, the arrival-order queue, killed 2/10 |
 | L38 | **When one fair trap kills ~100%, the lever is WHEN-discoverability, not deletion.** A cluster of tests failing in every run is not automatically over-strict: if it is one root cause and the contract already states the behaviour, agents are missing WHEN the behaviour must hold, not THAT it must. Restating the timing in the existing sentence, naming no API, is the cheapest lever measured on a 0% batch. | go-workflows scheduler-resumption cluster: 5/5 kills at batch 10 (0/5 overall). Changing "both proceed on their own" to "both **resume before the scheduler run that drained them finishes**" -- one clause, no new requirement, reference already conformed -- dropped it to **1-2/10** at batch 11 and the batch passed 2/10. Deleting the cluster was impossible: all 5 tests were one insight, so any subset left the near-miss still failing |
@@ -2993,7 +3751,7 @@ container (failed loudly, rebuilt from a real clone).
 | L59 | **Never assert exact equality on a value a formula produces, even at a mathematically exact point.** Equivalent algebra lands a few ulps away, the review flags it as over-pinning (T5), and correct agents fail. Compare with a tolerance and keep discrete parts (direction, sign) exact. | worldengine batch 1: **5/10** runs returned 0.9999999999999993 or 0.9999999999999998 for a band-centre strength through `wind_at`; Auto Review Tests 1/3 cited it |
 | L60 | **A parity promise between twin implementations imports every pre-existing divergence into review scope. Fix them all in the reference, but test only the divergences the feature's own inputs reach.** Each Solution Quality round finds another py/cc or undefined-behaviour asymmetry, and a regression test for one is a fresh trap unrelated to the feature (L55 through a new door). The FP adjudicator scopes "identical output" to what the feature exercises only when the fixtures stay inside that range. | cwerg-bcopy-bzero-lowering: about nine pre-existing divergences fixed over rounds 10-27. Testing float-DIV parity and narrow DIV/REM/CNTPOP chains took batch 5 to **0/9** (9/9 and 8-9/9 kills); a Docker replay without them read 3/9, and batch 6 was accepted at **3/10**. All three passes still fold signed DIV differently in Python and C++; every FP judge dissent on it was overruled as "pre-existing, task-unrelated... the hidden bulkwrap programs deliberately use only wrapping ops for lengths" |
 | L61 | **Bisect a test that kills everyone against the near-miss's OWN patch before you touch the description: a breadth-only program can be reaching a pre-existing bug outside the feature.** Coverage programs added for reviewer breadth pick up whatever else the repo gets wrong for those inputs. | cwerg: the parity-only `bulkshapes` program killed **11/11** in batch 2 (1/10 in batch 1, before typed constants were loaded into it for reviewer findings). Bisecting Nova #10's build showed x64 diverging only on typed constants and a32/a64 failing in the Python backend on callee-parameter widening. Dropping it: re-eval **1/11**, projection exact |
-| L62 | **The platform's environment start timeout (600 s) includes the Docker image build. Measure a cold `--no-cache` build, not a warm one.** Verify Solution reports `EnvironmentStartTimeoutError` while every local run is green. A C++ tool build followed by `chmod -R` over files from a lower `COPY` layer pays an overlayfs copy-up of the whole tree. | cwerg: cold build 704 s, `chmod -R a+rwX /app` alone 261 s. Moving COPY, build and chmod into one `RUN --mount=type=bind,source=.,target=/src` layer: 413 s, `/app` byte-identical (3080 hashes + modes), and batch 5 built in all nine runs |
+| L62 | **The platform's environment start timeout (600 s) includes the Docker image build. Measure a cold `--no-cache` build, not a warm one.** Verify Solution reports `EnvironmentStartTimeoutError` while every local run is green. A C++ tool build followed by `chmod -R` over files from a lower `COPY` layer pays an overlayfs copy-up of the whole tree. | cwerg: cold build 704 s, `chmod -R a+rwX /app` alone 261 s. Moving COPY, build and chmod into one `RUN --mount=type=bind,source=.,target=/src` layer: 413 s, `/app` byte-identical (3080 hashes + modes), and batch 5 built in all nine runs. **2026-09-23: the platform Dockerfile check now FAILS a bind mount + `cp` (must use COPY).** Use `COPY --chown=1000:1000 . .` and chmod only directories and root-owned build outputs (`find /app \( -type d -o -user 0 \) -exec chmod a+rwX {} +`): teavm 431 s vs 816 s for a full `chmod -R`, and unmapped uid 4242 still applies patches (Pattern 91) |
 | L63 | **In a compiled repo whose Dockerfile builds into `/app`, the build outputs are tracked files in the solver's sandbox. Agents `git restore` them to keep a source-only diff, the restore makes them newer than the edited sources, and a plain incremental `make` in test.sh then grades the BASELINE binary.** The batch reads as universal failure with no per-test signal, and evaluators flag runs as verifier blockers. Make test.sh rebuild what it tests regardless of timestamps (`make -B <targets>`, or delete the tracked outputs first), or be ready to contest every flagged run with the trajectory call that did the restore. | tippecanoe-tile-join-size-recourses: 9 of 10 trajectories restored `.o` files or `tile-join`; evaluators said 7 runs were graded against stale or unlinked binaries, each failing 49/49. The only run that never restored was the only pass. Two ENV-blocked flags were contested with the restore call and upheld. All seven also had a separate source defect, so forcing the rebuild would likely have left the rate at 1/10 while keeping the JUnit files usable |
 | L64 | **The working pool is cumulative: a later batch folder re-lists every earlier run under new numbers and appends the new ones. Fingerprint runs (added LOC plus prompt tokens) before mining, or every kill counts twice and the appended runs look like repeats.** Mine only the latest folder. | sfepy: the accepted folder held batch 10's 12 runs renumbered plus 4 appended (Nova, Orion, Vega x2); Auto Review's "2 of 15" is the pool |
 | L65 | **A zero from a Nova-heavy batch, with near-misses failing STATED sentences, measures the agent, not solvability. Add Orion or Vega runs before cutting a fair requirement.** Check fairness first: probe the near-miss patches to confirm they truly violate the sentence (Pattern 93). | sfepy: Nova 0/11 with two runs at 116/117; the 4 appended runs held both passes (Orion 1/1, Vega 1/2) |
@@ -3008,8 +3766,26 @@ container (failed loudly, rebuilt from a real clone).
 | L74 | **A host-language edge found by review can decide the band and still be accepted, but reviewers discount it as a tripwire.** When most failures are one special-key or one host-semantics cell, the agent-run review reports the strict pass rate as overstating difficulty. Pair such a cell with a core-algorithm killer so the failures are not mostly one edge. | featurevisor-minimal-rebucketing: `__proto__` took 7 of 9 failures, six of them near-misses at 33/34; the Auto Review filed a High "difficulty discrepancy" (effective difficulty "two full passes and six near-passes") and still approved, carried by the independent F-39 cluster (3/11) |
 | L75 | **Exact-boundary semantics are only testable on binary-exact geometry. A trajectory or approximated shape that lands within float noise of an edge turns an epsilon policy into a kill.** Circle centroids come from a buffered polygon and miss the exact centre by an ulp; a robot integrated at 0.1 m per step can land an ulp either side of the edge. Put inclusive/strict boundary cells on squares at dyadic coordinates, and treat a dynamic crossing near an edge as a measurement of rounding, not of the rule. | ir-sim-scenario-events: three edge/threshold tests passed by chance on circles (centroid 2.000000000000001) until moved to squares; 2/11 agents failed the remaining dynamic `leave` cell by widening the closed rectangle 1e-12 (logged 2.1 instead of 2.0); the Auto Review still called it fair |
 | L76 | **When a reviewer-found reference bug is one every agent shares (N/N), keep the fix and do not ship its test unless meta.md states the behaviour.** The test zeroes the batch, and a description that promises the opposite makes it a hidden requirement. Expect an FP-panel judge to probe the passer on it anyway; the adjudicator rules it out of scope. Refines L50/L55/L66. | ir-sim-scenario-events: the id-rewind regression test (created-but-unadded object keeps its id across reset) killed **11/11** in the local replay, the lone passer included, against a meta.md that promised "the same ids" on replay; shipped without it at 1/11; FP judge #2 flagged the passer on that probe and the adjudicator called the probe unfair |
-| L77 | **Naming the root cause of an N/N inherited gap in one meta clause takes it to 0/N. It restores fairness; it buys no difficulty.** Use it when a reviewer-found reference bug is shared by every run and the behaviour is already implied by the contract, and budget the band on the other walls. | featurevisor-target-specialization: the `{`/`[`-only condition parser was in 10/10 batch-1 solutions and the reference; "stringified in any form the builder writes today, scalar JSON included" -> 0/10 kills in batch 2, which read 3/10 on the other walls |
+| L77 | **Naming the root cause of an N/N inherited gap in one meta clause takes it to 0/N. It restores fairness; it buys no difficulty.** Use it when a reviewer-found reference bug is shared by every run and the behaviour is already implied by the contract, and budget the band on the other walls. | featurevisor-target-specialization: the `{`/`[`-only condition parser was in 10/10 batch-1 solutions and the reference; "stringified in any form the builder writes today, scalar JSON included" -> 0/10 kills in batch 2, which read 3/10 on the other walls; csbindgen-struct-layout-fidelity: the niche-Option array cell (two stated rules combined) killed 8/16 in batch 3, one clause naming the combination -> 0/10 in batch 4 |
 | L78 | **When test.patch removes repo specs the feature supersedes, some agents update those specs themselves and are graded PASS_CHEATED.** The run counts as a failure however good the solution. Expect about one per batch and read the strict rate with that in mind; do not treat it as a difficulty signal. | featurevisor-target-specialization: 1/10 PASS_CHEATED in each batch (24 `applyContextToDatafile.spec.ts` / `buildDatafile.spec.ts` cases removed by test.patch) |
+| L79 | **Every fixture the suite generates must be asserted or deleted. An unasserted fixture is an FP trap: a candidate that gets it wrong still passes, and the FP panel voids the pass.** Refines L76: when you drop an unfair test, drop its fixture too. | csbindgen-struct-layout-fidelity: ScopeOne/Two, LeftHolder/RightHolder, PtrAliases and DeepAlias were listed in TYPES but unasserted after four rounds of skipping reference-only tests; the FP panel ruled **3/3** batch-2 passes false positives on exactly those structs. A programmatic TYPES-vs-assertion audit kept every later round clean |
+| L80 | **A contract sentence that promises a host-language semantic in full (name resolution, module scoping, overload rules) turns Solution Quality into an unbounded ratchet. Narrow the contract instead of chasing.** Each fix exposes a narrower corner the reviewer can ground in the same sentence. | csbindgen-struct-layout-fidelity: "a const or alias name resolves in the module that uses it" -> **11 consecutive Solution Quality FAILs**, each a deeper scoping corner, with the pass rate unmeasured throughout; deleting the sentence and the const-name feature -> next Auto Review **approved 3/3/3**, batch accepted at 1/10 |
+| L81 | **An enumerated list in a contract sentence reads as exhaustive.** Agents treat anything the list omits as unsupported, even when the general rule covers it. Name every member the tests use, or state the rule without a list. Extends L1. | csbindgen-struct-layout-fidelity: "pointers, `usize`, `isize`, `c_long` and `c_ulong` take 8 bytes" -> **7/16** gave `c_float`/`c_double` no layout; adding "`c_float` takes 4 and `c_double` 8" -> **1/10** |
+| L82 | **Never assert the repo's own self-consistency checker once the feature changes what it checks.** `isIndexValid()`-style validators recompute internal bookkeeping their own way and demand exact equality, so any sound-but-different representation fails while every query answer is right. That is a representation pin, not a behaviour. Assert the behaviour (oracle comparisons on a deep tree) instead; the base suite's own calls stay as they are. | libspatialindex-tpr-temporal-knn batch 2: **9 of 10** blocking failures were `ASSERT_TRUE(scene.tree->isIndexValid())` after entry expiry changed node-bound maintenance; five runs failed ONLY that. Removed, the same ten solutions replayed at **5/10**, and the five near-misses passed the very oracle comparisons the ASSERT had been aborting |
+| L83 | **When a differential probe finds zero divergence among passers, the derivable surface is exhausted: stop adding cells and look for state the repo discards.** Grep the persistence and aggregation layers for a field the write path never mentions, a commented-out read, or a sentinel assigned on load, and make the feature depend on it (F-47). Reviewer coverage suggestions (L17) buy nothing against a converged population. | libspatialindex-tpr-temporal-knn: 57 probes x 7 passers = 0 divergences, 16 coverage tests (every advisory suggestion) = 0 new kills, 4 composition cells = 0; the per-entry end of motion `Node.cc` never persisted moved the rate **7/10 → 5/12** and carried the lead wall (4/12) |
+| L84 | **A feature that widens a persisted record will be probed for loading the OLD format, stated or not. Version per record, not per header.** Evaluators fail 100% runs on it and FP judges split on whether it is in scope. A header flag cannot describe a tree that mixes old and new pages, and a "legacy mode" that keeps writing the old layout silently loses the new field for new data. | libspatialindex-tpr-temporal-knn: a run with 73/73 + 27/27 was failed by its evaluator for an unversioned page; FP judges raised the same probe on 4 more passers across batches 3-4 (upheld 1, over-ruled 3); the reference's header-level `LegacyEntries` mode was itself a Solution Quality FAIL (a reopened old tree dropped new inserts' end times) until the flag moved into the node type word |
+| L85 | **A 0% batch is a claim about the ARTIFACT, not the design — mine it before changing anything.** Separate causes you own (a helper calling reference-only API, an ambiguous sentence, a wall a review round added) from difficulty, then re-measure. | siliconcompiler-flist-roundtrip batch 1: 0/11, of which a helper calling `get_filetypes()` masked 5-7 tests per run, one ambiguous spelling sentence took 4 tests at 9-11/11, and a `file://` requirement added in a Solution Quality round killed 11/11. The real trap (F-49, 7/10) was invisible until all three were removed; batch 2 read 2/10 **pyocd-sequence-expression-kernel** batch 1: 0/11, and one rule added in a review round (a control predicate must produce a value) killed 8/11 and was both near-misses' sole failure; batch 2 read 5/10. |
+| L86 | **Price every candidate cut by replaying the saved patches against it; do not cut by intuition.** Each option has a measurable rate, and the difference between "fair" and "too easy" is usually one sentence. | siliconcompiler-flist-roundtrip: fixing the unfair items alone projected 0/11, also cutting the `file://` case 3/11, additionally clarifying the edge-ownership sentence **9/11**. The last option looked like the same class of fairness fix as the others and would have destroyed the problem **pyocd-sequence-expression-kernel:** the replay chose the cut (2/11) after an intuitive broader cut fell under the LOC floor, and after batch 1 it withheld three reviewer-requested tests that each replayed at 0/11 (undocumented JTAG bytes, `DAP_WriteABORT`, a string-returning statement). |
+| L87 | **Explicitness is a measurable dial on a single axis, not a fairness switch.** Naming both readings of an ambiguous noun can take an axis from band-carrying to free, with no code change. | siliconcompiler-flist-roundtrip: the pre-existing-data-root test killed **6/11** under "a root registered earlier" and **0/10** once the sentence named both kinds of existing root **pyocd-sequence-expression-kernel:** one concrete consequence sentence took a scope test 6/11 -> 0/10 and call-boundary under-reduction 7/11 -> 0/10; the same batch then showed 2/10 OVER-applying the now-concrete rule one layer early (F-52). The dial moves the error, it does not delete the boundary. |
+| L88 | **A mutation that kills nothing is a test-gap signal, and closing it can produce the band decider.** L15 still holds for justifying a TRAP on mutation evidence; this is the converse use — a surviving mutation names a behaviour no fixture reaches. | siliconcompiler-flist-roundtrip: the "edges recorded on the reading design" mutation survived the whole suite, which forced a three-level chain fixture; that fixture became the 7/10 lead killer and the sole failure of five near-misses. A two-level sibling graph cannot see it |
+| L89 | **A carve-out that names only the exception pulls look-alikes across the boundary.** When a contract splits calls into two classes, name members of BOTH, with every tested call placed by name. Naming only the stepwise class made agents file anything that LOOKS stepwise with it. | pyfakefs-block-inode-accounting: five `create_dir`/`create_file` rollback tests, tests and solution unchanged: 0/11 (universal sentence) → 9-10/12 (one-sided carve-out) → 0/10 (both sides named) |
+| L90 | **The reference bugs Solution Quality finds are the batch's near-miss killers — build a test for each one.** An author who has just made a mistake in their own reference has located a place a capable implementer goes wrong. Keep the fix AND add the discriminating test; it is the cheapest calibrated trap you will get. | pyfakefs-block-inode-accounting: all three accepted-batch near-miss causes (unlimited placeholder as a limit, Windows symlink sized by stat, imports inheriting `create_dir` rollback) were reference bugs found at R4, R5 and R17 **Counter-evidence, pyocd-sequence-expression-kernel:** eleven reference bugs found by gates, each given a test; in the accepted batch they killed NOTHING, except that the test built for the round-1 finding (results not reduced) caught the OPPOSITE error (arguments over-narrowed, F-52, 2/10). L90 holds when the reviewer finds a place implementers go wrong; it fails when the finding is a reviewer-invented input (L93) or a contract gap no implementer reaches. **teavm-method-summaries (second counter-case):** two real Solution Quality reference bugs (absent-class VIRTUAL call, unwired `SIMPLE` pipeline), each with a test: 0/10 kills; see L95. |
+| L91 | **Refines L80 — Solution Quality only ever ADDS requirements, and their sum can pass solvable with every round individually fair.** Batch after the second gate round, not after the eighth. When a finding says "the contract promises X, so this path must do X too", prefer narrowing the sentence over implementing the Nth path. | pyfakefs-block-inode-accounting: Description 3/3 and Solution & Code 3/3 before any batch, then **0/11** with six tests at 11/11, all added between R4 and R9 **pyocd-sequence-expression-kernel:** eleven review rounds after the core slice; batch 1 0/11 was the round-3 predicate rule (8/11). Of the ~100 test cases added in review, only the round-1 argument test killed anyone in the accepted batch. |
+| L92 | **An arbitrary value for an argument the rule under test does not govern is an accidental trap, and read the assertion diff, never the test name, before attributing a kill.** Pass every non-governed argument an in-contract value. A test name says which rule the test was FOR; the diff says which rule the agent broke. | pyocd-sequence-expression-kernel: `tms=3` (the probe API documents 0 or 1, and the CMSIS-DAP layer masks it itself) killed 3/10 in the accepted batch, one near-miss on its own, plus Vega in batch 1: the only run-deciding trap that nobody designed. Batch 1's Vega failure had been read from test names as "JTAG width", and that misreading framed a keep-or-cut decision |
+| L93 | **A requirement a reviewer derives from a HYPOTHETICAL input costs rounds, not difficulty. Check whether the repo's own contract ever produces that input.** If it never does, satisfy the reviewer in the solution and keep the contract silent on the one case the tests cannot afford. A boundary sentence stating the repo's real contract may be overridden anyway. | pyocd-sequence-expression-kernel: rounds 8, 10 and 11 argued over a `-> str` sequence function; the repo has none (23 return `int`, 16 return `None`, and the delegate docstring says fixed-zero functions return `None`). The sentence saying so was overridden in round 11. Final design: static STRING rejection plus no-value at run time, contract silent on a bare string statement. Its tests killed 0/10 |
+| L94 | **A sentence can state an algorithm's DIRECTION and still not transmit it.** Where the natural construction starts from the wrong end of a fixed point, the sentence stays a trap after it is written down, and evaluators rule it fair. | teavm-method-summaries: "the most precise facts that hold for all methods at once, so recursion and mutual recursion lose nothing by themselves", and still **4/10** initialized never-null to false and promoted (F-53), three of them 25/26; all judged described AND inferable |
+| L95 | **Gate-found tests land where agents already converge.** A gate reads the reference, so its finding marks a place the AUTHOR went wrong, not a place implementers do. Budget them as insurance, not difficulty; the one that kills is the test asserting behaviour agents have a reason to change. | teavm-method-summaries: 2 Solution Quality reference bugs + 9 Auto Review / coverage cells, **0/10 kills** across all 11; the single coverage-suggestion kill (2/10) asserted the OLD no-summaries output (F-54). Second problem after pyocd (L90 counter-evidence) |
+| L96 | **Never put a frequency or timing property in the contract (once, lazily, cached, only after X) unless a test can observe it.** Reviewers score it as an untested requirement, and the only discriminators are bytecode counting or timing, both unfair. | teavm-method-summaries: "builds the summaries once per build" drew a High "untested" finding and Tests 1/3; counting `MethodSummaries.build` would also fail an agent building through its own overload. Dropped from meta.md; the Tests band came back to 2/3 |
 
 ---
 
@@ -3063,6 +3839,13 @@ problems**. Until then it lives here as problem-specific evidence. Demote to the
 
 | Repo has… | Reach for | Expected |
 |---|---|---|
+| A whole-program analysis computing a MUST fact (never null, never throws) over a call graph with cycles, next to a MAY fact the same pass computes | **F-53** — state "most precise facts for all methods at once"; test a jointly never-null cycle with one anchored exit, plus a cycle a null reaches | 4/10, sole failure of three 25/26 near-misses. Stays hard after it is stated (L94) |
+| An opt-in feature whose OFF state is promised unchanged, where the ON state must handle a case the base code silently ignores (arguably wrongly) | **F-54** — one "without X every pass behaves as it does today" sentence and one off-path test across the newly handled case | 2/10, one sole failure. Came from a coverage suggestion |
+| A pass keyed by a variable/node index with a second deferred path (join, frontier, replay queue) that stores the key, and a feature that needs "all of them" | **F-55** — test the "all" case on the straight line AND across a join, separately | 2/10, compound. Free if both paths exist |
+| A pluggable delegate, driver or backend seam whose INPUT tests can record, with a narrowing that belongs to the concrete operation below it | **F-52** — state the full-domain rule at the seam and the narrowing at the operation in adjacent sentences; test the seam with a recording delegate and the operation with the real implementation over a mock | 2/10, the sole failure of both runs (146/150). One sentence, but only once the seam rule is concrete (L87); abstract, the same tests killed 7/11 by under-reducing |
+| Writer flattens a DAG to a flat record list; reader rebuilds one object with no edges | **F-49** — round trip the graph, edges carried inside each record | 7/10, sole failure of five near-misses. Needs a THREE-level fixture; a two-level sibling graph measures nothing |
+| An "unlimited" mode AND a stats API that must report a finite number for it | **F-50** — test a request just PAST the reported figure, on each axis (bytes, inodes, reconfiguration) | 2/10 accepted batch, 4 runs earlier. Zero extra words if both halves are already stated |
+| A size or length getter with an OS-type / mode branch, and a feature that accounts the real stored quantity | **F-51** — one test on the non-default OS type asserting stat, the mount and the usage report | 3/11 → 5/12 → 1/10 across three batches; the repo's own test reinforces the wrong source |
 | A pipeline stage that destroys info a later stage needs | **F-1** | Largest single lever measured (+27 pts). Overshoot risk — disclose the root cause |
 | A construct that is producer AND consumer | **F-2** | ~50% kill; needs a real fixed point |
 | An options struct with an existing boolean `with_*` setter | **F-16** | 4/10, but a COMPILE error — bonus only, never the lead trap |
@@ -3111,8 +3894,13 @@ problems**. Until then it lives here as problem-specific evidence. Demote to the
 | A small range, cursor or allocation helper whose loop exits early and rebuilds its result from only the items it touched, used today only by callers whose input keeps that path unreachable, next to a feature that must feed it the other regime | **F-39** | 3/11 on featurevisor, three independent implementations. Zero description words: state the observable rule ("walked in order", "lowest first") and test a case where an earlier range is used up EXACTLY |
 | A JS/TS feature that reports figures in a record keyed by user-controlled strings whose repo type is unrestricted `string` | **F-40** | 7/11 on featurevisor, sole failure of six 33/34 near-misses. One `__proto__` test; pair it with a core killer or reviewers call the rate overstated (L74) |
 | An expression language where bare lists (implicit AND) may nest under named operators, and a feature that makes the agent evaluate or rewrite expressions itself | **F-43** | 2/10 then 1/10 on featurevisor-target-specialization; caught only by a seeded corpus compared against the repo's evaluator (Pattern 99) |
+| A code generator with aliases AND pointer/array wrappers, plus a feature adding a second type rewrite (lowering, flattening, niche erasure) | **F-44** | 6/16 then 7/10 (lead trap) on csbindgen-struct-layout-fidelity; test pointer-to-alias-of-array, alias-of-pointer-to-array, and one extra pointer level |
+| An emitter that decorates a scalar kind (attribute, annotation, cast) and a feature adding an aggregate form of that kind | **F-45** | 3/16 then 3/10; verify on the real runtime that the decorated aggregate is actually wrong |
+| A feature that chooses output by comparing a source-side model against a target-side model of NESTED values | **F-46** | 5/16 then 2/10, all via free P2P "stays Sequential" guards on containers of a promoted nested type |
 | Exported helpers with their own spec files that the feature's natural design would change | **F-12** (exported variant) | 7/20 on featurevisor-target-specialization; put the reference's new logic beside the helpers and keep their specs in base mode |
 | A loader that resolves names against two origins (disk and bundled resources) plus a second consumer (validator, watcher, CLI) that re-resolves a relative reference on its own | **F-9** origin variant | 3/10 on planetiler. Test a standalone bundled root whose sibling reference must come from the bundle |
+| A persisted index or cache whose value type already carries a field the store writes nowhere, reads back as a sentinel, or has commented out | **F-47** | 4/12 on libspatialindex-tpr-temporal-knn, lead wall; test on a deep tree, after reopen, and via the C API; never pin the store's self-check (L82) |
+| An existing public method whose parameter type is broader than the new contract accepts, with a base path that already handles the broad type | **F-48** | 3/12 on libspatialindex-tpr-temporal-knn; one general rejection sentence plus one test passing the base type |
 
 **Ship-in-every-problem shortlist.** F-10 has no precondition worth calling a precondition —
 almost every multi-capability contract has two axes — and it is the only pattern measured to
@@ -3281,3 +4069,12 @@ C-id as equivalent in strength to an F-id, and do not renumber or merge them int
   batch's pass-rate as INVALID until the API is documented, then re-run.
 - **PROMOTED to L72 (2026-09-18)** on a second independent source: planetiler-custommap-schema-composition
   batch 1, 8/8 compile-wiped on an unstated static `SchemaConfig.files(Path)`.
+
+### C-6 · Recursive removal releases only in the non-recursive branch (seen: pyfakefs-block-inode-accounting · Nova_9)
+- Symptom: 112/117. Directory inodes leak on `rmdir`, on removing a tree, and on repeated
+  create/remove cycles; files are released correctly.
+- Root cause: `remove_entry` handles a recursive `FakeDirectory` in an `if` branch and put the
+  release call only in the matching `elif`, so directories never give their inode back.
+- Watch for: any accounting hook added to a removal function that branches on "recurse first".
+  Promote on a second independent run.
+

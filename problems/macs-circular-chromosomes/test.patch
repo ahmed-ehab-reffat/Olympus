@@ -1,0 +1,594 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..6716599
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,80 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++OUTPUT_PATH="${OUTPUT_PATH:-/tmp/macs3-test-results.xml}"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++rm -f "$OUTPUT_PATH"
++
++cd "$(dirname "$0")"
++export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
++
++NEW_TESTS="test/test_circular_chromosomes_c4ea93.py"
++
++BUILD_LOG="$(mktemp)"
++python setup.py build_ext --inplace -j "$(nproc)" > "$BUILD_LOG" 2>&1
++BUILD_RC=$?
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest -p no:cacheprovider -q "$NEW_TESTS" --junitxml="$OUTPUT_PATH"
++else
++  python -m pytest -p no:cacheprovider -q test --ignore="$NEW_TESTS" --junitxml="$OUTPUT_PATH"
++fi
++TEST_RC=$?
++
++python - "$OUTPUT_PATH" "$BUILD_RC" "$BUILD_LOG" "$MODE" <<'PYEOF'
++import os
++import sys
++import xml.etree.ElementTree as ET
++
++path, build_rc, build_log, mode = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
++with open(build_log, errors="replace") as f:
++    log_tail = f.read()[-4000:]
++
++tree = None
++if os.path.exists(path):
++    try:
++        tree = ET.parse(path)
++    except ET.ParseError:
++        tree = None
++
++cases = tree.getroot().iter("testcase") if tree is not None else []
++cases = list(cases)
++if not cases:
++    root = ET.Element("testsuites")
++    suite = ET.SubElement(root, "testsuite", name="macs3-" + mode, tests="1", failures="1")
++    case = ET.SubElement(suite, "testcase", classname="macs3." + mode, name="test_collection")
++    failure = ET.SubElement(case, "failure", message="no test results were produced")
++    failure.text = log_tail
++    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
++    sys.exit(1)
++
++for case in cases:
++    case.set("classname", case.get("classname", "").replace("::", "."))
++    case.set("name", case.get("name", "").replace("::", "."))
++    if build_rc != 0:
++        for child in list(case):
++            if child.tag in ("skipped", "failure", "error"):
++                case.remove(child)
++        failure = ET.SubElement(case, "failure", message="extension build failed")
++        failure.text = log_tail
++tree.write(path, encoding="utf-8", xml_declaration=True)
++sys.exit(1 if build_rc != 0 else 0)
++PYEOF
++POST_RC=$?
++
++rm -f "$BUILD_LOG"
++if [ "$BUILD_RC" -ne 0 ] || [ "$POST_RC" -ne 0 ]; then
++  exit 1
++fi
++exit "$TEST_RC"
+diff --git a/test/test_circular_chromosomes_c4ea93.py b/test/test_circular_chromosomes_c4ea93.py
+new file mode 100644
+index 0000000..1f4c68c
+--- /dev/null
++++ b/test/test_circular_chromosomes_c4ea93.py
+@@ -0,0 +1,502 @@
++import gzip
++import os
++import struct
++import subprocess
++import sys
++
++import numpy as np
++import pytest
++
++REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++MACS3 = [sys.executable, os.path.join(REPO, "bin", "macs3")]
++RL = 50
++FRAG = 200
++L = 20000
++
++
++def bam_record(ref, pos, flag, next_ref, next_pos, tlen, name):
++    qname = name.encode() + b"\0"
++    seq = bytes(RL // 2)
++    qual = bytes([30]) * RL
++    body = struct.pack("<iiBBHHHiiii", ref, pos, len(qname), 60, 4680, 1,
++                       flag, RL, next_ref, next_pos, tlen)
++    body += qname + struct.pack("<I", RL << 4) + seq + qual
++    return struct.pack("<i", len(body)) + body
++
++
++def write_bam(path, chroms, records):
++    text = b"@HD\tVN:1.6\n"
++    header = b"BAM\1" + struct.pack("<i", len(text)) + text
++    header += struct.pack("<i", len(chroms))
++    for name, length in chroms:
++        header += struct.pack("<i", len(name) + 1) + name.encode() + b"\0"
++        header += struct.pack("<i", length)
++    records = sorted(records, key=lambda r: (r[0], r[1]))
++    with gzip.open(path, "wb") as f:
++        f.write(header)
++        for i, r in enumerate(records):
++            f.write(bam_record(*r, "r%d" % i))
++
++
++def se_records(reads):
++    records = []
++    for ref, five, strand in reads:
++        if strand == 0:
++            records.append((ref, five, 0, -1, -1, 0))
++        else:
++            records.append((ref, five - RL, 16, -1, -1, 0))
++    return records
++
++
++def pe_records(frags, lengths, rng):
++    records = []
++    for ref, left, flen in frags:
++        clen = lengths[ref]
++        right = (left + flen - RL) % clen
++        proper = left + flen <= clen
++        first_plus = bool(rng.integers(0, 2))
++        pflag = 1 | 32 | (2 if proper else 0) | (64 if first_plus else 128)
++        mflag = 1 | 16 | (2 if proper else 0) | (128 if first_plus else 64)
++        tlen = right + RL - left
++        records.append((ref, left, pflag, ref, right, tlen))
++        records.append((ref, right, mflag, ref, left, -tlen))
++    return records
++
++
++def site_reads(rng, ref, center, n, clen):
++    reads = []
++    for _ in range(n):
++        flen = int(rng.integers(170, 230))
++        left = (center - flen // 2 + int(rng.integers(-40, 41))) % clen
++        reads.append((ref, left, 0))
++        right = (left + flen) % clen
++        reads.append((ref, right if right else clen, 1))
++    return reads
++
++
++def background_reads(rng, ref, n, clen, gap=None):
++    reads = []
++    for p in rng.integers(0, clen, n):
++        if gap and gap[0] - FRAG <= p < gap[1] + FRAG:
++            continue
++        strand = int(rng.integers(0, 2))
++        reads.append((ref, int(p) if strand == 0 else int(p) + 1, strand))
++    return reads
++
++
++def valid_se(reads, lengths):
++    kept = []
++    for ref, five, strand in reads:
++        clen = lengths[ref]
++        if strand == 0 and five <= clen - RL:
++            kept.append((ref, five, strand))
++        elif strand == 1 and five >= RL:
++            kept.append((ref, five, strand))
++    return kept
++
++
++def rotate_se(reads, lengths, shifts):
++    out = []
++    for ref, five, strand in reads:
++        clen = lengths[ref]
++        r = shifts.get(ref, 0)
++        new = (five + r) % clen
++        if strand == 1 and new == 0:
++            new = clen
++        out.append((ref, new, strand))
++    assert len(valid_se(out, lengths)) == len(out)
++    return out
++
++
++def safe_shift(reads, lengths, ref, target):
++    clen = lengths[ref]
++    covered = np.zeros(clen + 1, dtype=bool)
++    for r, five, strand in reads:
++        if r != ref:
++            continue
++        start = five if strand == 0 else five - RL
++        covered[start + 1:start + RL] = True
++    for delta in range(clen):
++        for cut in ((target + delta) % clen, (target - delta) % clen):
++            if not covered[cut]:
++                return (clen - cut) % clen
++    raise AssertionError("no free cut")
++
++
++def run_callpeak(tmp_path, name, chroms, treat, ctrl, fmt="BAM", extra=(),
++                 records=se_records, expect_ok=True):
++    tfile = os.path.join(tmp_path, name + "_t.bam")
++    cfile = os.path.join(tmp_path, name + "_c.bam")
++    write_bam(tfile, chroms, records(treat))
++    write_bam(cfile, chroms, records(ctrl))
++    gsize = sum(length for _, length in chroms)
++    cmd = MACS3 + ["callpeak", "-t", tfile, "-c", cfile, "-f", fmt,
++                   "-g", str(gsize), "-n", name, "--outdir", str(tmp_path),
++                   "--keep-dup", "all"] + list(extra)
++    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(tmp_path))
++    if expect_ok:
++        assert proc.returncode == 0, proc.stderr[-3000:]
++    return proc
++
++
++def read_rows(path):
++    with open(path) as f:
++        return [line.rstrip("\n").split("\t") for line in f
++                if line.strip() and not line.startswith("#")]
++
++
++def narrow_keys(rows, lengths, shifts):
++    keys = []
++    for r in rows:
++        clen = lengths[r[0]]
++        start, end = int(r[1]), int(r[2])
++        back = (start - shifts.get(r[0], 0)) % clen
++        keys.append((r[0], back, end - start, r[4], r[6], r[7], r[8], r[9]))
++    return sorted(keys)
++
++
++def summit_keys(rows, lengths, shifts):
++    return sorted((r[0], (int(r[1]) - shifts.get(r[0], 0)) % lengths[r[0]], r[4])
++                  for r in rows)
++
++
++def xls_keys(rows, lengths, shifts):
++    keys = []
++    for r in rows[1:]:
++        clen = lengths[r[0]]
++        s = shifts.get(r[0], 0)
++        keys.append((r[0], (int(r[1]) - 1 - s) % clen, r[3],
++                     (int(r[4]) - 1 - s) % clen, r[5], r[6], r[7], r[8]))
++    return sorted(keys)
++
++
++def broad_keys(rows, lengths, shifts):
++    keys = []
++    for r in rows:
++        clen = lengths[r[0]]
++        start, end = int(r[1]), int(r[2])
++        keys.append((r[0], (start - shifts.get(r[0], 0)) % clen, end - start)
++                    + tuple(r[4:]))
++    return sorted(keys)
++
++
++def per_base(path, chrom, clen):
++    values = np.full(clen, np.nan)
++    for r in read_rows(path):
++        if r[0] != chrom:
++            continue
++        start, end = int(r[1]), int(r[2])
++        assert 0 <= start < end <= clen
++        values[start:end] = float(r[3])
++    return values
++
++
++def site_dataset(seed=11, centers=(0, 10000), n_site=80, n_bg=400, n_ctrl=1200):
++    rng = np.random.default_rng(seed)
++    lengths = {0: L}
++    treat = background_reads(rng, 0, n_bg, L, gap=(4000, 6000))
++    for c in centers:
++        treat += site_reads(rng, 0, c, n_site, L)
++    ctrl = background_reads(rng, 0, n_ctrl, L)
++    return lengths, valid_se(treat, lengths), valid_se(ctrl, lengths)
++
++
++def outputs(tmp_path, name):
++    return os.path.join(str(tmp_path), name)
++
++
++BASE_ARGS = ["--nomodel", "--extsize", str(FRAG), "--circular", "chr1"]
++CHROMS = [("chr1", L)]
++LEN_BY_NAME = {"chr1": L}
++
++
++def test_site_across_the_origin_is_one_narrow_peak(tmp_path):
++    lengths, treat, ctrl = site_dataset()
++    run_callpeak(tmp_path, "one", CHROMS, treat, ctrl, extra=BASE_ARGS)
++    rows = read_rows(outputs(tmp_path, "one_peaks.narrowPeak"))
++    crossing = [r for r in rows if int(r[1]) < L < int(r[2])]
++    assert len(crossing) == 1
++    assert all(int(r[2]) <= L for r in rows if r is not crossing[0])
++    assert all(0 <= int(r[1]) < L for r in rows)
++    twin = [r for r in rows if int(r[1]) < 10000 < int(r[2])]
++    assert len(twin) == 1
++    starts = [int(r[1]) for r in rows]
++    assert starts == sorted(starts)
++    assert crossing[0] is rows[-1]
++    summits = read_rows(outputs(tmp_path, "one_summits.bed"))
++    assert len(summits) == len(rows)
++    origin_summit = int(summits[-1][1])
++    peak_start = int(crossing[0][1])
++    assert (origin_summit - peak_start) % L == int(crossing[0][9])
++    assert 0 <= origin_summit < L
++
++
++def test_site_across_the_origin_is_not_split_or_lost(tmp_path):
++    lengths, treat, ctrl = site_dataset()
++    run_callpeak(tmp_path, "cmp", CHROMS, treat, ctrl, extra=BASE_ARGS)
++    rows = read_rows(outputs(tmp_path, "cmp_peaks.narrowPeak"))
++    near_origin = [r for r in rows if int(r[1]) < 400 or int(r[2]) > L - 400]
++    assert len(near_origin) == 1
++    assert float(near_origin[0][6]) > 3.0
++
++
++@pytest.mark.parametrize("target", [5000, 10000, 16000])
++def test_narrow_peaks_do_not_depend_on_where_the_origin_is(tmp_path, target):
++    lengths, treat, ctrl = site_dataset()
++    run_callpeak(tmp_path, "a", CHROMS, treat, ctrl, extra=BASE_ARGS)
++    shift = safe_shift(treat + ctrl, lengths, 0, target)
++    shifts = {0: shift}
++    run_callpeak(tmp_path, "b", CHROMS, rotate_se(treat, lengths, shifts),
++                 rotate_se(ctrl, lengths, shifts), extra=BASE_ARGS)
++    named = {"chr1": shift}
++    a = read_rows(outputs(tmp_path, "a_peaks.narrowPeak"))
++    b = read_rows(outputs(tmp_path, "b_peaks.narrowPeak"))
++    assert len(a) >= 2
++    assert narrow_keys(b, LEN_BY_NAME, named) == narrow_keys(a, LEN_BY_NAME, {})
++    sa = read_rows(outputs(tmp_path, "a_summits.bed"))
++    sb = read_rows(outputs(tmp_path, "b_summits.bed"))
++    assert summit_keys(sb, LEN_BY_NAME, named) == summit_keys(sa, LEN_BY_NAME, {})
++    xa = read_rows(outputs(tmp_path, "a_peaks.xls"))
++    xb = read_rows(outputs(tmp_path, "b_peaks.xls"))
++    assert xls_keys(xb, LEN_BY_NAME, named) == xls_keys(xa, LEN_BY_NAME, {})
++
++
++def test_subpeak_summits_do_not_depend_on_where_the_origin_is(tmp_path):
++    lengths, treat, ctrl = site_dataset(seed=5, centers=(60, 9000))
++    args = BASE_ARGS + ["--call-summits"]
++    run_callpeak(tmp_path, "a", CHROMS, treat, ctrl, extra=args)
++    shift = safe_shift(treat + ctrl, lengths, 0, 5000)
++    shifts = {0: shift}
++    run_callpeak(tmp_path, "b", CHROMS, rotate_se(treat, lengths, shifts),
++                 rotate_se(ctrl, lengths, shifts), extra=args)
++    named = {"chr1": shift}
++    a = read_rows(outputs(tmp_path, "a_peaks.narrowPeak"))
++    b = read_rows(outputs(tmp_path, "b_peaks.narrowPeak"))
++    assert any(int(r[1]) < L < int(r[2]) for r in a)
++    assert narrow_keys(b, LEN_BY_NAME, named) == narrow_keys(a, LEN_BY_NAME, {})
++    sa = read_rows(outputs(tmp_path, "a_summits.bed"))
++    sb = read_rows(outputs(tmp_path, "b_summits.bed"))
++    assert summit_keys(sb, LEN_BY_NAME, named) == summit_keys(sa, LEN_BY_NAME, {})
++    assert all(0 <= int(r[1]) < L for r in sa)
++
++
++def test_broad_regions_do_not_depend_on_where_the_origin_is(tmp_path):
++    rng = np.random.default_rng(3)
++    lengths = {0: L}
++    treat = background_reads(rng, 0, 400, L, gap=(8000, 10000))
++    for lo, hi, n in ((-900, 900, 150), (250, 400, 80)):
++        for p in rng.integers(lo, hi, n):
++            strand = int(rng.integers(0, 2))
++            treat.append((0, int(p) % L + strand, strand))
++    treat = valid_se(treat, lengths)
++    ctrl = valid_se(background_reads(rng, 0, 600, L), lengths)
++    args = BASE_ARGS + ["--broad", "-q", "0.00001", "--broad-cutoff", "0.1"]
++    run_callpeak(tmp_path, "a", CHROMS, treat, ctrl, extra=args)
++    shift = safe_shift(treat + ctrl, lengths, 0, 9000)
++    shifts = {0: shift}
++    run_callpeak(tmp_path, "b", CHROMS, rotate_se(treat, lengths, shifts),
++                 rotate_se(ctrl, lengths, shifts), extra=args)
++    named = {"chr1": shift}
++    a = read_rows(outputs(tmp_path, "a_peaks.broadPeak"))
++    b = read_rows(outputs(tmp_path, "b_peaks.broadPeak"))
++    assert any(int(r[1]) < L < int(r[2]) for r in a)
++    assert broad_keys(b, LEN_BY_NAME, named) == broad_keys(a, LEN_BY_NAME, {})
++    ga = read_rows(outputs(tmp_path, "a_peaks.gappedPeak"))
++    gb = read_rows(outputs(tmp_path, "b_peaks.gappedPeak"))
++    assert broad_keys(gb, LEN_BY_NAME, named) == broad_keys(ga, LEN_BY_NAME, {})
++    crossing = [r for r in ga if int(r[1]) < L < int(r[2])]
++    assert len(crossing) == 1
++    assert int(crossing[0][9]) >= 3
++
++
++def test_bedgraph_tracks_rotate_with_the_origin(tmp_path):
++    lengths, treat, ctrl = site_dataset()
++    args = BASE_ARGS + ["-B"]
++    run_callpeak(tmp_path, "a", CHROMS, treat, ctrl, extra=args)
++    shift = safe_shift(treat + ctrl, lengths, 0, 5000)
++    shifts = {0: shift}
++    run_callpeak(tmp_path, "b", CHROMS, rotate_se(treat, lengths, shifts),
++                 rotate_se(ctrl, lengths, shifts), extra=args)
++    for track in ("treat_pileup", "control_lambda"):
++        a = per_base(outputs(tmp_path, "a_%s.bdg" % track), "chr1", L)
++        b = per_base(outputs(tmp_path, "b_%s.bdg" % track), "chr1", L)
++        assert not np.isnan(a).any()
++        assert not np.isnan(b).any()
++        assert np.array_equal(np.roll(a, shift), b)
++
++
++def test_treatment_pileup_wraps_fragments_across_the_origin(tmp_path):
++    lengths, treat, ctrl = site_dataset()
++    run_callpeak(tmp_path, "p", CHROMS, treat, ctrl, extra=BASE_ARGS + ["-B"])
++    expected = np.zeros(L)
++    for _, five, strand in treat:
++        start = five if strand == 0 else five - FRAG
++        idx = np.arange(start, start + FRAG) % L
++        expected[idx] += 1
++    got = per_base(outputs(tmp_path, "p_treat_pileup.bdg"), "chr1", L)
++    assert np.array_equal(got, expected)
++
++
++def test_control_lambda_windows_wrap_across_the_origin(tmp_path):
++    lengths, treat, ctrl = site_dataset()
++    run_callpeak(tmp_path, "l", CHROMS, treat, ctrl, extra=BASE_ARGS + ["-B"])
++    ratio = len(treat) / len(ctrl)
++    lam = np.full(L, len(treat) * FRAG / L)
++    for window in (FRAG, 1000, 10000):
++        cover = np.zeros(L)
++        for _, five, strand in ctrl:
++            if strand == 0:
++                start = five - window // 2
++            else:
++                start = five - (window - window // 2)
++            cover[np.arange(start, start + window) % L] += 1
++        lam = np.maximum(lam, cover * ratio * FRAG / window)
++    got = per_base(outputs(tmp_path, "l_control_lambda.bdg"), "chr1", L)
++    assert np.allclose(got, lam, rtol=1e-4, atol=1e-4)
++
++
++def test_cutoff_analysis_does_not_depend_on_where_the_origin_is(tmp_path):
++    lengths, treat, ctrl = site_dataset(seed=21, centers=(30, 7000, 14000))
++    args = BASE_ARGS + ["--cutoff-analysis"]
++    run_callpeak(tmp_path, "a", CHROMS, treat, ctrl, extra=args)
++    shift = safe_shift(treat + ctrl, lengths, 0, 5000)
++    shifts = {0: shift}
++    run_callpeak(tmp_path, "b", CHROMS, rotate_se(treat, lengths, shifts),
++                 rotate_se(ctrl, lengths, shifts), extra=args)
++    with open(outputs(tmp_path, "a_cutoff_analysis.txt")) as f:
++        a = f.read()
++    with open(outputs(tmp_path, "b_cutoff_analysis.txt")) as f:
++        b = f.read()
++    assert a == b
++
++
++def pe_dataset(seed=17, centers=(0, 10000)):
++    rng = np.random.default_rng(seed)
++    frags = []
++    for p in rng.integers(0, L, 300):
++        if not 4800 <= p < 7200:
++            frags.append((0, int(p), int(rng.integers(150, 250))))
++    for c in centers:
++        for _ in range(80):
++            flen = int(rng.integers(170, 230))
++            frags.append((0, (c - flen // 2 + int(rng.integers(-40, 41))) % L, flen))
++    ctrl = [(0, int(p), int(rng.integers(150, 250)))
++            for p in rng.integers(0, L, 500)]
++    return valid_pe(frags), valid_pe(ctrl)
++
++
++def valid_pe(frags):
++    kept = []
++    for ref, left, flen in frags:
++        right_end = (left + flen) % L or L
++        if left <= L - RL and right_end >= RL:
++            kept.append((ref, left, flen))
++    return kept
++
++
++def rotate_pe(frags, shift):
++    out = [(ref, (left + shift) % L, flen) for ref, left, flen in frags]
++    assert len(valid_pe(out)) == len(out)
++    return out
++
++
++def pe_run(tmp_path, name, treat, ctrl, extra=()):
++    rng = np.random.default_rng(99)
++
++    def records(frags):
++        return pe_records(frags, {0: L}, rng)
++    return run_callpeak(tmp_path, name, CHROMS, treat, ctrl, fmt="BAMPE",
++                        extra=["--circular", "chr1"] + list(extra),
++                        records=records)
++
++
++def pe_safe_shift(frags, target):
++    reads = []
++    for ref, left, flen in frags:
++        reads.append((ref, left, 0))
++        reads.append((ref, (left + flen) % L or L, 1))
++    return safe_shift(reads, {0: L}, 0, target)
++
++
++def test_pairs_across_the_origin_are_fragments_in_bampe(tmp_path):
++    treat, ctrl = pe_dataset()
++    pe_run(tmp_path, "pe", treat, ctrl, extra=["-B"])
++    rows = read_rows(outputs(tmp_path, "pe_peaks.narrowPeak"))
++    crossing = [r for r in rows if int(r[1]) < L < int(r[2])]
++    assert len(crossing) == 1
++    expected = np.zeros(L)
++    for _, left, flen in treat:
++        expected[np.arange(left, left + flen) % L] += 1
++    got = per_base(outputs(tmp_path, "pe_treat_pileup.bdg"), "chr1", L)
++    assert np.array_equal(got, expected)
++
++
++def test_bampe_peaks_do_not_depend_on_where_the_origin_is(tmp_path):
++    treat, ctrl = pe_dataset()
++    pe_run(tmp_path, "a", treat, ctrl)
++    shift = pe_safe_shift(treat + ctrl, 6000)
++    pe_run(tmp_path, "b", rotate_pe(treat, shift), rotate_pe(ctrl, shift))
++    named = {"chr1": shift}
++    a = read_rows(outputs(tmp_path, "a_peaks.narrowPeak"))
++    b = read_rows(outputs(tmp_path, "b_peaks.narrowPeak"))
++    assert narrow_keys(b, LEN_BY_NAME, named) == narrow_keys(a, LEN_BY_NAME, {})
++    xa = read_rows(outputs(tmp_path, "a_peaks.xls"))
++    xb = read_rows(outputs(tmp_path, "b_peaks.xls"))
++    assert xls_keys(xb, LEN_BY_NAME, named) == xls_keys(xa, LEN_BY_NAME, {})
++    with open(outputs(tmp_path, "a_peaks.xls")) as f:
++        da = [line for line in f if line.startswith("# d = ")]
++    with open(outputs(tmp_path, "b_peaks.xls")) as f:
++        db = [line for line in f if line.startswith("# d = ")]
++    assert da == db
++    assert da == ["# d = %d\n" % int(sum(f[2] for f in treat) / len(treat))]
++
++
++def test_linear_chromosomes_keep_their_ends(tmp_path):
++    rng = np.random.default_rng(8)
++    chroms = [("chrA", L), ("chr1", L)]
++    lengths = {0: L, 1: L}
++    treat = background_reads(rng, 0, 400, L) + background_reads(rng, 1, 400, L)
++    treat += site_reads(rng, 0, 0, 80, L) + site_reads(rng, 0, 10000, 80, L)
++    treat += site_reads(rng, 1, 0, 80, L)
++    ctrl = background_reads(rng, 0, 600, L) + background_reads(rng, 1, 600, L)
++    treat, ctrl = valid_se(treat, lengths), valid_se(ctrl, lengths)
++    run_callpeak(tmp_path, "lin", chroms, treat, ctrl,
++                 extra=["--nomodel", "--extsize", str(FRAG), "-p", "0.00001"])
++    run_callpeak(tmp_path, "circ", chroms, treat, ctrl,
++                 extra=BASE_ARGS + ["-p", "0.00001"])
++
++    def chr_a(name):
++        return [(r[1], r[2], r[6], r[7], r[9])
++                for r in read_rows(outputs(tmp_path, name + "_peaks.narrowPeak"))
++                if r[0] == "chrA"]
++    assert chr_a("circ") == chr_a("lin")
++    assert all(int(r[2]) <= L for r in read_rows(outputs(tmp_path, "circ_peaks.narrowPeak"))
++               if r[0] == "chrA")
++
++
++def test_circular_needs_chromosome_lengths_from_bam(tmp_path):
++    lengths, treat, ctrl = site_dataset()
++    bed = os.path.join(str(tmp_path), "t.bed")
++    with open(bed, "w") as f:
++        for _, five, strand in treat:
++            start = five if strand == 0 else five - RL
++            f.write("chr1\t%d\t%d\tr\t0\t%s\n" % (start, start + RL, "+-"[strand]))
++    proc = subprocess.run(MACS3 + ["callpeak", "-t", bed, "-f", "BED", "-g", str(L),
++                                   "-n", "bed", "--outdir", str(tmp_path),
++                                   "--nomodel", "--circular", "chr1"],
++                          capture_output=True, text=True, cwd=str(tmp_path))
++    assert proc.returncode != 0
++    assert not os.path.exists(outputs(tmp_path, "bed_peaks.narrowPeak"))
++    run_callpeak(tmp_path, "bam", CHROMS, treat, ctrl, extra=BASE_ARGS)
++    assert os.path.exists(outputs(tmp_path, "bam_peaks.narrowPeak"))
++
++
++def test_unknown_circular_chromosome_is_an_error(tmp_path):
++    lengths, treat, ctrl = site_dataset()
++    proc = run_callpeak(tmp_path, "unk", CHROMS, treat, ctrl,
++                        extra=["--nomodel", "--extsize", str(FRAG),
++                               "--circular", "chrX"], expect_ok=False)
++    assert proc.returncode != 0
++    assert not os.path.exists(outputs(tmp_path, "unk_peaks.narrowPeak"))
++    run_callpeak(tmp_path, "known", CHROMS, treat, ctrl, extra=BASE_ARGS)
++    assert os.path.exists(outputs(tmp_path, "known_peaks.narrowPeak"))

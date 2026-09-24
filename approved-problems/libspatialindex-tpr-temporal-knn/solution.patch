@@ -1,0 +1,878 @@
+diff --git a/include/spatialindex/MovingRegion.h b/include/spatialindex/MovingRegion.h
+index 8f3f0a9..85912df 100644
+--- a/include/spatialindex/MovingRegion.h
++++ b/include/spatialindex/MovingRegion.h
+@@ -88,6 +88,10 @@ namespace SpatialIndex
+ 		virtual double getCenterDistanceInTime(const MovingRegion& r) const;
+ 		virtual double getCenterDistanceInTime(const Tools::IInterval& ivI, const MovingRegion& r) const;
+ 
++		virtual double getMinimumDistanceInTime(const Tools::IInterval& ivI, const MovingRegion& r) const;
++		virtual bool intersectsRegionAtSameInstant(const Tools::IInterval& ivI, const MovingRegion& r, const MovingRegion& s) const;
++		virtual bool containsRegionAtEveryInstant(const Tools::IInterval& ivI, const MovingRegion& r) const;
++
+ 		virtual bool intersectsRegionAtTime(double t, const MovingRegion& r) const;
+ 		virtual bool containsRegionAtTime(double t, const MovingRegion& r) const;
+ 
+diff --git a/include/spatialindex/TPRTree.h b/include/spatialindex/TPRTree.h
+index 7b743f9..45a4d3f 100644
+--- a/include/spatialindex/TPRTree.h
++++ b/include/spatialindex/TPRTree.h
+@@ -40,7 +40,8 @@ namespace SpatialIndex
+ 		enum PersistenObjectIdentifier
+ 		{
+ 			PersistentIndex = 0x1,
+-			PersistentLeaf = 0x2
++			PersistentLeaf = 0x2,
++			PersistentEntryEndTimes = 0x4
+ 		};
+ 
+ 		enum RangeQueryType
+diff --git a/src/spatialindex/MovingPoint.cc b/src/spatialindex/MovingPoint.cc
+index 7a08b1f..728e0fd 100644
+--- a/src/spatialindex/MovingPoint.cc
++++ b/src/spatialindex/MovingPoint.cc
+@@ -120,8 +120,8 @@ void MovingPoint::initialize(
+ 	m_endTime = tEnd;
+ 	m_pCoords = nullptr;
+ 
+-	if (m_endTime <= m_startTime)
+-		throw Tools::IllegalArgumentException("MovingPoint: Cannot support degenerate time intervals.");
++	if (m_endTime < m_startTime)
++		throw Tools::IllegalArgumentException("MovingPoint: Cannot support reversed time intervals.");
+ 
+ 	try
+ 	{
+diff --git a/src/spatialindex/MovingRegion.cc b/src/spatialindex/MovingRegion.cc
+index 0aa2c23..737be67 100644
+--- a/src/spatialindex/MovingRegion.cc
++++ b/src/spatialindex/MovingRegion.cc
+@@ -33,7 +33,9 @@
+ 
+ #include <cstring>
+ #include <cmath>
++#include <algorithm>
+ #include <limits>
++#include <vector>
+ 
+ #include <spatialindex/SpatialIndex.h>
+ 
+@@ -112,7 +114,7 @@ MovingRegion::MovingRegion(const MovingPoint& low, const MovingPoint& high)
+ 	m_pLow = nullptr; m_pHigh = nullptr;
+ 	m_pVLow = nullptr; m_pVHigh = nullptr;
+ 
+-	if (m_endTime <= m_startTime) throw Tools::IllegalArgumentException("MovingRegion: Cannot support degenerate time intervals.");
++	if (m_endTime < m_startTime) throw Tools::IllegalArgumentException("MovingRegion: Cannot support reversed time intervals.");
+ 
+ 	if (low.m_dimension != high.m_dimension) throw Tools::IllegalArgumentException("MovingRegion: arguments have different number of dimensions.");
+ 
+@@ -181,7 +183,7 @@ void MovingRegion::initialize(
+ 	m_pLow = nullptr; m_pHigh = nullptr;
+ 	m_pVLow = nullptr; m_pVHigh = nullptr;
+ 
+-	if (m_endTime <= m_startTime) throw Tools::IllegalArgumentException("MovingRegion: Cannot support degenerate time intervals.");
++	if (m_endTime < m_startTime) throw Tools::IllegalArgumentException("MovingRegion: Cannot support reversed time intervals.");
+ 
+ 	try
+ 	{
+@@ -225,7 +227,7 @@ MovingRegion& MovingRegion::operator=(const MovingRegion& r)
+ 		m_startTime = r.m_startTime;
+ 		m_endTime = r.m_endTime;
+ 
+-		assert(m_startTime < m_endTime);
++		assert(m_startTime <= m_endTime);
+ 	}
+ 
+ 	return *this;
+@@ -620,6 +622,215 @@ double MovingRegion::getCenterDistanceInTime(const IInterval& ivI, const MovingR
+ 	return (l * f + log(l / n + f) * m / n - b * std::sqrt(c) - std::log(b / n + std::sqrt(c)) * m / n) / (4.0 * a);
+ }
+ 
++static double heldLow(const MovingRegion& r, uint32_t d, double t)
++{
++	return r.getExtrapolatedLow(d, std::min(t, r.m_endTime));
++}
++
++static double heldHigh(const MovingRegion& r, uint32_t d, double t)
++{
++	return r.getExtrapolatedHigh(d, std::min(t, r.m_endTime));
++}
++
++static double heldVLow(const MovingRegion& r, uint32_t d, double t)
++{
++	return (t < r.m_endTime) ? r.getVLow(d) : 0.0;
++}
++
++static double heldVHigh(const MovingRegion& r, uint32_t d, double t)
++{
++	return (t < r.m_endTime) ? r.getVHigh(d) : 0.0;
++}
++
++static double getGapInTime(const MovingRegion& a, const MovingRegion& b, uint32_t d, double t)
++{
++	double above = heldLow(b, d, t) - heldHigh(a, d, t);
++	double below = heldLow(a, d, t) - heldHigh(b, d, t);
++	return std::max(0.0, std::max(above, below));
++}
++
++static double getSquaredDistanceAtTime(const MovingRegion& a, const MovingRegion& b, double t)
++{
++	double sum = 0.0;
++	for (uint32_t cDim = 0; cDim < a.m_dimension; ++cDim)
++	{
++		double gap = getGapInTime(a, b, cDim, t);
++		sum += gap * gap;
++	}
++	return sum;
++}
++
++static void addBreakpoint(std::vector<double>& times, double t, double tmin, double tmax)
++{
++	if (t > tmin && t < tmax) times.push_back(t);
++}
++
++static std::vector<double> getMotionPieces(const std::vector<const MovingRegion*>& parts, double tmin, double tmax)
++{
++	std::vector<double> pieces;
++	pieces.push_back(tmin);
++	for (size_t cPart = 0; cPart < parts.size(); ++cPart) addBreakpoint(pieces, parts[cPart]->m_endTime, tmin, tmax);
++	pieces.push_back(tmax);
++	std::sort(pieces.begin(), pieces.end());
++	pieces.erase(std::unique(pieces.begin(), pieces.end()), pieces.end());
++	if (pieces.size() < 2) pieces.push_back(tmax);
++	return pieces;
++}
++
++double MovingRegion::getMinimumDistanceInTime(const IInterval& ivI, const MovingRegion& r) const
++{
++	if (m_dimension != r.m_dimension) throw Tools::IllegalArgumentException("getMinimumDistanceInTime: MovingRegions have different number of dimensions.");
++
++	double tmin = ivI.getLowerBound();
++	double tmax = ivI.getUpperBound();
++	if (tmin > tmax) throw Tools::IllegalArgumentException("getMinimumDistanceInTime: the time interval is empty.");
++
++	std::vector<const MovingRegion*> parts;
++	parts.push_back(this);
++	parts.push_back(&r);
++	std::vector<double> pieces = getMotionPieces(parts, tmin, tmax);
++
++	double best = std::numeric_limits<double>::max();
++
++	for (size_t cPiece = 1; cPiece < pieces.size(); ++cPiece)
++	{
++		double first = pieces[cPiece - 1];
++		double last = pieces[cPiece];
++		double probe = (first + last) / 2.0;
++
++		std::vector<double> times;
++		times.push_back(first);
++		times.push_back(last);
++
++		for (uint32_t cDim = 0; cDim < m_dimension; ++cDim)
++		{
++			double above = heldLow(r, cDim, first) - heldHigh(*this, cDim, first);
++			double aboveRate = heldVLow(r, cDim, probe) - heldVHigh(*this, cDim, probe);
++			double below = heldLow(*this, cDim, first) - heldHigh(r, cDim, first);
++			double belowRate = heldVLow(*this, cDim, probe) - heldVHigh(r, cDim, probe);
++
++			if (aboveRate != 0.0) addBreakpoint(times, first - above / aboveRate, first, last);
++			if (belowRate != 0.0) addBreakpoint(times, first - below / belowRate, first, last);
++			if (aboveRate != belowRate) addBreakpoint(times, first - (above - below) / (aboveRate - belowRate), first, last);
++		}
++
++		std::sort(times.begin(), times.end());
++
++		for (size_t cTime = 0; cTime < times.size(); ++cTime)
++		{
++			best = std::min(best, getSquaredDistanceAtTime(*this, r, times[cTime]));
++		}
++
++		for (size_t cTime = 1; cTime < times.size(); ++cTime)
++		{
++			double t0 = times[cTime - 1];
++			double t1 = times[cTime];
++			if (t1 <= t0) continue;
++
++			double mid = (t0 + t1) / 2.0;
++			double a = 0.0, b = 0.0;
++
++			for (uint32_t cDim = 0; cDim < m_dimension; ++cDim)
++			{
++				double above = heldLow(r, cDim, mid) - heldHigh(*this, cDim, mid);
++				double below = heldLow(*this, cDim, mid) - heldHigh(r, cDim, mid);
++				if (above <= 0.0 && below <= 0.0) continue;
++
++				double gap = (above > below) ? above : below;
++				double rate = (above > below)
++					? heldVLow(r, cDim, mid) - heldVHigh(*this, cDim, mid)
++					: heldVLow(*this, cDim, mid) - heldVHigh(r, cDim, mid);
++				a += rate * rate;
++				b += gap * rate;
++			}
++
++			if (a > 0.0)
++			{
++				double t = mid - b / a;
++				if (t > t0 && t < t1) best = std::min(best, getSquaredDistanceAtTime(*this, r, t));
++			}
++		}
++	}
++
++	return std::sqrt(best);
++}
++
++static bool restrictToOverlap(const MovingRegion& x, const MovingRegion& y, double base, double probe, double& lo, double& hi)
++{
++	for (uint32_t cDim = 0; cDim < x.m_dimension; ++cDim)
++	{
++		for (int cSide = 0; cSide < 2; ++cSide)
++		{
++			const MovingRegion& p = (cSide == 0) ? x : y;
++			const MovingRegion& q = (cSide == 0) ? y : x;
++			double excess = heldLow(p, cDim, base) - heldHigh(q, cDim, base);
++			double rate = heldVLow(p, cDim, probe) - heldVHigh(q, cDim, probe);
++
++			if (rate == 0.0)
++			{
++				if (excess > 0.0) return false;
++			}
++			else if (rate > 0.0) hi = std::min(hi, base - excess / rate);
++			else lo = std::max(lo, base - excess / rate);
++		}
++	}
++	return lo <= hi;
++}
++
++bool MovingRegion::intersectsRegionAtSameInstant(const IInterval& ivI, const MovingRegion& r, const MovingRegion& s) const
++{
++	if (m_dimension != r.m_dimension || m_dimension != s.m_dimension) throw Tools::IllegalArgumentException("intersectsRegionAtSameInstant: MovingRegions have different number of dimensions.");
++
++	double tmin = ivI.getLowerBound();
++	double tmax = ivI.getUpperBound();
++	if (tmin > tmax) return false;
++
++	std::vector<const MovingRegion*> parts;
++	parts.push_back(this);
++	parts.push_back(&r);
++	parts.push_back(&s);
++	std::vector<double> pieces = getMotionPieces(parts, tmin, tmax);
++
++	for (size_t cPiece = 1; cPiece < pieces.size(); ++cPiece)
++	{
++		double lo = pieces[cPiece - 1];
++		double hi = pieces[cPiece];
++		double base = lo;
++		double probe = (lo + hi) / 2.0;
++
++		if (restrictToOverlap(*this, r, base, probe, lo, hi) &&
++			restrictToOverlap(*this, s, base, probe, lo, hi) &&
++			restrictToOverlap(r, s, base, probe, lo, hi)) return true;
++	}
++
++	return false;
++}
++
++bool MovingRegion::containsRegionAtEveryInstant(const IInterval& ivI, const MovingRegion& r) const
++{
++	if (m_dimension != r.m_dimension) throw Tools::IllegalArgumentException("containsRegionAtEveryInstant: MovingRegions have different number of dimensions.");
++
++	double tmin = ivI.getLowerBound();
++	double tmax = ivI.getUpperBound();
++	if (tmin > tmax) return false;
++
++	std::vector<const MovingRegion*> parts;
++	parts.push_back(this);
++	parts.push_back(&r);
++	std::vector<double> times = getMotionPieces(parts, tmin, tmax);
++
++	for (size_t cTime = 0; cTime < times.size(); ++cTime)
++	{
++		double t = times[cTime];
++		for (uint32_t cDim = 0; cDim < m_dimension; ++cDim)
++		{
++			if (heldLow(r, cDim, t) < heldLow(*this, cDim, t)) return false;
++			if (heldHigh(r, cDim, t) > heldHigh(*this, cDim, t)) return false;
++		}
++	}
++	return true;
++}
++
+ // does not work with degenerate time-intervals.
+ bool MovingRegion::intersectsRegionAtTime(double t, const MovingRegion& r) const
+ {
+diff --git a/src/tprtree/Node.cc b/src/tprtree/Node.cc
+index 5b6ca22..11ae558 100644
+--- a/src/tprtree/Node.cc
++++ b/src/tprtree/Node.cc
+@@ -56,7 +56,7 @@ uint32_t Node::getByteArraySize()
+ 		sizeof(uint32_t) +
+ 		sizeof(uint32_t) +
+ 		sizeof(double) +
+-		(m_children * (4 * m_pTree->m_dimension * sizeof(double) + sizeof(double) + sizeof(id_type) + sizeof(uint32_t))) +
++		(m_children * (4 * m_pTree->m_dimension * sizeof(double) + 2 * sizeof(double) + sizeof(id_type) + sizeof(uint32_t))) +
+ 		m_totalDataLength +
+ 		(4 * m_pTree->m_dimension * sizeof(double)));
+ }
+@@ -65,8 +65,10 @@ void Node::loadFromByteArray(const uint8_t* ptr)
+ {
+ 	m_nodeMBR = m_pTree->m_infiniteRegion;
+ 
+-	// skip the node type information, it is not needed.
++	uint32_t nodeType;
++	memcpy(&nodeType, ptr, sizeof(uint32_t));
+ 	ptr += sizeof(uint32_t);
++	bool storedEndTimes = (nodeType & PersistentEntryEndTimes) != 0;
+ 
+ 	memcpy(&m_level, ptr, sizeof(uint32_t));
+ 	ptr += sizeof(uint32_t);
+@@ -95,7 +97,16 @@ void Node::loadFromByteArray(const uint8_t* ptr)
+ 		ptr += m_pTree->m_dimension * sizeof(double);
+ 		memcpy(&(m_ptrMBR[cChild]->m_startTime), ptr, sizeof(double));
+ 		ptr += sizeof(double);
+-		m_ptrMBR[cChild]->m_endTime = std::numeric_limits<double>::max();
++
++		if (storedEndTimes)
++		{
++			memcpy(&(m_ptrMBR[cChild]->m_endTime), ptr, sizeof(double));
++			ptr += sizeof(double);
++		}
++		else
++		{
++			m_ptrMBR[cChild]->m_endTime = std::numeric_limits<double>::max();
++		}
+ 
+ 		memcpy(&(m_pIdentifier[cChild]), ptr, sizeof(id_type));
+ 		ptr += sizeof(id_type);
+@@ -137,8 +148,8 @@ void Node::storeToByteArray(uint8_t** data, uint32_t& len)
+ 
+ 	uint32_t nodeType;
+ 
+-	if (m_level == 0) nodeType = PersistentLeaf;
+-	else nodeType = PersistentIndex;
++	if (m_level == 0) nodeType = PersistentLeaf | PersistentEntryEndTimes;
++	else nodeType = PersistentIndex | PersistentEntryEndTimes;
+ 
+ 	memcpy(ptr, &nodeType, sizeof(uint32_t));
+ 	ptr += sizeof(uint32_t);
+@@ -165,6 +176,9 @@ void Node::storeToByteArray(uint8_t** data, uint32_t& len)
+ 		memcpy(ptr, &(m_ptrMBR[cChild]->m_startTime), sizeof(double));
+ 		ptr += sizeof(double);
+ 
++		memcpy(ptr, &(m_ptrMBR[cChild]->m_endTime), sizeof(double));
++		ptr += sizeof(double);
++
+ 		memcpy(ptr, &(m_pIdentifier[cChild]), sizeof(id_type));
+ 		ptr += sizeof(id_type);
+ 
+@@ -316,6 +330,23 @@ Node& Node::operator=(const Node&)
+ 	throw Tools::IllegalStateException("Node::operator =: This should never be called.");
+ }
+ 
++void Node::boundExpiringChildren()
++{
++	bool expiring = false;
++	for (uint32_t cChild = 0; cChild < m_children; ++cChild)
++	{
++		if (m_ptrMBR[cChild]->m_endTime != std::numeric_limits<double>::max()) { expiring = true; break; }
++	}
++
++	if (! expiring) return;
++
++	for (uint32_t cDim = 0; cDim < m_nodeMBR.m_dimension; ++cDim)
++	{
++		m_nodeMBR.m_pVLow[cDim] = std::min(m_nodeMBR.m_pVLow[cDim], 0.0);
++		m_nodeMBR.m_pVHigh[cDim] = std::max(m_nodeMBR.m_pVHigh[cDim], 0.0);
++	}
++}
++
+ bool Node::insertEntry(uint32_t dataLength, uint8_t* pData, MovingRegion& mbr, id_type id)
+ {
+ 	assert(m_children < m_capacity);
+@@ -342,8 +373,8 @@ bool Node::insertEntry(uint32_t dataLength, uint8_t* pData, MovingRegion& mbr, i
+ 
+ 			for (uint32_t cChild = 0; cChild < m_children; ++cChild)
+ 			{
+-				m_nodeMBR.m_pLow[cDim] = std::min(m_nodeMBR.m_pLow[cDim], m_ptrMBR[cChild]->getExtrapolatedLow(cDim, m_nodeMBR.m_startTime));
+-				m_nodeMBR.m_pHigh[cDim] = std::max(m_nodeMBR.m_pHigh[cDim], m_ptrMBR[cChild]->getExtrapolatedHigh(cDim, m_nodeMBR.m_startTime));
++				m_nodeMBR.m_pLow[cDim] = std::min(m_nodeMBR.m_pLow[cDim], m_ptrMBR[cChild]->getLow(cDim, m_nodeMBR.m_startTime));
++				m_nodeMBR.m_pHigh[cDim] = std::max(m_nodeMBR.m_pHigh[cDim], m_ptrMBR[cChild]->getHigh(cDim, m_nodeMBR.m_startTime));
+ 				m_nodeMBR.m_pVLow[cDim] = std::min(m_nodeMBR.m_pVLow[cDim], m_ptrMBR[cChild]->m_pVLow[cDim]);
+ 				m_nodeMBR.m_pVHigh[cDim] = std::max(m_nodeMBR.m_pVHigh[cDim], m_ptrMBR[cChild]->m_pVHigh[cDim]);
+ 			}
+@@ -358,14 +389,14 @@ bool Node::insertEntry(uint32_t dataLength, uint8_t* pData, MovingRegion& mbr, i
+ 		for (uint32_t cDim = 0; cDim < m_nodeMBR.m_dimension; ++cDim)
+ 		{
+ 			double l = m_nodeMBR.getExtrapolatedLow(cDim, m_pTree->m_currentTime);
+-			double rl = mbr.getExtrapolatedLow(cDim, m_pTree->m_currentTime);
++			double rl = mbr.getLow(cDim, m_pTree->m_currentTime);
+ 			if (rl <= l)
+ 			{
+ 				m_nodeMBR.m_pLow[cDim] = rl - 2.0 * std::numeric_limits<double>::epsilon();
+ 			}
+ 
+ 			double h = m_nodeMBR.getExtrapolatedHigh(cDim, m_pTree->m_currentTime);
+-			double rh = mbr.getExtrapolatedHigh(cDim, m_pTree->m_currentTime);
++			double rh = mbr.getHigh(cDim, m_pTree->m_currentTime);
+ 			if (rh >= h)
+ 			{
+ 				m_nodeMBR.m_pHigh[cDim] = rh + 2.0 * std::numeric_limits<double>::epsilon();
+@@ -376,6 +407,8 @@ bool Node::insertEntry(uint32_t dataLength, uint8_t* pData, MovingRegion& mbr, i
+ 		}
+ 	}
+ 
++	boundExpiringChildren();
++
+ 	return true;
+ }
+ 
+@@ -418,8 +451,8 @@ void Node::deleteEntry(uint32_t index)
+ 
+ 			for (uint32_t cChild = 0; cChild < m_children; ++cChild)
+ 			{
+-				m_nodeMBR.m_pLow[cDim] = std::min(m_nodeMBR.m_pLow[cDim], m_ptrMBR[cChild]->getExtrapolatedLow(cDim, m_nodeMBR.m_startTime));
+-				m_nodeMBR.m_pHigh[cDim] = std::max(m_nodeMBR.m_pHigh[cDim], m_ptrMBR[cChild]->getExtrapolatedHigh(cDim, m_nodeMBR.m_startTime));
++				m_nodeMBR.m_pLow[cDim] = std::min(m_nodeMBR.m_pLow[cDim], m_ptrMBR[cChild]->getLow(cDim, m_nodeMBR.m_startTime));
++				m_nodeMBR.m_pHigh[cDim] = std::max(m_nodeMBR.m_pHigh[cDim], m_ptrMBR[cChild]->getHigh(cDim, m_nodeMBR.m_startTime));
+ 				m_nodeMBR.m_pVLow[cDim] = std::min(m_nodeMBR.m_pVLow[cDim], m_ptrMBR[cChild]->m_pVLow[cDim]);
+ 				m_nodeMBR.m_pVHigh[cDim] = std::max(m_nodeMBR.m_pVHigh[cDim], m_ptrMBR[cChild]->m_pVHigh[cDim]);
+ 			}
+@@ -427,6 +460,8 @@ void Node::deleteEntry(uint32_t index)
+ 			m_nodeMBR.m_pHigh[cDim] += 2.0 * std::numeric_limits<double>::epsilon();
+ 		}
+ 
++		boundExpiringChildren();
++
+ 	}
+ }
+ 
+@@ -537,8 +572,8 @@ bool Node::insertData(uint32_t dataLength, uint8_t* pData, MovingRegion& mbr, id
+ 
+ 			for (uint32_t cChild = 0; cChild < m_children; ++cChild)
+ 			{
+-				m_nodeMBR.m_pLow[cDim] = std::min(m_nodeMBR.m_pLow[cDim], m_ptrMBR[cChild]->getExtrapolatedLow(cDim, m_nodeMBR.m_startTime));
+-				m_nodeMBR.m_pHigh[cDim] = std::max(m_nodeMBR.m_pHigh[cDim], m_ptrMBR[cChild]->getExtrapolatedHigh(cDim, m_nodeMBR.m_startTime));
++				m_nodeMBR.m_pLow[cDim] = std::min(m_nodeMBR.m_pLow[cDim], m_ptrMBR[cChild]->getLow(cDim, m_nodeMBR.m_startTime));
++				m_nodeMBR.m_pHigh[cDim] = std::max(m_nodeMBR.m_pHigh[cDim], m_ptrMBR[cChild]->getHigh(cDim, m_nodeMBR.m_startTime));
+ 				m_nodeMBR.m_pVLow[cDim] = std::min(m_nodeMBR.m_pVLow[cDim], m_ptrMBR[cChild]->m_pVLow[cDim]);
+ 				m_nodeMBR.m_pVHigh[cDim] = std::max(m_nodeMBR.m_pVHigh[cDim], m_ptrMBR[cChild]->m_pVHigh[cDim]);
+ 			}
+@@ -546,6 +581,8 @@ bool Node::insertData(uint32_t dataLength, uint8_t* pData, MovingRegion& mbr, id
+ 			m_nodeMBR.m_pHigh[cDim] += 2.0 * std::numeric_limits<double>::epsilon();
+ 		}
+ 
++		boundExpiringChildren();
++
+ 		m_pTree->writeNode(this);
+ 
+ 		// Diversion from R*-Tree algorithm here. First adjust
+diff --git a/src/tprtree/Node.h b/src/tprtree/Node.h
+index f5efd7a..eaea1e7 100644
+--- a/src/tprtree/Node.h
++++ b/src/tprtree/Node.h
+@@ -80,6 +80,7 @@ namespace SpatialIndex
+ 
+ 			virtual Node& operator=(const Node&);
+ 
++			void boundExpiringChildren();
+ 			virtual bool insertEntry(uint32_t dataLength, uint8_t* pData, MovingRegion& mbr, id_type id);
+ 			virtual void deleteEntry(uint32_t index);
+ 
+diff --git a/src/tprtree/TPRTree.cc b/src/tprtree/TPRTree.cc
+index 220ba76..1dbff81 100644
+--- a/src/tprtree/TPRTree.cc
++++ b/src/tprtree/TPRTree.cc
+@@ -34,6 +34,9 @@
+ #include "TPRTree.h"
+ 
+ #include <cstring>
++#include <queue>
++#include <string>
++#include <vector>
+ 
+ using namespace SpatialIndex::TPRTree;
+ 
+@@ -252,28 +255,16 @@ SpatialIndex::TPRTree::TPRTree::~TPRTree()
+ void SpatialIndex::TPRTree::TPRTree::insertData(uint32_t len, const uint8_t* pData, const IShape& shape, id_type id)
+ {
+ 	if (shape.getDimension() != m_dimension) throw Tools::IllegalArgumentException("insertData: Shape has the wrong number of dimensions.");
+-	const IEvolvingShape* es = dynamic_cast<const IEvolvingShape*>(&shape);
+-	if (es == nullptr) throw Tools::IllegalArgumentException("insertData: Shape does not support the Tools::IEvolvingShape interface.");
+ 	const Tools::IInterval *pivI  = dynamic_cast<const Tools::IInterval*>(&shape);
+ 	if (pivI == nullptr) throw Tools::IllegalArgumentException("insertData: Shape does not support the Tools::IInterval interface.");
+ 
+-	if (pivI->getLowerBound() < m_currentTime) throw Tools::IllegalArgumentException("insertData: Shape start time is older than tree current time.");
++	MovingRegion entry;
++	getShapeRegion(shape, entry);
+ 
+-	Region mbr;
+-	shape.getMBR(mbr);
+-	Region vbr;
+-	es->getVMBR(vbr);
+-	assert(mbr.m_dimension == vbr.m_dimension);
++	if (pivI->getLowerBound() < m_currentTime) throw Tools::IllegalArgumentException("insertData: Shape start time is older than tree current time.");
+ 
+ 	MovingRegionPtr mr = m_regionPool.acquire();
+-	mr->makeDimension(mbr.m_dimension);
+-
+-	memcpy(mr->m_pLow, mbr.m_pLow, mbr.m_dimension * sizeof(double));
+-	memcpy(mr->m_pHigh, mbr.m_pHigh, mbr.m_dimension * sizeof(double));
+-	memcpy(mr->m_pVLow, vbr.m_pLow, vbr.m_dimension * sizeof(double));
+-	memcpy(mr->m_pVHigh, vbr.m_pHigh, vbr.m_dimension * sizeof(double));
+-	mr->m_startTime = pivI->getLowerBound();
+-	mr->m_endTime = std::numeric_limits<double>::max();
++	*mr = entry;
+ 
+ 	uint8_t* buffer = nullptr;
+ 
+@@ -293,25 +284,14 @@ void SpatialIndex::TPRTree::TPRTree::insertData(uint32_t len, const uint8_t* pDa
+ bool SpatialIndex::TPRTree::TPRTree::deleteData(const IShape& shape, id_type id)
+ {
+ 	if (shape.getDimension() != m_dimension) throw Tools::IllegalArgumentException("insertData: Shape has the wrong number of dimensions.");
+-	const IEvolvingShape* es = dynamic_cast<const IEvolvingShape*>(&shape);
+-	if (es == nullptr) throw Tools::IllegalArgumentException("insertData: Shape does not support the Tools::IEvolvingShape interface.");
+ 	const Tools::IInterval *pivI  = dynamic_cast<const Tools::IInterval*>(&shape);
+ 	if (pivI == nullptr) throw Tools::IllegalArgumentException("insertData: Shape does not support the Tools::IInterval interface.");
+ 
+-	Region mbr;
+-	shape.getMBR(mbr);
+-	Region vbr;
+-	es->getVMBR(vbr);
+-	assert(mbr.m_dimension == vbr.m_dimension);
++	MovingRegion entry;
++	getShapeRegion(shape, entry);
+ 
+ 	MovingRegionPtr mr = m_regionPool.acquire();
+-	mr->makeDimension(mbr.m_dimension);
+-
+-	memcpy(mr->m_pLow, mbr.m_pLow, mbr.m_dimension * sizeof(double));
+-	memcpy(mr->m_pHigh, mbr.m_pHigh, mbr.m_dimension * sizeof(double));
+-	memcpy(mr->m_pVLow, vbr.m_pLow, vbr.m_dimension * sizeof(double));
+-	memcpy(mr->m_pVHigh, vbr.m_pHigh, vbr.m_dimension * sizeof(double));
+-	mr->m_startTime = pivI->getLowerBound();
++	*mr = entry;
+ 	mr->m_endTime = std::numeric_limits<double>::max();
+ 
+ 	m_currentTime = pivI->getUpperBound();
+@@ -340,13 +320,71 @@ void SpatialIndex::TPRTree::TPRTree::intersectsWithQuery(const IShape& query, IV
+ void SpatialIndex::TPRTree::TPRTree::pointLocationQuery(const Point& query, IVisitor& v)
+ {
+ 	if (query.m_dimension != m_dimension) throw Tools::IllegalArgumentException("pointLocationQuery: Shape has the wrong number of dimensions.");
+-	Region r(query, query);
+-	rangeQuery(IntersectionQuery, r, v);
++	rangeQuery(IntersectionQuery, query, v);
+ }
+ 
+-double SpatialIndex::TPRTree::TPRTree::nearestNeighborQuery(uint32_t, const IShape&, IVisitor&, INearestNeighborComparator&, double max_dist)
++double SpatialIndex::TPRTree::TPRTree::nearestNeighborQuery(uint32_t k, const IShape& query, IVisitor& v, INearestNeighborComparator& nnc, double max_dist)
+ {
+-	throw Tools::IllegalStateException("nearestNeighborQuery: not implemented yet.");
++	if (query.getDimension() != m_dimension) throw Tools::IllegalArgumentException("nearestNeighborQuery: Shape has the wrong number of dimensions.");
++
++	MovingRegion q;
++	getShapeRegion(query, q);
++	validateQueryInterval(q, "nearestNeighborQuery");
++
++	if (k == 0) return 0.0;
++
++	auto ascending = [](const NNEntry& lhs, const NNEntry& rhs) { return lhs.m_minDist > rhs.m_minDist; };
++	std::priority_queue<NNEntry, std::vector<NNEntry>, decltype(ascending)> queue(ascending);
++
++	queue.push(NNEntry(m_rootID, nullptr, 0.0));
++
++	uint32_t count = 0;
++	double knearest = 0.0;
++
++	while (! queue.empty())
++	{
++		NNEntry pFirst = queue.top();
++
++		if (max_dist > 0.0 && pFirst.m_minDist > max_dist) break;
++		if (count >= k && pFirst.m_minDist > knearest) break;
++
++		queue.pop();
++
++		if (pFirst.m_pEntry == nullptr)
++		{
++			NodePtr n = readNode(pFirst.m_id);
++			v.visitNode(*n);
++
++			for (uint32_t cChild = 0; cChild < n->m_children; ++cChild)
++			{
++				if (n->m_level == 0)
++				{
++					Data* e = new Data(n->m_pDataLength[cChild], n->m_pData[cChild], *(n->m_ptrMBR[cChild]), n->m_pIdentifier[cChild]);
++					queue.push(NNEntry(n->m_pIdentifier[cChild], e, nnc.getMinimumDistance(query, *e)));
++				}
++				else
++				{
++					queue.push(NNEntry(n->m_pIdentifier[cChild], nullptr, nnc.getMinimumDistance(query, *(n->m_ptrMBR[cChild]))));
++				}
++			}
++		}
++		else
++		{
++			v.visitData(*(static_cast<IData*>(pFirst.m_pEntry)));
++			++(m_stats.m_queryResults);
++			++count;
++			knearest = pFirst.m_minDist;
++			delete pFirst.m_pEntry;
++		}
++	}
++
++	while (! queue.empty())
++	{
++		if (queue.top().m_pEntry != nullptr) delete queue.top().m_pEntry;
++		queue.pop();
++	}
++
++	return knearest;
+ }
+ 
+ double SpatialIndex::TPRTree::TPRTree::nearestNeighborQuery(uint32_t k, const IShape& query, IVisitor& v, double max_dist)
+@@ -356,9 +394,17 @@ double SpatialIndex::TPRTree::TPRTree::nearestNeighborQuery(uint32_t k, const IS
+ 	return nearestNeighborQuery(k, query, v, nnc, max_dist);
+ }
+ 
+-void SpatialIndex::TPRTree::TPRTree::selfJoinQuery(const IShape&, IVisitor&)
++void SpatialIndex::TPRTree::TPRTree::selfJoinQuery(const IShape& query, IVisitor& v)
+ {
+-	throw Tools::IllegalStateException("selfJoinQuery: not implemented yet.");
++	if (query.getDimension() != m_dimension) throw Tools::IllegalArgumentException("selfJoinQuery: Shape has the wrong number of dimensions.");
++
++	MovingRegion q;
++	getShapeRegion(query, q);
++	validateQueryInterval(q, "selfJoinQuery");
++
++	NodePtr root = readNode(m_rootID);
++	if (root->m_children > 0 && q.intersectsRegionAtSameInstant(q, root->m_nodeMBR, root->m_nodeMBR))
++		selfJoinQuery(m_rootID, m_rootID, q, v);
+ }
+ 
+ void SpatialIndex::TPRTree::TPRTree::queryStrategy(IQueryStrategy& qs)
+@@ -509,8 +555,8 @@ bool SpatialIndex::TPRTree::TPRTree::isIndexValid()
+ 
+ 			for (uint32_t cChild = 0; cChild < e.m_pNode->m_children; ++cChild)
+ 			{
+-				tmpRegion.m_pLow[cDim] = std::min(tmpRegion.m_pLow[cDim], e.m_pNode->m_ptrMBR[cChild]->getExtrapolatedLow(cDim, tmpRegion.m_startTime));
+-				tmpRegion.m_pHigh[cDim] = std::max(tmpRegion.m_pHigh[cDim], e.m_pNode->m_ptrMBR[cChild]->getExtrapolatedHigh(cDim, tmpRegion.m_startTime));
++				tmpRegion.m_pLow[cDim] = std::min(tmpRegion.m_pLow[cDim], e.m_pNode->m_ptrMBR[cChild]->getLow(cDim, tmpRegion.m_startTime));
++				tmpRegion.m_pHigh[cDim] = std::max(tmpRegion.m_pHigh[cDim], e.m_pNode->m_ptrMBR[cChild]->getHigh(cDim, tmpRegion.m_startTime));
+ 				tmpRegion.m_pVLow[cDim] = std::min(tmpRegion.m_pVLow[cDim], e.m_pNode->m_ptrMBR[cChild]->m_pVLow[cDim]);
+ 				tmpRegion.m_pVHigh[cDim] = std::max(tmpRegion.m_pVHigh[cDim], e.m_pNode->m_ptrMBR[cChild]->m_pVHigh[cDim]);
+ 			}
+@@ -518,6 +564,21 @@ bool SpatialIndex::TPRTree::TPRTree::isIndexValid()
+ 			tmpRegion.m_pHigh[cDim] += 2.0 * std::numeric_limits<double>::epsilon();
+ 		}
+ 
++		bool expiring = false;
++		for (uint32_t cChild = 0; cChild < e.m_pNode->m_children; ++cChild)
++		{
++			if (e.m_pNode->m_ptrMBR[cChild]->m_endTime != std::numeric_limits<double>::max()) { expiring = true; break; }
++		}
++
++		if (expiring)
++		{
++			for (uint32_t cDim = 0; cDim < tmpRegion.m_dimension; ++cDim)
++			{
++				tmpRegion.m_pVLow[cDim] = std::min(tmpRegion.m_pVLow[cDim], 0.0);
++				tmpRegion.m_pVHigh[cDim] = std::max(tmpRegion.m_pVHigh[cDim], 0.0);
++			}
++		}
++
+ 		if (! (tmpRegion == e.m_pNode->m_nodeMBR))
+ 		{
+ 			std::cerr << "Invalid parent information." << std::endl;
+@@ -1131,17 +1192,18 @@ SpatialIndex::TPRTree::NodePtr SpatialIndex::TPRTree::TPRTree::readNode(id_type
+ 	{
+ 		uint32_t nodeType;
+ 		memcpy(&nodeType, buffer, sizeof(uint32_t));
++		uint32_t nodeKind = nodeType & (PersistentIndex | PersistentLeaf);
+ 
+ 		NodePtr n;
+ 
+-		if (nodeType == PersistentIndex) n = m_indexPool.acquire();
+-		else if (nodeType == PersistentLeaf) n = m_leafPool.acquire();
++		if (nodeKind == PersistentIndex) n = m_indexPool.acquire();
++		else if (nodeKind == PersistentLeaf) n = m_leafPool.acquire();
+ 		else throw Tools::IllegalStateException("readNode: failed reading the correct node type information");
+ 
+ 		if (n.get() == nullptr)
+ 		{
+-			if (nodeType == PersistentIndex) n = NodePtr(new Index(this, -1, 0), &m_indexPool);
+-			else if (nodeType == PersistentLeaf) n = NodePtr(new Leaf(this, -1), &m_leafPool);
++			if (nodeKind == PersistentIndex) n = NodePtr(new Index(this, -1, 0), &m_indexPool);
++			else if (nodeKind == PersistentLeaf) n = NodePtr(new Leaf(this, -1), &m_leafPool);
+ 		}
+ 
+ 		//n->m_pTree = this;
+@@ -1189,15 +1251,14 @@ void SpatialIndex::TPRTree::TPRTree::deleteNode(Node* n)
+ 
+ void SpatialIndex::TPRTree::TPRTree::rangeQuery(RangeQueryType type, const IShape& query, IVisitor& v)
+ {
+-	const MovingRegion* mr = dynamic_cast<const MovingRegion*>(&query);
+-	if (mr == nullptr) throw Tools::IllegalArgumentException("rangeQuery: Shape has to be a moving region.");
+-	if (mr->m_startTime < m_currentTime || mr->m_endTime >= m_currentTime + m_horizon)
+-		throw Tools::IllegalArgumentException("rangeQuery: Query time interval does not intersect current horizon.");
++	MovingRegion q;
++	getShapeRegion(query, q);
++	validateQueryInterval(q, "rangeQuery");
+ 
+ 	std::stack<NodePtr> st;
+ 	NodePtr root = readNode(m_rootID);
+ 
+-	if (root->m_children > 0 && mr->intersectsRegionInTime(root->m_nodeMBR)) st.push(root);
++	if (root->m_children > 0 && q.intersectsRegionAtSameInstant(q, q, root->m_nodeMBR)) st.push(root);
+ 
+ 	while (! st.empty())
+ 	{
+@@ -1210,8 +1271,8 @@ void SpatialIndex::TPRTree::TPRTree::rangeQuery(RangeQueryType type, const IShap
+ 			for (uint32_t cChild = 0; cChild < n->m_children; ++cChild)
+ 			{
+ 				bool b;
+-				if (type == ContainmentQuery) b = mr->containsRegionInTime(*(n->m_ptrMBR[cChild]));
+-				else b = mr->intersectsRegionInTime(*(n->m_ptrMBR[cChild]));
++				if (type == ContainmentQuery) b = q.containsRegionAtEveryInstant(q, *(n->m_ptrMBR[cChild]));
++				else b = q.intersectsRegionAtSameInstant(q, q, *(n->m_ptrMBR[cChild]));
+ 
+ 				if (b)
+ 				{
+@@ -1227,7 +1288,100 @@ void SpatialIndex::TPRTree::TPRTree::rangeQuery(RangeQueryType type, const IShap
+ 
+ 			for (uint32_t cChild = 0; cChild < n->m_children; ++cChild)
+ 			{
+-				if (mr->intersectsRegionInTime(*(n->m_ptrMBR[cChild]))) st.push(readNode(n->m_pIdentifier[cChild]));
++				if (q.intersectsRegionAtSameInstant(q, q, *(n->m_ptrMBR[cChild]))) st.push(readNode(n->m_pIdentifier[cChild]));
++			}
++		}
++	}
++}
++
++void SpatialIndex::TPRTree::TPRTree::getShapeRegion(const IShape& query, MovingRegion& out)
++{
++	uint32_t dim = query.getDimension();
++	std::vector<double> zero(dim, 0.0);
++
++	const Tools::IInterval* iv = dynamic_cast<const Tools::IInterval*>(&query);
++	if (iv == nullptr) throw Tools::IllegalArgumentException("TPRTree: the shape must be a moving region, a moving point, a time region or a time point.");
++	if (iv->getLowerBound() > iv->getUpperBound()) throw Tools::IllegalArgumentException("TPRTree: the shape time interval starts after it ends.");
++
++	if (const MovingRegion* mr = dynamic_cast<const MovingRegion*>(&query))
++	{
++		out = *mr;
++	}
++	else if (const MovingPoint* mp = dynamic_cast<const MovingPoint*>(&query))
++	{
++		out = MovingRegion(mp->m_pCoords, mp->m_pCoords, mp->m_pVCoords, mp->m_pVCoords, mp->m_startTime, mp->m_endTime, dim);
++	}
++	else if (const TimeRegion* tr = dynamic_cast<const TimeRegion*>(&query))
++	{
++		out = MovingRegion(tr->m_pLow, tr->m_pHigh, zero.data(), zero.data(), tr->m_startTime, tr->m_endTime, dim);
++	}
++	else if (const TimePoint* tp = dynamic_cast<const TimePoint*>(&query))
++	{
++		out = MovingRegion(tp->m_pCoords, tp->m_pCoords, zero.data(), zero.data(), tp->m_startTime, tp->m_endTime, dim);
++	}
++	else
++	{
++		throw Tools::IllegalArgumentException("TPRTree: the shape must be a moving region, a moving point, a time region or a time point.");
++	}
++}
++
++
++void SpatialIndex::TPRTree::TPRTree::validateQueryInterval(const MovingRegion& query, const std::string& method) const
++{
++	if (query.m_startTime < m_currentTime || query.m_endTime >= m_currentTime + m_horizon)
++		throw Tools::IllegalArgumentException(method + ": Query time interval does not intersect current horizon.");
++}
++
++double SpatialIndex::TPRTree::TPRTree::NNComparator::getMinimumDistance(const IShape& query, const IShape& entry)
++{
++	const MovingRegion* e = dynamic_cast<const MovingRegion*>(&entry);
++	if (e == nullptr) return query.getMinimumDistance(entry);
++
++	MovingRegion q;
++	getShapeRegion(query, q);
++	return q.getMinimumDistanceInTime(q, *e);
++}
++
++double SpatialIndex::TPRTree::TPRTree::NNComparator::getMinimumDistance(const IShape& query, const IData& data)
++{
++	IShape* pS;
++	data.getShape(&pS);
++	double ret = getMinimumDistance(query, *pS);
++	delete pS;
++	return ret;
++}
++
++void SpatialIndex::TPRTree::TPRTree::selfJoinQuery(id_type id1, id_type id2, const MovingRegion& query, IVisitor& v)
++{
++	NodePtr n1 = readNode(id1);
++	NodePtr n2 = (id1 == id2) ? n1 : readNode(id2);
++	v.visitNode(*n1);
++	if (id1 != id2) v.visitNode(*n2);
++
++	for (uint32_t cChild1 = 0; cChild1 < n1->m_children; ++cChild1)
++	{
++		const MovingRegion& r1 = *(n1->m_ptrMBR[cChild1]);
++		if (! query.intersectsRegionAtSameInstant(query, r1, r1)) continue;
++
++		for (uint32_t cChild2 = (id1 == id2) ? cChild1 : 0; cChild2 < n2->m_children; ++cChild2)
++		{
++			const MovingRegion& r2 = *(n2->m_ptrMBR[cChild2]);
++			if (n1->m_level == 0 && id1 == id2 && cChild1 == cChild2) continue;
++			if (! query.intersectsRegionAtSameInstant(query, r1, r2)) continue;
++
++			if (n1->m_level == 0)
++			{
++				std::vector<const IData*> pair;
++				Data e1(n1->m_pDataLength[cChild1], n1->m_pData[cChild1], *(n1->m_ptrMBR[cChild1]), n1->m_pIdentifier[cChild1]);
++				Data e2(n2->m_pDataLength[cChild2], n2->m_pData[cChild2], *(n2->m_ptrMBR[cChild2]), n2->m_pIdentifier[cChild2]);
++				pair.push_back(&e1);
++				pair.push_back(&e2);
++				v.visitData(pair);
++				++(m_stats.m_queryResults);
++			}
++			else
++			{
++				selfJoinQuery(n1->m_pIdentifier[cChild1], n2->m_pIdentifier[cChild2], query, v);
+ 			}
+ 		}
+ 	}
+diff --git a/src/tprtree/TPRTree.h b/src/tprtree/TPRTree.h
+index 91992a3..be5abc5 100644
+--- a/src/tprtree/TPRTree.h
++++ b/src/tprtree/TPRTree.h
+@@ -98,6 +98,8 @@ namespace SpatialIndex
+ 			void deleteNode(Node*);
+ 
+ 			void rangeQuery(RangeQueryType type, const IShape& query, IVisitor& v);
++			void validateQueryInterval(const MovingRegion& query, const std::string& method) const;
++			void selfJoinQuery(id_type id1, id_type id2, const MovingRegion& query, IVisitor& v);
+ 
+ 			IStorageManager* m_pStorageManager;
+ 
+@@ -162,21 +164,12 @@ namespace SpatialIndex
+ 			class NNComparator : public INearestNeighborComparator
+ 			{
+ 			public:
+-				double getMinimumDistance(const IShape& query, const IShape& entry)
+-				{
+-					return query.getMinimumDistance(entry);
+-				}
+-
+-				double getMinimumDistance(const IShape& query, const IData& data)
+-				{
+-					IShape* pS;
+-					data.getShape(&pS);
+-					double ret = query.getMinimumDistance(*pS);
+-					delete pS;
+-					return ret;
+-				}
++				double getMinimumDistance(const IShape& query, const IShape& entry) override;
++				double getMinimumDistance(const IShape& query, const IData& data) override;
+ 			}; // NNComparator
+ 
++			static void getShapeRegion(const IShape& shape, MovingRegion& out);
++
+ 			class ValidateEntry
+ 			{
+ 			public:

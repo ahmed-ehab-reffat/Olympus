@@ -3203,3 +3203,149 @@ equivalence batches), 2 base guards, 24 superseded repo specs removed; meta.md 3
 in the reference (shared by 10/10 runs); fixed, five tests added, root cause named in meta.md, fresh batch.
 Batch-2 review's remaining coverage notes (operators beyond the six generated; requiredFeatures with a false
 selector on global/variation overrides) were accepted as Medium.
+
+## csbindgen-struct-layout-fidelity (APPROVED Olympus 2026-09-21)
+
+**Outcome.** Accepted 2026-09-21 at 1/10 (batch 4); batches 1-3 read 0/11, 0/11, 0/16.
+
+**Shape + stats.** O-Algorithm-correctness. csbindgen computes a Rust `repr(C)` layout for a 64-bit
+target (pack/align, aliases, enum reprs, niche Options, zero-size fields, bindgen bitfields, arrays,
+unions) and emits the plainest C# layout .NET will lay out identically: Sequential, Sequential+Pack, or
+Explicit with Size and a FieldOffset on every field. 6 production files (new `layout.rs`), 402
+human-effective; 96 tests (70 F2P + 23 P2P + 3 lib); meta.md 488 words.
+
+**Decisive drivers.** F-44 alias x pointer lowering (7/10); F-45 bool decoration on fixed buffers (3/10);
+F-46 over-promotion guards (2/10); NonZero-by-name (1/10).
+
+**Iteration lessons.** Batches 1-2 each exposed unfair cells (an unstated Option-of-fn pointee rule; an
+aligned-enum fixture that panicked the base parser 11/11; an unstated declaration-pruning rule). The FP
+panel then voided all three "passes" of batch 2 on unasserted scoping fixtures. Eleven Solution Quality
+rounds chased module-scoping corners until the scoping sentence and const-name lengths were cut. Batch 3
+(0/16) showed two single-cell near-miss clusters; stating `c_float`/`c_double` and the niche-array
+combination in meta took them to 1/10 and 0/10, and batch 4 was accepted.
+
+## libspatialindex-tpr-temporal-knn (APPROVED Olympus 2026-09-21)
+
+**Outcome.** Accepted at 5/12 (Nova 4/10, Orion 1/2) on a re-eval of batch 3 with a clean FP panel.
+
+**Shape + stats.** O-Algorithm-correctness plus a state-carrying integration layer, C++. Implement the
+TPR-tree's two stubs (`nearestNeighborQuery`, `selfJoinQuery`), make its three range queries temporal
+over four shape kinds with closed and single-instant intervals, and give stored entries a finite end of
+motion. 8 production files (`MovingRegion`, `MovingPoint`, `Node`, `TPRTree`, two headers), 350
+human-effective LOC; 73 F2P tests + 27 base; meta 490 words.
+
+**Decisive difficulty drivers.** F-47 entry lifetime through node bounds, page format and reload (4/12,
+lead; the two deep stopped-entry scenes killed 4 each); F-48 legacy `Point` acceptance (3/12, same runs).
+35/73 tests killed nobody, including every validation, comparator, ordering and k = 0 test and the two
+kernel-layer stop tests.
+
+**Iteration lessons.** Batch 1 read 7/10 on geometry alone. Round 1 proved no tests-only lever existed
+(16 tests replayed 7/10 -> 7/10; 57 probes, 0 divergence). Round 2 added expiry as a description delta.
+Batch 2 read 0/10 because of an `isIndexValid()` assertion (L82); replay without it 5/10. Six review
+rounds then fixed nine reference bugs without moving the band. Batch 3 read 5/12; its re-eval was
+accepted.
+
+## siliconcompiler-flist-roundtrip (APPROVED Olympus 2026-09-23)
+
+**Outcome.** ACCEPTED at 2/10 (20%). Batch 1 0/11, batch 2 2/10. FP panels adjudicated both passes
+genuine (one judge dissent, overruled: the dissent rested on `comments=True` composing with
+`hierarchy=True`, which the contract never specifies).
+
+**Shape + stats.** O-Composite-extend. 3 files, 324 human-effective LOC, 57 new tests + 5 base-mode.
+Base mode scoped to 570 tests. Both passers: ~275-325 effective LOC in ONE file (`design.py`).
+
+**Decisive difficulty driver.** `test_read_records_a_nested_edge_on_the_group_that_carries_it` — 7/10
+kills, sole failure of five 56/57 near-misses. Its fixture is a three-level chain (`head -> middle ->
+tail`); the assertion that discriminates is `read.get("deps") == ["middle"]`, i.e. the ROOT's list, not
+the middle node's. Second axis: a marked group with no content must still materialise its fileset
+(2/10).
+
+**Iteration lessons.**
+
+- The decisive test came from my own mutation harness, not from review: the "edges recorded on the
+  reading design" mutation survived the whole suite, which forced the three-level fixture that became
+  the lead killer. Contrast L15 — a mutation that kills nothing is a test-gap signal even though a
+  mutation that kills something proves nothing about agents.
+- Of ten designed traps, one carried the band, one contributed 2 kills, and eight killed nobody:
+  per-group emission scope, flat-output preservation, the F-12 private-signature axis, prefix-vs-parent
+  containment, per-design root accumulation, `-f`/`-F` polarity, marker scope across includes, and the
+  path-kind/name-kind cell.
+- Seven reference bugs were found by review rounds before any batch; exactly one (empty-record
+  materialisation) became a measured killer.
+
+## pyfakefs-block-inode-accounting (APPROVED Olympus 2026-09-23)
+
+**Outcome.** ACCEPTED at 5/10 (50%, above the 40% ceiling; human reviewer accepted). Batch 1 0/11
+(10 Nova + 1 Vega), batch 2 0/12 plus two appended Vega = 1/14 with the pass adjudicated FP, batch 3
+5/10 Nova. The final Auto Review asked for revisions (a `create_file` `UnicodeEncodeError` rollback gap)
+and was overruled by the acceptance.
+
+**Shape + stats.** O-Composite-add. 4 files (`fake_file.py`, `fake_filesystem.py`, `fake_os.py`,
+`docs/modules.rst`), 334 human-effective LOC, 117 new tests, 5 base-mode deselects. meta.md 493 words.
+18 review rounds.
+
+**Decisive difficulty drivers.** `test_a_refused_eager_real_directory_import_keeps_its_parents` (3/10,
+sole failure of Nova 8), the unlimited-inode report and reset tests (1/10 each), and
+`test_a_symlink_is_charged_for_its_path_where_stat_reports_nothing` (1/10, sole failure of Nova 6).
+
+**Iteration lessons.**
+
+- 27 reference bugs over 18 rounds, none found by a batch. The three that predicted agent failure
+  became F-20, F-50 and F-51.
+- Batch 1's 0/11 was gate-ratcheted rollback coverage (L91); batch 2's 0/12 was a one-sided carve-out
+  (L89). Neither was difficulty.
+- Two authored walls decayed to 0/10 between batches 2 and 3: reserve renames and the unlinked-fd
+  resize. 108 of 117 tests killed nothing.
+- One reference gap remained at acceptance: `create_file` rolls back only on `OSError`.
+
+## pyocd-sequence-expression-kernel (APPROVED Olympus 2026-09-24)
+
+**Outcome.** ACCEPTED at 5/10 (50%, above the 40% ceiling; human reviewer accepted). Batch 1 0/11
+(10 Nova + 1 Vega), batch 2 5/10 Nova. Final Auto Review: Approved, Description 3/3, Tests 3/3,
+Solution 3/3, one Low (a 5 s wall-clock timeout on a bounded while-loop test).
+
+**Shape + stats.** O-Pipeline-hard. 4 files (`values.py` new, `sequences.py`, `scope.py`,
+`functions.py`), 243 human-effective LOC, 150 new test cases (90 functions), a 3-row deletion in the
+repo's fold table. meta.md 494 words. Core slice plus eleven review rounds.
+
+**Decisive difficulty drivers.** The four delegate-input tests (`test_call_arguments_are_evaluated_left_to_right`
+and three siblings; F-52, sole failure of Nova #7 and #2), the three JTAG tests on the `tms` argument
+(sole failure of Nova #5; accidental, L92), and `test_logical_operators_with_a_literal_operand_produce_one_or_zero`
++ `test_zero_minus_a_variable_is_the_negation` (F-31, with `tms`). 141 of 150 tests killed nothing.
+
+**Iteration lessons.**
+
+- Batch 1's 0/11 was one rule a review round added (control predicate must be a value, 8/11); the
+  replay picked that cut and projected 2/11.
+- Two boundary clauses rewritten as concrete consequences took their tests from 6-7/11 to 0/10.
+- Eleven reference bugs, all found by gates. Only the test built for the first one killed anyone, and
+  it caught the opposite error (L90 counter-evidence).
+- Three rounds on a `-> str` delegate the repo does not have (L93); three reviewer-requested tests
+  withheld after replaying at 0/11.
+- One Low remained at acceptance: the three-iteration while-loop test keeps a 5 s timeout.
+
+## teavm-method-summaries (APPROVED Olympus 2026-09-24)
+
+**Outcome.** ACCEPTED at 4/10 (40%, on the ceiling), batch 1, all Nova. Final Auto Review: Approved,
+Description 3/3, Tests 2/3, Solution 2/3. Open Mediums: direct invokedynamic does not invalidate RFRE
+caches (pre-existing, demoted), no unanchored recursive-cycle test, stale XML after an early runner
+failure.
+
+**Shape + stats.** O-Pipeline-hard / O-Algorithm-correctness. 9 files (`MethodSummaries.java` new,
+`NullnessInformation`, `NullnessInformationBuilder`, `MethodOptimizationContext`,
+RedundantNullCheckElimination, ConstantConditionElimination, LoopInvariantMotion,
+RepeatedFieldReadElimination, `TeaVM.java`), 298 human-effective LOC, 26 new tests, Gradle-free javac +
+JUnitCore harness. meta.md 413 words.
+
+**Decisive difficulty drivers.** `neverNullHoldsThroughMutualRecursion` (F-53, 4/10, sole failure of
+Nova #1, #4, #7), `withoutSummariesEveryPassBehavesAsBefore` (F-54, 2/10, sole failure of Nova #6),
+`fieldReadsSurviveACallThatDoesNotWriteThem` + `aCallInOneBranchForgetsItsFieldsAfterTheJoin` (F-55,
+2/10). 21 of 26 killed nothing.
+
+**Iteration lessons.**
+
+- Four gate rounds before any batch: bind-mount Dockerfile, synthetic fallback id + absent-class
+  VIRTUAL bug, unwired `SIMPLE` pipeline, then Tests 1/3 on "once per build" and invokedynamic.
+- A real `TeaVM.build` runs in a unit test with a stub `TeaVMTarget`; a bare
+  `new ClassHolder("java.lang.Object")` defaults its parent to itself and hangs dependency analysis.
+- 11 gate-requested tests, 0 kills.

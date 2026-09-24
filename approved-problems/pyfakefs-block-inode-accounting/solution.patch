@@ -1,0 +1,1081 @@
+diff --git a/docs/modules.rst b/docs/modules.rst
+index f978e36..f5c2365 100644
+--- a/docs/modules.rst
++++ b/docs/modules.rst
+@@ -14,6 +14,7 @@ Fake filesystem classes
+ .. autoclass:: pyfakefs.fake_filesystem.FakeFilesystem
+     :members: add_mount_point,
+         get_disk_usage, set_disk_usage, change_disk_usage,
++        statvfs, mount_usages, tree_usage,
+         add_real_directory, add_real_file, add_real_symlink, add_real_paths, add_package_metadata,
+         create_dir, create_file, create_symlink, create_link,
+         get_object, pause, resume
+diff --git a/pyfakefs/fake_file.py b/pyfakefs/fake_file.py
+index 4e30676..c174614 100644
+--- a/pyfakefs/fake_file.py
++++ b/pyfakefs/fake_file.py
+@@ -26,6 +26,7 @@ from collections.abc import Callable, Iterator
+ from stat import (
+     S_IFDIR,
+     S_IFREG,
++    S_ISLNK,
+ )
+ from types import TracebackType
+ from typing import (
+@@ -183,6 +184,7 @@ class FakeFile:
+             len(self._byte_contents) if self._byte_contents is not None else 0
+         )
+         self.epoch: int = 0
++        self.charged_dev: int | None = None
+         self.parent_dir: weakref.ReferenceType | None = None
+         # Linux specific: extended file system attributes
+         self.xattr: dict = {}
+@@ -272,13 +274,24 @@ class FakeFile:
+                    or if ``st_size`` exceeds the available file system space
+         """
+         self._check_positive_int(st_size)
+-        if self.st_size:
+-            self.size = 0
++        current_size = self.st_size or 0
+         if self._filesystem():
+-            self.filesystem.change_disk_usage(st_size, self.name, self.st_dev)
++            self._charge_resize(st_size)
++        if current_size:
++            self.epoch += 1
+         self.st_size = st_size
+         self._byte_contents = None
+ 
++    def _charge_resize(self, st_size: int) -> None:
++        """Charge what this object costs its file system when its byte length
++        becomes `st_size`. An object that no name holds any more was given
++        back with that name and is charged nothing further.
++        """
++        if self.charged_dev is not None:
++            self.filesystem._resize_allocation(
++                allocation_size(self), st_size, self.name, self.charged_dev
++            )
++
+     def _check_positive_int(self, size: int) -> None:
+         # the size should be a positive integer value
+         if not is_int_type(size) or size < 0:
+@@ -317,10 +330,7 @@ class FakeFile:
+         changed = self._byte_contents != byte_contents
+         st_size = len(byte_contents) if byte_contents else 0
+ 
+-        current_size = self.st_size or 0
+-        self.filesystem.change_disk_usage(
+-            st_size - current_size, self.name, self.st_dev
+-        )
++        self._charge_resize(st_size)
+         self._byte_contents = byte_contents
+         self.st_size = st_size
+         self.epoch += 1
+@@ -369,9 +379,7 @@ class FakeFile:
+ 
+         self._check_positive_int(st_size)
+         current_size = self.st_size or 0
+-        self.filesystem.change_disk_usage(
+-            st_size - current_size, self.name, self.st_dev
+-        )
++        self._charge_resize(st_size)
+         if self._byte_contents:
+             if st_size < current_size:
+                 self._byte_contents = self._byte_contents[:st_size]
+@@ -497,6 +505,20 @@ class FakeFileFromRealFile(FakeFile):
+         return False
+ 
+ 
++def allocation_size(path_object: FakeFile) -> int:
++    """Return the byte length an object occupies space for.
++
++    A directory occupies none, and a symbolic link occupies the length of the
++    path it holds, which ``stat`` reports as zero under Windows.
++    """
++    if isinstance(path_object, FakeDirectory):
++        return 0
++    if S_ISLNK(path_object.st_mode):
++        contents = path_object.byte_contents
++        return len(contents) if contents else 0
++    return path_object.st_size or 0
++
++
+ class FakeDirectory(FakeFile):
+     """Provides the appearance of a real directory."""
+ 
+@@ -537,15 +559,22 @@ class FakeDirectory(FakeFile):
+             for item in sorted(self._entries.items(), key=lambda entry: entry[1].st_ino)
+         ]
+ 
+-    def add_entry(self, path_object: FakeFile) -> None:
++    def add_entry(self, path_object: FakeFile, account: bool = True) -> None:
+         """Adds a child FakeFile to this directory.
+ 
+         Args:
+             path_object: FakeFile instance to add as a child of this directory.
++            account: If `True` (the default), the object is charged to the
++                file system it is added to if this is the only name it has.
++                An object that was not charged gives nothing back when it is
++                removed again, and an object that moves keeps the device it
++                was charged to.
+ 
+         Raises:
+             OSError: if the directory has no write permission (Posix only)
+             OSError: if the file or directory to be added already exists
++            OSError: if the file system has no free inode or not enough
++                free space left for the added object
+         """
+         if (
+             not helpers.is_root()
+@@ -558,6 +587,16 @@ class FakeDirectory(FakeFile):
+         if path_object_name in self.entries:
+             self.filesystem.raise_os_error(errno.EEXIST, self.path)
+ 
++        if (
++            account
++            and not self.filesystem.accounting_off
++            and path_object.st_nlink == self._own_link_count(path_object)
++        ):
++            self.filesystem.allocate_entry(
++                path_object.name, self._accounted_size(path_object), self.st_dev
++            )
++            path_object.charged_dev = self.st_dev
++
+         self._entries[path_object_name] = path_object
+         path_object.parent_dir = weakref.ref(self)
+         if path_object.st_ino is None:
+@@ -566,10 +605,17 @@ class FakeDirectory(FakeFile):
+         self.st_nlink += 1
+         path_object.st_nlink += 1
+         path_object.st_dev = self.st_dev
+-        if path_object.st_nlink == 1:
+-            self.filesystem.change_disk_usage(
+-                path_object.size, path_object.name, self.st_dev
+-            )
++
++    @staticmethod
++    def _own_link_count(path_object: FakeFile) -> int:
++        """Return the number of links an object carries while it has no name
++        in any directory. A directory counts itself."""
++        return 1 if isinstance(path_object, FakeDirectory) else 0
++
++    @staticmethod
++    def _accounted_size(path_object: FakeFile) -> int:
++        """Return the byte length the given object occupies space for."""
++        return allocation_size(path_object)
+ 
+     def get_entry(self, pathname_name: str) -> AnyFile:
+         """Retrieves the specified child file or directory entry.
+@@ -595,7 +641,9 @@ class FakeDirectory(FakeFile):
+                 pathname_name = matching_names[0]
+         return pathname_name
+ 
+-    def remove_entry(self, pathname_name: str, recursive: bool = True) -> None:
++    def remove_entry(
++        self, pathname_name: str, recursive: bool = True, account: bool = True
++    ) -> None:
+         """Removes the specified child file or directory.
+ 
+         Args:
+@@ -603,6 +651,8 @@ class FakeDirectory(FakeFile):
+             recursive: If `True` (default), the entries in contained directories
+                 are deleted first. Used to propagate removal errors
+                 (e.g. permission problems) from contained entries.
++            account: If `True` (the default), the object gives back what it
++                took from the file system when this was its last name.
+ 
+         Raises:
+             KeyError: if no child exists by the specified name.
+@@ -634,8 +684,13 @@ class FakeDirectory(FakeFile):
+         if recursive and isinstance(entry, FakeDirectory):
+             while entry.entries:
+                 entry.remove_entry(next(iter(entry.entries)))
+-        elif entry.st_nlink == 1:
+-            self.filesystem.change_disk_usage(-entry.size, pathname_name, entry.st_dev)
++
++        losing_last_name = entry.st_nlink == self._own_link_count(entry) + 1
++        if account and losing_last_name and entry.charged_dev is not None:
++            self.filesystem.release_entry(
++                pathname_name, self._accounted_size(entry), entry.charged_dev
++            )
++            entry.charged_dev = None
+ 
+         self.st_nlink -= 1
+         entry.st_nlink -= 1
+diff --git a/pyfakefs/fake_filesystem.py b/pyfakefs/fake_filesystem.py
+index e583b16..a4b1996 100644
+--- a/pyfakefs/fake_filesystem.py
++++ b/pyfakefs/fake_filesystem.py
+@@ -152,6 +152,81 @@ class OSType(Enum):
+ FakeFile = fake_file.FakeFile
+ FakeNullFile = fake_file.FakeNullFile
+ FakeFileFromRealFile = fake_file.FakeFileFromRealFile
++UNLIMITED_SIZE = 1024 * 1024 * 1024 * 1024
++TreeUsage = namedtuple("TreeUsage", "size, inodes")
++
++
++def blocks_for(size: int, block_size: int) -> int:
++    """Return the number of whole allocation units a byte length needs."""
++    if size <= 0:
++        return 0
++    return -(-size // block_size)
++
++
++def mount_capacity(mount_point: dict) -> int:
++    """Return the usable size of a mount point in bytes, which is the whole
++    allocation units that fit into its total size, and never less than none."""
++    total_size = mount_point["total_size"]
++    if total_size is None:
++        total_size = UNLIMITED_SIZE
++    block_size = mount_point["block_size"]
++    return max(0, total_size) // block_size * block_size
++
++
++def check_block_size(block_size: int | None) -> None:
++    """Raise if the given allocation unit size cannot be used."""
++    if block_size is not None and (not is_int_type(block_size) or block_size < 1):
++        raise ValueError("block_size must be a positive integer")
++
++
++def check_inode_count(inode_count: int | None) -> None:
++    """Raise if the given number of inodes cannot be used."""
++    if inode_count is not None and (not is_int_type(inode_count) or inode_count < 0):
++        raise ValueError("inode_count must be a non-negative integer")
++
++
++def check_reserved(name: str, reserved: int | None) -> None:
++    """Raise if the given size of a reserve cannot be used."""
++    if reserved is not None and (not is_int_type(reserved) or reserved < 0):
++        raise ValueError(f"{name} must be a non-negative integer")
++
++
++def free_size(mount_point: dict) -> int:
++    """Return the bytes of a mount point that hold no object."""
++    return mount_capacity(mount_point) - mount_point["used_size"]
++
++
++def available_size(mount_point: dict) -> int:
++    """Return the bytes of a mount point an unprivileged caller may still
++    take, which is the free space less the reserve."""
++    reserved = mount_point["reserved_blocks"] * mount_point["block_size"]
++    return max(0, free_size(mount_point) - reserved)
++
++
++def free_inodes(mount_point: dict) -> int:
++    """Return the number of inodes of a mount point that no object holds."""
++    inode_count = mount_point["inode_count"]
++    if inode_count is None:
++        inode_count = mount_capacity(mount_point) // mount_point["block_size"]
++    return inode_count - mount_point["used_inodes"]
++
++
++def available_inodes(mount_point: dict) -> int:
++    """Return the number of inodes of a mount point an unprivileged caller
++    may still take, which is the free inodes less the reserve."""
++    return max(0, free_inodes(mount_point) - mount_point["reserved_inodes"])
++
++
++def mount_settings(mount_point: dict) -> dict:
++    """Return the settings of a mount point, without anything it holds."""
++    return {
++        "block_size": mount_point["block_size"],
++        "inode_count": mount_point["inode_count"],
++        "reserved_blocks": mount_point["reserved_blocks"],
++        "reserved_inodes": mount_point["reserved_inodes"],
++    }
++
++
+ FakeDirectory = fake_file.FakeDirectory
+ FakeDirectoryFromRealDirectory = fake_file.FakeDirectoryFromRealDirectory
+ FakeFileWrapper = fake_file.FakeFileWrapper
+@@ -271,6 +346,7 @@ class FakeFilesystem:
+         self.last_ino: int = 0
+         self.last_dev: int = 0
+         self.mount_points: dict[AnyString, dict] = OrderedDict()
++        self.accounting_off: bool = False
+         self.dev_null: Any = None
+         self.reset(total_size=total_size, init_pathlib=False)
+ 
+@@ -428,7 +504,13 @@ class FakeFilesystem:
+         FakePathModule.reset(self)
+ 
+     def reset(self, total_size: int | None = None, init_pathlib: bool = True):
+-        """Remove all file system contents and reset the root."""
++        """Remove all file system contents and reset the root, keeping the
++        allocation settings of the root device."""
++        settings = (
++            mount_settings(next(iter(self.mount_points.values())))
++            if self.mount_points
++            else {}
++        )
+         self.root = FakeDirectory(self.path_separator, filesystem=self)
+ 
+         self.dev_null = FakeNullFile(self)
+@@ -437,7 +519,7 @@ class FakeFilesystem:
+         self.last_ino = 0
+         self.last_dev = 0
+         self.mount_points.clear()
+-        self._add_root_mount_point(total_size)
++        self._add_root_mount_point(total_size, settings)
+         self._add_standard_streams()
+         if self.create_temp_dir:
+             self._create_temp_dir()
+@@ -455,12 +537,12 @@ class FakeFilesystem:
+         finally:
+             self.fs_type = old_fs_type
+ 
+-    def _add_root_mount_point(self, total_size):
++    def _add_root_mount_point(self, total_size, settings: dict | None = None):
+         mount_point = "C:" if self.is_windows_fs else self.path_separator
+         self._cwd = mount_point
+         if not self.cwd.endswith(self.path_separator):
+             self._cwd += self.path_separator
+-        self.add_mount_point(mount_point, total_size)
++        self.add_mount_point(mount_point, total_size, **(settings or {}))
+ 
+     def pause(self) -> None:
+         """Pause the patching of the file system modules until :py:meth:`resume` is
+@@ -542,6 +624,10 @@ class FakeFilesystem:
+         path: AnyStr,
+         total_size: int | None = None,
+         can_exist: bool = False,
++        block_size: int = 1,
++        inode_count: int | None = None,
++        reserved_blocks: int = 0,
++        reserved_inodes: int = 0,
+     ) -> dict:
+         """Add a new mount point for a filesystem device.
+         The mount point gets a new unique device number.
+@@ -555,13 +641,33 @@ class FakeFilesystem:
+             can_exist: If `True`, no error is raised if the mount point
+                 already exists.
+ 
++            block_size: The size of the allocation unit of the new device
++                in bytes. Defaults to 1, which accounts the exact byte
++                length of every file.
++
++            inode_count: The number of inodes available on the new device.
++                Defaults to `None`, which means an unlimited number.
++
++            reserved_blocks: The number of allocation units of the new device
++                that only the root user may take. Defaults to 0.
++
++            reserved_inodes: The number of inodes of the new device that only
++                the root user may take. Defaults to 0.
++
+         Returns:
+             The newly created mount point dict.
+ 
+         Raises:
+             OSError: if trying to mount an existing mount point again,
+                 and ``can_exist`` is `False`.
+-        """
++            ValueError: if ``block_size`` is smaller than 1, or if
++                ``inode_count``, ``reserved_blocks`` or ``reserved_inodes``
++                is negative.
++        """
++        check_block_size(block_size)
++        check_inode_count(inode_count)
++        check_reserved("reserved_blocks", reserved_blocks)
++        check_reserved("reserved_inodes", reserved_inodes)
+         path = self.normpath(self.normcase(path))
+         for mount_point in self.mount_points:
+             if (
+@@ -579,6 +685,11 @@ class FakeFilesystem:
+             "idev": self.last_dev,
+             "total_size": total_size,
+             "used_size": 0,
++            "block_size": block_size,
++            "inode_count": inode_count,
++            "reserved_blocks": reserved_blocks,
++            "reserved_inodes": reserved_inodes,
++            "used_inodes": 0,
+         }
+         if path == matching_string(path, self.root.name):
+             # special handling for root path: has been created before
+@@ -587,6 +698,9 @@ class FakeFilesystem:
+             root_dir.st_ino = self.last_ino
+         else:
+             root_dir = self._create_mount_point_dir(path)
++            if root_dir.charged_dev is not None:
++                self.release_entry(root_dir.name, 0, root_dir.charged_dev)
++                root_dir.charged_dev = None
+         root_dir.st_dev = self.last_dev
+         return self.mount_points[path]
+ 
+@@ -604,7 +718,7 @@ class FakeFilesystem:
+             if not directory:
+                 new_dir = FakeDirectory(component, filesystem=self)
+                 new_dirs.append(new_dir)
+-                current_dir.add_entry(new_dir)
++                current_dir.add_entry(new_dir, account=False)
+                 current_dir = new_dir
+             else:
+                 current_dir = cast(FakeDirectory, directory)
+@@ -634,7 +748,7 @@ class FakeFilesystem:
+             root_path = matching_string(path, root_path)
+             if drive and not root_path.startswith(drive):
+                 continue
+-            if path.startswith(root_path) and len(root_path) > len(mount_path):
++            if self._is_below(path, root_path) and len(root_path) > len(mount_path):
+                 mount_path = root_path
+         if mount_path:
+             return self.mount_points[to_string(mount_path)]
+@@ -642,6 +756,16 @@ class FakeFilesystem:
+         assert mount_point
+         return mount_point
+ 
++    def _is_below(self, path: AnyStr, root_path: AnyStr) -> bool:
++        """Return `True` if the given path is the given root path or lies
++        below it, comparing whole path components."""
++        if not root_path or path == root_path:
++            return True
++        separator = matching_string(path, self.path_separator)
++        if not root_path.endswith(separator):
++            root_path += separator
++        return path.startswith(root_path)
++
+     def _mount_point_dir_for_cwd(self) -> FakeDirectory:
+         """Return the fake directory object of the mount point where the
+         current working directory points to."""
+@@ -673,6 +797,80 @@ class FakeFilesystem:
+                 return mount_point
+         return None
+ 
++    def _mount_path_for_device(self, idev: int) -> AnyString | None:
++        for mount_path, mount_point in self.mount_points.items():
++            if mount_point["idev"] == idev:
++                return mount_path
++        return None
++
++    def mount_usages(self) -> dict:
++        """Return what :py:meth:`statvfs` reports for every mount point,
++        mapped to the path the device is mounted at, in the order the mount
++        points were added.
++        """
++        usages: dict = OrderedDict()
++        for mount_path in self.mount_points:
++            usages[mount_path] = self.statvfs(mount_path)
++        return usages
++
++    def tree_usage(self, path: AnyStr, one_file_system: bool = False) -> dict:
++        """Return what the object at the given path and everything below it
++        occupies, split over the devices the objects live on.
++
++        Args:
++            path: The path of the object the walk starts at. A symbolic link
++                is not followed, neither at the start nor below it.
++
++            one_file_system: If `True`, the walk does not descend into a
++                directory that is the root of another device.
++
++        Returns:
++            A dict of the mount path of every device the tree took something
++            from, mapped to a `TreeUsage` pair of the allocated bytes and the
++            number of inodes the tree occupies there. An object that was never
++            charged to its mount point counts for nothing.
++
++        Raises:
++            OSError: if the path does not exist.
++        """
++        file_object = self.lresolve(make_string_path(path))
++        usage: dict = {}
++        self._add_tree_usage(file_object, usage, set(), one_file_system)
++        return usage
++
++    def _add_tree_usage(
++        self, file_object: AnyFile, usage: dict, seen: set, one_file_system: bool
++    ) -> None:
++        """Add one object and everything below it to a tree usage mapping,
++        skipping any object that a name in the tree already accounted for."""
++        identity = (file_object.st_dev, file_object.st_ino)
++        if identity in seen:
++            return
++        seen.add(identity)
++        is_dir = isinstance(file_object, FakeDirectory)
++        if file_object.charged_dev is not None:
++            self._add_object_usage(file_object, usage)
++        if not is_dir:
++            return
++        for entry in list(cast(FakeDirectory, file_object).entries.values()):
++            if one_file_system and entry.st_dev != file_object.st_dev:
++                continue
++            self._add_tree_usage(entry, usage, seen, one_file_system)
++
++    def _add_object_usage(self, file_object: AnyFile, usage: dict) -> None:
++        """Add what one charged object took from its mount point to a tree
++        usage mapping."""
++        charged_dev = cast(int, file_object.charged_dev)
++        mount_point = self._mount_point_for_device(charged_dev)
++        mount_path = self._mount_path_for_device(charged_dev)
++        if mount_point is None or mount_path is None:
++            return
++        block_size = mount_point["block_size"]
++        charged = fake_file.allocation_size(file_object)
++        size = blocks_for(charged, block_size) * block_size
++        current = usage.get(mount_path, TreeUsage(0, 0))
++        usage[mount_path] = TreeUsage(current.size + size, current.inodes + 1)
++
+     def get_disk_usage(self, path: AnyStr | None = None) -> tuple[int, int, int]:
+         """Return the total, used and free disk space in bytes as named tuple,
+         or placeholder values simulating unlimited space if not set.
+@@ -690,39 +888,104 @@ class FakeFilesystem:
+         else:
+             file_path = make_string_path(path)
+             mount_point = self._mount_point_for_path(file_path)
+-        if mount_point and mount_point["total_size"] is not None:
+-            return DiskUsage(
+-                mount_point["total_size"],
+-                mount_point["used_size"],
+-                mount_point["total_size"] - mount_point["used_size"],
+-            )
+-        return DiskUsage(1024 * 1024 * 1024 * 1024, 0, 1024 * 1024 * 1024 * 1024)
++        if mount_point is None:
++            return DiskUsage(UNLIMITED_SIZE, 0, UNLIMITED_SIZE)
++        return DiskUsage(
++            mount_capacity(mount_point),
++            mount_point["used_size"],
++            available_size(mount_point),
++        )
+ 
+-    def set_disk_usage(self, total_size: int, path: AnyStr | None = None) -> None:
++    def set_disk_usage(
++        self,
++        total_size: int | None,
++        path: AnyStr | None = None,
++        block_size: int | None = None,
++        inode_count: int | None = None,
++        reserved_blocks: int | None = None,
++        reserved_inodes: int | None = None,
++    ) -> None:
+         """Changes the total size of the file system, preserving the
+         used space.
+         Example usage: set the size of an auto-mounted Windows drive.
+ 
+         Args:
+             total_size: The new total size of the filesystem in bytes.
++                `None` means that the size is not limited.
+ 
+             path: The disk space is changed for the file system device where
+                 `path` resides.
+                 Defaults to the root path (e.g. '/' on Unix systems).
+ 
++            block_size: The new size of the allocation unit of the device in
++                bytes. Defaults to `None`, which leaves it unchanged.
++
++            inode_count: The new number of inodes available on the device.
++                Defaults to `None`, which leaves it unchanged.
++
++            reserved_blocks: The new number of allocation units only the root
++                user may take. Defaults to `None`, which leaves it unchanged.
++
++            reserved_inodes: The new number of inodes only the root user may
++                take. Defaults to `None`, which leaves it unchanged.
++
+         Raises:
+-            OSError: if the new space is smaller than the used size.
+-        """
++            OSError: if the new space is smaller than the used size, if the
++                new number of inodes is smaller than the number in use, or
++                if the block size is changed while the device is not empty.
++            ValueError: if ``block_size`` is smaller than 1, or if
++                ``inode_count``, ``reserved_blocks`` or ``reserved_inodes``
++                is negative.
++        """
++        check_block_size(block_size)
++        check_inode_count(inode_count)
++        check_reserved("reserved_blocks", reserved_blocks)
++        check_reserved("reserved_inodes", reserved_inodes)
+         file_path: AnyStr = (
+             path if path is not None else self.root_dir_name  # type: ignore
+         )
+         mount_point = self._mount_point_for_path(file_path)
+-        if (
+-            mount_point["total_size"] is not None
+-            and mount_point["used_size"] > total_size
++        candidate = dict(mount_point)
++        candidate["total_size"] = total_size
++        if block_size is not None:
++            candidate["block_size"] = block_size
++        if inode_count is not None:
++            candidate["inode_count"] = inode_count
++        if reserved_blocks is not None:
++            candidate["reserved_blocks"] = reserved_blocks
++        if reserved_inodes is not None:
++            candidate["reserved_inodes"] = reserved_inodes
++        self._check_mount_settings(mount_point, candidate, path)
++        mount_point.update(candidate)
++
++    def _check_mount_settings(
++        self, mount_point: dict, candidate: dict, path: AnyStr | None
++    ) -> None:
++        """Raise if a mount point cannot take the given settings. Nothing of
++        the new settings is applied before every one of them is accepted.
++
++        Args:
++            mount_point: The mount point as it is now.
++
++            candidate: The mount point as it would be.
++
++            path: The path the settings are changed for, used for the error.
++
++        Raises:
++            OSError: with `EBUSY` if the allocation unit size of a mount point
++                that holds something would change, and with `ENOSPC` if the
++                mount point could not hold what it holds today.
++        """
++        if candidate["block_size"] != mount_point["block_size"] and (
++            mount_point["used_inodes"] or mount_point["used_size"]
+         ):
++            self.raise_os_error(errno.EBUSY, path)
++        inode_count = candidate["inode_count"]
++        if inode_count is not None and inode_count < mount_point["used_inodes"]:
++            self.raise_os_error(errno.ENOSPC, path)
++        capacity = mount_capacity(candidate)
++        if candidate["total_size"] is not None and mount_point["used_size"] > capacity:
+             self.raise_os_error(errno.ENOSPC, path)
+-        mount_point["total_size"] = total_size
+ 
+     def change_disk_usage(
+         self, usage_change: int, file_path: AnyStr, st_dev: int
+@@ -739,16 +1002,156 @@ class FakeFilesystem:
+ 
+         Raises:
+             OSError: if `usage_change` exceeds the free file system space
++                the caller may take
+         """
+         mount_point = self._mount_point_for_device(st_dev)
+-        if mount_point:
+-            total_size = mount_point["total_size"]
+-            if (
+-                total_size is not None
+-                and total_size - mount_point["used_size"] < usage_change
+-            ):
++        if mount_point is not None:
++            self._move_used_size(mount_point, usage_change, file_path)
++
++    def _resize_allocation(
++        self, old_size: int, new_size: int, file_path: AnyStr, st_dev: int
++    ) -> None:
++        """Charge what an object costs its file system when its byte length
++        goes from `old_size` to `new_size`.
++
++        The space an object occupies is the whole allocation units its byte
++        length needs, so the change in used space depends on the length the
++        object had before, not on the difference alone.
++
++        Raises:
++            OSError: if the resulting allocation exceeds the file system space
++                the caller may take
++        """
++        mount_point = self._mount_point_for_device(st_dev)
++        if mount_point is None:
++            return
++        block_size = mount_point["block_size"]
++        self._move_used_size(
++            mount_point,
++            block_size
++            * (blocks_for(new_size, block_size) - blocks_for(old_size, block_size)),
++            file_path,
++        )
++
++    def _move_used_size(
++        self, mount_point: dict, size_change: int, file_path: AnyStr
++    ) -> None:
++        """Move the used space of a mount point by the given number of bytes,
++        refusing a change the caller has no room for. A mount point with no
++        total size holds whatever it is given."""
++        if mount_point["total_size"] is not None:
++            if helpers.is_root():
++                room = free_size(mount_point)
++            else:
++                room = available_size(mount_point)
++            if room < size_change:
++                self.raise_os_error(errno.ENOSPC, file_path)
++        mount_point["used_size"] += size_change
++
++    def charge_inode(self, file_path: AnyStr, st_dev: int) -> None:
++        """Take one inode of the file system the given device belongs to.
++
++        Args:
++            file_path: The path of the object taking the inode.
++
++            st_dev: The device ID for the respective file system.
++
++        Raises:
++            OSError: if the file system has no free inode left
++        """
++        mount_point = self._mount_point_for_device(st_dev)
++        if mount_point is None:
++            return
++        if mount_point["inode_count"] is not None:
++            if helpers.is_root():
++                room = free_inodes(mount_point)
++            else:
++                room = available_inodes(mount_point)
++            if room < 1:
+                 self.raise_os_error(errno.ENOSPC, file_path)
+-            mount_point["used_size"] += usage_change
++        mount_point["used_inodes"] += 1
++
++    def release_inode(self, st_dev: int) -> None:
++        """Give back one inode to the file system the given device belongs to.
++
++        Args:
++            st_dev: The device ID for the respective file system.
++        """
++        mount_point = self._mount_point_for_device(st_dev)
++        if mount_point and mount_point["used_inodes"] > 0:
++            mount_point["used_inodes"] -= 1
++
++    def allocate_entry(self, file_path: AnyStr, size: int, st_dev: int) -> None:
++        """Take one inode and the allocation units the given size needs.
++        Nothing is taken if either of them does not fit.
++
++        Args:
++            file_path: The path of the object being added.
++
++            size: The byte length of the object being added.
++
++            st_dev: The device ID for the respective file system.
++
++        Raises:
++            OSError: if the file system has no free inode left, or not
++                enough free space for the object
++        """
++        self.charge_inode(file_path, st_dev)
++        try:
++            self._resize_allocation(0, size, file_path, st_dev)
++        except OSError:
++            self.release_inode(st_dev)
++            raise
++
++    def release_entry(self, file_path: AnyStr, size: int, st_dev: int) -> None:
++        """Give back one inode and the allocation units the given size used.
++
++        Args:
++            file_path: The path of the object being removed.
++
++            size: The byte length of the object being removed.
++
++            st_dev: The device ID for the respective file system.
++        """
++        self._resize_allocation(size, 0, file_path, st_dev)
++        self.release_inode(st_dev)
++
++    def statvfs(self, path: AnyStr | None = None) -> os.statvfs_result:
++        """Return the file system statistics of the device the given path
++        resides on, as returned by ``os.statvfs()``.
++
++        Args:
++            path: The statistics are returned for the file system device
++                where `path` resides.
++                Defaults to the root path (e.g. '/' on Unix systems).
++        """
++        if path is None:
++            mount_point = next(iter(self.mount_points.values()))
++        else:
++            mount_point = self._mount_point_for_path(make_string_path(path))
++        block_size = mount_point["block_size"]
++        total_blocks = mount_capacity(mount_point) // block_size
++        free_blocks = max(0, free_size(mount_point)) // block_size
++        available_blocks = available_size(mount_point) // block_size
++        inode_count = mount_point["inode_count"]
++        if inode_count is None:
++            inode_count = total_blocks
++        unused_inodes = max(0, inode_count - mount_point["used_inodes"])
++        spare_inodes = max(0, unused_inodes - mount_point["reserved_inodes"])
++        return os.statvfs_result(
++            (
++                block_size,
++                block_size,
++                total_blocks,
++                free_blocks,
++                available_blocks,
++                inode_count,
++                unused_inodes,
++                spare_inodes,
++                0,
++                255,
++            )
++        )
+ 
+     def stat(self, entry_path: AnyStr, follow_symlinks: bool = True):
+         """Return the os.stat-like tuple for the FakeFile object of ``entry_path``.
+@@ -2043,7 +2446,9 @@ class FakeFilesystem:
+ 
+     def _do_rename(self, old_dir_object, old_name, new_dir_object, new_name):
+         object_to_rename = old_dir_object.get_entry(old_name)
+-        old_dir_object.remove_entry(old_name, recursive=False)
++        # the renamed object keeps what it already took from the file system,
++        # so it is moved without being released and charged again
++        old_dir_object.remove_entry(old_name, recursive=False, account=False)
+         object_to_rename.name = new_name
+         new_name = new_dir_object._normalized_entryname(new_name)
+         old_entry = (
+@@ -2055,13 +2460,13 @@ class FakeFilesystem:
+             if old_entry:
+                 # in case of overwriting remove the old entry first
+                 new_dir_object.remove_entry(new_name)
+-            new_dir_object.add_entry(object_to_rename)
++            new_dir_object.add_entry(object_to_rename, account=False)
+         except OSError:
+             # adding failed, roll back the changes before re-raising
+             if old_entry and new_name not in new_dir_object.entries:
+                 new_dir_object.add_entry(old_entry)
+             object_to_rename.name = old_name
+-            old_dir_object.add_entry(object_to_rename)
++            old_dir_object.add_entry(object_to_rename, account=False)
+             raise
+ 
+     def _handle_broken_link_with_trailing_sep(self, path: AnyStr) -> None:
+@@ -2235,7 +2640,54 @@ class FakeFilesystem:
+             :py:class:`FakeDirectory<pyfakefs.fake_file.FakeDirectory>` object.
+ 
+         Raises:
+-            OSError: if the directory already exists.
++            OSError: if the directory already exists, or if the file system
++                cannot hold every directory that has to be created.
++        """
++        return self._create_dir_path(directory_path, perm_bits, apply_umask)[0]
++
++    @contextlib.contextmanager
++    def _without_accounting(self):
++        """Create objects that are charged to no mount point, so that they
++        cost nothing and give nothing back when they are removed again."""
++        before = self.accounting_off
++        self.accounting_off = True
++        try:
++            yield
++        finally:
++            self.accounting_off = before
++
++    def _create_dir_stepwise(self, directory_path: AnyPath) -> FakeDirectory:
++        """Create a directory and every missing directory above it one at a
++        time, so that the directories already made are kept if a later one
++        does not fit."""
++        dir_path = self.absnormpath(self.make_string_path(directory_path))
++        components = self._path_components(dir_path)
++        for count in range(1, len(components) + 1):
++            partial = self._components_to_path(components[:count])
++            if not self.exists(partial):
++                self.create_dir(partial)
++        return cast(FakeDirectory, self.resolve(dir_path))
++
++    def _undo_new_dirs(self, new_dirs: list) -> None:
++        """Remove the directories a failed creation brought into being, the
++        deepest one first, so that nothing of it is left behind."""
++        for new_dir in reversed(new_dirs):
++            parent_dir = new_dir.parent_dir() if new_dir.parent_dir else None
++            if parent_dir is not None:
++                parent_dir.remove_entry(new_dir.name)
++
++    def _create_dir_path(
++        self,
++        directory_path: AnyPath,
++        perm_bits: int = helpers.PERM_DEF,
++        apply_umask: bool = True,
++    ) -> tuple[FakeDirectory, list]:
++        """Create a directory and every missing directory above it, and
++        return it together with the directories that had to be created.
++
++        Nothing is left behind if any of them does not fit: every directory
++        this call brought into being is removed again before the error is
++        passed on.
+         """
+         dir_path = self.make_string_path(directory_path)
+         dir_path = self.absnormpath(dir_path)
+@@ -2245,7 +2697,29 @@ class FakeFilesystem:
+         path_components = self._path_components(dir_path)
+         current_dir = self.root
+ 
+-        new_dirs = []
++        new_dirs: list = []
++        try:
++            current_dir = self._add_dir_components(
++                path_components, current_dir, new_dirs
++            )
++        except Exception:
++            self._undo_new_dirs(new_dirs)
++            raise
++
++        # set the permission after creating the directories
++        # to allow directory creation inside a read-only directory
++        for new_dir in new_dirs:
++            if apply_umask:
++                perm_bits &= ~self.umask
++            new_dir.st_mode = S_IFDIR | perm_bits
++
++        return current_dir, new_dirs
++
++    def _add_dir_components(
++        self, path_components: list, current_dir: FakeDirectory, new_dirs: list
++    ) -> FakeDirectory:
++        """Walk the given path components, creating the directories that do
++        not exist yet and collecting them in `new_dirs`."""
+         for component in [to_string(p) for p in path_components]:
+             directory = self._directory_content(current_dir, to_string(component))[1]
+             if not directory:
+@@ -2263,14 +2737,6 @@ class FakeFilesystem:
+                 current_dir = cast(FakeDirectory, directory)
+                 if directory.st_mode & S_IFDIR != S_IFDIR:
+                     self.raise_os_error(errno.ENOTDIR, current_dir.path)
+-
+-        # set the permission after creating the directories
+-        # to allow directory creation inside a read-only directory
+-        for new_dir in new_dirs:
+-            if apply_umask:
+-                perm_bits &= ~self.umask
+-            new_dir.st_mode = S_IFDIR | perm_bits
+-
+         return current_dir
+ 
+     def create_file(
+@@ -2361,14 +2827,25 @@ class FakeFilesystem:
+         target_path = target_path or source_path
+         source_path_str = make_string_path(source_path)
+         real_stat = os.stat(source_path_str)
+-        fake_file = self.create_file_internally(target_path, read_from_real_fs=True)
++        new_dirs: list = []
++        fake_file = self.create_file_internally(
++            target_path, read_from_real_fs=True, created_dirs=new_dirs
++        )
++
++        try:
++            self._resize_allocation(
++                0, real_stat.st_size, fake_file.name, fake_file.st_dev
++            )
++        except OSError:
++            self.remove_object(make_string_path(target_path))
++            self._undo_new_dirs(new_dirs)
++            raise
+ 
+         # for read-only mode, remove the write/executable permission bits
+         fake_file.stat_result.set_from_stat_result(real_stat)
+         if read_only:
+             fake_file.st_mode &= 0o777444
+         fake_file.file_path = source_path_str
+-        self.change_disk_usage(fake_file.size, fake_file.name, fake_file.st_dev)
+         return fake_file
+ 
+     def add_real_symlink(
+@@ -2469,7 +2946,7 @@ class FakeFilesystem:
+ 
+     def _create_fake_from_real_dir(self, source_path_str, target_path_str, read_only):
+         if not self.exists(target_path_str):
+-            self.create_dir(target_path_str)
++            self._create_dir_stepwise(target_path_str)
+         for base, _, files in os.walk(source_path_str):
+             new_base = os.path.join(
+                 target_path_str,
+@@ -2509,7 +2986,7 @@ class FakeFilesystem:
+         if self.exists(parent_path):
+             parent_dir = self._get_object(parent_path)
+         else:
+-            parent_dir = self.create_dir(parent_path)
++            parent_dir = self._create_dir_stepwise(parent_path)
+         new_dir = FakeDirectoryFromRealDirectory(
+             source_path_str, self, read_only, target_path_str
+         )
+@@ -2588,6 +3065,7 @@ class FakeFilesystem:
+         errors: str | None = None,
+         read_from_real_fs: bool = False,
+         side_effect: Callable | None = None,
++        created_dirs: list | None = None,
+     ) -> FakeFile:
+         """Internal fake file creator that supports both normal fake files
+         and fake files based on real files.
+@@ -2624,13 +3102,14 @@ class FakeFilesystem:
+         if not parent_directory:
+             parent_directory = matching_string(path, self.cwd)
+         self._auto_mount_drive_if_needed(parent_directory)
++        new_dirs: list = []
+         if not self.exists(parent_directory):
+             if not create_missing_dirs:
+                 self.raise_os_error(errno.ENOENT, parent_directory)
+-            parent_directory = matching_string(
+-                path,
+-                self.create_dir(parent_directory).path,  # type: ignore
+-            )
++            new_parent, new_dirs = self._create_dir_path(parent_directory)
++            parent_directory = matching_string(path, new_parent.path)  # type: ignore
++            if created_dirs is not None:
++                created_dirs.extend(new_dirs)
+         else:
+             parent_directory = self._original_path(parent_directory)
+         if apply_umask:
+@@ -2650,7 +3129,11 @@ class FakeFilesystem:
+                 side_effect=side_effect,
+             )
+ 
+-        self.add_object(parent_directory, file_object)
++        try:
++            self.add_object(parent_directory, file_object)
++        except Exception:
++            self._undo_new_dirs(new_dirs)
++            raise
+ 
+         if st_size is None and contents is None:
+             contents = ""
+@@ -2662,6 +3145,7 @@ class FakeFilesystem:
+                     file_object.set_initial_contents(contents)  # type: ignore
+             except OSError:
+                 self.remove_object(path)
++                self._undo_new_dirs(new_dirs)
+                 raise
+ 
+         return file_object
+@@ -3282,14 +3766,15 @@ class FakeFilesystem:
+         # the temp directory is assumed to exist at least in `tempfile`,
+         # so we create it here for convenience
+         temp_dir = self._tempdir_name()
+-        if not self.exists(temp_dir):
+-            self.create_dir(temp_dir)
+-        if sys.platform != "win32" and not self.exists("/tmp"):
+-            # under Posix, we also create a link in /tmp if the path does not exist
+-            self.create_symlink("/tmp", temp_dir)
+-            # reset the used size to 0 to avoid having the link size counted
+-            # which would make disk size tests more complicated
+-            next(iter(self.mount_points.values()))["used_size"] = 0
++        # the temp directory is charged to no mount point, which also avoids
++        # having the link size counted and making disk size tests
++        # more complicated
++        with self._without_accounting():
++            if not self.exists(temp_dir):
++                self.create_dir(temp_dir)
++            if sys.platform != "win32" and not self.exists("/tmp"):
++                # under Posix, we also create a link in /tmp if the path does not exist
++                self.create_symlink("/tmp", temp_dir)
+ 
+ 
+ def _run_doctest() -> TestResults:
+diff --git a/pyfakefs/fake_os.py b/pyfakefs/fake_os.py
+index 2576443..867d80b 100644
+--- a/pyfakefs/fake_os.py
++++ b/pyfakefs/fake_os.py
+@@ -143,6 +143,7 @@ class FakeOsModule:
+             _dir += [
+                 "getgid",
+                 "getuid",
++                "statvfs",
+             ]
+         return _dir
+ 
+@@ -722,6 +723,18 @@ class FakeOsModule:
+         path = self._path_with_dir_fd(path, self.lstat, dir_fd, check_supported=False)
+         return self.filesystem.stat(path, follow_symlinks=False)
+ 
++    def statvfs(self, path: AnyStr) -> os.statvfs_result:
++        """Return the file system statistics of the fake device the given
++        path resides on.
++
++        Args:
++            path: path to a filesystem object on the queried device.
++
++        Returns:
++            the os.statvfs_result object describing the fake device.
++        """
++        return self.filesystem.statvfs(path)
++
+     def remove(self, path: AnyStr, dir_fd: int | None = None) -> None:
+         """Remove the FakeFile object at the specified file path.
+ 

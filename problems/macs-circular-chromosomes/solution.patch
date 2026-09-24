@@ -1,0 +1,996 @@
+diff --git a/MACS3/Commands/callpeak_cmd.py b/MACS3/Commands/callpeak_cmd.py
+index 2c9a1ef..8a2c99d 100644
+--- a/MACS3/Commands/callpeak_cmd.py
++++ b/MACS3/Commands/callpeak_cmd.py
+@@ -156,6 +156,14 @@ def run(args):
+             c1 = c0
+     info("#1 finished!")
+ 
++    options.circular_lengths = {}
++    for chrom in options.circular:
++        rlength = treat.get_rlengths().get(chrom, 0)
++        if rlength <= 0 or rlength >= 2147483647:
++            error("#1 The length of circular chromosome %s can't be found in the treatment file!" % chrom.decode())
++            sys.exit(1)
++        options.circular_lengths[chrom] = rlength
++
+     # 2 Build Model
+     info("#2 Build Peak Model...")
+ 
+@@ -338,13 +346,24 @@ def cal_max_dup_tags(genome_size, tags_number, p=1e-5):
+     return binomial_cdf_inv(1-p, tags_number, 1.0/genome_size)
+ 
+ 
++def open_frag_parser(options, filename):
++    """Open a fragment file parser, telling a BAMPE parser which
++    chromosomes are circular.
++
++    """
++    parser = options.parser(filename, buffer_size=options.buffer_size)
++    if options.format == "BAMPE":
++        parser.circular = options.circular
++    return parser
++
++
+ def load_frag_files_options(options):
+     """From the options, load treatment fragments and control fragments (if available).
+ 
+     """
+     options.info("#1 read treatment fragments...")
+ 
+-    tp = options.parser(options.tfile[0], buffer_size=options.buffer_size)
++    tp = open_frag_parser(options, options.tfile[0])
+     if options.format == "FRAG" and options.maxcount:
+         treat = tp.build_petrack(max_count=options.maxcount)
+     else:
+@@ -352,7 +371,7 @@ def load_frag_files_options(options):
+     if len(options.tfile) > 1:
+         # multiple input
+         for tfile in options.tfile[1:]:
+-            tp = options.parser(tfile, buffer_size=options.buffer_size)
++            tp = open_frag_parser(options, tfile)
+             if options.format == "FRAG" and options.maxcount:
+                 treat = tp.append_petrack(treat, max_count=options.maxcount)
+             else:
+@@ -362,7 +381,7 @@ def load_frag_files_options(options):
+     options.tsize = tp.d
+     if options.cfile:
+         options.info("#1.2 read input fragments...")
+-        cp = options.parser(options.cfile[0], buffer_size=options.buffer_size)
++        cp = open_frag_parser(options, options.cfile[0])
+         if options.format == "FRAG" and options.maxcount:
+             control = cp.build_petrack(max_count=options.maxcount)
+         else:
+@@ -371,7 +390,7 @@ def load_frag_files_options(options):
+         if len(options.cfile) > 1:
+             # multiple input
+             for cfile in options.cfile[1:]:
+-                cp = options.parser(cfile, buffer_size=options.buffer_size)
++                cp = open_frag_parser(options, cfile)
+                 if options.format == "FRAG" and options.maxcount:
+                     control = cp.append_petrack(control, max_count=options.maxcount)
+                 else:
+diff --git a/MACS3/IO/Parser.py b/MACS3/IO/Parser.py
+index ad673da..4f4315b 100644
+--- a/MACS3/IO/Parser.py
++++ b/MACS3/IO/Parser.py
+@@ -194,6 +194,53 @@ def bampe_pe_binary_parse(data: cython.pointer[cython.const[cython.uchar]],
+ 
+     return (thisref, thisstart, thistlen)
+ 
++
++@cython.cfunc
++def bampe_origin_pair_parse(data: cython.pointer[cython.const[cython.uchar]],
++                            circular_rlengths: dict,
++                            endian_prefix=endian_prefix) -> tuple:
++    """Parse a BAMPE record whose pair spans the origin of a circular
++    chromosome.
++
++    Such a pair is a minus strand read near the start of the
++    chromosome whose plus strand mate sits near the end. The fragment
++    starts at the mate and runs past the chromosome length to the end
++    of this read.
++    """
++    thisref: cython.int
++    nextref: cython.int
++    pos: cython.int
++    nextpos: cython.int
++    thisend: cython.int
++    rlength: cython.int
++    l_read_name: cython.int
++    n_cigar_op: cython.int
++    bwflag: cython.ushort
++
++    if not data:
++        return (-1, -1, -1)
++
++    bwflag = unpack(endian_prefix+'H', data[14:16])[0]
++    if (bwflag & 3868) != 16 or not bwflag & 1:
++        return (-1, -1, -1)
++
++    (thisref, pos) = unpack(endian_prefix+'ii', data[0:8])
++    (nextref, nextpos) = unpack(endian_prefix+'ii', data[20:28])
++    if thisref != nextref or thisref not in circular_rlengths or nextpos <= pos:
++        return (-1, -1, -1)
++    rlength = circular_rlengths[thisref]
++
++    l_read_name = data[8]
++    n_cigar_op = unpack(endian_prefix+'H', data[12:14])[0]
++    thisend = pos
++    for cigar_code in unpack(endian_prefix+'%dI' % (n_cigar_op),
++                             data[32 + l_read_name: 32 + l_read_name + n_cigar_op*4]):
++        if cigar_code & 15 in [0, 2, 3, 7, 8]:
++            thisend += cigar_code >> 4
++    if thisend + rlength - nextpos > rlength // 2:
++        return (-1, -1, -1)
++    return (thisref, nextpos, thisend + rlength - nextpos)
++
+ # ------------------------------------
+ # Classes
+ # ------------------------------------
+@@ -1184,6 +1231,16 @@ class BAMPEParser(BAMParser):
+     n = cython.declare(cython.int, visibility='public')
+     # the average length of fragments
+     d = cython.declare(cython.float, visibility='public')
++    # names of circular chromosomes
++    circular = cython.declare(list, visibility='public')
++
++    @cython.cfunc
++    def circular_rlengths(self, references: list, rlengths: dict) -> dict:
++        """Map ids of circular chromosomes to their lengths."""
++        if not self.circular:
++            return {}
++        return dict([(i, rlengths[references[i]]) for i in range(len(references))
++                     if references[i] in self.circular])
+ 
+     @cython.ccall
+     def build_petrack(self):
+@@ -1207,9 +1264,12 @@ class BAMPEParser(BAMParser):
+         tlen: cython.int
+         references: list
+         rlengths: dict
++        circular_rlengths: dict
++        data: bytes
+ 
+         petrack = PETrackI(buffer_size=self.buffer_size)
+         references, rlengths = self.get_references()
++        circular_rlengths = self.circular_rlengths(references, rlengths)
+         # fseek = self.fhd.seek
+         fread = self.fhd.read
+         # ftell = self.fhd.tell
+@@ -1224,7 +1284,11 @@ class BAMPEParser(BAMParser):
+             except err:
+                 # e1 += 1
+                 break
+-            (chrid, fpos, tlen) = bampe_pe_binary_parse(fread(entrylength))
++            data = fread(entrylength)
++            (chrid, fpos, tlen) = bampe_pe_binary_parse(data)
++            if chrid == -1 and circular_rlengths:
++                (chrid, fpos, tlen) = bampe_origin_pair_parse(data,
++                                                              circular_rlengths)
+             if chrid == -1:
+                 # e2 += 1
+                 continue
+@@ -1269,8 +1333,11 @@ class BAMPEParser(BAMParser):
+         tlen: cython.int
+         references: list
+         rlengths: dict
++        circular_rlengths: dict
++        data: bytes
+ 
+         references, rlengths = self.get_references()
++        circular_rlengths = self.circular_rlengths(references, rlengths)
+         fread = self.fhd.read
+ 
+         # for convenience, only count valid pairs
+@@ -1282,7 +1349,11 @@ class BAMPEParser(BAMParser):
+                 entrylength = unpack('<i', fread(4))[0]
+             except err:
+                 break
+-            (chrid, fpos, tlen) = bampe_pe_binary_parse(fread(entrylength))
++            data = fread(entrylength)
++            (chrid, fpos, tlen) = bampe_pe_binary_parse(data)
++            if chrid == -1 and circular_rlengths:
++                (chrid, fpos, tlen) = bampe_origin_pair_parse(data,
++                                                              circular_rlengths)
+             if chrid == -1:
+                 continue
+             add_loc(references[chrid], fpos, fpos + tlen)
+diff --git a/MACS3/IO/PeakIO.py b/MACS3/IO/PeakIO.py
+index 1155e6e..6ce1498 100644
+--- a/MACS3/IO/PeakIO.py
++++ b/MACS3/IO/PeakIO.py
+@@ -231,6 +231,8 @@ class PeakIO:
+         CO_sorted: Whether peaks have been coordinate-sorted.
+         total: Total number of peaks.
+         name: Collection name used in output.
++        circular_lengths: Lengths of circular chromosomes, used to report
++            summits of peaks crossing the origin.
+     """
+     # dictionary storing peak contents
+     peaks = cython.declare(dict, visibility="public")
+@@ -240,6 +242,8 @@ class PeakIO:
+     total = cython.declare(cython.long, visibility="public")
+     # name
+     name = cython.declare(bytes, visibility="public")
++    # lengths of circular chromosomes
++    circular_lengths = cython.declare(dict, visibility="public")
+ 
+     def __init__(self, name: bytes = b"MACS3"):
+         """Initialise an empty peak collection."""
+@@ -247,6 +251,15 @@ class PeakIO:
+         self.CO_sorted = False
+         self.total = 0
+         self.name = name
++        self.circular_lengths = {}
++
++    @cython.cfunc
++    def _chrom_summit(self, chrom: bytes, summit: cython.long) -> cython.long:
++        """Map a summit of a peak crossing the origin of a circular
++        chromosome back onto the chromosome."""
++        if chrom in self.circular_lengths:
++            return summit % self.circular_lengths[chrom]
++        return summit
+ 
+     @cython.ccall
+     def add(self,
+@@ -618,11 +631,11 @@ class PeakIO:
+                 peaks = list(group)
+                 if len(peaks) > 1:
+                     for i, peak in enumerate(peaks):
+-                        summit_p = peak['summit']
++                        summit_p = self._chrom_summit(chrom, peak['summit'])
+                         print_func("%s\t%d\t%d\t%s%d%s\t%.6g\n" % (chrom.decode(), summit_p, summit_p+1, peakprefix.decode(), n_peak, subpeak_letters(i), peak[score_column]))
+                 else:
+                     peak = peaks[0]
+-                    summit_p = peak['summit']
++                    summit_p = self._chrom_summit(chrom, peak['summit'])
+                     print_func("%s\t%d\t%d\t%s%d\t%.6g\n" % (chrom.decode(), summit_p, summit_p+1, peakprefix.decode(), n_peak, peak[score_column]))
+ 
+     def tobed(self):
+@@ -816,7 +829,7 @@ class PeakIO:
+                                                   peak['start']+1,
+                                                   peak['end'],
+                                                   peak['length']))
+-                        write("\t%d" % (peak['summit']+1))  # summit position
++                        write("\t%d" % (self._chrom_summit(chrom, peak['summit'])+1))  # summit position
+                         write("\t%.6g" % (round(peak['pileup'], 2)))  # pileup height at summit
+                         write("\t%.6g" % (peak['pscore']))  # -log10pvalue at summit
+                         write("\t%.6g" % (peak['fc']))  # fold change at summit
+@@ -831,7 +844,7 @@ class PeakIO:
+                                               peak['start']+1,
+                                               peak['end'],
+                                               peak['length']))
+-                    write("\t%d" % (peak['summit']+1))  # summit position
++                    write("\t%d" % (self._chrom_summit(chrom, peak['summit'])+1))  # summit position
+                     write("\t%.6g" % (round(peak['pileup'], 2)))  # pileup height at summit
+                     write("\t%.6g" % (peak['pscore']))  # -log10pvalue at summit
+                     write("\t%.6g" % (peak['fc']))  # fold change at summit
+diff --git a/MACS3/Signal/CallPeakUnit.py b/MACS3/Signal/CallPeakUnit.py
+index 61f3428..f5f437e 100644
+--- a/MACS3/Signal/CallPeakUnit.py
++++ b/MACS3/Signal/CallPeakUnit.py
+@@ -400,6 +400,8 @@ class CallerFromAlignments:
+     no_lambda_flag: bool
+     # whether it's in PE mode, will be detected during initiation
+     PE_mode: bool
++    # lengths of chromosomes to be treated as circular
++    circular_lengths: dict
+ 
+     # temporary data buffer
+     # temporary [position, treat_pileup, ctrl_pileup] for a given chromosome
+@@ -444,7 +446,8 @@ class CallerFromAlignments:
+                  bedGraph_treat_filename: str = "TREAT.bdg",
+                  bedGraph_control_filename: str = "CTRL.bdg",
+                  cutoff_analysis_filename: str = "TMP.txt",
+-                 save_SPMR: bool = False):
++                 save_SPMR: bool = False,
++                 circular_lengths: dict = {}):
+         """Initialize.
+ 
+         A calculator is unique to each comparison of treat and
+@@ -515,6 +518,7 @@ class CallerFromAlignments:
+         else:
+             self.no_lambda_flag = False
+         self.pseudocount = pseudocount
++        self.circular_lengths = dict(circular_lengths)
+         # get the common chromosome names from both treatment and control
+         chr1 = set(self.treat.get_chr_names())
+         chr2 = set(self.ctrl.get_chr_names())
+@@ -589,17 +593,20 @@ class CallerFromAlignments:
+             clean_up_ndarray(self.chr_pos_treat_ctrl[1])
+             clean_up_ndarray(self.chr_pos_treat_ctrl[2])
+ 
++        circular = chrom in self.circular_lengths
+         if self.PE_mode:
+             treat_pv = self.treat.pileup_a_chromosome(chrom,
+                                                       self.treat_scaling_factor,
+-                                                      baseline_value=0.0)
++                                                      baseline_value=0.0,
++                                                      circular=circular)
+         else:
+             treat_pv = self.treat.pileup_a_chromosome(chrom,
+                                                       self.d,
+                                                       self.treat_scaling_factor,
+                                                       baseline_value=0.0,
+                                                       directional=True,
+-                                                      end_shift=self.end_shift)
++                                                      end_shift=self.end_shift,
++                                                      circular=circular)
+ 
+         if not self.no_lambda_flag:
+             if self.PE_mode:
+@@ -609,13 +616,15 @@ class CallerFromAlignments:
+                 ctrl_pv = self.ctrl.pileup_a_chromosome_c(chrom,
+                                                           self.ctrl_d_s,
+                                                           self.ctrl_scaling_factor_s,
+-                                                          baseline_value=self.lambda_bg)
++                                                          baseline_value=self.lambda_bg,
++                                                          circular=circular)
+             else:
+                 ctrl_pv = self.ctrl.pileup_a_chromosome_c(chrom,
+                                                           self.ctrl_d_s,
+                                                           self.ctrl_scaling_factor_s,
+                                                           baseline_value=self.lambda_bg,
+-                                                          directional=False)
++                                                          directional=False,
++                                                          circular=circular)
+         else:
+             # a: set global lambda
+             ctrl_pv = [treat_pv[0][-1:], np.array([self.lambda_bg,],
+@@ -638,6 +647,51 @@ class CallerFromAlignments:
+             self.pileup_data_files.pop(chrom)
+         return
+ 
++    @cython.cfunc
++    def __rotate_circular_regions(self,
++                                  chrom: bytes,
++                                  above_cutoff: cnp.ndarray,
++                                  startpos: cnp.ndarray,
++                                  endpos: cnp.ndarray,
++                                  indices: cnp.ndarray,
++                                  max_gap: cython.int) -> tuple:
++        """*private* Reorder above-cutoff regions of a circular
++        chromosome so that a run crossing the origin is contiguous.
++
++        Regions of the run that sit before the chromosome end are moved
++        to the front with coordinates shifted by minus the chromosome
++        length. Linear chromosomes are returned unchanged.
++        """
++        rlength: cython.long
++        n: cython.long
++        k: cython.long
++
++        rlength = self.circular_lengths.get(chrom, 0)
++        n = startpos.shape[0]
++        if rlength == 0 or n < 2:
++            return (startpos, endpos, indices)
++        if above_cutoff[0] == 0:
++            startpos[0] = 0
++        if rlength - endpos[n-1] + startpos[0] > max_gap:
++            return (startpos, endpos, indices)
++        k = n - 1
++        while k > 0 and startpos[k] - endpos[k-1] <= max_gap:
++            k -= 1
++        if k == 0:
++            return (startpos, endpos, indices)
++        startpos = np.concatenate((startpos[k:] - rlength, startpos[:k])).astype("i4")
++        endpos = np.concatenate((endpos[k:] - rlength, endpos[:k])).astype("i4")
++        indices = np.concatenate((indices[k:], indices[:k])).astype("i4")
++        return (startpos, endpos, indices)
++
++    @cython.cfunc
++    def __origin_offset(self, chrom: bytes, start: cython.long) -> cython.long:
++        """*private* Offset that moves a peak starting before the origin
++        of a circular chromosome back into [0, length)."""
++        if start < 0:
++            return self.circular_lengths[chrom]
++        return 0
++
+     @cython.cfunc
+     def __chrom_pair_treat_ctrl(self, treat_pv, ctrl_pv) -> list:
+         """*private* Pair treat and ctrl pileup for each region.
+@@ -918,6 +972,15 @@ class CallerFromAlignments:
+                 if above_cutoff_endpos.size == 0:
+                     continue
+ 
++                (above_cutoff_startpos,
++                 above_cutoff_endpos,
++                 above_cutoff) = self.__rotate_circular_regions(chrom,
++                                                                above_cutoff,
++                                                                above_cutoff_startpos,
++                                                                above_cutoff_endpos,
++                                                                above_cutoff,
++                                                                max_gap)
++
+                 # first bit of region above cutoff
+                 acs_ptr = cython.cast(cython.pointer(cython.int),
+                                       above_cutoff_startpos.data)
+@@ -1061,6 +1124,7 @@ class CallerFromAlignments:
+         tmp_bytes: bytes
+ 
+         peaks = PeakIO()
++        peaks.circular_lengths = self.circular_lengths
+ 
+         # prepare p-q table
+         if len(self.pqtable) == 0:
+@@ -1218,6 +1282,14 @@ class CallerFromAlignments:
+             # 0. otherwise it would be the last item in
+             # data[chrom]['pos']
+             above_cutoff_startpos[0] = 0
++        (above_cutoff_startpos,
++         above_cutoff_endpos,
++         above_cutoff_index_array) = self.__rotate_circular_regions(chrom,
++                                                                    above_cutoff,
++                                                                    above_cutoff_startpos,
++                                                                    above_cutoff_endpos,
++                                                                    above_cutoff_index_array,
++                                                                    max_gap)
+ 
+         # print "apply cutoff -- chrom:",chrom,"  time:", ttime() - t0
+         # start to build peak regions
+@@ -1305,6 +1377,8 @@ class CallerFromAlignments:
+                                               min_length,
+                                               score_array_s,
+                                               score_cutoff_s=score_cutoff_s)
++        if chrom in self.circular_lengths:
++            peaks.get_data_from_chrom(chrom).sort(key=lambda p: p["start"])
+ 
+         # print "close peaks -- chrom:",chrom,"  time:", ttime() - t0
+         return
+@@ -1340,6 +1414,7 @@ class CallerFromAlignments:
+         summit_p_score: cython.double
+         summit_q_score: cython.double
+         tlist_scores_p: cython.int
++        offset: cython.long
+ 
+         peak_length = peak_content[-1][1] - peak_content[0][0]
+         if peak_length >= min_length:  # if the peak is too small, reject it
+@@ -1374,11 +1449,12 @@ class CallerFromAlignments:
+                                                     summit_treat),
+                                         summit_ctrl)
+             summit_q_score = self.pqtable[summit_p_score]
++            offset = self.__origin_offset(chrom, peak_content[0][0])
+ 
+             peaks.add(chrom,           # chromosome
+-                      peak_content[0][0],           # start
+-                      peak_content[-1][1],          # end
+-                      summit=summit_pos,     # summit position
++                      peak_content[0][0] + offset,           # start
++                      peak_content[-1][1] + offset,          # end
++                      summit=summit_pos + offset,     # summit position
+                       peak_score=summit_q_score,  # score at summit
+                       pileup=summit_treat,    # pileup
+                       pscore=summit_p_score,  # pvalue
+@@ -1427,6 +1503,7 @@ class CallerFromAlignments:
+         summit_offsets: cnp.ndarray(cython.int, ndim=1)
+         mapped_summits: cnp.ndarray
+         tlist_scores_p: cython.int
++        offset: cython.long
+ 
+         peak_start = peak_content[0][0]
+         peak_end = peak_content[-1][1]
+@@ -1436,7 +1513,9 @@ class CallerFromAlignments:
+             return  # if the region is too small, reject it
+ 
+         # Add 10 bp padding to peak region so that we can get true minima
+-        start = max(peak_start - 10, 0)
++        start = peak_start - 10
++        if chrom not in self.circular_lengths:
++            start = max(start, 0)
+         end = peak_end + 10
+         start_boundary = peak_start - start
+ 
+@@ -1505,6 +1584,8 @@ class CallerFromAlignments:
+                                                  score_array_s,
+                                                  score_cutoff_s)
+ 
++        offset = self.__origin_offset(chrom, peak_start)
++
+         for summit_offset, summit_index in list(zip(summit_offsets,
+                                                     summit_indices)):
+ 
+@@ -1521,9 +1602,9 @@ class CallerFromAlignments:
+                     return False  # not passed, then disgard this summit.
+ 
+             peaks.add(chrom,
+-                      peak_content[0][0],
+-                      peak_content[-1][1],
+-                      summit=start + summit_offset,
++                      peak_content[0][0] + offset,
++                      peak_content[-1][1] + offset,
++                      summit=start + summit_offset + offset,
+                       peak_score=summit_q_score,
+                       pileup=summit_treat,
+                       pscore=summit_p_score,
+@@ -1885,6 +1966,10 @@ class CallerFromAlignments:
+         for chrom in sorted(chrs):
+             lvl1peakschrom = lvl1peaks.get_data_from_chrom(chrom)
+             lvl2peakschrom = lvl2peaks.get_data_from_chrom(chrom)
++            if chrom in self.circular_lengths:
++                lvl1peakschrom = self.__lift_lvl1_across_origin(chrom,
++                                                                lvl1peakschrom,
++                                                                lvl2peakschrom)
+             lvl1peakschrom_next = iter(lvl1peakschrom).__next__
+             tmppeakset = []             # to temporarily store lvl1 region inside a lvl2 region
+             # our assumption is lvl1 regions should be included in lvl2 regions
+@@ -2013,6 +2098,14 @@ class CallerFromAlignments:
+         if above_cutoff[0] == 0:
+             # first element > cutoff, fix the first point as 0. otherwise it would be the last item in data[chrom]['pos']
+             above_cutoff_startpos[0] = 0
++        (above_cutoff_startpos,
++         above_cutoff_endpos,
++         above_cutoff_index_array) = self.__rotate_circular_regions(chrom,
++                                                                    above_cutoff,
++                                                                    above_cutoff_startpos,
++                                                                    above_cutoff_endpos,
++                                                                    above_cutoff_index_array,
++                                                                    lvl1_max_gap)
+ 
+         # first bit of region above cutoff
+         acs_ptr = cython.cast(cython.pointer(cython.int),
+@@ -2094,6 +2187,14 @@ class CallerFromAlignments:
+         if above_cutoff[0] == 0:
+             # first element > cutoff, fix the first point as 0. otherwise it would be the last item in data[chrom]['pos']
+             above_cutoff_startpos[0] = 0
++        (above_cutoff_startpos,
++         above_cutoff_endpos,
++         above_cutoff_index_array) = self.__rotate_circular_regions(chrom,
++                                                                    above_cutoff,
++                                                                    above_cutoff_startpos,
++                                                                    above_cutoff_endpos,
++                                                                    above_cutoff_index_array,
++                                                                    lvl2_max_gap)
+ 
+         # first bit of region above cutoff
+         acs_ptr = cython.cast(cython.pointer(cython.int),
+@@ -2189,6 +2290,7 @@ class CallerFromAlignments:
+         tarray_pscore: cnp.ndarray
+         tarray_qscore: cnp.ndarray
+         tarray_fc: cnp.ndarray
++        offset: cython.long
+ 
+         peak_length = peak_content[-1][1] - peak_content[0][0]
+         if peak_length >= min_length:  # if the peak is too small, reject it
+@@ -2206,10 +2308,11 @@ class CallerFromAlignments:
+             tarray_pscore = self.__cal_pscore(tarray_pileup, tarray_control)
+             tarray_qscore = self.__cal_qscore(tarray_pileup, tarray_control)
+             tarray_fc = self.__cal_FE(tarray_pileup, tarray_control)
++            offset = self.__origin_offset(chrom, peak_content[0][0])
+ 
+             peaks.add(chrom,           # chromosome
+-                      peak_content[0][0],  # start
+-                      peak_content[-1][1],  # end
++                      peak_content[0][0] + offset,  # start
++                      peak_content[-1][1] + offset,  # end
+                       summit=0,
+                       peak_score=mean_from_value_length(tarray_qscore, tlist_length),
+                       pileup=mean_from_value_length(tarray_pileup, tlist_length),
+@@ -2222,6 +2325,29 @@ class CallerFromAlignments:
+             # start a new peak
+             return True
+ 
++    @cython.cfunc
++    def __lift_lvl1_across_origin(self,
++                                  chrom: bytes,
++                                  lvl1peakset: list,
++                                  lvl2peakset: list) -> list:
++        """*private* Move strong peaks lying after the origin inside a
++        weak region that crosses the origin of a circular chromosome
++        into the coordinates of that region.
++        """
++        rlength: cython.long
++        wrap_end: cython.long
++
++        rlength = self.circular_lengths[chrom]
++        wrap_end = max([p["end"] for p in lvl2peakset] + [rlength]) - rlength
++        for p in lvl1peakset:
++            if p["end"] <= wrap_end:
++                p["start"] += rlength
++                p["end"] += rlength
++                p["summit"] += rlength
++        lvl1peakset.sort(key=lambda p: p["start"])
++        lvl2peakset.sort(key=lambda p: p["start"])
++        return lvl1peakset
++
+     @cython.cfunc
+     def __add_broadpeak(self,
+                         bpeaks,
+diff --git a/MACS3/Signal/FixWidthTrack.py b/MACS3/Signal/FixWidthTrack.py
+index a79a3fc..0aff361 100644
+--- a/MACS3/Signal/FixWidthTrack.py
++++ b/MACS3/Signal/FixWidthTrack.py
+@@ -715,7 +715,8 @@ class FWTrack:
+                             scale_factor: cython.float = 1.0,
+                             baseline_value: cython.float = 0.0,
+                             directional: bool = True,
+-                            end_shift: cython.int = 0) -> list:
++                            end_shift: cython.int = 0,
++                            circular: bool = False) -> list:
+         """Compute a coverage pileup for a single chromosome.
+         
+         Parameters
+@@ -734,6 +735,9 @@ class FWTrack:
+         end_shift : int, optional
+             Shift applied to the 5' cuts before extension; positive values move
+             toward the 3' direction.
++        circular : bool, optional
++            If ``True``, extensions crossing either chromosome end wrap
++            around the origin instead of being clipped.
+         
+         Returns
+         -------
+@@ -768,7 +772,8 @@ class FWTrack:
+                                             three_shift,
+                                             rlength,
+                                             scale_factor,
+-                                            baseline_value)
++                                            baseline_value,
++                                            circular)
+         return tmp_pileup
+ 
+     @cython.ccall
+@@ -776,7 +781,8 @@ class FWTrack:
+                               scale_factor_s: list,
+                               baseline_value: cython.float = 0.0,
+                               directional: bool = True,
+-                              end_shift: cython.int = 0) -> list:
++                              end_shift: cython.int = 0,
++                              circular: bool = False) -> list:
+         """Compute a control pileup using multiple extension lengths.
+         
+         Parameters
+@@ -794,6 +800,9 @@ class FWTrack:
+         end_shift : int, optional
+             Shift applied to the 5' cuts before extension; positive values move
+             toward the 3' direction.
++        circular : bool, optional
++            If ``True``, windows crossing either chromosome end wrap around
++            the origin instead of being clipped.
+         
+         Returns
+         -------
+@@ -840,7 +849,8 @@ class FWTrack:
+                                                 three_shift,
+                                                 rlength,
+                                                 scale_factor,
+-                                                baseline_value)
++                                                baseline_value,
++                                                circular)
+ 
+             if prev_pileup:
+                 prev_pileup = over_two_pv_array(prev_pileup,
+diff --git a/MACS3/Signal/PairedEndTrack.py b/MACS3/Signal/PairedEndTrack.py
+index 154d460..46be5ea 100644
+--- a/MACS3/Signal/PairedEndTrack.py
++++ b/MACS3/Signal/PairedEndTrack.py
+@@ -788,7 +788,8 @@ class PETrackI:
+     def pileup_a_chromosome(self,
+                             chrom: bytes,
+                             scale_factor: cython.float = 1.0,
+-                            baseline_value: cython.float = 0.0) -> list:
++                            baseline_value: cython.float = 0.0,
++                            circular: bool = False) -> list:
+         """Compute a coverage pileup for a single chromosome.
+         
+         Parameters
+@@ -799,6 +800,9 @@ class PETrackI:
+             Value used to scale the resulting coverage.
+         baseline_value : float, optional
+             Minimum value enforced on the coverage array.
++        circular : bool, optional
++            If ``True``, fragments running past the chromosome end
++            continue from position 0.
+         
+         Returns
+         -------
+@@ -822,7 +826,8 @@ class PETrackI:
+ 
+         tmp_pileup = pileup_from_LR_as_list(self.locations[chrom],
+                                             scale_factor,
+-                                            baseline_value)
++                                            baseline_value,
++                                            self.get_rlengths()[chrom] if circular else 0)
+         return tmp_pileup
+ 
+     @cython.ccall
+@@ -830,7 +835,8 @@ class PETrackI:
+                               chrom: bytes,
+                               ds: list,
+                               scale_factor_s: list,
+-                              baseline_value: cython.float = 0.0) -> list:
++                              baseline_value: cython.float = 0.0,
++                              circular: bool = False) -> list:
+         """Project paired-end fragments into pseudo single-end pileups.
+         
+         Parameters
+@@ -843,6 +849,9 @@ class PETrackI:
+             Scale factors paired with each entry in ``ds``.
+         baseline_value : float, optional
+             Minimum value enforced on the coverage array.
++        circular : bool, optional
++            If ``True``, projections crossing either chromosome end wrap
++            around the origin instead of being clipped.
+         
+         Returns
+         -------
+@@ -877,7 +886,8 @@ class PETrackI:
+                                                 three_shift,
+                                                 rlength,
+                                                 scale_factor,
+-                                                baseline_value)
++                                                baseline_value,
++                                                circular)
+ 
+             if prev_pileup:
+                 prev_pileup = over_two_pv_array(prev_pileup,
+diff --git a/MACS3/Signal/PeakDetect.py b/MACS3/Signal/PeakDetect.py
+index e9f1caa..39d199b 100644
+--- a/MACS3/Signal/PeakDetect.py
++++ b/MACS3/Signal/PeakDetect.py
+@@ -242,7 +242,8 @@ class PeakDetect:
+                                                bedGraph_treat_filename=self.opt.bdg_treat,
+                                                bedGraph_control_filename=self.opt.bdg_control,
+                                                save_SPMR=self.opt.do_SPMR,
+-                                               cutoff_analysis_filename=self.opt.cutoff_analysis_file )
++                                               cutoff_analysis_filename=self.opt.cutoff_analysis_file,
++                                               circular_lengths=getattr(self.opt, "circular_lengths", {}))
+ 
+         if self.opt.trackline:
+             scorecalculator.enable_trackline()
+@@ -359,7 +360,8 @@ class PeakDetect:
+                                                bedGraph_treat_filename=self.opt.bdg_treat,
+                                                bedGraph_control_filename=self.opt.bdg_control,
+                                                save_SPMR=self.opt.do_SPMR,
+-                                               cutoff_analysis_filename=self.opt.cutoff_analysis_file)
++                                               cutoff_analysis_filename=self.opt.cutoff_analysis_file,
++                                               circular_lengths=getattr(self.opt, "circular_lengths", {}))
+ 
+         if self.opt.trackline:
+             scorecalculator.enable_trackline()
+diff --git a/MACS3/Signal/PeakModel.py b/MACS3/Signal/PeakModel.py
+index 7f62318..8c0604a 100644
+--- a/MACS3/Signal/PeakModel.py
++++ b/MACS3/Signal/PeakModel.py
+@@ -53,6 +53,7 @@ class PeakModel:
+     bw: cython.int
+     d_min: cython.int
+     tag_expansion_size: cython.int
++    circular_lengths: dict
+ 
+     info: object
+     debug: object
+@@ -93,6 +94,7 @@ class PeakModel:
+         self.warn = opt.warn
+         self.error = opt.warn
+         self.max_pairnum = max_pairnum
++        self.circular_lengths = getattr(opt, "circular_lengths", {})
+ 
+     @cython.ccall
+     def build(self):
+@@ -171,7 +173,7 @@ Summary of Peak Model:
+             chrom = chrs[i]
+             self.debug(f"Chromosome: {chrom}")
+             # extract tag positions
+-            [plus_tags, minus_tags] = self.treatment.get_locations_by_chr(chrom)
++            [plus_tags, minus_tags] = self.__chrom_locations(chrom)
+             # look for + strand peaks
+             plus_peaksinfo = self.__naive_find_peaks(plus_tags)
+             self.debug("Number of unique tags on + strand: %d" % (plus_tags.shape[0]))
+@@ -192,6 +194,36 @@ Summary of Peak Model:
+                 self.debug("Number of paired peaks in this chromosome: %d" % (len(paired_peaks_pos[chrom])))
+         return paired_peaks_pos
+ 
++    @cython.cfunc
++    def __chrom_locations(self, chrom: bytes) -> list:
++        """Return plus and minus tag positions of a chromosome.
++
++        A circular chromosome is rotated so that the middle of its
++        widest tag-free stretch becomes position 0, which keeps peaks
++        crossing the origin in one piece.
++        """
++        plus_tags: cnp.ndarray
++        minus_tags: cnp.ndarray
++        tags: cnp.ndarray
++        gaps: cnp.ndarray
++        rlength: cython.long
++        shift: cython.long
++        i: cython.long
++
++        [plus_tags, minus_tags] = self.treatment.get_locations_by_chr(chrom)
++        if chrom not in self.circular_lengths:
++            return [plus_tags, minus_tags]
++        rlength = self.circular_lengths[chrom]
++        tags = np.sort(np.concatenate((plus_tags, minus_tags)))
++        if tags.shape[0] < 2:
++            return [plus_tags, minus_tags]
++        gaps = np.diff(np.append(tags, tags[0] + rlength))
++        i = np.argmax(gaps)
++        shift = rlength - (tags[i] + gaps[i] // 2) % rlength
++        plus_tags = np.sort((plus_tags.astype("i8") + shift) % rlength).astype("i4")
++        minus_tags = np.sort((minus_tags.astype("i8") + shift) % rlength).astype("i4")
++        return [plus_tags, minus_tags]
++
+     @cython.cfunc
+     def __naive_find_peaks(self,
+                            taglist: cnp.ndarray(cython.int, ndim=1)) -> list:
+@@ -265,7 +297,7 @@ Summary of Peak Model:
+ 
+         for i in range(len(chroms)):
+             paired_peakpos_chrom = paired_peakpos[chroms[i]]
+-            (tags_plus, tags_minus) = self.treatment.get_locations_by_chr(chroms[i])
++            (tags_plus, tags_minus) = self.__chrom_locations(chroms[i])
+             # every paired peak has plus line and minus line
+             self.__model_add_line(paired_peakpos_chrom,
+                                   tags_plus,
+diff --git a/MACS3/Signal/PileupV2.py b/MACS3/Signal/PileupV2.py
+index 34017c3..493efd2 100644
+--- a/MACS3/Signal/PileupV2.py
++++ b/MACS3/Signal/PileupV2.py
+@@ -95,6 +95,49 @@ def fix_coordinates(poss: cnp.ndarray, rlength: cython.int) -> cnp.ndarray:
+     return poss
+ 
+ 
++@cython.cfunc
++def wrap_circular_ranges(start_poss: cnp.ndarray,
++                         end_poss: cnp.ndarray,
++                         rlength: cython.int) -> tuple:
++    """Fold ranges crossing the origin of a circular chromosome.
++
++    Each range is moved so its start falls in [0, rlength). A range
++    that then runs past rlength is split into [start, rlength) and
++    [0, end - rlength). Returned arrays are sorted.
++    """
++    lengths: cnp.ndarray
++    over: cnp.ndarray
++    new_starts: cnp.ndarray
++    new_ends: cnp.ndarray
++
++    lengths = end_poss - start_poss
++    lengths[lengths > rlength] = rlength
++    new_starts = np.mod(start_poss, rlength).astype("i4")
++    new_ends = (new_starts + lengths).astype("i4")
++    over = new_ends > rlength
++    if np.any(over):
++        new_starts = np.concatenate((new_starts,
++                                     np.zeros(np.count_nonzero(over),
++                                              dtype="i4")))
++        new_ends = np.concatenate((new_ends, new_ends[over] - rlength))
++        new_ends[:over.shape[0]][over] = rlength
++    new_starts.sort()
++    new_ends.sort()
++    return (new_starts, new_ends)
++
++
++@cython.cfunc
++def extend_to_rlength(pv: list,
++                      rlength: cython.int,
++                      baseline_value: cython.float) -> list:
++    """Extend a legacy [p, v] pileup of a circular chromosome so that it
++    covers the chromosome up to its length."""
++    if pv[0].shape[0] > 0 and pv[0][-1] >= rlength:
++        return pv
++    return [np.append(pv[0], rlength).astype("i4"),
++            np.append(pv[1], max(baseline_value, 0.0)).astype("f4")]
++
++
+ @cython.cfunc
+ def _pileup_sorted_unit(start_poss: cnp.ndarray,
+                         end_poss: cnp.ndarray) -> cnp.ndarray:
+@@ -818,10 +861,13 @@ def pileup_from_PN_shifted(P_array: cnp.ndarray,
+                            three_shift: cython.long,
+                            rlength: cython.int,
+                            scale_factor: cython.float = 1.0,
+-                           baseline_value: cython.float = 0.0) -> list:
++                           baseline_value: cython.float = 0.0,
++                           circular: cython.bint = False) -> list:
+     """Pile up plus/minus read ends using V1-compatible shifts.
+ 
+     Returns the legacy ``[positions, values]`` shape used by track methods.
++    With ``circular``, ranges crossing either end of the chromosome
++    continue on the other side instead of being clipped.
+     """
+     ret: list
+     start_poss: cnp.ndarray
+@@ -829,36 +875,55 @@ def pileup_from_PN_shifted(P_array: cnp.ndarray,
+ 
+     start_poss = np.concatenate((P_array-five_shift, N_array-three_shift))
+     end_poss = np.concatenate((P_array+three_shift, N_array+five_shift))
+-    start_poss.sort()
+-    end_poss.sort()
+-    start_poss = fix_coordinates(start_poss, rlength)
+-    end_poss = fix_coordinates(end_poss, rlength)
++    if circular:
++        (start_poss, end_poss) = wrap_circular_ranges(start_poss,
++                                                      end_poss,
++                                                      rlength)
++    else:
++        start_poss.sort()
++        end_poss.sort()
++        start_poss = fix_coordinates(start_poss, rlength)
++        end_poss = fix_coordinates(end_poss, rlength)
+     ret = _pileup_sorted_unit_as_list(start_poss,
+                                       end_poss,
+                                       scale_factor,
+                                       baseline_value)
+     clean_up_ndarray(start_poss)
+     clean_up_ndarray(end_poss)
++    if circular:
++        ret = extend_to_rlength(ret, rlength, baseline_value)
+     return ret
+ 
+ 
+ @cython.ccall
+ def pileup_from_LR_as_list(LR_array: cnp.ndarray,
+                            scale_factor: cython.float = 1.0,
+-                           baseline_value: cython.float = 0.0) -> list:
+-    """Pile up LR fragments and return the legacy ``[p, v]`` shape."""
++                           baseline_value: cython.float = 0.0,
++                           rlength: cython.int = 0) -> list:
++    """Pile up LR fragments and return the legacy ``[p, v]`` shape.
++
++    A positive ``rlength`` marks the chromosome as circular: fragments
++    running past its end continue from position 0.
++    """
+     ret: list
+     start_poss: cnp.ndarray
+     end_poss: cnp.ndarray
+ 
+-    start_poss = np.sort(LR_array['l'])
+-    end_poss = np.sort(LR_array['r'])
++    if rlength > 0:
++        (start_poss, end_poss) = wrap_circular_ranges(LR_array['l'].astype("i4"),
++                                                      LR_array['r'].astype("i4"),
++                                                      rlength)
++    else:
++        start_poss = np.sort(LR_array['l'])
++        end_poss = np.sort(LR_array['r'])
+     ret = _pileup_sorted_unit_as_list(start_poss,
+                                       end_poss,
+                                       scale_factor,
+                                       baseline_value)
+     clean_up_ndarray(start_poss)
+     clean_up_ndarray(end_poss)
++    if rlength > 0:
++        ret = extend_to_rlength(ret, rlength, baseline_value)
+     return ret
+ 
+ 
+diff --git a/MACS3/Utilities/OptValidator.py b/MACS3/Utilities/OptValidator.py
+index 753dc40..624bcd5 100644
+--- a/MACS3/Utilities/OptValidator.py
++++ b/MACS3/Utilities/OptValidator.py
+@@ -124,6 +124,11 @@ def opt_validate_callpeak(options):
+         logger.error("--broad can't be combined with --call-summits!")
+         sys.exit(1)
+ 
++    options.circular = [x.strip().encode() for x in options.circular.split(",") if x.strip()]
++    if options.circular and options.format not in ["BAM", "BAMPE"]:
++        logger.error("--circular needs chromosome lengths from a BAM header, so it only works with -f BAM or BAMPE!")
++        sys.exit(1)
++
+     if options.pvalue:
+         # if set, ignore qvalue cutoff
+         options.log_qvalue = None
+@@ -249,6 +254,8 @@ def opt_validate_callpeak(options):
+     #    options.argtxt += "# Refining peak for read balance is on\n"
+     if options.call_summits:
+         options.argtxt += "# Searching for subpeak summits is on\n"
++    if options.circular:
++        options.argtxt += "# Circular chromosomes: %s\n" % (",".join([x.decode() for x in options.circular]))
+ 
+     if options.do_SPMR and options.store_bdg:
+         options.argtxt += "# MACS will save fragment pileup signal per million reads\n"
+diff --git a/bin/macs3 b/bin/macs3
+index 84a44bb..68edccd 100644
+--- a/bin/macs3
++++ b/bin/macs3
+@@ -285,6 +285,8 @@ def add_callpeak_parser(subparsers):
+                                 help="Maximum gap between significant sites to cluster them together. The DEFAULT value is the detected read length/tag size.")
+     group_callpeak.add_argument("--min-length", dest="minlen", type=int,
+                                 help="Minimum length of a peak. The DEFAULT value is the predicted fragment size d. Note, if you set a value smaller than the fragment size, it may have NO effect on the result. For BROAD peak calling, try to set a large value such as 500bps. You can also use '--cutoff-analysis' option with default setting, and  check the column 'avelpeak' under different cutoff values to decide a reasonable minlen value.")
++    group_callpeak.add_argument("--circular", dest="circular", type=str, default="",
++                                help="Comma-separated names of circular chromosomes, such as bacterial genomes, plasmids or chrM. On these chromosomes, fragments, local lambda windows and peaks continue across the origin instead of being cut at the chromosome ends. A peak crossing the origin is reported once, with its start inside the chromosome and its end beyond the chromosome length; its summit is reported on the chromosome. Chromosome lengths are taken from the BAM header, so this option requires -f BAM or BAMPE. DEFAULT: \"\"")
+     group_callpeak.add_argument("--broad", dest="broad", action="store_true",
+                                 help="If set, MACS will try to call broad peaks using the --broad-cutoff setting. Please tweak '--broad-cutoff' setting to control the peak calling behavior. At the meantime, either -q or -p cutoff will be used to define regions with 'stronger enrichment' inside of broad peaks. The maximum gap is expanded to 4 * MAXGAP (--max-gap parameter). As a result, MACS will output a 'gappedPeak' and a 'broadPeak' file instead of 'narrowPeak' file. Note, a broad peak will be reported even if there is no 'stronger enrichment' inside. DEFAULT: False", default=False)
+     group_callpeak.add_argument("--broad-cutoff", dest="broadcutoff", type=float, default=0.1,

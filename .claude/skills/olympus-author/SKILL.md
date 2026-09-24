@@ -305,6 +305,49 @@ inputs, and agents leave the reader's base operator in place — 3/10). On that 
 itself (ranking, pool compaction, output bookkeeping) drew no failures at all; plan the band on the
 accounting cells, and count the machinery as LOC and FP insurance (L58).
 
+**One comes FREE with any serialisation round trip over a graph (F-49).** If the repo writes a DAG
+out as a FLAT record list with the parent/child relation carried inside each record, and the read
+entry point is called ON one node, agents re-parent the whole graph onto that node: every parsed name
+becomes a direct dependency of the reading object, on top of the correct nested edge. 7/10 on
+siliconcompiler-flist-roundtrip and the sole failure of five 56/57 runs. Two things make it
+measurable and neither is the edge rule: a fixture at least **three levels deep** (on a two-level
+sibling graph, re-parenting is indistinguishable from correct) and a separate rule for leftovers
+("a record nothing references attaches to the named fileset") so blanket attachment is visibly not
+the rule. State ownership once and never name the repo's `add_dep`-equivalent.
+
+**Two more come FREE with any resource-accounting pick (F-50, F-51).** If the resource has an
+unlimited mode that must still report a finite number, agents compute the reported figure once and
+enforce it as a limit (2/10 on the accepted pyfakefs batch; this workspace's reference did it twice).
+If the repo's size getter branches on OS type or object kind, agents account the presentation value
+instead of the stored one (3/11, 5/12, 1/10 on pyfakefs). Both need only a test just past the reported
+figure, or one on the non-default OS type. **And F-20 needs no refactor when the repo already shares
+the primitive:** making `create_dir` all-or-nothing leaked into `add_real_directory`, which the
+contract kept stepwise, with no agent refactor at all (3/10).
+
+**Two stacked boundaries give F-52 for one sentence.** If values cross a pluggable delegate seam and
+an operation below it narrows them, state the full-domain rule at the seam and the narrowing at the
+operation in adjacent sentences, then test the seam with a recording delegate. 2/10 on the accepted
+pyocd batch, both near-misses failing nothing else. It only works once the seam rule is CONCRETE
+(L87); abstract, the same tests killed 7/11 by under-reducing instead.
+
+**A fixed point's DIRECTION stays hard after you state it (F-53, L94).** If the feature computes an
+all-paths fact (never null, never throws) over a recursive call graph, say "the most precise facts
+that hold for all methods at once", then test a jointly never-null cycle with one anchored exit. 4/10
+on the accepted teavm batch, three near-misses failing nothing else, every evaluator ruling it
+described. Add an unanchored pure cycle too (Auto Review asked for it). Pair it with the compatibility
+cell (**F-54**: "without X every pass behaves as it does today" plus one off-path test across the case
+the base code ignores, 2/10) and, if the pass stores keys for a join, the straight-line vs join split
+(**F-55**, 2/10).
+
+**Turn every reference bug a gate finds into a test (L90).** On pyfakefs all three accepted-batch
+near-miss killers were bugs Solution Quality had first found in the reference. When you fix one,
+add the discriminating test in the same round; probe the saved agent patches first if you have them. **But L90 has counter-evidence:** pyocd's eleven gate-found bugs each got a test and killed NOTHING in
+the accepted batch, apart from one test that caught the opposite error. L90 holds when the reviewer
+has found a place implementers go wrong; not when the finding is an input the repo never produces
+(L93). Replay every such test against saved patches before shipping it, and if the requirement is
+not in meta.md, state it literally with an example rather than withholding the test (pyocd's JTAG
+byte test: 0/11 replayed while undocumented, 0/10 kills once stated).
+
 **Step B-bis — FAILURE-PATTERN TARGETING (`failure-patterns.md` § 1, mandatory):** the arsenal
 class in Step B says what KIND of trap it is; this step says whether anyone has ever measured
 that kind killing an agent. Name the F-id(s) the candidate targets and check the precondition
@@ -328,6 +371,22 @@ with a file:line citation, not a hunch.
   new API by naming only it, then guard the OLD api's behaviour in BOTH directions. The seam is live
   precisely when the old behaviour is documented in prose but has no repo test, so the agent's own
   green baseline cannot warn them. Verify that gap before counting on it.
+- **F-44 composes two rules and costs no description words (7/10 lead on csbindgen).** When the feature
+  adds a type rewrite to a model that already follows aliases, state each rule once and never their
+  combination, then test the composition cells (pointer-to-alias-of-array, alias-of-pointer-to-array,
+  one extra pointer level) with exact emitted types. The direct forms kill nobody.
+- **F-46 guards are free (2/10-5/16).** If the output is chosen by comparing a source model against a
+  target model, add P2P "stays unchanged" guards on containers of a NESTED value that the feature did
+  change. Correct solutions pass them for nothing; model reuse fails them.
+- **F-47 is the escape from a derivable core (4/12 lead on libspatialindex).** When the feature's
+  heart is maths the prompt must state in full (geometry kernels, interval arithmetic), agents
+  transcribe it: 7/10 there with the kernels alone. Look for a field the repo's persistence or
+  aggregate-bound layer drops, and make the feature depend on it with one behavioural sentence. Test it
+  on a deep random tree against an exhaustive oracle and after a close-and-reopen. Never assert the
+  store's own self-check (`isIndexValid()`) to do it: that pins a representation and zeroed a batch (L82).
+- **F-48 costs one test (3/12 on libspatialindex).** If the feature restricts a method whose parameter
+  type is broader than the new contract, write one general rejection sentence covering every entry point
+  and pass the base type to the narrowed method.
 - **F-19 is the most durable lever measured, and the cheapest to author.** If the repo's library
   entry point writes to a global output channel (a `println!` logger, a package-level writer) and
   the pick adds a command that must emit STRUCTURED output on that same channel, you get a trap
@@ -697,6 +756,14 @@ Wrong Logic % constraint: <25%. ≥25% → Olympus territory. Downgrade trap or 
       and test a retained reference reused in a later registration plus one that closes a cycle.**
 - [ ] **Inherited-aggregate audit (F-33): does the feature change what a field the repo already reads back from its inputs MEANS (a maximum where the reader sums, a union where it overwrites)? Name the reader and its operator, and test two inputs carrying distinct values plus one single-input case where the inherited value is smaller.**
 - [ ] **Attempt-vs-effect audit (F-15 accounting): for every "record what the recourse did" rule, test the degenerate attempt (one item that cannot be dropped, with and without inherited records), and a zoom/group where only a DIFFERENT member acted.**
+- [ ] **Fixture-assertion audit (L79): every type the harness generates (a TYPES / always-included
+      list, a shared fixture file) is asserted by some test, or deleted. Run it programmatically
+      after EVERY test edit — an unasserted fixture is an FP trap, and cutting test blocks by
+      marker silently deletes assertions (csbindgen lost six tests that way).**
+- [ ] **Enumeration audit (L81): no contract sentence lists members of a class unless the list is
+      complete for every member the tests use. A partial list reads as exhaustive (7/16 on c_float).**
+- [ ] **Host-semantics audit (L80): no sentence promises a host-language semantic in full (name
+      resolution, module scoping, overloads). If the feature needs it, narrow the feature.**
 - [ ] **Reference-bug harvest (L50): list every defect a reviewer found in YOUR reference and ask
       of each whether a test would discriminate. Each one that got a test on dfu-derived-recursion
       became a measured killer (4, 4 and 3 of 10). Replay against the saved passers first (L40).**
@@ -738,11 +805,24 @@ Wrong Logic % constraint: <25%. ≥25% → Olympus territory. Downgrade trap or 
       and confirm NO fixture reaches one the feature does not need. cwerg: two such tests took a
       batch to 0/9; without them 3/10, accepted.**
 - [ ] **Cold build under 600 s (L62): time `docker build --no-cache`. The platform's environment
-      start includes the image build; do COPY + build + `chmod -R` in one `RUN --mount=type=bind`
-      layer (cwerg: 704 s to 413 s).**
+      start includes the image build. Never a bind mount (the Dockerfile check FAILS it since
+      2026-09-23); `COPY --chown=1000:1000 . .` then chmod only directories and root-owned build
+      outputs, never `chmod -R /app` (teavm: 816 s to 431 s, Pattern 91).**
+- [ ] **Driver wiring (Pattern 105): if the contract says the driver hands the feature to every
+      unit it processes, test a real driver run with a stub backend, looped over EVERY mode / level /
+      pipeline the driver has. teavm: `SIMPLE` (the default level) ran a separate lazy pipeline that
+      never built summaries, a Solution Quality FAIL.**
+- [ ] **No unobservable frequency in meta.md (L96): drop "once", "lazily", "cached", "only after X"
+      unless a test can see it. teavm's "once per build" cost a Tests 1/3.**
 - [ ] **Loader-attribute audit (F-41): if the feature creates objects at runtime, diff the batch
       loader's call into the factory against the factory's public signature. Every argument the loader
       injects per entry (group index, owner, id) is a seam; test one object that depends only on it.**
+- [ ] **Self-check audit (L82): grep the suite for the repo's own validator (`isIndexValid`, `validate()`,
+      `check_invariants`). If the feature changes the bookkeeping that validator recomputes, delete the
+      assertion and keep the oracle comparisons; a batch read 0/10 on it with the answers all right.**
+- [ ] **Persisted-layout audit (L84): if the solution widens a stored record, version it PER RECORD (a
+      flag in the record's own type word), not per header, and write one test that loads a hand-built
+      page in the OLD layout. Evaluators fail 100% runs on an unversioned page.**
 - [ ] **Shared-reference-bug rule (L76): a reviewer-found reference bug that the local replay shows
       every agent shares (N/N) gets a reference fix and NO test unless meta.md already states the
       behaviour. Replay before adding the regression test a reviewer asks for.**
@@ -750,6 +830,23 @@ Wrong Logic % constraint: <25%. ≥25% → Olympus territory. Downgrade trap or 
       coordinates, never circles (buffered-polygon centroids) or a trajectory that lands on the edge.**
 - [ ] **Stated-noun list (L46): write down every noun meta.md actually names. Any fixture whose
       subject is NOT on that list is a gate on unstated behaviour — fix the reference instead.**
+- [ ] **Boundary-naming audit (L89): if meta.md splits calls into two behaviour classes (atomic vs
+      stepwise, validated vs not), members of BOTH classes are named and every tested call is placed
+      by name. A one-sided carve-out moved five unchanged tests from 0/11 to 10/12 kills.**
+- [ ] **Non-governed argument audit (L92): every argument a test passes that the rule under test
+      does NOT govern uses a value inside its documented range. pyocd's `tms=3` (documented 0 or 1)
+      was the only run-deciding trap nobody designed: 3/10 plus a batch-1 Vega run.**
+- [ ] **Seam-vs-operation audit (F-52): if values cross a delegate seam and an operation below it
+      narrows them, the seam rule and the narrowing are stated in adjacent sentences and a
+      recording-delegate test observes the seam's input.**
+- [ ] **Unlimited-reporting audit (F-50): if an unlimited mode reports a finite figure, one test goes
+      just PAST that figure on every axis the contract has (bytes, count, reconfiguration).**
+- [ ] **Branched-getter audit (F-51): if a size/length getter branches on OS type or kind, one test on
+      the non-default branch asserts the stored quantity in accounting AND in every report.**
+- [ ] **Graph-depth audit (F-49): does the feature round-trip a graph or tree? If so, at least one
+      fixture is THREE levels deep and asserts the middle node's own edge list, not just the root's.
+      On a two-level fixture, re-parenting every node onto the root passes, and that is the shape
+      agents actually ship (7/10).**
 - [ ] **Form-parity audit (F-18): if the domain has two lexical spellings of one concept, every
       position tested for the salient form is also tested for the other**
 - [ ] Format-noun extents stated for every record/entry/block/section the meta names (L24)
@@ -1093,10 +1190,31 @@ Mars: 1–3 rounds. Olympus: 3–5 rounds. >5 on Mars = playbook patterns not fo
 
 ## Difficulty Levers (ranked by MEASURED impact — see `failure-patterns.md`)
 
+0. **A deserialized graph re-parented onto the root (F-49)** — **7/10 on
+   siliconcompiler-flist-roundtrip, and the sole failure of five 56/57 near-misses**, in a 57-test
+   suite where everything else killed nothing. Free with any "write the graph out and read it back"
+   pick. Needs a three-level fixture; a sibling-shaped suite measures zero.
+
+0a. **Two stacked boundaries collapsed onto the nearer one (F-52)** — 2/10 on the accepted pyocd
+   batch, the sole failure of both runs (146/150). One sentence; needs a delegate seam tests can
+   record and a narrowing operation below it.
+
+0a-bis. **A must-fact fixed point solved from the pessimistic end (F-53)** — **4/10 on the accepted
+   teavm batch, sole failure of three 25/26 near-misses**, and it stays hard once stated (L94). Needs a
+   recursive call graph and an existing per-method analysis to prove the fact with. Companions:
+   F-54 compatibility path "fixed" (2/10) and F-55 wildcard sentinel through a join (2/10).
+
+0b. **"Unlimited" reported as a figure and enforced as a limit (F-50)** — 2/10 on the accepted
+   pyfakefs batch (116/117 near-miss), 4 runs on an earlier artifact. Free with any accounting pick
+   that has an unlimited mode.
+0c. **A platform-branched presentation size used as stored size (F-51)** — 3/11, 5/12, 1/10 across
+   three pyfakefs batches. Fair because the repo's own test pins the presentation value.
+
 1. **A convergent-architecture wall (F-1)** — the largest single lever measured: +27 points on
    pulldown (67% → 40%). Cannot be identified before a batch; you have to read the passing patches.
 2. **Sibling-API contamination (F-20)** — **8/10 on go-workflows, and the sole failure of BOTH
-   near-misses**, so it moved the batch from 40% to 20% on its own. Agents refactor the new and old
+   near-misses**; **3/10 on pyfakefs** in its repo-helper form (the repo already routes the sibling
+   through the primitive the feature changes, so no agent refactor is needed), so it moved the batch from 40% to 20% on its own. Agents refactor the new and old
    entry points onto a shared path and leak the new rule onto the old API. Requires an existing
    public behaviour that is documented but untested; costs zero description words and ~40 test lines.
 3. **An absent-key sentinel replacing an existing hard failure (F-24)** — **8/10 in TWO
@@ -1251,6 +1369,12 @@ compliance overhead.**
    review of the reference (L50). Zero description words; it decided the band alone, so pair it.
 22. **Several positional deletions undone in the wrong order (F-42)** — 2/11 on ir-sim. One fixture that
    deletes two items at different positions in one pass.
+25. **Per-entry state the repo's store discards (F-47)** — **4/12 on libspatialindex-tpr-temporal-knn,
+   the lead wall**, and the lever that moved a pure-geometry pick from 7/10 to 5/12 after three
+   coverage searches killed nobody. The piecewise kernels it forced killed 0/12 (L58); the band came from
+   node bounds, page format and reload. One description sentence.
+26. **A narrowed entry point that keeps its legacy convenience (F-48)** — **3/12 on libspatialindex**,
+   stacked on the F-47 runs. One test, zero words if a general rejection sentence already exists.
 
 
 ## Pre-Submit Checklist (Composite)

@@ -2085,20 +2085,27 @@ cached image and never see it. Verify Solution fails with `EnvironmentStartTimeo
 
 **Procedure.**
 1. Time `docker build --no-cache` before the first batch. Anything near 600 s is a failure.
-2. Do copy, build and chmod in ONE layer:
+2. ~~One `RUN --mount=type=bind` layer~~ **SUPERSEDED 2026-09-23: the platform's "Dockerfile
+   guidelines" check now FAILS any Dockerfile that brings the repo in through a bind mount + `cp`
+   ("does NOT copy repository files using Docker COPY ... requires BuildKit"). Use a real COPY and
+   avoid the copy-up instead:**
    ```dockerfile
-   RUN --mount=type=bind,source=.,target=/src \
-       cp -a /src/. /app/ \
-       && make cmake_setup && cd build && make -j2 <tools> \
-       && chmod -R a+rwX /app
+   COPY --chown=1000:1000 . .
+   RUN <build> \
+    && find /app \( -type d -o -user 0 \) -exec chmod a+rwX {} +
    ```
+   Only directories (metadata-only copy-up) and the root-owned build outputs (same layer, no
+   copy-up) get chmodded. Files stay owned by 1000 with their git modes, so root and uid 1000 edit in
+   place, and an unmapped uid (4242) can still `git apply`, because git writes a temp file and renames
+   it over the original. Never `COPY --chmod`: it also needs BuildKit and rewrites git modes.
 3. Verify the resulting `/app` is identical to the old image (hash every file plus its mode) so the
-   change is environment-neutral for the solvers.
+   change is environment-neutral for the solvers, and run the clean room as 0:0, 1000:1000 and 4242.
 
-`RUN --mount` needs BuildKit; the platform builds with `docker compose build`, which uses it.
-
-**Measured.** cwerg-bcopy-bzero-lowering: 704 s cold (chmod alone 261 s) to 413 s, `/app` identical
-across 3080 files, and the next batch built in all nine runs. (L62)
+**Measured.** cwerg-bcopy-bzero-lowering: 704 s cold (chmod alone 261 s) to 413 s with the bind mount,
+`/app` identical across 3080 files, and the next batch built in all nine runs. (L62)
+teavm-method-summaries (69 MB repo, gradle): bind mount 474 s, rejected by the Dockerfile check;
+`COPY --chown` + full `chmod -R /app` 816 s; `COPY --chown` + dirs/root-owned chmod 431 s, clean room
+identical as 0:0, 1000:1000, 4242:4242 and 4242:0.
 
 ## Pattern 92 — Timestamp-proof build in test.sh for compiled repos
 
@@ -2274,3 +2281,128 @@ transformation".
 of 20 runs and a `not` over a decided-false child, while twenty hand-written structural cells killed one run.
 The FP panels re-ran their own broader fuzzers and upheld every pass.
 
+## Pattern 100 — Dual-runtime ABI oracle for code generators
+
+**When.** The feature makes a generator emit code for a second language whose runtime must agree with the
+first (FFI bindings, schema-to-struct generators, serializers). The contract is "same size and offsets".
+
+**How.**
+1. Put each fixture in the test file through a `fixture!` macro that both COMPILES the items (so the
+   source compiler's `size_of`/`offset_of!` are the oracle) and `stringify!`s them as generator input.
+   No expected offset is ever typed by hand.
+2. Assert the emitted layout attribute, every `FieldOffset`, and the Size against that oracle.
+3. Outside the suite, compile the generated target-language file on the real target runtime and compare
+   its `sizeof` per type against the oracle. Run it after every solution change; regenerate first (a
+   stale generated file once "failed" to compile).
+4. Keep a programmatic audit that every generated fixture is asserted (L79).
+
+**Evidence.** csbindgen-struct-layout-fidelity: 85 fixtures, identical on Rust and .NET 8 at every round.
+The runtime check settled two reviewer claims (C# `Int128` alignment 16 on .NET 8 vs 8 before it;
+`MarshalAs` on `fixed bool` makes `Marshal.SizeOf` throw).
+
+## Pattern 101 — Convergence triage before a description delta
+
+**When.** A batch reads over the ceiling and you are about to spend a round on more test cells.
+
+**How.**
+1. Build a replay image from a pristine BASE clone plus the Dockerfile. For each saved run, keep only the
+   `diff --git a/(src|include)/` blocks of `solution-patch.patch`, apply them and the candidate
+   `test.patch`, and run new mode. Check it reproduces the batch exactly before trusting it: for a
+   tests-only delta it then predicts the re-eval (L40).
+2. Write a probe program that prints one canonical `name=value` line per contract cell (boundaries,
+   validation, every shape kind, instants, reload) and wrap each cell in a catch-all so an exception is a
+   value. Build it against every saved solution and the reference; diff.
+3. If the passers agree with the reference on every cell, stop adding cells (L83). Grep the persistence
+   and aggregate layers for state the repo discards and design one behavioural sentence around it
+   (F-47). That is a description delta: pay for a batch.
+
+**Evidence.** libspatialindex-tpr-temporal-knn: the replay reproduced batch 1 run for run; 57 probes x 7
+passers showed 0 divergences and 16 candidate tests 0 new kills; the discarded end-of-motion field moved
+the rate 7/10 -> 5/12, accepted. The same replay later showed batch 2's 0/10 was an assertion of mine
+(0/10 -> 5/10 with it removed).
+
+## Pattern 102
+
+**Repair a 0% batch by replay, not by redesign.** When a batch reads 0% and the saved solution
+patches exist, every candidate repair has a measurable rate: apply each agent's patch to base plus a
+CANDIDATE test suite in the platform image and count passes. This prices the options against each
+other before any of them is committed.
+
+Measured on siliconcompiler-flist-roundtrip (batch 1, 0/11, 11 saved patches):
+
+| Candidate repair | Replayed rate |
+|---|---|
+| fix the helper's reference-only API call + the ambiguous spelling sentence | 0/11 |
+| ... also cut the `file://` data-root case | 3/11 |
+| ... also clarify the edge-ownership sentence | **9/11** |
+
+The third row is the point. All three edits look like the same class of fairness repair; only the
+replay shows that one of them removes the problem's only real trap. Live batch 2 then measured 2/10
+against the 3/11 projection.
+
+Two caveats. The replay measures a TEST delta, so a repair that changes the DESCRIPTION (here, the
+spelling sentence) can only be modelled by excusing the tests it governs — L35's discount applies in
+reverse. And cut a requirement in all three places at once (tests, contract sentence, reference), or
+the next review scores the coverage gap the description still promises.
+
+## Pattern 103 — Boundary table for a two-class contract
+
+When the contract splits calls into two behaviour classes (atomic vs stepwise, validated vs raw,
+charged vs exempt), build a table before writing meta.md:
+
+1. List every public entry point that reaches the primitive the rule changes, including the repo's own
+   helpers: `grep -rn "self\.create_dir(" pkg/`.
+2. Place each one in a class, and name at least one member of EACH class in meta.md. Every call a test
+   exercises must be placed by name.
+3. For each repo helper routed through the primitive but placed in the other class, write the test
+   that tells the classes apart. That is the F-20 repo-helper cell and it costs no description words.
+
+Measured on pyfakefs-block-inode-accounting. Naming only the stepwise class moved five unchanged
+`create_dir`/`create_file` rollback tests from 0/11 to 9-10/12 kills; naming both sides took them to
+0/10. The helper cell (`add_real_directory` builds parents via `create_dir`, contract keeps them)
+killed 3/10 in the accepted batch and was the sole failure of one near-miss.
+
+## Pattern 104 — Replay gate for review-requested tests
+
+**When.** A batch has run and its solution patches are saved, and a review round asks for a new test.
+
+**How.** Replay the saved patches against the suite WITH the candidate test before shipping it (keep
+each patch's source hunks only, apply the candidate `test.patch`, run new mode). Then:
+
+| Replay result | Action |
+|---|---|
+| Kills only runs that already fail | Ship it |
+| Kills the near-misses, and meta.md does NOT state the requirement | The replay is measuring an undocumented rule. State it literally with one example, then ship the test |
+| Kills the near-misses, and the requirement IS stated | Cut it in the tests, the contract sentence and the reference together, or keep it and accept the rate |
+| Kills runs through an argument the rule does not govern | An accidental trap (L92): fix the fixture value |
+
+Read the assertion diff for every kill before choosing a row; a test name only says which rule the test
+was for.
+
+**Evidence.** pyocd-sequence-expression-kernel, eight review rounds after batch 1: most candidates cost
+nothing; JTAG byte responses, `DAP_WriteABORT` and a string-returning statement each replayed at
+0/11. The byte test, once stated in meta.md with an example, killed 0/10 in the accepted batch. The
+replay projected 2/11 for the final suite and batch 2 read 5/10, which is the L35 discount for the
+description changes made along the way.
+
+## Pattern 105 — Stub-backend end-to-end test for driver wiring
+
+**Problem.** A contract says the driver (compiler, build tool, pipeline runner) builds the feature and
+hands it to every unit it processes. Unit tests of the feature cannot see the wiring, reviewers flag
+the sentence "untested", and Solution Quality checks every mode of the driver, not the one you wired.
+
+**Procedure.**
+1. Find the driver's backend SPI (TeaVM: `TeaVMTarget`) and stub it: empty transformers, listeners and
+   extensions; the output hook (`emit`) records the processed program of the units under test.
+2. Build the smallest class/source set the driver accepts. For TeaVM: `java.lang.Object` with
+   `setParent(null)` (the default parent is itself, and dependency analysis spins), `java.lang.String`,
+   and an entry class with `main(String[])`.
+3. Pick a fixture only the feature can change: a virtual call with two implementations, so no
+   devirtualization or inlining removes the null check first. Confirm base leaves it at every level.
+4. Loop over EVERY mode, level or pipeline enum value. Use a second unit in another class, kept out of
+   inlining by the stub's filter, so "every unit" means more than the entry point.
+5. Do not assert frequency or timing ("once per build"); drop such words from the contract (L96).
+
+**Measured.** teavm-method-summaries: the loop over `TeaVMOptimizationLevel.values()` caught the
+unwired `SIMPLE` lazy pipeline that Solution Quality found, runs in 37 s, and killed 0/10 in the
+accepted batch. It is non-regression insurance, not difficulty.

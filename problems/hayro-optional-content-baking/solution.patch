@@ -1,0 +1,314 @@
+diff --git a/hayro-syntax/src/content/mod.rs b/hayro-syntax/src/content/mod.rs
+index 9915b99b..373dd51d 100644
+--- a/hayro-syntax/src/content/mod.rs
++++ b/hayro-syntax/src/content/mod.rs
+@@ -124,6 +124,11 @@ impl<'a> UntypedIter<'a> {
+         }
+     }
+ 
++    /// Return the byte offset right after the last instruction that was read.
++    pub fn offset(&self) -> usize {
++        self.reader.offset()
++    }
++
+     /// Return the next instruction.
+     #[allow(clippy::should_implement_trait)]
+     pub fn next(&mut self) -> Option<Instruction<'_, 'a>> {
+diff --git a/hayro-write/src/lib.rs b/hayro-write/src/lib.rs
+index a1b2d2ee..833f1795 100644
+--- a/hayro-write/src/lib.rs
++++ b/hayro-write/src/lib.rs
+@@ -11,8 +11,10 @@ well-documented.
+ #[macro_use]
+ mod log;
+ 
++mod optional_content;
+ mod primitive;
+ 
++use crate::optional_content::{OcConfig, bake};
+ use crate::primitive::{WriteDirect, WriteIndirect};
+ use flate2::Compression;
+ use flate2::write::ZlibEncoder;
+@@ -139,6 +141,7 @@ struct ExtractionContext<'a> {
+     cached_content_streams: FxHashMap<usize, Ref>,
+     page_tree_parent_ref: Ref,
+     chunk_settings: ChunkSettings,
++    oc_config: OcConfig,
+ }
+ 
+ impl<'a> ExtractionContext<'a> {
+@@ -160,6 +163,7 @@ impl<'a> ExtractionContext<'a> {
+             root_refs: Vec::new(),
+             page_tree_parent_ref,
+             chunk_settings,
++            oc_config: OcConfig::new(pdf),
+         }
+     }
+ 
+@@ -318,10 +322,7 @@ fn write_page(
+         let stream_ref = ctx.new_ref();
+ 
+         chunk
+-            .stream(
+-                stream_ref,
+-                &deflate_encode(page.page_stream().unwrap_or(b"")),
+-            )
++            .stream(stream_ref, &deflate_encode(&page_content(page, ctx)))
+             .filter(Filter::FlateDecode);
+         ctx.cached_content_streams.insert(page_idx, stream_ref);
+ 
+@@ -363,7 +364,7 @@ fn write_xobject(
+     ctx: &mut ExtractionContext<'_>,
+ ) -> Result<(), ExtractionError> {
+     let mut chunk = Chunk::with_settings(ctx.chunk_settings);
+-    let encoded_stream = deflate_encode(page.page_stream().unwrap_or(b""));
++    let encoded_stream = deflate_encode(&page_content(page, ctx));
+     let mut x_object = chunk.form_xobject(xobj_ref, &encoded_stream);
+     x_object.deref_mut().filter(Filter::FlateDecode);
+ 
+@@ -401,6 +402,12 @@ fn write_xobject(
+     Ok(())
+ }
+ 
++fn page_content(page: &Page<'_>, ctx: &ExtractionContext<'_>) -> Vec<u8> {
++    let data = page.page_stream().unwrap_or(b"");
++
++    bake(data, page.resources(), &ctx.oc_config).unwrap_or_else(|| data.to_vec())
++}
++
+ fn serialize_resources(
+     resources: &Resources<'_>,
+     ctx: &mut ExtractionContext<'_>,
+diff --git a/hayro-write/src/optional_content.rs b/hayro-write/src/optional_content.rs
+new file mode 100644
+index 00000000..b7f71879
+--- /dev/null
++++ b/hayro-write/src/optional_content.rs
+@@ -0,0 +1,227 @@
++use hayro_syntax::Pdf;
++use hayro_syntax::content::{Instruction, UntypedIter};
++use hayro_syntax::object::dict::keys::{
++    BASE_STATE, D, OC, OCGS, OCMD, OCPROPERTIES, OFF, ON, P, TYPE,
++};
++use hayro_syntax::object::{Array, Dict, Name, Object, ObjectIdentifier, Stream};
++use hayro_syntax::page::Resources;
++use rustc_hash::FxHashSet;
++use std::ops::Deref;
++
++const PAINTS: [&[u8]; 9] = [b"f", b"F", b"f*", b"S", b"s", b"B", b"B*", b"b", b"b*"];
++const SHOWS: [&[u8]; 4] = [b"Tj", b"TJ", b"'", b"\""];
++
++pub(crate) struct OcConfig {
++    hidden: FxHashSet<ObjectIdentifier>,
++}
++
++impl OcConfig {
++    pub(crate) fn new(pdf: &Pdf) -> Self {
++        let mut hidden = FxHashSet::default();
++        let xref = pdf.xref();
++        let properties = xref
++            .get::<Dict<'_>>(xref.root_id())
++            .and_then(|catalog| catalog.get::<Dict<'_>>(OCPROPERTIES));
++
++        if let Some(properties) = properties
++            && let Some(config) = properties.get::<Dict<'_>>(D)
++        {
++            if config.get::<Name<'_>>(BASE_STATE).as_deref() == Some(OFF) {
++                hidden.extend(refs_in(&properties, OCGS));
++            }
++
++            for id in refs_in(&config, ON) {
++                hidden.remove(&id);
++            }
++
++            hidden.extend(refs_in(&config, OFF));
++        }
++
++        Self { hidden }
++    }
++
++    fn hides(&self, id: Option<ObjectIdentifier>, dict: &Dict<'_>) -> bool {
++        if dict.get::<Name<'_>>(TYPE).as_deref() != Some(OCMD) {
++            return id.is_some_and(|id| self.hidden.contains(&id));
++        }
++
++        let mut members = refs_in(dict, OCGS);
++        if let Some(single) = dict.get_ref(OCGS) {
++            members.push(single.into());
++        }
++
++        if members.is_empty() {
++            return false;
++        }
++
++        let off = |id: &ObjectIdentifier| self.hidden.contains(id);
++        let visible = match dict.get::<Name<'_>>(P).as_deref() {
++            Some(b"AllOn") => !members.iter().any(off),
++            Some(b"AnyOff") => members.iter().any(off),
++            Some(b"AllOff") => members.iter().all(off),
++            _ => !members.iter().all(off),
++        };
++
++        !visible
++    }
++
++    fn hides_entry(&self, dict: &Dict<'_>, key: &[u8]) -> bool {
++        dict.get::<Dict<'_>>(key)
++            .is_some_and(|oc| self.hides(dict.get_ref(key).map(Into::into), &oc))
++    }
++}
++
++fn refs_in(dict: &Dict<'_>, key: &[u8]) -> Vec<ObjectIdentifier> {
++    dict.get::<Array<'_>>(key)
++        .map(|array| {
++            array
++                .raw_iter()
++                .filter_map(|item| item.as_obj_ref().map(Into::into))
++                .collect()
++        })
++        .unwrap_or_default()
++}
++
++fn lookup<'a, T>(
++    resources: &Resources<'a>,
++    select: impl Fn(&Resources<'a>) -> Option<T> + Copy,
++) -> Option<T> {
++    select(resources).or_else(|| resources.parent().and_then(|p| lookup(p, select)))
++}
++
++enum Action {
++    Keep,
++    Drop,
++    EndPath,
++    Invisible,
++}
++
++struct Baker<'c> {
++    config: &'c OcConfig,
++    visibility: Vec<bool>,
++    render_modes: Vec<i64>,
++    render_mode: i64,
++    changed: bool,
++}
++
++impl Baker<'_> {
++    fn is_hidden(&self) -> bool {
++        self.visibility.last().copied().unwrap_or(false)
++    }
++
++    fn marked_content_hides(
++        &self,
++        instruction: &Instruction<'_, '_>,
++        resources: &Resources<'_>,
++    ) -> bool {
++        let mut operands = instruction.operands();
++        let is_oc = matches!(operands.next(), Some(Object::Name(tag)) if tag.deref() == OC);
++        let Some(Object::Name(name)) = operands.next() else {
++            return false;
++        };
++
++        is_oc
++            && lookup(resources, |r| {
++                let dict = r.properties.get::<Dict<'_>>(name.deref())?;
++                Some(
++                    self.config
++                        .hides(r.properties.get_ref(name.deref()).map(Into::into), &dict),
++                )
++            })
++            .unwrap_or(false)
++    }
++
++    fn xobject_hides(&self, instruction: &Instruction<'_, '_>, resources: &Resources<'_>) -> bool {
++        let Some(Object::Name(name)) = instruction.operands().next() else {
++            return false;
++        };
++
++        lookup(resources, |r| r.x_objects.get::<Stream<'_>>(name.deref()))
++            .is_some_and(|stream| self.config.hides_entry(stream.dict(), OC))
++    }
++
++    fn classify(&mut self, instruction: &Instruction<'_, '_>, resources: &Resources<'_>) -> Action {
++        let hidden = self.is_hidden();
++        let operator = instruction.operator.deref();
++
++        match operator {
++            b"BDC" => {
++                let hides = hidden || self.marked_content_hides(instruction, resources);
++                self.visibility.push(hides);
++                Action::Keep
++            }
++            b"BMC" => {
++                self.visibility.push(hidden);
++                Action::Keep
++            }
++            b"EMC" => {
++                self.visibility.pop();
++                Action::Keep
++            }
++            b"q" => {
++                self.render_modes.push(self.render_mode);
++                Action::Keep
++            }
++            b"Q" => {
++                if let Some(mode) = self.render_modes.pop() {
++                    self.render_mode = mode;
++                }
++                Action::Keep
++            }
++            b"Tr" => {
++                if let Some(Object::Number(mode)) = instruction.operands().next() {
++                    self.render_mode = mode.as_f64() as i64;
++                }
++                Action::Keep
++            }
++            _ if hidden && PAINTS.contains(&operator) => Action::EndPath,
++            _ if hidden && SHOWS.contains(&operator) => Action::Invisible,
++            b"Do" | b"sh" | b"BI" if hidden => Action::Drop,
++            b"Do" if self.xobject_hides(instruction, resources) => Action::Drop,
++            _ => Action::Keep,
++        }
++    }
++}
++
++pub(crate) fn bake(data: &[u8], resources: &Resources<'_>, config: &OcConfig) -> Option<Vec<u8>> {
++    if config.hidden.is_empty() {
++        return None;
++    }
++
++    let mut baker = Baker {
++        config,
++        visibility: Vec::new(),
++        render_modes: Vec::new(),
++        render_mode: 0,
++        changed: false,
++    };
++    let mut out = Vec::with_capacity(data.len());
++    let mut iter = UntypedIter::new(data);
++    let mut start = 0;
++
++    while let Some(instruction) = iter.next() {
++        let action = baker.classify(&instruction, resources);
++        let end = iter.offset();
++        let segment = &data[start..end];
++        start = end;
++
++        match action {
++            Action::Keep => out.extend_from_slice(segment),
++            Action::Drop => baker.changed = true,
++            Action::EndPath => {
++                out.extend_from_slice(b"\nn");
++                baker.changed = true;
++            }
++            Action::Invisible => {
++                out.extend_from_slice(b"\n3 Tr");
++                out.extend_from_slice(segment);
++                out.extend_from_slice(format!("\n{} Tr", baker.render_mode).as_bytes());
++                baker.changed = true;
++            }
++        }
++    }
++
++    out.extend_from_slice(&data[start..]);
++
++    baker.changed.then_some(out)
++}

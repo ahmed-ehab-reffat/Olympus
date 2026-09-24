@@ -1,6 +1,6 @@
 ---
 name: olympus-factory
-description: Continuous hunt -> author loop. Keeps one olympus-hunter and one olympus-builder subagent busy, parks each new problem at the platform-precheck touchpoint, finishes it once the human writes a precheck verdict into pipeline/INBOX.md, and repeats until told to stop. Run with /olympus-factory; stop by typing "stop" or creating pipeline/STOP.
+description: Continuous hunt -> slice loop. Keeps one olympus-hunter and one olympus-builder subagent busy and hands each new problem over at SLICE-READY, so the human finishes it in a session of their own; it only runs a FINISH itself when asked to. Run with /olympus-factory; stop by typing "stop" or creating pipeline/STOP.
 disable-model-invocation: true
 ---
 
@@ -11,8 +11,19 @@ fresh subagent. That keeps this session's context small so it can run for days. 
 workers, parse their result blocks, keep `pipeline/LEDGER.md` accurate, and react to `pipeline/INBOX.md`.
 
 Arguments (optional, free text): language or domain preferences, and limits such as
-`max-ready=5` (stop after 5 READY) or `no-hunt` (only drain existing work). Pass preferences on to
-every hunter.
+`max-handoff=5` (stop after 5 HANDOFF rows) or `no-hunt` (only drain existing work). Pass preferences on
+to every hunter. `finish-here` restores the old behaviour: the loop also runs FINISH builds itself.
+
+## Where the loop hands over (DEFAULT)
+
+The loop's job is hunt -> scope-lock -> core slice. When a SLICE builder returns `SLICE-READY`, the
+problem is HANDED OVER: set the row `HANDOFF`, notify, and never launch another worker on that slug.
+The human runs the picker and the precheck and then finishes the problem in their own session, because
+FINISH is where scope judgement, description wording and batch strategy live.
+
+Run a FINISH build only when the human asks for one: an inbox line `<slug>: finish` (optionally with
+pasted precheck warnings after a `|`), or the `finish-here` argument, which makes `clean` verdicts queue
+a FINISH the way they used to. Without that, a `clean` verdict is only bookkeeping.
 
 ## State
 
@@ -22,15 +33,16 @@ every hunter.
   `## Processed`.
 - `pipeline/STOP`: if this file exists, stop launching work.
 
-Statuses: `HUNTED` (queued) -> `SLICING` -> `AWAITING-PRECHECK` -> `PRECHECK-CLEAN` -> `BUILDING` -> `READY`.
-Side exits: `DEAD`, `CLAIMED`.
+Statuses: `HUNTED` (queued) -> `SLICING` -> `HANDOFF` (default end state: the human takes it from here).
+With `finish-here` or a `finish` inbox line the older path still exists:
+`HANDOFF` -> `PRECHECK-CLEAN` -> `BUILDING` -> `READY`. Side exits: `DEAD`, `CLAIMED`.
 
 ## Limits
 
 - At most ONE hunter and ONE builder running at once. They run in parallel with each other.
 - Launch a hunter only while fewer than 2 rows are `HUNTED`.
-- Launch a SLICE builder only while fewer than 4 rows are `AWAITING-PRECHECK`. Past that, the human is
-  the bottleneck: send one notification and put builder capacity into FINISH work only.
+- Launch a SLICE builder only while fewer than 4 rows are `HANDOFF`. Past that the human is the
+  bottleneck: send one notification and stop slicing until a row clears (`CLAIMED`, `DEAD` or finished).
 
 ## The tick (run it at start, after every worker result, and after every wake-up)
 
@@ -39,7 +51,10 @@ Side exits: `DEAD`, `CLAIMED`.
    (see "Stopping"), and end. If the user said "pause", finish the running workers and wait on the inbox
    without launching new ones.
 2. **Inbox.** Process each line under `## New`:
-   - `clean`: set the row `PRECHECK-CLEAN` and keep any pasted warnings for the FINISH prompt.
+   - `clean`: set the row `PRECHECK-CLEAN` and keep any pasted warnings. Queue a FINISH only under
+     `finish-here`; otherwise the row is the human's and the loop just records it.
+   - `finish` (optionally `| <pasted precheck warnings>`): the human wants the loop to build this one
+     after all. Set `PRECHECK-CLEAN` and queue a FINISH build.
    - `dead` or `picker-refused`: launch nothing. Shelve the problem yourself: `git mv problems/<slug>
      rejected/<slug>` (or plain `mv`), plus a one-line entry in `Instructions/SATURATED-REPOS.md` (A0
      for a picker refusal, the lane ledger for a dedupe death). Set the row `DEAD`.
@@ -50,8 +65,8 @@ Side exits: `DEAD`, `CLAIMED`.
    `.claude/agents/olympus-hunter.md` and `olympus-builder.md`):
    - Hunter `CANDIDATE`: add a `HUNTED` row keyed by repo (slug `TBD`) and reset the miss counter.
      `NO-CANDIDATE`: add 1 to the miss counter and keep its `NEXT_HUNT_HINT`.
-   - Builder `SLICE-READY`: set `AWAITING-PRECHECK`, fill in the real slug, and notify the human (see
-     "Notifications").
+   - Builder `SLICE-READY`: set `HANDOFF`, fill in the real slug, and notify the human (see
+     "Notifications"). Launch nothing else on that slug.
    - Builder `READY`: set `READY` and notify.
    - Builder `DEAD`: set `DEAD` with the reason. If it was a SLICE run and the hunt had `FALLBACKS`, add
      the first unused fallback as a new `HUNTED` row.
@@ -61,8 +76,9 @@ Side exits: `DEAD`, `CLAIMED`.
    notify the human once, keep hunting (hunts barely use disk), and re-check each tick. Never prune Docker
    and never delete anything outside `worktrees/<repo>/target` yourself.
 5. **Launch builder** (if the builder slot is free and the disk gate passed). Pick in this order:
-   a. FINISH the oldest `PRECHECK-CLEAN` row (set it to `BUILDING`);
-   b. otherwise SLICE the oldest `HUNTED` row (set it to `SLICING`), if the AWAITING-PRECHECK cap allows.
+   a. FINISH the oldest `PRECHECK-CLEAN` row that the human asked for (a `finish` line, or any
+      `PRECHECK-CLEAN` row under `finish-here`); set it to `BUILDING`;
+   b. otherwise SLICE the oldest `HUNTED` row (set it to `SLICING`), if the `HANDOFF` cap allows.
 6. **Launch hunter** (if the hunter slot is free, fewer than 2 rows are `HUNTED`, and no `no-hunt`).
    Pass `CONSECUTIVE_MISSES`, the preferences, and the last `NEXT_HUNT_HINT`. After 5 misses in a row,
    notify the human once and keep going. The hunter itself widens its search as misses grow.
@@ -85,15 +101,17 @@ Never run two builders on the same slug. Never launch any worker on a `CLAIMED` 
 
 ## Notifications
 
-When the PushNotification tool is available (load it with ToolSearch), use it for: a SLICE-READY slug
-(include the slug and "run precheck + picker, then write the verdict in pipeline/INBOX.md"), a READY
-slug, the disk gate blocking, and 5 hunt misses in a row. Otherwise print one clear line in this session.
+When the PushNotification tool is available (load it with ToolSearch), use it for: a handed-over slug
+(include the slug and "picker + precheck, then finish it in your own session"), a READY slug from a
+requested FINISH, the disk gate blocking, and 5 hunt misses in a row. Otherwise print one clear line in this session.
 Do not notify on routine ticks.
 
 ## Stopping
 
 Print a table of every ledger row touched this run, with its status and next human step. Report counts
-(READY / AWAITING-PRECHECK / DEAD) and the remaining disk. Do not commit. The human decides what enters
+(HANDOFF / READY / DEAD) and the remaining disk. For each `HANDOFF` row give the handover facts the
+human's next session needs: folder path, what is owed (picker, precheck), the measured LOC and the
+FINISH plan in its `DESIGN.md`. Do not commit. The human decides what enters
 git.
 
 ## Rules that stay in force

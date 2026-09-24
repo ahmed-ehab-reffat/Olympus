@@ -1,0 +1,733 @@
+diff --git a/cpp/devices/storage_device.cpp b/cpp/devices/storage_device.cpp
+index bb7916d..65b2c60 100644
+--- a/cpp/devices/storage_device.cpp
++++ b/cpp/devices/storage_device.cpp
+@@ -10,6 +10,9 @@
+ #include "shared/piscsi_exceptions.h"
+ #include "scsi_command_util.h"
+ #include "storage_device.h"
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <set>
+ #include <unistd.h>
+ 
+ using namespace std;
+@@ -79,25 +82,149 @@ void StorageDevice::ValidateFile()
+ void StorageDevice::ReserveFile() const
+ {
+ 	assert(!filename.empty());
+-	assert(!reserved_files.contains(filename.string()));
+ 
+-	reserved_files[filename.string()] = { GetId(), GetLun() };
++	ReserveFile(filename.string(), { GetId(), GetLun() }, IsReadOnly());
++}
++
++void StorageDevice::ReserveFile(const string& file, const id_set& ids, bool read_only)
++{
++	auto& holders = reserved_files[file];
++	if (ranges::find(holders, ids, &ImageFileHolder::ids) == holders.end()) {
++		holders.push_back({ ids, read_only });
++		AddFileIdentity(ids, file);
++	}
+ }
+ 
+ void StorageDevice::UnreserveFile()
+ {
+-	reserved_files.erase(filename.string());
++	if (const auto& it = reserved_files.find(filename.string()); it != reserved_files.end()) {
++		const id_set ids = { GetId(), GetLun() };
++		if (erase_if(it->second, [&ids] (const auto& holder) { return holder.ids == ids; })) {
++			RemoveFileIdentity(ids);
++		}
++		if (it->second.empty()) {
++			reserved_files.erase(it);
++		}
++	}
+ 
+ 	filename.clear();
+ }
+ 
++void StorageDevice::SetReservedFiles(const unordered_map<string, vector<ImageFileHolder>, piscsi_util::StringHash, equal_to<>>& r)
++{
++	reserved_files = r;
++
++	set<id_set> ids;
++	for (const auto& [file, holders] : reserved_files) {
++		for (const auto& holder : holders) {
++			ids.insert(holder.ids);
++			if (!reserved_identities.contains(holder.ids)) {
++				AddFileIdentity(holder.ids, file);
++			}
++		}
++	}
++
++	vector<id_set> released;
++	for (const auto& entry : reserved_identities) {
++		if (!ids.contains(entry.first)) {
++			released.push_back(entry.first);
++		}
++	}
++	ranges::for_each(released, RemoveFileIdentity);
++}
++
+ id_set StorageDevice::GetIdsForReservedFile(const string& file)
+ {
+-	if (const auto& it = reserved_files.find(file); it != reserved_files.end()) {
+-		return { it->second.first, it->second.second };
++	const auto& holders = GetHoldersForReservedFile(file);
++	return holders.empty() ? id_set { -1, -1 } : holders.front().ids;
++}
++
++vector<ImageFileHolder> StorageDevice::GetHoldersForReservedFile(const string& file)
++{
++	const auto identity = GetFileIdentity(file);
++	const string canonical_name = GetCanonicalName(file);
++
++	vector<ImageFileHolder> holders;
++	for (const auto& [reserved_file, file_holders] : reserved_files) {
++		const bool same_name = reserved_file == file || GetCanonicalName(reserved_file) == canonical_name;
++		for (const auto& holder : file_holders) {
++			if (holder.ids.first == -1) {
++				continue;
++			}
++
++			// A captured identity is authoritative, the name is only used for files without one
++			const auto& it = reserved_identities.find(holder.ids);
++			const bool same_file = it != reserved_identities.end() ?
++					identity && it->second.device == identity->first && it->second.inode == identity->second :
++					same_name;
++			if (same_file) {
++				holders.push_back(holder);
++			}
++		}
++	}
++
++	ranges::sort(holders, {}, &ImageFileHolder::ids);
++
++	return holders;
++}
++
++vector<id_set> StorageDevice::GetConflictingIds(const string& file, bool read_only)
++{
++	vector<id_set> ids;
++	for (const auto& holder : GetHoldersForReservedFile(file)) {
++		if (!read_only || !holder.read_only) {
++			ids.push_back(holder.ids);
++		}
+ 	}
+ 
+-	return { -1, -1 };
++	return ids;
++}
++
++void StorageDevice::AddFileIdentity(const id_set& ids, const string& file)
++{
++	RemoveFileIdentity(ids);
++
++	const int fd = open(file.c_str(), O_RDONLY | O_CLOEXEC);
++	if (struct stat st; fd != -1 ? !fstat(fd, &st) : !stat(file.c_str(), &st)) {
++		reserved_identities[ids] = { st.st_dev, st.st_ino, fd };
++	}
++	else if (fd != -1) {
++		close(fd);
++	}
++}
++
++void StorageDevice::RemoveFileIdentity(const id_set& ids)
++{
++	if (const auto& it = reserved_identities.find(ids); it != reserved_identities.end()) {
++		if (it->second.fd != -1) {
++			close(it->second.fd);
++		}
++		reserved_identities.erase(it);
++	}
++}
++
++optional<pair<dev_t, ino_t>> StorageDevice::GetFileIdentity(const string& file)
++{
++	if (struct stat st; !stat(file.c_str(), &st)) {
++		return make_pair(st.st_dev, st.st_ino);
++	}
++
++	return nullopt;
++}
++
++string StorageDevice::GetCanonicalName(const string& file)
++{
++	error_code error;
++	path p = absolute(path(file), error);
++	if (error) {
++		return path(file).lexically_normal().string();
++	}
++
++	if (const path resolved = weakly_canonical(p, error); !error) {
++		return resolved.string();
++	}
++
++	return p.lexically_normal().string();
+ }
+ 
+ uint32_t StorageDevice::CalculateShiftCount(uint32_t size_in_bytes)
+@@ -109,6 +236,10 @@ uint32_t StorageDevice::CalculateShiftCount(uint32_t size_in_bytes)
+ void StorageDevice::UnreserveAll()
+ {
+ 	reserved_files.clear();
++
++	while (!reserved_identities.empty()) {
++		RemoveFileIdentity(reserved_identities.begin()->first);
++	}
+ }
+ 
+ bool StorageDevice::FileExists(string_view file)
+diff --git a/cpp/devices/storage_device.h b/cpp/devices/storage_device.h
+index c160a4b..149c985 100644
+--- a/cpp/devices/storage_device.h
++++ b/cpp/devices/storage_device.h
+@@ -14,11 +14,21 @@
+ #include "shared/piscsi_util.h"
+ #include "mode_page_device.h"
+ #include <unordered_map>
++#include <map>
+ #include <string>
++#include <optional>
++#include <vector>
+ #include <filesystem>
++#include <sys/types.h>
+ 
+ using namespace std;
+ 
++struct ImageFileHolder
++{
++	id_set ids;
++	bool read_only;
++};
++
+ class StorageDevice : public ModePageDevice
+ {
+ public:
+@@ -37,6 +47,7 @@ public:
+ 	uint64_t GetBlockCount() const { return blocks; }
+ 
+ 	void ReserveFile() const;
++	static void ReserveFile(const string&, const id_set&, bool);
+ 	void UnreserveFile();
+ 	// TODO Remove this method, it is only used by the unit tests
+ 	static void UnreserveAll();
+@@ -46,9 +57,10 @@ public:
+ 	void SetMediumChanged(bool b) { medium_changed = b; }
+ 
+ 	static auto GetReservedFiles() { return reserved_files; }
+-	static void SetReservedFiles(const unordered_map<string, id_set, piscsi_util::StringHash, equal_to<>>& r)
+-		{ reserved_files = r; }
++	static void SetReservedFiles(const unordered_map<string, vector<ImageFileHolder>, piscsi_util::StringHash, equal_to<>>&);
+ 	static id_set GetIdsForReservedFile(const string&);
++	static vector<ImageFileHolder> GetHoldersForReservedFile(const string&);
++	static vector<id_set> GetConflictingIds(const string&, bool);
+ 
+ 	static uint32_t CalculateShiftCount(uint32_t);
+ 	uint32_t GetSectorSizeInBytes() const;
+@@ -99,6 +111,21 @@ private:
+ 
+ 	bool medium_changed = false;
+ 
++	struct FileIdentity
++	{
++		dev_t device;
++		ino_t inode;
++		int fd;
++	};
++
++	static optional<pair<dev_t, ino_t>> GetFileIdentity(const string&);
++	static string GetCanonicalName(const string&);
++	static void AddFileIdentity(const id_set&, const string&);
++	static void RemoveFileIdentity(const id_set&);
++
+ 	// The list of image files in use and the IDs and LUNs using these files
+-	static inline unordered_map<string, id_set, piscsi_util::StringHash, equal_to<>> reserved_files;
++	static inline unordered_map<string, vector<ImageFileHolder>, piscsi_util::StringHash, equal_to<>> reserved_files;
++
++	// The device and inode of the file each holder opened, kept open so that the inode cannot be reused
++	static inline map<id_set, FileIdentity> reserved_identities;
+ };
+diff --git a/cpp/piscsi/piscsi_executor.cpp b/cpp/piscsi/piscsi_executor.cpp
+index 09ff5e2..b1501a4 100644
+--- a/cpp/piscsi/piscsi_executor.cpp
++++ b/cpp/piscsi/piscsi_executor.cpp
+@@ -108,6 +108,16 @@ bool PiscsiExecutor::ProcessCmd(const CommandContext& context)
+ 			break;
+ 	}
+ 
++	if (command.operation() == ATTACH) {
++		set<id_set> ids;
++		for (const auto& device : command.devices()) {
++			if (!ids.insert({ device.id(), device.unit() }).second) {
++				return context.ReturnLocalizedError(LocalizationKey::ERROR_DUPLICATE_ID, to_string(device.id()),
++						to_string(device.unit()));
++			}
++		}
++	}
++
+ 	// Remember the list of reserved files during the dry run
+ 	const auto& reserved_files = StorageDevice::GetReservedFiles();
+ 	const bool isDryRunError = ranges::find_if_not(command.devices(), [&] (const auto& device)
+@@ -247,6 +257,9 @@ bool PiscsiExecutor::Attach(const CommandContext& context, const PbDeviceDefinit
+ 
+ 	// Stop the dry run here, before actually attaching
+ 	if (dryRun) {
++		if (storage_device != nullptr && !storage_device->GetFilename().empty()) {
++			StorageDevice::ReserveFile(storage_device->GetFilename(), { id, lun }, storage_device->IsReadOnly());
++		}
+ 		return true;
+ 	}
+ 
+@@ -315,6 +328,10 @@ bool PiscsiExecutor::Insert(const CommandContext& context, const PbDeviceDefinit
+ 
+ 	auto storage_device = dynamic_pointer_cast<StorageDevice>(device);
+ 	if (!ValidateImageFile(context, *storage_device, filename)) {
++		if (!storage_device->IsRemoved()) {
++			storage_device->Eject(true);
++		}
++
+ 		return false;
+ 	}
+ 
+@@ -401,21 +418,11 @@ bool PiscsiExecutor::ValidateImageFile(const CommandContext& context, StorageDev
+ 		return true;
+ 	}
+ 
+-	if (!CheckForReservedFile(context, filename)) {
+-		return false;
+-	}
+-
+ 	storage_device.SetFilename(filename);
+ 
+ 	if (!StorageDevice::FileExists(filename)) {
+ 		// If the file does not exist search for it in the default image folder
+-		const string effective_filename = context.GetDefaultFolder() + "/" + filename;
+-
+-		if (!CheckForReservedFile(context, effective_filename)) {
+-			return false;
+-		}
+-
+-		storage_device.SetFilename(effective_filename);
++		storage_device.SetFilename(context.GetDefaultFolder() + "/" + filename);
+ 	}
+ 
+ 	try {
+@@ -425,14 +432,25 @@ bool PiscsiExecutor::ValidateImageFile(const CommandContext& context, StorageDev
+ 		return context.ReturnLocalizedError(LocalizationKey::ERROR_FILE_OPEN, storage_device.GetFilename());
+ 	}
+ 
+-	return true;
++	// Whether the device is read-only is only known after the image file has been opened
++	const bool read_only = storage_device.IsReadOnly();
++	if (!CheckForReservedFile(context, filename, read_only)) {
++		return false;
++	}
++
++	return storage_device.GetFilename() == filename ||
++			CheckForReservedFile(context, storage_device.GetFilename(), read_only);
+ }
+ 
+-bool PiscsiExecutor::CheckForReservedFile(const CommandContext& context, const string& filename)
++bool PiscsiExecutor::CheckForReservedFile(const CommandContext& context, const string& filename, bool read_only)
+ {
+-	if (const auto [id, lun] = StorageDevice::GetIdsForReservedFile(filename); id != -1) {
+-		return context.ReturnLocalizedError(LocalizationKey::ERROR_IMAGE_IN_USE, filename,
+-				to_string(id) + ":" + to_string(lun));
++	if (const auto ids = StorageDevice::GetConflictingIds(filename, read_only); !ids.empty()) {
++		vector<string> holders;
++		for (const auto& [id, lun] : ids) {
++			holders.push_back(to_string(id) + ":" + to_string(lun));
++		}
++
++		return context.ReturnLocalizedError(LocalizationKey::ERROR_IMAGE_IN_USE, filename, Join(holders, ", "));
+ 	}
+ 
+ 	return true;
+diff --git a/cpp/piscsi/piscsi_executor.h b/cpp/piscsi/piscsi_executor.h
+index 6c4ea1a..e56b964 100644
+--- a/cpp/piscsi/piscsi_executor.h
++++ b/cpp/piscsi/piscsi_executor.h
+@@ -55,7 +55,7 @@ public:
+ 
+ private:
+ 
+-	static bool CheckForReservedFile(const CommandContext&, const string&);
++	static bool CheckForReservedFile(const CommandContext&, const string&, bool);
+ 
+ 	BUS& bus;
+ 
+diff --git a/cpp/piscsi/piscsi_image.cpp b/cpp/piscsi/piscsi_image.cpp
+index d217888..f99e422 100644
+--- a/cpp/piscsi/piscsi_image.cpp
++++ b/cpp/piscsi/piscsi_image.cpp
+@@ -10,6 +10,7 @@
+ #include "devices/disk.h"
+ #include "piscsi_image.h"
+ #include "shared/protobuf_util.h"
++#include "shared/piscsi_util.h"
+ #include <spdlog/spdlog.h>
+ #include <unistd.h>
+ #include <pwd.h>
+@@ -20,6 +21,7 @@ using namespace std;
+ using namespace filesystem;
+ using namespace piscsi_interface;
+ using namespace protobuf_util;
++using namespace piscsi_util;
+ 
+ PiscsiImage::PiscsiImage()
+ {
+@@ -31,6 +33,44 @@ bool PiscsiImage::CheckDepth(string_view filename) const
+ 	return ranges::count(filename, '/') <= depth;
+ }
+ 
++string PiscsiImage::GetImageName(const string& filename) const
++{
++	path folder(default_folder);
++	if (!folder.has_filename()) {
++		folder = folder.parent_path();
++	}
++
++	const path name(filename);
++	const path file = name.is_absolute() ? name : folder / name;
++	if (const path last = file.filename(); last.empty() || last == "." || last == "..") {
++		return "";
++	}
++
++	// The folders leading to the file are resolved the way the filesystem resolves them, so that ".." after a
++	// symbolic link to a folder refers to the parent of the link target
++	error_code error;
++	const path resolved_folder = weakly_canonical(folder, error);
++	if (error) {
++		return "";
++	}
++	const path resolved_parent = weakly_canonical(file.parent_path(), error);
++	if (error) {
++		return "";
++	}
++
++	const path relative_parent = resolved_parent.lexically_relative(resolved_folder);
++	if (IsOutside(relative_parent)) {
++		return "";
++	}
++
++	return (relative_parent / file.filename()).lexically_normal().string();
++}
++
++bool PiscsiImage::IsOutside(const path& relative_name)
++{
++	return relative_name.empty() || *relative_name.begin() == "..";
++}
++
+ bool PiscsiImage::CreateImageFolder(const CommandContext& context, string_view filename) const
+ {
+ 	if (const auto folder = path(filename).parent_path(); !folder.string().empty()) {
+@@ -88,11 +128,16 @@ string PiscsiImage::SetDefaultFolder(string_view f)
+ 
+ bool PiscsiImage::CreateImage(const CommandContext& context) const
+ {
+-	const string filename = GetParam(context.GetCommand(), "file");
+-	if (filename.empty()) {
++	const string param = GetParam(context.GetCommand(), "file");
++	if (param.empty()) {
+ 		return context.ReturnErrorStatus("Missing image filename");
+ 	}
+ 
++	const string filename = GetImageName(param);
++	if (filename.empty()) {
++		return context.ReturnErrorStatus("Image file '" + param + "' is not in the image folder");
++	}
++
+ 	if (!CheckDepth(filename)) {
+ 		return context.ReturnErrorStatus(("Invalid folder hierarchy depth '" + filename + "'").c_str());
+ 	}
+@@ -153,11 +198,16 @@ bool PiscsiImage::CreateImage(const CommandContext& context) const
+ 
+ bool PiscsiImage::DeleteImage(const CommandContext& context) const
+ {
+-	const string filename = GetParam(context.GetCommand(), "file");
+-	if (filename.empty()) {
++	const string param = GetParam(context.GetCommand(), "file");
++	if (param.empty()) {
+ 		return context.ReturnErrorStatus("Missing image filename");
+ 	}
+ 
++	const string filename = GetImageName(param);
++	if (filename.empty()) {
++		return context.ReturnErrorStatus("Image file '" + param + "' is not in the image folder");
++	}
++
+ 	if (!CheckDepth(filename)) {
+ 		return context.ReturnErrorStatus("Invalid folder hierarchy depth '" + filename + "'");
+ 	}
+@@ -261,11 +311,16 @@ bool PiscsiImage::CopyImage(const CommandContext& context) const
+ 
+ bool PiscsiImage::SetImagePermissions(const CommandContext& context) const
+ {
+-	const string filename = GetParam(context.GetCommand(), "file");
+-	if (filename.empty()) {
++	const string param = GetParam(context.GetCommand(), "file");
++	if (param.empty()) {
+ 		return context.ReturnErrorStatus("Missing image filename");
+ 	}
+ 
++	const string filename = GetImageName(param);
++	if (filename.empty()) {
++		return context.ReturnErrorStatus("Image file '" + param + "' is not in the image folder");
++	}
++
+ 	if (!CheckDepth(filename)) {
+ 		return context.ReturnErrorStatus("Invalid folder hierarchy depth '" + filename + "'");
+ 	}
+@@ -277,7 +332,7 @@ bool PiscsiImage::SetImagePermissions(const CommandContext& context) const
+ 
+ 	const bool protect = context.GetCommand().operation() == PROTECT_IMAGE;
+ 
+-	if (protect && !IsReservedFile(context, full_filename, "protect")) {
++	if (!IsReservedFile(context, full_filename, protect ? "protect" : "unprotect")) {
+ 		return false;
+ 	}
+ 
+@@ -299,10 +354,14 @@ bool PiscsiImage::SetImagePermissions(const CommandContext& context) const
+ 
+ bool PiscsiImage::IsReservedFile(const CommandContext& context, const string& file, const string& op)
+ {
+-	const auto [id, lun] = StorageDevice::GetIdsForReservedFile(file);
+-	if (id != -1) {
++	if (const auto holders = StorageDevice::GetHoldersForReservedFile(file); !holders.empty()) {
++		vector<string> ids;
++		for (const auto& holder : holders) {
++			ids.push_back(to_string(holder.ids.first) + ":" + to_string(holder.ids.second));
++		}
++
+ 		return context.ReturnErrorStatus("Can't " + op + " image file '" + file +
+-				"', it is currently being used by device " + to_string(id) + ":" + to_string(lun));
++				"', it is currently being used by device " + Join(ids, ", "));
+ 	}
+ 
+ 	return true;
+@@ -310,20 +369,30 @@ bool PiscsiImage::IsReservedFile(const CommandContext& context, const string& fi
+ 
+ bool PiscsiImage::ValidateParams(const CommandContext& context, const string& op, string& from, string& to) const
+ {
+-	from = GetParam(context.GetCommand(), "from");
+-	if (from.empty()) {
++	const string from_param = GetParam(context.GetCommand(), "from");
++	if (from_param.empty()) {
+ 		return context.ReturnErrorStatus("Can't " + op + " image file: Missing source filename");
+ 	}
+ 
++	from = GetImageName(from_param);
++	if (from.empty()) {
++		return context.ReturnErrorStatus("Image file '" + from_param + "' is not in the image folder");
++	}
++
+ 	if (!CheckDepth(from)) {
+ 		return context.ReturnErrorStatus("Invalid folder hierarchy depth '" + from + "'");
+ 	}
+ 
+-	to = GetParam(context.GetCommand(), "to");
+-	if (to.empty()) {
++	const string to_param = GetParam(context.GetCommand(), "to");
++	if (to_param.empty()) {
+ 		return context.ReturnErrorStatus("Can't " + op + " image file '" + from + "': Missing destination filename");
+ 	}
+ 
++	to = GetImageName(to_param);
++	if (to.empty()) {
++		return context.ReturnErrorStatus("Image file '" + to_param + "' is not in the image folder");
++	}
++
+ 	if (!CheckDepth(to)) {
+ 		return context.ReturnErrorStatus("Invalid folder hierarchy depth '" + to + "'");
+ 	}
+@@ -402,7 +471,7 @@ pair<int, int> PiscsiImage::GetUidAndGid()
+ 	array<char, 256> pwbuf;
+ 
+ 	int gid = -1;
+-	if (!getpwuid_r(uid, &pwd, pwbuf.data(), pwbuf.size(), &p_pwd)) {
++	if (!getpwuid_r(uid, &pwd, pwbuf.data(), pwbuf.size(), &p_pwd) && p_pwd != nullptr) {
+ 		gid = pwd.pw_gid;
+ 	}
+ 
+diff --git a/cpp/piscsi/piscsi_image.h b/cpp/piscsi/piscsi_image.h
+index ae30fc5..e06d372 100644
+--- a/cpp/piscsi/piscsi_image.h
++++ b/cpp/piscsi/piscsi_image.h
+@@ -44,6 +44,8 @@ public:
+ private:
+ 
+ 	bool CheckDepth(string_view) const;
++	string GetImageName(const string&) const;
++	static bool IsOutside(const path&);
+ 	string GetFullName(const string& filename) const { return default_folder + "/" + filename; }
+ 	bool CreateImageFolder(const CommandContext&, string_view) const;
+ 	static bool IsReservedFile(const CommandContext&, const string&, const string&);
+diff --git a/cpp/piscsi/piscsi_response.cpp b/cpp/piscsi/piscsi_response.cpp
+index 21914b3..ce922ff 100644
+--- a/cpp/piscsi/piscsi_response.cpp
++++ b/cpp/piscsi/piscsi_response.cpp
+@@ -103,6 +103,12 @@ void PiscsiResponse::GetDevice(shared_ptr<Device> device, PbDevice& pb_device, c
+     const auto storage_device = dynamic_pointer_cast<const StorageDevice>(device);
+ 	if (storage_device != nullptr) {
+ 		GetImageFile(*pb_device.mutable_file(), default_folder, device->IsReady() ? storage_device->GetFilename() : "");
++
++		// The holders are those of the file the device opened, which may have been found in the working directory
++		if (device->IsReady()) {
++			pb_device.mutable_file()->clear_holders();
++			AddHolders(*pb_device.mutable_file(), storage_device->GetFilename());
++		}
+ 	}
+ }
+ 
+@@ -116,6 +122,8 @@ bool PiscsiResponse::GetImageFile(PbImageFile& image_file, const string& default
+ 
+ 		image_file.set_read_only(access(p.c_str(), W_OK));
+ 
++		AddHolders(image_file, p.string());
++
+ 		error_code error;
+ 		if (is_regular_file(p, error) || (is_symlink(p, error) && !is_block_file(p, error))) {
+ 			image_file.set_size(file_size(p));
+@@ -126,6 +134,16 @@ bool PiscsiResponse::GetImageFile(PbImageFile& image_file, const string& default
+ 	return false;
+ }
+ 
++void PiscsiResponse::AddHolders(PbImageFile& image_file, const string& filename)
++{
++	for (const auto& holder : StorageDevice::GetHoldersForReservedFile(filename)) {
++		auto pb_holder = image_file.add_holders();
++		pb_holder->set_id(holder.ids.first);
++		pb_holder->set_unit(holder.ids.second);
++		pb_holder->set_read_only(holder.read_only);
++	}
++}
++
+ void PiscsiResponse::GetAvailableImages(PbImageFilesInfo& image_files_info, const string& default_folder,
+ 		const string& folder_pattern, const string& file_pattern, int scan_depth) const
+ {
+diff --git a/cpp/piscsi/piscsi_response.h b/cpp/piscsi/piscsi_response.h
+index a4ab033..ed0fe84 100644
+--- a/cpp/piscsi/piscsi_response.h
++++ b/cpp/piscsi/piscsi_response.h
+@@ -60,6 +60,7 @@ private:
+ 	set<id_set> MatchDevices(const unordered_set<shared_ptr<PrimaryDevice>>&, PbResult&, const PbCommand&) const;
+ 
+ 	static bool ValidateImageFile(const path&);
++	static void AddHolders(PbImageFile&, const string&);
+ 
+ 	static bool FilterMatches(const string&, string_view);
+ 
+diff --git a/cpp/scsictl/scsictl_display.cpp b/cpp/scsictl/scsictl_display.cpp
+index 7250910..f9de912 100644
+--- a/cpp/scsictl/scsictl_display.cpp
++++ b/cpp/scsictl/scsictl_display.cpp
+@@ -49,6 +49,16 @@ string ScsictlDisplay::DisplayDeviceInfo(const PbDevice& pb_device) const
+ 
+ 	if (pb_device.properties().supports_file() && !pb_device.file().name().empty()) {
+ 		s << "  " << pb_device.file().name();
++
++		vector<string> sharing_devices;
++		for (const auto& holder : pb_device.file().holders()) {
++			if (holder.id() != pb_device.id() || holder.unit() != pb_device.unit()) {
++				sharing_devices.push_back(to_string(holder.id()) + ":" + to_string(holder.unit()));
++			}
++		}
++		if (!sharing_devices.empty()) {
++			s << "  shared with " << Join(sharing_devices, ", ");
++		}
+ 	}
+ 
+ 	s << "  ";
+@@ -180,6 +190,14 @@ string ScsictlDisplay::DisplayImageFile(const PbImageFile& image_file_info) cons
+ 		s << "  " << PbDeviceType_Name(image_file_info.type());
+ 	}
+ 
++	if (!image_file_info.holders().empty()) {
++		vector<string> holders;
++		for (const auto& holder : image_file_info.holders()) {
++			holders.push_back(to_string(holder.id()) + ":" + to_string(holder.unit()));
++		}
++		s << "  in use by " << Join(holders, ", ");
++	}
++
+ 	s << '\n';
+ 
+ 	return s.str();
+diff --git a/proto/piscsi_interface.proto b/proto/piscsi_interface.proto
+index 4273325..0e9a358 100644
+--- a/proto/piscsi_interface.proto
++++ b/proto/piscsi_interface.proto
+@@ -152,39 +152,39 @@ enum PbOperation {
+ 
+     // Create an image file. The image file must not yet exist.
+     // Parameters:
+-    //   "file": The filename, relative to the default image folder
++    //   "file": The filename, relative to the default image folder or an absolute path inside it
+     //   "size": The file size in bytes, must be a multiple of 512
+     //   "read_only": Optional, "true" (case-insensitive) in order to create a read-only file
+     CREATE_IMAGE = 24;
+ 
+     // Delete an image file.
+     // Parameters:
+-    //    "file": The filename, relative to the default image folder.
++    //    "file": The filename, relative to the default image folder or an absolute path inside it.
+     DELETE_IMAGE = 25;
+ 
+     // Rename/Move an image file.
+     // Parameters:
+-    //   "from": The old filename, relative to the default image folder
+-    //   "to": The new filename, relative to the default image folder
++    //   "from": The old filename, relative to the default image folder or an absolute path inside it
++    //   "to": The new filename, relative to the default image folder or an absolute path inside it
+     // The new filename must not yet exist.
+     RENAME_IMAGE = 26;
+ 
+     // Copy an image file.
+     // Parameters:
+-    //   "from": The source filename, relative to the default image folder
+-    //   "to": The destination filename, relative to the default image folder
++    //   "from": The source filename, relative to the default image folder or an absolute path inside it
++    //   "to": The destination filename, relative to the default image folder or an absolute path inside it
+     //   "read_only": Optional, "true" (case-insensitive) in order to create a read-only file
+     // The destination filename must not yet exist.
+     COPY_IMAGE = 27;
+     
+     // Write-protect an image file.
+     // Parameters:
+-    //  "file": The filename, relative to the default image folder
++    //  "file": The filename, relative to the default image folder or an absolute path inside it
+     PROTECT_IMAGE = 28;
+ 
+     // Make an image file writable.
+     // Parameters:
+-    //   "file": The filename, relative to the default image folder
++    //   "file": The filename, relative to the default image folder or an absolute path inside it
+     UNPROTECT_IMAGE = 29;
+ 
+     // Check whether an authentication token is valid. A client can use this operation in order to
+@@ -289,6 +289,14 @@ message PbDeviceTypesInfo {
+ }
+ 
+ // The image file data
++// A device that currently uses an image file
++message PbImageFileHolder {
++    int32 id = 1;
++    int32 unit = 2;
++    // Read-only devices may share an image file with other read-only devices
++    bool read_only = 3;
++}
++
+ message PbImageFile {
+     string name = 1;
+     // The assumed device type, based on the filename extension
+@@ -296,6 +304,8 @@ message PbImageFile {
+     // The file size in bytes, 0 for block devices in /dev
+     uint64 size = 3;
+     bool read_only = 4;
++    // The devices using this file under any of its names, ordered by ID and LUN
++    repeated PbImageFileHolder holders = 5;
+ }
+ 
+ // The default image folder and the image files it contains

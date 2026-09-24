@@ -1758,3 +1758,121 @@ the only difference is one test helper.
   the build context, so `git apply` inside the container fails.
 - **Assert what the contract states, not the residual it leaves.** Exact residual trees (`{not:["beta"]}`)
   were relaxed to kept-key sets; the SDK-equivalence check covers correctness of the residual.
+
+## csbindgen-struct-layout-fidelity (APPROVED Olympus 2026-09-21)
+
+- **An unasserted fixture is an FP trap (L79).** Skipping a reference-only test but leaving its fixture
+  in the generated set let flat-map candidates pass while emitting wrong layouts; the FP panel voided all
+  3 batch-2 passes. Drop the fixture with the test, and audit generated-vs-asserted programmatically.
+- **Cutting test blocks by start/end marker deletes everything between them.** Two R14 cuts silently
+  removed six unrelated tests (the enum-width matrix, `usize` bases, both `Option` niche tests,
+  `DeepAlias`). Diff the test-name list after every scripted cut.
+- **Restore from a copy, never from HEAD, after checking out an older commit to compare.** `git checkout
+  HEAD -- src` while HEAD was still the previous commit wiped a round's uncommitted solution edits.
+- **Check `wc -c` after any scripted rewrite.** `open(p,'w')` followed by a failing write truncated a
+  source file to 0 bytes.
+- **A Solution Quality ratchet is a contract problem, not a code problem (L80).** Eleven consecutive
+  FAILs on module-scoping corners ended in one round when the scoping sentence was deleted.
+- **Measure the stale population before trusting a re-grade.** Local re-grades of batch-2 patches were
+  useful for FAIRNESS (which cells kill everyone) but meaningless for the rate once meta changed.
+
+## libspatialindex-tpr-temporal-knn (APPROVED Olympus 2026-09-21)
+
+- **Never assert the repo's own self-check once the feature changes what it checks (L82).** One
+  `ASSERT_TRUE(isIndexValid())` per deep-tree test zeroed batch 2 (9 of 10 blockers) while every query
+  answer was right. Replaying the saved solutions without it read 5/10.
+- **Replay first, then pay.** Pristine BASE clone + each run's `src/`+`include/` hunks + the candidate
+  `test.patch`, in the clean-room image, reproduced batch 1 exactly, so every tests-only lever was priced
+  for free before a re-eval. A description delta cannot be priced this way (L35).
+- **Broadening a contract sentence is a promise the reference must keep on every path.** Extending the
+  rejection sentence to `insertData`/`deleteData` produced the next Solution Quality FAIL (mutations
+  accepted any `ITimeShape`). Route every entry point through one normaliser before widening the prose.
+- **A compatibility mode must not change what NEW data means (L84).** Header-level "legacy" mode kept
+  writing the old layout and silently dropped the end time of every insert into a reopened old tree.
+  Version the record, not the file.
+- **Two reviewers asked for opposite things on k = 0** (Test Quality: unfair, unstated; Auto Review: add
+  it). State the behaviour in one clause and keep the test; do not pick a side.
+- **Archive what was accepted, not what is on disk.** The accepted upload was the round-6 artifact; an
+  un-uploaded round-7 edit (74 tests, one extra meta sentence) had to be reverted before `git mv`.
+- **A root-owned scratch dir after `docker run -v` of a missing path.** When the scratchpad was wiped,
+  Docker created the bind-mount target as root and every later `cp` failed with EACCES. Use a fresh path.
+
+## siliconcompiler-flist-roundtrip (APPROVED Olympus 2026-09-23)
+
+Accepted at 2/10 (20%) on batch 2, after batch 1 read 0/11.
+
+- **A 0% batch is a claim about the artifact first.** Three of the four causes of that 0/11 were mine:
+  a test helper calling `Design.get_filetypes()`, which only my reference defined, raised
+  `AttributeError` in 5-7 tests in every run; one ambiguous spelling sentence took 4 tests at 9-11/11;
+  and a `file://` data-root case a review round had added killed 11/11. Replaying the saved patches
+  against a repaired suite showed the masked tests had been PASSING all along.
+- **Audit test helpers against base API, not just test assertions.** The pre-submit check I already
+  had ("every new API the tests call must be named in meta.md") was written for assertions and I never
+  applied it to a helper. Regex every `.method(` in the test files and require `def method(` in the
+  BASE source.
+- **Do all description work in one round, and do it before the first batch.** The `-G` fix and three
+  reviewer readability rewrites all landed together because a description edit costs a full batch;
+  re-eval was never available after batch 1.
+- **Eight clean gate rounds preceded the 0%.** Description 3/3 and Solution 3/3 say nothing about
+  solvability; no static gate asks whether one agent can still finish everything the rounds added.
+
+## pyfakefs-block-inode-accounting (APPROVED Olympus 2026-09-23)
+
+Accepted at 5/10 on batch 3, after batches 1 and 2 read 0/11 and 0/12.
+
+- **A static gate round can make the problem unsolvable one fair test at a time.** Solution Quality
+  kept finding paths the atomicity promise covered and asking for their rollback. Each request was
+  fair; together they meant five recursive undo mechanisms, and batch 1 read 0/11. Fix every reference
+  bug a gate finds, but only add a test once a probe of saved patches shows agents split on it.
+- **A cut is three edits, not one.** Dropping nine tests while the sentence promising them and the
+  code implementing them stayed got the next review to score the coverage gap. Cut the tests, the
+  contract sentence and the reference together.
+- **Name both sides of any carve-out.** Batch 2 named only the stepwise helpers and five unchanged
+  rollback tests jumped from 0/11 to 9-10/12 kills. Naming the atomic calls too took them to 0/10.
+- **Keep pronouns next to their antecedent.** "returns it for every mount", three sentences from the
+  type it meant, got `(0, 0)` pairs from 10/11 runs. Naming `os.statvfs_result` fixed it.
+- **Validate as an unmapped UID as well as root and 1000.** A repo test that passed for both failed for
+  uid 4242 with no passwd entry, which is how the offline validator runs, and cost a Tests Blocker.
+- **Accepted above the ceiling.** 5/10 was accepted by the human reviewer. It is one data point, not
+  a new ceiling; design to the 40% cap as before.
+
+## pyocd-sequence-expression-kernel (APPROVED Olympus 2026-09-24)
+
+Accepted at 5/10 on batch 2, after batch 1 read 0/11.
+
+- **Once a batch exists, replay every test a reviewer asks for before shipping it.** After batch 1,
+  eight rounds of requested tests were replayed against the saved patches. Most cost nothing; three
+  (JTAG byte responses, `DAP_WriteABORT`, a string-returning statement) each took the replay to 0/11
+  and would have made the problem unsolvable again.
+- **Undocumented is not the same as hard.** The byte-response test failed every replayed patch while
+  the byte form was unstated; once meta.md stated it with one example it killed 0/10. When a replay
+  says 0/N, first check whether the requirement is written down.
+- **Read the assertion diff, not the test name.** A batch-1 Vega failure was filed as "JTAG width"
+  from its name; the diff was `tms 1 != 3`, an out-of-range value for an argument the rule never
+  governed. That accident killed 3/10 in the accepted batch.
+- **A reviewer can argue over an input the repo never produces.** Three rounds went to a `-> str`
+  sequence function; the repo has none. Check the repo's contract first, then satisfy the reviewer
+  in the solution and keep the description silent on the case the tests cannot afford.
+- **Prefer a closed list to a general principle when coverage is finite.** "Transfers keep only the
+  bits their width names" drew a new site every round until it became the exact list of functions.
+- **Accepted above the ceiling** (5/10), the second problem in a row. Still one data point each.
+
+## teavm-method-summaries (APPROVED Olympus 2026-09-24)
+
+Accepted at 4/10 on the first batch, after four platform gate rounds and no earlier batch.
+
+- **The Dockerfile check rejects a BuildKit bind mount.** `RUN --mount=type=bind ... cp -a` is not a
+  COPY. Use `COPY --chown=1000:1000 . .` and chmod only directories and root-owned build outputs, never
+  `chmod -R /app` (431 s vs 816 s cold here). An unmapped uid still needs write access to directories
+  so `git apply` can create files.
+- **A new-mode compile fallback must emit the real test ids.** One synthetic `compile_test_sources`
+  failure is in neither f2p nor p2p and fails Verify Solution. Parse the `@Test` methods and write one
+  failing case per method.
+- **Check every mode and pipeline of the driver you wire into.** `SIMPLE` is TeaVM's default level and
+  runs a separate lazy pipeline; wiring only the eager one was a Solution Quality FAIL.
+- **Resolve a declaration before scanning its implementations.** A virtual scan over an absent class
+  returned an empty list, and "never null, writes nothing" held vacuously.
+- **Drop contract words no test can observe.** "Once per build" cost a Tests 1/3; nothing but bytecode
+  counting could see it.
+- **Gate-requested tests bought no difficulty.** 11 of them, 0 kills. The band came from the design's
+  mutual-recursion test and one coverage suggestion that asserted legacy behaviour.

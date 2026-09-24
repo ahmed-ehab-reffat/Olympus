@@ -1454,3 +1454,90 @@ Second lane in a proven repo, accepted at 3/10 on its second batch. What to reus
    unsound fold the hand-written cells missed.
 4. **Measure LOC by building, then pivot early.** The dinit lane before it looked like 315-340 eff on
    paper and was 105 built; this one was 231 on paper-free measurement and held.
+
+## csbindgen-struct-layout-fidelity (APPROVED Olympus 2026-09-21)
+
+Accepted at 1/10 on the fourth batch, after 25 review rounds. What to reuse:
+1. **Use the source compiler as the test oracle.** Every layout assertion compares emitted output to
+   Rust's own `size_of`/`offset_of!` on the same fixture tokens, so no expected value is hand-computed.
+2. **Spot-check the target runtime outside the suite.** Compiling the generated C# on .NET 8 and
+   comparing `sizeof` caught stale output and settled two disputed reviewer claims (Int128 alignment,
+   `MarshalAs` on fixed buffers).
+3. **Narrow the contract when review ratchets (L80).** Module scoping promised in one sentence cost 11
+   rounds; cutting it ended the loop.
+4. **Name every class member the tests use, or none (L81)**, and state two-sentence combinations in
+   one clause when half the batch misses them (L77).
+
+## libspatialindex-tpr-temporal-knn (APPROVED Olympus 2026-09-21)
+
+Accepted at 5/12 on a re-eval of the third batch. What to reuse:
+1. **Oracle every geometric assertion.** A `Mover` model with its own stop time, motion pieces and
+   ambiguity margins (`EXPECT_GT(margin, 1e-6)`) produced expected sets for deep random trees, so no
+   result was hand-computed and no fixture landed on a rounding edge.
+2. **When the core is derivable maths, look for state the repo discards (F-47, L83).** The kernels alone
+   read 7/10; one behavioural sentence about entry lifetime reached the storage and bound layers.
+3. **Run each GoogleTest case in its own process** and merge the JUnit, so one crash fails one case.
+4. **Do not assert the store's self-check (L82)**, and version a widened record per record (L84).
+
+## siliconcompiler-flist-roundtrip (APPROVED Olympus 2026-09-23)
+
+O-Composite-extend on a Python schema/serialisation subsystem. Accepted at 2/10.
+
+The band came from one test. In a 57-test suite, exactly three tests killed anything outside a single
+wire-format outlier: the graph-ownership test (7/10) and an empty-record pair (2/10 each). Budget
+accordingly — breadth bought fairness and FP insurance, not difficulty.
+
+Two process facts worth carrying:
+
+- **Batch early.** This artifact passed eight static gate rounds before its first batch and then read
+  0/11; most of that was repairable artifact defects that only a batch could reveal.
+- **Price cuts by replay, not intuition.** With all batch-1 patches saved, each candidate repair had a
+  measurable rate: unfair-only fixes 0/11, plus cutting one added wall 3/11, plus clarifying the
+  ownership sentence 9/11. The third looked like the same class of fairness fix as the first two and
+  would have pushed the problem over the too-easy ceiling.
+
+## pyfakefs-block-inode-accounting (APPROVED Olympus 2026-09-23)
+
+O-Composite-add on a Python fake-filesystem accounting model. Accepted at 5/10.
+
+The band came from derivations the contract did not spell out, not from the stated rules. Of 117 tests,
+9 killed anything: import rollback via a repo helper (3/10), the "unlimited" figure (2/10), the Windows
+symlink size (1/10) and one run's recursive-removal leak. The walls the design was built around
+(reserve-crossing renames, resize through an unlinked descriptor) killed 4/12 in batch 2 and 0/10 in
+batch 3.
+
+Process facts worth carrying:
+
+- **Probe before you add.** Every test added after batch 2 was first run against all 14 saved agent
+  patches. The FP fix (reset a bounded mount to unlimited) turned out 12/14 correct already, so it was
+  a fair discriminator rather than a new wall.
+- **Turn gate-found reference bugs into tests only when the probe backs them.** All three near-miss
+  killers were reference bugs Solution Quality found first; many of the other 24 would have been walls.
+- **Describe both sides of every split.** Most of batch 2's 0/12 was one carve-out sentence.
+
+## pyocd-sequence-expression-kernel (APPROVED Olympus 2026-09-24)
+
+Olympus, accepted 5/10 on batch 2 (batch 1 0/11). 4 files, 243 human-effective LOC, 150 test cases.
+
+- **After the first batch, the saved patches are a free oracle for every test.** Replay each candidate
+  before shipping it: ship if it costs nothing, state the requirement literally if it is undocumented,
+  and cut it in tests, contract and reference if it is stated and still kills the near-misses (Pattern 104).
+- **For a value-domain pick, state each boundary as its observable consequence** ("a variable set to a
+  negative value reads back as its unsigned form"). Abstract phrasing killed 6-7/11; concrete phrasing 0/10.
+- **Every argument a test passes that the rule doesn't govern gets an in-contract value.** One
+  arbitrary `tms=3` became the only run-deciding trap nobody designed.
+- **When coverage is finite, write the list, not the principle.** A general transfer rule kept
+  generating reviewer findings; the closed list ended them.
+
+## teavm-method-summaries (APPROVED Olympus 2026-09-24)
+
+Olympus, accepted 4/10 on batch 1. 9 files, 298 human-effective LOC, 26 new tests, Java.
+
+- **A whole-program analysis feeding existing per-method passes is a good Olympus lane.** The scope
+  was obvious (every run touched the same nine files); the difficulty was one fixed-point decision
+  (F-53) plus two integration cells (F-54, F-55).
+- **Freeze meta.md before the first batch, then take every gate round on the reference and tests.**
+  Four gate rounds changed meta.md twice; none of that cost a batch because no batch had run yet.
+- **Wire and test every pipeline the driver has.** Loop the end-to-end test over all optimization
+  levels with a stub backend (Pattern 105).
+- **40% is accepted, with no margin.** Batch variance alone could have read 5/10.

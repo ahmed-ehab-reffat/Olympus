@@ -1,0 +1,542 @@
+diff --git a/bayes_opt/acquisition.py b/bayes_opt/acquisition.py
+index ce31d27..7b77588 100644
+--- a/bayes_opt/acquisition.py
++++ b/bayes_opt/acquisition.py
+@@ -113,6 +113,11 @@ class AcquisitionFunction(abc.ABC):
+         )
+         raise NotImplementedError(error_msg)
+ 
++    def _plan_space_change(
++        self, carry: Callable[[NDArray[Float]], NDArray[Float] | None], target_space: TargetSpace
++    ) -> Callable[[], None]:
++        return lambda: None
++
+     def suggest(
+         self,
+         gp: GaussianProcessRegressor,
+@@ -1010,6 +1015,27 @@ class ConstantLiar(AcquisitionFunction):
+         """
+         return self.base_acquisition.base_acq(*args, **kwargs)
+ 
++    def _plan_space_change(
++        self, carry: Callable[[NDArray[Float]], NDArray[Float] | None], target_space: TargetSpace
++    ) -> Callable[[], None]:
++        dummies = []
++        seen: set[tuple[float, ...]] = set()
++        for point in map(carry, self.dummies):
++            if point is None:
++                continue
++            key = tuple(point.ravel())
++            if not target_space._allow_duplicate_points and key in seen:
++                continue
++            seen.add(key)
++            dummies.append(point)
++        commit_base = self.base_acquisition._plan_space_change(carry, target_space)
++
++        def commit() -> None:
++            self.dummies = dummies
++            commit_base()
++
++        return commit
++
+     def _copy_target_space(self, target_space: TargetSpace) -> TargetSpace:
+         """Create a copy of the target space.
+ 
+@@ -1023,11 +1049,13 @@ class ConstantLiar(AcquisitionFunction):
+         TargetSpace
+             A copy of the target space.
+         """
+-        keys = target_space.keys
+-        pbounds = {key: bound for key, bound in zip(keys, target_space.bounds)}
+-        target_space_copy = TargetSpace(
+-            None, pbounds=pbounds, allow_duplicate_points=target_space._allow_duplicate_points
+-        )
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore")
++            target_space_copy = TargetSpace(
++                None,
++                pbounds=dict(target_space.params_config),
++                allow_duplicate_points=target_space._allow_duplicate_points,
++            )
+         if target_space._constraint is not None:
+             target_space_copy.set_constraint(deepcopy(target_space.constraint))
+ 
+@@ -1218,6 +1246,27 @@ class GPHedge(AcquisitionFunction):
+         )
+         raise TypeError(msg)
+ 
++    def _plan_space_change(
++        self, carry: Callable[[NDArray[Float]], NDArray[Float] | None], target_space: TargetSpace
++    ) -> Callable[[], None]:
++        commits = [acq._plan_space_change(carry, target_space) for acq in self.base_acquisitions]
++        candidates = None
++        if self.previous_candidates is not None:
++            carried = []
++            for point in self.previous_candidates:
++                new_point = None if np.isnan(point).any() else carry(point)
++                carried.append(np.full(target_space.dim, np.nan) if new_point is None else new_point)
++            candidates = np.array(carried)
++            if np.isnan(candidates).any(axis=1).all():
++                candidates = None
++
++        def commit() -> None:
++            self.previous_candidates = candidates
++            for commit_base in commits:
++                commit_base()
++
++        return commit
++
+     def _sample_idx_from_softmax_gains(self, random_state: RandomState) -> int:
+         """Sample an index weighted by the softmax of the gains.
+ 
+@@ -1245,8 +1294,9 @@ class GPHedge(AcquisitionFunction):
+         """
+         with warnings.catch_warnings():
+             warnings.simplefilter("ignore")
+-            rewards = gp.predict(self.previous_candidates)
+-        self.gains += rewards
++            scored = ~np.isnan(self.previous_candidates).reshape(self.n_acq, -1).any(axis=1)
++            rewards = gp.predict(self.previous_candidates[scored])
++        self.gains[scored] += rewards
+         self.previous_candidates = None
+ 
+     def suggest(
+diff --git a/bayes_opt/bayesian_optimization.py b/bayes_opt/bayesian_optimization.py
+index 828bff2..17776ce 100644
+--- a/bayes_opt/bayesian_optimization.py
++++ b/bayes_opt/bayesian_optimization.py
+@@ -26,7 +26,7 @@ from bayes_opt.target_space import TargetSpace
+ from bayes_opt.util import ensure_rng
+ 
+ if TYPE_CHECKING:
+-    from collections.abc import Callable
++    from collections.abc import Callable, Mapping
+ 
+     from numpy.random import RandomState
+     from numpy.typing import NDArray
+@@ -322,7 +322,10 @@ class BayesianOptimization:
+ 
+     def suggest(self) -> dict[str, float | NDArray[Float]]:
+         """Suggest a promising point to probe next."""
+-        if len(self._space) == 0:
++        bounds = self._space.bounds
++        params = self._space.params
++        inside = np.all((bounds[:, 0] <= params) & (params <= bounds[:, 1]), axis=1)
++        if not inside.any():
+             return self.random_sample(1)[0]
+ 
+         # Finding argmax of the acquisition function.
+@@ -400,6 +403,42 @@ class BayesianOptimization:
+         """
+         self._space.set_bounds(new_bounds)
+ 
++    def set_space(self, pbounds: BoundsMapping, fill: Mapping[str, Any] | None = None) -> None:
++        """Replace the search space and carry the optimizer's state into it.
++
++        Parameters
++        ----------
++        pbounds : dict
++            The complete new search space, in the same form as for the constructor.
++
++        fill : dict, optional
++            The value that existing points take for each added parameter.
++
++        Raises
++        ------
++        ValueError
++            If the change cannot be made. The optimizer is then left unchanged.
++        """
++        old_space = self._space
++        new_space, carry = old_space._migrated(pbounds, fill)
++
++        queue: deque[ParamsType] = deque()
++        for params in self._queue:
++            point = carry(old_space._as_array(params))
++            if point is not None:
++                queue.append(new_space.array_to_params(point))
++
++        commit_acquisition = self._acquisition_function._plan_space_change(carry, new_space)
++        commit_transformer = None
++        if self._bounds_transformer:
++            commit_transformer = self._bounds_transformer._plan_space_change(old_space, new_space)
++
++        old_space._adopt(new_space)
++        self._queue = queue
++        commit_acquisition()
++        if commit_transformer is not None:
++            commit_transformer(old_space)
++
+     def set_gp_params(self, **params: Any) -> None:
+         """Set parameters of the internal Gaussian Process Regressor."""
+         if "kernel" in params:
+diff --git a/bayes_opt/domain_reduction.py b/bayes_opt/domain_reduction.py
+index 243a51b..5e32848 100644
+--- a/bayes_opt/domain_reduction.py
++++ b/bayes_opt/domain_reduction.py
+@@ -8,7 +8,8 @@ simple domain reduction scheme for simulation-based optimization"
+ from __future__ import annotations
+ 
+ from abc import ABC, abstractmethod
+-from collections.abc import Iterable, Mapping, Sequence
++from collections.abc import Callable, Iterable, Mapping, Sequence
++from copy import deepcopy
+ from typing import TYPE_CHECKING, Any
+ from warnings import warn
+ 
+@@ -38,6 +39,17 @@ class DomainTransformer(ABC):
+     def transform(self, target_space: TargetSpace) -> dict[str, NDArray[Float]]:
+         """To override with specific implementation."""
+ 
++    def _plan_space_change(
++        self, old_space: TargetSpace, new_space: TargetSpace
++    ) -> Callable[[TargetSpace], None]:
++        planned = deepcopy(self)
++        planned.initialize(new_space)
++
++        def commit(target_space: TargetSpace) -> None:
++            self.__dict__.update(planned.__dict__)
++
++        return commit
++
+ 
+ class SequentialDomainReductionTransformer(DomainTransformer):
+     """Reduce the searchable space.
+@@ -85,10 +97,11 @@ class SequentialDomainReductionTransformer(DomainTransformer):
+         target_space : TargetSpace
+             TargetSpace this DomainTransformer operates on.
+         """
++        window_value: NDArray[Float] | Sequence[float] | float
+         if isinstance(self.minimum_window_value, Mapping):
+-            self.minimum_window_value = [self.minimum_window_value[key] for key in target_space.keys]
++            window_value = [self.minimum_window_value[key] for key in target_space.keys]
+         else:
+-            self.minimum_window_value = self.minimum_window_value
++            window_value = self.minimum_window_value
+ 
+         any_not_float = any([not isinstance(p, FloatParameter) for p in target_space._params_config.values()])
+         if any_not_float:
+@@ -100,13 +113,13 @@ class SequentialDomainReductionTransformer(DomainTransformer):
+ 
+         self.minimum_window: NDArray[Float] | Sequence[float]
+         # Set the minimum window to an array of length bounds
+-        if isinstance(self.minimum_window_value, (Sequence, np.ndarray)):
+-            if len(self.minimum_window_value) != len(target_space.bounds):
++        if isinstance(window_value, (Sequence, np.ndarray)):
++            if len(window_value) != len(target_space.bounds):
+                 error_msg = "Length of minimum_window must be the same as the number of parameters"
+                 raise ValueError(error_msg)
+-            self.minimum_window = self.minimum_window_value
++            self.minimum_window = window_value
+         else:
+-            self.minimum_window = [self.minimum_window_value] * len(target_space.bounds)
++            self.minimum_window = [window_value] * len(target_space.bounds)
+ 
+         # Set initial values
+         self.previous_optimal = np.mean(target_space.bounds, axis=1)
+@@ -129,6 +142,68 @@ class SequentialDomainReductionTransformer(DomainTransformer):
+         # check if the minimum window fits in the original bounds
+         self._window_bounds_compatibility(self.original_bounds)
+ 
++    def _plan_space_change(
++        self, old_space: TargetSpace, new_space: TargetSpace
++    ) -> Callable[[TargetSpace], None]:
++        old_index = {key: i for i, key in enumerate(old_space.keys)}
++        old_windows = dict(zip(old_space.keys, self.minimum_window))
++        windows: list[float] = []
++        for key in new_space.keys:
++            if isinstance(self.minimum_window_value, Mapping):
++                if key not in self.minimum_window_value:
++                    msg = f"No minimum window is given for the parameter {key}."
++                    raise ValueError(msg)
++                windows.append(self.minimum_window_value[key])
++            elif key in old_windows:
++                windows.append(old_windows[key])
++            elif isinstance(self.minimum_window_value, (Sequence, np.ndarray)):
++                windows.append(0.0)
++            else:
++                windows.append(self.minimum_window_value)
++
++        planned = deepcopy(self)
++        planned.minimum_window_value = windows
++        planned.initialize(new_space)
++        if not isinstance(self.minimum_window_value, (Sequence, np.ndarray)):
++            planned.minimum_window_value = self.minimum_window_value
++
++        window = np.copy(new_space.bounds)
++        for i, key in enumerate(new_space.keys):
++            if key not in old_index:
++                continue
++            j = old_index[key]
++            window[i] = old_space.bounds[j]
++            for name in (
++                "previous_optimal",
++                "current_optimal",
++                "r",
++                "previous_d",
++                "current_d",
++                "c",
++                "c_hat",
++                "gamma",
++                "contraction_rate",
++            ):
++                getattr(planned, name)[i] = getattr(self, name)[j]
++        window = planned._trim(window, planned.original_bounds)
++        history = [
++            np.array(
++                [
++                    past[old_index[key]] if key in old_index else planned.original_bounds[i]
++                    for i, key in enumerate(new_space.keys)
++                ]
++            )
++            for past in self.bounds
++        ]
++        planned.bounds = [*history[:-1], window]
++        new_bounds = planned._create_bounds(new_space.keys, window)
++
++        def commit(target_space: TargetSpace) -> None:
++            self.__dict__.update(planned.__dict__)
++            target_space.set_bounds(new_bounds)
++
++        return commit
++
+     def _update(self, target_space: TargetSpace) -> None:
+         """Update contraction rate, window size, and window center.
+ 
+diff --git a/bayes_opt/parameter.py b/bayes_opt/parameter.py
+index a8955e5..56640e6 100644
+--- a/bayes_opt/parameter.py
++++ b/bayes_opt/parameter.py
+@@ -146,6 +146,41 @@ class BayesParameter(abc.ABC):
+             return s[: str_len - 3] + "..."
+         return s
+ 
++    def convert(self, value: Any) -> Any:
++        """Convert a value of another parameter into a value of this parameter.
++
++        Parameters
++        ----------
++        value : Any
++            The value to convert.
++
++        Returns
++        -------
++        Any
++            The canonical representation of the value for this parameter.
++
++        Raises
++        ------
++        ValueError
++            If this parameter cannot take the value.
++        """
++        return value
++
++    def contains(self, value: Any) -> bool:
++        """Check whether a value of this parameter lies within its bounds.
++
++        Parameters
++        ----------
++        value : Any
++            A canonical value of this parameter.
++
++        Returns
++        -------
++        bool
++        """
++        x = np.atleast_1d(self.to_float(value))
++        return bool(np.all((self.bounds[..., 0] <= x) & (x <= self.bounds[..., 1])))
++
+     @property
+     @abc.abstractmethod
+     def dim(self) -> int:
+@@ -197,6 +232,25 @@ class FloatParameter(BayesParameter):
+         """
+         return value.flatten()[0]
+ 
++    def convert(self, value: Any) -> float:
++        """Convert a value of another parameter into a float.
++
++        Parameters
++        ----------
++        value : Any
++            The value to convert.
++
++        Returns
++        -------
++        float
++
++        Raises
++        ------
++        ValueError
++            If the value is not a real number.
++        """
++        return _real_number(self.name, value)
++
+     def to_string(self, value: float, str_len: int) -> str:
+         """Represent a parameter value as a string.
+ 
+@@ -305,6 +359,25 @@ class IntParameter(BayesParameter):
+         """
+         return int(np.round(np.squeeze(value)))
+ 
++    def convert(self, value: Any) -> int:
++        """Convert a value of another parameter into an integer.
++
++        Parameters
++        ----------
++        value : Any
++            The value to convert.
++
++        Returns
++        -------
++        int
++
++        Raises
++        ------
++        ValueError
++            If the value is not a real number.
++        """
++        return self.to_param(_real_number(self.name, value))
++
+     def kernel_transform(self, value: NDArray[Float]) -> NDArray[Float]:
+         """Transform a parameter value for use in a kernel.
+ 
+@@ -408,6 +481,30 @@ class CategoricalParameter(BayesParameter):
+         """
+         return self.categories[int(np.argmax(value))]
+ 
++    def convert(self, value: Any) -> Any:
++        """Convert a value of another parameter into one of the categories.
++
++        Parameters
++        ----------
++        value : Any
++            The value to convert.
++
++        Returns
++        -------
++        Any
++            The category equal to the value.
++
++        Raises
++        ------
++        ValueError
++            If no category equals the value.
++        """
++        for category in self.categories:
++            if _values_equal(category, value):
++                return category
++        msg = f"Parameter {self.name} has no category {value!r}."
++        raise ValueError(msg)
++
+     def to_string(self, value: Any, str_len: int) -> str:
+         """Represent a parameter value as a string.
+ 
+@@ -454,6 +551,24 @@ class CategoricalParameter(BayesParameter):
+         return len(self.categories)
+ 
+ 
++def _real_number(name: str, value: Any) -> float:
++    if not is_numeric(value) or np.iscomplexobj(value):
++        msg = f"Parameter {name} cannot take the value {value!r}."
++        raise ValueError(msg)
++    try:
++        return float(value)
++    except (TypeError, ValueError) as error:
++        msg = f"Parameter {name} cannot take the value {value!r}."
++        raise ValueError(msg) from error
++
++
++def _values_equal(a: Any, b: Any) -> bool:
++    try:
++        return bool(a == b)
++    except (TypeError, ValueError):
++        return False
++
++
+ def wrap_kernel(kernel: kernels.Kernel, transform: Callable[[Any], Any]) -> kernels.Kernel:
+     """Wrap a kernel to transform input data before passing it to the kernel.
+ 
+diff --git a/bayes_opt/target_space.py b/bayes_opt/target_space.py
+index 33bf068..fae0fb8 100644
+--- a/bayes_opt/target_space.py
++++ b/bayes_opt/target_space.py
+@@ -684,6 +684,79 @@ class TargetSpace:
+             )
+         ]
+ 
++    def _migrated(
++        self, pbounds: BoundsMapping, fill: Mapping[str, Any] | None = None
++    ) -> tuple[TargetSpace, Callable[[NDArray[Float]], NDArray[Float] | None]]:
++        space = TargetSpace(None, pbounds, allow_duplicate_points=self._allow_duplicate_points)
++        fill = dict(fill or {})
++        added = [key for key in space.keys if key not in self._params_config]
++        unknown = [key for key in fill if key not in added]
++        if unknown:
++            msg = f"Fill values given for parameters that are not added: {unknown}."
++            raise ValueError(msg)
++        fill_values: dict[str, Any] = {}
++        for key in added:
++            if key not in fill:
++                msg = f"No fill value given for the added parameter {key}."
++                raise ValueError(msg)
++            param = space.params_config[key]
++            value = param.convert(fill[key])
++            if not param.contains(value):
++                msg = f"Fill value {fill[key]!r} lies outside the bounds of parameter {key}."
++                raise ValueError(msg)
++            fill_values[key] = value
++
++        def carry(x: NDArray[Float]) -> NDArray[Float] | None:
++            values = self.array_to_params(np.asarray(x, dtype=float).ravel())
++            carried: dict[str, Any] = {}
++            for key in space.keys:
++                if key in fill_values:
++                    carried[key] = fill_values[key]
++                    continue
++                try:
++                    carried[key] = space.params_config[key].convert(values[key])
++                except ValueError:
++                    return None
++            return space._to_float(carried)
++
++        kept: list[int] = []
++        points: list[NDArray[Float]] = []
++        seen: set[tuple[float, ...]] = set()
++        for i, x in enumerate(self._params):
++            y = carry(x)
++            if y is None:
++                continue
++            if not self._allow_duplicate_points and _hashable(y) in seen:
++                continue
++            seen.add(_hashable(y))
++            kept.append(i)
++            points.append(y)
++
++        space._params = np.array(points, dtype=float).reshape(len(points), space.dim)
++        space._target = self._target[kept]
++        space.n_duplicate_points = self.n_duplicate_points
++        space._constraint = self._constraint
++        if self._constraint is not None:
++            space._constraint_values = self._constraint_values[kept]
++        for i, y in enumerate(space._params):
++            if self._constraint is None:
++                space._cache[_hashable(y)] = space._target[i]
++            else:
++                space._cache[_hashable(y)] = (space._target[i], space._constraint_values[i])
++        return space, carry
++
++    def _adopt(self, space: TargetSpace) -> None:
++        self._keys = space._keys
++        self._params_config = space._params_config
++        self._dim = space._dim
++        self._masks = space._masks
++        self._bounds = space._bounds
++        self._params = space._params
++        self._target = space._target
++        self._cache = space._cache
++        if self._constraint is not None:
++            self._constraint_values = space._constraint_values
++
+     def set_bounds(self, new_bounds: BoundsMapping) -> None:
+         """Change the lower and upper search bounds.
+ 

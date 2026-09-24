@@ -941,6 +941,104 @@ yes/no + the key type's declaration`. Prove F-39 before designing: call the help
 regime's input in a scratch test and watch the tail disappear. F-40 is narrow; plan a core-algorithm
 killer beside it (L74).
 
+### F-47 / F-48 seam probe — state the store discards, and a narrowed entry point (4/12 and 3/12 on libspatialindex)
+
+```bash
+# F-47: persisted fields the write path never mentions, commented-out reads, sentinels assigned on load
+grep -rnE "^\s*//\s*memcpy|^\s*//.*(read|load|write|store).*\(" src --include=*.cc --include=*.cpp | head
+grep -rnE "= std::numeric_limits<double>::max\(\);|= (INF|None|nullptr|-1);" src --include=*.cc | grep -iE "load|read|From" | head
+# then confirm the value type HAS the field and the aggregate/bound code ignores it
+grep -rn "getExtrapolated\|combineRegion\|getMBRAtTime" src --include=*.cc | head
+# F-48: base-typed parameters on methods the feature will make stricter
+grep -rnE "\(const (Point|IShape|Region)&" include --include=*.h | head
+```
+
+Dossier rows: `F-47 seam: yes/no + the field + the load line that discards it`, `F-48 seam: yes/no +
+the method whose parameter is broader than the new contract`. F-47 is the lever to reach for when the
+feature's core is DERIVABLE geometry or maths (L83): a batch of kernels alone read 7/10 on libspatialindex.
+
+### F-49 seam probe — a graph the repo flattens on write and cannot rebuild on read (7/10 on siliconcompiler)
+
+```bash
+# a writer that walks a dependency/child graph and emits ONE flat stream
+grep -rnE "def (write|export|dump|save)_[a-z_]*\(|func (Write|Export|Dump)" --include=*.py --include=*.go --include=*.rs . \
+  | grep -viE "test" | head
+# the walk itself: a visited set plus recursion, producing a flat list
+grep -rnE "visited|seen\b" -A 6 --include=*.py . | grep -nE "recurs|\bdfs\b|__[a-z_]+\(.*visited" | head
+# and the reader that produces ONE object with no edges: parses lines/records but never re-links
+grep -rnE "def (read|load|import|parse)_[a-z_]*\(" -A 25 --include=*.py . \
+  | grep -iE "add_dep|add_child|add_edge|parent =" | head    # EMPTY here is the seam
+```
+
+The seam is live when the writer flattens a real graph and the reader has **no** edge-rebuilding call
+at all: the round trip is lossy today, so restoring it is a genuine capability rather than a tightening.
+Dossier row: `F-49 seam: yes/no + the writer's walk + the reader's missing re-link`. Two design notes
+carry over from the measured batch: the fixture must be **three levels deep** (a root with siblings
+cannot distinguish re-parenting from correct), and the pick needs a second rule for records nothing
+references, or blanket attachment to the root reads as the rule.
+
+### F-50 / F-51 seam probes — an "unlimited" that must still report a number, and a size getter that lies on one platform (pyfakefs)
+
+```bash
+# F-50: a hard-coded "unlimited" constant returned by a reporting path (statvfs/disk_usage/capacity)
+grep -rnE "(UNLIMITED|INFINITE|MAX)_[A-Z_]*\s*=\s*[0-9]|1024 \* 1024 \* 1024 \* 1024" --include=*.py --include=*.go --include=*.rs . | grep -v test | head
+grep -rnE "def (get_)?(disk_usage|capacity|statvfs|quota)" -A 12 --include=*.py . | grep -nE "None|UNLIMITED|return .*\(" | head
+# F-51: a size/length getter with an OS-type or mode branch
+grep -rnE "def (st_)?size\b|def length\b" -A 6 --include=*.py . | grep -nE "is_windows|os\.name|platform|S_IFLNK" | head
+```
+
+F-50 is live when the resource has an unlimited mode AND a stats surface that must return a finite
+figure for it: the natural helper computes the figure once and the allocation path reuses it as a
+ceiling (2/10 on the accepted pyfakefs batch). F-51 is live when a size getter branches on OS type or
+object kind and the feature accounts the real stored quantity (3/11, 5/12, 1/10). The repo's own test
+of the branched getter makes F-51 codebase-inferable, which keeps it fair. Dossier rows:
+`F-50 seam: yes/no + the reporting constant + the allocation check that could reuse it`,
+`F-51 seam: yes/no + the branched getter + the test that pins its presentation value`.
+
+### F-52 seam probe — a pluggable delegate seam above a narrowing operation (pyocd)
+
+```bash
+# F-52: a dispatcher that calls a pluggable delegate by name ...
+grep -rnE "getattr\(self\._(fns|delegate|backend|driver)|get_[a-z_]*functions\(\)" --include=*.py . | grep -v test | head
+# ... with fixed-width operations below the seam
+grep -rnE "def (write|read)(8|16|32|64)\b|def write_(ap|dp|reg)\b" --include=*.py . | grep -v test | head
+```
+
+F-52 is live when an interpreter or dispatcher hands values to a pluggable delegate (so tests can
+record the delegate's INPUT) and the operations below the seam narrow what they transfer. Agents
+collapse the seam's full-domain rule and the operation's narrowing onto the nearer site: 2/10 on the
+accepted pyocd batch, both 146/150 with nothing else failing. While there, note the DOCUMENTED range
+of every argument those operations take (a probe's `tms` is "0 or 1"): L92 says an out-of-range
+test value for an argument the rule does not govern becomes an accidental trap. Dossier row:
+`F-52 seam: yes/no + the dispatch site + the narrowing operation + can tests record the delegate's input`.
+
+### F-53 / F-54 / F-55 seam probe — whole-program analysis feeding existing passes (teavm)
+
+```bash
+# F-53: an existing per-method analysis that a whole-program MUST fact could be proven with
+grep -rnE "class (Nullness|Escape|Purity|SideEffect)[A-Za-z]*(Information|Analysis)" --include=*.java . | grep -v test | head
+# ... and a call graph with virtual dispatch the summary must resolve
+grep -rnE "resolveImplementation|getOverriddenMethods|ClassHierarchy" --include=*.java . | grep -v test | head
+# F-54: optimizer passes that treat every call as opaque today (the feature makes them selective)
+grep -rnE "visit\(InvokeInstruction[^)]*\)\s*\{" -A2 --include=*.java . | grep -E "invalidatesAll|= true" | head
+# F-55: a pass keyed by variable index with a deferred join/frontier path
+grep -rnE "domFrontiers|dominanceFrontier|IntObjectHashMap<Set<" --include=*.java . | grep -v test | head
+```
+
+F-53 is live when the feature computes an all-paths fact over a recursive call graph next to a
+union fact in the same pass: agents solve the all-paths fact from the pessimistic end (4/10 on the
+accepted teavm batch, three at 25/26, despite an explicit "recursion loses nothing" sentence). F-54
+is live when the base pass silently ignores a case the new mode must handle (teavm's RFRE ignored
+`initClass`), and the contract promises the off path unchanged: 2/10. F-55 is live when the pass
+stores its key for a later join or frontier replay and the feature needs an "all instances" key: 2/10.
+Dossier rows: `F-53 seam: yes/no + the per-method analysis + the recursive call graph`,
+`F-54 seam: yes/no + the case the base pass ignores`, `F-55 seam: yes/no + the deferred path that stores the key`.
+
+**F-20, repo-helper variant.** F-20 does not need an agent refactor: if the repo already routes a
+sibling operation through the primitive the feature changes (`add_real_directory` -> `create_dir`),
+a new rule on the primitive leaks by itself (3/10 on pyfakefs). Grep the callers of whatever the
+feature makes stricter: `grep -rn "self\.create_dir(" --include=*.py .`.
+
 ## Stage 3 — TRAP-SEAM AUDIT (the stage that actually decides — 10 min)
 
 This is what separates this skill from a GitHub search. Clone the finalist shallowly and look for
@@ -992,6 +1090,8 @@ ls */ | head -20                      # multi-package? (Gate: clear module bound
 | **A range, cursor or allocation helper whose loop exits early and keeps only the items it touched, where every existing caller stays in a regime that never reaches the lossy path** | grep the helper for `while (remaining > 0 && i < n)`-style loops that return a rebuilt list; list its callers; call it with the new regime's input (an earlier item used up EXACTLY, later items untouched) and watch the tail vanish | **F-39** inherited helper bug — 3/11 on featurevisor-minimal-rebucketing, three independent implementations, and the reference reused it first; zero description words |
 | **A TS/JS feature that returns figures in a record keyed by user-controlled strings, whose key type in the repo is plain `string`** | grep the types package for `= string;` key aliases and the builder for `{}` records indexed by those keys | **F-40** `__proto__` key lost — 7/11 on featurevisor, sole failure of six near-misses; narrow, pair it with a core killer (L74) |
 | **A batch loader that injects a per-entry attribute (group index, owner, id) which the public single-object constructor leaves at a default, next to a subsystem that dispatches by that attribute** | diff the loader's factory call against the factory's public signature: `grep -rn "create_from_parse\|group_start_index\|enumerate(parse)" ; grep -n "group: int = 0\|owner=None"`; then find the per-group / per-owner dispatch | **F-41** runtime creation path skips a loader-injected attribute — 10/11 on ir-sim-scenario-events, sole failure of six 89/90 near-misses; zero description words |
+| **A persisted index or cache whose value type carries a field the store writes nowhere, reads back as a sentinel, or has commented out** | grep the node/page serialiser for a commented-out `memcpy` and for a load path that assigns `max()`/`INF`/`None` to a field the write path never mentions; then check the aggregate-bound code for unclamped extrapolation | **F-47** discarded per-entry state — 4/12 on libspatialindex-tpr-temporal-knn, lead wall, found only after a 57-cell probe showed the geometry was exhausted (L83) |
+| **An existing public method whose parameter type is broader than the feature's new contract, with a base path that already answers for the broad type** | grep public headers for base-class reference parameters (`const Point&`, `const IShape&`) on methods the feature rewires | **F-48** legacy convenience kept — 3/12 on libspatialindex, stacked on the same runs as F-47 |
 | **Two lexical spellings of one concept the language treats as equivalent** | line vs block comments, short vs long flags, quote styles, prefix vs infix call syntax; grep the lexer for a second branch on the same token class | **F-18** token-form parity gap — decided the band on gluon (7/11, 22 of 37 kills) |
 
 ```bash
@@ -1502,6 +1602,20 @@ the clean-room build belongs to authoring.
   not on how many lifecycle paths it has.
 
 
+## Seam rows added 2026-09-21 (libspatialindex-tpr-temporal-knn)
+
+- **F-47 discarded per-entry state** — persisted spatial or temporal indexes (tree pages, WALs,
+  caches) where the value type already has a field the page drops or hard-codes on load. On
+  libspatialindex `Node.cc` never wrote an entry's end time and read it back as infinity, with the
+  author's commented-out lines still in place. 4/12, the lead wall.
+- **What did NOT pay on libspatialindex:** a well-known computational-geometry lane with three stated
+  kernels read **7/10** on its own, and 57 probes found no difference between the passers and the
+  reference. Rank a derivable-maths lane on whether the REPO drops state the feature needs, not on how
+  hard the maths looks. A textbook-adjacent lane with no discarded state is TOO-EASY row 30/32.
+- **F-48 narrowed entry point** — a public method whose base-typed parameter the feature restricts.
+  3/12; cheap to add, and it stacks on the same runs as the lead wall.
+
+
 ## Seam rows added 2026-09-19 (featurevisor-target-specialization)
 
 - **F-12 exported-helper variant** — target repos where the capability's natural home is an EXPORTED
@@ -1516,3 +1630,21 @@ the clean-room build belongs to authoring.
 - **The SDK as oracle.** A repo that ships both a builder and an evaluator of the builder's output
   gives a free, fair oracle for any build-time transformation: "evaluates exactly as before".
 
+## Seam rows added 2026-09-21 (csbindgen-struct-layout-fidelity)
+
+- **F-44 composed type rewrites** — code generators whose type model already has aliases AND pointer or
+  array wrappers (FFI binding generators, schema compilers, IDL tools). A feature that adds a second
+  rewrite on top (lowering, flattening, niche erasure) gets a composition seam for free: 7/10 runs.
+  Probe: `grep -n "alias\|get_mapped_value\|resolve" <type-model>` and confirm the renderer resolves
+  aliases at ONE point (usually the outer name) rather than recursively.
+- **F-45 scalar-only decoration** — emitters that attach a per-kind attribute/annotation/cast to a
+  scalar (`MarshalAs` before `bool`, `#[serde(...)]`, a narrowing cast). Probe: grep the field emitter
+  for `if type_name == "<kind>"` next to the decoration. Pays when the feature adds an aggregate form of
+  that kind: 3/10.
+- **F-46 two-model comparison** — features whose output choice compares a source-side and a
+  target-side model (Rust ABI vs .NET layout, schema vs wire, logical vs physical). Every nested value
+  needs its TARGET-side model; free P2P "stays unchanged" guards on containers kill model reuse: 2/10.
+- **⚠️ Language/ABI tools attract host-semantics creep (L80).** A pick whose contract would have to
+  promise a host-language semantic in full (name resolution, module scoping, overloads) invites an
+  unbounded Solution Quality ratchet: csbindgen burned 11 review rounds on scoping corners before the
+  sentence was cut. Scope the lane so the contract never needs that sentence.

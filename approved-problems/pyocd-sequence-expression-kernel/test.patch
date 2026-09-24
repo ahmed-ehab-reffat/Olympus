@@ -1,0 +1,978 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..88a60c91
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,50 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++
++MODE="${MODE:-base}"
++OUTPUT_PATH="${OUTPUT_PATH:-/tmp/results.xml}"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++cd "$(dirname "$0")"
++
++PYTHON="python3"
++command -v "$PYTHON" >/dev/null 2>&1 || PYTHON="python"
++
++NEW_TESTS="test/unit/test_sequence_eval_6f893c.py"
++LOG_FILE="$(mktemp)"
++
++if [ "$MODE" = "new" ]; then
++    $PYTHON -m pytest "$NEW_TESTS" \
++        -p no:cacheprovider --junitxml="$OUTPUT_PATH" 2>&1 | tee "$LOG_FILE"
++else
++    $PYTHON -m pytest test/unit --ignore="$NEW_TESTS" \
++        -p no:cacheprovider --junitxml="$OUTPUT_PATH" 2>&1 | tee "$LOG_FILE"
++fi
++EXIT_CODE=${PIPESTATUS[0]}
++
++if [ ! -s "$OUTPUT_PATH" ] || ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++    DIAGNOSTIC=$(tail -c 3000 "$LOG_FILE" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
++    cat > "$OUTPUT_PATH" <<XMLEOF
++<?xml version="1.0" encoding="utf-8"?>
++<testsuites><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="0">
++<testcase classname="pyocd.sequence_eval" name="test_runner_produced_no_results" time="0">
++<failure message="pytest produced no test results">${DIAGNOSTIC}</failure>
++</testcase>
++</testsuite></testsuites>
++XMLEOF
++    EXIT_CODE=1
++fi
++
++rm -f "$LOG_FILE"
++exit $EXIT_CODE
+diff --git a/test/unit/test_debug_sequences.py b/test/unit/test_debug_sequences.py
+index 3ac09abc..6574095c 100644
+--- a/test/unit/test_debug_sequences.py
++++ b/test/unit/test_debug_sequences.py
+@@ -558,7 +558,6 @@ class TestConstantFolder:
+             ("^",   "x"),
+             ("<<",  "x"),
+             (">>",  "x"),
+-            ("||",  "x"),
+             # return 0
+             ("*",   0),
+             ("/",   0),
+@@ -572,10 +571,8 @@ class TestConstantFolder:
+     @pytest.mark.parametrize(("op", "expected"), [
+             # return right
+             ("+",   "x"),
+-            ("-",   "x"),
+             ("|",   "x"),
+             ("^",   "x"),
+-            ("||",  "x"),
+             # return 0
+             ("*",   0),
+             ("/",   0),
+diff --git a/test/unit/test_sequence_eval_6f893c.py b/test/unit/test_sequence_eval_6f893c.py
+new file mode 100644
+index 00000000..5cf62b9a
+--- /dev/null
++++ b/test/unit/test_sequence_eval_6f893c.py
+@@ -0,0 +1,893 @@
++# pyOCD debugger
++# Copyright (c) 2026 Arm Limited
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from __future__ import annotations
++
++import pytest
++from unittest import mock
++
++from pyocd.debug.sequences.scope import Scope
++from pyocd.debug.sequences.sequences import (
++    DebugSequenceExecutionContext,
++    DebugSequenceSemanticError,
++    DebugSequence,
++    Block,
++    WhileControl,
++    IfControl,
++)
++from pyocd.debug.sequences.functions import DebugSequenceCommonFunctions
++from pyocd.core.session import Session
++from pyocd.coresight.ap import (APv1Address, MEM_AP)
++from pyocd.probe.debug_probe import DebugProbe
++
++WORD_MASK = 0xffffffffffffffff
++
++## Number of reads after which the test target stops reporting a non-zero word, so that a
++## predicate built on a read cannot spin.
++READ_BUDGET = 8
++
++class RecordingSequenceFunctions:
++    def __init__(self, log):
++        self._log = log
++
++    def read32(self, addr: int) -> int:
++        self._log.append(('read32', addr))
++        if len([entry for entry in self._log if entry[0] == 'read32']) > READ_BUDGET:
++            return 0
++        return 0x10000 | (addr & 0xffff)
++
++    def write32(self, addr: int, val: int) -> None:
++        self._log.append(('write32', addr, val))
++
++    def dap_delay(self, delay: int) -> None:
++        self._log.append(('dap_delay', delay))
++
++    def message(self, type: int, format: str, *args: int) -> None:
++        self._log.append(('message', type, format) + args)
++
++    def text(self) -> str:
++        self._log.append(('text',))
++        return "x"
++
++    def signed(self) -> int:
++        self._log.append(('signed',))
++        return -1
++
++    def oversized(self) -> int:
++        self._log.append(('oversized',))
++        return (1 << 64) | 0x25
++
++class RecordingSequenceDelegate:
++    def __init__(self, functions=None):
++        self.log = []
++        self._root = Scope(name="eval-test-root")
++        self._functions = functions
++
++    @property
++    def sequences(self):
++        return set()
++
++    @property
++    def cmsis_pack_device(self):
++        device = mock.MagicMock()
++        device.uses_apid = False
++        return device
++
++    def get_root_scope(self, context) -> Scope:
++        return self._root
++
++    def has_sequence_with_name(self, name, pname=None):
++        return False
++
++    def get_sequence_with_name(self, name, pname=None):
++        return None
++
++    def get_protocol(self):
++        return 2
++
++    def get_connection_type(self):
++        return 1
++
++    def get_traceout(self):
++        return 0
++
++    def get_traceclockin(self) -> int:
++        return 0
++
++    def get_traceclockout(self) -> int:
++        return 0
++
++    def get_sequence_functions(self):
++        if self._functions is not None:
++            return self._functions
++        return RecordingSequenceFunctions(self.log)
++
++class RecordingProbe:
++    wire_protocol = DebugProbe.Protocol.SWD
++
++    def __init__(self, log=None):
++        self.log = [] if log is None else log
++        self.tdo = (1 << 40) | 0xff
++        self.capabilities = {
++            DebugProbe.Capability.SWJ_SEQUENCE,
++            DebugProbe.Capability.JTAG_SEQUENCE,
++            }
++
++    def lock(self):
++        pass
++
++    def unlock(self):
++        pass
++
++    def swj_sequence(self, cnt, val):
++        self.log.append(('swj_sequence', cnt, val))
++
++    def jtag_sequence(self, cnt, tms, capture, tdi):
++        self.log.append(('jtag_sequence', cnt, tms, tdi))
++        return self.tdo
++
++@pytest.fixture(scope='function')
++def delegate():
++    return RecordingSequenceDelegate()
++
++@pytest.fixture(scope='function')
++def context(delegate):
++    session = Session(None)
++    setattr(session, '_probe', RecordingProbe())
++    return DebugSequenceExecutionContext(session, delegate, pname=None)
++
++@pytest.fixture(scope='function')
++def transfer_ap():
++    ap = mock.MagicMock(spec=MEM_AP)
++    ap.read32.return_value = 0xabcd1234
++    return ap
++
++@pytest.fixture(scope='function')
++def transfer_probe():
++    return RecordingProbe()
++
++@pytest.fixture(scope='function')
++def transfer_target(transfer_ap):
++    target = mock.MagicMock()
++    target.aps = {APv1Address(0): transfer_ap}
++    return target
++
++@pytest.fixture(scope='function')
++def transfer_context(transfer_target, transfer_probe):
++    session = Session(None)
++    board = mock.MagicMock()
++    board.target = transfer_target
++    setattr(session, '_probe', transfer_probe)
++    setattr(session, '_board', board)
++
++    delegate = RecordingSequenceDelegate(functions=DebugSequenceCommonFunctions())
++    context = DebugSequenceExecutionContext(session, delegate, pname=None)
++    with context:
++        yield context
++
++def run_block(context, code):
++    seq = DebugSequence('eval_test')
++    scope = seq._create_scope(context)
++    context._push(seq, scope)
++    Block(code).execute(context)
++    return scope
++
++def run_nodes(context, *nodes):
++    seq = DebugSequence('eval_test')
++    for node in nodes:
++        seq.add_child(node)
++    return seq.execute(context)
++
++def calls_of(delegate, name):
++    return [entry for entry in delegate.log if entry[0] == name]
++
++class TestSequenceExpressionEffects:
++    def test_conjunction_with_a_literal_zero_right_operand_calls_the_left(self, context, delegate):
++        scope = run_block(context, "__var x = Read32(0x1000) && 0;")
++        assert delegate.log == [('read32', 0x1000)]
++        assert scope.get('x') == 0
++
++    def test_disjunction_with_a_literal_one_right_operand_calls_the_left(self, context, delegate):
++        scope = run_block(context, "__var x = Read32(0x1000) || 1;")
++        assert delegate.log == [('read32', 0x1000)]
++        assert scope.get('x') == 1
++
++    def test_multiply_by_a_literal_zero_calls_the_operand(self, context, delegate):
++        scope = run_block(context, "__var x = Read32(0x1004) * 0;")
++        assert delegate.log == [('read32', 0x1004)]
++        assert scope.get('x') == 0
++
++    def test_bitwise_and_with_a_literal_zero_left_operand_calls_the_right(self, context, delegate):
++        scope = run_block(context, "__var x = 0 & Read32(0x1008);")
++        assert delegate.log == [('read32', 0x1008)]
++        assert scope.get('x') == 0
++
++    def test_remainder_by_a_literal_one_calls_the_operand(self, context, delegate):
++        scope = run_block(context, "__var x = Read32(0x100c) % 1;")
++        assert delegate.log == [('read32', 0x100c)]
++        assert scope.get('x') == 0
++
++    def test_shift_of_a_literal_zero_calls_the_shift_count(self, context, delegate):
++        scope = run_block(context, "__var x = 0 << Read32(0x1010);")
++        assert delegate.log == [('read32', 0x1010)]
++        assert scope.get('x') == 0
++
++    def test_discarded_assignment_still_updates_the_variable(self, context, delegate):
++        scope = run_block(context, "__var y = 0; __var x = (y = 7) * 0;")
++        assert scope.get('y') == 7
++        assert scope.get('x') == 0
++
++    def test_call_nested_inside_a_discarded_operand_still_runs(self, context, delegate):
++        scope = run_block(context, "__var x = (Read32(0x1014) + 1) * 0;")
++        assert delegate.log == [('read32', 0x1014)]
++        assert scope.get('x') == 0
++
++    @pytest.mark.parametrize(("op", "literal"), [
++            ("*", 0), ("&", 0), ("/", 0), ("%", 1), ("&&", 0), ("||", 1),
++        ])
++    def test_a_literal_operand_behaves_like_a_variable_holding_it(self, context, delegate, op, literal):
++        with_literal = run_block(context, f"__var a = (0 - Read32(0x1a00)) {op} {literal};").get('a')
++        literal_log = list(delegate.log)
++        del delegate.log[:]
++        with_variable = run_block(context, f"__var v = {literal}; __var b = (0 - Read32(0x1a00)) {op} v;").get('b')
++        assert literal_log == delegate.log == [('read32', 0x1a00)]
++        assert with_literal == with_variable
++
++    @pytest.mark.parametrize(("with_literal", "with_variable", "expected"), [
++            ("{x} + 3", "{x} + z", 0xfffffffffffee404),
++            ("3 + {x}", "z + {x}", 0xfffffffffffee404),
++            ("{x} - 3", "{x} - z", 0xfffffffffffee3fe),
++            ("{x} * 3", "{x} * z", 0xfffffffffffcac03),
++            ("3 * {x}", "z * {x}", 0xfffffffffffcac03),
++            ("{x} / 3", "{x} / z", 0x555555555554f6ab),
++            ("3 / {x}", "z / {x}", 0x0),
++            ("{x} % 3", "{x} % z", 0x0),
++            ("3 % {x}", "z % {x}", 0x3),
++            ("{x} | 3", "{x} | z", 0xfffffffffffee403),
++            ("3 | {x}", "z | {x}", 0xfffffffffffee403),
++            ("{x} ^ 3", "{x} ^ z", 0xfffffffffffee402),
++            ("3 ^ {x}", "z ^ {x}", 0xfffffffffffee402),
++            ("{x} << 3", "{x} << z", 0xfffffffffff72008),
++            ("3 << {x}", "z << {x}", 0x0),
++            ("{x} >> 3", "{x} >> z", 0x1fffffffffffdc80),
++            ("3 >> {x}", "z >> {x}", 0x0),
++            ("{x} < 3", "{x} < z", 0x0),
++            ("3 < {x}", "z < {x}", 0x1),
++            ("{x} <= 3", "{x} <= z", 0x0),
++            ("3 <= {x}", "z <= {x}", 0x1),
++            ("{x} > 3", "{x} > z", 0x1),
++            ("3 > {x}", "z > {x}", 0x0),
++            ("{x} >= 3", "{x} >= z", 0x1),
++            ("3 >= {x}", "z >= {x}", 0x0),
++        ])
++    def test_every_operator_gives_a_literal_the_value_of_a_variable(self, context, delegate,
++            with_literal, with_variable, expected):
++        operand = "(1 - Read32(0x1c00))"
++        a = run_block(context, "__var a = " + with_literal.format(x=operand) + ";").get('a')
++        literal_log = list(delegate.log)
++        del delegate.log[:]
++        b = run_block(context, "__var z = 3; __var b = " + with_variable.format(x=operand) + ";").get('b')
++        assert literal_log == delegate.log == [('read32', 0x1c00)]
++        assert a == b == expected
++
++    @pytest.mark.parametrize(("with_literal", "with_variable", "literal"), [
++            ("{x} + 0",     "{x} + z",  0),
++            ("0 + {x}",     "z + {x}",  0),
++            ("{x} - 0",     "{x} - z",  0),
++            ("{x} | 0",     "{x} | z",  0),
++            ("0 | {x}",     "z | {x}",  0),
++            ("{x} ^ 0",     "{x} ^ z",  0),
++            ("0 ^ {x}",     "z ^ {x}",  0),
++            ("{x} << 0",    "{x} << z", 0),
++            ("{x} >> 0",    "{x} >> z", 0),
++            ("{x} * 1",     "{x} * z",  1),
++            ("1 * {x}",     "z * {x}",  1),
++            ("{x} / 1",     "{x} / z",  1),
++        ])
++    def test_an_identity_literal_keeps_its_operand_and_calls(self, context, delegate,
++            with_literal, with_variable, literal):
++        operand = "(0 - Read32(0x1b00))"
++        a = run_block(context, "__var a = " + with_literal.format(x=operand) + ";").get('a')
++        literal_log = list(delegate.log)
++        del delegate.log[:]
++        b = run_block(context, f"__var z = {literal}; __var b = " + with_variable.format(x=operand) + ";").get('b')
++        assert literal_log == delegate.log == [('read32', 0x1b00)]
++        assert a == b == WORD_MASK - 0x11b00 + 1
++
++    @pytest.mark.parametrize("op", [
++            "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>",
++            "==", "!=", "<", "<=", ">", ">=",
++        ])
++    def test_both_operands_are_called_left_to_right(self, context, delegate, op):
++        run_block(context, f"__var x = (Read32(0x1100) * 0) {op} Read32(0x1200);")
++        assert delegate.log == [('read32', 0x1100), ('read32', 0x1200)]
++
++    def test_a_difference_of_two_calls_wraps_when_the_left_is_smaller(self, context, delegate):
++        scope = run_block(context, "__var x = Read32(0x1100) - Read32(0x1200);")
++        assert delegate.log == [('read32', 0x1100), ('read32', 0x1200)]
++        assert scope.get('x') == WORD_MASK - 0xff
++
++    def test_effects_on_both_sides_of_a_discarded_operand_all_run_in_order(self, context, delegate):
++        scope = run_block(context,
++                "__var a = 0; __var b = 0;"
++                "__var x = ((a = Read32(0x1300)) + Read32(0x1400)) * ((b = Read32(0x1500)) && 0);")
++        assert delegate.log == [
++            ('read32', 0x1300),
++            ('read32', 0x1400),
++            ('read32', 0x1500),
++            ]
++        assert scope.get('a') == 0x11300
++        assert scope.get('b') == 0x11500
++        assert scope.get('x') == 0
++
++    def test_call_arguments_are_evaluated_left_to_right(self, context, delegate):
++        run_block(context, "Write32(Read32(0x1600), 0 - Read32(0x1700));")
++        assert delegate.log == [
++            ('read32', 0x1600),
++            ('read32', 0x1700),
++            ('write32', 0x11600, WORD_MASK - 0x11700 + 1),
++            ]
++
++class TestSequenceExpressionShortCircuit:
++    def test_conjunction_evaluates_the_right_operand_only_when_the_left_is_true(self, context, delegate):
++        scope = run_block(context, "__var f = 0; __var x = f && Read32(0x2000);")
++        assert delegate.log == []
++        assert scope.get('x') == 0
++
++        scope = run_block(context, "__var g = 1; __var y = g && Read32(0x2004);")
++        assert delegate.log == [('read32', 0x2004)]
++        assert scope.get('y') == 1
++
++    def test_disjunction_evaluates_the_right_operand_only_when_the_left_is_false(self, context, delegate):
++        scope = run_block(context, "__var f = 1; __var x = f || Read32(0x2008);")
++        assert delegate.log == []
++        assert scope.get('x') == 1
++
++        scope = run_block(context, "__var g = 0; __var y = g || Read32(0x200c);")
++        assert delegate.log == [('read32', 0x200c)]
++        assert scope.get('y') == 1
++
++    def test_a_deciding_literal_on_the_left_skips_the_right_operand(self, context, delegate):
++        scope = run_block(context, "__var x = 0 && Read32(0x2010);")
++        assert delegate.log == []
++        assert scope.get('x') == 0
++
++        scope = run_block(context, "__var y = 1 || Read32(0x2014);")
++        assert delegate.log == []
++        assert scope.get('y') == 1
++
++    def test_ternary_evaluates_only_the_selected_branch(self, context, delegate):
++        scope = run_block(context, "__var f = 0; __var x = f ? Read32(0x3000) : 5;")
++        assert delegate.log == []
++        assert scope.get('x') == 5
++
++        scope = run_block(context, "__var g = 1; __var y = g ? Read32(0x3004) : Read32(0x3008);")
++        assert delegate.log == [('read32', 0x3004)]
++        assert scope.get('y') == 0x13004
++
++    def test_conjunction_nested_in_a_disjunction_keeps_both_calls(self, context, delegate):
++        scope = run_block(context, "__var x = (Read32(0x4000) && 0) || Read32(0x4004);")
++        assert delegate.log == [('read32', 0x4000), ('read32', 0x4004)]
++        assert scope.get('x') == 1
++
++class TestSequenceExpressionValues:
++    def test_logical_operators_with_a_literal_operand_produce_one_or_zero(self, context):
++        scope = run_block(context, "__var y = 5; __var x = y || 0;")
++        assert scope.get('x') == 1
++
++        scope = run_block(context, "__var z = 5; __var w = 0 || z;")
++        assert scope.get('w') == 1
++
++        scope = run_block(context, "__var p = 5; __var q = p && 1;")
++        assert scope.get('q') == 1
++
++        scope = run_block(context, "__var r = 5; __var t = 1 && r;")
++        assert scope.get('t') == 1
++
++    def test_zero_minus_a_variable_is_the_negation(self, context):
++        scope = run_block(context, "__var y = 1; __var x = 0 - y;")
++        assert scope.get('x') == WORD_MASK
++
++        scope = run_block(context, "__var z = 0x10000; __var w = 0 - z;")
++        assert scope.get('w') == 0xffffffffffff0000
++
++    def test_literal_subtraction_below_zero_wraps(self, context):
++        scope = run_block(context, "__var x = 0 - 1;")
++        assert scope.get('x') == WORD_MASK
++
++    def test_unary_negation_and_subtraction_agree(self, context):
++        scope = run_block(context, "__var a = 0 - 2; __var b = -2; __var c = a - b;")
++        assert scope.get('a') == 0xfffffffffffffffe
++        assert scope.get('b') == 0xfffffffffffffffe
++        assert scope.get('c') == 0
++
++    def test_compound_subtraction_below_zero_wraps(self, context):
++        scope = run_block(context, "__var y = 0; y -= 1;")
++        assert scope.get('y') == WORD_MASK
++
++    def test_shift_count_at_the_width_produces_zero(self, context):
++        scope = run_block(context, "__var x = 1 << 64;")
++        assert scope.get('x') == 0
++
++        scope = run_block(context, "__var y = 1; __var z = y << 64;")
++        assert scope.get('z') == 0
++
++    def test_shift_counts_beyond_the_width_produce_zero(self, context):
++        scope = run_block(context, "__var x = 1 << 65; __var y = 0x8000 >> 65;")
++        assert scope.get('x') == 0
++        assert scope.get('y') == 0
++
++        scope = run_block(context, "__var n = 200; __var p = 1 << n; __var q = 0x8000 >> n;")
++        assert scope.get('p') == 0
++        assert scope.get('q') == 0
++
++    def test_shift_by_a_wrapped_count_produces_zero(self, context):
++        scope = run_block(context, "__var y = 1; __var x = y << (0 - 1);")
++        assert scope.get('x') == 0
++
++        scope = run_block(context, "__var z = 0xff; __var w = z >> (0 - 1);")
++        assert scope.get('w') == 0
++
++    def test_a_shift_result_wider_than_the_domain_wraps(self, context):
++        scope = run_block(context, "__var y = 0xffffffffffffffff; __var x = y << 1;")
++        assert scope.get('x') == 0xfffffffffffffffe
++
++        scope = run_block(context, "__var z = (0 - 1) << 4;")
++        assert scope.get('z') == 0xfffffffffffffff0
++
++    def test_scope_stores_variables_in_the_value_domain(self):
++        scope = Scope(name='domain')
++        scope.set('v', -1)
++        assert scope.get('v') == WORD_MASK
++        scope.set('w', 1 << 64)
++        assert scope.get('w') == 0
++
++    def test_multiplication_wraps_at_the_width(self, context):
++        scope = run_block(context, "__var x = 0xffffffffffffffff * 2;")
++        assert scope.get('x') == 0xfffffffffffffffe
++
++    def test_addition_wraps_at_the_width(self, context):
++        scope = run_block(context, "__var y = 0xffffffffffffffff; __var x = y + 3;")
++        assert scope.get('x') == 2
++
++    def test_a_literal_wider_than_the_domain_is_reduced(self, context):
++        scope = run_block(context, "__var x = 0x10000000000000000;")
++        assert scope.get('x') == 0
++
++        scope = run_block(context, "__var y = 0x1000000000000000f + 1;")
++        assert scope.get('y') == 0x10
++
++        scope = run_block(context, "__var z = 0x10000000000000000 > 5;")
++        assert scope.get('z') == 0
++
++    def test_intermediate_results_are_reduced_before_the_next_operator(self, context):
++        scope = run_block(context, "__var x = (0 - 1) > 5;")
++        assert scope.get('x') == 1
++
++        scope = run_block(context, "__var y = 0xffffffffffffffff; __var z = (y * 2) >> 1;")
++        assert scope.get('z') == 0x7fffffffffffffff
++
++    def test_division_of_a_wrapped_value_is_unsigned(self, context):
++        scope = run_block(context, "__var x = (0 - 1) / 2;")
++        assert scope.get('x') == 0x7fffffffffffffff
++
++        scope = run_block(context, "__var y = 0 - 2; __var z = y / 0x100000000;")
++        assert scope.get('z') == 0xffffffff
++
++    def test_remainder_of_a_wrapped_value_is_unsigned(self, context):
++        scope = run_block(context, "__var y = 0 - 1; __var x = y % 10;")
++        assert scope.get('x') == 5
++
++    def test_division_and_remainder_by_zero_produce_zero(self, context, delegate):
++        scope = run_block(context, "__var x = 5 / 0; __var y = 5 % 0;")
++        assert scope.get('x') == 0
++        assert scope.get('y') == 0
++
++        scope = run_block(context, "__var n = 3; __var p = 5 / (n - 3); __var q = 5 % (n - 3);")
++        assert scope.get('p') == 0
++        assert scope.get('q') == 0
++
++        scope = run_block(context, "__var d = Read32(0x1800) / 0; __var e = Read32(0x1804) % 0;")
++        assert delegate.log == [('read32', 0x1800), ('read32', 0x1804)]
++        assert scope.get('d') == 0
++        assert scope.get('e') == 0
++
++    @pytest.mark.parametrize(("op", "operand", "expected"), [
++            (">",   "5",                    1),
++            (">=",  "5",                    1),
++            ("<",   "5",                    0),
++            ("<=",  "5",                    0),
++            ("==",  "0xffffffffffffffff",   1),
++            ("!=",  "0xffffffffffffffff",   0),
++        ])
++    def test_every_comparison_of_a_wrapped_value_is_unsigned(self, context, op, operand, expected):
++        scope = run_block(context, f"__var y = 0 - 1; __var x = y {op} {operand};")
++        assert scope.get('x') == expected
++
++    def test_a_function_result_below_zero_is_reduced_to_the_domain(self, context, delegate):
++        scope = run_block(context, "__var x = Signed() > 5;")
++        assert delegate.log == [('signed',)]
++        assert scope.get('x') == 1
++
++        scope = run_block(context, "__var y = Signed();")
++        assert scope.get('y') == WORD_MASK
++
++    def test_a_function_result_wider_than_the_domain_is_reduced(self, context, delegate):
++        scope = run_block(context, "__var x = Oversized() & 0xff;")
++        assert delegate.log == [('oversized',)]
++        assert scope.get('x') == 0x25
++
++        scope = run_block(context, "__var y = Oversized() >> 8;")
++        assert scope.get('y') == 0
++
++    def test_a_function_result_is_reduced_before_it_is_a_shift_count(self, context, delegate):
++        scope = run_block(context, "__var x = 1 << Signed();")
++        assert delegate.log == [('signed',)]
++        assert scope.get('x') == 0
++
++    def test_a_function_argument_is_a_value_of_the_domain(self, context, delegate):
++        run_block(context, "Write32(0x10, 0 - 1);")
++        assert delegate.log == [('write32', 0x10, WORD_MASK)]
++
++        run_block(context, "Write32(0x14, Signed());")
++        assert calls_of(delegate, 'write32')[-1] == ('write32', 0x14, WORD_MASK)
++
++        run_block(context, "Write32(0x18, 0x10000000000000003);")
++        assert calls_of(delegate, 'write32')[-1] == ('write32', 0x18, 3)
++
++        run_block(context, "Write32(0x1c, Oversized());")
++        assert calls_of(delegate, 'write32')[-1] == ('write32', 0x1c, 0x25)
++
++    def test_an_assignment_expression_is_worth_the_stored_value(self, context):
++        scope = run_block(context, "__var y = 0; __var x = (y = 0 - 1) > 5;")
++        assert scope.get('y') == WORD_MASK
++        assert scope.get('x') == 1
++
++        scope = run_block(context, "__var b = 0; __var a = (b = 0x10000000000000003) + 1;")
++        assert scope.get('b') == 3
++        assert scope.get('a') == 4
++
++class TestSequenceCompoundAssignment:
++    def test_a_compound_assignment_reads_the_variable_before_the_right_hand_side(self, context):
++        scope = run_block(context, "__var x = 1; x += (x = 2);")
++        assert scope.get('x') == 3
++
++        scope = run_block(context, "__var y = 10; y -= (y = 4);")
++        assert scope.get('y') == 6
++
++    def test_a_compound_assignment_evaluates_the_right_hand_side_once(self, context, delegate):
++        scope = run_block(context, "__var x = 0; x -= Read32(0x5100);")
++        assert delegate.log == [('read32', 0x5100)]
++        assert scope.get('x') == WORD_MASK - 0x15100 + 1
++
++    def test_a_compound_assignment_wraps_into_the_domain(self, context):
++        scope = run_block(context, "__var x = 0xffffffffffffffff; x *= 2;")
++        assert scope.get('x') == 0xfffffffffffffffe
++
++        scope = run_block(context, "__var y = 1; y <<= 64;")
++        assert scope.get('y') == 0
++
++    def test_a_compound_assignment_is_worth_the_stored_value(self, context):
++        scope = run_block(context, "__var y = 0; __var x = (y -= 1) > 5;")
++        assert scope.get('y') == WORD_MASK
++        assert scope.get('x') == 1
++
++class TestSequenceControlEvaluation:
++    def test_while_predicate_short_circuits_on_the_final_evaluation(self, context, delegate):
++        setup = Block("__var n = 3;")
++        loop = WhileControl("n && Read32(0x5000)", timeout=5000000)
++        loop.add_child(Block("Write32(0x6000, n); n -= 1;"))
++        run_nodes(context, setup, loop)
++
++        assert calls_of(delegate, 'read32') == [('read32', 0x5000)] * 3
++        assert calls_of(delegate, 'write32') == [
++            ('write32', 0x6000, 3),
++            ('write32', 0x6000, 2),
++            ('write32', 0x6000, 1),
++            ]
++
++    def test_while_predicate_keeps_the_effects_of_its_single_evaluation(self, context, delegate):
++        setup = Block("__var n = 3;")
++        loop = WhileControl("(n -= 1) && 0", timeout=5000000)
++        loop.add_child(Block("Write32(0x6004, n);"))
++        scope = run_nodes(context, setup, loop)
++
++        assert calls_of(delegate, 'write32') == []
++        assert scope.get('n') == 2
++
++    def test_if_predicate_with_a_literal_zero_right_operand_calls_the_left(self, context, delegate):
++        setup = Block("__var n = 0;")
++        branch = IfControl("Read32(0x7000) && 0")
++        branch.add_child(Block("Write32(0x7004, 1);"))
++        run_nodes(context, setup, branch)
++
++        assert calls_of(delegate, 'read32') == [('read32', 0x7000)]
++        assert calls_of(delegate, 'write32') == []
++
++    def test_if_predicate_with_a_literal_one_left_operand_skips_the_right(self, context, delegate):
++        branch = IfControl("1 || Read32(0x7008)")
++        branch.add_child(Block("Write32(0x700c, 1);"))
++        run_nodes(context, branch)
++
++        assert calls_of(delegate, 'read32') == []
++        assert calls_of(delegate, 'write32') == [('write32', 0x700c, 1)]
++
++    def test_running_a_conditional_twice_repeats_its_predicate_calls(self, context, delegate):
++        branch = IfControl("Read32(0x7010) && 0")
++        branch.add_child(Block("Write32(0x7014, 1);"))
++        run_nodes(context, branch, branch)
++
++        assert calls_of(delegate, 'read32') == [('read32', 0x7010)] * 2
++        assert calls_of(delegate, 'write32') == []
++
++class TestSequenceExpressionOperands:
++    def test_a_string_operand_is_rejected_before_anything_runs(self, context, delegate):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, '__var x = Read32(0x8000) + (1 ? "a" : 2);')
++        assert delegate.log == []
++
++    def test_a_string_is_rejected_as_the_operand_of_a_unary_operator(self, context):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, '__var x = !("a");')
++
++    def test_a_string_is_rejected_as_the_value_of_a_variable(self, context):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, '__var x = 1 ? "a" : 2;')
++
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, '__var y = 0; y = 1 ? "a" : 2;')
++
++    def test_a_call_that_returns_nothing_is_rejected_as_an_operand(self, context, delegate):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, "__var x = DAP_Delay(10) + 1;")
++        assert delegate.log == []
++
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, "__var y = Read32(0x8004) && Write32(0x8008, 1);")
++        assert delegate.log == []
++
++    def test_a_string_is_rejected_by_a_parameter_that_takes_an_integer(self, context, delegate):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, 'Write32(0x10, 1 ? "a" : 2);')
++        assert delegate.log == []
++
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, 'Write32(0x10, "a");')
++        assert delegate.log == []
++
++    def test_a_call_that_returns_a_string_is_rejected_as_an_operand(self, context, delegate):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, "__var x = Text() + 1;")
++        assert delegate.log == []
++
++    def test_a_call_that_returns_a_string_is_rejected_by_a_parameter_that_takes_an_integer(self, context, delegate):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, "Write32(0x10, Text());")
++        assert delegate.log == []
++
++    def test_a_call_that_returns_a_string_is_rejected_as_a_conditional_branch(self, context, delegate):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, "__var x = 1 ? Text() : 2;")
++        assert delegate.log == []
++
++    def test_a_call_that_returns_nothing_is_rejected_as_a_stored_value(self, context, delegate):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, "__var x = DAP_Delay(1);")
++        assert delegate.log == []
++
++    def test_a_call_that_returns_nothing_is_rejected_as_an_assigned_value(self, context, delegate):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, "__var x = 0; x = DAP_Delay(1);")
++        assert delegate.log == []
++
++    def test_a_call_that_returns_nothing_is_rejected_as_an_argument(self, context, delegate):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, "Write32(0x800c, DAP_Delay(1));")
++        assert delegate.log == []
++
++    def test_a_call_that_returns_nothing_is_rejected_as_a_variadic_argument(self, context, delegate):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, '__var x = 0; Message(0, "%d", DAP_Delay(1));')
++        assert delegate.log == []
++
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, '__var y = 0; Message(0, "%d %d", 1, Write32(0x8020, 2));')
++        assert delegate.log == []
++
++    def test_a_string_is_rejected_as_a_variadic_integer_argument(self, context, delegate):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, '__var x = 0; Message(0, "%d", "a");')
++        assert delegate.log == []
++
++    def test_a_call_that_returns_nothing_is_rejected_as_a_conditional_branch(self, context, delegate):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, "__var x = 1 ? DAP_Delay(1) : 2;")
++        assert delegate.log == []
++
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, "__var y = 0 ? 2 : Write32(0x8018, 1);")
++        assert delegate.log == []
++
++    def test_an_unselected_conditional_branch_is_rejected_too(self, context, delegate):
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, "__var x = 1 ? 2 : DAP_Delay(1);")
++        assert delegate.log == []
++
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, '__var y = 0 ? "a" : 2;')
++        assert delegate.log == []
++
++        with pytest.raises(DebugSequenceSemanticError):
++            run_block(context, "__var f = 1; __var z = f ? 2 : Write32(0x801c, 1);")
++        assert delegate.log == []
++
++class TestSequenceCallBoundary:
++    def test_a_call_made_as_a_statement_receives_values_of_the_domain(self, context, delegate):
++        scope = run_block(context, "DAP_Delay(10); Write32(0x8010, 0 - 2); __var x = 1;")
++        assert delegate.log == [('dap_delay', 10), ('write32', 0x8010, WORD_MASK - 1)]
++        assert scope.get('x') == 1
++
++    def test_every_argument_of_a_call_is_evaluated_left_to_right(self, context, delegate):
++        run_block(context, '__var x = 0; Message(1, "%d %d %d", '
++                           '0 - Read32(0x1800), Read32(0x1804), 0 - Read32(0x1808));')
++        assert delegate.log == [
++            ('read32', 0x1800),
++            ('read32', 0x1804),
++            ('read32', 0x1808),
++            ('message', 1, "%d %d %d", WORD_MASK - 0x11800 + 1, 0x11804, WORD_MASK - 0x11808 + 1),
++            ]
++
++    def test_a_variadic_argument_is_a_value_of_the_domain(self, context, delegate):
++        run_block(context, '__var x = 0; Message(7, "%d %d", 0 - 1, 0x10000000000000003);')
++        assert delegate.log == [('message', 7, "%d %d", WORD_MASK, 3)]
++
++    def test_a_call_result_flows_into_the_surrounding_expression(self, context, delegate):
++        scope = run_block(context, "__var x = Read32(0x8014) - 0x18015;")
++        assert delegate.log == [('read32', 0x8014)]
++        assert scope.get('x') == WORD_MASK
++
++class TestSequenceControlPredicates:
++    def test_a_predicate_branch_that_produces_no_value_is_rejected(self, context, delegate):
++        branch = IfControl("1 ? DAP_Delay(12) : 0")
++        branch.add_child(Block("Write32(0x9008, 1);"))
++        with pytest.raises(DebugSequenceSemanticError):
++            run_nodes(context, branch)
++        assert delegate.log == []
++
++    def test_a_predicate_branch_that_is_a_string_is_rejected(self, context, delegate):
++        branch = IfControl('1 ? "a" : 0')
++        branch.add_child(Block("Write32(0x900c, 1);"))
++        with pytest.raises(DebugSequenceSemanticError):
++            run_nodes(context, branch)
++        assert delegate.log == []
++
++    def test_a_predicate_that_produces_no_value_is_false(self, context, delegate):
++        branch = IfControl("DAP_Delay(0 - 1)")
++        branch.add_child(Block("Write32(0x9020, 1);"))
++        loop = WhileControl("DAP_Delay(0 - 2)", timeout=5000000)
++        loop.add_child(Block("Write32(0x9024, 1);"))
++        declared = IfControl("__var q = 3")
++        declared.add_child(Block("Write32(0x9028, 1);"))
++        run_nodes(context, branch, loop, declared)
++
++        assert delegate.log == [('dap_delay', WORD_MASK), ('dap_delay', WORD_MASK - 1)]
++
++    def test_the_last_statement_decides_a_predicate(self, context, delegate):
++        first_true = IfControl("1; 0 - 0")
++        first_true.add_child(Block("Write32(0x9030, 0 - 1);"))
++        last_true = IfControl("0; 2")
++        last_true.add_child(Block("Write32(0x9034, 0 - 1);"))
++        last_void = IfControl("1; DAP_Delay(3)")
++        last_void.add_child(Block("Write32(0x9038, 0 - 1);"))
++        run_nodes(context, first_true, last_true, last_void)
++
++        assert delegate.log == [('write32', 0x9034, WORD_MASK), ('dap_delay', 3)]
++
++    def test_a_call_that_produces_a_value_is_a_valid_predicate(self, context, delegate):
++        branch = IfControl("Signed() > 5")
++        branch.add_child(Block("Write32(0x9010, 1);"))
++        run_nodes(context, branch)
++
++        assert delegate.log == [('signed',), ('write32', 0x9010, 1)]
++
++class TestSequenceTransferWidth:
++    def test_a_written_word_is_reduced_to_the_width_of_the_transfer(self, transfer_context, transfer_ap):
++        run_block(transfer_context, "Write32(0x1000, 0 - 1);")
++        assert transfer_ap.write32.call_args_list == [mock.call(0x1000, 0xffffffff)]
++
++        run_block(transfer_context, "Write8(0x1004, 0x1234);")
++        assert transfer_ap.write8.call_args_list == [mock.call(0x1004, 0x34)]
++
++        run_block(transfer_context, "Write16(0x1006, 0 - 1);")
++        assert transfer_ap.write16.call_args_list == [mock.call(0x1006, 0xffff)]
++
++    def test_an_ap_register_write_is_reduced_to_32_bits(self, transfer_context, transfer_target):
++        run_block(transfer_context, "WriteAP(0x0c, 0 - 1);")
++        assert transfer_target.dp.write_ap.call_args_list == [mock.call(0x0c, 0xffffffff)]
++
++    def test_an_access_port_memory_write_is_reduced_to_32_bits(self, transfer_context, transfer_target):
++        run_block(transfer_context, "WriteAccessAP(0x10, 0 - 1);")
++        assert transfer_target.dp.apacc_memory_interface.write32.call_args_list == [mock.call(0x10, 0xffffffff)]
++
++    def test_a_dp_register_write_is_reduced_to_32_bits(self, transfer_context, transfer_target):
++        run_block(transfer_context, "WriteDP(0x08, 0 - 1);")
++        assert transfer_target.dp.write_dp.call_args_list == [mock.call(0x08, 0xffffffff)]
++
++    def test_a_transfer_as_wide_as_the_domain_carries_the_whole_value(self, transfer_context, transfer_ap):
++        run_block(transfer_context, "Write64(0x1008, 0 - 1);")
++        assert transfer_ap.write64.call_args_list == [mock.call(0x1008, WORD_MASK)]
++
++    def test_a_read_word_is_a_value_of_the_domain(self, transfer_context, transfer_ap):
++        scope = run_block(transfer_context, "__var x = Read32(0x100c) - 0xabcd1235;")
++        assert transfer_ap.read32.call_args_list == [mock.call(0x100c)]
++        assert scope.get('x') == WORD_MASK
++
++    def test_a_sequence_of_bits_is_reduced_to_the_count_it_carries(self, transfer_context, transfer_probe):
++        run_block(transfer_context, "DAP_SWJ_Sequence(8, 0 - 1);")
++        assert transfer_probe.log == [('swj_sequence', 8, 0xff)]
++
++    def test_a_bit_count_beyond_the_domain_carries_the_whole_value(self, transfer_context, transfer_probe):
++        run_block(transfer_context, "DAP_SWJ_Sequence(0 - 1, 0x55);")
++        assert transfer_probe.log == [('swj_sequence', WORD_MASK, 0x55)]
++
++    def test_a_bit_count_at_the_domain_carries_the_whole_value(self, transfer_context, transfer_probe):
++        run_block(transfer_context, "DAP_SWJ_Sequence(64, 0 - 1); DAP_SWJ_Sequence(72, 1 << 63);")
++        assert transfer_probe.log == [
++            ('swj_sequence', 64, WORD_MASK),
++            ('swj_sequence', 72, 1 << 63),
++            ]
++
++    def test_a_jtag_sequence_reduces_what_it_sends_and_what_it_returns(self, transfer_context, transfer_probe):
++        scope = run_block(transfer_context, "__var x = DAP_JTAG_Sequence(8, 3, 0x1ff);")
++        assert transfer_probe.log == [('jtag_sequence', 8, 3, 0xff)]
++        assert scope.get('x') == 0xff
++
++    def test_every_bit_count_reduces_to_the_bits_it_carries(self, transfer_context, transfer_probe):
++        run_block(transfer_context,
++                "DAP_SWJ_Sequence(1, 0 - 1); DAP_SWJ_Sequence(16, 0 - 1); DAP_SWJ_Sequence(0, 0 - 1);")
++        assert transfer_probe.log == [
++            ('swj_sequence', 1, 0x1),
++            ('swj_sequence', 16, 0xffff),
++            ('swj_sequence', 0, 0),
++            ]
++
++    def test_a_jtag_sequence_at_the_domain_reports_the_whole_value(self, transfer_context, transfer_probe):
++        scope = run_block(transfer_context, "__var x = DAP_JTAG_Sequence(64, 3, 0 - 1);")
++        assert transfer_probe.log == [('jtag_sequence', 64, 3, WORD_MASK)]
++        assert scope.get('x') == (1 << 40) | 0xff
++
++        scope = run_block(transfer_context, "__var y = DAP_JTAG_Sequence(72, 1, 0 - 1);")
++        assert transfer_probe.log[-1] == ('jtag_sequence', 72, 1, WORD_MASK)
++        assert scope.get('y') == (1 << 40) | 0xff
++
++    def test_a_jtag_sequence_reads_bits_a_probe_reports_as_bytes(self, transfer_context, transfer_probe):
++        transfer_probe.tdo = bytes([0x34, 0x12])
++        scope = run_block(transfer_context, "__var x = DAP_JTAG_Sequence(12, 1, 0 - 1);")
++        assert transfer_probe.log == [('jtag_sequence', 12, 1, 0xfff)]
++        assert scope.get('x') == 0x234
++
++        transfer_probe.tdo = bytes([0x34, 0x12, 0xff])
++        scope = run_block(transfer_context, "__var y = DAP_JTAG_Sequence(24, 0, 0 - 1);")
++        assert scope.get('y') == 0xff1234
++
++    def test_a_jtag_sequence_reduces_at_other_counts(self, transfer_context, transfer_probe):
++        scope = run_block(transfer_context, "__var x = DAP_JTAG_Sequence(16, 3, 0 - 1);")
++        assert transfer_probe.log == [('jtag_sequence', 16, 3, 0xffff)]
++        assert scope.get('x') == 0xff
++
++        scope = run_block(transfer_context, "__var y = DAP_JTAG_Sequence(4, 1, 0x3f);")
++        assert transfer_probe.log[-1] == ('jtag_sequence', 4, 1, 0xf)
++        assert scope.get('y') == 0xf

@@ -1,0 +1,818 @@
+diff --git a/src/file_highlighter.rs b/src/file_highlighter.rs
+index 9903504..4ea7914 100644
+--- a/src/file_highlighter.rs
++++ b/src/file_highlighter.rs
+@@ -13,6 +13,7 @@ use crate::token_collector::{
+ use crate::hunk_header::HunkHeader;
+ use crate::hunk_highlighter::HunkLinesHighlighter;
+ use crate::refiner::Formatter;
++use crate::unified_conflicts_highlighter::UnifiedConflictsHighlighter;
+ 
+ pub(crate) struct FileHighlighter {
+     /// May or may not end with one or more tabs + a timestamp string.
+@@ -36,6 +37,8 @@ pub(crate) struct FileHighlighter {
+     /// line is a hunk header, the header's own hyperlink can point at the
+     /// same line as the hunk header's hyperlink.
+     header_rendered: bool,
++
++    pending_region: Option<UnifiedConflictsHighlighter>,
+ }
+ 
+ /// Remove trailing diff timestamp from a string, retaining only the filename
+@@ -120,6 +123,7 @@ impl LinesHighlighter for FileHighlighter {
+                     });
+                 }
+                 LineAcceptance::RejectedDone => {
++                    self.pending_region = highlighter.take_open_region();
+                     self.sub_highlighter = None;
+ 
+                     // Fall through here and let the outer logic do its thing
+@@ -128,9 +132,12 @@ impl LinesHighlighter for FileHighlighter {
+         }
+ 
+         // Not in a sub-highlighter: look for hunk header
+-        if let Some(hunk_highlighter) =
++        if let Some(mut hunk_highlighter) =
+             HunkLinesHighlighter::from_line(line, self.formatter.clone(), &self.url)?
+         {
++            if let Some(region) = self.pending_region.take() {
++                hunk_highlighter.adopt_region(region);
++            }
+             self.sub_highlighter = Some(Box::new(hunk_highlighter));
+             return Ok(Response {
+                 line_accepted: LineAcceptance::AcceptedWantMore,
+@@ -138,6 +145,10 @@ impl LinesHighlighter for FileHighlighter {
+             });
+         }
+ 
++        if let Some(mut region) = self.pending_region.take() {
++            highlights.extend(region.consume_eof(thread_pool)?);
++        }
++
+         // Otherwise we're done
+         return Ok(Response {
+             line_accepted: LineAcceptance::RejectedDone,
+@@ -158,6 +169,9 @@ impl LinesHighlighter for FileHighlighter {
+             self.header_rendered = true;
+         }
+ 
++        if let Some(mut region) = self.pending_region.take() {
++            return_me.extend(region.consume_eof(thread_pool)?);
++        }
+         if let Some(ref mut sub) = self.sub_highlighter {
+             return_me.extend(sub.consume_eof(thread_pool)?);
+         }
+@@ -183,6 +197,7 @@ impl FileHighlighter {
+             new_name: String::new(),
+             formatter,
+             sub_highlighter: None,
++            pending_region: None,
+             url: None, // Will be set in consume_line() based on the +++ line
+             header_rendered: false,
+         };
+diff --git a/src/hunk_highlighter.rs b/src/hunk_highlighter.rs
+index 4f91b9f..f192b74 100644
+--- a/src/hunk_highlighter.rs
++++ b/src/hunk_highlighter.rs
+@@ -8,6 +8,7 @@ use crate::lines_highlighter::{LineAcceptance, LinesHighlighter, Response};
+ use crate::plusminus_lines_highlighter::PlusMinusLinesHighlighter;
+ use crate::refiner::Formatter;
+ use crate::string_future::StringFuture;
++use crate::unified_conflicts_highlighter::{is_opening_marker, UnifiedConflictsHighlighter};
+ 
+ #[derive(Debug)]
+ pub(crate) struct HunkLinesHighlighter {
+@@ -23,6 +24,10 @@ pub(crate) struct HunkLinesHighlighter {
+     remaining_line_counts: Vec<usize>,
+ 
+     formatter: Formatter,
++
++    block_lines: Vec<String>,
++
++    region: Option<UnifiedConflictsHighlighter>,
+ }
+ 
+ impl LinesHighlighter for HunkLinesHighlighter {
+@@ -52,6 +57,12 @@ impl LinesHighlighter for HunkLinesHighlighter {
+         }
+ 
+         if !self.more_lines_expected() {
++            if let Some(region) = &mut self.region {
++                if region.is_complete() {
++                    return_me.append(&mut region.consume_eof(thread_pool)?);
++                    self.region = None;
++                }
++            }
+             if let Some(ref mut lines_highlighter) = self.lines_highlighter {
+                 let mut result = lines_highlighter.consume_eof(thread_pool)?;
+                 return_me.append(&mut result);
+@@ -81,11 +92,27 @@ impl LinesHighlighter for HunkLinesHighlighter {
+             ));
+         }
+ 
+-        return self.drain(thread_pool);
++        let mut return_me = vec![];
++        if let Some(mut region) = self.region.take() {
++            return_me.append(&mut region.consume_eof(thread_pool)?);
++        }
++        return_me.append(&mut self.drain(thread_pool)?);
++        return Ok(return_me);
++    }
++
++    fn take_open_region(&mut self) -> Option<UnifiedConflictsHighlighter> {
++        return self.region.take();
+     }
+ }
+ 
+ impl HunkLinesHighlighter {
++    pub(crate) fn adopt_region(&mut self, mut region: UnifiedConflictsHighlighter) {
++        if let Some(hunk_header) = self.hunk_header.take() {
++            region.push_hunk_header(hunk_header);
++        }
++        self.region = Some(region);
++    }
++
+     /// Create a new LinesHighlighter from a line of input.
+     ///
+     /// Returns None if this line doesn't start a new LinesHighlighter.
+@@ -117,6 +144,8 @@ impl HunkLinesHighlighter {
+             initial_line_counts: hunk_header.linecounts,
+             lines_highlighter: None,
+             formatter,
++            block_lines: vec![],
++            region: None,
+         });
+     }
+ 
+@@ -133,17 +162,45 @@ impl HunkLinesHighlighter {
+ 
+         let spaces_only = " ".repeat(prefix_length);
+ 
++        if let Some(region) = &mut self.region {
++            let mut result = region.consume_line(line, thread_pool)?;
++            return_me.append(&mut result.highlighted);
++            if result.line_accepted == LineAcceptance::RejectedDone {
++                self.region = None;
++                return_me.append(&mut self.consume_line_internal(line, thread_pool)?);
++            }
++            return Ok(return_me);
++        }
++
++        if prefix_length == 1 && is_opening_marker(line) {
++            if line.starts_with('-') && self.block_lines.iter().any(|l| l.starts_with('+')) {
++                return_me.append(&mut self.drain(thread_pool)?);
++                self.block_lines.clear();
++            }
++            self.lines_highlighter = None;
++            self.region = Some(UnifiedConflictsHighlighter::from_block(
++                std::mem::take(&mut self.block_lines),
++                line,
++                self.formatter.clone(),
++            ));
++            return Ok(return_me);
++        }
++
+         if let Some(lines_highlighter) = &mut self.lines_highlighter {
+             let mut result = lines_highlighter.consume_line(line, thread_pool)?;
+             return_me.append(&mut result.highlighted);
+             match result.line_accepted {
+-                LineAcceptance::AcceptedWantMore => { /* Just keep going */ }
++                LineAcceptance::AcceptedWantMore => {
++                    self.block_lines.push(line.to_string());
++                }
+                 LineAcceptance::AcceptedDone => {
+                     self.lines_highlighter = None;
++                    self.block_lines.clear();
+                 }
+                 LineAcceptance::RejectedDone => {
+                     // Drop our lines_highlighter and retry the line
+                     self.lines_highlighter = None;
++                    self.block_lines.clear();
+                     return_me.append(&mut self.consume_line_internal(line, thread_pool)?);
+                     return Ok(return_me);
+                 }
+@@ -161,6 +218,7 @@ impl HunkLinesHighlighter {
+             PlusMinusLinesHighlighter::from_line(line, prefix_length, self.formatter.clone())
+         {
+             self.lines_highlighter = Some(Box::new(highlighter));
++            self.block_lines = vec![line.to_string()];
+             return Ok(return_me);
+         }
+ 
+@@ -170,6 +228,7 @@ impl HunkLinesHighlighter {
+         // Context lines
+         if line.is_empty() || line.starts_with(&spaces_only) {
+             return_me.append(&mut self.drain(thread_pool)?);
++            self.block_lines.clear();
+ 
+             // FIXME: Consider whether we should be coalescing the plain lines?
+             // Maybe that would improve performance? Measure and find out!
+diff --git a/src/lines_highlighter.rs b/src/lines_highlighter.rs
+index 3c00155..0def68f 100644
+--- a/src/lines_highlighter.rs
++++ b/src/lines_highlighter.rs
+@@ -1,6 +1,7 @@
+ use threadpool::ThreadPool;
+ 
+ use crate::string_future::StringFuture;
++use crate::unified_conflicts_highlighter::UnifiedConflictsHighlighter;
+ 
+ #[derive(Debug, PartialEq)]
+ pub(crate) enum LineAcceptance {
+@@ -34,6 +35,10 @@ pub(crate) trait LinesHighlighter {
+ 
+     // No more lines available
+     fn consume_eof(&mut self, thread_pool: &ThreadPool) -> Result<Vec<StringFuture>, String>;
++
++    fn take_open_region(&mut self) -> Option<UnifiedConflictsHighlighter> {
++        return None;
++    }
+ }
+ 
+ impl std::fmt::Debug for dyn LinesHighlighter {
+diff --git a/src/main.rs b/src/main.rs
+index 5dc2964..b2bbbbd 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -37,6 +37,7 @@ mod rename_highlighter;
+ mod string_future;
+ mod token_collector;
+ mod tokenizer;
++mod unified_conflicts_highlighter;
+ 
+ const HELP_TEXT_FOOTER: &str = r#"Installing riff in the $PATH:
+   sudo cp riff /usr/local/bin
+diff --git a/src/refiner.rs b/src/refiner.rs
+index ed3a3e5..0d0a4ed 100644
+--- a/src/refiner.rs
++++ b/src/refiner.rs
+@@ -53,6 +53,14 @@ impl Formatter {
+         }
+     }
+ 
++    pub(crate) fn old_line_style(&self) -> &LineStyle {
++        return &self.line_style_old;
++    }
++
++    pub(crate) fn new_line_style(&self) -> &LineStyle {
++        return &self.line_style_new;
++    }
++
+     /// Format old and new lines in OLD and NEW colors.
+     ///
+     /// No intra-line refinement.
+diff --git a/src/unified_conflicts_highlighter.rs b/src/unified_conflicts_highlighter.rs
+new file mode 100644
+index 0000000..806fbdd
+--- /dev/null
++++ b/src/unified_conflicts_highlighter.rs
+@@ -0,0 +1,549 @@
++use threadpool::ThreadPool;
++
++use crate::constants::{INVERSE_VIDEO, NORMAL, NO_EOF_NEWLINE_COLOR};
++use crate::lines_highlighter::{LineAcceptance, LinesHighlighter, Response};
++use crate::plusminus_lines_highlighter::PlusMinusLinesHighlighter;
++use crate::refiner::{self, Formatter};
++use crate::string_future::StringFuture;
++use crate::token_collector::{
++    render_row, LineStyle, Style, StyledToken, LINE_STYLE_CONFLICT_BASE, LINE_STYLE_CONFLICT_NEW,
++    LINE_STYLE_CONFLICT_OLD,
++};
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum MarkerKind {
++    Open,
++    Base,
++    Separator,
++    Close,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum Zone {
++    Before,
++    Side1,
++    Base,
++    Side2,
++    After,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum Role {
++    Side1,
++    Base,
++    Side2,
++    Resolution,
++}
++
++#[derive(Clone, Debug)]
++enum RegionLine {
++    Content {
++        raw: String,
++        zone: Zone,
++        no_newline: bool,
++    },
++    Marker(String),
++    NoNewline(String),
++    HunkHeader(String),
++}
++
++#[derive(Debug)]
++pub(crate) struct UnifiedConflictsHighlighter {
++    lines: Vec<RegionLine>,
++    marker_prefix: char,
++    marker_length: usize,
++    zone: Zone,
++    valid: bool,
++    closing_block_has_plus: bool,
++    formatter: Formatter,
++}
++
++fn parse_marker(text: &str) -> Option<(MarkerKind, usize)> {
++    let first = text.chars().next()?;
++    let kind = match first {
++        '<' => MarkerKind::Open,
++        '|' => MarkerKind::Base,
++        '=' => MarkerKind::Separator,
++        '>' => MarkerKind::Close,
++        _ => return None,
++    };
++    let length = text.chars().take_while(|c| *c == first).count();
++    if length < 7 {
++        return None;
++    }
++    let rest = &text[length..];
++    if kind == MarkerKind::Separator && !rest.is_empty() {
++        return None;
++    }
++    if !rest.is_empty() && !rest.starts_with(' ') {
++        return None;
++    }
++    return Some((kind, length));
++}
++
++fn split_prefix(line: &str) -> (char, &str) {
++    let mut chars = line.chars();
++    let prefix = chars.next().unwrap_or(' ');
++    return (prefix, chars.as_str());
++}
++
++pub(crate) fn is_opening_marker(line: &str) -> bool {
++    let (prefix, text) = split_prefix(line);
++    if prefix != '-' && prefix != '+' {
++        return false;
++    }
++    return matches!(parse_marker(text), Some((MarkerKind::Open, _)));
++}
++
++impl LinesHighlighter for UnifiedConflictsHighlighter {
++    fn consume_line(&mut self, line: &str, thread_pool: &ThreadPool) -> Result<Response, String> {
++        if line.starts_with('\\') {
++            self.mark_no_newline(line);
++            return Ok(Response {
++                line_accepted: LineAcceptance::AcceptedWantMore,
++                highlighted: vec![],
++            });
++        }
++
++        let (prefix, text) = split_prefix(line);
++        if self.zone == Zone::After {
++            let block_ended =
++                prefix == ' ' || line.is_empty() || (prefix == '-' && self.closing_block_has_plus);
++            if block_ended {
++                return Ok(Response {
++                    line_accepted: LineAcceptance::RejectedDone,
++                    highlighted: self.render(thread_pool),
++                });
++            }
++            if prefix == '+' {
++                self.closing_block_has_plus = true;
++            }
++            self.push_content(line);
++            return Ok(Response {
++                line_accepted: LineAcceptance::AcceptedWantMore,
++                highlighted: vec![],
++            });
++        }
++
++        match self.marker_kind(prefix, text) {
++            Some(kind) => {
++                self.advance_zone(kind);
++                self.lines.push(RegionLine::Marker(line.to_string()));
++                if kind == MarkerKind::Close {
++                    self.closing_block_has_plus = prefix == '+';
++                }
++            }
++            None => self.push_content(line),
++        }
++        return Ok(Response {
++            line_accepted: LineAcceptance::AcceptedWantMore,
++            highlighted: vec![],
++        });
++    }
++
++    fn consume_eof(&mut self, thread_pool: &ThreadPool) -> Result<Vec<StringFuture>, String> {
++        return Ok(self.render(thread_pool));
++    }
++}
++
++impl UnifiedConflictsHighlighter {
++    pub(crate) fn from_block(
++        block_lines: Vec<String>,
++        marker_line: &str,
++        formatter: Formatter,
++    ) -> Self {
++        let (marker_prefix, text) = split_prefix(marker_line);
++        let marker_length = parse_marker(text).map_or(7, |(_, length)| length);
++
++        let mut highlighter = UnifiedConflictsHighlighter {
++            lines: vec![],
++            marker_prefix,
++            marker_length,
++            zone: Zone::Before,
++            valid: true,
++            closing_block_has_plus: false,
++            formatter,
++        };
++        for line in block_lines {
++            if line.starts_with('\\') {
++                highlighter.mark_no_newline(&line);
++            } else {
++                highlighter.push_content(&line);
++            }
++        }
++        highlighter.zone = Zone::Side1;
++        highlighter
++            .lines
++            .push(RegionLine::Marker(marker_line.to_string()));
++        return highlighter;
++    }
++
++    pub(crate) fn is_complete(&self) -> bool {
++        return self.zone == Zone::After;
++    }
++
++    pub(crate) fn push_hunk_header(&mut self, header: String) {
++        self.lines.push(RegionLine::HunkHeader(header));
++    }
++
++    fn marker_kind(&self, prefix: char, text: &str) -> Option<MarkerKind> {
++        if prefix != self.marker_prefix {
++            return None;
++        }
++        let (kind, length) = parse_marker(text)?;
++        if length != self.marker_length {
++            return None;
++        }
++        return Some(kind);
++    }
++
++    fn push_content(&mut self, line: &str) {
++        self.lines.push(RegionLine::Content {
++            raw: line.to_string(),
++            zone: self.zone,
++            no_newline: false,
++        });
++    }
++
++    fn mark_no_newline(&mut self, line: &str) {
++        if let Some(RegionLine::Content { no_newline, .. }) = self.lines.last_mut() {
++            *no_newline = true;
++        }
++        self.lines.push(RegionLine::NoNewline(line.to_string()));
++    }
++
++    fn advance_zone(&mut self, kind: MarkerKind) {
++        self.zone = match (self.zone, kind) {
++            (Zone::Side1, MarkerKind::Base) => Zone::Base,
++            (Zone::Side1 | Zone::Base, MarkerKind::Separator) => Zone::Side2,
++            (Zone::Side2, MarkerKind::Close) => Zone::After,
++            (_, MarkerKind::Close) => {
++                self.valid = false;
++                Zone::After
++            }
++            (zone, _) => {
++                self.valid = false;
++                zone
++            }
++        };
++    }
++
++    fn resolved(&self) -> bool {
++        return self.marker_prefix == '-';
++    }
++
++    fn roles_of(&self, raw: &str, zone: Zone) -> Vec<Role> {
++        let prefix = split_prefix(raw).0;
++        let side = match zone {
++            Zone::Side1 => Some(Role::Side1),
++            Zone::Base => Some(Role::Base),
++            Zone::Side2 => Some(Role::Side2),
++            Zone::Before | Zone::After => None,
++        };
++        if self.resolved() {
++            return match (prefix, side) {
++                ('+', _) => vec![Role::Resolution],
++                (' ', Some(side)) => vec![side, Role::Resolution],
++                ('-', Some(side)) => vec![side],
++                _ => vec![],
++            };
++        }
++        return match (prefix, side) {
++            ('+' | ' ', Some(side)) => vec![side],
++            _ => vec![],
++        };
++    }
++
++    fn collect_text(&self, role: Role) -> String {
++        let mut text = String::new();
++        for line in &self.lines {
++            if let RegionLine::Content {
++                raw,
++                zone,
++                no_newline,
++            } = line
++            {
++                if !self.roles_of(raw, *zone).contains(&role) {
++                    continue;
++                }
++                text.push_str(split_prefix(raw).1);
++                if !no_newline {
++                    text.push('\n');
++                }
++            }
++        }
++        return text;
++    }
++
++    fn render(&mut self, thread_pool: &ThreadPool) -> Vec<StringFuture> {
++        if !self.valid || !self.is_complete() {
++            return self.render_as_plain_diff(thread_pool);
++        }
++
++        let side1 = self.collect_text(Role::Side1);
++        let base = self.collect_text(Role::Base);
++        let side2 = self.collect_text(Role::Side2);
++        let resolution = self.collect_text(Role::Resolution);
++        let resolved = self.resolved();
++        let roles: Vec<Vec<Role>> = self
++            .lines
++            .iter()
++            .map(|line| match line {
++                RegionLine::Content { raw, zone, .. } => self.roles_of(raw, *zone),
++                _ => vec![],
++            })
++            .collect();
++        let region = std::mem::take(&mut self.lines);
++        let formatter = self.formatter.clone();
++
++        return vec![StringFuture::from_function(
++            move || {
++                let tokens = if resolved {
++                    attribute_resolved(&side1, &base, &side2, &resolution)
++                } else {
++                    attribute_unresolved(&side1, &base, &side2)
++                };
++                let mut cursors = RoleCursors::new(tokens);
++                let mut rendered = String::new();
++                for (line, line_roles) in region.iter().zip(roles.iter()) {
++                    rendered.push_str(&render_region_line(
++                        line,
++                        line_roles,
++                        resolved,
++                        &mut cursors,
++                        &formatter,
++                    ));
++                    rendered.push('\n');
++                }
++                rendered
++            },
++            thread_pool,
++        )];
++    }
++
++    fn render_as_plain_diff(&mut self, thread_pool: &ThreadPool) -> Vec<StringFuture> {
++        let mut rendered = vec![];
++        let mut block: Option<PlusMinusLinesHighlighter> = None;
++        for line in std::mem::take(&mut self.lines) {
++            let raw = match line {
++                RegionLine::Content { raw, .. } | RegionLine::Marker(raw) => raw,
++                RegionLine::NoNewline(raw) => {
++                    if let Some(highlighter) = block.as_mut() {
++                        if let Ok(response) = highlighter.consume_line(&raw, thread_pool) {
++                            rendered.extend(response.highlighted);
++                            if response.line_accepted == LineAcceptance::AcceptedDone {
++                                block = None;
++                            }
++                            continue;
++                        }
++                    }
++                    rendered.push(StringFuture::from_string(format!(
++                        "{NO_EOF_NEWLINE_COLOR}{raw}{NORMAL}\n"
++                    )));
++                    continue;
++                }
++                RegionLine::HunkHeader(header) => {
++                    if let Some(mut highlighter) = block.take() {
++                        rendered.extend(highlighter.consume_eof(thread_pool).unwrap_or_default());
++                    }
++                    rendered.push(StringFuture::from_string(header + "\n"));
++                    continue;
++                }
++            };
++            if let Some(highlighter) = block.as_mut() {
++                if let Ok(response) = highlighter.consume_line(&raw, thread_pool) {
++                    rendered.extend(response.highlighted);
++                    if response.line_accepted != LineAcceptance::RejectedDone {
++                        continue;
++                    }
++                }
++            }
++            block = PlusMinusLinesHighlighter::from_line(&raw, 1, self.formatter.clone());
++            if block.is_none() {
++                rendered.push(StringFuture::from_string(raw + "\n"));
++            }
++        }
++        if let Some(mut highlighter) = block {
++            rendered.extend(highlighter.consume_eof(thread_pool).unwrap_or_default());
++        }
++        return rendered;
++    }
++}
++
++struct RoleTokens {
++    side1: Vec<StyledToken>,
++    base: Vec<StyledToken>,
++    side2: Vec<StyledToken>,
++    resolution: Vec<StyledToken>,
++}
++
++fn text_or_newline(text: &str) -> &str {
++    if text.is_empty() {
++        return "\n";
++    }
++    return text;
++}
++
++fn max_merge(into: &mut [StyledToken], other: &[StyledToken]) {
++    for (token, other_token) in into.iter_mut().zip(other.iter()) {
++        if other_token.style as u8 > token.style as u8 {
++            token.style = other_token.style;
++        }
++    }
++}
++
++fn attribute_resolved(side1: &str, base: &str, side2: &str, resolution: &str) -> RoleTokens {
++    let resolution = text_or_newline(resolution);
++    let (side1_tokens, mut resolution_tokens) = refiner::diff(text_or_newline(side1), resolution);
++    let (side2_tokens, resolution_vs_side2) = refiner::diff(text_or_newline(side2), resolution);
++    max_merge(&mut resolution_tokens, &resolution_vs_side2);
++    let base_tokens = if base.is_empty() {
++        vec![]
++    } else {
++        refiner::diff(base, resolution).0
++    };
++    return RoleTokens {
++        side1: side1_tokens,
++        base: base_tokens,
++        side2: side2_tokens,
++        resolution: resolution_tokens,
++    };
++}
++
++fn attribute_unresolved(side1: &str, base: &str, side2: &str) -> RoleTokens {
++    if base.is_empty() {
++        let (side1_tokens, side2_tokens) =
++            refiner::diff(text_or_newline(side1), text_or_newline(side2));
++        return RoleTokens {
++            side1: side1_tokens,
++            base: vec![],
++            side2: side2_tokens,
++            resolution: vec![],
++        };
++    }
++
++    let (mut base_vs_side1, side1_tokens) = refiner::diff(base, text_or_newline(side1));
++    let (mut base_vs_side2, side2_tokens) = refiner::diff(base, text_or_newline(side2));
++    if side1.is_empty() {
++        base_vs_side1
++            .iter_mut()
++            .for_each(|t| t.style = Style::Context);
++    }
++    if side2.is_empty() {
++        base_vs_side2
++            .iter_mut()
++            .for_each(|t| t.style = Style::Context);
++    }
++    max_merge(&mut base_vs_side1, &base_vs_side2);
++    return RoleTokens {
++        side1: side1_tokens,
++        base: base_vs_side1,
++        side2: side2_tokens,
++        resolution: vec![],
++    };
++}
++
++fn split_rows(tokens: Vec<StyledToken>) -> Vec<Vec<StyledToken>> {
++    let mut rows = vec![];
++    let mut row = vec![];
++    for token in tokens {
++        if token.token == "\n" {
++            rows.push(std::mem::take(&mut row));
++            continue;
++        }
++        row.push(token);
++    }
++    if !row.is_empty() {
++        rows.push(row);
++    }
++    return rows;
++}
++
++struct RoleCursors {
++    rows: Vec<std::vec::IntoIter<Vec<StyledToken>>>,
++}
++
++impl RoleCursors {
++    fn new(tokens: RoleTokens) -> Self {
++        let rows = vec![
++            split_rows(tokens.side1).into_iter(),
++            split_rows(tokens.base).into_iter(),
++            split_rows(tokens.side2).into_iter(),
++            split_rows(tokens.resolution).into_iter(),
++        ];
++        return RoleCursors { rows };
++    }
++
++    fn next(&mut self, role: Role) -> Option<Vec<StyledToken>> {
++        let index = match role {
++            Role::Side1 => 0,
++            Role::Base => 1,
++            Role::Side2 => 2,
++            Role::Resolution => 3,
++        };
++        return self.rows[index].next();
++    }
++}
++
++fn role_style(role: Role, resolved: bool, formatter: &Formatter) -> LineStyle {
++    if resolved {
++        return match role {
++            Role::Resolution => formatter.new_line_style().clone(),
++            Role::Base => LINE_STYLE_CONFLICT_BASE.clone(),
++            _ => formatter.old_line_style().clone(),
++        };
++    }
++    return match role {
++        Role::Side1 => LINE_STYLE_CONFLICT_OLD.clone(),
++        Role::Base => LINE_STYLE_CONFLICT_BASE.clone(),
++        _ => LINE_STYLE_CONFLICT_NEW.clone(),
++    };
++}
++
++fn render_region_line(
++    line: &RegionLine,
++    roles: &[Role],
++    resolved: bool,
++    cursors: &mut RoleCursors,
++    formatter: &Formatter,
++) -> String {
++    let raw = match line {
++        RegionLine::HunkHeader(header) => return header.clone(),
++        RegionLine::NoNewline(raw) => return format!("{NO_EOF_NEWLINE_COLOR}{raw}{NORMAL}"),
++        RegionLine::Marker(raw) => {
++            let (prefix, text) = split_prefix(raw);
++            return format!("{prefix}{INVERSE_VIDEO}{text}{NORMAL}");
++        }
++        RegionLine::Content { raw, .. } => raw,
++    };
++
++    let mut rows: Vec<(Role, Option<Vec<StyledToken>>)> = roles
++        .iter()
++        .map(|role| (*role, cursors.next(*role)))
++        .collect();
++    let (prefix, text) = split_prefix(raw);
++    let prefix = prefix.to_string();
++    let plain = [StyledToken::new(
++        text.to_string(),
++        Style::DiffPartMidlighted,
++    )];
++
++    if raw.is_empty() || (resolved && raw.starts_with(' ')) {
++        return raw.to_string();
++    }
++    if rows.is_empty() {
++        let style = if prefix == "+" {
++            formatter.new_line_style()
++        } else {
++            formatter.old_line_style()
++        };
++        return render_row(style, &prefix, &plain, false);
++    }
++
++    let (role, row) = rows.remove(0);
++    let style = role_style(role, resolved, formatter);
++    return match row {
++        Some(row) => render_row(&style, &prefix, &row, false),
++        None => render_row(&style, &prefix, &plain, false),
++    };
++}

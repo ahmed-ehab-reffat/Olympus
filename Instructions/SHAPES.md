@@ -551,3 +551,62 @@ existing step loop (conditions, actions, timing, undo on reset). Profile: one ne
 plus lifecycle wiring (~60 eff), ~90 tests, a ~490-word description that pins every semantic. The
 lifecycle wiring the prompt names is transcribed; the band sits in an integration default the loader
 supplies implicitly (F-41).
+
+## Shape note — csbindgen-struct-layout-fidelity (APPROVED 2026-09-21)
+
+O-Algorithm-correctness confirmed for a **two-model comparison** feature: the output is chosen by
+comparing a source-language model against a target-runtime model. Kills come from composing the model's
+rewrite rules (F-44) and from reusing one model for the other side (F-46), not from the individual layout
+rules, which 63/70 cells show agents transcribe. Pass rate 1/10 on Nova.
+
+## Shape note — libspatialindex-tpr-temporal-knn (APPROVED 2026-09-21)
+
+O-Algorithm-correctness with a **derivable core** confirmed as too easy on its own: three stated
+interval-geometry kernels read 7/10. What made it land was an integration layer the core forced through
+the repo's storage (per-entry lifetime through node pages, node bounds and reload; F-47). For a maths
+pick, budget the band on state the repo discards, not on the maths. Accepted at 5/12.
+
+## Shape note — siliconcompiler-flist-roundtrip (APPROVED 2026-09-23)
+
+O-Composite-extend, confirmed on a serialisation round trip rather than a schema merge.
+
+The shape's usual reading is "extend an existing aggregation across packages". This instance shows the
+productive variant: extend an aggregation that is **lossy by construction** (a walk that flattens a
+graph into an ordered command list) so that what the flattening destroys survives a write/read pair.
+That framing gives the writer and the reader as two independent surfaces over one structure, and the
+band lives in the structure, not in either surface.
+
+Warning carried from HARDENING § 0 and confirmed here: a write/read pair is a closed loop and the
+reader is an oracle for the writer, so any self-consistent encoding satisfies a pure round-trip suite.
+Half this suite reads hand-written lists the writer never produced, and the exact-emitted-text writer
+tests pin the other half. Pass rate 2/10.
+
+## Shape note — pyfakefs-block-inode-accounting (APPROVED 2026-09-23)
+
+O-Composite-add, confirmed on an accounting model: new accounting axes (whole blocks, inodes,
+reserves) laid over an existing byte-only model, reported through new surfaces (`statvfs` on two
+modules, `mount_usages()`, `tree_usage()`).
+
+The productive variant: the band lives where a new axis meets a surface the old model never had to
+reconcile, namely an unlimited mode that must report a finite figure (F-50), a size getter that
+presents something other than what is stored (F-51), and repo helpers already routed through the
+primitive the new rule changes (F-20). The stated per-operation rules were transcribed. Pass rate 5/10.
+
+## Shape note — pyocd-sequence-expression-kernel (APPROVED 2026-09-24)
+
+O-Pipeline-hard, confirmed on an expression engine: one semantic model (unsigned 64-bit values,
+operand order, effect preservation) that several existing consumers of one operator table must agree
+on: a parse-time constant folder, the interpreter, the semantic checker, control predicates and a
+pluggable delegate.
+
+The productive variant: the band lives where two consumers or two layers each hold part of one rule.
+Folder vs interpreter (F-31) and delegate seam vs the operation below it (F-52) decided every near-miss.
+The stated per-operator rules were transcribed. Pass rate 5/10.
+
+## Shape note — teavm-method-summaries (APPROVED 2026-09-24)
+
+O-Pipeline-hard with an O-Algorithm-correctness core: a new whole-program analysis whose facts are
+consumed by several existing per-method passes. The consumer wiring is transcribed (every run touched
+the same nine files). The band comes from the analysis's fixed-point direction (F-53) and from how the
+new facts enter the old passes: the frozen off path (F-54) and the deferred join path (F-55). Pass
+rate 4/10.

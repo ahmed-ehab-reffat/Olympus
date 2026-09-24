@@ -1,0 +1,864 @@
+diff --git a/csbindgen/src/alias_map.rs b/csbindgen/src/alias_map.rs
+index 2e27c60..217d11e 100644
+--- a/csbindgen/src/alias_map.rs
++++ b/csbindgen/src/alias_map.rs
+@@ -19,6 +19,10 @@ impl AliasMap {
+         self.type_aliases.insert(name.to_owned(), alias.clone());
+     }
+ 
++    pub fn get(&self, name: &str) -> Option<&RustType> {
++        self.type_aliases.get(name)
++    }
++
+     pub fn get_mapped_value(&self, name: &String) -> Option<RustType> {
+         match self.type_aliases.get(name) {
+             Some(x) => {
+diff --git a/csbindgen/src/emitter.rs b/csbindgen/src/emitter.rs
+index 5252cfb..462d8c1 100644
+--- a/csbindgen/src/emitter.rs
++++ b/csbindgen/src/emitter.rs
+@@ -1,6 +1,7 @@
+ use crate::alias_map::AliasMap;
+ use crate::builder::BindgenOptions;
+ use crate::doc_comment::escape_doc_comment;
++use crate::layout::LayoutMap;
+ use crate::type_meta::ExportSymbolNaming::{ExportName, NoMangle};
+ use crate::type_meta::*;
+ use crate::util::*;
+@@ -82,6 +83,7 @@ pub fn emit_csharp(
+     structs: &Vec<RustStruct>,
+     enums: &Vec<RustEnum>,
+     consts: &Vec<RustConst>,
++    layouts: &LayoutMap,
+     options: &BindgenOptions,
+ ) -> String {
+     // configure
+@@ -199,27 +201,81 @@ pub fn emit_csharp(
+     let mut structs_string = String::new();
+     for item in structs {
+         let name = (options.csharp_type_rename)(escape_csharp_name(&item.struct_name));
+-        let layout_kind = if item.is_union {
+-            "Explicit"
++        let layout = layouts.struct_layout(&item.struct_name);
++        let zero_size = layout.as_ref().is_some_and(|x| x.rust.size == 0);
++        let layout = layout.filter(|_| !zero_size);
++        let explicit = layout.as_ref().is_some_and(|x| x.explicit);
++        let mut layout_args = vec![if item.is_union || explicit {
++            "LayoutKind.Explicit".to_string()
+         } else {
+-            "Sequential"
+-        };
++            "LayoutKind.Sequential".to_string()
++        }];
++        if let Some(x) = layout.as_ref().filter(|x| x.explicit) {
++            layout_args.push(format!("Size = {}", x.rust.size));
++        }
++        if let Some(pack) = item.pack.filter(|_| !zero_size) {
++            layout_args.push(format!("Pack = {pack}"));
++        }
+ 
+         if let Some(doc_comment) = escape_doc_comment(&item.doc_comment, "    ") {
+             structs_string.push_str_ln(&doc_comment);
+         }
+ 
+         structs_string
+-            .push_str_ln(format!("    [StructLayout(LayoutKind.{layout_kind})]").as_str());
++            .push_str_ln(format!("    [StructLayout({})]", layout_args.join(", ")).as_str());
+         structs_string
+             .push_str_ln(format!("    {accessibility} unsafe partial struct {name}").as_str());
+         structs_string.push_str_ln("    {");
+-        for field in &item.fields {
++        for (index, field) in item.fields.iter().enumerate() {
++            if layout.as_ref().is_some_and(|x| x.offsets[index].is_none()) {
++                continue;
++            }
++            let offset = layout
++                .as_ref()
++                .filter(|x| x.explicit || item.is_union)
++                .and_then(|x| x.offsets[index]);
++            let shape = layout
++                .as_ref()
++                .and_then(|_| layouts.array_shape(&field.rust_type));
+             if let Some(doc_comment) = escape_doc_comment(&field.doc_comment, "        ") {
+                 structs_string.push_str_ln(&doc_comment);
+             }
+-            if item.is_union {
+-                structs_string.push_str_ln("        [FieldOffset(0)]");
++            if let Some(shape) = shape {
++                let element = shape.element.to_csharp_string(
++                    options,
++                    aliases,
++                    &mut delegate_list,
++                    true,
++                    &"".to_string(),
++                    &"".to_string(),
++                );
++                let field_name = escape_csharp_name(field.name.as_str());
++                if shape.fixed {
++                    push_field_offset(&mut structs_string, offset);
++                    structs_string.push_str_ln(
++                        format!(
++                            "        public fixed {element} {field_name}[{}];",
++                            shape.count
++                        )
++                        .as_str(),
++                    );
++                } else {
++                    for i in 0..shape.count {
++                        push_field_offset(
++                            &mut structs_string,
++                            offset.map(|x| x + i * shape.stride),
++                        );
++                        structs_string.push_str_ln(
++                            format!("        public {element} {field_name}_{i};").as_str(),
++                        );
++                    }
++                }
++                continue;
++            }
++            if let Some(x) = offset {
++                push_field_offset(&mut structs_string, Some(x));
++            } else if item.is_union {
++                push_field_offset(&mut structs_string, Some(0));
+             }
+ 
+             let type_name = field.rust_type.to_csharp_string(
+@@ -246,24 +302,28 @@ pub fn emit_csharp(
+                 .as_str(),
+             );
+ 
+-            if let TypeKind::FixedArray(digits, _) = &field.rust_type.type_kind {
++            if let TypeKind::FixedArray(digits, ..) = &field.rust_type.type_kind {
+                 let mut digits = digits.clone();
+                 if digits == "0" {
+                     digits = "1".to_string(); // 0 fixed array is not allowed in C#
++                } else if digits.parse::<usize>().is_err() {
++                    digits.clear();
+                 };
+ 
+                 structs_string.push_str(format!("[{}]", digits).as_str());
+-            } else {
++            } else if let TypeKind::Normal = field.rust_type.type_kind {
+                 let alias_resolved_field =
+                     match aliases.get_mapped_value(&field.rust_type.type_name) {
+                         Some(x) => x,
+                         None => field.rust_type.clone(),
+                     };
+ 
+-                if let TypeKind::FixedArray(digits, _) = &alias_resolved_field.type_kind {
++                if let TypeKind::FixedArray(digits, ..) = &alias_resolved_field.type_kind {
+                     let mut digits = digits.clone();
+                     if digits == "0" {
+                         digits = "1".to_string(); // 0 fixed array is not allowed in C#
++                    } else if digits.parse::<usize>().is_err() {
++                        digits.clear();
+                     };
+ 
+                     structs_string.push_str(format!("[{}]", digits).as_str());
+@@ -442,6 +502,14 @@ fn convert_token_enum_repr(repr: &str) -> &str {
+         "i16" => "short",
+         "i32" => "int",
+         "i64" => "long",
++        "usize" => "ulong",
++        "isize" => "long",
+         x => x,
+     }
+ }
++
++fn push_field_offset(sb: &mut String, offset: Option<usize>) {
++    if let Some(x) = offset {
++        sb.push_str_ln(format!("        [FieldOffset({x})]").as_str());
++    }
++}
+diff --git a/csbindgen/src/layout.rs b/csbindgen/src/layout.rs
+new file mode 100644
+index 0000000..7aa6a80
+--- /dev/null
++++ b/csbindgen/src/layout.rs
+@@ -0,0 +1,265 @@
++use crate::alias_map::AliasMap;
++use crate::type_meta::{PointerType, RustEnum, RustStruct, RustType, TypeKind};
++use std::cell::RefCell;
++use std::collections::HashMap;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Layout {
++    pub size: usize,
++    pub align: usize,
++}
++
++#[derive(Clone, Debug)]
++pub struct StructLayout {
++    pub rust: Layout,
++    pub csharp: Layout,
++    pub offsets: Vec<Option<usize>>,
++    pub explicit: bool,
++}
++
++#[derive(Clone, Debug)]
++pub struct ArrayShape {
++    pub element: RustType,
++    pub count: usize,
++    pub stride: usize,
++    pub fixed: bool,
++}
++
++pub struct LayoutMap<'a> {
++    structs: HashMap<&'a str, &'a RustStruct>,
++    enums: HashMap<&'a str, &'a RustEnum>,
++    aliases: &'a AliasMap,
++    cache: RefCell<HashMap<String, Option<StructLayout>>>,
++}
++
++fn round_up(value: usize, align: usize) -> usize {
++    value.div_ceil(align) * align
++}
++
++fn primitive_size(name: &str) -> Option<usize> {
++    let size = match name {
++        "()" | "PhantomData" => 0,
++        "i8" | "u8" | "bool" | "c_char" | "c_schar" | "c_uchar" | "NonZeroI8" | "NonZeroU8" => 1,
++        "i16" | "u16" | "c_short" | "c_ushort" | "NonZeroI16" | "NonZeroU16" => 2,
++        "i32" | "u32" | "f32" | "char" | "c_int" | "c_uint" | "c_float" | "NonZeroI32"
++        | "NonZeroU32" => 4,
++        "i64" | "u64" | "f64" | "isize" | "usize" | "c_long" | "c_ulong" | "c_longlong"
++        | "c_ulonglong" | "c_double" | "NonZeroI64" | "NonZeroU64" | "NonZeroIsize"
++        | "NonZeroUsize" => 8,
++        "i128" | "u128" | "NonZeroI128" | "NonZeroU128" => 16,
++        _ => return None,
++    };
++    Some(size)
++}
++
++fn fixed_element_size(name: &str) -> Option<usize> {
++    match name {
++        "()" | "PhantomData" | "isize" | "usize" | "c_long" | "c_ulong" | "i128" | "u128"
++        | "NonZeroI128" | "NonZeroU128" | "NonZeroIsize" | "NonZeroUsize" => None,
++        x => primitive_size(x),
++    }
++}
++
++impl<'a> LayoutMap<'a> {
++    pub fn new(structs: &'a [RustStruct], enums: &'a [RustEnum], aliases: &'a AliasMap) -> Self {
++        Self {
++            structs: structs
++                .iter()
++                .map(|x| (x.struct_name.as_str(), x))
++                .collect(),
++            enums: enums.iter().map(|x| (x.enum_name.as_str(), x)).collect(),
++            aliases,
++            cache: RefCell::new(HashMap::new()),
++        }
++    }
++
++    pub fn struct_layout(&self, name: &str) -> Option<StructLayout> {
++        if let Some(x) = self.cache.borrow().get(name) {
++            return x.clone();
++        }
++        self.cache.borrow_mut().insert(name.to_string(), None);
++        let result = self.structs.get(name).and_then(|x| self.compute(x));
++        self.cache
++            .borrow_mut()
++            .insert(name.to_string(), result.clone());
++        result
++    }
++
++    fn named(&self, name: &str, rust: bool) -> Option<Layout> {
++        if let Some(size) = primitive_size(name).filter(|_| !self.structs.contains_key(name)) {
++            let align = if rust { size } else { size.min(8) }.max(1);
++            return Some(Layout { size, align });
++        }
++        if let Some(target) = self.aliases.get(name) {
++            return if rust {
++                self.rust_layout(target)
++            } else {
++                self.csharp_layout(target)
++            };
++        }
++        if let Some(e) = self.enums.get(name) {
++            let size = match e.repr.as_deref()? {
++                "C" => 4,
++                x => primitive_size(x)?,
++            };
++            return Some(if rust {
++                let align = size.max(e.align.unwrap_or(1));
++                Layout {
++                    size: round_up(size, align),
++                    align,
++                }
++            } else {
++                Layout {
++                    size,
++                    align: size.min(8),
++                }
++            });
++        }
++        let info = self.struct_layout(name)?;
++        Some(if rust { info.rust } else { info.csharp })
++    }
++
++    fn resolve(&self, rust_type: &RustType) -> RustType {
++        let mut current = rust_type.clone();
++        while matches!(current.type_kind, TypeKind::Normal) {
++            match self.aliases.get(&current.type_name) {
++                Some(x) => current = x.clone(),
++                None => break,
++            }
++        }
++        current
++    }
++
++    pub fn array_shape(&self, rust_type: &RustType) -> Option<ArrayShape> {
++        let TypeKind::FixedArray(digits, None, elem) = self.resolve(rust_type).type_kind else {
++            return None;
++        };
++        let count = digits.parse::<usize>().ok()?;
++        if let Some(inner) = self.array_shape(&elem) {
++            return Some(ArrayShape {
++                count: count * inner.count,
++                ..inner
++            });
++        }
++        let resolved = self.resolve(&elem);
++        let fixed = match &resolved.type_kind {
++            TypeKind::Normal => fixed_element_size(&resolved.type_name).is_some(),
++            TypeKind::Option(inner) if self.nullable(inner) => {
++                let payload = self.resolve(inner);
++                matches!(payload.type_kind, TypeKind::Normal)
++                    && fixed_element_size(&payload.type_name).is_some()
++            }
++            _ => false,
++        };
++        Some(ArrayShape {
++            stride: self.rust_layout(&elem)?.size,
++            element: *elem,
++            count,
++            fixed,
++        })
++    }
++
++    fn nullable(&self, rust_type: &RustType) -> bool {
++        let resolved = self.resolve(rust_type);
++        if self.structs.contains_key(resolved.type_name.as_str()) {
++            return false;
++        }
++        match &resolved.type_kind {
++            TypeKind::Function(..) => true,
++            TypeKind::Pointer(p, _) => matches!(p, PointerType::NonNull | PointerType::Box),
++            TypeKind::Normal => {
++                resolved.type_name.starts_with("NonZero")
++                    && primitive_size(&resolved.type_name).is_some()
++            }
++            _ => false,
++        }
++    }
++
++    fn rust_layout(&self, rust_type: &RustType) -> Option<Layout> {
++        match &rust_type.type_kind {
++            TypeKind::Normal => self.named(&rust_type.type_name, true),
++            TypeKind::Option(inner) if self.nullable(inner) => self.rust_layout(inner),
++            TypeKind::Option(_) => None,
++            TypeKind::FixedArray(..) => {
++                let shape = self.array_shape(rust_type)?;
++                let elem = self.rust_layout(&shape.element)?;
++                Some(Layout {
++                    size: elem.size * shape.count,
++                    align: elem.align,
++                })
++            }
++            _ => Some(Layout { size: 8, align: 8 }),
++        }
++    }
++
++    fn csharp_layout(&self, rust_type: &RustType) -> Option<Layout> {
++        match &rust_type.type_kind {
++            TypeKind::Normal => self.named(&rust_type.type_name, false),
++            TypeKind::Option(inner) if self.nullable(inner) => self.csharp_layout(inner),
++            TypeKind::Option(_) => None,
++            TypeKind::FixedArray(..) => {
++                let shape = self.array_shape(rust_type)?;
++                let elem = self.csharp_layout(&shape.element)?;
++                Some(Layout {
++                    size: elem.size * shape.count,
++                    align: elem.align,
++                })
++            }
++            _ => Some(Layout { size: 8, align: 8 }),
++        }
++    }
++
++    fn compute(&self, item: &RustStruct) -> Option<StructLayout> {
++        if !item.is_repr && !item.is_union {
++            return None;
++        }
++        let cap = |align: usize| item.pack.map_or(align, |p| align.min(p));
++
++        let mut offsets = Vec::new();
++        let mut same_offsets = true;
++        let (mut rust_end, mut rust_align) = (0, 1);
++        let (mut cs_end, mut cs_align) = (0, 1);
++        for field in &item.fields {
++            let rust = self.rust_layout(&field.rust_type)?;
++            let cs = self.csharp_layout(&field.rust_type)?;
++            let rust_offset = if item.is_union {
++                0
++            } else {
++                round_up(rust_end, cap(rust.align))
++            };
++            rust_end = rust_end.max(rust_offset + rust.size);
++            rust_align = rust_align.max(cap(rust.align));
++            if rust.size == 0 {
++                offsets.push(None);
++                continue;
++            }
++            offsets.push(Some(rust_offset));
++            let cs_offset = if item.is_union {
++                0
++            } else {
++                round_up(cs_end, cap(cs.align))
++            };
++            same_offsets &= rust_offset == cs_offset;
++            cs_end = cs_end.max(cs_offset + cs.size);
++            cs_align = cs_align.max(cap(cs.align));
++        }
++
++        let rust_align = rust_align.max(item.align.unwrap_or(1));
++        let rust_size = round_up(rust_end, rust_align);
++        let cs_size = round_up(cs_end, cs_align);
++        let explicit = rust_size > 0 && (!same_offsets || rust_size != cs_size);
++
++        Some(StructLayout {
++            rust: Layout {
++                size: rust_size,
++                align: rust_align,
++            },
++            csharp: Layout {
++                size: rust_size,
++                align: cs_align,
++            },
++            offsets,
++            explicit,
++        })
++    }
++}
+diff --git a/csbindgen/src/lib.rs b/csbindgen/src/lib.rs
+index 3a7cef5..6770611 100644
+--- a/csbindgen/src/lib.rs
++++ b/csbindgen/src/lib.rs
+@@ -3,6 +3,7 @@ mod builder;
+ mod doc_comment;
+ mod emitter;
+ mod field_map;
++mod layout;
+ mod parser;
+ mod type_meta;
+ mod util;
+@@ -13,6 +14,7 @@ pub use builder::Builder;
+ use builder::BindgenOptions;
+ use emitter::*;
+ use field_map::FieldMap;
++use layout::LayoutMap;
+ use parser::*;
+ use std::{collections::HashSet, error::Error};
+ use type_meta::{ExternMethod, RustConst, RustEnum, RustStruct, RustType};
+@@ -80,15 +82,24 @@ pub(crate) fn generate(
+ 
+     using_types.extend(options.always_included_types.iter().cloned());
+ 
+-    let structs = reduce_struct(&structs, &field_map, &using_types);
+-    let enums = reduce_enum(&enums, &field_map, &using_types);
++    let layouts = LayoutMap::new(&structs, &enums, &aliases);
++    let reduced_structs = reduce_struct(&structs, &field_map, &using_types);
++    let reduced_enums = reduce_enum(&enums, &field_map, &using_types);
+ 
+     let rust = if generate_rust {
+         Some(emit_rust_method(&methods, options))
+     } else {
+         None
+     };
+-    let csharp = emit_csharp(&methods, &aliases, &structs, &enums, &consts, options);
++    let csharp = emit_csharp(
++        &methods,
++        &aliases,
++        &reduced_structs,
++        &reduced_enums,
++        &consts,
++        &layouts,
++        options,
++    );
+ 
+     Ok((rust, csharp))
+ }
+@@ -100,6 +111,10 @@ fn collect_using_types(
+ ) {
+     if let type_meta::TypeKind::Option(o) = &rust_type.type_kind {
+         collect_using_types(using_types, aliases, o);
++    } else if let type_meta::TypeKind::FixedArray(_, _, element) = &rust_type.type_kind {
++        collect_using_types(using_types, aliases, element);
++    } else if let type_meta::TypeKind::Pointer(_, element) = &rust_type.type_kind {
++        collect_using_types(using_types, aliases, element);
+     } else if let type_meta::TypeKind::Function(parameters, return_type) = &rust_type.type_kind {
+         if let Some(x) = &return_type {
+             collect_using_types(using_types, aliases, x);
+@@ -125,6 +140,10 @@ fn collect_field_types(
+ ) {
+     if let type_meta::TypeKind::Option(o) = &rust_type.type_kind {
+         collect_field_types(field_map, aliases, struct_type_normalized, o);
++    } else if let type_meta::TypeKind::FixedArray(_, _, element) = &rust_type.type_kind {
++        collect_field_types(field_map, aliases, struct_type_normalized, element);
++    } else if let type_meta::TypeKind::Pointer(_, element) = &rust_type.type_kind {
++        collect_field_types(field_map, aliases, struct_type_normalized, element);
+     } else if let type_meta::TypeKind::Function(parameters, return_type) = &rust_type.type_kind {
+         if let Some(x) = &return_type {
+             collect_field_types(field_map, aliases, struct_type_normalized, x);
+diff --git a/csbindgen/src/parser.rs b/csbindgen/src/parser.rs
+index 8ea6c16..15af2cd 100644
+--- a/csbindgen/src/parser.rs
++++ b/csbindgen/src/parser.rs
+@@ -274,21 +274,19 @@ pub fn collect_struct(ast: &syn::File, result: &mut Vec<RustStruct>) {
+         if let Item::Union(t) = item {
+             let struct_name = t.ident.to_string();
+             let fields = collect_fields(&t.fields);
++            let (repr, pack, align) = parse_struct_repr(&t.attrs);
+ 
+             result.push(RustStruct {
+                 struct_name,
+                 fields,
+                 is_union: true,
++                is_repr: repr,
++                pack,
++                align,
+                 doc_comment: gather_docs(&t.attrs),
+             });
+         } else if let Item::Struct(t) = item {
+-            let mut repr = false;
+-            for attr in &t.attrs {
+-                let last_segment = attr.path().segments.last().unwrap();
+-                if last_segment.ident == "repr" {
+-                    repr = true;
+-                }
+-            }
++            let (repr, pack, align) = parse_struct_repr(&t.attrs);
+             let doc_comment = gather_docs(&t.attrs);
+ 
+             if repr {
+@@ -299,6 +297,9 @@ pub fn collect_struct(ast: &syn::File, result: &mut Vec<RustStruct>) {
+                         struct_name,
+                         fields,
+                         is_union: false,
++                        is_repr: true,
++                        pack,
++                        align,
+                         doc_comment,
+                     });
+                 } else if let syn::Fields::Unnamed(f) = &t.fields {
+@@ -308,6 +309,9 @@ pub fn collect_struct(ast: &syn::File, result: &mut Vec<RustStruct>) {
+                         struct_name,
+                         fields,
+                         is_union: false,
++                        is_repr: true,
++                        pack,
++                        align,
+                         doc_comment,
+                     });
+                 } else if let syn::Fields::Unit = &t.fields {
+@@ -317,6 +321,9 @@ pub fn collect_struct(ast: &syn::File, result: &mut Vec<RustStruct>) {
+                         struct_name,
+                         fields,
+                         is_union: false,
++                        is_repr: true,
++                        pack,
++                        align,
+                         doc_comment,
+                     });
+                 }
+@@ -328,6 +335,9 @@ pub fn collect_struct(ast: &syn::File, result: &mut Vec<RustStruct>) {
+                     struct_name,
+                     fields,
+                     is_union: false,
++                    is_repr: false,
++                    pack: None,
++                    align: None,
+                     doc_comment,
+                 });
+             }
+@@ -335,6 +345,34 @@ pub fn collect_struct(ast: &syn::File, result: &mut Vec<RustStruct>) {
+     }
+ }
+ 
++fn parse_struct_repr(attrs: &[syn::Attribute]) -> (bool, Option<usize>, Option<usize>) {
++    let mut repr = false;
++    let mut pack = None;
++    let mut align = None;
++    for attr in attrs {
++        if attr.path().segments.last().unwrap().ident != "repr" {
++            continue;
++        }
++        repr = true;
++        let _ = attr.parse_nested_meta(|meta| {
++            let value = if meta.input.peek(syn::token::Paren) {
++                let content;
++                syn::parenthesized!(content in meta.input);
++                content.parse::<syn::LitInt>()?.base10_parse::<usize>().ok()
++            } else {
++                None
++            };
++            if meta.path.is_ident("packed") {
++                pack = Some(value.unwrap_or(1));
++            } else if meta.path.is_ident("align") {
++                align = value.max(align);
++            }
++            Ok(())
++        });
++    }
++    (repr, pack, align)
++}
++
+ fn collect_fields(fields: &syn::FieldsNamed) -> Vec<FieldMember> {
+     let mut result = Vec::new();
+ 
+@@ -424,20 +462,36 @@ pub fn collect_enum(ast: &syn::File, result: &mut Vec<RustEnum>) {
+     for item in depth_first_module_walk(&ast.items) {
+         if let Item::Enum(t) = item {
+             let mut repr = None;
++            let mut align = None;
+             for attr in &t.attrs {
+                 let last_segment = attr.path().segments.last().unwrap();
+                 if last_segment.ident == "repr" {
+-                    attr.parse_nested_meta(|meta| {
+-                        repr = meta.path.get_ident().map(|ident| ident.to_string());
++                    let _ = attr.parse_nested_meta(|meta| {
++                        let value = if meta.input.peek(syn::token::Paren) {
++                            let content;
++                            syn::parenthesized!(content in meta.input);
++                            content.parse::<syn::LitInt>()?.base10_parse::<usize>().ok()
++                        } else {
++                            None
++                        };
++                        if meta.path.is_ident("align") {
++                            align = value.max(align);
++                        } else if !meta.path.is_ident("packed") {
++                            repr = meta.path.get_ident().map(|ident| ident.to_string());
++                        }
+                         Ok(())
+-                    })
+-                    .unwrap();
++                    });
+                 }
+             }
+ 
+             let enum_name = t.ident.to_string();
+             let mut fields = Vec::new(); // Vec<(String, Option<String>)>
+ 
++            if matches!(repr.as_deref(), Some("i128" | "u128")) {
++                println!("csbindgen can't handle Enum with 128-bit repr, so ignore generate, enum_name: {enum_name}");
++                continue;
++            }
++
+             if t.variants
+                 .iter()
+                 .any(|x| !matches!(x.fields, syn::Fields::Unit))
+@@ -478,6 +532,7 @@ pub fn collect_enum(ast: &syn::File, result: &mut Vec<RustEnum>) {
+                 enum_name,
+                 fields,
+                 repr,
++                align,
+                 is_flags: false,
+                 doc_comment: gather_docs(&t.attrs),
+             });
+@@ -534,6 +589,7 @@ pub fn collect_enum(ast: &syn::File, result: &mut Vec<RustEnum>) {
+                     enum_name,
+                     fields,
+                     repr,
++                    align: None,
+                     is_flags: true,
+                     doc_comment: gather_docs(&t.attrs),
+                 });
+@@ -606,6 +662,26 @@ fn parse_type(t: &syn::Type) -> RustType {
+                     };
+                 }
+             }
++            if !matches!(&*t.elem, syn::Type::Slice(_) | syn::Type::TraitObject(_)) {
++                let mut pointee = parse_type(&t.elem);
++                if pointee.type_name.is_empty() {
++                    pointee.type_name = "c_void".to_string();
++                }
++                return RustType {
++                    type_name: match pointee.type_kind {
++                        TypeKind::Function(..) => "c_void".to_string(),
++                        _ => pointee.type_name.clone(),
++                    },
++                    type_kind: TypeKind::Pointer(
++                        if has_const {
++                            PointerType::ConstPointer
++                        } else {
++                            PointerType::MutPointer
++                        },
++                        Box::new(pointee),
++                    ),
++                };
++            }
+         }
+         syn::Type::Path(t) => {
+             return parse_type_path(t);
+@@ -618,10 +694,10 @@ fn parse_type(t: &syn::Type) -> RustType {
+                 }
+             };
+ 
+-            let type_name = parse_type(&t.elem).type_name; // maybe ok, only retrieve type_name
++            let elem = parse_type(&t.elem);
+             return RustType {
+-                type_name,
+-                type_kind: TypeKind::FixedArray(digits, None),
++                type_name: elem.type_name.clone(),
++                type_kind: TypeKind::FixedArray(digits, None, Box::new(elem)),
+             };
+         }
+         syn::Type::Tuple(t) => {
+@@ -749,7 +825,9 @@ fn parse_type_path(t: &syn::TypePath) -> RustType {
+                     type_name: "Box".to_string(),
+                     type_kind: TypeKind::Pointer(PointerType::Box, Box::new(rust_type)),
+                 };
+-            } else if last_segment.ident == "MaybeUninit" {
++            } else if last_segment.ident == "MaybeUninit"
++                || last_segment.ident == "__BindgenBitfieldUnit"
++            {
+                 return rust_type;
+             }
+         }
+diff --git a/csbindgen/src/type_meta.rs b/csbindgen/src/type_meta.rs
+index 1b53ec4..6e7db68 100644
+--- a/csbindgen/src/type_meta.rs
++++ b/csbindgen/src/type_meta.rs
+@@ -57,8 +57,8 @@ pub struct RustType {
+ pub enum TypeKind {
+     Normal,
+     Pointer(PointerType, Box<RustType>),
+-    FixedArray(String, Option<PointerType>),         // digits
+-    Function(Vec<Parameter>, Option<Box<RustType>>), // parameter, return
++    FixedArray(String, Option<PointerType>, Box<RustType>), // digits
++    Function(Vec<Parameter>, Option<Box<RustType>>),        // parameter, return
+     Option(Box<RustType>),
+ }
+ 
+@@ -79,6 +79,9 @@ pub struct RustStruct {
+     pub struct_name: String,
+     pub fields: Vec<FieldMember>,
+     pub is_union: bool,
++    pub is_repr: bool,
++    pub pack: Option<usize>,
++    pub align: Option<usize>,
+     pub doc_comment: Vec<String>,
+ }
+ 
+@@ -87,6 +90,7 @@ pub struct RustEnum {
+     pub enum_name: String,
+     pub fields: Vec<RustEnumVariant>, // name, value
+     pub repr: Option<String>,
++    pub align: Option<usize>,
+     pub is_flags: bool,
+     pub doc_comment: Vec<String>,
+ }
+@@ -152,7 +156,7 @@ impl RustType {
+                     sb.push('>');
+                 }
+             }
+-            FixedArray(digits, pointer) => {
++            FixedArray(digits, pointer, element) => {
+                 let mut need_close = false;
+                 if let Some(p) = pointer {
+                     need_close = emit_pointer(&mut sb, p);
+@@ -160,7 +164,11 @@ impl RustType {
+                 }
+ 
+                 sb.push('[');
+-                emit_type_name(&mut sb);
++                if matches!(element.type_kind, FixedArray(..)) {
++                    sb.push_str(element.to_rust_string(type_path).as_str());
++                } else {
++                    emit_type_name(&mut sb);
++                }
+                 sb.push_str("; ");
+                 sb.push_str(digits.as_str());
+                 sb.push(']');
+@@ -199,6 +207,30 @@ impl RustType {
+         sb
+     }
+ 
++    pub fn csharp_pointee(&self, alias_map: &AliasMap) -> Option<RustType> {
++        match &self.type_kind {
++            TypeKind::FixedArray(_, _, inner) => Some(
++                inner
++                    .csharp_pointee(alias_map)
++                    .unwrap_or_else(|| (**inner).clone()),
++            ),
++            TypeKind::Normal => {
++                let target = alias_map.get_mapped_value(&self.type_name)?;
++                match &target.type_kind {
++                    TypeKind::FixedArray(..) => target.csharp_pointee(alias_map),
++                    TypeKind::Pointer(p, inner) => {
++                        inner.csharp_pointee(alias_map).map(|x| RustType {
++                            type_name: x.type_name.clone(),
++                            type_kind: TypeKind::Pointer(p.clone(), Box::new(x)),
++                        })
++                    }
++                    _ => None,
++                }
++            }
++            _ => None,
++        }
++    }
++
+     pub fn to_csharp_string(
+         &self,
+         options: &BindgenOptions,
+@@ -273,6 +305,40 @@ impl RustType {
+             name.to_string()
+         }
+ 
++        if let TypeKind::Normal = self.type_kind {
++            if let Some(target) = alias_map.get_mapped_value(&self.type_name) {
++                if let TypeKind::Pointer(_, inner) = &target.type_kind {
++                    if inner.csharp_pointee(alias_map).is_some() {
++                        return target.to_csharp_string(
++                            options,
++                            alias_map,
++                            delegate_list,
++                            emit_from_struct,
++                            method_name,
++                            parameter_name,
++                        );
++                    }
++                }
++            }
++        }
++
++        if let TypeKind::Pointer(p, inner) = &self.type_kind {
++            if let Some(pointee) = inner.csharp_pointee(alias_map) {
++                let lowered = RustType {
++                    type_name: pointee.type_name.clone(),
++                    type_kind: TypeKind::Pointer(p.clone(), Box::new(pointee)),
++                };
++                return lowered.to_csharp_string(
++                    options,
++                    alias_map,
++                    delegate_list,
++                    emit_from_struct,
++                    method_name,
++                    parameter_name,
++                );
++            }
++        }
++
+         // resolve alias
+         let (use_type, use_alias) = match alias_map.get_mapped_value(&self.type_name) {
+             Some(x) => (x, true),
+@@ -296,7 +362,7 @@ impl RustType {
+         let mut sb = String::new();
+ 
+         match &self.type_kind {
+-            TypeKind::FixedArray(_, _) => {
++            TypeKind::FixedArray(..) => {
+                 if emit_from_struct {
+                     sb.push_str("fixed ");
+ 

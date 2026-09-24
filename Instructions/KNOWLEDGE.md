@@ -1148,3 +1148,115 @@ vs uncompressed measurement, and extent rescaling. Treat that with the static-re
 - **Stated per-kind match rules are transcribed.** "Judge each kind of entry by the rule the SDK uses"
   gave force OR, global AND, rule-override precedence and requiredFeatures gating: 1 kill in 20 runs.
 - Agent split: Nova only, 2/10 then 3/10 legitimate; passers 61-91 messages.
+
+## csbindgen-struct-layout-fidelity (APPROVED Olympus 2026-09-21)
+
+- **Nova composes two type rewrites in the wrong order (F-44).** Alias resolution applied at the outer
+  name, then the array renderer runs on the target: `fixed byte* p`, lost or doubled pointer levels.
+  6/16 and 7/10; every direct form passed.
+- **Nova reuses the scalar emission path for aggregates (F-45).** `[MarshalAs(UnmanagedType.U1)]` stayed
+  on `fixed bool` buffers: 3/16 and 3/10. Auto Review called it a shared blind spot and kept the test.
+- **Nova computes the target-side model from source-side data (F-46).** Nested C# alignment/size taken
+  from Rust, so containers were over-promoted to Explicit: 5/16 and 2/10.
+- **Nova reads an enumerated list as exhaustive (L81).** With four 8-byte C scalars named, 7/16 gave
+  `c_float`/`c_double` no layout.
+- **Nova over-delivers when the task stops short.** 5/16 resolved const names and evaluated `4 + 4` in
+  array lengths the contract said fall back; one run recursed into a stack overflow.
+- Agent split: batch 4 Nova-only 1/10; Vega (batch 3) 0/1; passing patch 974 human-eff over 5 files.
+
+## libspatialindex-tpr-temporal-knn (APPROVED Olympus 2026-09-21)
+
+- **Stated geometry kernels are transcribed.** 7/10 Nova passed a pure interval-geometry contract, and a
+  57-cell probe found zero behavioural difference between the passers and the reference. The convergent
+  architecture: a private shape normaliser plus private meet/contain/distance predicates over
+  extrapolated coordinates, bypassing the repo's own `MovingRegion` machinery entirely.
+- **Agents do the local maths and drop state across storage and bounds (F-47).** With a per-entry end of
+  motion, 4/12 lost it somewhere: node-bound pruning on deep trees, finite end times lost on insert, or an
+  unversioned page. Point evaluation stayed right in every one.
+- **5 of 6 clean solutions widened the page with no layout marker.** The evaluator failed one 73/73 run
+  for it; FP judges probed four more and were over-ruled as out of scope.
+- **Agents keep an existing method's legacy convenience when the contract narrows it (F-48).**
+  `pointLocationQuery` kept answering a plain `Point`: 3/12, Orion included.
+- One-run failures, not promoted: a nearest-distance optimiser that fixes the gap branch at a segment
+  midpoint and misses a branch switch; a singleton interval left at `DBL_MAX`; a self-join that returns
+  false after the first infeasible motion piece.
+- Agent split, accepted pool: Nova 4/10, Orion 1/2. Passing patches 504-658 added lines over 5-8 files.
+
+## siliconcompiler-flist-roundtrip (APPROVED Olympus 2026-09-23)
+
+Cross-agent blind spots measured on a 10-Nova batch (plus 1 Vega in batch 1).
+
+- **Re-parenting a deserialized graph onto the root (7/10).** Reading a flat record list whose edges
+  live inside the records, seven independent runs registered every parsed node as a direct dependency
+  of the object `read_fileset` was called on, in addition to the correct nested edge. Five shipped it
+  as their only defect at 56/57. The convergence is architectural, not careless: a flat serialized
+  form has no nesting to imitate, and the surrounding contract sentences all name the reading design.
+- **Marker-only records not materialised (2/10).** A record with a marker and no content must still
+  create the thing it names; two runs created it lazily from content and raised when a later reference
+  needed it.
+- **One run (1/10) implemented a comment-line marker as two lines** — the wire format is a place a
+  single agent can diverge wholesale, failing 28/57 with everything else sound.
+- **Wording moves a blind spot measurably.** The same pre-existing-data-root test killed 6/11 when the
+  contract said "a root registered earlier" and 0/10 once the sentence named both readings.
+- Effort: median ~7M prompt tokens per run; both passers wrote ~500 raw added lines in ONE source file.
+
+## pyfakefs-block-inode-accounting (APPROVED Olympus 2026-09-23)
+
+Cross-agent blind spots, 10-Nova accepted batch (plus 12 Nova/Vega in batch 2).
+
+- **A repo helper that already routes through the changed primitive (F-20, 3/10).** `add_real_directory`
+  builds its parents with `create_dir`. Once `create_dir` was made all-or-nothing, three runs' imports
+  rolled back parents the contract kept, with no agent refactor at all. Agents change the primitive and
+  never grep its callers.
+- **"Unlimited" reported as a number, then enforced (F-50, 2/10).** To report `f_files` for an
+  unlimited inode count, agents derived a figure from the block count and then refused allocations
+  past it, or lost the usage when a bounded mount was set back to unlimited.
+- **A platform-branched size getter used as stored size (F-51, 1/10 here; 3/11 and 5/12 earlier).**
+  pyfakefs zeroes `st_size` for Windows symlinks. Agents sized the symlink by `stat` and charged
+  nothing for its path.
+- **Recursive removal releasing only in the non-recursive branch (1/10, candidate C-6).** Directory
+  inodes leaked through `rmtree`; one run failed four tests on it and everything else was sound.
+- **Wording blind spots measured:** a one-sided carve-out moved five tests 0/11 to 10/12, and a
+  distant pronoun killed 10/11. Both went to 0/10 once rewritten.
+- Effort: median ~14.6M prompt tokens per run. Passers wrote 487-689 raw added lines over 3-4 files.
+
+## pyocd-sequence-expression-kernel (APPROVED Olympus 2026-09-24)
+
+Cross-agent blind spots, 10-Nova accepted batch (plus 10 Nova + 1 Vega in batch 1).
+
+- **Two stacked boundaries collapsed onto the nearer one (F-52, 2/10).** "A sequence function receives
+  the unsigned form of every value" and "Write32 reduces the word it writes to 32 bits" were both
+  implemented in the interpreter's call path, so the delegate got `0xffffffff`. Both runs were 146/150
+  with nothing else failing. Agents edit where they already are.
+- **A sibling argument normalised with the rule (F-20, 3/10).** Width masking on JTAG's sent bits
+  spread to the `tms` argument, which the CMSIS-DAP layer itself masks with `& 1`. Partly an artefact
+  of a test value outside the documented range (L92).
+- **Twin evaluators fixed on one side only (F-31, 2/10).** Value semantics moved into the interpreter
+  while the constant folder kept `x || 0 -> x` and `0 - x -> x`, the identities the repo's own fold
+  table encoded.
+- **What stopped killing once stated concretely:** unsigned scope storage 6/11 -> 0/10, argument
+  reduction 7/11 -> 0/10, JTAG byte responses (unstated) -> 0/10.
+- **A rule added in review killed 8/11 in batch 1:** "a control predicate must produce a value". Agents
+  treat a predicate as a statement list, not a value position.
+- Effort: 4.9M-8.6M prompt tokens per run. Passers wrote 232-296 non-blank added source lines over 3-4
+  files.
+
+## teavm-method-summaries (APPROVED Olympus 2026-09-24)
+
+Cross-agent blind spots, 10-Nova accepted batch (4/10).
+
+- **Least instead of greatest fixed point for an all-paths fact (F-53, 4/10).** Agents start
+  never-null at false and promote a method only after its callees are proven, so a jointly never-null
+  cycle never bootstraps. Three runs at 25/26 failed only this. The contract said "recursion and
+  mutual recursion lose nothing" in so many words.
+- **Improving the legacy path the contract freezes (F-54, 2/10).** The new `initClass` handler in
+  RepeatedFieldReadElimination forgot every read even with null summaries; base keeps them. One run
+  failed only this.
+- **An "all instances" sentinel sent through the per-instance path (F-55, 2/10).** `-2` reached
+  `AliasAnalysis.affectsEverything` and threw `ArrayIndexOutOfBoundsException`. The passers used the
+  same `-2` and branched on it first.
+- **What every agent got right:** SPECIAL vs VIRTUAL dispatch, absent classes and natives as unknown,
+  `<clinit>` effects, invokedynamic, arrays, both TeaVM pipelines. All ten runs touched exactly the
+  reference's nine source files.
+- Effort: 9.5M-20.4M prompt tokens per run; passers 12.9M-20.4M. Passing production diffs ~425
+  effective lines (reference 298). Auto Review counted 116-158 messages.

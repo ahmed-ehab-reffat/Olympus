@@ -30,13 +30,16 @@ Catalog of picks that were authored, batched, and SHELVED because they could not
 | **Spec-knowable predicate domain** | the feature's semantics are fixed by an RFC / standard the agent can DERIVE from first principles (IP-CIDR containment, date arithmetic, unicode classes, checksum families), and the only remaining work is threading it through the host language | distinct from saturated-reference-port: the agent has not memorised a library, it can simply RE-DERIVE the whole spec, so no fair test can ever split correct implementations. Difficulty collapses onto the WIRING (new enum variant through exhaustive matches, reporters, parser ordering), which is derivable from the repo's own existing variants. A differential harness will find NO fair discriminator | cfn-guard-cidr-operator (5/10 then 6/10 across two batches) |
 | **Textbook SQL-standard feature** (DERIVATIVE **or** TOO-EASY — same tell, two death mechanisms) | a named standard-SQL feature in a SQL engine: GROUPING SETS/ROLLUP/CUBE, window fns, CTE/recursive CTE, EXCEPT/INTERSECT, LATERAL, MERGE, PIVOT | the SQL standard fixes both the behavior AND the obvious data model, so independent AUTHORS converge on a near-identical feature core -> platform similarity/dedupe compares the CORE -> >0.90 DERIVATIVE flag (repo coldness does NOT protect; it guards maintainer/issue dedup, not another author picking the same famous feature). The SAME convergence also happens one level down: independent AGENTS solving it converge on the identical implementation because they already know the standard's semantics cold, so contract-stated fairness traps get satisfied as a side effect of implementing the well-known algorithm correctly -> TOO-EASY even with zero prior-art collision. Either way, no packaging change clears it | kitesql-grouping-sets (precheck 93.6%, derivative); gql-window-cumulative-rank (89% aggregate across 5 batches, too-easy — thoroughness-gate convergence, not a dedupe collision) |
 | **New value kind in a generic evaluator** (TOO-EASY even when LOC clears — the difficulty twin of the row below) | add a new kind of VALUE (fractions, decimals, a new numeric or scalar type) to an expression evaluator whose symbols, resolver, user functions, conditionals and macro/ruledef arguments all store values generically, plus builtins whose math the description has to state exactly | the generic storage carries the new variant through every other stage for free, so the only real work is the arm itself and a formula the spec must write out to be fair. LOC can be plentiful (a whole rational module) and still no trap exists: a differential harness finds no stage that quietly mishandles the new kind. Any lever whose WRONG version breaks the existing suite is self-revealing, because agents run that suite | customasm-exact-fractional-values (8/8 then 7/8 across two batches, 368 human-eff; 35 fair probes x 16 saved solutions found zero divergence outside the stated formula) |
-| **Machinery-absorbed capability** (UNDER-FLOOR, not too-easy) | the repo already owns a primitive that does the hard half of your capability (`Settle`, a generic walker, a resolver, a complete interface, an enum that already IS the identity key you need) and your fix is "call it at N sites" or "add a lookup in front of it" | the correct implementation is a 2-6 line call-through per site, so the whole feature lands far under the 200 effective-LOC floor no matter how many sites there are. Site COUNT does not buy LOC: N thin call-throughs is still thin, and genuine bolt-on companion features that route through the SAME absorbed primitive inherit its thinness rather than escaping it. Estimating "restructure the emission" before checking what the primitive already does overshoots by 3-5x, and trap-seam RICHNESS (F-9/F-10/F-18 all present) does not substitute for missing SIZE | canvas-fill-rule-backends (44 eff vs 200 floor; DESIGN.md sketched 213); iced-x86-pointer-data-dedup (126 eff after 2 genuine expansion rounds vs 200 floor; DESIGN.md sketched 180-220) |
+| **Machinery-absorbed capability** (UNDER-FLOOR, not too-easy) | the repo already owns a primitive that does the hard half of your capability (`Settle`, a generic walker, a resolver, a complete interface, an enum that already IS the identity key you need) and your fix is "call it at N sites" or "add a lookup in front of it" | the correct implementation is a 2-6 line call-through per site, so the whole feature lands far under the 200 effective-LOC floor no matter how many sites there are. Site COUNT does not buy LOC: N thin call-throughs is still thin, and genuine bolt-on companion features that route through the SAME absorbed primitive inherit its thinness rather than escaping it. Estimating "restructure the emission" before checking what the primitive already does overshoots by 3-5x, and trap-seam RICHNESS (F-9/F-10/F-18 all present) does not substitute for missing SIZE | canvas-fill-rule-backends (44 eff vs 200 floor; DESIGN.md sketched 213); iced-x86-pointer-data-dedup (126 eff after 2 genuine expansion rounds vs 200 floor; DESIGN.md sketched 180-220); vrp-initial-clustering-roundtrip (155 eff slice, 168 with every genuine extra; hunt sketched ~260; the loader's `restore()` recomputes all schedules) |
 | **Textbook numerical algorithm already implemented in a SIBLING library** (EXCLUSIVITY, cross-repo) | the capability's hard core is a named textbook algorithm (arc-length/Crisfield continuation, and by extension Newmark, return mapping, Gauss-Kronrod, CQC, ...), and ANY public repo in the same language and domain has a working implementation, even with a different data model | the scope gate searches public code ACROSS repos and rules the pick not exclusive when the corrector/root-selection/loop can be cribbed, leaving "primarily integration and policy/status work". Checking only the target repo, its tracker and its parent/reference toolchain is not enough. **Pick-time check:** search GitHub code for the algorithm's signature formula in the language (`gh search code '<formula or function name>' --language=python`) and in the 3-5 nearest sibling libraries (sfepy -> jax-fem, scikit-fem, dolfinx, GetFEM, FEniCS, pyiron). One working hit = dead | sfepy-arc-length-continuation (JAX-FEM `solver.py:595` arc-length engine, 7/15 cases) |
 | **Repo is a PORT of a reference tool** (EXCLUSIVITY, repo-level — the strongest form of the row below) | the target repo vendors, ports or reimplements a canonical reference tool (pandapower vendors 69 PYPOWER files carrying PSERC's MATPOWER copyright; 25 more reference MATPOWER) | a port **inherits its parent's ENTIRE feature list as prior art**, so every capability the parent ships is dead in the child — and worse, the child's internal data structures are usually the parent's, so a solver can port the parent's implementation almost line-for-line (saturated-reference-port on top of the scope-gate reject). **Check this ONCE at repo level, not per capability**, and treat the parent's function list as a blocklist | pandapower continuation power flow (MATPOWER ships the whole `runcpf` + `cpf_*` family) |
 | **Sibling-ecosystem-tool implements the core algorithm** (EXCLUSIVITY / publicly-solved) | your target library parses/emits one half of a widely standardized binary or text format (SPIR-V, DWARF, ELF, WASM, a bytecode ISA, a protocol wire format) and there exists a separate, often reference-maintainer-published, tool for that SAME format that already performs the algorithm you are about to add | the same-repo GitHub PR/issue search (`CLAUDE.md § Exclusivity`) only ever looks inside the target repo; it cannot see a public implementation living in a DIFFERENT project. Format-standard ecosystems always grow a canonical toolchain (Khronos's SPIRV-Tools/SPIRV-Cross for SPIR-V, `llvm-dwarfdump`/`gimli` for DWARF, `wabt`/`binaryen` for WASM) that agents can be assumed to have seen; if that toolchain already ships your feature's core algorithm as a named pass or function, the Scope Gate rejects on sight, quoting its source, regardless of how much of the target repo's OWN history is clean | rspirv-decoration-group-resolution (SPIRV-Tools' `--flatten-decoration` optimizer pass performs the identical two-pass group-to-concrete-decoration expansion) |
+| **Invariant-upkeep clause of a larger feature** (DERIVATIVE, the sub-requirement twin of the rows above) | the pick makes an index or cache that a subsystem already owns stay correct under insert/remove/move (incremental quadtree or R-tree maintenance, count and parent-pointer repair, split/collapse cleanup, cache invalidation), where base keeps it right only after a bulk build | any rival feature on the same subsystem (dynamic entities, live updates, streaming edits) has to add exactly this upkeep as one of its clauses, and it converges: the invariants are fixed by the bulk build, so split, count repair, the duplicate-position guard and pointer upkeep come out line for line the same. The gate reads a clause promoted to a standalone task as the rival's core, and new read-only accessors and stricter invariant tests count as elaboration. A clean SIX-CHECK says nothing, because the rival lives in the pipeline | openglobus-entitycollections-tree-maintenance (overlap `Blocker` at the core slice, 92/197 authored lines = 46.7%, 92/338 = 27.2% of the rival; shelved before picker or batch) |
 | **Maintainer-staged plan in a popular issue** (DERIVATIVE, set-level) | a busy, user-bumped issue where the maintainer publicly splits the feature into numbered stages ("1. read/write, 2. recompress, 3. reductions, 4. cropping/dedup"), the first stages shipped and the rest open with no PR | each remaining stage is its own pre-sized pick, so different rival authors take different stages. Building the union does not escape: the gate treats "stitches two older major implementation blocks" as a **set-level derivative** even when no single rival covers half. The welcome and the plan clear Gate 8 and mark the lane at the same time (hunt Stage 2d's worst case) | oxipng-apng-frame-optimization (overlap `Blocker` x3 at the core slice: 181/407 discounted lines = 44.5% against an older APNG-wide reduction submission, 199/407 = 48.9% against an older canvas/cropping one, set-level union ruled derivative; issue #551, open since 2023-08) |
+| **Container completion of a just-shipped per-element API** (DERIVATIVE, the release-notes twin of the roadmap rows) | the latest release added an interface to the ELEMENTS of an aggregate (`Copyable` on `Body`/`Joint`, serialisation on nodes, equality on items) and the aggregate that owns them (`World`, the graph, the collection) is the one obvious class left without it; the pick is "do it for the container", however much hidden state (caches, warm-start, broadphase trees, time history) the container really needs | the gap is printed in the changelog, so every author who reads the release lands on it, and the container's state is fixed by the engine, so independent authors copy the same fields in the same places. A stricter contract on top (bit-identical continuation, same event order, placement rules) is judged "tightens determinism and generalizes placement", i.e. elaboration. Zero open issues and a clean exclusivity sweep say nothing: the rival lives in the pipeline | dyn4j-world-copy (overlap `Blocker` at the core slice, 157/297 rival lines = 52.9%, 157/492 ours = 31.9%; hunt had rated it a MEDIUM magnet and leaned on the bit-identity contract as the mitigation) |
 | **Reintroduces a capability the maintainer REMOVED** (PUBLICLY-SOLVED, unfixable) | the repo used to ship the capability and a release deliberately dropped it: a changelog/release note saying "X is no longer ...", "removed X", "dropped support for X", often next to a friendly "if you need X, let me know" | the scope gate treats the repo's OWN history as prior art: the removing commit and the release record prove the capability was public, and it rules reintroduction unfixable "regardless of whether the modern implementation uses a new ... mechanism". Corpus overlap, dedupe and every PR/issue query read clean, because the prior art is the repo's past, not a rival. **The invitation beside the removal is not a welcome, it is the removal record.** Pick-time check: grep the changelog and release notes for `no longer`, `removed`, `dropped`, `deprecated` and run `git log -S` on the capability's old API names before scoping | kira-frame-accurate-start-times (precheck `publicly-solved` Blocker on commit 4c29057a and `changelog.md` L102-L124 "Clocks are no longer sample accurate"; 0/206 corpus overlap; killed at the core slice) |
 | **Substrate-repair contract** (UNSOLVABLE-UNDER-REVIEW, the opposite failure to every row above) | the correct fix must REPAIR facts the host already records (decoder flags, recorded code flow, a cached IR, a symbol table), and some load-bearing fixture needs an instruction/node that base's substrate never records | agents build on the recorded substrate and do not repair it, so every fixture that depends on a dropped successor fails ~90%+ while its walker-layer twin costs a few runs. Stating the repair makes the test fair and lethal; leaving it unstated makes it an FP hole or a review finding, and a general soundness sentence keeps it in scope even after its specific clause is deleted. **Pick-time test: for each fixture, does base already record what the assertion walks?** | vivisect-noret-propagation (166 runs / 2 genuine passes; every candidate answer to the final review measured 0/21; Solution 3/3 Clean at shelving) |
+| **Mock-harness type wall** (UNAUTHORABLE, repo-level) | the repo's test double for its IO/env boundary returns PRE-BUILT typed values and resolves them by EXACT type (`Box<dyn Any>::downcast`, a TypeId/class registry, a mock keyed on the return type) so no deserialization runs in tests, and the pick needs that boundary type to change shape | the capability's input only exists on the wire, so widening the boundary type makes every existing handler fail the exact-type cast at once. `solution.patch` may not repair test files; `test.patch` cannot, because the repair must differ between the base and solution trees; and the SOLVER sees the breakage with no patch to explain it, so ~100% of runs either edit repo tests (`PASS_CHEATED`) or edit the harness and make test.patch conflict. The same property blocks the inverse move: a new test cannot inject wire metadata either. **Pick-time check (one grep): open the test env/mock, look for a cast keyed on the fetched type, and count the sites that build the old type.** Pair it with the serde/golden-token and exhaustive-struct-literal question for every type the pick must extend | stremio-core-resource-freshness (30 `Box::new(ResourceResponse…)` sites in 15 test files against `TestEnv::fetch`'s `downcast::<OUT>()`; killed at scope-lock, no code written) |
 
 
 ### ⭐⭐⭐ RECOGNISER / POST-PASS-OVER-THE-PUBLIC-STREAM (added 2026-09-01-C — killed lyon T1 at the Phase-3 guard, AFTER it had cleared all 10 PICK-FILTER gates)
@@ -190,6 +193,38 @@ regardless of how good its trap seams look. Seam richness does NOT substitute fo
 **The unifying law (3x confirmed: petgraph, kysely, ironcalc):** difficulty and fairness pull in opposite directions for a single-subsystem, well-specified feature. The fairness gate forces you to state the contract / canonical form / rule; stating it hands the agent the answer. Genuine hardness must come from depth that SURVIVES full specification (cross-subsystem integration timing, a genuinely-new load-bearing algorithm, an interdependent multi-stage pipeline), never from a trap that only works while the spec hides something.
 
 ---
+
+## vrp-initial-clustering-roundtrip (Rust, SHELVED 2026-09-23 - machinery-absorbed UNDER-FLOOR, killed at the core slice)
+
+**Repo:** reinterpretcat/vrp (508 stars, base `e49bee0e`), hunt RANK 1 of
+`repo-hunt-logs/REPO-HUNT-2026-09-23-I.md`. **Lane:** make pragmatic initial solutions work for
+vicinity-clustered problems: `read_init_solution` reads back the clustered stops (parking, commute) the
+writer emits, and the solver maps a supplied initial individual onto the clustered job registry that
+`VicinityClustering::pre_process` swaps in (the F-9 stage boundary at `rosomaxa/src/evolution/simulator.rs:63`).
+
+**Everything the hunt measured was true.** Both gaps reproduced at base: the reader refuses the solver's
+own clustered output ("commute property in initial solution is not supported"), and an unclustered
+initial solution comes back fully unclustered after 0 or 200 generations. SIX-CHECK, exclusivity and
+fork-branch scans were clean; the one-day 2021 commute passthrough was never released.
+
+**Killed by size, measured on a working slice.** Reader inversion of clustered stops + open-shift start
+fix + translation of initial individuals + a defaulted rosomaxa hook: **155 human-effective**, 8 tests
+green. Required breaks (the only other genuine reader gap) prototyped to **168** in total. The hunter
+sketched ~260. Every item the sketch priced as work was absorbed: `Commute::to_domain` already parses
+the writer's commute; `get_extra_time` already undoes break extension; `InsertionContext::restore`
+recomputes every schedule, so the translation needs no schedule arithmetic at all; the hook is six lines.
+The one piece of real extra depth (required breaks inside a clustered stop) is blocked by a pre-existing
+writer quirk (members written as served during the break), so stating a read-back law over it would pin
+a base bug.
+
+**Law.** A lane whose correctness is checked by a recompute-on-load engine (here: `restore()` rebuilding
+schedules) only needs to get IDENTITY right, not arithmetic. Before sketching LOC for a "read back /
+translate into the internal model" lane, check what the loader recomputes; every recomputed field is a
+line item that costs nothing. Also: a 0-generation solve with one initial solution is a deterministic
+end-to-end oracle in this repo, which is worth reusing on any future vrp lane.
+
+Artifacts: `rejected/vrp-initial-clustering-roundtrip/` (DESIGN.md, meta.md draft, both patches,
+Dockerfile, fixtures in test.patch). Tooling and probes: `worktrees/_vrp_probe/`.
 
 ## messageformat-mf2-to-mf1 (TypeScript, SHELVED 2026-09-19 - DERIVATIVE, overlap `Blocker` 270/354 = 76.3%)
 
@@ -1685,3 +1720,137 @@ session. Evidence kept in `rejected/oxipng-apng-frame-optimization/` (DESIGN.md 
 branch `spike` in `worktrees/oxipng`. Reusable: the dispose-aware minimal-rect rule and the
 state-equality merge rule are good traps for any animation format lane that is not already taken.
 
+## stremio-core-resource-freshness (Rust, SHELVED 2026-09-21 - UNAUTHORABLE-HARNESS, killed at scope-lock with no code written)
+
+**Repo:** Stremio/stremio-core (MIT, Rust 99.8%, 2411 stars, base `b3062f7f`), hunt RANK 1 of
+`repo-hunt-logs/REPO-HUNT-2026-09-21-B.md`. **Lane:** honour the addon protocol's per-response
+freshness directives - `ResourceResponseCache { cache_max_age, stale_revalidate, stale_error }`,
+a struct the repo parses and then throws away - inside the shared `ResourceLoadable` kernel that
+feeds eleven model surfaces.
+
+**Everything the hunt measured was true.** `ResourceResponseCache` really is dead state (three grep
+hits, all in its own file, two and a half years after the +76/-0 PR that added it). The three latent
+kernel bugs are all real at base: all four result handlers gate on
+`matches!(resource.content, Some(Loadable::Loading))` while every current caller sets `Loading`
+first, so the `_ => Effects::none().unchanged()` arm is dead code; `resources_update`'s dedup
+`find(|r| r.request == request && r.content.is_some() && !force)` returns before any timestamp
+comparison; and `resource_vector_content_from_result` maps empty to `Err(EmptyContent)` while its
+scalar twin has no such branch. The repo even ships a settable clock (`src/unit_tests/env.rs:27`),
+which is exactly what a TTL feature needs to clear the flakiness gate.
+
+**ROOT CAUSE - the mock fetch harness casts by exact type, so no wire type can change shape.**
+The directives only exist on the wire, so reaching the kernel means changing the `OUT` type of
+`Env::fetch` for addon resources. `TestEnv::fetch` (`src/unit_tests/env.rs:112-124`) never
+deserializes anything: handlers return `Box<dyn Any + Send>` holding a pre-built value and it does
+`resp.downcast::<OUT>().unwrap_or_else(|_| panic!(...))`. `downcast` matches on exact `TypeId`, so
+asking for `ResourceResponseCache` panics every handler that boxes a `ResourceResponse` -
+**30 sites across 15 test files**. `solution.patch` may not repair them (test files);
+`test.patch` cannot either, because the repair has to differ between the base tree
+(`OUT = ResourceResponse`) and the solution tree. A tolerant adapter inside `TestEnv::fetch` does
+compile and pass in BOTH trees, but it lives under `src/` outside test.patch's remit and, decisively,
+the SOLVER never sees it: every agent that widens the transport type watches 30 repo tests panic and
+then either edits repo tests (`PASS_CHEATED`, L31/L78) or edits the harness and makes test.patch
+conflict. Contamination is ~100% of runs and measures nothing. The same property blocks the inverse
+move: because no deserialization runs in tests, a NEW test cannot inject wire metadata either.
+
+**Every re-source of the freshness windows is blocked too**, which is what makes this a repo verdict
+rather than a lane verdict: a field on `Manifest` breaks 36 exhaustive `Manifest { … }` literals in
+the test tree (none use `..Default::default()`); a field on `ManifestBehaviorHints` breaks
+`src/unit_tests/serde/manifest_behavior_hints.rs`, which pins the token stream including `len: 5`;
+a field on `ResourceLoadable` breaks the one exhaustive literal at
+`src/unit_tests/meta_details/live_tv.rs:58-61` and nothing can keep that literal compiling in both
+trees; an 8th `Ctx::new` argument breaks ~20 call sites; and windows taken from repo constants drop
+the protocol tie and collapse the pick to a nameable "TTL cache".
+
+**Repo verdict: Stremio/stremio-core is AVOID for an Olympus-sized pick**, despite being
+mechanically excellent (MIT, pure Rust, committed `Cargo.lock`, one rev-pinned git dep, 282 lib +
+18 doc tests deterministic in 0.12s, settable clock, 0 of 6 quota). Three properties squeeze from
+different sides: (1) `src/unit_tests/serde/` token-pins ~48 of the public types, so extending almost
+any of them reds a test only the agent can repair; (2) the mock fetch harness above makes every wire
+type immovable; (3) the runtime is a generic `Effects` / `Env` / `Loadable` engine, so new cases are
+absorbed - probed on a second lane, chunking `AggrRequest::CatalogsFiltered`'s id batches past the
+addon's `options_limit` measures ~30 effective LOC, because `ResourceRequest` equality already lets
+the kernel hold N entries per addon and `update_notification_items` already scans every catalog.
+
+**Reusable law (new taxonomy row - MOCK-HARNESS TYPE WALL).** Before scope-locking any pick whose
+capability rides a wire, boundary or IO type, open the repo's test double for that boundary. If it
+returns PRE-BUILT typed values and resolves them by exact type (`Box<dyn Any>::downcast`, a
+`TypeId`/class registry, a `Mock` keyed on the return type) rather than by parsing bytes, then the
+boundary type is FROZEN: it cannot widen without breaking every existing handler, and neither patch
+can repair that fairly. Count the handler construction sites at pick time - it is one grep - and pair
+the check with the older serde/golden-token question. The cheap version of both: `grep -rn "downcast\|isinstance\|mock" <test-env-file>` and `grep -rc "<Type> {" <test tree>`.
+
+Artifacts: `rejected/stremio-core-resource-freshness/` (BASE_COMMIT.txt + feedback.md with the full
+citation set). No code, no Docker build, no batch.
+
+## openglobus-entitycollections-tree-maintenance (TypeScript, SHELVED 2026-09-22 - DERIVATIVE, overlap `Blocker` 92/197 = 46.7%)
+
+**Pick:** openglobus/openglobus (Apache-2.0, 936 stars, base `61757dbc`), hunt RANK 1 of
+REPO-HUNT-2026-09-21. Incremental insert/remove upkeep for the `Vector` layer's entity collections
+tree (Earth: mercator/north/south; Equi: west/east): descend to the right leaf, re-arm
+`nodeCapacity`, repair counts on remove, collapse emptied nodes, keep `_nodePtr` right, plus a
+same-position split guard. New API `Vector.getEntityCollectionsTreeStrategy()`,
+`EntityCollectionsTreeStrategy.removeEntity()` and `.getRootNodes()`. Factory SLICE: 152
+human-effective LOC across 7 files, 28 tests, clean room 3x identical, 7/7 mutants killed.
+
+**Timeline:** SLICE handed off 2026-09-21 -> core-slice precheck -> overlap **Blocker**:
+*"re-deliver the older candidate's incremental entity-tree rebucketing, removal/count repair,
+same-position split guard, node-pointer maintenance, and cleanup engine ... turns a
+repository-specific maintenance clause already implemented by the older candidate into the primary
+standalone task."* Stopped before the picker spend and before any batch.
+
+**ROOT CAUSE - the lane was a clause of someone else's feature.** The hunt checked for a rival
+doing *this* task. The rival did a bigger task on the same subsystem (entities that change after the
+bulk build), and keeping the tree correct was one of its clauses. Any feature that makes entities
+dynamic needs the same upkeep, and the bulk build fixes every invariant, so independent authors write
+the same split, count-repair and collapse code. Even our own "unattended" choice, the duplicate-
+position guard, was forced by the contract, so the rival has it too.
+
+**LAW:** before scope-locking a "keep the index correct incrementally" pick, ask which bigger
+features on that subsystem would have to include it (live updates, moves, streaming, undo). If one
+of those is an obvious author pick, the upkeep lane is presumptively claimed. Additive accessors and
+stricter invariant coverage never differentiate a recycled core.
+
+**Repo verdict:** openglobus `Vector` / `EntityCollectionsTreeStrategy` / `EntityCollectionNode` /
+`Entity` setters are covered by a prior pipeline submission. The DESIGN.md sec 15 FINISH scope
+(cross-tree re-homing, setter wiring, deferred queue, `_renderingNodes` hygiene) is the same engine,
+so it is dead too. Other openglobus subsystems were not surveyed.
+
+Artifacts: `rejected/openglobus-entitycollections-tree-maintenance/` (full slice + DESIGN.md).
+
+## dyn4j-world-copy (Java, SHELVED 2026-09-24 - DERIVATIVE, overlap `Blocker` 157/297 rival lines = 52.9%)
+
+**Pick:** dyn4j/dyn4j (BSD-3-Clause, 538 stars, base `bcf942ad`, release 6.0.0), hunt RANK 1 of
+REPO-HUNT-2026-09-23-J. `World.copy()`: a deep copy of a live physics world that is independent both
+ways and steps bit-identically with the original (broadphase tree, contacts + warm-start impulses,
+constraint graph, CCD data, time step, accumulated time), `World implements Copyable`, `CopyException`
+for a non-overriding subclass. Factory SLICE: 225 honest human-effective LOC across 12 files in 4
+packages, 10 tests, clean room 3 uids 3x identical (2385 base tests).
+
+**Timeline:** SLICE handed off 2026-09-23 -> core-slice precheck 2026-09-24 -> overlap **Blocker**:
+*"The older task already makes live physics worlds copyable with independent bodies, fixtures,
+joints, broadphase caches, contacts, warm-start state, and time history. The subject tightens
+determinism and generalizes placement but re-delivers that primary implementation challenge."*
+157/492 discounted subject lines (31.9%), 157/297 candidate lines (52.9%). Upstream and scope checks
+clean. Stopped before the picker spend and before any batch.
+
+**ROOT CAUSE - the lane was printed in the changelog.** 6.0.0 (#293) put `Copyable` on bodies and
+joints and left `World` out. The hunt saw it ("the obvious next step after #293's Copyable program",
+MEDIUM magnet) and cleared it on the repo-model contract: bit-identical continuation, warm-start and
+broadphase order, independence both ways. The judge read all of that as tightening, because the
+container's state is fixed by the engine, so any rival copying a world copies the same caches in the
+same places. Zero open issues and a clean PR/fork/code sweep were the expected readings for a lane
+whose rivals live only in the pipeline.
+
+**LAW:** when a release adds an interface to the elements of an aggregate and leaves the aggregate
+out, the aggregate is a claimed lane; do not scope-lock it on a stricter contract. The only
+mitigations that ever worked for a nameable lane were a different CORE, never a tighter version of
+the same one (same law as koto-nested-bindings, scikit-fem-embedded-meshes).
+
+**Repo verdict:** dyn4j world-level copy / snapshot / clone / rollback / prediction-by-copy is held
+by a prior pipeline submission. The DESIGN.md FINISH scope (brute-force + Sap broadphase copies,
+listener and collision-data cells, CCD tree) is the same engine, so it is dead too. Other dyn4j
+subsystems were not surveyed.
+
+Artifacts: `rejected/dyn4j-world-copy/` (full slice + DESIGN.md). Clones `worktrees/dyn4j`,
+`worktrees/dyn4j-cleanroom`, `worktrees/dyn4j-probe` (41M total).

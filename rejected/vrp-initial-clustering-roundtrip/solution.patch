@@ -1,0 +1,328 @@
+diff --git a/rosomaxa/src/evolution/mod.rs b/rosomaxa/src/evolution/mod.rs
+index 6f0e4816..0e25b946 100644
+--- a/rosomaxa/src/evolution/mod.rs
++++ b/rosomaxa/src/evolution/mod.rs
+@@ -28,6 +28,11 @@ pub trait HeuristicContextProcessing {
+ 
+     /// Preprocess a context in order to replace usages of a given context with a new one.
+     fn pre_process(&self, context: Self::Context) -> Self::Context;
++
++    /// Adapts an initial solution built for the original context to the one returned by `pre_process`.
++    fn pre_process_solution(&self, _context: &Self::Context, solution: Self::Solution) -> Self::Solution {
++        solution
++    }
+ }
+ 
+ /// Provides the way to modify solution before returning it.
+diff --git a/rosomaxa/src/evolution/simulator.rs b/rosomaxa/src/evolution/simulator.rs
+index 0224da59..1ed2b6f4 100644
+--- a/rosomaxa/src/evolution/simulator.rs
++++ b/rosomaxa/src/evolution/simulator.rs
+@@ -70,6 +70,10 @@ where
+         let init_size = std::mem::take(&mut config.initial.individuals).into_iter().take(config.initial.max_size).fold(
+             0,
+             |acc, solution| {
++                let solution = hooks
++                    .context
++                    .iter()
++                    .fold(solution, |solution, hook| hook.pre_process_solution(&heuristic_ctx, solution));
+                 heuristic_ctx.on_initial(solution, "user", Timer::start());
+                 acc + 1
+             },
+diff --git a/vrp-core/src/solver/processing/vicinity_clustering.rs b/vrp-core/src/solver/processing/vicinity_clustering.rs
+index 0793fbfe..516a7642 100644
+--- a/vrp-core/src/solver/processing/vicinity_clustering.rs
++++ b/vrp-core/src/solver/processing/vicinity_clustering.rs
+@@ -4,14 +4,18 @@ mod vicinity_clustering_test;
+ 
+ use super::*;
+ use crate::construction::clustering::vicinity::*;
+-use crate::models::common::Schedule;
+-use crate::models::problem::Jobs;
+-use crate::models::solution::{Activity, Place};
+-use crate::models::{Extras, GoalContext, Problem};
++use crate::construction::heuristics::UnassignmentInfo;
++use crate::models::common::{Schedule, TimeWindow};
++use crate::models::problem::{Job, Jobs};
++use crate::models::solution::{Activity, Place, Route};
++use crate::models::{Extras, GoalContext, Problem, Solution};
+ use crate::solver::RefinementContext;
+-use std::collections::HashSet;
++use std::collections::{HashMap, HashSet};
++use std::iter::once;
+ use std::sync::Arc;
+ 
++type ClusterMembers = HashMap<Job, (Job, usize)>;
++
+ custom_extra_property!(pub ClusterConfig typeof ClusterConfig);
+ custom_extra_property!(pub OriginalProblem typeof Problem);
+ 
+@@ -74,6 +78,154 @@ impl HeuristicContextProcessing for VicinityClustering {
+             RefinementContext { problem, ..context }
+         }
+     }
++
++    fn pre_process_solution(&self, context: &Self::Context, solution: Self::Solution) -> Self::Solution {
++        let problem = context.problem.clone();
++
++        if Arc::ptr_eq(&problem, &solution.problem) || problem.extras.get_original_problem().is_none() {
++            return solution;
++        }
++
++        let environment = solution.environment.clone();
++        let members = get_cluster_members(problem.jobs.all());
++        let solution: Solution = solution.into();
++        let served = get_served_clusters(solution.routes.as_slice(), &members);
++
++        let routes = solution
++            .routes
++            .into_iter()
++            .map(|route| replace_cluster_members(route, &members, &served))
++            .collect::<Vec<_>>();
++
++        let assigned = routes.iter().flat_map(|route| route.tour.jobs()).cloned().collect::<HashSet<_>>();
++        let mut unassigned = Vec::new();
++        let mut listed = HashSet::new();
++        solution.unassigned.into_iter().for_each(|(job, code)| {
++            let job = members.get(&job).map_or(job, |(cluster, _)| cluster.clone());
++            if !assigned.contains(&job) && listed.insert(job.clone()) {
++                unassigned.push((job, code));
++            }
++        });
++        unassigned.extend(
++            problem
++                .jobs
++                .all()
++                .iter()
++                .filter(|job| !assigned.contains(*job) && !listed.contains(*job))
++                .map(|job| (job.clone(), UnassignmentInfo::Unknown)),
++        );
++
++        InsertionContext::new_from_solution(
++            problem,
++            (
++                Solution {
++                    cost: solution.cost,
++                    registry: solution.registry,
++                    routes,
++                    unassigned,
++                    telemetry: solution.telemetry,
++                },
++                None,
++            ),
++            environment,
++        )
++    }
++}
++
++fn get_cluster_members(jobs: &[Job]) -> ClusterMembers {
++    jobs.iter()
++        .filter_map(|job| job.dimens().get_cluster_info().map(|infos| (job, infos)))
++        .flat_map(|(cluster, infos)| infos.iter().map(move |info| (info.job.clone(), (cluster.clone(), infos.len()))))
++        .collect()
++}
++
++fn get_served_clusters(routes: &[Route], members: &ClusterMembers) -> HashSet<Job> {
++    let mut runs = HashMap::<Job, usize>::new();
++    let mut complete = HashSet::new();
++
++    routes.iter().for_each(|route| {
++        let mut current: Option<(Job, usize, HashSet<Job>)> = None;
++        let mut close = |current: &mut Option<(Job, usize, HashSet<Job>)>| {
++            if let Some((cluster, size, seen)) = current.take() {
++                *runs.entry(cluster.clone()).or_default() += 1;
++                if seen.len() == size {
++                    complete.insert(cluster);
++                }
++            }
++        };
++
++        route.tour.all_activities().for_each(|activity| {
++            let member = activity.retrieve_job().and_then(|job| members.get(&job).map(|info| (job, info.clone())));
++            match member {
++                Some((job, (cluster, _))) if current.as_ref().is_some_and(|(active, ..)| *active == cluster) => {
++                    current.as_mut().unwrap().2.insert(job);
++                }
++                Some((job, (cluster, size))) => {
++                    close(&mut current);
++                    current = Some((cluster, size, once(job).collect()));
++                }
++                None => close(&mut current),
++            }
++        });
++        close(&mut current);
++    });
++
++    complete.retain(|cluster| runs.get(cluster) == Some(&1));
++
++    complete
++}
++
++fn replace_cluster_members(mut route: Route, members: &ClusterMembers, served: &HashSet<Job>) -> Route {
++    let route_start = route.tour.start().map_or(0., |start| start.schedule.departure);
++    let mut runs = Vec::<(usize, usize, Job)>::new();
++
++    route.tour.all_activities().enumerate().for_each(|(idx, activity)| {
++        let cluster = activity.retrieve_job().and_then(|job| members.get(&job).map(|(cluster, _)| cluster.clone()));
++        if let Some(cluster) = cluster {
++            match runs.last_mut() {
++                Some((_, end, active)) if *end + 1 == idx && *active == cluster => *end = idx,
++                _ => runs.push((idx, idx, cluster)),
++            }
++        }
++    });
++
++    runs.into_iter().rev().for_each(|(start, end, cluster)| {
++        let arrival = route.tour.get(start).unwrap().schedule.arrival;
++        let departure = route.tour.get(end).unwrap().schedule.departure;
++
++        (start..=end).rev().for_each(|idx| {
++            route.tour.remove_activity_at(idx);
++        });
++
++        if served.contains(&cluster) {
++            route.tour.insert_at(create_cluster_activity(&cluster, route_start, arrival, departure), start);
++        }
++    });
++
++    route
++}
++
++fn create_cluster_activity(cluster: &Job, route_start: f64, arrival: f64, departure: f64) -> Activity {
++    let single = cluster.to_single();
++    let place = single.places.first().expect("cluster has no place");
++    let time = place
++        .times
++        .iter()
++        .map(|time| time.to_time_window(route_start))
++        .find(|time| time.end >= arrival)
++        .unwrap_or_else(|| TimeWindow::new(arrival, departure));
++
++    Activity {
++        place: Place {
++            idx: 0,
++            location: place.location.expect("cluster has no location"),
++            duration: place.duration,
++            time,
++        },
++        schedule: Schedule::new(arrival, departure),
++        job: Some(single.clone()),
++        commute: None,
++    }
+ }
+ 
+ impl HeuristicSolutionProcessing for VicinityClustering {
+diff --git a/vrp-pragmatic/src/format/solution/initial_reader.rs b/vrp-pragmatic/src/format/solution/initial_reader.rs
+index a1cc653e..a00af022 100644
+--- a/vrp-pragmatic/src/format/solution/initial_reader.rs
++++ b/vrp-pragmatic/src/format/solution/initial_reader.rs
+@@ -3,6 +3,7 @@
+ mod initial_reader_test;
+ 
+ use crate::format::solution::Activity as FormatActivity;
++use crate::format::solution::PointStop;
+ use crate::format::solution::Stop as FormatStop;
+ use crate::format::solution::Tour as FormatTour;
+ use crate::format::solution::activity_matcher::{JobInfo, try_match_point_job};
+@@ -14,9 +15,10 @@ use std::io::{BufReader, Read};
+ use std::sync::Arc;
+ use vrp_core::construction::heuristics::UnassignmentInfo;
+ use vrp_core::models::common::*;
++use vrp_core::models::problem::Single;
+ use vrp_core::models::problem::{Actor, Job, JobIdDimension, VehicleIdDimension};
+ use vrp_core::models::solution::Tour as CoreTour;
+-use vrp_core::models::solution::{Activity, Registry, Route};
++use vrp_core::models::solution::{Activity, Commute, Place, Registry, Route};
+ use vrp_core::prelude::*;
+ 
+ type ActorKey = (String, String, usize);
+@@ -107,10 +109,6 @@ fn try_insert_activity(
+     coord_index: &CoordIndex,
+     added_jobs: &mut HashSet<Job>,
+ ) -> Result<(), GenericError> {
+-    if activity.commute.is_some() {
+-        return Err("commute property in initial solution is not supported".into());
+-    }
+-
+     let stop = match stop {
+         FormatStop::Transit(_) => return Err("transit property in initial solution is not yet supported".into()),
+         FormatStop::Point(stop) => stop,
+@@ -128,12 +126,19 @@ fn try_insert_activity(
+             .into());
+             }
+ 
+-            route.tour.insert_last(Activity {
+-                place,
+-                schedule: Schedule { arrival: time.start, departure: time.end },
+-                job: Some(single),
+-                commute: None,
+-            });
++            let activity = match activity.commute.as_ref() {
++                Some(commute) => {
++                    create_commute_activity(route, stop, activity, commute.to_domain(coord_index), single, place, time)
++                }
++                None => Activity {
++                    place,
++                    schedule: Schedule { arrival: time.start, departure: time.end },
++                    job: Some(single),
++                    commute: None,
++                },
++            };
++
++            route.tour.insert_last(activity);
+         }
+         _ => {
+             if activity.activity_type != "departure" && activity.activity_type != "arrival" {
+@@ -149,6 +154,43 @@ fn try_insert_activity(
+     Ok(())
+ }
+ 
++fn create_commute_activity(
++    route: &Route,
++    stop: &PointStop,
++    activity: &FormatActivity,
++    commute: Commute,
++    single: Arc<Single>,
++    place: Place,
++    time: TimeWindow,
++) -> Activity {
++    let is_first = stop.activities.first().is_some_and(|first| std::ptr::eq(first, activity));
++    let parking = match (&stop.parking, is_first) {
++        (Some(parking), true) => parse_time(&parking.end) - parse_time(&parking.start),
++        _ => 0.,
++    };
++
++    let arrival = if is_first {
++        parse_time(&stop.time.arrival)
++    } else {
++        route.tour.get(route.tour.job_activity_count()).map_or(time.start, |previous| previous.schedule.departure)
++    };
++    let departure = time.end + commute.backward.duration;
++
++    let service_arrival = arrival + parking + commute.forward.duration;
++    let place_time = if time.start > service_arrival {
++        TimeWindow::new(time.start, place.time.end.max(time.start))
++    } else {
++        place.time.clone()
++    };
++
++    Activity {
++        place: Place { duration: time.duration() + parking, time: place_time, ..place },
++        schedule: Schedule { arrival, departure },
++        job: Some(single),
++        commute: Some(commute),
++    }
++}
++
+ fn get_actor_key(actor: &Actor) -> ActorKey {
+     let dimens = &actor.vehicle.dimens;
+ 
+@@ -185,7 +227,7 @@ fn create_core_route(actor: Arc<Actor>, format_tour: &FormatTour) -> Result<Rout
+ 
+     set_activity_time(start_stop, start_activity, core_start)?;
+ 
+-    if core_tour.end().is_some() {
++    if actor.detail.end.is_some() {
+         let end_stop = format_tour.stops.last().unwrap();
+         let end_activity = end_stop.activities().first().ok_or_else(|| "end stop has no activities".to_string())?;
+         let core_end = core_tour.all_activities_mut().last().unwrap();

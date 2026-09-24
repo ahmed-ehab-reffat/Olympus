@@ -1,0 +1,2108 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..ce587cf
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,153 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++mode=""
++output_path=""
++while [ $# -gt 0 ]; do
++    case "$1" in
++        --output_path=*) output_path="${1#--output_path=}"; shift ;;
++        --output_path) output_path="$2"; shift 2 ;;
++        base|new) mode="$1"; shift ;;
++        *) shift ;;
++    esac
++done
++mode="${mode:-base}"
++output_path="${output_path:-$PWD/test-results-$mode.xml}"
++case "$output_path" in
++    /*) ;;
++    *) output_path="$PWD/$output_path" ;;
++esac
++mkdir -p "$(dirname "$output_path")"
++
++repo_root="$(cd "$(dirname "$0")" && pwd)"
++build_dir="$repo_root/build"
++log_file="$(mktemp)"
++
++if [ "$mode" = "base" ]; then
++    target="libsidxtest"
++    fallback_case="LibsidxtestBuild"
++else
++    target="tprtree_temporal_test"
++    fallback_case="TemporalQueriesBuild"
++fi
++
++write_failure() {
++    python3 - "$output_path" "$fallback_case" "$1" "$log_file" <<'PY'
++import sys
++from xml.sax.saxutils import escape
++out, name, phase, log = sys.argv[1:5]
++try:
++    text = open(log, errors="replace").read()[-16000:]
++except OSError:
++    text = ""
++with open(out, "w") as f:
++    f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
++    f.write('<testsuites tests="1" failures="1" errors="0">\n')
++    f.write('<testsuite name="build" tests="1" failures="1" errors="0">\n')
++    f.write('<testcase name="%s" classname="build">' % escape(name))
++    f.write('<failure message="%s failed">%s</failure>' % (escape(phase), escape(text)))
++    f.write('</testcase>\n</testsuite>\n</testsuites>\n')
++PY
++}
++
++if [ -d "$build_dir" ] && [ "$(stat -c %u "$build_dir")" != "$(id -u)" ]; then
++    rm -rf "$build_dir.owned"
++    if cp -R --preserve=mode,timestamps "$build_dir" "$build_dir.owned" 2>>"$log_file" \
++        && rm -rf "$build_dir" 2>>"$log_file" \
++        && mv "$build_dir.owned" "$build_dir" 2>>"$log_file"; then
++        :
++    else
++        rm -rf "$build_dir.owned"
++        build_dir="$repo_root/build-$(id -u)"
++    fi
++fi
++
++if [ ! -f "$build_dir/CMakeCache.txt" ]; then
++    cmake -S "$repo_root" -B "$build_dir" -G Ninja \
++        -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON >>"$log_file" 2>&1
++    status=$?
++    if [ $status -ne 0 ]; then
++        cat "$log_file"
++        write_failure "configure"
++        exit 1
++    fi
++fi
++
++cmake --build "$build_dir" --target "$target" --parallel 4 >>"$log_file" 2>&1
++status=$?
++if [ $status -ne 0 ]; then
++    cat "$log_file"
++    write_failure "build of $target"
++    exit 1
++fi
++
++python3 - "$build_dir/bin/$target" "$output_path" <<'PY'
++import os
++import subprocess
++import sys
++import tempfile
++import xml.etree.ElementTree as ET
++
++binary, out = sys.argv[1], sys.argv[2]
++listing = subprocess.run([binary, "--gtest_list_tests"], capture_output=True, text=True, cwd=os.path.dirname(binary))
++tests = []
++suite = None
++for line in listing.stdout.splitlines():
++    if not line.strip() or line.startswith("Running main"):
++        continue
++    if not line.startswith(" "):
++        suite = line.strip().rstrip(".")
++    else:
++        tests.append((suite, line.strip().split()[0]))
++
++root = ET.Element("testsuites")
++suites = {}
++failed = 0
++workdir = tempfile.mkdtemp()
++for index, (suite_name, test_name) in enumerate(tests):
++    xml_path = os.path.join(workdir, "case%d.xml" % index)
++    try:
++        proc = subprocess.run(
++            [binary, "--gtest_filter=%s.%s" % (suite_name, test_name), "--gtest_output=xml:" + xml_path],
++            capture_output=True, text=True, cwd=os.path.dirname(binary), timeout=300)
++    except subprocess.TimeoutExpired as expired:
++        proc = subprocess.CompletedProcess(expired.cmd, 124, str(expired.stdout or ""), "timed out after 300 s")
++    sys.stdout.write(proc.stdout)
++    sys.stderr.write(proc.stderr)
++    if suite_name not in suites:
++        suites[suite_name] = ET.SubElement(root, "testsuite", name=suite_name)
++    case = None
++    if os.path.exists(xml_path):
++        for element in ET.parse(xml_path).getroot().iter("testcase"):
++            if element.get("name") == test_name:
++                case = element
++    if case is None:
++        case = ET.Element("testcase", name=test_name, classname=suite_name)
++        failure = ET.SubElement(case, "failure", message="test process exited with status %d" % proc.returncode)
++        failure.text = (proc.stdout + proc.stderr)[-8000:]
++    elif proc.returncode != 0 and case.find("failure") is None:
++        failure = ET.SubElement(case, "failure", message="test process exited with status %d" % proc.returncode)
++        failure.text = (proc.stdout + proc.stderr)[-8000:]
++    if case.find("failure") is not None or case.find("error") is not None:
++        failed += 1
++    suites[suite_name].append(case)
++
++if not tests:
++    suite_element = ET.SubElement(root, "testsuite", name="listing")
++    case = ET.SubElement(suite_element, "testcase", name="ListTests", classname="listing")
++    failure = ET.SubElement(case, "failure", message="no tests could be listed")
++    failure.text = (listing.stdout + listing.stderr)[-8000:]
++    failed = 1
++    tests = [("listing", "ListTests")]
++
++for suite_element in root:
++    suite_element.set("tests", str(len(suite_element)))
++root.set("tests", str(len(tests)))
++root.set("failures", str(failed))
++ET.ElementTree(root).write(out, encoding="UTF-8", xml_declaration=True)
++print("%d tests, %d failed" % (len(tests), failed))
++sys.exit(1 if failed else 0)
++PY
++status=$?
++rm -f "$log_file"
++exit $status
+diff --git a/test/gtest/CMakeLists.txt b/test/gtest/CMakeLists.txt
+index 0de6d84..9100d9d 100644
+--- a/test/gtest/CMakeLists.txt
++++ b/test/gtest/CMakeLists.txt
+@@ -37,3 +37,15 @@ add_test(NAME ${TESTNAME}
+ set_target_properties( ${TESTNAME} PROPERTIES
+     RUNTIME_OUTPUT_DIRECTORY
+     ${CMAKE_BINARY_DIR}/bin)
++
++add_executable(tprtree_temporal_test TPRTreeTemporal_48145d.cpp)
++if (SYSTEM_GTEST AND TARGET GTest::gtest_main)
++    target_link_libraries(tprtree_temporal_test PRIVATE spatialindex_c ${SIDX_GTEST_TARGET} GTest::gtest_main)
++elseif (SYSTEM_GTEST)
++    target_link_libraries(tprtree_temporal_test PRIVATE spatialindex_c ${SIDX_GTEST_TARGET} GTest::Main)
++else()
++    target_link_libraries(tprtree_temporal_test PRIVATE spatialindex_c ${SIDX_GTEST_TARGET} gtest_main)
++endif()
++set_target_properties(tprtree_temporal_test PROPERTIES
++    RUNTIME_OUTPUT_DIRECTORY
++    ${CMAKE_BINARY_DIR}/bin)
+diff --git a/test/gtest/TPRTreeTemporal_48145d.cpp b/test/gtest/TPRTreeTemporal_48145d.cpp
+new file mode 100644
+index 0000000..3dccb77
+--- /dev/null
++++ b/test/gtest/TPRTreeTemporal_48145d.cpp
+@@ -0,0 +1,1923 @@
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include <limits>
++#include <map>
++#include <memory>
++#include <set>
++#include <utility>
++#include <vector>
++
++#include <spatialindex/SpatialIndex.h>
++#include <spatialindex/capi/sidx_api.h>
++
++#include "NativeTestSupport.h"
++
++namespace {
++
++using SpatialIndex::id_type;
++
++struct Mover {
++    double lo[2];
++    double hi[2];
++    double vlo[2];
++    double vhi[2];
++    double ref;
++    double stop;
++};
++
++const double kNoStop = std::numeric_limits<double>::max();
++
++Mover pointMover(double ref, double x, double y, double vx, double vy) {
++    Mover m = {{x, y}, {x, y}, {vx, vy}, {vx, vy}, ref, kNoStop};
++    return m;
++}
++
++Mover boxMover(double ref, double x0, double y0, double x1, double y1, double vx, double vy) {
++    Mover m = {{x0, y0}, {x1, y1}, {vx, vy}, {vx, vy}, ref, kNoStop};
++    return m;
++}
++
++Mover stretchMover(double ref, double x0, double y0, double x1, double y1,
++                   double vlx, double vly, double vhx, double vhy) {
++    Mover m = {{x0, y0}, {x1, y1}, {vlx, vly}, {vhx, vhy}, ref, kNoStop};
++    return m;
++}
++
++Mover stopping(Mover m, double stop) {
++    m.stop = stop;
++    return m;
++}
++
++double moverLow(const Mover& m, int d, double t) { return m.lo[d] + m.vlo[d] * (std::min(t, m.stop) - m.ref); }
++double moverHigh(const Mover& m, int d, double t) { return m.hi[d] + m.vhi[d] * (std::min(t, m.stop) - m.ref); }
++double moverVLow(const Mover& m, int d, double t) { return (t < m.stop) ? m.vlo[d] : 0.0; }
++double moverVHigh(const Mover& m, int d, double t) { return (t < m.stop) ? m.vhi[d] : 0.0; }
++
++std::vector<double> motionPieces(const std::vector<Mover>& boxes, double t0, double t1) {
++    std::vector<double> pieces;
++    pieces.push_back(t0);
++    for (size_t i = 0; i < boxes.size(); ++i) {
++        if (boxes[i].stop > t0 && boxes[i].stop < t1) pieces.push_back(boxes[i].stop);
++    }
++    pieces.push_back(t1);
++    std::sort(pieces.begin(), pieces.end());
++    pieces.erase(std::unique(pieces.begin(), pieces.end()), pieces.end());
++    if (pieces.size() < 2) pieces.push_back(t1);
++    return pieces;
++}
++
++double distanceAt(const Mover& a, const Mover& b, double t) {
++    double sum = 0.0;
++    for (int d = 0; d < 2; ++d) {
++        double gap = std::max(0.0, std::max(moverLow(b, d, t) - moverHigh(a, d, t), moverLow(a, d, t) - moverHigh(b, d, t)));
++        sum += gap * gap;
++    }
++    return std::sqrt(sum);
++}
++
++double oracleDistance(const Mover& query, const Mover& entry, double t0, double t1) {
++    std::vector<Mover> boxes;
++    boxes.push_back(query);
++    boxes.push_back(entry);
++    std::vector<double> pieces = motionPieces(boxes, t0, t1);
++
++    double best = std::numeric_limits<double>::max();
++    for (size_t p = 1; p < pieces.size(); ++p) {
++        double lo = pieces[p - 1];
++        double hi = pieces[p];
++        best = std::min(best, std::min(distanceAt(query, entry, lo), distanceAt(query, entry, hi)));
++        for (int i = 0; i < 300; ++i) {
++            double m1 = lo + (hi - lo) / 3.0;
++            double m2 = hi - (hi - lo) / 3.0;
++            if (distanceAt(query, entry, m1) <= distanceAt(query, entry, m2)) hi = m2;
++            else lo = m1;
++        }
++        best = std::min(best, distanceAt(query, entry, (lo + hi) / 2.0));
++    }
++    return best;
++}
++
++class Scene {
++public:
++    explicit Scene(uint32_t capacity = 20, double horizon = 20.0)
++        : storage(sidx_test::memoryStorage()) {
++        tree.reset(SpatialIndex::TPRTree::createNewTPRTree(
++            *storage, 0.7, capacity, capacity, 2, SpatialIndex::TPRTree::TPRV_RSTAR, horizon, identifier));
++    }
++
++    void reopen() {
++        tree.reset();
++        tree.reset(SpatialIndex::TPRTree::loadTPRTree(*storage, identifier));
++    }
++
++    id_type identifier;
++
++    void insert(id_type id, const Mover& m) {
++        SpatialIndex::MovingRegion r(m.lo, m.hi, m.vlo, m.vhi, m.ref, m.stop, 2);
++        tree->insertData(0, nullptr, r, id);
++        movers[id] = m;
++    }
++
++    std::unique_ptr<SpatialIndex::IStorageManager> storage;
++    std::unique_ptr<SpatialIndex::ISpatialIndex> tree;
++    std::map<id_type, Mover> movers;
++};
++
++SpatialIndex::MovingRegion movingBox(const Mover& m, double t0, double t1) {
++    return SpatialIndex::MovingRegion(m.lo, m.hi, m.vlo, m.vhi, t0, t1, 2);
++}
++
++SpatialIndex::MovingPoint movingPoint(double x, double y, double vx, double vy, double t0, double t1) {
++    double p[2] = {x, y};
++    double v[2] = {vx, vy};
++    return SpatialIndex::MovingPoint(p, v, t0, t1, 2);
++}
++
++SpatialIndex::TimePoint timePoint(double x, double y, double t0, double t1) {
++    double p[2] = {x, y};
++    return SpatialIndex::TimePoint(p, t0, t1, 2);
++}
++
++SpatialIndex::TimeRegion timeBox(double x0, double y0, double x1, double y1, double t0, double t1) {
++    double lo[2] = {x0, y0};
++    double hi[2] = {x1, y1};
++    return SpatialIndex::TimeRegion(lo, hi, t0, t1, 2);
++}
++
++std::vector<id_type> sorted(std::vector<id_type> ids) {
++    std::sort(ids.begin(), ids.end());
++    return ids;
++}
++
++std::vector<id_type> ids(std::initializer_list<id_type> list) {
++    return sorted(std::vector<id_type>(list));
++}
++
++std::set<std::pair<id_type, id_type> > normalisedPairs(const sidx_test::IdVisitor& visitor) {
++    std::set<std::pair<id_type, id_type> > out;
++    for (size_t i = 0; i < visitor.pairs.size(); ++i) {
++        id_type a = visitor.pairs[i].first;
++        id_type b = visitor.pairs[i].second;
++        out.insert(std::make_pair(std::min(a, b), std::max(a, b)));
++    }
++    return out;
++}
++
++std::vector<id_type> oracleNearest(const Scene& scene, const Mover& query, double t0, double t1, uint32_t k, double* kth) {
++    std::vector<std::pair<double, id_type> > all;
++    for (std::map<id_type, Mover>::const_iterator it = scene.movers.begin(); it != scene.movers.end(); ++it) {
++        all.push_back(std::make_pair(oracleDistance(query, it->second, t0, t1), it->first));
++    }
++    std::sort(all.begin(), all.end());
++    std::vector<id_type> out;
++    for (size_t i = 0; i < all.size() && i < k; ++i) out.push_back(all[i].second);
++    *kth = all[std::min<size_t>(k, all.size()) - 1].first;
++    EXPECT_GT(all[k].first - all[k - 1].first, 1e-6);
++    return sorted(out);
++}
++
++struct Window {
++    double lo;
++    double hi;
++    double flatMargin;
++};
++
++void requireNonPositive(double valueAtStart, double rate, double t0, Window& w) {
++    if (rate == 0.0) {
++        w.flatMargin = std::min(w.flatMargin, std::fabs(valueAtStart));
++        if (valueAtStart > 0.0) w.hi = -std::numeric_limits<double>::max();
++        return;
++    }
++    double root = t0 - valueAtStart / rate;
++    if (rate > 0.0) w.hi = std::min(w.hi, root);
++    else w.lo = std::max(w.lo, root);
++}
++
++bool overlapAtInstant(const std::vector<Mover>& boxes, double t, double* margin) {
++    bool ok = true;
++    *margin = std::numeric_limits<double>::max();
++    for (size_t i = 0; i < boxes.size(); ++i) {
++        for (size_t j = 0; j < boxes.size(); ++j) {
++            if (i == j) continue;
++            for (int d = 0; d < 2; ++d) {
++                double value = moverLow(boxes[i], d, t) - moverHigh(boxes[j], d, t);
++                *margin = std::min(*margin, std::fabs(value));
++                if (value > 0.0) ok = false;
++            }
++        }
++    }
++    return ok;
++}
++
++bool sameInstantOverlap(const std::vector<Mover>& boxes, double t0, double t1, double* margin) {
++    if (t0 == t1) return overlapAtInstant(boxes, t0, margin);
++
++    std::vector<double> pieces = motionPieces(boxes, t0, t1);
++    bool found = false;
++    *margin = std::numeric_limits<double>::max();
++
++    for (size_t p = 1; p < pieces.size(); ++p) {
++        double first = pieces[p - 1];
++        double last = pieces[p];
++        double probe = (first + last) / 2.0;
++
++        Window w = {first, last, std::numeric_limits<double>::max()};
++        for (size_t i = 0; i < boxes.size(); ++i) {
++            for (size_t j = 0; j < boxes.size(); ++j) {
++                if (i == j) continue;
++                for (int d = 0; d < 2; ++d) {
++                    requireNonPositive(moverLow(boxes[i], d, first) - moverHigh(boxes[j], d, first),
++                                       moverVLow(boxes[i], d, probe) - moverVHigh(boxes[j], d, probe), first, w);
++                }
++            }
++        }
++        double span = w.hi - w.lo;
++        *margin = std::min(*margin, std::min(std::fabs(span), w.flatMargin));
++        if (span >= 0.0) found = true;
++    }
++    return found;
++}
++
++bool containedThroughout(const Mover& query, const Mover& entry, double t0, double t1, double* margin) {
++    bool inside = true;
++    *margin = std::numeric_limits<double>::max();
++    std::vector<Mover> boxes;
++    boxes.push_back(query);
++    boxes.push_back(entry);
++    std::vector<double> times = motionPieces(boxes, t0, t1);
++    for (size_t i = 0; i < times.size(); ++i) {
++        for (int d = 0; d < 2; ++d) {
++            double below = moverLow(entry, d, times[i]) - moverLow(query, d, times[i]);
++            double above = moverHigh(query, d, times[i]) - moverHigh(entry, d, times[i]);
++            *margin = std::min(*margin, std::min(std::fabs(below), std::fabs(above)));
++            if (below < 0.0 || above < 0.0) inside = false;
++        }
++    }
++    return inside;
++}
++
++double nextValue(uint64_t& state, double lo, double hi) {
++    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
++    return lo + (hi - lo) * static_cast<double>((state >> 33) % 10001) / 10000.0;
++}
++
++void fillStoppingScene(Scene& scene, id_type count, uint64_t seed, double spread, double speed) {
++    uint64_t state = seed;
++    for (id_type id = 1; id <= count; ++id) {
++        double ref = static_cast<double>(id - 1) * 0.05;
++        double x = nextValue(state, -spread, spread);
++        double y = nextValue(state, -spread, spread);
++        double w = nextValue(state, 0.5, 3.0);
++        double h = nextValue(state, 0.5, 3.0);
++        double vx = nextValue(state, -speed, speed);
++        double vy = nextValue(state, -speed, speed);
++        double stop = (id % 3 == 0) ? kNoStop : ref + nextValue(state, 1.0, 9.0);
++        scene.insert(id, stopping(boxMover(ref, x, y, x + w, y + h, vx, vy), stop));
++    }
++}
++
++void fillStretchingScene(Scene& scene, id_type count, uint64_t seed, double spread, double speed) {
++    uint64_t state = seed;
++    for (id_type id = 1; id <= count; ++id) {
++        double ref = static_cast<double>(id - 1) * 0.05;
++        double x = nextValue(state, -spread, spread);
++        double y = nextValue(state, -spread, spread);
++        double w = nextValue(state, 0.5, 3.0);
++        double h = nextValue(state, 0.5, 3.0);
++        double vlx = nextValue(state, -speed, speed);
++        double vly = nextValue(state, -speed, speed);
++        double vhx = vlx + nextValue(state, 0.1, speed);
++        double vhy = vly + nextValue(state, 0.1, speed);
++        scene.insert(id, stretchMover(ref, x, y, x + w, y + h, vlx, vly, vhx, vhy));
++    }
++}
++
++void fillRandomScene(Scene& scene, id_type count, uint64_t seed, double spread, double speed) {
++    uint64_t state = seed;
++    for (id_type id = 1; id <= count; ++id) {
++        double ref = static_cast<double>(id - 1) * 0.05;
++        double x = nextValue(state, -spread, spread);
++        double y = nextValue(state, -spread, spread);
++        double w = (id % 2 == 0) ? nextValue(state, 0.5, 3.0) : 0.0;
++        double h = (id % 2 == 0) ? nextValue(state, 0.5, 3.0) : 0.0;
++        double vx = nextValue(state, -speed, speed);
++        double vy = nextValue(state, -speed, speed);
++        scene.insert(id, boxMover(ref, x, y, x + w, y + h, vx, vy));
++    }
++}
++
++std::vector<id_type> oracleIntersecting(const Scene& scene, const Mover& query, double t0, double t1) {
++    std::vector<id_type> out;
++    for (std::map<id_type, Mover>::const_iterator it = scene.movers.begin(); it != scene.movers.end(); ++it) {
++        std::vector<Mover> boxes;
++        boxes.push_back(query);
++        boxes.push_back(it->second);
++        double margin = 0.0;
++        if (sameInstantOverlap(boxes, t0, t1, &margin)) out.push_back(it->first);
++        EXPECT_GT(margin, 1e-6) << "ambiguous fixture entry " << it->first;
++    }
++    return sorted(out);
++}
++
++std::vector<id_type> oracleContained(const Scene& scene, const Mover& query, double t0, double t1) {
++    std::vector<id_type> out;
++    for (std::map<id_type, Mover>::const_iterator it = scene.movers.begin(); it != scene.movers.end(); ++it) {
++        double margin = 0.0;
++        if (containedThroughout(query, it->second, t0, t1, &margin)) out.push_back(it->first);
++        EXPECT_GT(margin, 1e-6) << "ambiguous fixture entry " << it->first;
++    }
++    return sorted(out);
++}
++
++std::vector<id_type> intersecting(Scene& scene, const SpatialIndex::IShape& query) {
++    sidx_test::IdVisitor visitor;
++    scene.tree->intersectsWithQuery(query, visitor);
++    return sorted(visitor.ids);
++}
++
++std::vector<id_type> contained(Scene& scene, const SpatialIndex::IShape& query) {
++    sidx_test::IdVisitor visitor;
++    scene.tree->containsWhatQuery(query, visitor);
++    return sorted(visitor.ids);
++}
++
++std::vector<id_type> located(Scene& scene, const SpatialIndex::Point& query) {
++    sidx_test::IdVisitor visitor;
++    scene.tree->pointLocationQuery(query, visitor);
++    return sorted(visitor.ids);
++}
++
++template <typename Shape>
++Shape atInstant(Shape shape, double t) {
++    shape.setBounds(t, t);
++    return shape;
++}
++
++class TimedBox : public SpatialIndex::Region, public SpatialIndex::ITimeShape {
++public:
++    TimedBox(const double* low, const double* high, double first, double last)
++        : SpatialIndex::Region(low, high, 2), begins(first), ends(last) {}
++
++    double getLowerBound() const override { return begins; }
++    double getUpperBound() const override { return ends; }
++    void setBounds(double first, double last) override { begins = first; ends = last; }
++    bool intersectsInterval(const Tools::IInterval& other) const override {
++        return begins <= other.getUpperBound() && other.getLowerBound() <= ends;
++    }
++    bool intersectsInterval(Tools::IntervalType, const double first, const double last) const override {
++        return begins <= last && first <= ends;
++    }
++    bool containsInterval(const Tools::IInterval& other) const override {
++        return begins <= other.getLowerBound() && other.getUpperBound() <= ends;
++    }
++    Tools::IntervalType getIntervalType() const override { return Tools::IT_RIGHTOPEN; }
++
++    bool intersectsShapeInTime(const SpatialIndex::ITimeShape&) const override { return false; }
++    bool intersectsShapeInTime(const Tools::IInterval&, const SpatialIndex::ITimeShape&) const override { return false; }
++    bool containsShapeInTime(const SpatialIndex::ITimeShape&) const override { return false; }
++    bool containsShapeInTime(const Tools::IInterval&, const SpatialIndex::ITimeShape&) const override { return false; }
++    bool touchesShapeInTime(const SpatialIndex::ITimeShape&) const override { return false; }
++    bool touchesShapeInTime(const Tools::IInterval&, const SpatialIndex::ITimeShape&) const override { return false; }
++    double getAreaInTime() const override { return 0.0; }
++    double getAreaInTime(const Tools::IInterval&) const override { return 0.0; }
++    double getIntersectingAreaInTime(const SpatialIndex::ITimeShape&) const override { return 0.0; }
++    double getIntersectingAreaInTime(const Tools::IInterval&, const SpatialIndex::ITimeShape&) const override { return 0.0; }
++
++    double begins;
++    double ends;
++};
++
++class BandedComparator : public SpatialIndex::INearestNeighborComparator {
++public:
++    double getMinimumDistance(const SpatialIndex::IShape&, const SpatialIndex::IShape&) override {
++        return 0.0;
++    }
++
++    double getMinimumDistance(const SpatialIndex::IShape&, const SpatialIndex::IData& data) override {
++        id_type id = data.getIdentifier();
++        if (id <= 2) return 1.0;
++        if (id <= 4) return 5.0;
++        return 9.0;
++    }
++};
++
++class ScaledIdComparator : public SpatialIndex::INearestNeighborComparator {
++public:
++    double getMinimumDistance(const SpatialIndex::IShape&, const SpatialIndex::IShape&) override {
++        return 0.0;
++    }
++
++    double getMinimumDistance(const SpatialIndex::IShape&, const SpatialIndex::IData& data) override {
++        return 100.0 - static_cast<double>(data.getIdentifier());
++    }
++};
++
++class CountingComparator : public SpatialIndex::INearestNeighborComparator {
++public:
++    double getMinimumDistance(const SpatialIndex::IShape&, const SpatialIndex::IShape&) override {
++        ++shapeCalls;
++        return 0.0;
++    }
++
++    double getMinimumDistance(const SpatialIndex::IShape&, const SpatialIndex::IData& data) override {
++        ++dataCalls;
++        return 100.0 - static_cast<double>(data.getIdentifier());
++    }
++
++    size_t shapeCalls{0};
++    size_t dataCalls{0};
++};
++
++class PairArityVisitor : public SpatialIndex::IVisitor {
++public:
++    void visitNode(const SpatialIndex::INode&) override {}
++
++    void visitData(const SpatialIndex::IData&) override { ++singles; }
++
++    void visitData(std::vector<const SpatialIndex::IData*>& data) override {
++        sizes.push_back(data.size());
++        if (data.size() >= 2) {
++            id_type a = data[0]->getIdentifier();
++            id_type b = data[1]->getIdentifier();
++            pairs.insert(std::make_pair(std::min(a, b), std::max(a, b)));
++        }
++    }
++
++    size_t singles{0};
++    std::vector<size_t> sizes;
++    std::set<std::pair<id_type, id_type> > pairs;
++};
++
++}
++
++TEST(TPRTreeTemporalQueries, NearestUsesTheClosestApproachInsideTheInterval) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, -10.0, 3.0, 2.0, 0.0));
++    scene.insert(2, pointMover(0.0, 4.0, 0.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    SpatialIndex::TimePoint query = timePoint(0.0, 0.0, 0.0, 10.0);
++    double d = scene.tree->nearestNeighborQuery(1, query, visitor);
++
++    EXPECT_EQ(ids({1}), sorted(visitor.ids));
++    EXPECT_NEAR(3.0, d, 1e-9);
++}
++
++TEST(TPRTreeTemporalQueries, EveryDimensionMustBeCloseAtTheSameInstant) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, -5.0, -2.0, 1.0, 1.0));
++    scene.insert(2, pointMover(0.0, 1.5, 0.0, 0.0, 0.0));
++    scene.insert(3, pointMover(0.0, 0.0, 2.5, 0.0, 0.0));
++
++    SpatialIndex::TimePoint query = timePoint(0.0, 0.0, 0.0, 10.0);
++
++    sidx_test::IdVisitor first;
++    double d1 = scene.tree->nearestNeighborQuery(1, query, first);
++    EXPECT_EQ(ids({2}), sorted(first.ids));
++    EXPECT_NEAR(1.5, d1, 1e-9);
++
++    sidx_test::IdVisitor second;
++    double d2 = scene.tree->nearestNeighborQuery(2, query, second);
++    EXPECT_EQ(ids({1, 2}), sorted(second.ids));
++    EXPECT_NEAR(std::sqrt(4.5), d2, 1e-9);
++}
++
++TEST(TPRTreeTemporalQueries, EntriesMoveFromTheTimeTheyWereInserted) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 6.5, 0.0, -1.0, 0.0));
++    scene.insert(2, pointMover(4.0, 4.0, 0.0, -1.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    SpatialIndex::TimePoint query = timePoint(0.0, 0.0, 5.0, 5.0);
++    double d = scene.tree->nearestNeighborQuery(1, query, visitor);
++
++    EXPECT_EQ(ids({1}), sorted(visitor.ids));
++    EXPECT_NEAR(1.5, d, 1e-9);
++}
++
++TEST(TPRTreeTemporalQueries, MovingQueryBoxAgainstMovingEntries) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, 10.0, 0.0, 11.0, 1.0, 0.0, 0.0));
++    scene.insert(2, boxMover(0.0, 0.0, 6.0, 1.0, 7.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    Mover q = boxMover(1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0);
++    SpatialIndex::MovingRegion query = movingBox(q, 1.0, 6.0);
++    double d = scene.tree->nearestNeighborQuery(1, query, visitor);
++
++    EXPECT_EQ(ids({1}), sorted(visitor.ids));
++    EXPECT_NEAR(4.0, d, 1e-9);
++}
++
++TEST(TPRTreeTemporalQueries, NearestMatchesExhaustiveSearchOnADeepTree) {
++    Scene scene(4);
++    uint64_t state = 12345;
++    for (id_type id = 1; id <= 60; ++id) {
++        double v[4];
++        for (int i = 0; i < 4; ++i) {
++            state = state * 6364136223846793005ULL + 1442695040888963407ULL;
++            v[i] = static_cast<double>((state >> 33) % 2001) / 100.0 - 10.0;
++        }
++        scene.insert(id, pointMover(0.0, v[0] * 5.0, v[1] * 5.0, v[2] / 4.0, v[3] / 4.0));
++    }
++
++    Mover q = pointMover(2.0, 5.0, -3.0, -1.5, 2.0);
++    for (uint32_t k = 1; k <= 7; k += 3) {
++        sidx_test::IdVisitor visitor;
++        SpatialIndex::MovingPoint query = movingPoint(5.0, -3.0, -1.5, 2.0, 2.0, 9.0);
++        double d = scene.tree->nearestNeighborQuery(k, query, visitor);
++        double kth = 0.0;
++        EXPECT_EQ(oracleNearest(scene, q, 2.0, 9.0, k, &kth), sorted(visitor.ids)) << "k=" << k;
++        EXPECT_NEAR(kth, d, 1e-7) << "k=" << k;
++    }
++}
++
++TEST(TPRTreeTemporalQueries, EntriesTiedWithTheKthDistanceAreAllReported) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 3.0, 0.0, 0.0, 0.0));
++    scene.insert(2, pointMover(0.0, 0.0, 3.0, 0.0, 0.0));
++    scene.insert(3, pointMover(0.0, -3.0, 0.0, 0.0, 0.0));
++    scene.insert(4, pointMover(0.0, 5.0, 0.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    SpatialIndex::TimePoint query = timePoint(0.0, 0.0, 0.0, 1.0);
++    double d = scene.tree->nearestNeighborQuery(1, query, visitor);
++
++    EXPECT_EQ(ids({1, 2, 3}), sorted(visitor.ids));
++    EXPECT_DOUBLE_EQ(3.0, d);
++}
++
++TEST(TPRTreeTemporalQueries, MaximumDistanceStopsTheSearch) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 3.0, 0.0, 0.0, 0.0));
++    scene.insert(2, pointMover(0.0, 10.0, 0.0, -1.0, 0.0));
++    scene.insert(3, pointMover(0.0, 8.0, 0.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    SpatialIndex::TimePoint query = timePoint(0.0, 0.0, 0.0, 6.0);
++    double d = scene.tree->nearestNeighborQuery(10, query, visitor, 4.5);
++
++    EXPECT_EQ(ids({1, 2}), sorted(visitor.ids));
++    EXPECT_NEAR(4.0, d, 1e-9);
++}
++
++TEST(TPRTreeTemporalQueries, CustomComparatorRanksDataEntries) {
++    Scene scene;
++    for (id_type id = 1; id <= 5; ++id) scene.insert(id, pointMover(0.0, static_cast<double>(id), 0.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    ScaledIdComparator comparator;
++    SpatialIndex::TimePoint query = timePoint(0.0, 0.0, 0.0, 1.0);
++    double d = scene.tree->nearestNeighborQuery(2, query, visitor, comparator);
++
++    EXPECT_EQ(ids({4, 5}), sorted(visitor.ids));
++    EXPECT_DOUBLE_EQ(96.0, d);
++}
++
++TEST(TPRTreeTemporalQueries, SelfJoinNeedsOneInstantInsideTheWindow) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, 0.0, 1.0, 0.5, 1.5, 1.0, 0.0));
++    scene.insert(2, boxMover(0.0, 4.0, 1.0, 4.5, 1.5, -1.0, 0.0));
++    scene.insert(3, boxMover(0.0, 0.0, 3.0, 0.5, 3.5, 3.0, 0.0));
++    scene.insert(4, boxMover(0.0, 10.0, 3.0, 10.5, 3.5, -2.0, 0.0));
++    scene.insert(5, boxMover(0.0, 20.0, 20.0, 20.5, 20.5, 0.0, 0.0));
++    scene.insert(6, boxMover(0.0, 20.2, 20.2, 20.7, 20.7, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    SpatialIndex::TimeRegion window = timeBox(0.0, 0.0, 4.0, 4.0, 0.0, 10.0);
++    scene.tree->selfJoinQuery(window, visitor);
++
++    std::set<std::pair<id_type, id_type> > expected;
++    expected.insert(std::make_pair(1, 2));
++    EXPECT_EQ(expected, normalisedPairs(visitor));
++    EXPECT_EQ(1u, visitor.pairs.size());
++}
++
++TEST(TPRTreeTemporalQueries, QueriesOutsideTheHorizonAreRejected) {
++    Scene scene(20, 10.0);
++    scene.insert(1, pointMover(0.0, 1.0, 1.0, 0.0, 0.0));
++    scene.insert(2, pointMover(3.0, 2.0, 2.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    SpatialIndex::TimePoint early = timePoint(0.0, 0.0, 2.0, 4.0);
++    SpatialIndex::TimePoint late = timePoint(0.0, 0.0, 4.0, 13.0);
++    SpatialIndex::Point untimed;
++    double origin[2] = {0.0, 0.0};
++    untimed = SpatialIndex::Point(origin, 2);
++
++    EXPECT_THROW(scene.tree->nearestNeighborQuery(1, early, visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->nearestNeighborQuery(1, late, visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->nearestNeighborQuery(1, untimed, visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->selfJoinQuery(late, visitor), Tools::IllegalArgumentException);
++}
++
++TEST(TPRTreeTemporalQueries, CApiReturnsTheNearestMovingObjects) {
++    IndexPropertyH props = IndexProperty_Create();
++    IndexProperty_SetIndexType(props, RT_TPRTree);
++    IndexProperty_SetIndexStorage(props, RT_Memory);
++    IndexProperty_SetDimension(props, 2);
++    IndexProperty_SetTPRHorizon(props, 20.0);
++    IndexH index = Index_Create(props);
++    IndexProperty_Destroy(props);
++    ASSERT_TRUE(index != nullptr);
++
++    double lo1[2] = {-10.0, 3.0}, v1[2] = {2.0, 0.0};
++    double lo2[2] = {4.0, 0.0}, v2[2] = {0.0, 0.0};
++    ASSERT_EQ(RT_None, Index_InsertTPData(index, 1, lo1, lo1, v1, v1, 0.0, kNoStop, 2, nullptr, 0));
++    ASSERT_EQ(RT_None, Index_InsertTPData(index, 2, lo2, lo2, v2, v2, 0.0, kNoStop, 2, nullptr, 0));
++
++    double qlo[2] = {0.0, 0.0}, qv[2] = {0.0, 0.0};
++    int64_t* found = nullptr;
++    uint64_t count = 1;
++    EXPECT_EQ(RT_None, Index_TPNearestNeighbors_id(index, qlo, qlo, qv, qv, 0.0, 10.0, 2, &found, &count));
++    ASSERT_EQ(1u, count);
++    EXPECT_EQ(1, found[0]);
++
++    free(found);
++    Index_Destroy(index);
++}
++
++TEST(TPRTreeTemporalQueries, NearestToAStaticQueryBoxMeasuresFromItsEdges) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 10.0, 5.0, -0.5, -1.0));
++    scene.insert(2, pointMover(0.0, 7.0, 1.0, 0.0, 0.0));
++
++    SpatialIndex::TimeRegion query = timeBox(0.0, 0.0, 2.0, 2.0, 0.0, 10.0);
++
++    sidx_test::IdVisitor first;
++    double d1 = scene.tree->nearestNeighborQuery(1, query, first);
++    EXPECT_EQ(ids({1}), sorted(first.ids));
++    EXPECT_NEAR(std::sqrt(24.2), d1, 1e-9);
++
++    sidx_test::IdVisitor both;
++    double d2 = scene.tree->nearestNeighborQuery(2, query, both);
++    EXPECT_EQ(ids({1, 2}), sorted(both.ids));
++    EXPECT_NEAR(5.0, d2, 1e-9);
++}
++
++TEST(TPRTreeTemporalQueries, NearestAtASingleInstantOfAMovingQuery) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 0.0, 0.0, 1.0, 0.0));
++    scene.insert(2, pointMover(0.0, 10.0, 0.0, -1.0, 0.0));
++    scene.insert(3, pointMover(0.0, 3.0, 3.0, 0.0, 0.0));
++
++    SpatialIndex::MovingPoint point = atInstant(movingPoint(5.5, 0.0, 5.0, 0.0, 4.0, 5.0), 4.0);
++    sidx_test::IdVisitor byPoint;
++    double d1 = scene.tree->nearestNeighborQuery(1, point, byPoint);
++    EXPECT_EQ(ids({2}), sorted(byPoint.ids));
++    EXPECT_NEAR(0.5, d1, 1e-9);
++
++    Mover q = boxMover(4.0, 7.0, 2.0, 8.0, 3.0, -1.0, 0.0);
++    SpatialIndex::MovingRegion box = atInstant(movingBox(q, 4.0, 5.0), 4.0);
++    sidx_test::IdVisitor byBox;
++    double d2 = scene.tree->nearestNeighborQuery(2, box, byBox);
++    EXPECT_EQ(ids({1, 2}), sorted(byBox.ids));
++    EXPECT_NEAR(std::sqrt(13.0), d2, 1e-9);
++}
++
++TEST(TPRTreeTemporalQueries, NearestOnADeepTreeWithInsertionTimesAndMaximumDistance) {
++    Scene scene(4);
++    fillRandomScene(scene, 70, 987654321ULL, 40.0, 2.0);
++
++    Mover q = boxMover(3.5, -3.0, -2.0, 4.0, 2.0, 0.0, 0.0);
++    SpatialIndex::TimeRegion query = timeBox(-3.0, -2.0, 4.0, 2.0, 3.5, 9.0);
++
++    std::vector<std::pair<double, id_type> > all;
++    for (std::map<id_type, Mover>::const_iterator it = scene.movers.begin(); it != scene.movers.end(); ++it) {
++        all.push_back(std::make_pair(oracleDistance(q, it->second, 3.5, 9.0), it->first));
++    }
++    std::sort(all.begin(), all.end());
++
++    for (uint32_t k = 1; k <= 9; k += 4) {
++        ASSERT_GT(all[k].first - all[k - 1].first, 1e-6);
++        std::vector<id_type> expected;
++        for (uint32_t i = 0; i < k; ++i) expected.push_back(all[i].second);
++        sidx_test::IdVisitor visitor;
++        double d = scene.tree->nearestNeighborQuery(k, query, visitor);
++        EXPECT_EQ(sorted(expected), sorted(visitor.ids)) << "k=" << k;
++        EXPECT_NEAR(all[k - 1].first, d, 1e-7) << "k=" << k;
++    }
++
++    ASSERT_GT(all[12].first - all[11].first, 1e-4);
++    double limit = (all[11].first + all[12].first) / 2.0;
++    std::vector<id_type> expected;
++    for (size_t i = 0; i < 12; ++i) expected.push_back(all[i].second);
++    sidx_test::IdVisitor limited;
++    double d = scene.tree->nearestNeighborQuery(50, query, limited, limit);
++    EXPECT_EQ(sorted(expected), sorted(limited.ids));
++    EXPECT_NEAR(all[11].first, d, 1e-7);
++}
++
++TEST(TPRTreeTemporalQueries, AnEntryExactlyAtTheMaximumDistanceIsVisited) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 4.0, 0.0, 0.0, 0.0));
++    scene.insert(2, pointMover(0.0, 0.0, 4.5, 0.0, 0.0));
++    scene.insert(3, pointMover(0.0, 0.0, -6.0, 0.0, 1.0));
++    scene.insert(4, pointMover(0.0, -3.0, 0.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    SpatialIndex::TimePoint query = timePoint(0.0, 0.0, 0.0, 2.0);
++    double d = scene.tree->nearestNeighborQuery(10, query, visitor, 4.0);
++
++    EXPECT_EQ(ids({1, 3, 4}), sorted(visitor.ids));
++    EXPECT_DOUBLE_EQ(4.0, d);
++}
++
++TEST(TPRTreeTemporalQueries, NothingVisitedReturnsZero) {
++    Scene empty;
++    sidx_test::IdVisitor none;
++    SpatialIndex::TimePoint query = timePoint(0.0, 0.0, 0.0, 1.0);
++    EXPECT_EQ(0.0, empty.tree->nearestNeighborQuery(3, query, none));
++    EXPECT_TRUE(none.ids.empty());
++
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 6.0, 0.0, 0.0, 0.0));
++    scene.insert(2, pointMover(0.0, 0.0, 7.0, 0.0, 0.0));
++    sidx_test::IdVisitor far;
++    EXPECT_EQ(0.0, scene.tree->nearestNeighborQuery(3, query, far, 5.0));
++    EXPECT_TRUE(far.ids.empty());
++}
++
++TEST(TPRTreeTemporalQueries, ReversedIntervalsAndWrongDimensionsAreRejected) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 1.0, 1.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    SpatialIndex::TimePoint valid = timePoint(0.0, 0.0, 1.0, 2.0);
++    EXPECT_NO_THROW(scene.tree->nearestNeighborQuery(1, valid, visitor));
++    EXPECT_NO_THROW(scene.tree->selfJoinQuery(valid, visitor));
++
++    SpatialIndex::TimePoint reversed = timePoint(0.0, 0.0, 5.0, 3.0);
++    EXPECT_THROW(scene.tree->nearestNeighborQuery(1, reversed, visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->selfJoinQuery(reversed, visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->intersectsWithQuery(reversed, visitor), Tools::IllegalArgumentException);
++
++    double p3[3] = {0.0, 0.0, 0.0};
++    SpatialIndex::TimePoint threeDimensional(p3, 1.0, 2.0, 3);
++    EXPECT_THROW(scene.tree->nearestNeighborQuery(1, threeDimensional, visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->selfJoinQuery(threeDimensional, visitor), Tools::IllegalArgumentException);
++}
++
++TEST(TPRTreeTemporalQueries, StationaryEntriesCanBeInsertedAndDeleted) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, -10.0, 0.0, 1.0, 0.0));
++
++    double boxLow[2] = {3.0, 3.0};
++    double boxHigh[2] = {4.0, 4.0};
++    scene.tree->insertData(0, nullptr, SpatialIndex::TimeRegion(boxLow, boxHigh, 1.0, 2.0, 2), 7);
++    double at[2] = {0.0, 2.0};
++    scene.tree->insertData(0, nullptr, SpatialIndex::TimePoint(at, 1.5, 1.5, 2), 8);
++
++    SpatialIndex::TimePoint query = timePoint(0.0, 0.0, 2.0, 12.0);
++    sidx_test::IdVisitor nearest;
++    double d = scene.tree->nearestNeighborQuery(3, query, nearest);
++    EXPECT_EQ(ids({1, 7, 8}), sorted(nearest.ids));
++    EXPECT_NEAR(std::sqrt(18.0), d, 1e-9);
++
++    SpatialIndex::TimeRegion window = timeBox(-1.0, -1.0, 1.0, 3.0, 2.0, 12.0);
++    EXPECT_EQ(ids({1, 8}), intersecting(scene, window));
++
++    EXPECT_TRUE(scene.tree->deleteData(SpatialIndex::TimePoint(at, 1.5, 3.0, 2), 8));
++    EXPECT_TRUE(scene.tree->deleteData(SpatialIndex::TimeRegion(boxLow, boxHigh, 1.0, 3.0, 2), 7));
++
++    SpatialIndex::TimePoint later = timePoint(0.0, 0.0, 3.0, 12.0);
++    sidx_test::IdVisitor remaining;
++    EXPECT_EQ(0.0, scene.tree->nearestNeighborQuery(3, later, remaining));
++    EXPECT_EQ(ids({1}), sorted(remaining.ids));
++    EXPECT_EQ(ids({1}), intersecting(scene, timeBox(-1.0, -1.0, 1.0, 3.0, 3.0, 12.0)));
++}
++
++TEST(TPRTreeTemporalQueries, SelfJoinMatchesExhaustiveSearchOnADeepTree) {
++    Scene scene(4);
++    fillRandomScene(scene, 60, 24681357ULL, 12.0, 1.5);
++
++    Mover q = boxMover(3.0, -6.0, -6.0, 6.0, 6.0, 1.0, 0.5);
++    SpatialIndex::MovingRegion window = movingBox(q, 3.0, 8.0);
++
++    std::set<std::pair<id_type, id_type> > expected;
++    for (std::map<id_type, Mover>::const_iterator a = scene.movers.begin(); a != scene.movers.end(); ++a) {
++        std::map<id_type, Mover>::const_iterator b = a;
++        for (++b; b != scene.movers.end(); ++b) {
++            std::vector<Mover> boxes;
++            boxes.push_back(q);
++            boxes.push_back(a->second);
++            boxes.push_back(b->second);
++            double margin = 0.0;
++            if (sameInstantOverlap(boxes, 3.0, 8.0, &margin)) expected.insert(std::make_pair(a->first, b->first));
++            ASSERT_GT(margin, 1e-6) << a->first << "," << b->first;
++        }
++    }
++    ASSERT_GT(expected.size(), 10u);
++
++    sidx_test::IdVisitor visitor;
++    scene.tree->selfJoinQuery(window, visitor);
++    EXPECT_EQ(expected, normalisedPairs(visitor));
++    EXPECT_EQ(expected.size(), visitor.pairs.size());
++}
++
++TEST(TPRTreeTemporalQueries, SelfJoinAtASingleInstant) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0));
++    scene.insert(2, boxMover(0.0, 6.0, 0.0, 7.0, 1.0, -0.5, 0.0));
++    scene.insert(3, boxMover(0.0, 0.0, 5.0, 1.0, 6.0, 1.0, 0.0));
++    scene.insert(4, boxMover(0.0, 5.0, 5.0, 6.0, 6.0, -1.0, 0.0));
++
++    sidx_test::IdVisitor atFour;
++    scene.tree->selfJoinQuery(timeBox(0.0, 0.0, 10.0, 10.0, 4.0, 4.0), atFour);
++    std::set<std::pair<id_type, id_type> > expected;
++    expected.insert(std::make_pair(1, 2));
++    EXPECT_EQ(expected, normalisedPairs(atFour));
++    EXPECT_EQ(1u, atFour.pairs.size());
++
++    sidx_test::IdVisitor atPoint;
++    scene.tree->selfJoinQuery(timePoint(2.75, 5.5, 2.25, 2.25), atPoint);
++    expected.clear();
++    expected.insert(std::make_pair(3, 4));
++    EXPECT_EQ(expected, normalisedPairs(atPoint));
++    EXPECT_EQ(1u, atPoint.pairs.size());
++}
++
++TEST(TPRTreeTemporalQueries, SelfJoinIgnoresOverlapOutsideTheInterval) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, 0.0, 5.0, 2.0, 7.0, 1.0, 0.0));
++    scene.insert(2, boxMover(0.0, 1.0, 5.0, 3.0, 7.0, 0.0, 0.0));
++    scene.insert(3, boxMover(0.0, 20.0, 0.0, 21.0, 1.0, -1.0, 0.0));
++    scene.insert(4, boxMover(0.0, 10.0, 0.0, 11.0, 1.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    scene.tree->selfJoinQuery(timeBox(0.0, 0.0, 30.0, 30.0, 4.0, 12.0), visitor);
++    std::set<std::pair<id_type, id_type> > expected;
++    expected.insert(std::make_pair(3, 4));
++    EXPECT_EQ(expected, normalisedPairs(visitor));
++    EXPECT_EQ(1u, visitor.pairs.size());
++}
++
++TEST(TPRTreeTemporalQueries, IntersectionQueriesAcceptEveryTimeShape) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, -5.0, 1.0, 1.0, 0.0));
++    scene.insert(2, boxMover(0.0, 3.0, 3.0, 4.0, 4.0, 0.0, 0.0));
++    scene.insert(3, pointMover(0.0, 50.0, 50.0, 0.0, 0.0));
++
++    EXPECT_EQ(ids({1}), intersecting(scene, timeBox(0.0, 0.0, 2.0, 2.0, 0.0, 10.0)));
++    EXPECT_EQ(ids({2}), intersecting(scene, timePoint(3.5, 3.5, 0.0, 10.0)));
++    EXPECT_EQ(ids({2}), intersecting(scene, movingPoint(0.0, 0.0, 0.5, 0.5, 0.0, 10.0)));
++    EXPECT_EQ(ids({1}), intersecting(scene, movingBox(boxMover(0.0, -1.0, 0.0, 0.0, 2.0, 0.0, 0.0), 0.0, 10.0)));
++    EXPECT_EQ(ids({2}), intersecting(scene, movingBox(boxMover(0.0, -2.0, 0.0, -1.0, 1.0, 0.5, 0.5), 0.0, 10.0)));
++}
++
++TEST(TPRTreeTemporalQueries, RangeQueriesAtASingleInstant) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, -5.0, 1.0, 1.0, 0.0));
++    scene.insert(2, boxMover(0.0, 3.0, 3.0, 4.0, 4.0, 0.0, 0.0));
++    scene.insert(3, pointMover(0.0, 2.0, 2.0, 0.0, 0.0));
++
++    EXPECT_EQ(ids({1}), intersecting(scene, timeBox(-0.5, 0.5, 0.5, 1.5, 5.0, 5.0)));
++    EXPECT_EQ(std::vector<id_type>(), intersecting(scene, timeBox(-0.5, 0.5, 0.5, 1.5, 4.0, 4.0)));
++    EXPECT_EQ(ids({1, 2, 3}), contained(scene, timeBox(-1.0, -1.0, 5.0, 5.0, 5.0, 5.0)));
++    EXPECT_EQ(ids({2, 3}), contained(scene, timeBox(-1.0, -1.0, 5.0, 5.0, 2.0, 2.0)));
++
++    Mover q = boxMover(5.0, 1.5, 1.5, 2.5, 2.5, 3.0, 0.0);
++    EXPECT_EQ(ids({3}), intersecting(scene, atInstant(movingBox(q, 5.0, 6.0), 5.0)));
++    EXPECT_EQ(ids({3}), contained(scene, atInstant(movingBox(q, 5.0, 6.0), 5.0)));
++}
++
++TEST(TPRTreeTemporalQueries, TouchingAtEitherEndOfTheIntervalCounts) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, 5.0, 0.0, 6.0, 1.0, -1.0, 0.0));
++    scene.insert(2, boxMover(0.0, -3.0, 0.0, 0.0, 1.0, -1.0, 0.0));
++    scene.insert(3, boxMover(0.0, 0.0, 0.0, 1.0, 1.0, 0.25, 0.0));
++    scene.insert(4, boxMover(0.0, 0.0, 5.0, 1.0, 6.0, 0.0, 0.0));
++
++    Mover still = boxMover(0.0, 0.0, 0.0, 2.0, 1.0, 0.0, 0.0);
++    EXPECT_EQ(ids({1, 2, 3}), intersecting(scene, timeBox(0.0, 0.0, 2.0, 1.0, 0.0, 3.0)));
++    EXPECT_EQ(ids({1, 2, 3}), intersecting(scene, movingBox(still, 0.0, 3.0)));
++    EXPECT_EQ(ids({3}), contained(scene, timeBox(0.0, 0.0, 2.0, 1.0, 0.0, 3.0)));
++
++    sidx_test::IdVisitor visitor;
++    double d = scene.tree->nearestNeighborQuery(3, timeBox(0.0, 0.0, 2.0, 1.0, 0.0, 3.0), visitor);
++    EXPECT_EQ(ids({1, 2, 3}), sorted(visitor.ids));
++    EXPECT_EQ(0.0, d);
++}
++
++TEST(TPRTreeTemporalQueries, ContainmentHoldsAtEveryInstant) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 5.0, 5.0, 0.0, 0.0));
++    scene.insert(2, pointMover(0.0, 8.0, 5.0, 1.0, 0.0));
++    scene.insert(3, boxMover(0.0, 1.0, 1.0, 2.0, 2.0, 1.0, 1.0));
++    scene.insert(4, pointMover(0.0, -1.0, 5.0, 1.0, 0.0));
++    scene.insert(5, boxMover(0.0, 0.5, 0.5, 1.5, 1.5, 2.0, 0.0));
++
++    SpatialIndex::TimeRegion square = timeBox(0.0, 0.0, 10.0, 10.0, 0.0, 4.0);
++    EXPECT_EQ(ids({1, 3, 5}), contained(scene, square));
++    EXPECT_EQ(ids({1, 2, 3, 4, 5}), intersecting(scene, square));
++    EXPECT_EQ(ids({1, 2, 3, 5}), contained(scene, timeBox(0.0, 0.0, 10.0, 10.0, 0.5, 0.5)));
++
++    Mover follower = boxMover(0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 0.0);
++    EXPECT_EQ(ids({5}), contained(scene, movingBox(follower, 0.0, 4.0)));
++    EXPECT_EQ(ids({3, 5}), contained(scene, atInstant(movingBox(follower, 0.0, 4.0), 0.0)));
++}
++
++TEST(TPRTreeTemporalQueries, PointLocationUsesTimePoints) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, 0.0, 0.0, 2.0, 2.0, 0.0, 0.0));
++    scene.insert(2, boxMover(0.0, 5.0, 0.0, 6.0, 1.0, -1.0, 0.0));
++
++    EXPECT_EQ(ids({1, 2}), located(scene, timePoint(1.0, 0.5, 0.0, 10.0)));
++    EXPECT_EQ(ids({1}), located(scene, timePoint(1.0, 0.5, 2.0, 2.0)));
++    EXPECT_EQ(ids({1}), located(scene, movingPoint(3.0, 0.5, -1.0, 0.0, 0.0, 10.0)));
++    EXPECT_EQ(ids({2}), located(scene, atInstant(movingPoint(4.5, 0.5, -1.0, 0.0, 1.0, 2.0), 1.0)));
++
++    sidx_test::IdVisitor visitor;
++    double origin[2] = {1.0, 0.5};
++    EXPECT_THROW(scene.tree->pointLocationQuery(SpatialIndex::Point(origin, 2), visitor), Tools::IllegalArgumentException);
++}
++
++TEST(TPRTreeTemporalQueries, RangeQueriesMatchExhaustiveSearchOnADeepTree) {
++    Scene scene(4);
++    fillRandomScene(scene, 80, 1122334455ULL, 25.0, 2.0);
++
++    Mover still = boxMover(4.0, -8.0, -6.0, 6.0, 9.0, 0.0, 0.0);
++    std::vector<id_type> hits = oracleIntersecting(scene, still, 4.0, 9.0);
++    ASSERT_GT(hits.size(), 5u);
++    EXPECT_EQ(hits, intersecting(scene, timeBox(-8.0, -6.0, 6.0, 9.0, 4.0, 9.0)));
++    EXPECT_EQ(oracleContained(scene, still, 4.0, 9.0), contained(scene, timeBox(-8.0, -6.0, 6.0, 9.0, 4.0, 9.0)));
++
++    std::vector<id_type> instantHits = oracleIntersecting(scene, still, 6.5, 6.5);
++    ASSERT_GT(instantHits.size(), 3u);
++    EXPECT_EQ(instantHits, intersecting(scene, timeBox(-8.0, -6.0, 6.0, 9.0, 6.5, 6.5)));
++    EXPECT_EQ(oracleContained(scene, still, 6.5, 6.5), contained(scene, timeBox(-8.0, -6.0, 6.0, 9.0, 6.5, 6.5)));
++
++    Mover sweep = boxMover(4.0, -20.0, -3.0, -12.0, 3.0, 4.0, 0.5);
++    EXPECT_EQ(oracleIntersecting(scene, sweep, 4.0, 10.0), intersecting(scene, movingBox(sweep, 4.0, 10.0)));
++    EXPECT_EQ(oracleContained(scene, sweep, 4.0, 10.0), contained(scene, movingBox(sweep, 4.0, 10.0)));
++    Mover sweepAtSeven = boxMover(7.0, -8.0, -1.5, 0.0, 4.5, 4.0, 0.5);
++    EXPECT_EQ(oracleIntersecting(scene, sweep, 7.0, 7.0), intersecting(scene, atInstant(movingBox(sweepAtSeven, 7.0, 8.0), 7.0)));
++
++    Mover probe = pointMover(4.0, 1.0, 1.0, -1.5, 0.75);
++    EXPECT_EQ(oracleIntersecting(scene, probe, 4.0, 12.0), located(scene, movingPoint(1.0, 1.0, -1.5, 0.75, 4.0, 12.0)));
++}
++
++TEST(TPRTreeTemporalQueries, RangeQueriesRejectShapesWithoutTime) {
++    Scene scene(20, 10.0);
++    scene.insert(1, pointMover(0.0, 1.0, 1.0, 0.0, 0.0));
++    scene.insert(2, pointMover(2.0, 2.0, 2.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    EXPECT_NO_THROW(scene.tree->intersectsWithQuery(timeBox(0.0, 0.0, 3.0, 3.0, 2.0, 11.5), visitor));
++    EXPECT_EQ(ids({1, 2}), sorted(visitor.ids));
++
++    double lo[2] = {0.0, 0.0};
++    double hi[2] = {3.0, 3.0};
++    EXPECT_THROW(scene.tree->intersectsWithQuery(SpatialIndex::Region(lo, hi, 2), visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->containsWhatQuery(SpatialIndex::Region(lo, hi, 2), visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->containsWhatQuery(timeBox(0.0, 0.0, 3.0, 3.0, 1.0, 4.0), visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->intersectsWithQuery(timeBox(0.0, 0.0, 3.0, 3.0, 2.0, 12.0), visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->pointLocationQuery(timePoint(1.0, 1.0, 4.0, 3.0), visitor), Tools::IllegalArgumentException);
++}
++
++TEST(TPRTreeTemporalQueries, CApiAcceptsASingleInstant) {
++    IndexPropertyH props = IndexProperty_Create();
++    IndexProperty_SetIndexType(props, RT_TPRTree);
++    IndexProperty_SetIndexStorage(props, RT_Memory);
++    IndexProperty_SetDimension(props, 2);
++    IndexProperty_SetTPRHorizon(props, 20.0);
++    IndexH index = Index_Create(props);
++    IndexProperty_Destroy(props);
++    ASSERT_TRUE(index != nullptr);
++
++    double lo1[2] = {-10.0, 0.0}, v1[2] = {2.0, 0.0};
++    double lo2[2] = {3.0, 0.0}, v2[2] = {0.0, 0.0};
++    ASSERT_EQ(RT_None, Index_InsertTPData(index, 1, lo1, lo1, v1, v1, 0.0, kNoStop, 2, nullptr, 0));
++    ASSERT_EQ(RT_None, Index_InsertTPData(index, 2, lo2, lo2, v2, v2, 0.0, kNoStop, 2, nullptr, 0));
++
++    double qlo[2] = {-1.0, -1.0}, qhi[2] = {1.0, 1.0}, qv[2] = {0.0, 0.0};
++    int64_t* found = nullptr;
++    uint64_t count = 0;
++    EXPECT_EQ(RT_None, Index_TPIntersects_id(index, qlo, qhi, qv, qv, 5.0, 5.0, 2, &found, &count));
++    ASSERT_EQ(1u, count);
++    EXPECT_EQ(1, found[0]);
++    free(found);
++
++    uint64_t hits = 0;
++    EXPECT_EQ(RT_None, Index_TPIntersects_count(index, qlo, qhi, qv, qv, 4.0, 4.0, 2, &hits));
++    EXPECT_EQ(0u, hits);
++
++    double p[2] = {1.5, 0.0};
++    found = nullptr;
++    count = 1;
++    EXPECT_EQ(RT_None, Index_TPNearestNeighbors_id(index, p, p, qv, qv, 6.0, 6.0, 2, &found, &count));
++    ASSERT_EQ(1u, count);
++    EXPECT_EQ(1, found[0]);
++    free(found);
++
++    Index_Destroy(index);
++}
++
++TEST(TPRTreeTemporalQueries, EntriesWithIdenticalGeometryStillFormAPair) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0));
++    scene.insert(2, boxMover(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0));
++    scene.insert(3, boxMover(0.0, 8.0, 0.0, 9.0, 1.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor joined;
++    scene.tree->selfJoinQuery(timeBox(-1.0, -1.0, 5.0, 5.0, 0.0, 2.0), joined);
++    std::set<std::pair<id_type, id_type> > expected;
++    expected.insert(std::make_pair(1, 2));
++    EXPECT_EQ(expected, normalisedPairs(joined));
++    EXPECT_EQ(1u, joined.pairs.size());
++
++    sidx_test::IdVisitor nearest;
++    double d = scene.tree->nearestNeighborQuery(1, timePoint(3.0, 0.0, 0.0, 2.0), nearest);
++    EXPECT_EQ(ids({1, 2}), sorted(nearest.ids));
++    EXPECT_EQ(0.0, d);
++}
++
++TEST(TPRTreeTemporalQueries, NearestVisitsEntriesInAscendingDistanceOrder) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 1.0, 0.0, 0.0, 0.0));
++    scene.insert(2, pointMover(0.0, 3.0, 0.0, 0.0, 0.0));
++    scene.insert(3, pointMover(0.0, 5.0, 0.0, 0.0, 0.0));
++    scene.insert(4, pointMover(0.0, 0.0, 5.0, 0.0, 0.0));
++    scene.insert(5, pointMover(0.0, 7.0, 0.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    SpatialIndex::TimePoint query = timePoint(0.0, 0.0, 0.0, 2.0);
++    double d = scene.tree->nearestNeighborQuery(3, query, visitor);
++
++    ASSERT_EQ(4u, visitor.ids.size());
++    EXPECT_EQ(1, visitor.ids[0]);
++    EXPECT_EQ(2, visitor.ids[1]);
++    EXPECT_EQ(ids({3, 4}), sorted(std::vector<id_type>(visitor.ids.begin() + 2, visitor.ids.end())));
++    EXPECT_DOUBLE_EQ(5.0, d);
++}
++
++TEST(TPRTreeTemporalQueries, ANonPositiveMaximumDistanceDoesNotRestrictTheSearch) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 3.0, 0.0, 0.0, 0.0));
++    scene.insert(2, pointMover(0.0, 8.0, 0.0, 0.0, 0.0));
++    scene.insert(3, pointMover(0.0, 0.0, 20.0, 0.0, 0.0));
++
++    SpatialIndex::TimePoint query = timePoint(0.0, 0.0, 0.0, 1.0);
++
++    sidx_test::IdVisitor negative;
++    double d = scene.tree->nearestNeighborQuery(2, query, negative, -1.0);
++    EXPECT_EQ(ids({1, 2}), sorted(negative.ids));
++    EXPECT_DOUBLE_EQ(8.0, d);
++
++    sidx_test::IdVisitor unbounded;
++    double z = scene.tree->nearestNeighborQuery(3, query, unbounded, 0.0);
++    EXPECT_EQ(ids({1, 2, 3}), sorted(unbounded.ids));
++    EXPECT_DOUBLE_EQ(20.0, z);
++}
++
++TEST(TPRTreeTemporalQueries, ComparatorSeesIndexEntriesAsShapesAndLeavesAsData) {
++    Scene scene(4);
++    for (id_type id = 1; id <= 12; ++id) scene.insert(id, pointMover(0.0, static_cast<double>(id), 0.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    CountingComparator comparator;
++    SpatialIndex::TimePoint query = timePoint(0.0, 0.0, 0.0, 1.0);
++    double d = scene.tree->nearestNeighborQuery(2, query, visitor, comparator);
++
++    EXPECT_EQ(ids({11, 12}), sorted(visitor.ids));
++    EXPECT_DOUBLE_EQ(89.0, d);
++    EXPECT_GE(comparator.dataCalls, 12u);
++    EXPECT_GT(comparator.shapeCalls, 0u);
++}
++
++TEST(TPRTreeTemporalQueries, MovingShapesCanAskAboutASingleInstant) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 0.0, 0.0, 1.0, 0.0));
++    scene.insert(2, pointMover(0.0, 0.0, 10.0, 1.0, 0.0));
++
++    Mover window = boxMover(4.0, 3.5, -0.5, 4.5, 0.5, 0.0, 0.0);
++    EXPECT_EQ(ids({1}), intersecting(scene, movingBox(window, 4.0, 4.0)));
++
++    sidx_test::IdVisitor nearest;
++    SpatialIndex::MovingPoint instant = movingPoint(4.0, 0.0, 1.0, 0.0, 4.0, 4.0);
++    double d = scene.tree->nearestNeighborQuery(1, instant, nearest);
++    EXPECT_EQ(ids({1}), sorted(nearest.ids));
++    EXPECT_DOUBLE_EQ(0.0, d);
++}
++
++TEST(TPRTreeTemporalQueries, MovingPointEntriesCanBeInsertedAndDeleted) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, -10.0, 0.0, 1.0, 0.0));
++
++    double at[2] = {2.0, 2.0};
++    double vel[2] = {0.0, 1.0};
++    scene.tree->insertData(0, nullptr, SpatialIndex::MovingPoint(at, vel, 1.0, 2.0, 2), 9);
++
++    EXPECT_EQ(ids({9}), intersecting(scene, timeBox(1.5, 2.5, 2.5, 3.5, 2.0, 2.0)));
++    EXPECT_EQ(ids({9}), intersecting(scene, timeBox(1.5, 2.5, 2.5, 3.5, 9.0, 9.0)));
++
++    sidx_test::IdVisitor nearest;
++    double d = scene.tree->nearestNeighborQuery(1, timePoint(2.0, 3.0, 2.0, 2.0), nearest);
++    EXPECT_EQ(ids({9}), sorted(nearest.ids));
++    EXPECT_DOUBLE_EQ(0.0, d);
++
++    EXPECT_TRUE(scene.tree->deleteData(SpatialIndex::MovingPoint(at, vel, 1.0, 3.0, 2), 9));
++    EXPECT_TRUE(intersecting(scene, timeBox(1.5, 2.5, 2.5, 3.5, 3.0, 3.0)).empty());
++}
++
++TEST(TPRTreeTemporalQueries, SelfJoinReportsEachPairAsTwoDataEntries) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, 0.0, 1.0, 0.5, 1.5, 1.0, 0.0));
++    scene.insert(2, boxMover(0.0, 4.0, 1.0, 4.5, 1.5, -1.0, 0.0));
++    scene.insert(3, boxMover(0.0, 0.0, 3.0, 0.5, 3.5, 3.0, 0.0));
++    scene.insert(4, boxMover(0.0, 10.0, 3.0, 10.5, 3.5, -2.0, 0.0));
++    scene.insert(5, boxMover(0.0, 20.0, 20.0, 20.5, 20.5, 0.0, 0.0));
++    scene.insert(6, boxMover(0.0, 20.2, 20.2, 20.7, 20.7, 0.0, 0.0));
++
++    PairArityVisitor visitor;
++    scene.tree->selfJoinQuery(timeBox(0.0, 0.0, 4.0, 4.0, 0.0, 10.0), visitor);
++
++    std::set<std::pair<id_type, id_type> > expected;
++    expected.insert(std::make_pair(1, 2));
++    EXPECT_EQ(expected, visitor.pairs);
++    ASSERT_EQ(1u, visitor.sizes.size());
++    EXPECT_EQ(2u, visitor.sizes[0]);
++    EXPECT_EQ(0u, visitor.singles);
++}
++
++TEST(TPRTreeTemporalQueries, SelfJoinAcceptsAMovingPointQuery) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, -1.0, -1.0, 1.0, 1.0, 1.0, 0.0));
++    scene.insert(2, boxMover(0.0, 4.0, -1.0, 6.0, 1.0, -1.0, 0.0));
++    scene.insert(3, boxMover(0.0, 30.0, 30.0, 31.0, 31.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    scene.tree->selfJoinQuery(movingPoint(0.0, 0.0, 1.0, 0.0, 0.0, 4.0), visitor);
++
++    std::set<std::pair<id_type, id_type> > expected;
++    expected.insert(std::make_pair(1, 2));
++    EXPECT_EQ(expected, normalisedPairs(visitor));
++    EXPECT_EQ(1u, visitor.pairs.size());
++}
++
++TEST(TPRTreeTemporalQueries, SelfJoinCountsBoundaryContactOnly) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0));
++    scene.insert(2, boxMover(0.0, 3.0, 0.0, 4.0, 1.0, -1.0, 0.0));
++    scene.insert(3, boxMover(0.0, 20.0, 0.0, 21.0, 1.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor touching;
++    scene.tree->selfJoinQuery(timeBox(-1.0, -1.0, 5.0, 2.0, 0.0, 1.0), touching);
++    std::set<std::pair<id_type, id_type> > expected;
++    expected.insert(std::make_pair(1, 2));
++    EXPECT_EQ(expected, normalisedPairs(touching));
++
++    sidx_test::IdVisitor apart;
++    scene.tree->selfJoinQuery(timeBox(-1.0, -1.0, 5.0, 2.0, 0.0, 0.9), apart);
++    EXPECT_TRUE(apart.pairs.empty());
++}
++
++TEST(TPRTreeTemporalQueries, CApiReturnsTheNearestMovingObjectsAsItems) {
++    IndexPropertyH props = IndexProperty_Create();
++    IndexProperty_SetIndexType(props, RT_TPRTree);
++    IndexProperty_SetIndexStorage(props, RT_Memory);
++    IndexProperty_SetDimension(props, 2);
++    IndexProperty_SetTPRHorizon(props, 20.0);
++    IndexH index = Index_Create(props);
++    IndexProperty_Destroy(props);
++    ASSERT_TRUE(index != nullptr);
++
++    const char* payload = "mover";
++    double lo1[2] = {-10.0, 3.0}, v1[2] = {2.0, 0.0};
++    double lo2[2] = {4.0, 0.0}, v2[2] = {0.0, 0.0};
++    ASSERT_EQ(RT_None, Index_InsertTPData(index, 1, lo1, lo1, v1, v1, 0.0, kNoStop, 2,
++                                          reinterpret_cast<const uint8_t*>(payload), 6));
++    ASSERT_EQ(RT_None, Index_InsertTPData(index, 2, lo2, lo2, v2, v2, 0.0, kNoStop, 2,
++                                          reinterpret_cast<const uint8_t*>(payload), 6));
++
++    double qlo[2] = {0.0, 0.0}, qv[2] = {0.0, 0.0};
++    IndexItemH* items = nullptr;
++    uint64_t count = 1;
++    ASSERT_EQ(RT_None, Index_TPNearestNeighbors_obj(index, qlo, qlo, qv, qv, 0.0, 10.0, 2, &items, &count));
++    ASSERT_TRUE(items != nullptr);
++    ASSERT_EQ(1u, count);
++    EXPECT_EQ(1, IndexItem_GetID(items[0]));
++
++    Index_DestroyObjResults(items, static_cast<uint32_t>(count));
++    Index_Destroy(index);
++}
++
++TEST(TPRTreeTemporalQueries, CApiAcceptsASingleInstantForObjectsAndMutations) {
++    IndexPropertyH props = IndexProperty_Create();
++    IndexProperty_SetIndexType(props, RT_TPRTree);
++    IndexProperty_SetIndexStorage(props, RT_Memory);
++    IndexProperty_SetDimension(props, 2);
++    IndexProperty_SetTPRHorizon(props, 20.0);
++    IndexH index = Index_Create(props);
++    IndexProperty_Destroy(props);
++    ASSERT_TRUE(index != nullptr);
++
++    const char* payload = "mover";
++    double lo1[2] = {-10.0, 0.0}, v1[2] = {2.0, 0.0};
++    double lo2[2] = {3.0, 0.0}, v2[2] = {0.0, 0.0};
++    ASSERT_EQ(RT_None, Index_InsertTPData(index, 1, lo1, lo1, v1, v1, 0.0, kNoStop, 2,
++                                          reinterpret_cast<const uint8_t*>(payload), 6));
++    ASSERT_EQ(RT_None, Index_InsertTPData(index, 2, lo2, lo2, v2, v2, 5.0, 5.0, 2,
++                                          reinterpret_cast<const uint8_t*>(payload), 6));
++
++    double qlo[2] = {2.5, -0.5}, qhi[2] = {3.5, 0.5}, qv[2] = {0.0, 0.0};
++    uint64_t hits = 0;
++    EXPECT_EQ(RT_None, Index_TPIntersects_count(index, qlo, qhi, qv, qv, 5.0, 5.0, 2, &hits));
++    EXPECT_EQ(1u, hits);
++
++    double p[2] = {2.0, 0.0};
++    IndexItemH* items = nullptr;
++    uint64_t count = 1;
++    ASSERT_EQ(RT_None, Index_TPNearestNeighbors_obj(index, p, p, qv, qv, 6.0, 6.0, 2, &items, &count));
++    ASSERT_TRUE(items != nullptr);
++    ASSERT_EQ(1u, count);
++    EXPECT_EQ(1, IndexItem_GetID(items[0]));
++    Index_DestroyObjResults(items, static_cast<uint32_t>(count));
++
++    ASSERT_EQ(RT_None, Index_DeleteTPData(index, 2, lo2, lo2, v2, v2, 5.0, 5.0, 2));
++
++    hits = 0;
++    EXPECT_EQ(RT_None, Index_TPIntersects_count(index, qlo, qhi, qv, qv, 5.0, 5.0, 2, &hits));
++    EXPECT_EQ(0u, hits);
++
++    Index_Destroy(index);
++}
++
++TEST(TPRTreeTemporalQueries, GrowingEntriesMeetTheQueryWhileTheyAreWideEnough) {
++    Scene scene;
++    scene.insert(1, stretchMover(0.0, -6.0, 0.0, -5.0, 1.0, 0.0, 0.0, 1.0, 0.0));
++    scene.insert(2, stretchMover(0.0, 6.0, 0.0, 7.0, 1.0, -1.5, 0.0, 0.0, 0.0));
++    scene.insert(3, stretchMover(0.0, -1.0, -1.0, 1.0, 1.0, -0.5, -0.5, 0.5, 0.5));
++    scene.insert(4, stretchMover(0.0, 20.0, 20.0, 21.0, 21.0, 0.0, 0.0, 0.1, 0.1));
++
++    Mover window = boxMover(0.0, -2.0, -2.0, 2.0, 2.0, 0.0, 0.0);
++    SpatialIndex::TimeRegion query = timeBox(-2.0, -2.0, 2.0, 2.0, 0.0, 4.0);
++    EXPECT_EQ(oracleIntersecting(scene, window, 0.0, 4.0), intersecting(scene, query));
++    EXPECT_EQ(oracleContained(scene, window, 0.0, 4.0), contained(scene, query));
++
++    SpatialIndex::TimeRegion early = timeBox(-2.0, -2.0, 2.0, 2.0, 0.0, 1.0);
++    EXPECT_EQ(oracleIntersecting(scene, window, 0.0, 1.0), intersecting(scene, early));
++}
++
++TEST(TPRTreeTemporalQueries, NearestToGrowingEntriesUsesTheirNearestEdge) {
++    Scene scene;
++    scene.insert(1, stretchMover(0.0, 8.0, 0.0, 9.0, 1.0, -1.0, 0.0, 0.0, 0.0));
++    scene.insert(2, stretchMover(0.0, 4.0, 6.0, 5.0, 7.0, 0.0, 0.0, 0.5, 0.5));
++    scene.insert(3, stretchMover(0.0, -12.0, 0.0, -11.0, 1.0, 0.0, 0.0, 2.0, 0.0));
++    scene.insert(4, stretchMover(0.0, 0.0, 30.0, 1.0, 31.0, 0.0, 0.0, 0.1, 0.1));
++
++    Mover query = stretchMover(0.0, -0.5, -0.5, 0.5, 0.5, -0.25, 0.0, 0.25, 0.0);
++    double kth = 0.0;
++    std::vector<id_type> expected = oracleNearest(scene, query, 0.0, 4.0, 2, &kth);
++
++    sidx_test::IdVisitor visitor;
++    double d = scene.tree->nearestNeighborQuery(2, movingBox(query, 0.0, 4.0), visitor);
++    EXPECT_EQ(expected, sorted(visitor.ids));
++    EXPECT_NEAR(kth, d, 1e-6);
++}
++
++TEST(TPRTreeTemporalQueries, SelfJoinWithGrowingEntriesNeedsOneCommonInstant) {
++    Scene scene;
++    scene.insert(1, stretchMover(0.0, -4.0, 0.0, -3.0, 1.0, 0.0, 0.0, 1.0, 0.0));
++    scene.insert(2, stretchMover(0.0, 3.0, 0.0, 4.0, 1.0, -1.0, 0.0, 0.0, 0.0));
++    scene.insert(3, stretchMover(0.0, 0.0, 9.0, 1.0, 10.0, 0.0, 0.0, 0.2, 0.0));
++    scene.insert(4, stretchMover(0.0, 40.0, 40.0, 41.0, 41.0, 0.0, 0.0, 0.1, 0.1));
++
++    Mover q = stretchMover(0.0, -5.0, -1.0, 5.0, 2.0, -0.2, 0.0, 0.2, 0.0);
++
++    std::set<std::pair<id_type, id_type> > expected;
++    for (std::map<id_type, Mover>::const_iterator a = scene.movers.begin(); a != scene.movers.end(); ++a) {
++        std::map<id_type, Mover>::const_iterator b = a;
++        for (++b; b != scene.movers.end(); ++b) {
++            std::vector<Mover> boxes;
++            boxes.push_back(q);
++            boxes.push_back(a->second);
++            boxes.push_back(b->second);
++            double margin = 0.0;
++            if (sameInstantOverlap(boxes, 0.0, 4.0, &margin)) expected.insert(std::make_pair(a->first, b->first));
++            ASSERT_GT(margin, 1e-6) << a->first << "," << b->first;
++        }
++    }
++
++    sidx_test::IdVisitor visitor;
++    scene.tree->selfJoinQuery(movingBox(q, 0.0, 4.0), visitor);
++    EXPECT_EQ(expected, normalisedPairs(visitor));
++    EXPECT_EQ(expected.size(), visitor.pairs.size());
++}
++
++TEST(TPRTreeTemporalQueries, RangeQueriesWithAGrowingQueryBoxMatchExhaustiveSearch) {
++    Scene scene(4);
++    fillStretchingScene(scene, 70, 90210111ULL, 20.0, 1.5);
++
++    Mover sweep = stretchMover(4.0, -9.0, -7.0, 5.0, 8.0, -0.75, -0.5, 1.25, 0.5);
++    std::vector<id_type> hits = oracleIntersecting(scene, sweep, 4.0, 9.0);
++    ASSERT_GT(hits.size(), 5u);
++    EXPECT_EQ(hits, intersecting(scene, movingBox(sweep, 4.0, 9.0)));
++    EXPECT_EQ(oracleContained(scene, sweep, 4.0, 9.0), contained(scene, movingBox(sweep, 4.0, 9.0)));
++}
++
++TEST(TPRTreeTemporalQueries, NearestFarInsideTheHorizonMatchesExhaustiveSearch) {
++    Scene scene(4, 40.0);
++    for (id_type id = 1; id <= 10; ++id) {
++        double speed = static_cast<double>(id);
++        scene.insert(id, pointMover(0.0, speed, 0.0, speed, 0.0));
++    }
++
++    Mover query = stretchMover(26.0, 99.0, -1.0, 101.0, 1.0, -0.5, 0.0, 0.5, 0.0);
++    double kth = 0.0;
++    std::vector<id_type> expected = oracleNearest(scene, query, 26.0, 33.0, 3, &kth);
++
++    sidx_test::IdVisitor visitor;
++    double d = scene.tree->nearestNeighborQuery(3, movingBox(query, 26.0, 33.0), visitor);
++    EXPECT_EQ(expected, sorted(visitor.ids));
++    EXPECT_NEAR(kth, d, 1e-6);
++}
++
++TEST(TPRTreeTemporalQueries, ContainmentAcceptsPointQueryShapes) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 2.0, 2.0, 1.0, 0.0));
++    scene.insert(2, pointMover(0.0, 6.0, 6.0, 0.0, 0.0));
++    scene.insert(3, boxMover(0.0, 1.5, 1.5, 2.5, 2.5, 1.0, 0.0));
++
++    EXPECT_EQ(ids({1}), contained(scene, timePoint(2.0, 2.0, 0.0, 0.0)));
++    EXPECT_EQ(ids({2}), contained(scene, timePoint(6.0, 6.0, 0.0, 3.0)));
++    EXPECT_TRUE(contained(scene, timePoint(2.0, 2.0, 0.0, 3.0)).empty());
++    EXPECT_EQ(ids({1}), contained(scene, movingPoint(2.0, 2.0, 1.0, 0.0, 0.0, 3.0)));
++    EXPECT_TRUE(contained(scene, movingPoint(6.0, 6.0, 1.0, 0.0, 0.0, 3.0)).empty());
++}
++
++TEST(TPRTreeTemporalQueries, ContainmentCountsAnEntryFlushWithTheQueryEdge) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, 0.0, 0.0, 2.0, 2.0, 1.0, 0.0));
++    scene.insert(2, boxMover(0.0, 0.0, 0.0, 2.0, 2.0, 5.0, 0.0));
++
++    Mover window = boxMover(0.0, 0.0, 0.0, 6.0, 2.0, 1.0, 0.0);
++    EXPECT_EQ(ids({1}), contained(scene, movingBox(window, 0.0, 2.0)));
++    EXPECT_EQ(ids({1, 2}), contained(scene, atInstant(movingBox(window, 0.0, 2.0), 0.0)));
++}
++
++TEST(TPRTreeTemporalQueries, SelfJoinAcceptsAMovingRegionQuery) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 0.0));
++    scene.insert(2, boxMover(0.0, 3.0, 0.0, 4.0, 1.0, 1.0, 0.0));
++    scene.insert(3, boxMover(0.0, 0.0, 0.0, 1.0, 1.0, -3.0, 0.0));
++
++    Mover window = boxMover(0.0, 2.0, -1.0, 6.0, 2.0, 1.0, 0.0);
++
++    std::set<std::pair<id_type, id_type> > expected;
++    for (std::map<id_type, Mover>::const_iterator a = scene.movers.begin(); a != scene.movers.end(); ++a) {
++        std::map<id_type, Mover>::const_iterator b = a;
++        for (++b; b != scene.movers.end(); ++b) {
++            std::vector<Mover> boxes;
++            boxes.push_back(window);
++            boxes.push_back(a->second);
++            boxes.push_back(b->second);
++            double margin = 0.0;
++            if (sameInstantOverlap(boxes, 0.0, 4.0, &margin)) expected.insert(std::make_pair(a->first, b->first));
++            ASSERT_GT(margin, 1e-6) << a->first << "," << b->first;
++        }
++    }
++
++    sidx_test::IdVisitor visitor;
++    scene.tree->selfJoinQuery(movingBox(window, 0.0, 4.0), visitor);
++    EXPECT_EQ(expected, normalisedPairs(visitor));
++    EXPECT_EQ(expected.size(), visitor.pairs.size());
++}
++
++TEST(TPRTreeTemporalQueries, SelfJoinAcceptsATimePointQuery) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, -2.0, -2.0, 2.0, 2.0, 0.0, 0.0));
++    scene.insert(2, boxMover(0.0, -6.0, -2.0, -4.0, 2.0, 1.0, 0.0));
++    scene.insert(3, boxMover(0.0, 8.0, 8.0, 9.0, 9.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    scene.tree->selfJoinQuery(timePoint(0.0, 0.0, 0.0, 6.0), visitor);
++
++    std::set<std::pair<id_type, id_type> > expected;
++    expected.insert(std::make_pair(1, 2));
++    EXPECT_EQ(expected, normalisedPairs(visitor));
++    EXPECT_EQ(1u, visitor.pairs.size());
++}
++
++TEST(TPRTreeTemporalQueries, PointLocationFollowsAMovingQueryPoint) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, 0.0, -1.0, 2.0, 1.0, 0.0, 0.0));
++    scene.insert(2, boxMover(0.0, 8.0, -1.0, 10.0, 1.0, 0.0, 0.0));
++    scene.insert(3, boxMover(0.0, 0.0, 8.0, 2.0, 10.0, 0.0, 0.0));
++
++    EXPECT_EQ(ids({1, 2}), located(scene, movingPoint(1.0, 0.0, 2.0, 0.0, 0.0, 5.0)));
++    EXPECT_EQ(ids({1}), located(scene, movingPoint(1.0, 0.0, 2.0, 0.0, 0.0, 0.5)));
++    EXPECT_EQ(ids({2}), located(scene, movingPoint(10.0, 0.0, 2.0, 0.0, 4.5, 4.5)));
++}
++
++TEST(TPRTreeTemporalQueries, ContainmentRejectsBadIntervalsAndDimensions) {
++    Scene scene(20, 10.0);
++    scene.insert(1, pointMover(0.0, 1.0, 1.0, 0.0, 0.0));
++    scene.insert(2, pointMover(2.0, 2.0, 2.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    EXPECT_NO_THROW(scene.tree->containsWhatQuery(timeBox(-5.0, -5.0, 5.0, 5.0, 2.0, 11.5), visitor));
++
++    EXPECT_THROW(scene.tree->containsWhatQuery(timeBox(-5.0, -5.0, 5.0, 5.0, 6.0, 4.0), visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->containsWhatQuery(timeBox(-5.0, -5.0, 5.0, 5.0, 1.0, 5.0), visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->containsWhatQuery(timeBox(-5.0, -5.0, 5.0, 5.0, 2.0, 12.0), visitor), Tools::IllegalArgumentException);
++
++    double lo3[3] = {-5.0, -5.0, -5.0};
++    double hi3[3] = {5.0, 5.0, 5.0};
++    EXPECT_THROW(scene.tree->containsWhatQuery(SpatialIndex::TimeRegion(lo3, hi3, 3.0, 5.0, 3), visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->intersectsWithQuery(SpatialIndex::TimeRegion(lo3, hi3, 3.0, 5.0, 3), visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->intersectsWithQuery(SpatialIndex::TimePoint(lo3, 3.0, 5.0, 3), visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->pointLocationQuery(SpatialIndex::TimePoint(lo3, 3.0, 5.0, 3), visitor), Tools::IllegalArgumentException);
++}
++
++TEST(TPRTreeTemporalQueries, SelfJoinRejectsUntimedShapesAndBadIntervals) {
++    Scene scene(20, 10.0);
++    scene.insert(1, pointMover(0.0, 1.0, 1.0, 0.0, 0.0));
++    scene.insert(2, pointMover(2.0, 2.0, 2.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    double lo[2] = {-5.0, -5.0};
++    double hi[2] = {5.0, 5.0};
++    EXPECT_THROW(scene.tree->selfJoinQuery(SpatialIndex::Region(lo, hi, 2), visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->selfJoinQuery(SpatialIndex::Point(lo, 2), visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->selfJoinQuery(timeBox(-5.0, -5.0, 5.0, 5.0, 1.0, 5.0), visitor), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->selfJoinQuery(timeBox(-5.0, -5.0, 5.0, 5.0, 2.0, 12.0), visitor), Tools::IllegalArgumentException);
++}
++
++TEST(TPRTreeTemporalQueries, MoreNeighboursThanEntriesVisitsThemAll) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 3.0, 0.0, 0.0, 0.0));
++    scene.insert(2, pointMover(0.0, 0.0, 6.0, 0.0, 0.0));
++    scene.insert(3, pointMover(0.0, -9.0, 0.0, 0.0, 0.0));
++
++    sidx_test::IdVisitor visitor;
++    double d = scene.tree->nearestNeighborQuery(10, timePoint(0.0, 0.0, 0.0, 1.0), visitor);
++    EXPECT_EQ(ids({1, 2, 3}), sorted(visitor.ids));
++    EXPECT_DOUBLE_EQ(9.0, d);
++}
++
++TEST(TPRTreeTemporalQueries, ComparatorRespectsTheMaximumDistanceAndTies) {
++    Scene scene;
++    for (id_type id = 1; id <= 6; ++id) scene.insert(id, pointMover(0.0, static_cast<double>(id), 0.0, 0.0, 0.0));
++
++    SpatialIndex::TimePoint query = timePoint(0.0, 0.0, 0.0, 1.0);
++
++    sidx_test::IdVisitor tied;
++    BandedComparator first;
++    double a = scene.tree->nearestNeighborQuery(1, query, tied, first);
++    EXPECT_EQ(ids({1, 2}), sorted(tied.ids));
++    EXPECT_DOUBLE_EQ(1.0, a);
++
++    sidx_test::IdVisitor capped;
++    BandedComparator second;
++    double b = scene.tree->nearestNeighborQuery(10, query, capped, second, 5.0);
++    EXPECT_EQ(ids({1, 2, 3, 4}), sorted(capped.ids));
++    EXPECT_DOUBLE_EQ(5.0, b);
++    ASSERT_EQ(4u, capped.ids.size());
++    EXPECT_EQ(ids({1, 2}), sorted(std::vector<id_type>(capped.ids.begin(), capped.ids.begin() + 2)));
++    EXPECT_EQ(ids({3, 4}), sorted(std::vector<id_type>(capped.ids.begin() + 2, capped.ids.end())));
++}
++
++TEST(TPRTreeTemporalQueries, CApiObjectIntersectionAcceptsASingleInstant) {
++    IndexPropertyH props = IndexProperty_Create();
++    IndexProperty_SetIndexType(props, RT_TPRTree);
++    IndexProperty_SetIndexStorage(props, RT_Memory);
++    IndexProperty_SetDimension(props, 2);
++    IndexProperty_SetTPRHorizon(props, 20.0);
++    IndexH index = Index_Create(props);
++    IndexProperty_Destroy(props);
++    ASSERT_TRUE(index != nullptr);
++
++    const char* payload = "mover";
++    double lo1[2] = {-10.0, 0.0}, v1[2] = {2.0, 0.0};
++    double lo2[2] = {40.0, 40.0}, v2[2] = {0.0, 0.0};
++    ASSERT_EQ(RT_None, Index_InsertTPData(index, 1, lo1, lo1, v1, v1, 0.0, kNoStop, 2,
++                                          reinterpret_cast<const uint8_t*>(payload), 6));
++    ASSERT_EQ(RT_None, Index_InsertTPData(index, 2, lo2, lo2, v2, v2, 0.0, kNoStop, 2,
++                                          reinterpret_cast<const uint8_t*>(payload), 6));
++
++    double qlo[2] = {-1.0, -1.0}, qhi[2] = {1.0, 1.0}, qv[2] = {0.0, 0.0};
++    IndexItemH* items = nullptr;
++    uint64_t count = 0;
++    ASSERT_EQ(RT_None, Index_TPIntersects_obj(index, qlo, qhi, qv, qv, 5.0, 5.0, 2, &items, &count));
++    ASSERT_TRUE(items != nullptr);
++    ASSERT_EQ(1u, count);
++    EXPECT_EQ(1, IndexItem_GetID(items[0]));
++    Index_DestroyObjResults(items, static_cast<uint32_t>(count));
++
++    uint64_t hits = 1;
++    EXPECT_EQ(RT_None, Index_TPIntersects_count(index, qlo, qhi, qv, qv, 4.0, 4.0, 2, &hits));
++    EXPECT_EQ(0u, hits);
++
++    Index_Destroy(index);
++}
++
++TEST(TPRTreeTemporalQueries, EntriesStopMovingAtTheEndOfTheirInsertionInterval) {
++    Scene scene;
++    scene.insert(1, stopping(pointMover(0.0, 0.0, 0.0, 1.0, 0.0), 2.0));
++    scene.insert(2, pointMover(0.0, 0.0, 5.0, 1.0, 0.0));
++
++    EXPECT_EQ(ids({1}), intersecting(scene, timeBox(0.5, -0.5, 1.5, 0.5, 1.0, 1.0)));
++    EXPECT_EQ(ids({1}), intersecting(scene, timeBox(1.5, -0.5, 2.5, 0.5, 6.0, 6.0)));
++    EXPECT_TRUE(intersecting(scene, timeBox(5.5, -0.5, 6.5, 0.5, 6.0, 6.0)).empty());
++    EXPECT_EQ(ids({2}), intersecting(scene, timeBox(5.5, 4.5, 6.5, 5.5, 6.0, 6.0)));
++
++    sidx_test::IdVisitor nearest;
++    double d = scene.tree->nearestNeighborQuery(1, timePoint(2.0, 0.0, 6.0, 6.0), nearest);
++    EXPECT_EQ(ids({1}), sorted(nearest.ids));
++    EXPECT_DOUBLE_EQ(0.0, d);
++}
++
++TEST(TPRTreeTemporalQueries, ContainmentSeesAnEntryStopInsideTheInterval) {
++    Scene scene;
++    Mover leaves = stopping(stretchMover(0.0, 0.0, -1.0, 5.0, 1.0, 4.0, 0.0, 4.0, 0.0), 2.0);
++    Mover stays = stopping(stretchMover(0.0, 0.0, -1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0), 2.0);
++    scene.insert(1, leaves);
++    scene.insert(2, stays);
++
++    Mover window = stretchMover(0.0, -50.0, -50.0, 10.0, 50.0, 0.0, 0.0, 1.0, 0.0);
++    EXPECT_EQ(oracleContained(scene, window, 0.0, 4.0), contained(scene, movingBox(window, 0.0, 4.0)));
++    EXPECT_EQ(ids({2}), contained(scene, movingBox(window, 0.0, 4.0)));
++    EXPECT_EQ(ids({1, 2}), contained(scene, movingBox(window, 0.0, 1.0)));
++}
++
++TEST(TPRTreeTemporalQueries, SelfJoinMeetingHappensOnlyAfterAnEntryStops) {
++    Scene scene(20, 40.0);
++    scene.insert(1, boxMover(0.0, -5.0, -1.0, -4.0, 1.0, 1.0, 0.0));
++    scene.insert(2, stopping(boxMover(0.0, 0.0, -1.0, 1.0, 1.0, 5.0, 0.0), 4.0));
++    scene.insert(3, boxMover(0.0, 0.0, 60.0, 1.0, 61.0, 0.0, 0.0));
++
++    Mover window = boxMover(0.0, -10.0, -5.0, 30.0, 5.0, 0.0, 0.0);
++
++    std::set<std::pair<id_type, id_type> > expected;
++    for (std::map<id_type, Mover>::const_iterator a = scene.movers.begin(); a != scene.movers.end(); ++a) {
++        std::map<id_type, Mover>::const_iterator b = a;
++        for (++b; b != scene.movers.end(); ++b) {
++            std::vector<Mover> boxes;
++            boxes.push_back(window);
++            boxes.push_back(a->second);
++            boxes.push_back(b->second);
++            double margin = 0.0;
++            if (sameInstantOverlap(boxes, 0.0, 30.0, &margin)) expected.insert(std::make_pair(a->first, b->first));
++            ASSERT_GT(margin, 1e-6) << a->first << "," << b->first;
++        }
++    }
++
++    sidx_test::IdVisitor joined;
++    scene.tree->selfJoinQuery(timeBox(-10.0, -5.0, 30.0, 5.0, 0.0, 30.0), joined);
++    EXPECT_EQ(expected, normalisedPairs(joined));
++
++    std::set<std::pair<id_type, id_type> > pair12;
++    pair12.insert(std::make_pair(1, 2));
++    EXPECT_EQ(pair12, normalisedPairs(joined));
++
++    sidx_test::IdVisitor early;
++    scene.tree->selfJoinQuery(timeBox(-10.0, -5.0, 30.0, 5.0, 0.0, 20.0), early);
++    EXPECT_TRUE(early.pairs.empty());
++}
++
++TEST(TPRTreeTemporalQueries, NearestUsesTheDistanceAfterAnEntryStops) {
++    Scene scene;
++    Mover halted = stopping(pointMover(0.0, -10.0, 0.0, 1.0, 0.0), 4.0);
++    scene.insert(1, halted);
++    scene.insert(2, pointMover(0.0, 5.0, 0.0, 0.0, 0.0));
++
++    Mover query = pointMover(0.0, 0.0, 0.0, 0.0, 0.0);
++    double kth = 0.0;
++    std::vector<id_type> expected = oracleNearest(scene, query, 0.0, 10.0, 1, &kth);
++
++    sidx_test::IdVisitor nearest;
++    double d = scene.tree->nearestNeighborQuery(1, timePoint(0.0, 0.0, 0.0, 10.0), nearest);
++    EXPECT_EQ(expected, sorted(nearest.ids));
++    EXPECT_EQ(ids({2}), sorted(nearest.ids));
++    EXPECT_NEAR(kth, d, 1e-9);
++    EXPECT_NEAR(5.0, d, 1e-9);
++
++    sidx_test::IdVisitor both;
++    double far = scene.tree->nearestNeighborQuery(2, timePoint(0.0, 0.0, 0.0, 10.0), both);
++    EXPECT_EQ(ids({1, 2}), sorted(both.ids));
++    EXPECT_NEAR(6.0, far, 1e-9);
++}
++
++TEST(TPRTreeTemporalQueries, DeepTreeWithStoppedEntriesMatchesExhaustiveSearch) {
++    Scene scene(4, 40.0);
++    fillStoppingScene(scene, 70, 1357924680ULL, 18.0, 1.5);
++
++    Mover window = boxMover(10.0, -7.0, -6.0, 6.0, 7.0, 0.0, 0.0);
++    std::vector<id_type> hits = oracleIntersecting(scene, window, 10.0, 16.0);
++    ASSERT_GT(hits.size(), 5u);
++    EXPECT_EQ(hits, intersecting(scene, timeBox(-7.0, -6.0, 6.0, 7.0, 10.0, 16.0)));
++    EXPECT_EQ(oracleContained(scene, window, 10.0, 16.0), contained(scene, timeBox(-7.0, -6.0, 6.0, 7.0, 10.0, 16.0)));
++
++    std::vector<id_type> instant = oracleIntersecting(scene, window, 14.0, 14.0);
++    ASSERT_GT(instant.size(), 3u);
++    EXPECT_EQ(instant, intersecting(scene, timeBox(-7.0, -6.0, 6.0, 7.0, 14.0, 14.0)));
++
++    Mover probe = pointMover(10.0, 0.0, 0.0, 0.0, 0.0);
++    double kth = 0.0;
++    std::vector<id_type> near = oracleNearest(scene, probe, 10.0, 16.0, 3, &kth);
++    sidx_test::IdVisitor visitor;
++    double d = scene.tree->nearestNeighborQuery(3, timePoint(0.0, 0.0, 10.0, 16.0), visitor);
++    EXPECT_EQ(near, sorted(visitor.ids));
++    EXPECT_NEAR(kth, d, 1e-6);
++}
++
++TEST(TPRTreeTemporalQueries, CApiEntriesStopAtTheEndOfTheirInsertionInterval) {
++    IndexPropertyH props = IndexProperty_Create();
++    IndexProperty_SetIndexType(props, RT_TPRTree);
++    IndexProperty_SetIndexStorage(props, RT_Memory);
++    IndexProperty_SetDimension(props, 2);
++    IndexProperty_SetTPRHorizon(props, 20.0);
++    IndexH index = Index_Create(props);
++    IndexProperty_Destroy(props);
++    ASSERT_TRUE(index != nullptr);
++
++    const char* payload = "mover";
++    double lo[2] = {0.0, 0.0}, v[2] = {2.0, 0.0};
++    ASSERT_EQ(RT_None, Index_InsertTPData(index, 1, lo, lo, v, v, 0.0, 2.0, 2,
++                                          reinterpret_cast<const uint8_t*>(payload), 6));
++
++    double still[2] = {0.0, 0.0};
++    uint64_t hits = 1;
++    double atStop[2] = {3.5, -0.5}, atStopHigh[2] = {4.5, 0.5};
++    EXPECT_EQ(RT_None, Index_TPIntersects_count(index, atStop, atStopHigh, still, still, 6.0, 6.0, 2, &hits));
++    EXPECT_EQ(1u, hits);
++
++    double kept[2] = {11.5, -0.5}, keptHigh[2] = {12.5, 0.5};
++    hits = 1;
++    EXPECT_EQ(RT_None, Index_TPIntersects_count(index, kept, keptHigh, still, still, 6.0, 6.0, 2, &hits));
++    EXPECT_EQ(0u, hits);
++
++    Index_Destroy(index);
++}
++
++TEST(TPRTreeTemporalQueries, NearestFindsTheClosestApproachBeforeAnEntryStops) {
++    Scene scene;
++    Mover crossing = stopping(pointMover(0.0, -10.0, 3.0, 6.0, 0.0), 2.0);
++    scene.insert(1, crossing);
++    scene.insert(2, pointMover(0.0, 0.0, 3.3, 0.0, 0.0));
++
++    Mover query = pointMover(0.0, 0.0, 0.0, 0.0, 0.0);
++    double kth = 0.0;
++    std::vector<id_type> expected = oracleNearest(scene, query, 0.0, 10.0, 1, &kth);
++
++    sidx_test::IdVisitor nearest;
++    double d = scene.tree->nearestNeighborQuery(1, timePoint(0.0, 0.0, 0.0, 10.0), nearest);
++    EXPECT_EQ(expected, sorted(nearest.ids));
++    EXPECT_EQ(ids({1}), sorted(nearest.ids));
++    EXPECT_NEAR(kth, d, 1e-9);
++    EXPECT_NEAR(3.0, d, 1e-9);
++}
++
++TEST(TPRTreeTemporalQueries, AStoppingEntryStaysFoundBesideAnIdenticalMover) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, 0.0, 0.0, 1.0, 0.0));
++    scene.insert(2, stopping(pointMover(0.0, 0.0, 0.0, 1.0, 0.0), 1.0));
++
++    EXPECT_EQ(ids({1, 2}), intersecting(scene, timeBox(-0.5, -0.5, 0.5, 0.5, 0.0, 0.0)));
++    EXPECT_EQ(ids({1, 2}), intersecting(scene, timeBox(0.5, -0.5, 1.5, 0.5, 1.0, 1.0)));
++    EXPECT_EQ(ids({2}), intersecting(scene, timeBox(0.5, -0.5, 1.5, 0.5, 2.0, 2.0)));
++    EXPECT_EQ(ids({1}), intersecting(scene, timeBox(1.5, -0.5, 2.5, 0.5, 2.0, 2.0)));
++
++    sidx_test::IdVisitor nearest;
++    double d = scene.tree->nearestNeighborQuery(1, timePoint(1.0, 0.0, 5.0, 5.0), nearest);
++    EXPECT_EQ(ids({2}), sorted(nearest.ids));
++    EXPECT_DOUBLE_EQ(0.0, d);
++}
++
++TEST(TPRTreeTemporalQueries, MovingRegionEntriesCanBeDeleted) {
++    Scene scene;
++    scene.insert(1, pointMover(0.0, -20.0, 0.0, 0.0, 0.0));
++
++    double low[2] = {3.0, 3.0};
++    double high[2] = {5.0, 6.0};
++    double vlow[2] = {1.0, 0.0};
++    double vhigh[2] = {1.0, 0.0};
++    scene.tree->insertData(0, nullptr, SpatialIndex::MovingRegion(low, high, vlow, vhigh, 1.0, 4.0, 2), 5);
++
++    EXPECT_EQ(ids({5}), intersecting(scene, timeBox(5.5, 3.5, 6.5, 5.5, 2.0, 2.0)));
++
++    EXPECT_TRUE(scene.tree->deleteData(SpatialIndex::MovingRegion(low, high, vlow, vhigh, 1.0, 5.0, 2), 5));
++    EXPECT_TRUE(intersecting(scene, timeBox(5.5, 3.5, 6.5, 5.5, 5.0, 5.0)).empty());
++    EXPECT_FALSE(scene.tree->deleteData(SpatialIndex::MovingRegion(low, high, vlow, vhigh, 1.0, 6.0, 2), 5));
++}
++
++TEST(TPRTreeTemporalQueries, AReloadedTreeKeepsEachEntrysEndOfMotion) {
++    Scene scene;
++    scene.insert(1, stopping(pointMover(0.0, 0.0, 0.0, 1.0, 0.0), 2.0));
++    scene.insert(2, pointMover(0.0, 0.0, 6.0, 1.0, 0.0));
++
++    EXPECT_EQ(ids({1}), intersecting(scene, timeBox(1.5, -0.5, 2.5, 0.5, 5.0, 5.0)));
++
++    scene.reopen();
++
++    EXPECT_EQ(ids({1}), intersecting(scene, timeBox(1.5, -0.5, 2.5, 0.5, 5.0, 5.0)));
++    EXPECT_TRUE(intersecting(scene, timeBox(4.5, -0.5, 5.5, 0.5, 5.0, 5.0)).empty());
++    EXPECT_EQ(ids({2}), intersecting(scene, timeBox(4.5, 5.5, 5.5, 6.5, 5.0, 5.0)));
++
++    sidx_test::IdVisitor nearest;
++    double d = scene.tree->nearestNeighborQuery(1, timePoint(2.0, 0.0, 5.0, 5.0), nearest);
++    EXPECT_EQ(ids({1}), sorted(nearest.ids));
++    EXPECT_DOUBLE_EQ(0.0, d);
++
++    double at[2] = {0.0, 20.0};
++    double vel[2] = {1.0, 0.0};
++    scene.tree->insertData(0, nullptr, SpatialIndex::MovingPoint(at, vel, 5.0, 7.0, 2), 3);
++
++    EXPECT_EQ(ids({3}), intersecting(scene, timeBox(1.5, 19.5, 2.5, 20.5, 9.0, 9.0)));
++    EXPECT_TRUE(intersecting(scene, timeBox(3.5, 19.5, 4.5, 20.5, 9.0, 9.0)).empty());
++}
++
++TEST(TPRTreeTemporalQueries, ZeroNeighboursVisitsNothing) {
++    Scene scene;
++    scene.insert(1, boxMover(0.0, -5.0, -5.0, 5.0, 5.0, 0.0, 0.0));
++    scene.insert(2, pointMover(0.0, 20.0, 0.0, 0.0, 0.0));
++
++    SpatialIndex::TimePoint query = timePoint(0.0, 0.0, 0.0, 2.0);
++
++    sidx_test::IdVisitor none;
++    EXPECT_EQ(0.0, scene.tree->nearestNeighborQuery(0, query, none));
++    EXPECT_TRUE(none.ids.empty());
++
++    sidx_test::IdVisitor compared;
++    ScaledIdComparator comparator;
++    EXPECT_EQ(0.0, scene.tree->nearestNeighborQuery(0, query, compared, comparator));
++    EXPECT_TRUE(compared.ids.empty());
++
++    sidx_test::IdVisitor one;
++    EXPECT_EQ(0.0, scene.tree->nearestNeighborQuery(1, query, one));
++    EXPECT_EQ(ids({1}), sorted(one.ids));
++}
++
++TEST(TPRTreeTemporalQueries, MutationsRejectReversedIntervalsAndWrongDimensions) {
++    Scene scene(20, 10.0);
++    scene.insert(1, pointMover(0.0, 1.0, 1.0, 0.0, 0.0));
++
++    double at[2] = {4.0, 4.0};
++    double hi[2] = {5.0, 5.0};
++    double vel[2] = {0.0, 0.0};
++
++    EXPECT_THROW(scene.tree->insertData(0, nullptr, SpatialIndex::TimePoint(at, 5.0, 3.0, 2), 8),
++                 Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->insertData(0, nullptr, SpatialIndex::TimeRegion(at, hi, 5.0, 3.0, 2), 8),
++                 Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->deleteData(SpatialIndex::TimePoint(at, 5.0, 3.0, 2), 1),
++                 Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->deleteData(SpatialIndex::TimeRegion(at, hi, 5.0, 3.0, 2), 1),
++                 Tools::IllegalArgumentException);
++
++    double at3[3] = {4.0, 4.0, 4.0};
++    EXPECT_THROW(scene.tree->insertData(0, nullptr, SpatialIndex::TimePoint(at3, 1.0, 2.0, 3), 8),
++                 Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->deleteData(SpatialIndex::TimePoint(at3, 1.0, 2.0, 3), 1),
++                 Tools::IllegalArgumentException);
++
++    sidx_test::IdVisitor visitor;
++    EXPECT_NO_THROW(scene.tree->intersectsWithQuery(timeBox(0.0, 0.0, 2.0, 2.0, 0.0, 5.0), visitor));
++    EXPECT_EQ(ids({1}), sorted(visitor.ids));
++
++    EXPECT_TRUE(scene.tree->deleteData(SpatialIndex::TimePoint(at, 0.0, 1.0, 2), 8) == false);
++}
++
++TEST(TPRTreeTemporalQueries, SelfJoinPairsWithTwoDifferentStopTimes) {
++    Scene scene;
++    scene.insert(1, stopping(boxMover(0.0, 0.0, -1.0, 1.0, 1.0, 2.0, 0.0), 2.0));
++    scene.insert(2, stopping(boxMover(0.0, 20.0, -1.0, 21.0, 1.0, -3.0, 0.0), 6.0));
++    scene.insert(3, boxMover(0.0, 60.0, 60.0, 61.0, 61.0, 0.0, 0.0));
++
++    Mover window = boxMover(0.0, -10.0, -5.0, 30.0, 5.0, 0.0, 0.0);
++
++    std::set<std::pair<id_type, id_type> > expected;
++    for (std::map<id_type, Mover>::const_iterator a = scene.movers.begin(); a != scene.movers.end(); ++a) {
++        std::map<id_type, Mover>::const_iterator b = a;
++        for (++b; b != scene.movers.end(); ++b) {
++            std::vector<Mover> boxes;
++            boxes.push_back(window);
++            boxes.push_back(a->second);
++            boxes.push_back(b->second);
++            double margin = 0.0;
++            if (sameInstantOverlap(boxes, 0.0, 8.0, &margin)) expected.insert(std::make_pair(a->first, b->first));
++            ASSERT_GT(margin, 1e-6) << a->first << "," << b->first;
++        }
++    }
++
++    sidx_test::IdVisitor joined;
++    scene.tree->selfJoinQuery(timeBox(-10.0, -5.0, 30.0, 5.0, 0.0, 8.0), joined);
++    EXPECT_EQ(expected, normalisedPairs(joined));
++
++    std::set<std::pair<id_type, id_type> > pair12;
++    pair12.insert(std::make_pair(1, 2));
++    EXPECT_EQ(pair12, normalisedPairs(joined));
++
++    sidx_test::IdVisitor late;
++    scene.tree->selfJoinQuery(timeBox(-10.0, -5.0, 30.0, 5.0, 6.0, 8.0), late);
++    EXPECT_TRUE(late.pairs.empty());
++}
++
++TEST(TPRTreeTemporalQueries, AnEntryStoppingAtAnIntervalBoundary) {
++    Scene scene;
++    scene.insert(1, stopping(pointMover(0.0, 0.0, 0.0, 1.0, 0.0), 4.0));
++    scene.insert(2, pointMover(0.0, 0.0, 9.0, 0.0, 0.0));
++
++    EXPECT_EQ(ids({1}), intersecting(scene, timeBox(3.5, -0.5, 4.5, 0.5, 0.0, 4.0)));
++    EXPECT_EQ(ids({1}), intersecting(scene, timeBox(3.5, -0.5, 4.5, 0.5, 4.0, 4.0)));
++    EXPECT_EQ(ids({1}), intersecting(scene, timeBox(3.5, -0.5, 4.5, 0.5, 4.0, 9.0)));
++    EXPECT_TRUE(intersecting(scene, timeBox(5.5, -0.5, 6.5, 0.5, 4.0, 9.0)).empty());
++
++    sidx_test::IdVisitor atStop;
++    double d = scene.tree->nearestNeighborQuery(1, timePoint(4.0, 0.0, 4.0, 4.0), atStop);
++    EXPECT_EQ(ids({1}), sorted(atStop.ids));
++    EXPECT_DOUBLE_EQ(0.0, d);
++}
++
++TEST(TPRTreeTemporalQueries, NearestAcrossTwoStopInstants) {
++    Scene scene;
++    scene.insert(1, stopping(pointMover(0.0, -10.0, 0.0, 2.0, 0.0), 4.0));
++    scene.insert(2, stopping(pointMover(0.0, 10.0, 0.0, -1.0, 0.0), 7.0));
++    scene.insert(3, pointMover(0.0, 0.0, 40.0, 0.0, 0.0));
++
++    Mover query = pointMover(0.0, 0.0, 0.0, 0.0, 0.0);
++    double kth = 0.0;
++    std::vector<id_type> expected = oracleNearest(scene, query, 0.0, 10.0, 1, &kth);
++
++    sidx_test::IdVisitor nearest;
++    double d = scene.tree->nearestNeighborQuery(1, timePoint(0.0, 0.0, 0.0, 10.0), nearest);
++    EXPECT_EQ(expected, sorted(nearest.ids));
++    EXPECT_EQ(ids({1}), sorted(nearest.ids));
++    EXPECT_NEAR(kth, d, 1e-9);
++    EXPECT_NEAR(2.0, d, 1e-9);
++
++    sidx_test::IdVisitor both;
++    double far = scene.tree->nearestNeighborQuery(2, timePoint(0.0, 0.0, 0.0, 10.0), both);
++    EXPECT_EQ(ids({1, 2}), sorted(both.ids));
++    EXPECT_NEAR(3.0, far, 1e-9);
++}
++
++TEST(TPRTreeTemporalQueries, ASecondDeepTreeOfStoppedEntriesMatchesExhaustiveSearch) {
++    Scene scene(4, 40.0);
++    fillStoppingScene(scene, 60, 24685137ULL, 14.0, 1.25);
++
++    Mover window = boxMover(6.0, -5.0, -5.0, 5.0, 5.0, 0.4, -0.3);
++    std::vector<id_type> hits = oracleIntersecting(scene, window, 6.0, 13.0);
++    ASSERT_GT(hits.size(), 4u);
++    EXPECT_EQ(hits, intersecting(scene, movingBox(window, 6.0, 13.0)));
++    EXPECT_EQ(oracleContained(scene, window, 6.0, 13.0), contained(scene, movingBox(window, 6.0, 13.0)));
++
++    Mover probe = pointMover(6.0, 2.0, -2.0, 0.0, 0.0);
++    double kth = 0.0;
++    std::vector<id_type> near = oracleNearest(scene, probe, 6.0, 13.0, 2, &kth);
++    sidx_test::IdVisitor visitor;
++    double d = scene.tree->nearestNeighborQuery(2, timePoint(2.0, -2.0, 6.0, 13.0), visitor);
++    EXPECT_EQ(near, sorted(visitor.ids));
++    EXPECT_NEAR(kth, d, 1e-6);
++}
++
++TEST(TPRTreeTemporalQueries, OnlyTheFourTimeShapesAreAccepted) {
++    Scene scene(20, 10.0);
++    scene.insert(1, pointMover(0.0, 1.0, 1.0, 0.0, 0.0));
++
++    double low[2] = {0.0, 0.0};
++    double high[2] = {2.0, 2.0};
++    sidx_test::IdVisitor visitor;
++
++    EXPECT_THROW(scene.tree->insertData(0, nullptr, TimedBox(low, high, 1.0, 2.0), 9), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->deleteData(TimedBox(low, high, 1.0, 2.0), 1), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->intersectsWithQuery(TimedBox(low, high, 1.0, 2.0), visitor), Tools::IllegalArgumentException);
++
++    EXPECT_THROW(scene.tree->insertData(0, nullptr, SpatialIndex::Region(low, high, 2), 9), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->insertData(0, nullptr, SpatialIndex::Point(low, 2), 9), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->deleteData(SpatialIndex::Region(low, high, 2), 1), Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->deleteData(SpatialIndex::Point(low, 2), 1), Tools::IllegalArgumentException);
++
++    EXPECT_EQ(ids({1}), intersecting(scene, timeBox(0.0, 0.0, 2.0, 2.0, 0.0, 5.0)));
++}
++
++TEST(TPRTreeTemporalQueries, MovingShapesAreValidatedOnEveryPath) {
++    Scene scene(20, 10.0);
++    scene.insert(1, pointMover(0.0, 1.0, 1.0, 0.0, 0.0));
++
++    double at[2] = {1.0, 1.0};
++    double vel[2] = {0.0, 0.0};
++    EXPECT_THROW(SpatialIndex::MovingPoint(at, vel, 5.0, 3.0, 2), Tools::IllegalArgumentException);
++    EXPECT_THROW(SpatialIndex::MovingRegion(at, at, vel, vel, 5.0, 3.0, 2), Tools::IllegalArgumentException);
++
++    double at3[3] = {1.0, 1.0, 1.0};
++    double vel3[3] = {0.0, 0.0, 0.0};
++    EXPECT_THROW(scene.tree->insertData(0, nullptr, SpatialIndex::MovingPoint(at3, vel3, 1.0, 2.0, 3), 9),
++                 Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->insertData(0, nullptr, SpatialIndex::MovingRegion(at3, at3, vel3, vel3, 1.0, 2.0, 3), 9),
++                 Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->deleteData(SpatialIndex::MovingPoint(at3, vel3, 1.0, 2.0, 3), 1),
++                 Tools::IllegalArgumentException);
++    EXPECT_THROW(scene.tree->deleteData(SpatialIndex::MovingRegion(at3, at3, vel3, vel3, 1.0, 2.0, 3), 1),
++                 Tools::IllegalArgumentException);
++
++    sidx_test::IdVisitor visitor;
++    EXPECT_NO_THROW(scene.tree->pointLocationQuery(timePoint(1.0, 1.0, 0.0, 9.5), visitor));
++    EXPECT_EQ(ids({1}), sorted(visitor.ids));
++    EXPECT_THROW(scene.tree->pointLocationQuery(timePoint(1.0, 1.0, 0.0, 10.0), visitor), Tools::IllegalArgumentException);
++
++    scene.tree->insertData(0, nullptr, SpatialIndex::TimePoint(at, 3.0, 3.0, 2), 7);
++    EXPECT_THROW(scene.tree->pointLocationQuery(timePoint(1.0, 1.0, 2.0, 5.0), visitor), Tools::IllegalArgumentException);
++}
