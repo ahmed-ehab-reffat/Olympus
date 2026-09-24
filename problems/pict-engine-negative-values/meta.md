@@ -9,7 +9,7 @@ Title: Add negative values to the PICT engine and C API
 
 # Add negative values to the PICT engine and C API
 
-Add negative (out-of-range) values to the generation engine and its C API in `pictapi.h`.
+Add negative (out-of-range) values to the generation engine and its C API. Like the existing functions, each new function is declared in `pictapi.h` and listed in the exports of `api/pict.def`.
 
 Add `PICT_RET_CODE PictSetNegativeValue(PICT_HANDLE parameter, PICT_VALUE valueIndex)`, which marks one value of a parameter negative. It returns `PICT_SUCCESS`, or a new code `PICT_INVALID_VALUE` (`0xc0000003`) when the index is past the parameter's last value or when the value is the only one of that parameter that is not negative.
 

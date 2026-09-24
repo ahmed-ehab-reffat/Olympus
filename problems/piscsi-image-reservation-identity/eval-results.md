@@ -124,3 +124,32 @@ No platform batch yet. Local validation numbers are logged below as they are mea
 | base mode, with solution, 3 runs | 317 / 0 each, all three uids |
 | new mode, with solution, 3 runs | 65 / 0 each, all three uids |
 | Counter 1 / hook human-effective | 281 / 212 |
+
+## Batch 1 — 10 x Nova, 2026-09-24: 1/10 pass (Nova #9)
+
+Auto Review: Description 3/3, Tests 2/3, Solution 1/3 (revision requested). Adjudicator: the one pass is genuine (judge-c flagged a stale private filename after a refused insert as FP; adjudicated inert, not prompt-observable).
+
+| Batch | Agent | Verdict | Files | +lines | Failed tests | Note |
+|---|---|---|---|---|---|---|
+| 1 | Nova #10 | FAIL | 10 | +396 | cd_roms_share_one_image_under_any_name, detaching_one_reader_keeps_the_others_holding, ejecting_one_reader_keeps_the_others_holding, one_command_may_attach_several_cd_roms_to_one_image, one_command_with_a_cd_rom_and_a_disk_on_one_image_attaches_nothing, image_file_information_lists_the_holders, scsictl_device_list_names_the_devices_sharing_an_image, refusals_name_every_conflicting_holder, holders_are_ordered_by_id_and_then_lun, image_file_information_reports_the_lun_of_each_holder, devices_sharing_an_image_from_the_working_directory_report_each_other, hold_stays_with_the_file_after_its_name_is_reused | The agent passed all baseline tests but failed 12 of 65 new image-reservation tests. The main implementation errors are incorrect reader classification before i |
+| 1 | Nova #9 | PASS | 9 | +487 | - | Agent passed all baseline and new tests with a legitimate implementation. |
+| 1 | Nova #8 | FAIL | 9 | +401 | insert_with_dot_segment_is_refused_while_attached, writer_is_refused_while_a_cd_rom_holds_the_image | The agent implemented most of the reservation feature, but two new tests fail because a refused insert leaves the removable device with a medium still loaded. |
+| 1 | Nova #7 | FAIL | 9 | +389 | image_commands_accept_both_name_forms_in_every_position, one_command_with_a_cd_rom_and_a_disk_on_one_image_attaches_nothing, create_resolves_names_and_refuses_names_outside_the_image_folder, refusals_name_every_conflicting_holder, unprotect_of_a_held_image_is_refused_until_it_is_released, create_works_for_a_user_without_a_passwd_entry | The agent implemented most of the feature and preserved the baseline suite, but six new tests fail because path normalization, multi-device holder identity, and |
+| 1 | Nova #6 | FAIL | 10 | +348 | create_works_for_a_user_without_a_passwd_entry, hold_stays_with_the_file_after_its_name_is_reused | The agent passed all baseline tests but failed 2 of 65 new tests: passwd-less image creation and preserving a reservation when a held filename is reused. |
+| 1 | Nova #5 | FAIL | 9 | +371 | delete_with_dot_segment_succeeds_when_not_attached, delete_with_absolute_name_succeeds_after_detach, create_works_for_a_user_without_a_passwd_entry, devices_sharing_an_image_from_the_working_directory_report_each_other, hold_stays_with_the_file_after_its_name_is_reused | The agent implemented most of the feature and preserved all baseline behavior, but 5 of 65 new tests fail due to reservation identity/state handling and several |
+| 1 | Nova #4 | FAIL | 11 | +417 | insert_with_dot_segment_is_refused_while_attached, image_commands_accept_both_name_forms_in_every_position, writer_is_refused_while_a_cd_rom_holds_the_image, create_resolves_names_and_refuses_names_outside_the_image_folder, refusals_name_every_conflicting_holder, unprotect_of_a_held_image_is_refused_until_it_is_released, create_works_for_a_user_without_a_passwd_entry, devices_sharing_an_image_from_the_working_directory_report_each_other | Agent passed all baseline tests but failed 8 of 65 new image-reservation tests. |
+| 1 | Nova #3 | FAIL | 14 | +578 | create_works_for_a_user_without_a_passwd_entry | Agent passed all baseline tests and 64 of 65 new tests, but missed the passwd-less user ownership requirement. |
+| 1 | Nova #2 | FAIL | 10 | +363 | one_command_with_a_cd_rom_and_a_disk_on_one_image_attaches_nothing, hold_stays_with_the_file_after_its_name_is_reused | Baseline tests passed, but two new image-reservation tests failed due to incorrect dry-run holder bookkeeping and pathname reuse handling. |
+| 1 | Nova #1 | FAIL | 12 | +411 | image_commands_refuse_names_outside_the_image_folder, links_inside_the_image_folder_stay_usable, create_resolves_names_and_refuses_names_outside_the_image_folder, create_works_for_a_user_without_a_passwd_entry, hold_stays_with_the_file_after_its_name_is_reused, dot_dot_after_a_folder_link_is_resolved_through_the_link | The agent passed all baseline tests but failed 6 of 65 new tests due to explicit path-resolution, rename/reuse identity, and missing-passwd ownership requiremen |
+
+Kill counts: no-passwd create 6, rename/name reuse 5, batch conflict message 3, refusal messages 3, working-directory device holders 3, create name resolution 3, refused-insert cleanup 2, reader-after-open 1 run (12 tests).
+
+## Local validation — after batch 1 (device reporting by retained identity, 66 tests), 2026-09-24
+
+| Check | Result |
+|---|---|
+| Replay of the 10 batch-1 agent patches vs the new test.patch | 0/10 (all fail `device_list_follows_the_held_file_after_its_name_is_reused`); reference 66/66 |
+| base mode, no solution, uid 0 / 1000 / 4242 | 317 pass / 0 fail, all three |
+| new mode, no solution | 66 named failures (same ids as the solution run), all three |
+| base / new mode, with solution, 3 runs | 317 / 0 and 66 / 0 each, all three uids |
+| Counter 1 / hook human-effective | 294 / 221 |

@@ -107,3 +107,15 @@ Hook: human-effective 238, 5 files.
 | 2026-09-24 | Docker x3 runs x3 uids | all four cells | 498 verdicts | identical across all 9 |
 
 Hook: human-effective 242, 5 files.
+
+## Local validation, round 7 (2026-09-24, tests + meta changed)
+
+| Date | Where | Mode | Cases | Result |
+|---|---|---|---|---|
+| 2026-09-24 | Docker, uid 0/1000/4242, offline | base on base | 167 | 167 pass |
+| 2026-09-24 | Docker, uid 0/1000/4242, offline | new on base | 83 | 83 fail (all AttributeError set_space) |
+| 2026-09-24 | Docker, uid 0/1000/4242, offline | base on solution | 167 | 167 pass |
+| 2026-09-24 | Docker, uid 0/1000/4242, offline | new on solution | 83 | 83 pass |
+| 2026-09-24 | Docker x3 runs x3 uids | all four cells | 500 verdicts | identical across all 9 |
+
+Hook: human-effective 242, 5 files.

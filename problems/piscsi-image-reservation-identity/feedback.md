@@ -2,6 +2,16 @@ NEXT (human): Requirement 0 picker check + upload this slice to the platform pre
 
 # feedback — piscsi-image-reservation-identity
 
+## 2026-09-24 BATCH 1 (10 x Nova): 1/10 pass, then Auto Review REVISION (Desc 3/3, Tests 2/3, Solution 1/3)
+- Pass rate 10%: in band. Failures cluster on stated requirements (see eval-results.md): no-passwd create 6, rename/reuse 5, batch/refusal messages 3+3, cwd device holders 3.
+- High (solution): per-device holders were looked up by the device's stored pathname, so after rename + name reuse device 1 was shown "shared with" the replacement's holder. Fixed: new `StorageDevice::GetHoldersOfOwnFile()` uses the identity retained for that device (falls back to the name only without one); `PiscsiResponse::GetDevice` uses it; `FindHolders(identity, name)` shared with `GetHoldersForReservedFile`.
+- Medium (tests): cwd test now asserts the `GetReservedFiles` keys are the relative names as given (`disk.hds`, `disk2.hds`), not default-folder-prefixed.
+- New test `device_list_follows_the_held_file_after_its_name_is_reused`.
+- Replay of all 10 saved agent patches against the new test.patch (root, one container per sequence): reference 66/66; EVERY agent patch, including the only passer Nova #9, fails `device_list_follows_the_held_file_after_its_name_is_reused` (they all fill device holders by re-resolving the device's stored path). A re-eval with that test would read 0/10. One extra Nova #9 failure was a replay artifact (stale `.moved` file in the shared /tmp from an earlier patch); the outside-folder test now clears its leftover names first.
+- DECISION (user): keep the device-list rename test, so a FRESH batch is needed (not a re-eval). Since the batch is full price anyway, meta.md now states the rule explicitly: "A device's own entry lists the holders of the file it opened, even after that name is reused." (0/10 agents inferred it). Trims elsewhere; 496 words.
+- Validated (platform order, `--network none`) as root, uid 1000 and uid 4242: base 317/0 without and with solution; new 66 named failures without, 66/0 with, 3 identical runs; test ids match with and without the solution. Counter 1 = 294, hook human-effective = 221.
+- NEXT: fresh batch (meta.md changed, so no re-eval).
+
 ## 2026-09-24 round 13: Solution Quality FAIL (comprehensiveness 1/3, code quality 2/3)
 - High: `GetImageName` collapsed `..` lexically before the folder-boundary check, so `escape/../victim.hds` (escape -> /tmp/outside/sub) passed as `victim.hds` and DELETE removed `<default>/victim.hds` while the name denotes `/tmp/outside/victim.hds`. Fixed: the parent path is now resolved with `weakly_canonical` on the UNNORMALIZED path (links followed before `..`), containment is checked on that, and the returned name is built from the resolved parent plus the untouched last component, so the command acts on exactly the checked location. The last component is still never resolved (image symlinks stay usable).
 - Test: `dot_dot_after_a_folder_link_is_resolved_through_the_link` (escape/../ refused for delete/protect/copy/create with both files intact; inside the folder, `jump/../in.hds` with jump -> real/deep deletes real/in.hds, not the lexically collapsed in.hds).

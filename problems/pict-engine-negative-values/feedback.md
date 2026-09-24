@@ -1,6 +1,22 @@
 # pict-engine-negative-values - feedback
 
-NEXT (human): re-upload R4 (test.patch + solution.patch changed, meta.md unchanged) and re-run Auto Review.
+NEXT (human): re-upload R5 (meta.md + test.patch changed, solution.patch unchanged) and re-run Auto Review.
+
+## R5 (2026-09-24) - Auto Review: Description 3/3, Tests 1/3, Solution 3/3
+
+- T4 High: nothing checked api/pict.def (the Makefile's ELF link never reads it). New
+  test_new_functions_are_listed_in_the_export_definition parses EXPORTS. meta.md now says each new
+  function is declared in pictapi.h and listed in api/pict.def (the reviewer called it
+  codebase-inferable; stating it keeps the test fair). Mutant: def entries removed -> only that
+  test fails.
+- T4 Medium: marking an already-negative value again must succeed (python marking test + client
+  header check). Mutant with the last-non-negative count checked first -> both fail.
+- T4 Medium: CLI repeatability. Standalone would pass on base (deterministic output there too), so
+  the constraints and seeded CLI tests now run the same model twice and compare full stdout.
+- 40 new tests. Clean room 1000/0/4242: 588 base pass, 40 fail without / pass with, x3.
+- Review cycle note: R2-R5 each surfaced a new High T4 gap in an area previous rounds rated fine.
+  Pattern: every stated contract clause needs a test on EVERY surface that carries it (C header,
+  export manifest, CLI, nested trees), not just the main one.
 
 ## R4 (2026-09-24) - Auto Review: Description 3/3, Tests 1/3, Solution 3/3
 

@@ -1,6 +1,6 @@
 # feedback.md - bayesopt-search-space-migration
 
-NEXT (human): round-6 artifact (solution + tests changed 2026-09-24; meta unchanged since round 5, still never batched) needs prechecks, then a FULL batch.
+NEXT (human): round-7 artifact (tests + meta changed 2026-09-24; solution unchanged since round 6) needs prechecks, then a FULL batch.
 
 Repo: bayesian-optimization/BayesianOptimization (MIT, 8,714 stars), base af8b928 (master HEAD 2026-08-21).
 Hunt: Instructions/repo-hunt-logs/REPO-HUNT-2026-09-23-E.md (RANK 1). Mode: factory SLICE.
@@ -173,4 +173,15 @@ Hunt: Instructions/repo-hunt-logs/REPO-HUNT-2026-09-23-E.md (RANK 1). Mode: fact
 - Risk noted: the first precheck grader objected to reading acquisition state; these reads go through the public
   get_acquisition_params() only.
 - Tests 82 cases. Host full suite: 249 passed. human-effective 242.
+
+## Auto Review round 7 (2026-09-24): Description 3/3, Tests 1/3, Solution 3/3
+- T3/T4 (High): no test separated "kept window carried + trimmed" from "kept parameter re-initialized" when its GLOBAL bounds
+  change. The old (0.6, 1) case could not: the bowl pulls x's window to [0.06, 0.60], entirely below 0.6, so the trim resets it
+  to the full new bounds, same as a fresh start.
+- Fix: test_domain_reduction_carries_a_kept_window_into_moved_global_bounds. New x bounds (0.33, 1) overlap the window
+  (guarded), expected window = [0.33, old high] with y's row unchanged, r unchanged, original_bounds = new bounds, next suggestions
+  inside the trimmed window. Reads the user-held transformer's public bounds/r/original_bounds (repo tests read
+  bounds_transformer.bounds the same way). The reviewer's mutant (re-init kept params whose global bounds moved) is KILLED.
+- P4 (Low): split the long transformer sentence in meta (493 words, unchanged count).
+- Tests 83 cases. Host full suite: 250 passed.
 

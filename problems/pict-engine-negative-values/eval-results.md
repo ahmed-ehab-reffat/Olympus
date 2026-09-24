@@ -63,3 +63,9 @@ Clean room as R3 (`--memory 2g`, one uid at a time). uid 1000, 0, 4242: base 588
 without the solution; new 39/39 fail without, 39/39 pass with, 3 identical runs each. Lifecycle
 mutants (PictDeleteModel no-op + PictDeleteTask frees tree; root-only params; params deferred to
 the task) all fail the lifecycle test. 253 human-effective.
+
+## Local validation - R5 (2026-09-24)
+
+Clean room as R3/R4. uid 1000, 0, 4242: base 588/588 pass with and without the solution; new 40/40
+fail without, 40/40 pass with, 3 identical runs each. Mutants: pict.def entries removed -> export
+test fails; already-negative check moved after the count -> marking + header tests fail.
