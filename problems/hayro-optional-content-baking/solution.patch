@@ -15,37 +15,82 @@ index 9915b99b..373dd51d 100644
      #[allow(clippy::should_implement_trait)]
      pub fn next(&mut self) -> Option<Instruction<'_, 'a>> {
 diff --git a/hayro-write/src/lib.rs b/hayro-write/src/lib.rs
-index a1b2d2ee..833f1795 100644
+index a1b2d2ee..55355d3b 100644
 --- a/hayro-write/src/lib.rs
 +++ b/hayro-write/src/lib.rs
-@@ -11,8 +11,10 @@ well-documented.
+@@ -11,15 +11,17 @@ well-documented.
  #[macro_use]
  mod log;
  
 +mod optional_content;
  mod primitive;
  
-+use crate::optional_content::{OcConfig, bake};
++use crate::optional_content::{Baked, OcConfig, bake};
  use crate::primitive::{WriteDirect, WriteIndirect};
  use flate2::Compression;
  use flate2::write::ZlibEncoder;
-@@ -139,6 +141,7 @@ struct ExtractionContext<'a> {
-     cached_content_streams: FxHashMap<usize, Ref>,
+ use hayro_syntax::object::Dict;
+ use hayro_syntax::object::Object;
+ use hayro_syntax::object::dict::keys::{
+-    COLORSPACE, EXT_G_STATE, FONT, GROUP, PATTERN, PROPERTIES, SHADING, XOBJECT,
++    COLORSPACE, EXT_G_STATE, FONT, GROUP, PATTERN, PROPERTIES, RESOURCES, SHADING, XOBJECT,
+ };
+ use hayro_syntax::object::{MaybeRef, ObjRef};
+ use hayro_syntax::page::{Page, Resources, Rotation};
+@@ -28,6 +30,7 @@ use rustc_hash::FxHashMap;
+ use std::collections::{BTreeMap, HashSet};
+ use std::ops::Deref;
+ use std::ops::DerefMut;
++use std::rc::Rc;
+ 
+ pub use hayro_syntax;
+ use hayro_syntax::Pdf;
+@@ -127,6 +130,9 @@ pub struct ExtractionResult {
+     pub page_tree_parent_ref: Ref,
+ }
+ 
++pub(crate) type ResourceAlias = (&'static [u8], Vec<u8>, Ref);
++type VariantKey = (usize, &'static [u8], Vec<u8>);
++
+ struct ExtractionContext<'a> {
+     chunks: Vec<Chunk>,
+     visited_objects: HashSet<ObjRef>,
+@@ -136,9 +142,13 @@ struct ExtractionContext<'a> {
+     pdf: &'a Pdf,
+     new_ref: Box<dyn FnMut() -> Ref + 'a>,
+     ref_map: FxHashMap<ObjRef, Ref>,
+-    cached_content_streams: FxHashMap<usize, Ref>,
++    cached_content_streams: FxHashMap<usize, (Ref, Vec<ResourceAlias>)>,
      page_tree_parent_ref: Ref,
      chunk_settings: ChunkSettings,
-+    oc_config: OcConfig,
++    oc_config: Option<Rc<OcConfig>>,
++    variants: FxHashMap<VariantKey, Option<Ref>>,
++    active_streams: Vec<hayro_syntax::object::ObjectIdentifier>,
++    oc_scopes: usize,
  }
  
  impl<'a> ExtractionContext<'a> {
-@@ -160,6 +163,7 @@ impl<'a> ExtractionContext<'a> {
+@@ -160,6 +170,10 @@ impl<'a> ExtractionContext<'a> {
              root_refs: Vec::new(),
              page_tree_parent_ref,
              chunk_settings,
 +            oc_config: OcConfig::new(pdf),
++            variants: FxHashMap::default(),
++            active_streams: Vec::new(),
++            oc_scopes: 0,
          }
      }
  
-@@ -318,10 +322,7 @@ fn write_page(
+@@ -312,20 +326,19 @@ fn write_page(
+     let mut chunk = Chunk::with_settings(ctx.chunk_settings);
+     // Note: We can cache content stream references, but _not_ the page references themselves.
+     // Acrobat for some reason doesn't like duplicate page references in the page tree.
+-    let stream_ref = if let Some(cached) = ctx.cached_content_streams.get(&page_idx) {
+-        *cached
++    let (stream_ref, x_objects) = if let Some(cached) = ctx.cached_content_streams.get(&page_idx) {
++        cached.clone()
+     } else {
++        let baked = page_content(page, ctx);
          let stream_ref = ctx.new_ref();
  
          chunk
@@ -53,78 +98,151 @@ index a1b2d2ee..833f1795 100644
 -                stream_ref,
 -                &deflate_encode(page.page_stream().unwrap_or(b"")),
 -            )
-+            .stream(stream_ref, &deflate_encode(&page_content(page, ctx)))
++            .stream(stream_ref, &deflate_encode(&baked.content))
              .filter(Filter::FlateDecode);
-         ctx.cached_content_streams.insert(page_idx, stream_ref);
+-        ctx.cached_content_streams.insert(page_idx, stream_ref);
++        ctx.cached_content_streams
++            .insert(page_idx, (stream_ref, baked.aliases.clone()));
  
-@@ -363,7 +364,7 @@ fn write_xobject(
+-        stream_ref
++        (stream_ref, baked.aliases)
+     };
+ 
+     let mut pdf_page = chunk.page(page_ref);
+@@ -348,7 +361,7 @@ fn write_page(
+         group.write_direct(pdf_page.insert(Name(GROUP)), ctx);
+     }
+ 
+-    serialize_resources(page.resources(), ctx, &mut pdf_page);
++    serialize_resources(page.resources(), ctx, &mut pdf_page, &x_objects);
+ 
+     pdf_page.finish();
+ 
+@@ -363,7 +376,8 @@ fn write_xobject(
      ctx: &mut ExtractionContext<'_>,
  ) -> Result<(), ExtractionError> {
      let mut chunk = Chunk::with_settings(ctx.chunk_settings);
 -    let encoded_stream = deflate_encode(page.page_stream().unwrap_or(b""));
-+    let encoded_stream = deflate_encode(&page_content(page, ctx));
++    let baked = page_content(page, ctx);
++    let encoded_stream = deflate_encode(&baked.content);
      let mut x_object = chunk.form_xobject(xobj_ref, &encoded_stream);
      x_object.deref_mut().filter(Filter::FlateDecode);
  
-@@ -401,6 +402,12 @@ fn write_xobject(
+@@ -387,7 +401,7 @@ fn write_xobject(
+         i[5] as f32,
+     ]);
+ 
+-    serialize_resources(page.resources(), ctx, &mut x_object);
++    serialize_resources(page.resources(), ctx, &mut x_object, &baked.aliases);
+ 
+     let raw_dict = page.raw();
+ 
+@@ -401,10 +415,20 @@ fn write_xobject(
      Ok(())
  }
  
-+fn page_content(page: &Page<'_>, ctx: &ExtractionContext<'_>) -> Vec<u8> {
++fn page_content(page: &Page<'_>, ctx: &mut ExtractionContext<'_>) -> Baked {
 +    let data = page.page_stream().unwrap_or(b"");
 +
-+    bake(data, page.resources(), &ctx.oc_config).unwrap_or_else(|| data.to_vec())
++    bake(data, page.resources(), ctx).unwrap_or_else(|| Baked {
++        content: data.to_vec(),
++        aliases: Vec::new(),
++    })
 +}
 +
  fn serialize_resources(
      resources: &Resources<'_>,
      ctx: &mut ExtractionContext<'_>,
+     writer: &mut impl ResourcesExt,
++    aliases: &[ResourceAlias],
+ ) {
+     let ext_g_states = collect_resources(resources, |r| r.ext_g_states.clone());
+     let shadings = collect_resources(resources, |r| r.shadings.clone());
+@@ -420,12 +444,17 @@ fn serialize_resources(
+ 
+     macro_rules! write {
+         ($name:ident, $key:expr) => {
+-            if !$name.is_empty() {
++            let extra = aliases.iter().filter(|(key, _, _)| *key == $key);
++            if !$name.is_empty() || extra.clone().next().is_some() {
+                 let mut dict = resources.insert(Name($key)).dict();
+ 
+                 for (name, obj) in $name {
+                     obj.write_direct(dict.insert(Name(name.deref())), ctx);
+                 }
++
++                for (_, name, ref_) in extra {
++                    dict.pair(Name(name), *ref_);
++                }
+             }
+         };
+     }
+@@ -500,3 +529,15 @@ impl ResourcesExt for pdf_writer::writers::FormXObject<'_> {
+         Self::resources(self)
+     }
+ }
++
++impl ResourcesExt for pdf_writer::Dict<'_> {
++    fn resources(&mut self) -> pdf_writer::writers::Resources<'_> {
++        self.insert(Name(RESOURCES)).start()
++    }
++}
++
++impl ResourcesExt for pdf_writer::Stream<'_> {
++    fn resources(&mut self) -> pdf_writer::writers::Resources<'_> {
++        self.insert(Name(RESOURCES)).start()
++    }
++}
 diff --git a/hayro-write/src/optional_content.rs b/hayro-write/src/optional_content.rs
 new file mode 100644
-index 00000000..b7f71879
+index 00000000..59cc2bb6
 --- /dev/null
 +++ b/hayro-write/src/optional_content.rs
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,553 @@
++use crate::primitive::{WriteDirect, write_dict};
++use crate::{ExtractionContext, ResourceAlias, deflate_encode, serialize_resources};
 +use hayro_syntax::Pdf;
 +use hayro_syntax::content::{Instruction, UntypedIter};
 +use hayro_syntax::object::dict::keys::{
-+    BASE_STATE, D, OC, OCGS, OCMD, OCPROPERTIES, OFF, ON, P, TYPE,
++    BASE_STATE, CHAR_PROCS, D, DECODE_PARMS, EXT_G_STATE, FILTER, FONT, FORM, G, LENGTH, OC, OCGS,
++    OCMD, OCPROPERTIES, OFF, ON, P, PATTERN, PATTERN_TYPE, RESOURCES, SMASK, SUBTYPE, TYPE, TYPE3,
++    XOBJECT,
 +};
 +use hayro_syntax::object::{Array, Dict, Name, Object, ObjectIdentifier, Stream};
 +use hayro_syntax::page::Resources;
++use pdf_writer::{Chunk, Filter, Finish, Ref};
 +use rustc_hash::FxHashSet;
 +use std::ops::Deref;
++use std::rc::Rc;
 +
 +const PAINTS: [&[u8]; 9] = [b"f", b"F", b"f*", b"S", b"s", b"B", b"B*", b"b", b"b*"];
 +const SHOWS: [&[u8]; 4] = [b"Tj", b"TJ", b"'", b"\""];
++const STREAM_SKIP: [&[u8]; 4] = [LENGTH, FILTER, DECODE_PARMS, RESOURCES];
 +
 +pub(crate) struct OcConfig {
 +    hidden: FxHashSet<ObjectIdentifier>,
 +}
 +
 +impl OcConfig {
-+    pub(crate) fn new(pdf: &Pdf) -> Self {
-+        let mut hidden = FxHashSet::default();
++    pub(crate) fn new(pdf: &Pdf) -> Option<Rc<Self>> {
 +        let xref = pdf.xref();
 +        let properties = xref
-+            .get::<Dict<'_>>(xref.root_id())
-+            .and_then(|catalog| catalog.get::<Dict<'_>>(OCPROPERTIES));
++            .get::<Dict<'_>>(xref.root_id())?
++            .get::<Dict<'_>>(OCPROPERTIES)?;
++        let config = properties.get::<Dict<'_>>(D)?;
++        let mut hidden = FxHashSet::default();
 +
-+        if let Some(properties) = properties
-+            && let Some(config) = properties.get::<Dict<'_>>(D)
-+        {
-+            if config.get::<Name<'_>>(BASE_STATE).as_deref() == Some(OFF) {
-+                hidden.extend(refs_in(&properties, OCGS));
-+            }
-+
-+            for id in refs_in(&config, ON) {
-+                hidden.remove(&id);
-+            }
-+
-+            hidden.extend(refs_in(&config, OFF));
++        if config.get::<Name<'_>>(BASE_STATE).as_deref() == Some(OFF) {
++            hidden.extend(refs_in(&properties, OCGS));
 +        }
 +
-+        Self { hidden }
++        for id in refs_in(&config, ON) {
++            hidden.remove(&id);
++        }
++
++        hidden.extend(refs_in(&config, OFF));
++
++        Some(Rc::new(Self { hidden }))
 +    }
 +
 +    fn hides(&self, id: Option<ObjectIdentifier>, dict: &Dict<'_>) -> bool {
@@ -176,22 +294,48 @@ index 00000000..b7f71879
 +    select(resources).or_else(|| resources.parent().and_then(|p| lookup(p, select)))
 +}
 +
++fn category<'r, 'a>(resources: &'r Resources<'a>, key: &[u8]) -> &'r Dict<'a> {
++    match key {
++        XOBJECT => &resources.x_objects,
++        PATTERN => &resources.patterns,
++        FONT => &resources.fonts,
++        _ => &resources.ext_g_states,
++    }
++}
++
++fn resolve_stream<'a>(resources: &Resources<'a>, key: &[u8], name: &[u8]) -> Option<Stream<'a>> {
++    lookup(resources, |r| category(r, key).get::<Stream<'a>>(name))
++}
++
++fn resolve_dict<'a>(resources: &Resources<'a>, key: &[u8], name: &[u8]) -> Option<Dict<'a>> {
++    lookup(resources, |r| category(r, key).get::<Dict<'a>>(name))
++}
++
++pub(crate) struct Baked {
++    pub(crate) content: Vec<u8>,
++    pub(crate) aliases: Vec<ResourceAlias>,
++}
++
 +enum Action {
 +    Keep,
 +    Drop,
 +    EndPath,
 +    Invisible,
++    Replace(Vec<u8>),
 +}
 +
-+struct Baker<'c> {
-+    config: &'c OcConfig,
++struct Baker<'c, 'e> {
++    config: Rc<OcConfig>,
++    ctx: &'c mut ExtractionContext<'e>,
 +    visibility: Vec<bool>,
 +    render_modes: Vec<i64>,
 +    render_mode: i64,
++    scope: usize,
++    aliases: Vec<ResourceAlias>,
 +    changed: bool,
 +}
 +
-+impl Baker<'_> {
++impl Baker<'_, '_> {
 +    fn is_hidden(&self) -> bool {
 +        self.visibility.last().copied().unwrap_or(false)
 +    }
@@ -201,30 +345,108 @@ index 00000000..b7f71879
 +        instruction: &Instruction<'_, '_>,
 +        resources: &Resources<'_>,
 +    ) -> bool {
-+        let mut operands = instruction.operands();
-+        let is_oc = matches!(operands.next(), Some(Object::Name(tag)) if tag.deref() == OC);
-+        let Some(Object::Name(name)) = operands.next() else {
-+            return false;
-+        };
-+
-+        is_oc
-+            && lookup(resources, |r| {
-+                let dict = r.properties.get::<Dict<'_>>(name.deref())?;
-+                Some(
-+                    self.config
-+                        .hides(r.properties.get_ref(name.deref()).map(Into::into), &dict),
-+                )
-+            })
-+            .unwrap_or(false)
++        match instruction.operands().nth(1) {
++            Some(Object::Name(name)) => {
++                let properties = &resources.properties;
++                properties
++                    .get::<Dict<'_>>(name.deref())
++                    .is_some_and(|dict| {
++                        let id = properties.get_ref(name.deref()).map(Into::into);
++                        self.config.hides(id, &dict)
++                    })
++            }
++            Some(Object::Dict(props)) => {
++                let id = props.get_ref(OC).map(ObjectIdentifier::from);
++                let dict = match id {
++                    Some(id) => self.ctx.pdf.xref().get::<Dict<'_>>(id),
++                    None => props.get::<Dict<'_>>(OC),
++                };
++                dict.is_some_and(|dict| self.config.hides(id, &dict))
++            }
++            _ => false,
++        }
 +    }
 +
-+    fn xobject_hides(&self, instruction: &Instruction<'_, '_>, resources: &Resources<'_>) -> bool {
-+        let Some(Object::Name(name)) = instruction.operands().next() else {
-+            return false;
++    fn variant(
++        &mut self,
++        key: &'static [u8],
++        name: &[u8],
++        resources: &Resources<'_>,
++    ) -> Option<Ref> {
++        let cache_key = (self.scope, key, name.to_vec());
++        if let Some(variant) = self.ctx.variants.get(&cache_key) {
++            return *variant;
++        }
++
++        let ctx = &mut *self.ctx;
++        let variant = match key {
++            XOBJECT => resolve_stream(resources, key, name)
++                .filter(|s| s.dict().get::<Name<'_>>(SUBTYPE).as_deref() == Some(FORM))
++                .and_then(|s| write_stream_variant(ctx, &s, resources)),
++            PATTERN => resolve_stream(resources, key, name)
++                .filter(|s| s.dict().get::<u8>(PATTERN_TYPE) == Some(1))
++                .and_then(|s| write_stream_variant(ctx, &s, resources)),
++            FONT => resolve_dict(resources, key, name)
++                .filter(|d| d.get::<Name<'_>>(SUBTYPE).as_deref() == Some(TYPE3))
++                .and_then(|d| write_type3_variant(ctx, &d, resources)),
++            _ => resolve_dict(resources, key, name)
++                .and_then(|d| write_ext_g_state_variant(ctx, &self.config, &d, resources)),
 +        };
 +
-+        lookup(resources, |r| r.x_objects.get::<Stream<'_>>(name.deref()))
-+            .is_some_and(|stream| self.config.hides_entry(stream.dict(), OC))
++        self.ctx.variants.insert(cache_key, variant);
++
++        variant
++    }
++
++    fn select(
++        &mut self,
++        key: &'static [u8],
++        instruction: &Instruction<'_, '_>,
++        resources: &Resources<'_>,
++    ) -> Action {
++        let operands = instruction.operands().collect::<Vec<_>>();
++        let Some(name) = operands.iter().find_map(|o| match o {
++            Object::Name(name) => Some(name.to_vec()),
++            _ => None,
++        }) else {
++            return Action::Keep;
++        };
++        let Some(variant) = self.variant(key, &name, resources) else {
++            return Action::Keep;
++        };
++
++        let mut alias = format!("oc{}", variant.get()).into_bytes();
++        while lookup(resources, |r| {
++            category(r, key).get::<Object<'_>>(alias.as_slice())
++        })
++        .is_some()
++        {
++            alias.push(b'_');
++        }
++
++        if !self
++            .aliases
++            .iter()
++            .any(|(k, n, _)| *k == key && *n == alias)
++        {
++            self.aliases.push((key, alias.clone(), variant));
++        }
++
++        let mut out = b"\n".to_vec();
++        for operand in &operands {
++            match operand {
++                Object::Name(_) => {
++                    out.push(b'/');
++                    out.extend_from_slice(&alias);
++                }
++                Object::Number(n) => out.extend_from_slice(n.as_f64().to_string().as_bytes()),
++                _ => return Action::Keep,
++            }
++            out.push(b' ');
++        }
++        out.extend_from_slice(instruction.operator.deref());
++
++        Action::Replace(out)
 +    }
 +
 +    fn classify(&mut self, instruction: &Instruction<'_, '_>, resources: &Resources<'_>) -> Action {
@@ -261,25 +483,228 @@ index 00000000..b7f71879
 +                }
 +                Action::Keep
 +            }
++            b"scn" | b"SCN" => self.select(PATTERN, instruction, resources),
++            b"Tf" => self.select(FONT, instruction, resources),
++            b"gs" => self.select(EXT_G_STATE, instruction, resources),
 +            _ if hidden && PAINTS.contains(&operator) => Action::EndPath,
 +            _ if hidden && SHOWS.contains(&operator) => Action::Invisible,
 +            b"Do" | b"sh" | b"BI" if hidden => Action::Drop,
-+            b"Do" if self.xobject_hides(instruction, resources) => Action::Drop,
++            b"Do" => {
++                let hides = match instruction.operands().next() {
++                    Some(Object::Name(name)) => resolve_stream(resources, XOBJECT, name)
++                        .is_some_and(|s| self.config.hides_entry(s.dict(), OC)),
++                    _ => false,
++                };
++
++                if hides {
++                    Action::Drop
++                } else {
++                    self.select(XOBJECT, instruction, resources)
++                }
++            }
 +            _ => Action::Keep,
 +        }
 +    }
 +}
 +
-+pub(crate) fn bake(data: &[u8], resources: &Resources<'_>, config: &OcConfig) -> Option<Vec<u8>> {
-+    if config.hidden.is_empty() {
++fn bake_stream(
++    ctx: &mut ExtractionContext<'_>,
++    stream: &Stream<'_>,
++    resources: &Resources<'_>,
++) -> Option<Baked> {
++    let id = stream.obj_id();
++    if ctx.active_streams.contains(&id) {
 +        return None;
 +    }
 +
++    let data = stream.decoded().ok()?;
++
++    ctx.active_streams.push(id);
++    let baked = bake(&data, resources, ctx);
++    ctx.active_streams.pop();
++
++    baked
++}
++
++fn write_stream_variant<'a>(
++    ctx: &mut ExtractionContext<'_>,
++    stream: &Stream<'a>,
++    parent: &Resources<'a>,
++) -> Option<Ref> {
++    let own = stream.dict().get::<Dict<'_>>(RESOURCES).unwrap_or_default();
++    let resources = Resources::from_parent(own, parent.clone());
++    let baked = bake_stream(ctx, stream, &resources)?;
++
++    Some(write_stream(ctx, stream, &resources, &baked))
++}
++
++fn write_stream(
++    ctx: &mut ExtractionContext<'_>,
++    stream: &Stream<'_>,
++    resources: &Resources<'_>,
++    baked: &Baked,
++) -> Ref {
++    let variant = ctx.new_ref();
++    let mut chunk = Chunk::with_settings(ctx.chunk_settings);
++    let encoded = deflate_encode(&baked.content);
++    let mut writer = chunk.stream(variant, &encoded);
++    writer.filter(Filter::FlateDecode);
++    write_dict(stream.dict(), &mut writer, ctx, &STREAM_SKIP);
++    serialize_resources(resources, ctx, &mut writer, &baked.aliases);
++    writer.finish();
++    ctx.chunks.push(chunk);
++
++    variant
++}
++
++fn write_type3_variant<'a>(
++    ctx: &mut ExtractionContext<'_>,
++    font: &Dict<'a>,
++    parent: &Resources<'a>,
++) -> Option<Ref> {
++    let procs = font.get::<Dict<'_>>(CHAR_PROCS)?;
++    let own = font.get::<Dict<'_>>(RESOURCES).unwrap_or_default();
++    let resources = Resources::from_parent(own, parent.clone());
++    let mut chunk = Chunk::with_settings(ctx.chunk_settings);
++    let mut aliases: Vec<ResourceAlias> = Vec::new();
++    let mut baked_procs = Vec::new();
++
++    for (name, _) in procs.entries() {
++        let Some(proc) = procs.get::<Stream<'_>>(name.deref()) else {
++            continue;
++        };
++        let proc_resources = match proc.dict().get::<Dict<'_>>(RESOURCES) {
++            Some(own) => Resources::from_parent(own, resources.clone()),
++            None => resources.clone(),
++        };
++        let Some(baked) = bake_stream(ctx, &proc, &proc_resources) else {
++            continue;
++        };
++
++        let proc_ref = ctx.new_ref();
++        let encoded = deflate_encode(&baked.content);
++        let mut writer = chunk.stream(proc_ref, &encoded);
++        writer.filter(Filter::FlateDecode);
++        write_dict(proc.dict(), &mut writer, ctx, &STREAM_SKIP[..3]);
++        writer.finish();
++
++        for alias in baked.aliases {
++            if !aliases.contains(&alias) {
++                aliases.push(alias);
++            }
++        }
++        baked_procs.push((name.to_vec(), proc_ref));
++    }
++
++    if baked_procs.is_empty() {
++        return None;
++    }
++
++    let variant = ctx.new_ref();
++    let mut dict = chunk.indirect(variant).dict();
++    write_dict(font, &mut dict, ctx, &[CHAR_PROCS, RESOURCES]);
++
++    let mut char_procs = dict.insert(pdf_writer::Name(CHAR_PROCS)).dict();
++    for (name, proc) in procs.entries() {
++        match baked_procs
++            .iter()
++            .find(|(n, _)| n.as_slice() == name.deref())
++        {
++            Some((_, proc_ref)) => {
++                char_procs.pair(pdf_writer::Name(name.deref()), *proc_ref);
++            }
++            None => proc.write_direct(char_procs.insert(pdf_writer::Name(name.deref())), ctx),
++        }
++    }
++    char_procs.finish();
++
++    serialize_resources(&resources, ctx, &mut dict, &aliases);
++    dict.finish();
++    ctx.chunks.push(chunk);
++
++    Some(variant)
++}
++
++fn write_ext_g_state_variant<'a>(
++    ctx: &mut ExtractionContext<'_>,
++    config: &OcConfig,
++    ext_g_state: &Dict<'a>,
++    parent: &Resources<'a>,
++) -> Option<Ref> {
++    let mask = ext_g_state.get::<Dict<'_>>(SMASK);
++    let group_ref = mask
++        .as_ref()
++        .and_then(|mask| mask.get::<Stream<'_>>(G))
++        .and_then(|group| {
++            if config.hides_entry(group.dict(), OC) {
++                let empty = Baked {
++                    content: Vec::new(),
++                    aliases: Vec::new(),
++                };
++                let resources = Resources::from_parent(Dict::default(), parent.clone());
++                Some(write_stream(ctx, &group, &resources, &empty))
++            } else {
++                write_stream_variant(ctx, &group, parent)
++            }
++        });
++
++    let font = ext_g_state.get::<Array<'_>>(FONT);
++    let font_ref = font
++        .as_ref()
++        .and_then(|font| font.iter::<Dict<'_>>().next())
++        .filter(|d| d.get::<Name<'_>>(SUBTYPE).as_deref() == Some(TYPE3))
++        .and_then(|d| write_type3_variant(ctx, &d, parent));
++
++    if group_ref.is_none() && font_ref.is_none() {
++        return None;
++    }
++
++    let mut skip = Vec::new();
++    skip.extend(group_ref.map(|_| SMASK));
++    skip.extend(font_ref.map(|_| FONT));
++
++    let variant = ctx.new_ref();
++    let mut chunk = Chunk::with_settings(ctx.chunk_settings);
++    let mut dict = chunk.indirect(variant).dict();
++    write_dict(ext_g_state, &mut dict, ctx, &skip);
++
++    if let (Some(mask), Some(group_ref)) = (&mask, group_ref) {
++        let mut mask_writer = dict.insert(pdf_writer::Name(SMASK)).dict();
++        write_dict(mask, &mut mask_writer, ctx, &[G]);
++        mask_writer.pair(pdf_writer::Name(G), group_ref);
++        mask_writer.finish();
++    }
++
++    if let (Some(font), Some(font_ref)) = (&font, font_ref) {
++        let mut font_writer = dict.insert(pdf_writer::Name(FONT)).array();
++        font_writer.item(font_ref);
++        for size in font.raw_iter().skip(1) {
++            size.write_direct(font_writer.push(), ctx);
++        }
++        font_writer.finish();
++    }
++
++    dict.finish();
++    ctx.chunks.push(chunk);
++
++    Some(variant)
++}
++
++pub(crate) fn bake(
++    data: &[u8],
++    resources: &Resources<'_>,
++    ctx: &mut ExtractionContext<'_>,
++) -> Option<Baked> {
++    let config = ctx.oc_config.clone()?;
++    ctx.oc_scopes += 1;
 +    let mut baker = Baker {
 +        config,
++        scope: ctx.oc_scopes,
++        ctx,
 +        visibility: Vec::new(),
 +        render_modes: Vec::new(),
 +        render_mode: 0,
++        aliases: Vec::new(),
 +        changed: false,
 +    };
 +    let mut out = Vec::with_capacity(data.len());
@@ -294,15 +719,27 @@ index 00000000..b7f71879
 +
 +        match action {
 +            Action::Keep => out.extend_from_slice(segment),
-+            Action::Drop => baker.changed = true,
++            Action::Drop => {
++                out.push(b'\n');
++                baker.changed = true;
++            }
 +            Action::EndPath => {
 +                out.extend_from_slice(b"\nn");
 +                baker.changed = true;
 +            }
 +            Action::Invisible => {
-+                out.extend_from_slice(b"\n3 Tr");
++                let invisible: &[u8] = if baker.render_mode >= 4 {
++                    b"\n7 Tr\n"
++                } else {
++                    b"\n3 Tr\n"
++                };
++                out.extend_from_slice(invisible);
 +                out.extend_from_slice(segment);
 +                out.extend_from_slice(format!("\n{} Tr", baker.render_mode).as_bytes());
++                baker.changed = true;
++            }
++            Action::Replace(replacement) => {
++                out.extend_from_slice(&replacement);
 +                baker.changed = true;
 +            }
 +        }
@@ -310,5 +747,48 @@ index 00000000..b7f71879
 +
 +    out.extend_from_slice(&data[start..]);
 +
-+    baker.changed.then_some(out)
++    baker.changed.then_some(Baked {
++        content: out,
++        aliases: baker.aliases,
++    })
 +}
+diff --git a/hayro-write/src/primitive.rs b/hayro-write/src/primitive.rs
+index 6482be8b..fa5f63b9 100644
+--- a/hayro-write/src/primitive.rs
++++ b/hayro-write/src/primitive.rs
+@@ -108,14 +108,14 @@ impl<T: WriteDirect> WriteDirect for MaybeRef<T> {
+     }
+ }
+ 
+-fn write_dict(
++pub(crate) fn write_dict(
+     hayro_dict: &dict::Dict<'_>,
+     pdf_dict: &mut Dict<'_>,
+     ctx: &mut ExtractionContext<'_>,
+-    is_stream: bool,
++    skip: &[&[u8]],
+ ) {
+     for (name, val) in hayro_dict.entries() {
+-        if is_stream && name.deref() == LENGTH {
++        if skip.contains(&name.deref()) {
+             continue;
+         }
+ 
+@@ -129,7 +129,7 @@ impl WriteDirect for object::Dict<'_> {
+     fn write_direct(&self, obj: Obj<'_>, ctx: &mut ExtractionContext<'_>) {
+         let mut dict = obj.dict();
+ 
+-        write_dict(self, &mut dict, ctx, false);
++        write_dict(self, &mut dict, ctx, &[]);
+     }
+ }
+ 
+@@ -175,7 +175,7 @@ impl WriteIndirect for Stream<'_> {
+         // TODO: Handle `Crypt` filter
+         let data = self.raw_data();
+         let mut obj = chunk.stream(id, &data);
+-        write_dict(self.dict(), obj.deref_mut(), ctx, true);
++        write_dict(self.dict(), obj.deref_mut(), ctx, &[LENGTH]);
+     }
+ }
+ 

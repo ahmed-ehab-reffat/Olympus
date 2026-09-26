@@ -170,6 +170,12 @@ The natural order is wrong.
 validation occurs before trailing-period removal"* — and a sibling run **panicked** slicing the
 empty host of the same degenerate input. One documented rule pair, two distinct kills.
 
+Also `piscsi-image-reservation-identity`: the REFERENCE collapsed `..` lexically before its
+folder-boundary check, so `escape/../victim.hds` (escape -> a folder outside) passed as `victim.hds`
+and DELETE removed the wrong file (Solution Quality round 13). Agents: **1/10** (batch 1, Nova #1,
+`dot_dot_after_a_folder_link_is_resolved_through_the_link`) and **1/10** (accepted batch, Nova #1).
+The second axis (how far resolution reaches) is F-60.
+
 **How to build.** Two documented transforms + one input where applying them in the natural order
 gives a different answer. State both rules, never their order. Include the degenerate input
 (the empty/one-character case) — it converts a wrong answer into a crash.
@@ -433,7 +439,18 @@ near-miss runs** (Nova #4 and #9 passed 20 of 21 and printed `20\n20\n` instead 
 Both had implemented each axis correctly in isolation. Arithmetically decisive: without this
 one test the batch reads **4/10 = 40%, at the ceiling**; with it, **2/10 = 20%**. `go-workflows-channel-drain`: **4/10 runs** on the cell (parked `Drain` select-case) x
 (unbuffered channel + nonblocking send) -- each axis worked alone; the intersection dropped the
-value. It was the sole remaining failure of the 98/102 near-miss (Nova #8) after the F-20 pair.
+value. It was the sole remaining failure of the 98/102 near-miss (Nova #8) after the F-20 pair. `bayesopt-search-space-migration`: cell = the duplicate
+rule (earliest registered point survives) x a SECOND holder of points (ConstantLiar's pending
+suggestions). Every run applied the rule to registered points; **6/10 in the accepted batch and 4/11
+in batch 1** carried the pending points without it, and it was the **SOLE failure of both 84/85
+near-misses**. The contract reached the cell with one clause ("under the same rules as registered
+points"), and every evaluator ruled it described and inferable.
+
+Also `piscsi-image-reservation-identity` batch 1: **3/10** on the cell (working-directory-first lookup ×
+holder reporting): two separately stated rules, and three runs reported the default-folder path's
+holders for a device that had opened its image from the daemon's working directory
+(`devices_sharing_an_image_from_the_working_directory_report_each_other`, ruled subtle but fair). 0/10
+in the accepted batch.
 
 **Precondition.** Any feature stated as "X must work for all forms of Y". Two axes is enough;
 one of them wants multiplicity (fan-out, N receivers, repeated rounds) and the other wants
@@ -1259,6 +1276,14 @@ batch-1 solutions and the R0 reference** kept the `{`/`[` rule and pruned that c
 the Auto Review's High finding). Stated in meta.md as "stringified in any form the builder writes today,
 scalar JSON included", it killed **0/10** in batch 2 (L77).
 
+`piscsi-image-reservation-identity` adds a LIBRARY-CONTRACT instance: base `PiscsiImage::GetUidAndGid`
+treats `getpwuid_r` returning 0 as "found" and reads `pw_gid` from the zeroed struct when the result
+pointer is null, so CREATE chowns to group 0 and fails for any non-root user without a passwd entry.
+The platform validates as such a user (uid 4242). Stated in meta.md ("Creating works for a user without
+a passwd entry too, keeping that user's group") and still: **6/10** in batch 1 and **3/10** in the
+accepted batch (one of them the `SUDO_GID` variant: *"GetUidAndGid uses SUDO_GID for a UID without a
+passwd entry"*). Stating the rule does not transmit a latent library-API edge.
+
 **Precondition.** A small allocation, cursor or range-arithmetic helper whose loop exits early and
 rebuilds its result from only the items it touched, used today only by callers whose input keeps the
 bug unreachable (one element, contiguous input, partial fills). Confirm by calling it with the new
@@ -1822,6 +1847,203 @@ tests. Free if the pass already has both paths.
 **Arsenal mapping.** A sibling of F-24 and F-37 (sentinel family). F-24 swaps a hard failure for a
 sentinel; F-37 collides an in-band sentinel with real input; F-55 leaks an out-of-band sentinel into
 an existing index-keyed API.
+
+---
+
+### F-56. A secondary component's learned state rebuilt from its initializer when the configuration it indexes changes ★ 5/10 on bayesopt-search-space-migration (2/11 in batch 1)
+
+**Mechanism.** An optional collaborator (here `SequentialDomainReductionTransformer`) holds learned
+per-dimension state: a current reduced window, a contraction radius, oscillation terms, keyed by
+position. The feature changes the dimension set. The component already has `initialize(space)`, the
+obvious call, and agents call it (or recompute the radius from the clipped window) instead of
+carrying each kept column by name. The object is valid afterwards and every later suggestion lies
+inside the new bounds; it has just forgotten how far it had contracted.
+
+**Why it misdirects.** Nothing crashes and nothing lands out of range. Only the COURSE of later
+suggestions changes, so any assertion on ranges, shapes or keys passes. The failure shows up only
+against an oracle that knows where the state should have continued from.
+
+**Evidence.** `bayesopt-search-space-migration`: 5/10 in the accepted batch (Nova #10, #9, #7, #6,
+#2), across the undo-twin tests (add a parameter then remove it, then compare the next four
+maximize steps with an untouched twin: 5/10), the moved-global-bounds window test (5/10), the
+narrowed-window test (2/10), added-parameter start (2/10), removed-parameter twin (1/10); 2/11 in
+batch 1. Evaluators: *"changes the kept contraction radius"*, *"resets transformer history/state in a
+way that changes subsequent suggestions"*, *"changes the current contraction state when clipping a
+window"*. It was never the SOLE failure of a run; it compounded with F-10.
+
+**Precondition.** A pluggable collaborator with its own positional state and an `initialize`-style
+entry point, plus a feature that changes the configuration that state is indexed by (dimensions,
+columns, channels, fields).
+
+**How to build.** State the continuity in the contract ("a kept parameter keeps contracting from
+where it was and keeps its current window, trimmed ..."). Test it with a TWIN: change and then undo
+the configuration, and require the same further course as an optimizer that was never changed (the
+undo twin needs no internal reads). Add one moved-bounds case where the kept window overlaps the new
+bounds only partly, otherwise the trim resets it to exactly what a re-initialize gives (the first
+fixture here could not tell them apart).
+
+**Arsenal mapping.** HARDENING S1 (state that must survive a transformation) with a twin oracle.
+
+---
+
+### F-57. Type membership used where the contract needs a value check (NaN and infinity pass `isinstance(x, Real)`) — 2/10 on bayesopt-search-space-migration
+
+**Mechanism.** The contract says a numeric parameter takes "any real number". Agents implement
+it as a type test (`isinstance(value, numbers.Real)`, `is_numeric`, or a NaN-only guard), and
+`float("nan")`, `float("inf")` and huge ints pass it. The value is then carried, stored or evaluated.
+
+**Why it misdirects.** Every ordinary input, and every string, complex or out-of-range number, is
+handled correctly, so the predicate looks complete. The failure appears only on a registered or
+queued non-finite value, far from the predicate.
+
+**Evidence.** `bayesopt-search-space-migration`, accepted batch: **2/10** (Nova #10 rejected NaN
+but not infinity; Nova #6 accepted both), killing the NaN point test (2/10) and the NaN queued-probe
+test (1/10). The REFERENCE had the same bug (Auto Review round 6, three paths: `OverflowError` on an
+infinite integer fill, NaN point kept, NaN lazy probe evaluated), and the accepted review still found
+`10**10000` raising `OverflowError` (Medium).
+
+**Precondition.** A contract phrase over numeric values ("real", "finite", "a number") and a code
+path that stores or forwards the value rather than computing with it at once.
+
+**How to build.** Keep the contract word ("real number"), and test NaN and infinity on each path that
+STORES the value (registered point, queued item, fill), not only the one that validates it.
+
+**Arsenal mapping.** HARDENING B (value-domain edge), cheap insurance rather than a lead trap.
+
+---
+
+### F-58. A dry-run record stamped with the identity of an object not yet registered ★ 5 runs across 2 batches on piscsi-image-reservation-identity, the sole failure of a 65/66 near-miss
+
+**Mechanism.** A multi-item command is validated in a dry run before anything is committed, and the
+feature needs the dry run to STAGE each item so later items are checked against earlier ones. The
+natural staging call is the object's own "record me" method (`storage_device->ReserveFile()`), which
+reads the object's identity from where it will live (`GetId()`/`GetLun()` come from the controller the
+device is attached to). In the dry run the object is not attached yet, so the identity is a sentinel
+(`-1:0`). The staged record exists, conflicts are detected, and the command is refused, but every
+message and query that names the staged holder names the sentinel.
+
+**Why it misdirects.** The conflict IS detected, atomicity holds (nothing is attached), and every test
+that checks only refusal passes. The failure is one substring in an error message (`1:0, 2:0` expected,
+`-1:0, -1:0` produced), which reads as a formatting slip, not as a staging design error. In the base
+repo the sentinel is also the "not reserved" value, so a sentinel-stamped record can silently disappear
+from lookups that skip id -1.
+
+**Evidence.** piscsi-image-reservation-identity batch 1: **2/10** (Nova #7 *"multi-device holder
+identity"*, Nova #2 *"incorrect dry-run holder bookkeeping"*); accepted batch: **3/10** (Nova #5, Nova #2,
+Nova #1). Nova #2's sole failure, 65/66: *"Attach calls storage_device->ReserveFile(), which records
+GetId() and GetLun() from the temporary device. Those values are -1:0 during validation, so the later
+conflict error names -1:0, -1:0 rather than the actual requested holders 1:0 and 2:0."* All ruled
+mentioned and inferable. This was a DESIGNED trap (DESIGN.md, "zero description words"); the contract
+sentence that made it observable ("Refusal errors name holders as `1:0, 3:0`") came later from a gate.
+
+**Precondition.** A dry-run/validate-then-commit loop over several items, where an item's identity is
+assigned by the container it is committed INTO (controller slot, parent node, registry index), and an
+observable (error text, query, report) that names staged items.
+
+**How to build.** State that refusals name the conflicting holders and give the format. Test one
+command whose LATER item conflicts with an EARLIER item of the same command, and assert the earlier
+item's real identity in the message. Keep a second test where the conflict is with an already
+committed holder, so the message format itself is not the trap.
+
+**Arsenal mapping.** A cousin of F-25 (a placeholder valid only inside its own pass): here the
+placeholder is the object's own identity before registration. Zero extra description words.
+
+---
+
+### F-59. A snapshot restore that rebuilds a captured identity from the name it was filed under ★ 8 runs across 2 batches on piscsi-image-reservation-identity
+
+**Mechanism.** The feature captures an identity (device and inode) when an entry is created, and keeps
+the entry under a presentation key (the name the file was opened by). Some path later rebuilds the
+identity table from the key table instead of carrying it: a dry-run snapshot restore
+(`SetReservedFiles(snapshot)` clearing and re-statting every key), or a lookup that falls back to the
+key when the queried path "has no identity". After the held file is renamed and a new file is created
+under the old name, the rebuilt identity points at the replacement. The old holder now "holds" a file
+it never opened, and the renamed original looks free.
+
+**Why it misdirects.** Every alias test passes, including hard links, because in those tests the name
+still denotes the captured file. Only rename-then-reuse separates "identity captured once" from
+"identity re-derived from the name", and the failing test reads as a refused attach of a fresh file,
+which looks like an over-strict conflict rule rather than a restore bug.
+
+**Evidence.** piscsi-image-reservation-identity batch 1: **5/10** (`hold_stays_with_the_file_after_its_name_is_reused`:
+Nova #10, #6, #5, #2, #1, *"snapshot restoration or name fallback rebound the old holder after
+rename-and-reuse"*); accepted batch: **3/10** (Nova #8, #3, #1), two of them also failing the device
+report. Nova #8 (batch 2): *"SetReservedFiles clears the identity map and reconstructs it from the
+current name map. After a held file is renamed and that name is reused, the old holder is either
+associated with the replacement inode or disappears from the original inode."* The REFERENCE had this
+twice first: exact-key and canonical text matches accepted over a differing identity (Solution Quality
+round 12), and per-device reporting re-resolving the stored name (Auto Review after batch 1).
+
+**Precondition.** A ledger keyed by a human-facing name (path, hostname, label) with a derived identity
+beside it, and any path that rebuilds, restores or re-resolves the ledger: dry-run rollback, reload,
+cache invalidation, reporting.
+
+**How to build.** State the rule once ("a hold stays with that file even if it is renamed and its name
+reused") and, if the report must follow it too, say that separately (L100). Test: hold A, rename A away,
+create B under A's old name, then (1) B is free and can be taken, (2) A's new name is still held, (3) the
+report for A's holder does not list B's holder. It is deterministic because A still exists, so B's inode
+must differ. Keep the reference's identity alive with an open descriptor so inode reuse cannot fake it.
+
+**Arsenal mapping.** F-56's family (state rebuilt instead of carried), on an identity rather than
+learned state. HARDENING S-tier when the restore path exists in the repo already.
+
+---
+
+### F-60. Containment decided on the fully resolved path, so the final link the operation acts on is judged by its target — 5 runs across 2 batches on piscsi-image-reservation-identity, one sole failure
+
+**Mechanism.** Image commands must refuse names outside a folder, including through a folder symlink,
+while an image that is itself a link to a file elsewhere stays usable. The natural containment check
+resolves the whole path (`canonical`, `weakly_canonical`, `filesystem::relative`) and compares it with
+the folder. That also resolves the LAST component, so the in-folder link is judged by where it points
+and refused. The opposite mistake, collapsing `..` lexically before resolving, lets `escape/../x`
+through when `escape` is a folder link (F-6).
+
+**Why it misdirects.** Folder-link escapes are refused correctly and every plain file works, so the
+check looks complete. The failure appears only on the one case the contract carved out, and it reads
+as a symlink permission rule the agent believes it implemented.
+
+**Evidence.** piscsi-image-reservation-identity accepted batch: **3/10** (Nova #6 sole cause, 64/66:
+*"its path containment check uses std::filesystem::relative on the whole path. That resolves the final
+image symlink, so a link in the image folder to a file outside it is rejected before delete or copy can
+operate on the link"*; Nova #7; Nova #1 *"rejects valid normalized paths through in-folder directory
+links"*), batch 1: **2/10** (Nova #1 in-folder links + `..` after a link; Nova #7 name forms).
+
+**Precondition.** A path-confinement rule with a stated exception for the last component (symlinks,
+mount points, device files), and operations that act on the link itself (unlink, rename, copy of the
+link).
+
+**How to build.** Name both sides of the carve-out in one sentence (the folders are checked, an image
+that itself links elsewhere stays usable). Test a folder-link escape (refused), `..` after a folder link
+(resolved through the link), an in-folder folder link (allowed), and a final link to an outside file used
+by attach, copy and delete.
+
+**Arsenal mapping.** F-6 (validation vs normalisation order) on a second axis: how FAR normalisation
+reaches, not only when.
+
+---
+
+### F-61. A check that must open the resource before it can classify it leaves it opened when it refuses — 2/10 on piscsi-image-reservation-identity (batch 1)
+
+**Mechanism.** Whether the requester may share the resource depends on a property only known after
+opening it (a device is read-only once its image is opened). So the conflict check moves after the
+open. On refusal, the natural code just returns false, and the half-applied open stays: an INSERT that
+was refused leaves the drive holding the medium.
+
+**Why it misdirects.** The refusal is reported correctly and no reservation is created, so every
+"refused" assertion passes; only a follow-up state assertion (`IsRemoved()`) fails.
+
+**Evidence.** piscsi-image-reservation-identity batch 1: **2/10** (Nova #8, Nova #4:
+`insert_with_dot_segment_is_refused_while_attached` and `writer_is_refused_while_a_cd_rom_holds_the_image`,
+*"the refused insert leaves the device non-removed"*, ruled subtle but fair). **0/10** in the accepted
+batch, with nothing changed on this path: variance, not a fix.
+
+**Precondition.** A classify-by-opening step on an existing object (insert into a drive, reload into a
+live slot), where the refusal happens after the open.
+
+**How to build.** No extra words: "attaching or inserting is refused" already implies nothing is
+inserted. Assert the object's state after the refusal, not only the return value.
+
+**Arsenal mapping.** HARDENING B, a cheap follow-up assertion on every refusal test.
 
 ---
 
@@ -3686,6 +3908,102 @@ surviving an early runner failure (Medium, **open**).
 
 ---
 
+### bayesopt-search-space-migration (Python / Bayesian optimization: live search-space change with state migration) — ACCEPTED 2026-09-25, 3/10
+
+| | |
+|---|---|
+| Shape | O-Composite-add. New `BayesianOptimization.set_space(pbounds, fill)` carrying registered points, constraint values, duplicate cache, lazy queue, nested ConstantLiar/GPHedge state and SequentialDomainReductionTransformer state through add/remove/retype/category changes, transactionally |
+| Final artifact | 5 files (`acquisition.py`, `bayesian_optimization.py`, `domain_reduction.py`, `parameter.py`, `target_space.py`), 242 human-effective LOC, 85 new test cases, 167 base tests |
+| Pass-rate history | slice 140 eff → eight gate rounds (precheck internals, Solution Quality x3, Auto Review x4) → batch 1 **0/11** (GPHedge per-candidate rule only implied: 11/11) → rule and EI/PI fallback stated in meta.md, full batch → batch 2 **3/10** (accepted, Auto Review Approved 3/2/2) |
+| Patterns used | **F-10** (duplicate rule x pending-point holder, 6/10, sole failure of both 84/85 near-misses), **F-56** (5/10, new), **F-57** (2/10, new) |
+| Agent split | Batch 2: Nova 3/10. Batch 1: Nova 0/10, Orion 0/1 |
+
+**Why it held.** Two traps the evaluators ruled fair. The F-10 cell (a rule written once for
+registered points, applied by "the same rules" to ConstantLiar's pending points) decided the band:
+both near-misses failed only that. The transformer continuity trap (F-56) took five runs, always in
+combination. 76 of 85 tests killed nothing.
+
+**What the batches taught.**
+
+- **A gate-demanded CHOICE between two defensible designs must be stated; an EXTENSION of a stated
+  rule can stay implied (L97).** Solution Quality made GPHedge keep the candidates that survive (the
+  other defensible design: drop the whole round, since gains align with base acquisitions). The
+  prompt only implied it. 11/11 chose "drop all", several with written reasons ("the only shape-safe
+  option"); my own first reference did too. Stated in one sentence: **0/10**. The ConstantLiar dedup,
+  found by the same gate and ALSO only implied, killed 4/11 then 6/10 and was ruled fair, because
+  skipping it has no rationale; agents simply did not extend the rule.
+- **The undo twin is a public-API oracle for hidden state (L98, Pattern 106).** The first precheck
+  rejected tests reading `liar.dummies`, `hedge.gains`, `optimizer._queue`. Replacing them with
+  "change, undo, then match an untouched twin's res and next suggestions" passed that check and
+  killed 5/10 through the transformer. Later Auto Reviews still asked for direct reads (through the
+  public `get_acquisition_params()`), and those reads killed nobody.
+- **L90 held strongly.** All three accepted-batch killers (ConstantLiar dedup, transformer continuity,
+  non-finite values) were reference bugs a gate found. The gate findings that picked a design
+  (GPHedge per-candidate, EI/PI random fallback) killed 0/10 once stated.
+- **An upstream bug made one requirement unobservable.** `CategoricalParameter.kernel_transform`
+  (`res[:, np.argmax(value, axis=1)] = 1`) marks every row's argmax column in every row, so the GP
+  never learns a category effect and a swapped-category GPHedge candidate scores the same. Only a
+  decoded state read could test it. Check what the base model can distinguish before designing a
+  behavioural test on it.
+- **Probing saved patches killed a false lever.** A constrained-suggestion twin diverged for 7/11
+  batch-1 solutions; the cause was a rebuilt ConstraintModel sharing the optimizer's RNG, not a model
+  bug. Unfair, discarded.
+- **Passers wrote more than the reference.** Passing diffs +529 to +656 raw lines (~430 effective per
+  Auto Review) against the reference's 242; median 82 model requests in batch 2, 79 in batch 1.
+
+**Reference bugs found: 9**, all by gates. ConstantLiar collisions not deduped; transformer not
+migrated; GPHedge all-or-nothing; transformer history ragged, then duplicated on undo; complex
+categories raising `TypeError`; EI/PI raising when every point is outside the bounds; NaN/infinity
+carried on three paths. Two Mediums left open at acceptance: `10**10000` fill raises
+`OverflowError`, ConstantLiar pending categories untested under a reorder.
+
+### piscsi-image-reservation-identity (C++ / PiSCSI daemon: identity-aware, shareable image reservations) — ACCEPTED 2026-09-26, 3/10
+
+| | |
+|---|---|
+| Shape | O-Composite-extend grown from a bug-shaped slice. String-keyed reservation ledger turned into a device/inode identity ledger with per-holder read-only sharing, name confinement for six image commands, holder reporting through protobuf and scsictl, and atomic multi-device attach |
+| Final artifact | 10 files (storage_device.cpp/.h, piscsi_executor.cpp/.h, piscsi_image.cpp/.h, piscsi_response.cpp/.h, scsictl_display.cpp, piscsi_interface.proto), Counter 1 294 / hook human-effective 221, 66 new tests, 317 base tests (one run as `nobody` via setpriv) |
+| Pass-rate history | core slice 23 eff → 13 gate rounds (category, Dockerfile, Solution Quality x7, Auto Review x5, Verify Solution) growing it to 279 eff → batch 1 **1/10** → reference device-reporting fix + rename-reuse device test; replay of the 10 saved patches read **0/10** on it, so the rule was stated in meta.md and a fresh batch run → batch 2 **3/10** (accepted, Auto Review Approved 3/3/3) |
+| Patterns used | **F-59** (8 runs over 2 batches, new), **F-39** (9 runs, library-contract instance), **F-58** (5 runs, new, designed; sole failure of a 65/66 run), **F-60** (5 runs, new; one sole failure), **F-61** (2 runs, new), **F-10** (3 runs, batch 1), F-6 (reference bug, 2 runs) |
+| Agent split | Nova only. Batch 1: 1/10. Batch 2: 3/10 |
+
+**Why it held.** Five independent causes, each ruled "mentioned and inferable" by the evaluators, and
+no failing run shared one root with another (L4). The near-misses were decided by F-58 (65/66), F-59
+(64/66), F-60 (64/66) and F-58+F-39 (64/66).
+
+**What the batches taught.**
+
+- **The headline killed nobody.** The pick's premise (alias identity through `.`/`..`, symlinks and hard
+  links: second attach, delete, rename, copy, protect while held) is 16+ tests that killed **0 of 20
+  runs**. 37 of 66 tests never killed anyone. Every measured killer except F-58 entered through a gate
+  finding against the reference (L50), and the one designed trap that worked needed a gate-added
+  message rule to become observable.
+- **A stated rule can still read 10/10 wrong when it is an unstated EXTENSION (L100).** "A hold stays
+  with the file after its name is reused" was stated; its extension to a device's own report was not.
+  Replaying all ten batch-1 patches against the new device-list test: **10/10 failed**, including the
+  only passer. One sentence ("A device's own entry lists the holders of the file it opened, even after
+  that name is reused") took it to **2/10** in the next fresh batch.
+- **Library-contract edges survive being stated (F-39).** "Creating works for a user without a passwd
+  entry" was in the description; `getpwuid_r`'s success-with-null result still killed 6/10 and 3/10.
+- **Root-graded permission semantics need a forked, privilege-dropping test (Pattern 107).** Read-only
+  by file permission and "no passwd entry" are both impossible as root. A child that drops to
+  `nobody`/4242 when it starts as root and reports each check through its exit code made both
+  deterministic under root, uid 1000 and 4242.
+- **Harness, twice (L99).** New tests that call the new API do not compile on base, and base mode
+  built the same binary: all 316 base tests "failed" without the solution until base mode excluded the
+  new test file. Then Verify Solution failed on the synthetic `build::compile` case; the new-mode
+  fallback now writes one failing case per real test name.
+- **Growing a 23-line slice to 294 took thirteen gate rounds, and each round added requirements** (L91).
+  Batch after round 13 still landed in band because every added rule was stated before the batch.
+
+**Reference bugs found: 12**, all by gates: hard links not one image; directory-symlink escape; `..`
+after a folder link collapsed lexically; exact-name and canonical matches overriding a captured
+identity; recycled inode of a deleted reserved file (fixed with a held descriptor); UNPROTECT skipping
+the reservation check; duplicate ID/LUN in one ATTACH aborting on an assertion; working-directory
+device holders looked up under the default folder; per-device holders re-resolved from a reused name;
+image commands rejecting absolute names; relative `GetIdsForReservedFile` resolved against the CWD
+(contract narrowed); base `GetUidAndGid` passwd bug (fixed and stated).
+
 ## 3. CROSS-PROBLEM LAWS
 
 | # | Law | Evidence |
@@ -3739,7 +4057,7 @@ surviving an early runner failure (Medium, **open**).
 | L47 | **Parametrise a "works for all forms of X" axis by what the IMPLEMENTATION distinguishes, not by what looks varied to a reader.** Spellings a human calls different are one cell to the code; the cells that kill are the ones the repo's own validator treats differently. | rocketpy: 7 callable spellings shipped, only `defaulted` and `keyword_only` killed (6/10 each); `partial`, callable-instance and `*args` killed nothing because `Function` accepts them. Read the wrapper's `inspect.signature` logic to find the boundary before writing the matrix |
 | L48 | **A representation-tolerant reader in the test suite is FP-panel armour, not just fairness hygiene.** A helper that accepts every shape the contract permits is executable documentation of the permitted domain, and the adjudicator will cite it against a dissenting judge. | rocketpy FP panel: judge-c filed a solo `false_positive` on "no-slosh `slosh_mass` must be callable"; the adjudicator rejected it at high confidence *"contradicted by the verifier's OWN reported_slosh_mass helper, which explicitly accepts a bare 0"*. The helper had been added one round earlier purely to un-pin a representation |
 | L49 | **A test that kills a run for a REPRESENTATION reason is visible in the run data long before a reviewer names it.** Treat "failed only on the shape of a returned value" as a fairness defect the first time it appears, not the third. | rocketpy batch 1: Nova #5 lost exactly the four `test_a_tank_without_slosh_has_no_participating_mass` cases by returning int `0`. The same pin was flagged by Test Quality at round 25, fixed at round 26, and was worth the whole band -- unfixed, batch 3 read **0/10 = reject**; fixed, the identical ten solutions read **1/10 = accepted**. featurevisor-minimal-rebucketing: batch 1 had 7 kill events from `formatRebucketing` return shape (joined string, per-change signature) and one-log-per-line counting; a shape-tolerant `renderLines` plus rendered-line counting removed all 7 and moved no pass (2/11 before and after). |
-| L50 | **A bug a reviewer finds in YOUR reference predicts an agent failure mode — turn each one into a test.** You and the solvers face the same design pressure, so the mistake you made is the mistake they make. Every reference defect that got a regression test became a measured killer. | dfu-derived-recursion batch 2: the 3 tests written only to prove Solution-Quality findings took 4, 4 and 3 of 10 runs — 11 of 32 kill events — and grew the killing-test set from 5 to 8. The 79 tests the DESIGN was about killed nothing. worldengine: the round-1 reference bug (execute overwrote a supplied wind) became `test_a_supplied_wind_is_kept_by_execute`, 4/10 in batch 2 (F-29 twice, F-16 twice). tippecanoe-tile-join-size-recourses: both measured killers (F-33 3/10, the F-15 cells 4/10) were reviewer findings against the reference first, while every trap the design named took 0; sfepy: F-34 (8/13) was Auto Review R21 on the reference; the hook cell (7/13) grew from R27 and R36; planetiler-custommap-schema-composition: BOTH measured killers were Solution Quality findings against the reference (R1 same-file removal, F-38 7/10; R4 standalone bundled examples, F-9 3/10), while every trap the DESIGN named (args fixed point, position rule, raw-vs-accessor scalars, diamond, cycles) took 0. featurevisor-minimal-rebucketing: both measured killers started in the reference. The Solution Quality `__proto__` finding became F-40 (7/11); the free-range helper the first kernel reused became F-39 (3/11). Nothing the design named killed. |
+| L50 | **A bug a reviewer finds in YOUR reference predicts an agent failure mode — turn each one into a test.** You and the solvers face the same design pressure, so the mistake you made is the mistake they make. Every reference defect that got a regression test became a measured killer. | dfu-derived-recursion batch 2: the 3 tests written only to prove Solution-Quality findings took 4, 4 and 3 of 10 runs — 11 of 32 kill events — and grew the killing-test set from 5 to 8. The 79 tests the DESIGN was about killed nothing. worldengine: the round-1 reference bug (execute overwrote a supplied wind) became `test_a_supplied_wind_is_kept_by_execute`, 4/10 in batch 2 (F-29 twice, F-16 twice). tippecanoe-tile-join-size-recourses: both measured killers (F-33 3/10, the F-15 cells 4/10) were reviewer findings against the reference first, while every trap the design named took 0; sfepy: F-34 (8/13) was Auto Review R21 on the reference; the hook cell (7/13) grew from R27 and R36; planetiler-custommap-schema-composition: BOTH measured killers were Solution Quality findings against the reference (R1 same-file removal, F-38 7/10; R4 standalone bundled examples, F-9 3/10), while every trap the DESIGN named (args fixed point, position rule, raw-vs-accessor scalars, diamond, cycles) took 0. featurevisor-minimal-rebucketing: both measured killers started in the reference. The Solution Quality `__proto__` finding became F-40 (7/11); the free-range helper the first kernel reused became F-39 (3/11). Nothing the design named killed. piscsi-image-reservation-identity: four of the five measured causes (F-59 8 runs, F-39 9, F-60 5, F-61 2) were gate findings against the reference first; the pick's own alias-identity core killed 0 of 20 runs. |
 | L51 | **In a long review cycle most reference bugs are FIX-INDUCED: after each reference fix re-run the whole matrix AND the agent replay, and prefer deleting the mechanism over narrowing the guard.** A patch that adds a phase flag, a cached field or a mutable "current scope" to make one finding go away is the next finding. | dfu-derived-recursion: 4 of 7 reference bugs were created by the previous round's fix (lazy placeholder → NPE at registration → wrong-group resolution → lost identity wrapper). The chain ended only when the phase variable was deleted and placeholders were substituted eagerly. planetiler: letting the validator accept bundled names (R3) broke standalone bundled examples (R4); fixing that by inlining examples eagerly broke `--watch` for a missing or malformed spec file, found by Auto Review after acceptance |
 | L52 | **A qualifier binds to its nearest clause: a sentence with two subjects and one "except" / "including" / "unless" is misread by the whole population, and the evaluators will still call the tests fair.** Move each qualifier to the other subject; if the meaning changes, split the sentence so every qualifier has one possible subject. A unanimous same-reason failure overrides a "fair" verdict (L18). | ray-optics batch 1: 10 tests failed in **11 of 11** runs on "The derivative of a comparison, `and`, `or` or `not` is 0, and the derivative of `if` is the derivative of the selected branch, except on the switching set". All 11 returned 0 for bare comparisons and built a switching guard for `if`. A round-12 precheck had independently asked for that sentence to be split |
 | L53 | **The FP check reads the DESCRIPTION, not the suite. A spec dense enough that every clause is either tested (traps stack) or untested (FP exposure) has no clean pass: shrink the spec.** Before redesigning after an FP flag, probe every saved solution against every stated-but-untested sentence (Pattern 89); the violation table picks the clauses to delete. | ray-optics batch 2: the lone pass was FP-flagged. Probes over 10 solutions: order-independent `and` narrowing violated by 10/10, nested-`if` over-guard 8/10, invalid-only truth value 7/10, identity range 4/10. Deleting nested propagation, order independence and full invalid-operand precision gave batch 3 a clean 1/10; sfepy: cutting the restart lane (19 tests, two sentences) turned 0/8 and 0/9 into near-misses, then 2/15 |
@@ -3779,13 +4097,17 @@ surviving an early runner failure (Medium, **open**).
 | L87 | **Explicitness is a measurable dial on a single axis, not a fairness switch.** Naming both readings of an ambiguous noun can take an axis from band-carrying to free, with no code change. | siliconcompiler-flist-roundtrip: the pre-existing-data-root test killed **6/11** under "a root registered earlier" and **0/10** once the sentence named both kinds of existing root **pyocd-sequence-expression-kernel:** one concrete consequence sentence took a scope test 6/11 -> 0/10 and call-boundary under-reduction 7/11 -> 0/10; the same batch then showed 2/10 OVER-applying the now-concrete rule one layer early (F-52). The dial moves the error, it does not delete the boundary. |
 | L88 | **A mutation that kills nothing is a test-gap signal, and closing it can produce the band decider.** L15 still holds for justifying a TRAP on mutation evidence; this is the converse use — a surviving mutation names a behaviour no fixture reaches. | siliconcompiler-flist-roundtrip: the "edges recorded on the reading design" mutation survived the whole suite, which forced a three-level chain fixture; that fixture became the 7/10 lead killer and the sole failure of five near-misses. A two-level sibling graph cannot see it |
 | L89 | **A carve-out that names only the exception pulls look-alikes across the boundary.** When a contract splits calls into two classes, name members of BOTH, with every tested call placed by name. Naming only the stepwise class made agents file anything that LOOKS stepwise with it. | pyfakefs-block-inode-accounting: five `create_dir`/`create_file` rollback tests, tests and solution unchanged: 0/11 (universal sentence) → 9-10/12 (one-sided carve-out) → 0/10 (both sides named) |
-| L90 | **The reference bugs Solution Quality finds are the batch's near-miss killers — build a test for each one.** An author who has just made a mistake in their own reference has located a place a capable implementer goes wrong. Keep the fix AND add the discriminating test; it is the cheapest calibrated trap you will get. | pyfakefs-block-inode-accounting: all three accepted-batch near-miss causes (unlimited placeholder as a limit, Windows symlink sized by stat, imports inheriting `create_dir` rollback) were reference bugs found at R4, R5 and R17 **Counter-evidence, pyocd-sequence-expression-kernel:** eleven reference bugs found by gates, each given a test; in the accepted batch they killed NOTHING, except that the test built for the round-1 finding (results not reduced) caught the OPPOSITE error (arguments over-narrowed, F-52, 2/10). L90 holds when the reviewer finds a place implementers go wrong; it fails when the finding is a reviewer-invented input (L93) or a contract gap no implementer reaches. **teavm-method-summaries (second counter-case):** two real Solution Quality reference bugs (absent-class VIRTUAL call, unwired `SIMPLE` pipeline), each with a test: 0/10 kills; see L95. |
-| L91 | **Refines L80 — Solution Quality only ever ADDS requirements, and their sum can pass solvable with every round individually fair.** Batch after the second gate round, not after the eighth. When a finding says "the contract promises X, so this path must do X too", prefer narrowing the sentence over implementing the Nth path. | pyfakefs-block-inode-accounting: Description 3/3 and Solution & Code 3/3 before any batch, then **0/11** with six tests at 11/11, all added between R4 and R9 **pyocd-sequence-expression-kernel:** eleven review rounds after the core slice; batch 1 0/11 was the round-3 predicate rule (8/11). Of the ~100 test cases added in review, only the round-1 argument test killed anyone in the accepted batch. |
+| L90 | **The reference bugs Solution Quality finds are the batch's near-miss killers — build a test for each one.** An author who has just made a mistake in their own reference has located a place a capable implementer goes wrong. Keep the fix AND add the discriminating test; it is the cheapest calibrated trap you will get. | pyfakefs-block-inode-accounting: all three accepted-batch near-miss causes (unlimited placeholder as a limit, Windows symlink sized by stat, imports inheriting `create_dir` rollback) were reference bugs found at R4, R5 and R17 **Counter-evidence, pyocd-sequence-expression-kernel:** eleven reference bugs found by gates, each given a test; in the accepted batch they killed NOTHING, except that the test built for the round-1 finding (results not reduced) caught the OPPOSITE error (arguments over-narrowed, F-52, 2/10). L90 holds when the reviewer finds a place implementers go wrong; it fails when the finding is a reviewer-invented input (L93) or a contract gap no implementer reaches. **teavm-method-summaries (second counter-case):** two real Solution Quality reference bugs (absent-class VIRTUAL call, unwired `SIMPLE` pipeline), each with a test: 0/10 kills; see L95. **bayesopt-search-space-migration (confirmation):** all three accepted-batch killers were gate-found reference bugs (ConstantLiar dedup 6/10, transformer continuity 5/10, non-finite values 2/10); the gate findings that chose a design (GPHedge per-candidate, EI/PI fallback) killed 0/10 once stated, see L97. |
+| L91 | **Refines L80 — Solution Quality only ever ADDS requirements, and their sum can pass solvable with every round individually fair.** Batch after the second gate round, not after the eighth. When a finding says "the contract promises X, so this path must do X too", prefer narrowing the sentence over implementing the Nth path. | pyfakefs-block-inode-accounting: Description 3/3 and Solution & Code 3/3 before any batch, then **0/11** with six tests at 11/11, all added between R4 and R9 **pyocd-sequence-expression-kernel:** eleven review rounds after the core slice; batch 1 0/11 was the round-3 predicate rule (8/11). Of the ~100 test cases added in review, only the round-1 argument test killed anyone in the accepted batch. **bayesopt-search-space-migration:** four gate rounds, then **0/11** from one round-3 requirement the prompt only implied (L97); fixed by stating it, 3/10 in the next full batch. |
 | L92 | **An arbitrary value for an argument the rule under test does not govern is an accidental trap, and read the assertion diff, never the test name, before attributing a kill.** Pass every non-governed argument an in-contract value. A test name says which rule the test was FOR; the diff says which rule the agent broke. | pyocd-sequence-expression-kernel: `tms=3` (the probe API documents 0 or 1, and the CMSIS-DAP layer masks it itself) killed 3/10 in the accepted batch, one near-miss on its own, plus Vega in batch 1: the only run-deciding trap that nobody designed. Batch 1's Vega failure had been read from test names as "JTAG width", and that misreading framed a keep-or-cut decision |
 | L93 | **A requirement a reviewer derives from a HYPOTHETICAL input costs rounds, not difficulty. Check whether the repo's own contract ever produces that input.** If it never does, satisfy the reviewer in the solution and keep the contract silent on the one case the tests cannot afford. A boundary sentence stating the repo's real contract may be overridden anyway. | pyocd-sequence-expression-kernel: rounds 8, 10 and 11 argued over a `-> str` sequence function; the repo has none (23 return `int`, 16 return `None`, and the delegate docstring says fixed-zero functions return `None`). The sentence saying so was overridden in round 11. Final design: static STRING rejection plus no-value at run time, contract silent on a bare string statement. Its tests killed 0/10 |
 | L94 | **A sentence can state an algorithm's DIRECTION and still not transmit it.** Where the natural construction starts from the wrong end of a fixed point, the sentence stays a trap after it is written down, and evaluators rule it fair. | teavm-method-summaries: "the most precise facts that hold for all methods at once, so recursion and mutual recursion lose nothing by themselves", and still **4/10** initialized never-null to false and promoted (F-53), three of them 25/26; all judged described AND inferable |
-| L95 | **Gate-found tests land where agents already converge.** A gate reads the reference, so its finding marks a place the AUTHOR went wrong, not a place implementers do. Budget them as insurance, not difficulty; the one that kills is the test asserting behaviour agents have a reason to change. | teavm-method-summaries: 2 Solution Quality reference bugs + 9 Auto Review / coverage cells, **0/10 kills** across all 11; the single coverage-suggestion kill (2/10) asserted the OLD no-summaries output (F-54). Second problem after pyocd (L90 counter-evidence) |
+| L95 | **Gate-found tests land where agents already converge.** A gate reads the reference, so its finding marks a place the AUTHOR went wrong, not a place implementers do. Budget them as insurance, not difficulty; the one that kills is the test asserting behaviour agents have a reason to change. | teavm-method-summaries: 2 Solution Quality reference bugs + 9 Auto Review / coverage cells, **0/10 kills** across all 11; the single coverage-suggestion kill (2/10) asserted the OLD no-summaries output (F-54). Second problem after pyocd (L90 counter-evidence) **bayesopt-search-space-migration refines it:** gate tests that assert a stated CHOICE killed 0/10; gate tests that EXTEND a stated rule to another holder killed 6/10 and 5/10 (L97). |
 | L96 | **Never put a frequency or timing property in the contract (once, lazily, cached, only after X) unless a test can observe it.** Reviewers score it as an untested requirement, and the only discriminators are bytecode counting or timing, both unfair. | teavm-method-summaries: "builds the summaries once per build" drew a High "untested" finding and Tests 1/3; counting `MethodSummaries.build` would also fail an agent building through its own overload. Dropped from meta.md; the Tests band came back to 2/3 |
+| L97 | **When a gate demands a behaviour that CHOOSES between two defensible designs, state the choice in the contract. A behaviour that only EXTENDS an already-stated rule to another holder can stay implied, and it is where the band comes from.** Agents take the other defensible reading unanimously and write down why; they miss an unstated extension one at a time. | bayesopt-search-space-migration: GPHedge per-candidate scoring, implied by "under the same rules": **11/11** chose drop-all (batch 1), **0/10** once stated; ConstantLiar dedup, equally implied: 4/11 then **6/10**, sole failure of both near-misses, ruled fair |
+| L98 | **To test hidden state through public behaviour, change it and undo it, then compare with an untouched twin.** Graders accept it where attribute reads draw "tests implementation, not behaviour", and it catches state that is rebuilt instead of carried. Build the twin with the same seed so the course is deterministic. | bayesopt-search-space-migration: undo-twin tests passed the internals precheck and killed **5/10** (transformer rebuilt, F-56); the later `get_acquisition_params()` reads the Auto Review demanded killed 0/10 |
+| L99 | **A compiled suite whose new tests call the new API needs TWO harness fixes: build base mode without the new test file, and make the new-mode build-failure fallback emit one failing case per REAL test name.** Otherwise the whole baseline "fails" without the solution, and Verify Solution rejects the synthetic case as outside p2p/f2p. | piscsi-image-reservation-identity: base mode compiled `image_reservation_e3806d_test.cpp` into `bin/piscsi_test`, so all 316 base tests failed without the solution (fixed with a make override of `SRC_PISCSI_TEST`); then Verify Solution FAILED on `build.compile`; the fallback now parses `TEST_F(Suite, name)` and the no-solution id set equals the solution id set |
+| L100 | **Refines L97: an implied EXTENSION of a stated rule can still be missed unanimously. Replay the saved patches before re-evaluating a new test; at 10/10 missed, state the extension and pay the fresh batch.** | piscsi-image-reservation-identity: "a hold stays with the file after its name is reused" was stated, its extension to a device's own report was not; replay of 10 batch-1 patches read **10/10** failing the new device-list test (re-eval would have read 0/10, unsolvable); stated in one sentence, **2/10** in the fresh batch, which was accepted at 3/10 |
 
 ---
 
@@ -3901,6 +4223,13 @@ problems**. Until then it lives here as problem-specific evidence. Demote to the
 | A loader that resolves names against two origins (disk and bundled resources) plus a second consumer (validator, watcher, CLI) that re-resolves a relative reference on its own | **F-9** origin variant | 3/10 on planetiler. Test a standalone bundled root whose sibling reference must come from the bundle |
 | A persisted index or cache whose value type already carries a field the store writes nowhere, reads back as a sentinel, or has commented out | **F-47** | 4/12 on libspatialindex-tpr-temporal-knn, lead wall; test on a deep tree, after reopen, and via the C API; never pin the store's self-check (L82) |
 | An existing public method whose parameter type is broader than the new contract accepts, with a base path that already handles the broad type | **F-48** | 3/12 on libspatialindex-tpr-temporal-knn; one general rejection sentence plus one test passing the base type |
+| An optional collaborator (transformer, scheduler, cache) holding learned per-dimension state behind an `initialize()` entry point, and a feature that changes the dimension set | **F-56** | 5/10 on bayesopt-search-space-migration; state the continuity, test it with a change-then-undo twin plus one partially overlapping moved-bounds case |
+| A contract over "real"/"finite" numbers and a path that stores or forwards the value (queue, registry, fill) | **F-57** | 2/10 on bayesopt-search-space-migration; test NaN and infinity on every storing path, cheap insurance |
+| A validate-then-commit dry run over several items whose identity is assigned by the container they are committed into (controller slot, parent, registry index), and an error or report that names staged items | **F-58** | 5 runs over 2 batches on piscsi-image-reservation-identity, sole failure of a 65/66 run; state the message format, test a later item conflicting with an earlier one in the same command |
+| A name-keyed ledger (paths, hosts, labels) with a derived identity beside it, and any restore, reload or reporting path that re-derives it | **F-59** | 8 runs over 2 batches on piscsi-image-reservation-identity; hold A, rename A away, create B under the old name; B free, A still held, A's report excludes B's holder |
+| A path-confinement rule with a stated exception for the last component (symlink image, mount point) and operations on the link itself | **F-60** | 5 runs over 2 batches on piscsi-image-reservation-identity, one sole failure; test folder-link escape, `..` after a folder link, an in-folder folder link and a final link to an outside file |
+| A property only known after opening the resource (read-only on open) deciding a conflict on an existing object (insert into a drive) | **F-61** | 2/10 then 0/10 on piscsi-image-reservation-identity; assert the object's state after every refusal |
+| A base helper wrapping a POSIX API with a "success but no result" return (`getpwuid_r`, `getgrgid_r`, `getaddrinfo`) that only a new caller's environment reaches | **F-39** (library-contract instance) | 6/10 then 3/10 on piscsi-image-reservation-identity, still after the rule was stated; construct the environment in the test (Pattern 107) |
 
 **Ship-in-every-problem shortlist.** F-10 has no precondition worth calling a precondition —
 almost every multi-capability contract has two axes — and it is the only pattern measured to

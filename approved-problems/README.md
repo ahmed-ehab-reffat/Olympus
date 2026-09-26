@@ -1309,3 +1309,62 @@ tests land where agents converge), L96 (no unobservable frequency in the contrac
 L62 (bind mount now a Dockerfile-check FAIL) and counter-evidence on L90, Pattern 105 (stub-backend
 driver test), the F-53/54/55 seam probe in olympus-hunt, a lever and two checklist audits in
 olympus-author, two diagnosis rows in olympus-harden.
+
+## bayesopt-search-space-migration (Python / Bayesian optimization: live search-space change with state migration) — ACCEPTED 2026-09-25, 3/10
+
+**What made it hard.** `BayesianOptimization.set_space(pbounds, fill)` replaces a running optimizer's
+search space and carries everything it learned: registered points and constraint values by parameter
+value (add, remove, retype, category changes, earliest duplicate survives), the lazy queue, nested
+ConstantLiar and GPHedge state, and SequentialDomainReductionTransformer state, all or nothing. The
+band came from **a stated rule not reaching a second holder of points (F-10, 6/10)**: every run
+deduplicated registered points, six kept duplicate ConstantLiar pending points, and both 84/85
+near-misses failed only that. **Transformer state rebuilt instead of carried (F-56, 5/10)** and
+**NaN or infinity passing a type test (F-57, 2/10)** added the rest. 76 of 85 tests killed nothing.
+
+**The fixes, and what each cost.** Eight gate rounds, then two batches. (1) The tests-quality precheck
+rejected attribute reads (`liar.dummies`, `hedge.gains`, `_queue`); replaced by change-then-undo and
+rollback twins. (2-4) Solution Quality: ConstantLiar collisions not deduped, transformer not migrated
+(lifting the slice from 140 to ~220 eff), GPHedge dropping all candidates when one fails, ragged then
+growing transformer history, complex categories raising `TypeError`. (5-8) Auto Review: EI/PI raising
+with every point out of bounds (random fallback), NaN and infinity, then coverage for warmed gains,
+gain attribution, pending collisions, moved global bounds, category reorder, constrained fallback.
+Batch 1 read **0/11**: the GPHedge per-candidate rule was a gate-demanded CHOICE the prompt only
+implied, and all 11 agents took the other defensible design. Stated in meta.md (with the fallback),
+full batch: **3/10**, accepted, Auto Review Approved 3/2/2. Two Mediums open: `10**10000` fill raises
+`OverflowError`; ConstantLiar pending categories untested under a reorder.
+
+**Carried forward**: F-56, F-57 (new), F-10 holder-cell evidence, L97 (state gate-demanded choices;
+extensions may stay implied), L98 (change-then-undo twin), confirmation on L90 and refinement of L95,
+Pattern 106, an F-56 / holder seam probe in olympus-hunt, a lever and two audits in olympus-author,
+two diagnosis rows in olympus-harden.
+
+## piscsi-image-reservation-identity (C++ / PiSCSI SCSI emulator: identity-aware, shareable image reservations) — ACCEPTED 2026-09-26, 3/10
+
+**What made it hard.** The daemon's image reservation ledger becomes a file-identity ledger: one image
+under every spelling (`.`/`..`, symlinks, hard links), a hold that stays with its file through
+rename-and-reuse, read-only devices sharing an image while writers need it alone, name confinement
+for six image commands (`..` resolved through folder links, final image links left usable), ordered
+holders through a new API, protobuf and scsictl, and atomic multi-device attach. The alias headline
+itself killed nobody (0 of 20 runs). The band came from **identity re-derived from the name on restore
+or report (F-59, 8 runs over two batches)**, **the base `getpwuid_r` null-result bug behind passwd-less
+create (F-39, 9 runs, still 3/10 after being stated)**, **dry-run staging with an unattached device's
+`-1:0` id (F-58, 5 runs, sole failure of a 65/66 run)** and **whole-path containment rejecting a final
+image link (F-60, 5 runs)**. 37 of 66 tests never killed.
+
+**The fixes, and what each cost.** Thirteen gate rounds from a 23-line slice. (1) Category check:
+rewrite as a capability, no "today X is broken". (2) Dockerfile: no in-image git fetch even though the
+repo's `.dockerignore` strips `.git`; apt pinned. (3-9) Solution Quality: image commands rejecting
+absolute names, relative query against the CWD (narrowed), hard links, a directory-symlink escape, the
+raw-spelling listing (narrowed to base behaviour), UNPROTECT unchecked, identity overridden by name
+text after rename, a recycled inode (held descriptor), working-directory device holders, `..` after a
+folder link. (10-13) Auto Review: scope below the 200 floor (132; grown with read-only sharing and
+holder reporting to 216+), a duplicate ID/LUN abort, a non-CD reader test (forked privilege drop), the
+passwd-less create (base bug fixed and stated), and harness fixes (base build excludes the new test
+file; the fallback emits real test ids after Verify Solution failed on `build.compile`). Batch 1
+**1/10**; the device-report-after-reuse fix added a test that a replay of all ten saved patches failed
+**10/10**, so the rule went into meta.md and a fresh batch read **3/10**, accepted, Auto Review
+Approved 3/3/3.
+
+**Carried forward**: F-58, F-59, F-60, F-61 (new), F-39 library-contract instance, F-6 and F-10 evidence,
+L99 (compiled-suite harness), L100 (replay before re-eval; state unanimous extensions), Pattern 107
+(forked privilege-dropping test).

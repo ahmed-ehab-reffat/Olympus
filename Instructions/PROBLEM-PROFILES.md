@@ -3349,3 +3349,51 @@ Nova #1, #4, #7), `withoutSummariesEveryPassBehavesAsBefore` (F-54, 2/10, sole f
 - A real `TeaVM.build` runs in a unit test with a stub `TeaVMTarget`; a bare
   `new ClassHolder("java.lang.Object")` defaults its parent to itself and hangs dependency analysis.
 - 11 gate-requested tests, 0 kills.
+
+## bayesopt-search-space-migration (APPROVED Olympus 2026-09-25)
+
+**Outcome.** Accepted 3/10 on batch 2 (all Nova), Auto Review Approved 3/2/2. Batch 1 was 0/11 (10 Nova,
+1 Orion). Two Mediums left open: a `10**10000` fill raises `OverflowError`, and ConstantLiar pending
+categories are untested under a category reorder.
+
+**Shape + stats.** O-Composite-add. `BayesianOptimization.set_space(pbounds, fill)` in 5 files
+(`acquisition.py`, `bayesian_optimization.py`, `domain_reduction.py`, `parameter.py`, `target_space.py`),
+242 human-effective LOC, 85 new test cases, 167 base tests, pytest + native JUnit. meta.md 493 words.
+
+**Decisive difficulty drivers.** `test_constant_liar_suggests_after_pending_points_coincide[False]`
+(F-10 holder cell, 6/10, sole failure of Nova #3 and #5), the transformer undo twins and
+moved-bounds window (F-56, 5/10), the non-finite point/queue tests (F-57, 2/10). 76 of 85 killed
+nothing.
+
+**Iteration lessons.**
+
+- Slice at 140 eff, grown to 242 through gate findings (transformer migration, fallback, non-finite).
+- Precheck R1 rejected attribute reads; replaced by undo twins and rollback twins.
+- Solution Quality R2-R4: ConstantLiar dedup, transformer migration, GPHedge per-candidate, ragged
+  then growing transformer history, complex categories. Auto Review R5-R8: EI/PI fallback, non-finite
+  values, warmed gains / attribution / collision reads, moved global bounds, category reorder,
+  constrained fallback.
+- Batch 1 0/11 on the implied GPHedge choice; stated it (meta change, full batch), accepted at 3/10.
+- Harness: worktrees/_bo_tools (venv, mutate scripts, probe_run.sh replaying saved patches).
+
+## piscsi-image-reservation-identity (APPROVED Olympus 2026-09-26)
+
+**Outcome.** Accepted 3/10 on batch 2 (all Nova), Auto Review Approved 3/3/3 with one Medium advisory
+(a passing agent used an ambient `SUDO_GID` for a passwd-less creator). Batch 1 was 1/10 (all Nova).
+
+**Shape + stats.** O-Composite-extend from a bug-shaped slice. 10 files (storage_device, executor, image
+commands, response, scsictl display, protobuf schema), 294 Counter 1 / 221 human-effective LOC, 66 new
+gtest cases, 317 base tests (one run as `nobody` through setpriv). meta.md 496 words.
+
+**Decisive difficulty drivers.** `hold_stays_with_the_file_after_its_name_is_reused` (F-59, 5 then 3),
+`create_works_for_a_user_without_a_passwd_entry` (F-39, 6 then 3),
+`one_command_with_a_cd_rom_and_a_disk_on_one_image_attaches_nothing` (F-58, 2 then 3, sole failure of a
+65/66 run), `links_inside_the_image_folder_stay_usable` and the external-link test (F-60, 3 in batch 2),
+`device_list_follows_the_held_file_after_its_name_is_reused` (2, after being stated). 37 of 66 never
+killed.
+
+**Iteration lessons.** Category warning: rewrite as a capability, never narrate current behaviour as
+broken. The Dockerfile must not fetch the repo, even though `.dockerignore` strips `.git`. Thirteen gate
+rounds each added a requirement; twelve reference bugs, all found by gates. After batch 1 a replay of
+the saved patches showed a new test at 10/10 failing, so the rule was stated and a fresh batch run
+instead of a re-eval.

@@ -1589,3 +1589,32 @@ Confirmed on a compiler analysis consumed by several optimizer passes:
   straight line and the join separately, 2/10.
 - **What did NOT add difficulty:** dispatch resolution, unknown bodies, invokedynamic, array returns,
   `<clinit>` propagation and the end-to-end TeaVM wiring all killed 0/10. 21 of 26 tests killed nobody.
+
+## bayesopt-search-space-migration (APPROVED Olympus 2026-09-25)
+
+Confirmed on a live search-space change for a Bayesian optimizer:
+
+- **F-10, holder variant.** Write a rule once for the main registry (earliest duplicate survives) and
+  extend it to the other holders of points with "under the same rules". The pending-points holder
+  killed 6/10 and decided the band, ruled fair.
+- **F-56 — learned collaborator state that must continue.** An optional transformer with positional
+  state and an `initialize()` is rebuilt by half the runs. A change-then-undo twin sees it (5/10).
+- **What does NOT add difficulty once stated:** GPHedge per-candidate scoring, the out-of-bounds
+  random fallback, integer rounding ties, complex and non-real categories, rollback of failed changes.
+  76 of 85 tests killed nobody.
+- **What made it UNSOLVABLE:** the same GPHedge rule when only implied, 11/11 (L97).
+
+## piscsi-image-reservation-identity (APPROVED Olympus 2026-09-26)
+
+Confirmed on an identity-aware reservation ledger for a SCSI emulator:
+
+- **F-59, identity that must outlive its name.** Rename the held file and create another under the old
+  name. Agents that re-derive identity on restore or fall back to the name fail it (8 runs, two batches).
+- **F-58, staged records stamped with an unregistered identity.** A validate-then-commit loop whose
+  items get their id from the container they join. Observable only through a message that names staged
+  items; 5 runs, sole failure of a 65/66 run.
+- **F-60, confinement with a last-component exception.** Refuse folder-link escapes, keep an image that
+  is itself a link usable. Whole-path resolution fails the exception (5 runs).
+- **What does NOT add difficulty:** alias identity through `.`, `..`, symlinks and hard links; reader
+  and writer sharing rules; per-holder release; holder ordering. 37 of 66 tests killed nobody.
+- **A stated library-contract edge stays hard (F-39):** passwd-less create, 6/10 then 3/10.

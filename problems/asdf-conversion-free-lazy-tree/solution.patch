@@ -1,0 +1,832 @@
+diff --git a/asdf/_asdf.py b/asdf/_asdf.py
+index a484aa90..3256c6d8 100644
+--- a/asdf/_asdf.py
++++ b/asdf/_asdf.py
+@@ -21,6 +21,7 @@ from . import _io, constants, generic_io, lazy_nodes, reference, schema, treeuti
+ from . import _node_info as node_info
+ from ._block.manager import Manager as BlockManager
+ from ._helpers import is_set, validate_version
++from ._pass_through import LazyView, PassThrough, has_private_blocks
+ from .config import config_context, get_config
+ from .exceptions import (
+     AsdfManifestURIMismatchWarning,
+@@ -143,6 +144,8 @@ class AsdfFile:
+         # A cache of tagged objects and their converted custom objects used when
+         # a file is read with "lazy_tree=True". Used by lazy_nodes.
+         self._tagged_object_cache = lazy_nodes._TaggedObjectCache()
++        self._lazy_tree_version = None
++        self._lazy_tree_private_blocks = False
+ 
+         self._fd: GenericFile | None = None
+         self._mode: FileMode | None = None
+@@ -763,7 +766,8 @@ class AsdfFile:
+         """
+         return self._blocks._get_array_save_base(arr)
+ 
+-    def _write_tree(self, tree: AsdfObject, fd: GenericFile, pad_blocks: float | bool) -> None:
++    def _write_tree(self, tree: AsdfObject, fd: GenericFile, pad_blocks: float | bool) -> list[tuple[Any, int]]:
++        renumbered = []
+         fd.write(constants.ASDF_MAGIC)
+         fd.write(b" ")
+         fd.write(f"{self.file_format_version}".encode("ascii"))
+@@ -777,6 +781,7 @@ class AsdfFile:
+ 
+         if len(tree):
+             serialization_context = self._create_serialization_context(_serialization_context.BlockAccess.WRITE)
++            serialization_context._pass_through = PassThrough.create(self, serialization_context)
+ 
+             for compression in self._blocks.get_output_compressions():
+                 # lookup extension
+@@ -809,17 +814,24 @@ class AsdfFile:
+                 tree_finalizer=_tree_finalizer,
+                 _serialization_context=serialization_context,
+             )
++            if serialization_context._pass_through is not None:
++                renumbered = serialization_context._pass_through.renumbered
+ 
+         if pad_blocks:
+             padding = util.calculate_padding(fd.tell(), pad_blocks, fd.block_size)
+             fd.fast_forward(padding)
++        return renumbered
+ 
+     def _serial_write(
+         self, fd: GenericFile, pad_blocks: float | bool, include_block_index: bool, write_checksums: bool
+     ) -> None:
+         with self._blocks.write_context(fd):
+             # prep a tree for a writing
+-            tree = copy.copy(self._tree)
++            if isinstance(self._tree.data, lazy_nodes.AsdfDictNode):
++                tree = AsdfObject()
++                tree.data = copy.copy(self._tree.data)
++            else:
++                tree = copy.copy(self._tree)
+             tree["asdf_library"] = _io.get_asdf_library_info()
+             if "history" in self._tree:
+                 tree["history"] = copy.deepcopy(self._tree["history"])
+@@ -949,11 +961,13 @@ class AsdfFile:
+             with self._blocks.write_context(fd, copy_options=False):
+                 # write out tree to temporary buffer
+                 tree_fd = generic_io.get_file(io.BytesIO(), mode="rw")
+-                self._write_tree(self._tree, tree_fd, False)
++                renumbered = self._write_tree(self._tree, tree_fd, False)
+                 new_tree_size = tree_fd.tell()
+ 
+                 # update blocks
+                 self._blocks.update(new_tree_size, pad_blocks, include_block_index, write_checksums)
++                for node, source in renumbered:
++                    node["source"] = source
+                 end_of_file = fd.tell()
+ 
+             # now write the tree
+@@ -1244,6 +1258,7 @@ class AsdfFile:
+             self.tree,
+             preserve_list=preserve_list,
+             extension_manager=self.extension_manager,
++            view=LazyView.create(self),
+         )
+ 
+     def info(
+@@ -1287,6 +1302,7 @@ class AsdfFile:
+             show_values=show_values,
+             identifier="root",
+             extension_manager=self.extension_manager,
++            view=LazyView.create(self),
+         )
+         print("\n".join(lines))
+ 
+@@ -1361,7 +1377,7 @@ class AsdfFile:
+         asdf.search.AsdfSearchResult
+             the result of the search
+         """
+-        result = AsdfSearchResult(["root"], self.tree)
++        result = AsdfSearchResult(["root"], self.tree, view=LazyView.create(self))
+         return result.search(key=key, type_=type_, value=value, filter_=filter_)
+ 
+     # This function is called from within yamlutil methods to create
+@@ -1468,9 +1484,10 @@ def open_asdf(
+         when the file is loaded. Instead, objects will be "lazily" converted
+         only when they are accessed. Note that the tree will not contain dict
+         and list instances for containers and instead return instances of classes
+-        defined in `asdf.lazy_nodes`. Since objects are converted when they
+-        are accessed, traversing the tree (like is done during `AsdfFile.info`
+-        and `AsdfFile.search`) will result in nodes being converted.
++        defined in `asdf.lazy_nodes`. `AsdfFile.info`, `AsdfFile.search`,
++        `AsdfFile.write_to` and `AsdfFile.update` leave nodes that were never
++        accessed in the form they were read in, converting a node only when
++        they need the converted object.
+ 
+     custom_schema : str, optional
+         Path to a custom schema file that will be used for a secondary
+@@ -1553,6 +1570,8 @@ def open_asdf(
+ 
+         # lazy tree?
+         if lazy_tree and not _force_raw_types:
++            instance._lazy_tree_version = instance.version
++            instance._lazy_tree_private_blocks = has_private_blocks(tree, len(blocks.blocks))
+             obj = AsdfObject()
+             obj.data = lazy_nodes.AsdfDictNode(tree, weakref.ref(instance))
+             tree = obj
+diff --git a/asdf/_display.py b/asdf/_display.py
+index d467ba4e..bd0b8e53 100644
+--- a/asdf/_display.py
++++ b/asdf/_display.py
+@@ -58,6 +58,7 @@ def render_tree(
+     filters=None,
+     identifier="root",
+     extension_manager=None,
++    view=None,
+ ):
+     """
+     Render a tree as text with indents showing depth.
+@@ -68,6 +69,7 @@ def render_tree(
+         identifier=identifier,
+         filters=[] if filters is None else filters,
+         extension_manager=extension_manager,
++        view=view,
+     )
+     if info is None:
+         return []
+@@ -269,9 +271,9 @@ class _TreeRenderer:
+         return line
+ 
+     def _render_node_value(self, info):
+-        rendered_type = type(info.node).__name__
++        rendered_type = info.rendered_type or type(info.node).__name__
+ 
+-        if not info.children and self._show_values:
++        if not info.children and self._show_values and not info.hide_value:
+             try:
+                 s = f"{info.node}"
+             except Exception:
+diff --git a/asdf/_node_info.py b/asdf/_node_info.py
+index ef9a639e..96ce5672 100644
+--- a/asdf/_node_info.py
++++ b/asdf/_node_info.py
+@@ -17,7 +17,16 @@ if TYPE_CHECKING:
+     from asdf.typing import FilterFn, TreeKey
+ 
+ 
+-def _filter_tree(info, filters):
++def accepts(filters, node, identifier):
++    """
++    Check every filter's cheap criteria before any criteria that need the node's value.
++    """
++    if not all(getattr(f, "pre", f)(node, identifier) for f in filters):
++        return False
++    return all(f.post(node, identifier) for f in filters if hasattr(f, "post"))
++
++
++def _filter_tree(info, filters, view=None):
+     """
+     Keep nodes in tree which pass the all of the filters.
+ 
+@@ -25,11 +34,17 @@ def _filter_tree(info, filters):
+     """
+     filtered_children = []
+     for child in info.children:
+-        if _filter_tree(child, filters):
++        if _filter_tree(child, filters, view):
+             filtered_children.append(child)
+     info.children = filtered_children
+ 
+-    return len(info.children) > 0 or all(f(info.node, info.identifier) for f in filters)
++    if len(info.children) > 0:
++        return True
++    if not accepts(filters, info.node, info.identifier):
++        return False
++    if view is not None and info.hide_value and (node := view.resolved(info.node)) is not info.node:
++        info.node, info.rendered_type, info.hide_value = node, None, False
++    return True
+ 
+ 
+ def _get_matching_schema_property(schema, property_name):
+@@ -156,6 +171,7 @@ def create_tree(
+     identifier: str = "root",
+     filters: Collection[FilterFn] | None = None,
+     extension_manager: ExtensionManager | None = None,
++    view: Any = None,
+ ) -> NodeSchemaInfo | None:
+     """
+     Create a `NodeSchemaInfo` tree which can be filtered from a base node.
+@@ -178,9 +194,10 @@ def create_tree(
+         identifier,
+         node,
+         extension_manager=extension_manager,
++        view=view,
+     )
+ 
+-    if len(filters) > 0 and not _filter_tree(schema_info, filters):
++    if len(filters) > 0 and not _filter_tree(schema_info, filters, view):
+         return None
+ 
+     return schema_info
+@@ -194,6 +211,7 @@ def collect_schema_info(
+     filters: Collection[FilterFn] | None = None,
+     preserve_list: bool = True,
+     extension_manager: ExtensionManager | None = None,
++    view: Any = None,
+ ):
+     """
+     Collect from the underlying schemas any of the info stored under key, relative to the path
+@@ -219,6 +237,7 @@ def collect_schema_info(
+         identifier=identifier,
+         filters=[] if filters is None else filters,
+         extension_manager=extension_manager,
++        view=view,
+     )
+     if schema_info is None:
+         return None
+@@ -324,6 +343,8 @@ class NodeSchemaInfo:
+     recursive: bool = False
+     visible: bool = True
+     extension_manager: ExtensionManager = field(default_factory=_get_extension_manager)
++    rendered_type: str | None = None
++    hide_value: bool = False
+     children: list[NodeSchemaInfo] = field(default_factory=list, init=False)
+     schema: Mapping[TreeKey, Any] | None = field(default=None, init=False)
+ 
+@@ -369,6 +390,7 @@ class NodeSchemaInfo:
+         root_node: Any,
+         schema: Mapping[TreeKey, Any] | None = None,
+         extension_manager: ExtensionManager | None = None,
++        view: Any = None,
+     ):
+         """
+         Build a NodeSchemaInfo tree from the given ASDF root node.
+@@ -388,8 +410,12 @@ class NodeSchemaInfo:
+                 # node is the item in the tree
+                 # We might sometimes not want to use that node directly
+                 # but instead using a different node for traversal.
+-                t_node, traversable, _ = _make_traversable(node, extension_manager)
+-                if (is_container(node) or traversable) and id(node) in seen:
++                if view is None:
++                    t_node, traversable, _ = _make_traversable(node, extension_manager)
++                    container, rendered_type, hide_value = is_container(node) or traversable, None, False
++                else:
++                    t_node, traversable, container, rendered_type, hide_value = view.describe(node, True)
++                if container and id(node) in seen:
+                     info = NodeSchemaInfo(
+                         key,
+                         parent,
+@@ -398,12 +424,20 @@ class NodeSchemaInfo:
+                         current_depth,
+                         recursive=True,
+                         extension_manager=extension_manager,
++                        rendered_type=rendered_type,
+                     )
+                     parent.children.append(info)
+ 
+                 else:
+                     info = NodeSchemaInfo(
+-                        key, parent, identifier, node, current_depth, extension_manager=extension_manager
++                        key,
++                        parent,
++                        identifier,
++                        node,
++                        current_depth,
++                        extension_manager=extension_manager,
++                        rendered_type=rendered_type,
++                        hide_value=hide_value,
+                     )
+ 
+                     # If this is the first node keep a reference so we can return it.
+@@ -440,7 +474,8 @@ class NodeSchemaInfo:
+                                 pass
+ 
+                     # add children to queue
+-                    for child_identifier, child_node in get_children(t_node):
++                    children = get_children(t_node) if view is None else view.children(t_node, True)
++                    for child_identifier, child_node in children:
+                         next_nodes.append((info, child_identifier, child_node))
+ 
+             if len(next_nodes) == 0:
+diff --git a/asdf/_pass_through.py b/asdf/_pass_through.py
+new file mode 100644
+index 00000000..21099669
+--- /dev/null
++++ b/asdf/_pass_through.py
+@@ -0,0 +1,318 @@
++import collections
++import sys
++import weakref
++
++import numpy as np
++
++from . import lazy_nodes, tagged, util
++from ._block.options import Options
++from ._node_info import _make_traversable
++from .config import get_config
++from .extension._manager import _resolve_type
++from .tags.core import AsdfObject, NDArrayType
++from .tags.core.ndarray import asdf_datatype_to_numpy_dtype
++from .treeutil import get_children, is_container
++
++_NDARRAY_TAG_PREFIX = "tag:stsci.edu:asdf/core/ndarray-"
++
++
++def _is_ndarray(node):
++    return isinstance(node, tagged.TaggedDict) and node._tag.startswith(_NDARRAY_TAG_PREFIX)
++
++
++def _unwrap(container):
++    while isinstance(container, (collections.UserDict, collections.UserList)):
++        container = container.data
++    return container
++
++
++def _raw_items(container):
++    data = _unwrap(container)
++    if isinstance(data, dict):
++        return list(data.items())
++    return list(enumerate(data))
++
++
++def materialize(owner, container, key, value):
++    """
++    Convert ``value`` (stored at ``container[key]``) the way tree access
++    would, so the result is cached and replaces the tagged node in the tree.
++    """
++    if isinstance(container, lazy_nodes._AsdfNode):
++        return container[key]
++    obj = owner._tagged_object_cache.retrieve(value)
++    if obj is None:
++        obj = lazy_nodes.AsdfListNode([value], weakref.ref(owner))[0]
++    _unwrap(container)[key] = obj
++    return obj
++
++
++def has_private_blocks(tree, n_blocks):
++    """
++    Return True if some block read from the file is not the source of
++    any ndarray node in the tagged ``tree`` (and so is referenced by a
++    converter in a way that can not be renumbered without converting).
++    """
++    if not n_blocks:
++        return False
++    used = set()
++    seen = set()
++    stack = [tree]
++    while stack:
++        node = stack.pop()
++        if id(node) in seen:
++            continue
++        seen.add(id(node))
++        if _is_ndarray(node) and isinstance(source := node.get("source"), int):
++            used.add(source % n_blocks)
++        if isinstance(node, (dict, list)):
++            stack.extend(value for _, value in _raw_items(node))
++    return len(used) < n_blocks
++
++
++class PassThrough:
++    """
++    Write-time state for lazy trees whose untouched nodes are written
++    from the tagged form they were read in instead of being converted.
++    """
++
++    def __init__(self, af, serialization_context):
++        self._af = af
++        self._ctx = serialization_context
++        self._blocks = af._blocks
++        self._extension_manager = serialization_context.extension_manager
++        self._owners = {}
++        self._storage = {}
++        self.renumbered = []
++
++    @classmethod
++    def create(cls, af, serialization_context):
++        if af._blocks._write_fd is None:
++            return None
++        return cls(af, serialization_context)
++
++    def _lazy_owner(self, node):
++        owner = node._af_ref() if node._af_ref is not None else None
++        if owner is None or owner._closed or getattr(owner, "_lazy_tree_version", None) != self._af.version:
++            return None
++        return owner
++
++    def _must_convert(self, owner, node):
++        if not isinstance(node, tagged.Tagged) or not self._extension_manager.handles_tag(node._tag):
++            return False
++        if _is_ndarray(node):
++            read_storage, options = self._ndarray_storage(owner, node)
++            return options.storage_type != read_storage or not self._saves_base(options)
++        return owner._lazy_tree_private_blocks
++
++    def _resolve(self, owner, container, key, value):
++        if not isinstance(value, (tagged.Tagged, dict, list)):
++            return value
++        if owner._tagged_object_cache.retrieve(value) is None and not self._must_convert(owner, value):
++            self._owners[id(value)] = owner
++            return value
++        return materialize(owner, container, key, value)
++
++    def _plain(self, owner, container, result):
++        for key, value in _raw_items(container):
++            value = self._resolve(owner, container, key, value)
++            if isinstance(result, list):
++                result.append(value)
++            else:
++                result[key] = value
++        return result
++
++    def view(self, node):
++        """
++        Return the node the writer should serialize in place of ``node``.
++        """
++        if isinstance(node, AsdfObject) and isinstance(node.data, lazy_nodes._AsdfNode):
++            owner = self._lazy_owner(node.data)
++            return node if owner is None else AsdfObject(self._plain(owner, node.data, {}))
++        if isinstance(node, lazy_nodes._AsdfNode):
++            if (owner := self._lazy_owner(node)) is None:
++                return node
++            if isinstance(node, lazy_nodes.AsdfOrderedDictNode):
++                return self._plain(owner, node, collections.OrderedDict())
++            return self._plain(owner, node, {} if isinstance(node, lazy_nodes.AsdfDictNode) else [])
++        owner = self._owners.get(id(node))
++        if owner is None:
++            return node
++        if isinstance(node, tagged.Tagged):
++            if isinstance(node, tagged.TaggedString):
++                return node
++            if self._extension_manager.handles_tag(node._tag):
++                converter = self._extension_manager.get_converter_for_tag(node._tag)
++                self._ctx._mark_extension_used(converter.extension)
++            result = tagged.tag_object(node._tag, self._plain(owner, node, {} if isinstance(node, dict) else []))
++            if _is_ndarray(node):
++                self._write_ndarray(owner, node, result)
++            return result
++        return self._plain(owner, node, node.__class__())
++
++    def _block_data(self, owner, source):
++        if isinstance(source, str):
++            return owner._blocks._load_external(source)
++        return util.get_array_base(owner._blocks.blocks[source].cached_data)
++
++    def _saves_base(self, options):
++        return options.save_base or (options.save_base is None and get_config().default_array_save_base)
++
++    def _ndarray_storage(self, owner, node):
++        if id(node) in self._storage:
++            return self._storage[id(node)][1:]
++        source = node.get("source")
++        data = None
++        if source is None:
++            read_storage = "inline"
++            options = Options("inline")
++        elif isinstance(source, str):
++            read_storage = "external"
++            data = self._block_data(owner, source)
++            options = self._blocks.options.lookup_by_object(data) or Options("external")
++        else:
++            read_storage = "streamed" if source == -1 else "internal"
++            data = self._block_data(owner, source)
++            options = self._blocks.options.get_options(data)
++        cfg = get_config()
++        if cfg.all_array_storage is not None:
++            options.storage_type = cfg.all_array_storage
++        if cfg.all_array_compression != "input":
++            options.compression = cfg.all_array_compression
++            options.compression_kwargs = cfg.all_array_compression_kwargs
++        if cfg.array_inline_threshold is not None and options.storage_type in ("inline", "internal"):
++            size = np.size(node["data"]) if source is None else int(np.prod(node.get("shape")))
++            options.storage_type = "inline" if size < cfg.array_inline_threshold else "internal"
++        if data is not None:
++            self._blocks.options.set_options(data, options)
++        self._storage[id(node)] = (node, read_storage, options)
++        return read_storage, options
++
++    def _write_ndarray(self, owner, node, result):
++        source = node.get("source")
++        if source is None:
++            return
++        _, options = self._ndarray_storage(owner, node)
++        data = self._block_data(owner, source)
++        if options.storage_type == "streamed":
++            self._blocks.set_streamed_write_block(data, node)
++            result["source"] = -1
++            return
++        result["source"] = self._blocks.make_write_block(data, options, node)
++        if owner is self._af and isinstance(source, int) and source >= 0:
++            self.renumbered.append((node, result["source"]))
++
++
++class LazyView:
++    """
++    Traversal of a lazy tree for info and search that leaves tagged
++    nodes nobody accessed in their tagged form.
++    """
++
++    def __init__(self, extension_manager):
++        self._extension_manager = extension_manager
++        self._slots = {}
++
++    @classmethod
++    def create(cls, af):
++        if not isinstance(getattr(af._tree, "data", None), lazy_nodes._AsdfNode):
++            return None
++        return cls(af.extension_manager)
++
++    def untouched(self, node):
++        slot = self._slots.get(id(node))
++        return slot is not None and slot[3] is node and slot[0]._tagged_object_cache.retrieve(node) is None
++
++    def resolved(self, node):
++        slot = self._slots.get(id(node))
++        if slot is None or slot[3] is not node:
++            return node
++        return slot[0]._tagged_object_cache.retrieve(node) or node
++
++    def materialize(self, node):
++        slot = self._slots.get(id(node))
++        if slot is None or slot[3] is not node:
++            return node
++        owner, container, key, _ = slot
++        return materialize(owner, container, key, node)
++
++    def _declared_type(self, owner, node):
++        if not self._extension_manager.handles_tag(node._tag):
++            return type(node)
++        if node._tag.startswith(_NDARRAY_TAG_PREFIX):
++            if owner._blocks._lazy_load:
++                return NDArrayType
++            return np.ma.MaskedArray if "mask" in node else np.ndarray
++        types = self._extension_manager.get_converter_for_tag(node._tag).types
++        if len(types) != 1:
++            return None
++        return _resolve_type(types[0]) if isinstance(types[0], str) else types[0]
++
++    def _array_info(self, node):
++        shape = node.get("shape") if isinstance(node, dict) else None
++        if not isinstance(shape, list) or "*" in shape or "datatype" not in node:
++            return None
++        byteorder = node["byteorder"] if "source" in node else sys.byteorder
++        return {"shape": tuple(shape), "dtype": asdf_datatype_to_numpy_dtype(node["datatype"], byteorder)}
++
++    def _needs_conversion(self, owner, node, for_info):
++        if not self._extension_manager.handles_tag(node._tag):
++            return False
++        if node._tag.startswith(_NDARRAY_TAG_PREFIX):
++            return for_info and self._array_info(node) is None
++        typ = self._declared_type(owner, node)
++        if typ is None:
++            return True
++        if for_info and hasattr(self._extension_manager.get_converter_for_tag(node._tag).delegate, "to_info"):
++            return True
++        return issubclass(typ, (dict, list, tuple)) or hasattr(typ, "__asdf_traverse__")
++
++    def _children(self, owner, container, for_info):
++        children = []
++        for key, value in _raw_items(container):
++            if isinstance(value, tagged.Tagged) or type(value) in (dict, list, collections.OrderedDict):
++                if (cached := owner._tagged_object_cache.retrieve(value)) is not None:
++                    value = cached
++                elif isinstance(value, tagged.Tagged) and not self._needs_conversion(owner, value, for_info):
++                    self._slots[id(value)] = (owner, container, key, value)
++                else:
++                    value = materialize(owner, container, key, value)
++            children.append((key, value))
++        return children
++
++    def type_of(self, node):
++        if not self.untouched(node):
++            return type(node)
++        return self._declared_type(self._slots[id(node)][0], node) or type(self.materialize(node))
++
++    def describe(self, node, for_info):
++        """
++        Return ``(target, traversable, container, rendered_type, hide_value)``
++        where ``target`` is what the children of ``node`` are taken from.
++        """
++        if self.untouched(node):
++            owner = self._slots[id(node)][0]
++            if not self._extension_manager.handles_tag(node._tag):
++                return (node if is_container(node) else None), False, is_container(node), None, False
++            typ = self._declared_type(owner, node)
++            target = (
++                self._array_info(node) if for_info and typ in (NDArrayType, np.ndarray, np.ma.MaskedArray) else None
++            )
++            return target, False, False, typ.__name__, True
++        if for_info:
++            target, traversable, _ = _make_traversable(node, self._extension_manager)
++            return target, traversable, is_container(node) or traversable, None, False
++        traversable = hasattr(node, "__asdf_traverse__")
++        target = node.__asdf_traverse__() if traversable else node
++        return target, traversable, isinstance(node, (dict, list, tuple)) or traversable, None, False
++
++    def children(self, target, for_info):
++        if target is None:
++            return []
++        if isinstance(target, (AsdfObject, tagged.Tagged)) and isinstance(target.data, lazy_nodes._AsdfNode):
++            target = target.data
++        if isinstance(target, lazy_nodes._AsdfNode):
++            return self._children(lazy_nodes._resolve_af_ref(target._af_ref), target, for_info)
++        if self.untouched(target):
++            return self._children(self._slots[id(target)][0], target, for_info)
++        return get_children(target)
+diff --git a/asdf/search.py b/asdf/search.py
+index d5b50223..d96e9f23 100644
+--- a/asdf/search.py
++++ b/asdf/search.py
+@@ -8,7 +8,7 @@ import re
+ import typing
+ 
+ from ._display import DEFAULT_MAX_COLS, DEFAULT_MAX_ROWS, DEFAULT_SHOW_VALUES, render_tree
+-from ._node_info import collect_schema_info
++from ._node_info import accepts, collect_schema_info
+ from .treeutil import get_children, is_container
+ from .util import NOT_SET
+ 
+@@ -29,7 +29,9 @@ class AsdfSearchResult:
+         max_rows=DEFAULT_MAX_ROWS,
+         max_cols=DEFAULT_MAX_COLS,
+         show_values=DEFAULT_SHOW_VALUES,
++        view=None,
+     ):
++        self._view = view
+         self._identifiers = identifiers
+         self._node = node
+         self._filters = [] if filters is None else filters
+@@ -87,6 +89,7 @@ class AsdfSearchResult:
+             max_rows=max_rows,
+             max_cols=max_cols,
+             show_values=show_values,
++            view=self._view,
+         )
+ 
+     def _maybe_compile_pattern(self, query):
+@@ -107,8 +110,7 @@ class AsdfSearchResult:
+ 
+         return False
+ 
+-    def _get_fully_qualified_type(self, value):
+-        value_type = type(value)
++    def _get_fully_qualified_type(self, value_type):
+         if value_type.__module__ == "builtins":
+             return value_type.__name__
+ 
+@@ -167,8 +169,9 @@ class AsdfSearchResult:
+         value = self._maybe_compile_pattern(value)
+ 
+         filter_ = _wrap_filter(filter_)
++        view = self._view
+ 
+-        def _filter(node, identifier):
++        def _pre(node, identifier):
+             if isinstance(key, typing.Pattern):
+                 if key.search(str(identifier)) is None:
+                     return False
+@@ -176,13 +179,21 @@ class AsdfSearchResult:
+             elif key is not NOT_SET and not self._safe_equals(identifier, key):
+                 return False
+ 
++            node_type = type(node) if view is None else view.type_of(node)
+             if isinstance(type_, typing.Pattern):
+-                fully_qualified_node_type = self._get_fully_qualified_type(node)
++                fully_qualified_node_type = self._get_fully_qualified_type(node_type)
+                 if type_.search(fully_qualified_node_type) is None:
+                     return False
+ 
+-            elif isinstance(type_, builtins.type) and not isinstance(node, type_):
+-                return False
++            elif isinstance(type_, builtins.type):
++                if not (issubclass(node_type, type_) if node_type is not type(node) else isinstance(node, type_)):
++                    return False
++
++            return True
++
++        def _post(node, identifier):
++            if view is not None and (value is not NOT_SET or filter_ is not None):
++                node = view.materialize(node)
+ 
+             if isinstance(value, typing.Pattern):
+                 if is_container(node):
+@@ -205,11 +216,12 @@ class AsdfSearchResult:
+         return AsdfSearchResult(
+             self._identifiers,
+             self._node,
+-            filters=[*self._filters, _filter],
++            filters=[*self._filters, _Criterion(_pre, _post)],
+             parent_node=self._parent_node,
+             max_rows=self._max_rows,
+             max_cols=self._max_cols,
+             show_values=self._show_values,
++            view=view,
+         )
+ 
+     def replace(self, value):
+@@ -224,10 +236,10 @@ class AsdfSearchResult:
+         results = []
+ 
+         def _callback(identifiers, parent, node, children):
+-            if all(f(node, identifiers[-1]) for f in self._filters):
++            if accepts(self._filters, node, identifiers[-1]):
+                 results.append((identifiers[-1], parent))
+ 
+-        _walk_tree_breadth_first(self._identifiers, self._node, _callback)
++        _walk_tree_breadth_first(self._identifiers, self._node, _callback, self._view)
+ 
+         for identifier, parent in results:
+             parent[identifier] = value
+@@ -286,10 +298,10 @@ class AsdfSearchResult:
+         results = []
+ 
+         def _callback(identifiers, parent, node, children):
+-            if all(f(node, identifiers[-1]) for f in self._filters):
+-                results.append(node)
++            if accepts(self._filters, node, identifiers[-1]):
++                results.append(node if self._view is None else self._view.materialize(node))
+ 
+-        _walk_tree_breadth_first(self._identifiers, self._node, _callback)
++        _walk_tree_breadth_first(self._identifiers, self._node, _callback, self._view)
+         return results
+ 
+     @property
+@@ -305,10 +317,10 @@ class AsdfSearchResult:
+         results = []
+ 
+         def _callback(identifiers, parent, node, children):
+-            if all(f(node, identifiers[-1]) for f in self._filters):
++            if accepts(self._filters, node, identifiers[-1]):
+                 results.append(_build_path(identifiers))
+ 
+-        _walk_tree_breadth_first(self._identifiers, self._node, _callback)
++        _walk_tree_breadth_first(self._identifiers, self._node, _callback, self._view)
+         return results
+ 
+     def __repr__(self):
+@@ -319,6 +331,7 @@ class AsdfSearchResult:
+             show_values=self._show_values,
+             filters=self._filters,
+             identifier=self._identifiers[-1],
++            view=self._view,
+         )
+ 
+         if len(lines) == 0:
+@@ -344,6 +357,7 @@ class AsdfSearchResult:
+             self._node,
+             filters=self._filters,
+             preserve_list=preserve_list,
++            view=self._view,
+         )
+ 
+     def __getitem__(self, key):
+@@ -361,10 +375,20 @@ class AsdfSearchResult:
+             max_rows=self._max_rows,
+             max_cols=self._max_cols,
+             show_values=self._show_values,
++            view=self._view,
+         )
+ 
+ 
+-def _walk_tree_breadth_first(root_identifiers, root_node, callback):
++class _Criterion:
++    def __init__(self, pre, post):
++        self.pre = pre
++        self.post = post
++
++    def __call__(self, node, identifier):
++        return self.pre(node, identifier) and self.post(node, identifier)
++
++
++def _walk_tree_breadth_first(root_identifiers, root_node, callback, view=None):
+     """
+     Walk the tree in breadth-first order (useful for prioritizing
+     lower-depth nodes).
+@@ -375,10 +399,15 @@ def _walk_tree_breadth_first(root_identifiers, root_node, callback):
+         next_nodes = []
+ 
+         for identifiers, parent, node in current_nodes:
+-            if (isinstance(node, (dict, list, tuple)) or hasattr(node, "__asdf_traverse__")) and id(node) in seen:
++            if view is None:
++                container = isinstance(node, (dict, list, tuple)) or hasattr(node, "__asdf_traverse__")
++            else:
++                tnode, _, container, _, _ = view.describe(node, False)
++            if container and id(node) in seen:
+                 continue
+-            tnode = node.__asdf_traverse__() if hasattr(node, "__asdf_traverse__") else node
+-            children = get_children(tnode)
++            if view is None:
++                tnode = node.__asdf_traverse__() if hasattr(node, "__asdf_traverse__") else node
++            children = get_children(tnode) if view is None else view.children(tnode, False)
+             callback(identifiers, parent, node, [c for _, c in children])
+             next_nodes.extend([([*identifiers, i], node, c) for i, c in children])
+             seen.add(id(node))
+diff --git a/asdf/yamlutil.py b/asdf/yamlutil.py
+index 33da57cd..90300e19 100644
+--- a/asdf/yamlutil.py
++++ b/asdf/yamlutil.py
+@@ -302,9 +302,13 @@ def custom_tree_to_tagged_tree(tree, ctx, _serialization_context=None) -> Tagged
+         if generator is not None:
+             yield from generator
+ 
++    pass_through = getattr(_serialization_context, "_pass_through", None)
++
+     converters_cache = {}
+ 
+     def _walker(obj):
++        if pass_through is not None:
++            obj = pass_through.view(obj)
+         typ = type(obj)
+         if typ in converters_cache:
+             return converters_cache[typ](obj)

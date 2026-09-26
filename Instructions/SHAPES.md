@@ -610,3 +610,11 @@ consumed by several existing per-method passes. The consumer wiring is transcrib
 the same nine files). The band comes from the analysis's fixed-point direction (F-53) and from how the
 new facts enter the old passes: the frozen off path (F-54) and the deferred join path (F-55). Pass
 rate 4/10.
+
+## Shape note — bayesopt-search-space-migration (APPROVED 2026-09-25)
+
+O-Composite-add, confirmed on a numerical optimizer: one new reconfiguration call threaded through
+every object that holds state about the old configuration (registry + cache, lazy queue, nested
+acquisition functions, an optional transformer). The value conversions are transcribed; the band
+lives in the holders a stated rule has to reach (F-10) and in collaborator state that must continue
+rather than restart (F-56). Pass rate 3/10.

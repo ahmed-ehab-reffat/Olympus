@@ -40,6 +40,19 @@ Latest admin update. These OVERRIDE the 2026-06-26 caps and EVERY older tier / b
 
 ---
 
+## ⚠️ RULE UPDATE 2026-09-25 — pass-rate ceiling RAISED to <= 50% (user report)
+
+The platform ceiling is **50%** again (user, 2026-09-25). This OVERRIDES the 2026-09-16 block below
+and every other 20% / 30% / 40% cap in this repo. Approvable = solvable (>= 1 pass) through <= 50%;
+0% = reject, > 50% = reject. Still a CEILING, not a target: payout scales with difficulty and the
+same artifact has swung 22% to 50% between batches, so design to the hard edge. Everything else in
+the 2026-07 SPRINT block is unchanged.
+
+**meta.md word limit (user, 2026-09-25):** over 500 words only WARNS; the platform rejects only above
+**1000**. The 500-word "hard cap" figures elsewhere in this repo are superseded.
+
+---
+
 ## ⚠️ RULE UPDATE 2026-09-16 — pass-rate ceiling LOWERED back to <= 40%
 
 Platform lowered the Olympus pass-rate MAXIMUM from 50% back to **40%**. This OVERRIDES the

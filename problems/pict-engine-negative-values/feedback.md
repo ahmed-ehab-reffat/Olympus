@@ -1,6 +1,70 @@
 # pict-engine-negative-values - feedback
 
-NEXT (human): re-upload R5 (meta.md + test.patch changed, solution.patch unchanged) and re-run Auto Review.
+NEXT (human): R10 = R9 meta + test.patch (whole-row test) -> Auto Review, then a FRESH batch (full price).
+
+## R10 (2026-09-26) - Auto Review on R9: Description 3/3, Tests 1/3 (High), Solution 3/3
+
+- T3/T4 High: cross-child checks only projected leaf values; a child is a pseudo-parameter whose values
+  are whole child rows. New Suite.assert_whole_rows + test_child_models_combine_as_whole_rows (two_children
+  and wide_children, root order 2 with only the two children): child rows are derived from the OUTPUT
+  (valid = projections in rows without negatives, negative = projections carrying a negative), then every
+  valid x valid pair must appear in a row without negatives and every negative x valid pair in some row.
+  Mutant (one partner row per child) -> only this test fails.
+- Replay over all 22 saved solutions: both previous full-suite passers (b1 dir 9, b2 dir 4) pass it.
+- 35 tests. Clean room 1000/0/4242 green x3.
+
+## R9 (2026-09-26) - re-eval 1/11 (Nova #7) FP-flagged; user chose: precondition in meta
+
+- FP: Nova #7 hangs on a flat model with a starved value (exclusion a=1 & c=1 where c=1 is c's only
+  non-negative value); reference returns success. Probe over all 22 saved solutions: 13 succeed, the
+  rest abort/hang/error, and BOTH solutions that ever passed the full suite fail it -> a test for it
+  would measure 0/22.
+- Required coverage for a starved value is ill-defined under the current contract (its positive
+  combinations cannot exist), so meta now states the precondition: apart from the generation-error
+  case, every non-negative value that the exclusions allow can appear in some row with no negative
+  value. Brute-force check: no fixture starves a value (the nested generation-error test is the
+  separate "no non-negative value at all" case). Tests and solution unchanged. 397 words.
+
+## R8 (2026-09-25) - batch 2 0/11; Auto Review APPROVED (Tests 2/3, one Medium)
+
+- Nova #7 failed only the lifecycle test, and on a generation abort, not a leak. Cause: my R6 fixture
+  exclusion (L1=0, L2=1) where L1=0 is L1's only non-negative value, so L2=1 has no non-negative partner.
+  Degenerate case, stated nowhere, tested only by accident inside a deletion test. Fixture now excludes
+  (L1=1 negative, L2=2). Lesson: when moving exclusions around, check none uses a parameter's LAST
+  non-negative value unless that is the point of the test.
+- Auto Review Medium: Tree.fetch checks every cell is in range for its column's parameter.
+- Replay: 1/11 (Nova #7 34/34, base clean). Clean room green.
+
+## R7 (2026-09-25) - Auto Review on the R6 cut: Description 3/3, Tests 1/3, Solution 3/3
+
+- T3/T4 High: PictGetResultParameter never checked after a generation with no negative values. New
+  test_result_parameters_map_columns_of_a_model_without_negative_values: root + child, no negatives;
+  raw-column oracle independent of the getter (distinct value counts 2/3/4/5 identify each column by its
+  largest value), handle per column, null at count, count+1, count+100. Mutant (mapping only in the
+  negative branch) -> only this test fails. The replay passer (dir 9) and dirs 1, 2 pass it.
+- 34 tests. Clean room 1000/0/4242: 588 base pass, 34 fail without / pass with, x3. Solution unchanged (214).
+
+## R6 (2026-09-25) - batch 1 = 0/11, user chose: cut CLI parity + cross-model exclusions
+
+Batch 1 (10 Nova + 1 Vega) 0/11; details in eval-results.md. Every run hit >= 2 independent walls; no
+test-only lever produced a pass (nearest: Nova #9 failed only the 4 cross-model user-exclusion tests
+but also aborted 9 base tests). Classic gate-round ratchet: R2-R5 each added a surface (cross-model
+exclusions, CLI order 3, CLI constraints, CLI seeds, lifecycle) and the batch paid for all of them.
+
+Cut (user decision):
+- CLI parity dropped: meta.md CLI paragraph removed, cli/ reverted to base in the solution, the 7 CLI
+  tests and cli_negative_8f8ea0.py removed. The CLI-only engine hooks (Task::Generate prepareModel
+  callback, task-level combination counters) removed as dead code. Base CLI harness 588/588 with the
+  API-only solution.
+- Cross-model user exclusions dropped: meta now says each exclusion names parameters of a single
+  model; excluded_tree rewritten with exclusions inside inner, middle (new M2) and branch; nested
+  generation-error test and the lifecycle client use within-model exclusions.
+- Kept: #44 partner-row trap on the API, the inherent sequence collision for masking exclusions
+  across children, repeat generation state, lifecycle, header/export checks.
+- 33 API tests. Solution 214 human-effective (7 files) - thin margin over the 200 floor.
+- Replay of the batch-1 patches on the R6 suite: 1/11 counterfactual pass (dir 9, Nova #2, whose api-only
+  changes also keep the base suite clean). Base C API aborts on user exclusions in two child models (a
+  pre-existing bug), so user exclusions now sit in one model per tree; meta says so.
 
 ## R5 (2026-09-24) - Auto Review: Description 3/3, Tests 1/3, Solution 3/3
 

@@ -15,6 +15,8 @@ the line to "Processed".
 
 ## Processed
 
+    hayro-optional-content-baking / ray-optics-sp-coherence-transport / riff-unified-conflict-regions / macs-circular-chromosomes: claimed   (said in session 2026-09-26; handled)
+
     dyn4j-world-copy: dead derivative overlap Blocker 52.9% of rival   (said in session 2026-09-24; handled)
 
     teavm-method-summaries: claimed   (said in session 2026-09-23; handled)

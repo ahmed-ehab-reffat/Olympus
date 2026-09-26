@@ -2406,3 +2406,49 @@ the sentence "untested", and Solution Quality checks every mode of the driver, n
 **Measured.** teavm-method-summaries: the loop over `TeaVMOptimizationLevel.values()` caught the
 unwired `SIMPLE` lazy pipeline that Solution Quality found, runs in 37 s, and killed 0/10 in the
 accepted batch. It is non-regression insurance, not difficulty.
+
+## Pattern 106 — Change-then-undo twin as a public oracle for hidden state
+
+**When.** The feature must carry internal state (pending points, gains, a transformer's window) that the
+public API does not expose, and the tests-quality check scores attribute reads as "implementation, not
+behaviour".
+
+**Procedure.**
+1. Build the optimizer and an identical twin with the same seed and history, including warm-up steps
+   that put nonzero state in place (a single warm-up can leave gains at zero, making a reset invisible).
+2. Apply a lossless change to one and undo it (add a parameter then remove it; widen bounds then
+   restore). Choose changes the contract makes exactly reversible; a retype through integers is not
+   (raw candidates get rounded).
+3. Drain queues on both, then compare `res`, `max` and the next N suggestions exactly.
+4. For a one-way change, compare against a twin built directly in the new configuration with the
+   carried data, only where nothing random was consumed before the change.
+5. Use a fixture where the state matters: a linear objective puts every suggestion in a corner and
+   hides window and contraction differences; a softmax over gains ignores common shifts, so a gains
+   reset needs uneven rewards to show.
+
+**Measured.** bayesopt-search-space-migration: passed the internals precheck that rejected attribute
+reads, and the transformer undo twins killed 5/10 in the accepted batch (F-56). A limit: when the
+base model cannot see the state at all (categorical kernel collapse), only a decoded state read works.
+
+## Pattern 107 — Forked, privilege-dropping test for permission semantics under a root grader
+
+**When.** The contract depends on who the process is: a file is read-only by its mode, a user has no
+passwd entry, a group is not the caller's. Root ignores file modes, and the grader runs as root, but
+the platform also validates as an unmapped uid (4242), so the test must be deterministic under both.
+
+**Procedure.**
+1. Prepare the fixture as the parent: create the files, set modes (`0444`), and make any folder the
+   child must write world-writable.
+2. `fork()`. In the child: `if (!getuid()) { setgid(N); setuid(N); }` with N = 65534 or 4242, and
+   `_exit(10)` if that fails. Unset environment that changes identity (`SUDO_UID`).
+3. Assert the precondition the test relies on (`getpwuid(getuid()) == nullptr`), `_exit` with a
+   distinct code if it does not hold.
+4. Run the scenario through the public API and `_exit` with a distinct code per failed check, so the
+   parent's failure names the check.
+5. Parent: `waitpid`, then `ASSERT_TRUE(WIFEXITED(status))` and `EXPECT_EQ(0, WEXITSTATUS(status))`.
+   Do any filesystem assertions that do not depend on the identity in the parent.
+
+**Measured.** piscsi-image-reservation-identity: `disks_opened_read_only_share_an_image_as_readers`
+and `create_works_for_a_user_without_a_passwd_entry` passed identically as root, uid 1000 and uid 4242;
+the passwd-less create killed 3/10 in the accepted batch. The repo's own `StorageDeviceTest.ValidateFile`
+(red as root) went back into base mode the same way, through `setpriv` in test.sh.

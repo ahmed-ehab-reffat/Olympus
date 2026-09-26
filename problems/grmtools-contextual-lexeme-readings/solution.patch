@@ -1,0 +1,948 @@
+diff --git a/cfgrammar/src/lib/yacc/ast.rs b/cfgrammar/src/lib/yacc/ast.rs
+index fb1ef5c..d90ab82 100644
+--- a/cfgrammar/src/lib/yacc/ast.rs
++++ b/cfgrammar/src/lib/yacc/ast.rs
+@@ -166,6 +166,8 @@ pub struct GrammarAST {
+     pub precs: HashMap<String, (Precedence, Span)>,
+     pub avoid_insert: Option<HashMap<String, Span>>,
+     pub implicit_tokens: Option<HashMap<String, Span>>,
++    pub fallbacks: IndexMap<String, ((String, Span), Span)>,
++    pub splits: IndexMap<String, (Vec<(String, Span)>, Span)>,
+     // Error pretty-printers,
+     // The first span of the value is the span of the key,
+     // The second span in the value, is the span of the values string.
+@@ -248,6 +250,8 @@ impl GrammarAST {
+             precs: HashMap::new(),
+             avoid_insert: None,
+             implicit_tokens: None,
++            fallbacks: IndexMap::new(),
++            splits: IndexMap::new(),
+             epp: HashMap::new(),
+             expect: None,
+             expectrr: None,
+@@ -419,6 +423,42 @@ impl GrammarAST {
+             }
+         }
+ 
++        for (src, ((target, target_span), src_span)) in &self.fallbacks {
++            if !self.tokens.contains(target) {
++                return Err(YaccGrammarError {
++                    kind: YaccGrammarErrorKind::UnknownToken(target.clone()),
++                    spans: vec![*target_span],
++                });
++            }
++            if target == src
++                || self.fallbacks.contains_key(target)
++                || self.splits.contains_key(target)
++            {
++                return Err(YaccGrammarError {
++                    kind: YaccGrammarErrorKind::InvalidFallback(src.clone()),
++                    spans: vec![*src_span],
++                });
++            }
++        }
++        for (src, (pieces, src_span)) in &self.splits {
++            for (piece, piece_span) in pieces {
++                if !self.tokens.contains(piece) {
++                    return Err(YaccGrammarError {
++                        kind: YaccGrammarErrorKind::UnknownToken(piece.clone()),
++                        spans: vec![*piece_span],
++                    });
++                }
++            }
++            if pieces.len() < 2
++                || pieces.iter().map(|(p, _)| p.as_str()).collect::<String>() != *src
++            {
++                return Err(YaccGrammarError {
++                    kind: YaccGrammarErrorKind::InvalidSplit(src.clone()),
++                    spans: vec![*src_span],
++                });
++            }
++        }
++
+         for (k, (sp, _)) in self.epp.iter() {
+             if self.tokens.contains(k) {
+                 continue;
+@@ -520,6 +560,17 @@ impl GrammarAST {
+                 }
+             }
+         }
++        let reachable = seen_tokens.clone();
++        for (src, ((target, _), _)) in &self.fallbacks {
++            if reachable.contains(target) {
++                seen_tokens.insert(src);
++            }
++        }
++        for (src, (pieces, _)) in &self.splits {
++            if pieces.iter().all(|(p, _)| reachable.contains(p)) {
++                seen_tokens.insert(src);
++            }
++        }
+         self.rules
+             .iter()
+             .enumerate()
+diff --git a/cfgrammar/src/lib/yacc/grammar.rs b/cfgrammar/src/lib/yacc/grammar.rs
+index cd2eab3..418c36b 100644
+--- a/cfgrammar/src/lib/yacc/grammar.rs
++++ b/cfgrammar/src/lib/yacc/grammar.rs
+@@ -97,6 +97,11 @@ pub struct YaccGrammar<StorageT = u32> {
+     actiontypes: Box<[Option<String>]>,
+     /// Tokens marked as %avoid_insert (if any).
+     avoid_insert: Option<Vob>,
++    /// A mapping from `TIdx` -> the token it may be read as under `%fallback` (if any).
++    token_fallbacks: Box<[Option<TIdx<StorageT>>]>,
++    /// A mapping from `TIdx` -> the tokens it may be read as a sequence of under `%split` (if
++    /// any).
++    token_splits: Box<[Option<Box<[TIdx<StorageT>]>>]>,
+     /// How many shift/reduce conflicts the grammar author expected (if any).
+     expect: Option<usize>,
+     /// How many reduce/reduce conflicts the grammar author expected (if any).
+@@ -358,6 +363,16 @@ where
+             None
+         };
+ 
++        let mut token_fallbacks = vec![None; token_names.len()];
++        for (src, ((target, _), _)) in &ast.fallbacks {
++            token_fallbacks[usize::from(token_map[src])] = Some(token_map[target]);
++        }
++        let mut token_splits = vec![None; token_names.len()];
++        for (src, (pieces, _)) in &ast.splits {
++            token_splits[usize::from(token_map[src])] =
++                Some(pieces.iter().map(|(p, _)| token_map[p]).collect());
++        }
++
+         assert!(!token_names.is_empty());
+         assert!(!rule_names.is_empty());
+         Ok(YaccGrammar {
+@@ -388,6 +403,8 @@ where
+             parse_generics: ast.parse_generics.clone(),
+             programs: ast.programs.clone(),
+             avoid_insert,
++            token_fallbacks: token_fallbacks.into_boxed_slice(),
++            token_splits: token_splits.into_boxed_slice(),
+             actiontypes: actiontypes.into_boxed_slice(),
+             expect: ast.expect.map(|(n, _)| n),
+             expectrr: ast.expectrr.map(|(n, _)| n),
+@@ -609,6 +626,18 @@ where
+         }
+     }
+ 
++    /// If the token `tidx` is marked in a `%fallback` declaration, return the token it may be
++    /// read as.
++    pub fn token_fallback(&self, tidx: TIdx<StorageT>) -> Option<TIdx<StorageT>> {
++        self.token_fallbacks[usize::from(tidx)]
++    }
++
++    /// If the token `tidx` is marked in a `%split` declaration, return the sequence of tokens it
++    /// may be read as.
++    pub fn token_split(&self, tidx: TIdx<StorageT>) -> Option<&[TIdx<StorageT>]> {
++        self.token_splits[usize::from(tidx)].as_deref()
++    }
++
+     // How many shift/reduce conflicts were expected?
+     pub fn expect(&self) -> Option<usize> {
+         self.expect
+diff --git a/cfgrammar/src/lib/yacc/parser.rs b/cfgrammar/src/lib/yacc/parser.rs
+index 4ee8eec..85e05a3 100644
+--- a/cfgrammar/src/lib/yacc/parser.rs
++++ b/cfgrammar/src/lib/yacc/parser.rs
+@@ -55,6 +55,9 @@ pub enum YaccGrammarErrorKind {
+     DuplicateStartDeclaration,
+     DuplicateActiontypeDeclaration,
+     DuplicateEPP,
++    DuplicateReinterpretation,
++    InvalidFallback(String),
++    InvalidSplit(String),
+     ReachedEOL,
+     InvalidString,
+     NoStartRule,
+@@ -130,6 +133,15 @@ impl fmt::Display for YaccGrammarErrorKind {
+                 "Duplicate %actiontype declaration"
+             }
+             YaccGrammarErrorKind::DuplicateEPP => "Duplicate %epp declaration for this token",
++            YaccGrammarErrorKind::DuplicateReinterpretation => {
++                "Token appears in more than one %fallback or %split declaration"
++            }
++            YaccGrammarErrorKind::InvalidFallback(name) => {
++                return write!(f, "Invalid %fallback declaration for token '{}'", name);
++            }
++            YaccGrammarErrorKind::InvalidSplit(name) => {
++                return write!(f, "Invalid %split declaration for token '{}'", name);
++            }
+             YaccGrammarErrorKind::ReachedEOL => {
+                 "Reached end of line without finding expected content"
+             }
+@@ -275,6 +287,8 @@ impl Spanned for YaccGrammarError {
+             | YaccGrammarErrorKind::NoPrecForToken(_)
+             | YaccGrammarErrorKind::InvalidYaccKind
+             | YaccGrammarErrorKind::ExpectedInput(_)
++            | YaccGrammarErrorKind::InvalidFallback(_)
++            | YaccGrammarErrorKind::InvalidSplit(_)
+             | YaccGrammarErrorKind::UnknownEPP(_) => SpansKind::Error,
+             YaccGrammarErrorKind::DuplicatePrecedence
+             | YaccGrammarErrorKind::DuplicateAvoidInsertDeclaration
+@@ -283,7 +297,8 @@ impl Spanned for YaccGrammarError {
+             | YaccGrammarErrorKind::DuplicateImplicitTokensDeclaration
+             | YaccGrammarErrorKind::DuplicateStartDeclaration
+             | YaccGrammarErrorKind::DuplicateActiontypeDeclaration
+-            | YaccGrammarErrorKind::DuplicateEPP => SpansKind::DuplicationError,
++            | YaccGrammarErrorKind::DuplicateEPP
++            | YaccGrammarErrorKind::DuplicateReinterpretation => SpansKind::DuplicationError,
+             YaccGrammarErrorKind::Header(_, spanskind) => spanskind,
+         }
+     }
+@@ -459,6 +474,38 @@ impl YaccParser<'_> {
+                 i = self.parse_ws(j, true)?;
+                 continue;
+             }
++            if let Some(j) = self.lookahead_is("%fallback", i) {
++                i = self.parse_ws(j, false)?;
++                let (j, target, target_span, _) = self.parse_token(i)?;
++                i = self.parse_ws(j, false)?;
++                let num_newlines = self.num_newlines;
++                while i < self.src.len() && num_newlines == self.num_newlines {
++                    let (j, n, span, _) = self.parse_token(i)?;
++                    if self.add_reinterpreted_token(&n, span, errs) {
++                        self.ast
++                            .fallbacks
++                            .insert(n, ((target.clone(), target_span), span));
++                    }
++                    i = self.parse_ws(j, true)?;
++                }
++                continue;
++            }
++            if let Some(j) = self.lookahead_is("%split", i) {
++                i = self.parse_ws(j, false)?;
++                let (j, n, span, _) = self.parse_token(i)?;
++                let num_newlines = self.num_newlines;
++                i = self.parse_ws(j, true)?;
++                let mut pieces = Vec::new();
++                while i < self.src.len() && num_newlines == self.num_newlines {
++                    let (j, piece, piece_span, _) = self.parse_token(i)?;
++                    pieces.push((piece, piece_span));
++                    i = self.parse_ws(j, true)?;
++                }
++                if self.add_reinterpreted_token(&n, span, errs) {
++                    self.ast.splits.insert(n, (pieces, span));
++                }
++                continue;
++            }
+             if let Some(j) = self.lookahead_is("%expect-rr", i) {
+                 i = self.parse_ws(j, false)?;
+                 let (j, n) = self.parse_int(i)?;
+@@ -1052,6 +1099,35 @@ impl YaccParser<'_> {
+         Ok(i)
+     }
+ 
++    fn add_reinterpreted_token(
++        &mut self,
++        n: &str,
++        span: Span,
++        errs: &mut Vec<YaccGrammarError>,
++    ) -> bool {
++        let orig = self
++            .ast
++            .fallbacks
++            .get(n)
++            .map(|(_, sp)| *sp)
++            .or_else(|| self.ast.splits.get(n).map(|(_, sp)| *sp));
++        if let Some(orig_span) = orig {
++            add_duplicate_occurrence(
++                errs,
++                YaccGrammarErrorKind::DuplicateReinterpretation,
++                orig_span,
++                span,
++            );
++            return false;
++        }
++        let (idx, new_tok) = self.ast.tokens.insert_full(n.to_string());
++        if new_tok {
++            self.ast.spans.push(span);
++        }
++        self.ast.token_directives.insert(idx);
++        true
++    }
++
+     fn lookahead_is(&self, s: &'static str, i: usize) -> Option<usize> {
+         if self.src[i..].starts_with(s) {
+             Some(i + s.len())
+diff --git a/lrpar/src/lib/cpctplus.rs b/lrpar/src/lib/cpctplus.rs
+index 7d82abd..8e9d421 100644
+--- a/lrpar/src/lib/cpctplus.rs
++++ b/lrpar/src/lib/cpctplus.rs
+@@ -19,7 +19,7 @@ use num_traits::{AsPrimitive, PrimInt, Unsigned};
+ use super::{
+     Lexeme, LexerTypes,
+     dijkstra::dijkstra,
+-    parser::{AStackType, ParseRepair, Parser, Recoverer},
++    parser::{AStackType, ParseRepair, Parser, Reading, Recoverer},
+ };
+ 
+ const PARSE_AT_LEAST: usize = 3; // N in Corchuelo et al.
+@@ -33,6 +33,10 @@ enum Repair<StorageT> {
+     Delete,
+     /// Shift a symbol.
+     Shift,
++    /// Delete the next piece of a split lexeme.
++    DeletePiece,
++    /// Shift the next piece of a split lexeme.
++    ShiftPiece,
+ }
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+@@ -46,6 +50,7 @@ enum RepairMerge<StorageT> {
+ struct PathFNode<StorageT> {
+     pstack: Cactus<StIdx<StorageT>>,
+     laidx: usize,
++    piece: usize,
+     repairs: Cactus<RepairMerge<StorageT>>,
+     cf: u16,
+ }
+@@ -64,12 +69,13 @@ impl<StorageT: Hash + PrimInt + Unsigned> Hash for PathFNode<StorageT> {
+     fn hash<H: Hasher>(&self, state: &mut H) {
+         self.pstack.hash(state);
+         self.laidx.hash(state);
++        self.piece.hash(state);
+     }
+ }
+ 
+ impl<StorageT: PrimInt + Unsigned> PartialEq for PathFNode<StorageT> {
+     fn eq(&self, other: &PathFNode<StorageT>) -> bool {
+-        if self.laidx != other.laidx || self.pstack != other.pstack {
++        if self.laidx != other.laidx || self.piece != other.piece || self.pstack != other.pstack {
+             return false;
+         }
+         // The rest of this function is subtle: we're not looking for repair sequences which are
+@@ -79,8 +85,10 @@ impl<StorageT: PrimInt + Unsigned> PartialEq for PathFNode<StorageT> {
+         // sequence ends in a delete, the other must do so as well.
+ 
+         match (self.last_repair(), other.last_repair()) {
+-            (Some(Repair::Delete), Some(Repair::Delete)) => (),
+-            (Some(Repair::Delete), _) | (_, Some(Repair::Delete)) => return false,
++            (Some(Repair::Delete), Some(Repair::Delete))
++            | (Some(Repair::DeletePiece), Some(Repair::DeletePiece)) => (),
++            (Some(Repair::Delete | Repair::DeletePiece), _)
++            | (_, Some(Repair::Delete | Repair::DeletePiece)) => return false,
+             (_, _) => (),
+         }
+ 
+@@ -88,9 +96,8 @@ impl<StorageT: PrimInt + Unsigned> PartialEq for PathFNode<StorageT> {
+             let mut n = 0;
+             for r in c.vals() {
+                 match *r {
+-                    RepairMerge::Repair(Repair::Shift) | RepairMerge::Merge(Repair::Shift, _) => {
+-                        n += 1
+-                    }
++                    RepairMerge::Repair(Repair::Shift | Repair::ShiftPiece)
++                    | RepairMerge::Merge(Repair::Shift | Repair::ShiftPiece, _) => n += 1,
+                     _ => break,
+                 }
+             }
+@@ -151,10 +158,15 @@ where
+         finish_by: Instant,
+         parser: &Parser<StorageT, LexerTypesT, ActionT, ParamT>,
+         in_laidx: usize,
++        in_piece: usize,
+         in_pstack: &mut Vec<StIdx<StorageT>>,
+         astack: &mut Vec<AStackType<LexerTypesT::LexemeT, ActionT>>,
+         spans: &mut Vec<Span>,
+-    ) -> (usize, Vec<Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>>>) {
++    ) -> (
++        usize,
++        usize,
++        Vec<Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>>>,
++    ) {
+         // This function implements a minor variant of the algorithm from "Repairing syntax errors
+         // in LR parsers" by Rafael Corchuelo, Jose A. Perez, Antonio Ruiz, and Miguel Toro.
+         //
+@@ -179,6 +191,7 @@ where
+         let start_node = PathFNode {
+             pstack: start_cactus_pstack,
+             laidx: in_laidx,
++            piece: in_piece,
+             repairs: Cactus::new().child(RepairMerge::Terminator),
+             cf: 0,
+         };
+@@ -192,7 +205,7 @@ where
+                 }
+ 
+                 match n.last_repair() {
+-                    Some(Repair::Delete) => {
++                    Some(Repair::Delete | Repair::DeletePiece) => {
+                         // We follow Corcheulo et al.'s suggestions and never follow Deletes with
+                         // Inserts.
+                     }
+@@ -246,27 +259,29 @@ where
+         );
+ 
+         if astar_cnds.is_empty() {
+-            return (in_laidx, vec![]);
++            return (in_laidx, in_piece, vec![]);
+         }
+ 
+-        let Some(full_rprs) = self.collect_repairs(finish_by, in_laidx, astar_cnds) else {
+-            return (in_laidx, vec![]);
++        let Some(full_rprs) = self.collect_repairs(finish_by, in_laidx, in_piece, astar_cnds)
++        else {
++            return (in_laidx, in_piece, vec![]);
+         };
+-        let mut rnk_rprs = rank_cnds(parser, finish_by, in_laidx, in_pstack, full_rprs);
++        let mut rnk_rprs = rank_cnds(parser, finish_by, in_laidx, in_piece, in_pstack, full_rprs);
+         if rnk_rprs.is_empty() {
+-            return (in_laidx, vec![]);
++            return (in_laidx, in_piece, vec![]);
+         }
+         simplify_repairs(parser, &mut rnk_rprs);
+-        let laidx = apply_repairs(
++        let (laidx, piece) = apply_repairs(
+             parser,
+             in_laidx,
++            in_piece,
+             in_pstack,
+             &mut Some(astack),
+             &mut Some(spans),
+             &rnk_rprs[0],
+         );
+ 
+-        (laidx, rnk_rprs)
++        (laidx, piece, rnk_rprs)
+     }
+ }
+ 
+@@ -289,7 +304,7 @@ where
+                 continue;
+             }
+ 
+-            let next_lexeme = self.parser.next_lexeme(n.laidx);
++            let next_lexeme = self.parser.lexeme_at(n.laidx, n.piece);
+             let new_lexeme = Lexeme::new_faulty(
+                 StorageT::from(u32::from(tidx)).unwrap(),
+                 next_lexeme.span().start(),
+@@ -306,6 +321,7 @@ where
+                 let nn = PathFNode {
+                     pstack: n_pstack,
+                     laidx: n.laidx,
++                    piece: n.piece,
+                     repairs: n
+                         .repairs
+                         .child(RepairMerge::Repair(Repair::InsertTerm(tidx))),
+@@ -319,16 +335,49 @@ where
+         }
+     }
+ 
++    /// Should the lexeme at `n`'s position be repaired piece by piece? True inside a split lexeme
++    /// and at a split lexeme which cannot be read from `n`'s configuration.
++    fn piecewise(&self, n: &PathFNode<StorageT>) -> bool {
++        n.piece > 0
++            || (self.parser.split_pieces(n.laidx).is_some()
++                && matches!(
++                    self.parser.reading(n.laidx, || {
++                        let mut v = n.pstack.vals().copied().collect::<Vec<_>>();
++                        v.reverse();
++                        v
++                    }),
++                    Reading::Unreadable
++                ))
++    }
++
+     fn delete(&self, n: &PathFNode<StorageT>, nbrs: &mut Vec<(u16, PathFNode<StorageT>)>) {
+         if n.laidx == self.parser.lexemes.len() {
+             return;
+         }
+ 
++        if self.piecewise(n) {
++            let la_tidx = TIdx(self.parser.piece_lexeme(n.laidx, n.piece).tok_id());
++            let (laidx, piece) = self.parser.next_piece(n.laidx, n.piece);
++            let nn = PathFNode {
++                pstack: n.pstack.clone(),
++                laidx,
++                piece,
++                repairs: n.repairs.child(RepairMerge::Repair(Repair::DeletePiece)),
++                cf: n
++                    .cf
++                    .checked_add(u16::from((self.parser.token_cost)(la_tidx)))
++                    .unwrap(),
++            };
++            nbrs.push((nn.cf, nn));
++            return;
++        }
++
+         let la_tidx = self.parser.next_tidx(n.laidx);
+         let cost = (self.parser.token_cost)(la_tidx);
+         let nn = PathFNode {
+             pstack: n.pstack.clone(),
+             laidx: n.laidx + 1,
++            piece: 0,
+             repairs: n.repairs.child(RepairMerge::Repair(Repair::Delete)),
+             cf: n.cf.checked_add(u16::from(cost)).unwrap(),
+         };
+@@ -339,18 +388,29 @@ where
+         // This is CR Shift 3 from "Don't Panic!".
+ 
+         let laidx = n.laidx;
++        let piecewise = self.piecewise(n);
++        let prefix = piecewise.then(|| self.parser.piece_lexeme(laidx, n.piece));
+         let (new_laidx, n_pstack) =
+             self.parser
+-                .lr_cactus(None, laidx, laidx + 1, n.pstack.clone(), &mut None);
++                .lr_cactus(prefix, laidx, laidx + 1, n.pstack.clone(), &mut None);
+         if new_laidx > laidx || n.pstack != n_pstack {
+-            let n_repairs = if new_laidx > laidx {
+-                n.repairs.child(RepairMerge::Repair(Repair::Shift))
++            let (n_repairs, (laidx, piece)) = if new_laidx == laidx {
++                (n.repairs.clone(), (laidx, n.piece))
++            } else if piecewise {
++                (
++                    n.repairs.child(RepairMerge::Repair(Repair::ShiftPiece)),
++                    self.parser.next_piece(laidx, n.piece),
++                )
+             } else {
+-                n.repairs.clone()
++                (
++                    n.repairs.child(RepairMerge::Repair(Repair::Shift)),
++                    (new_laidx, 0),
++                )
+             };
+             let nn = PathFNode {
+                 pstack: n_pstack,
+-                laidx: new_laidx,
++                laidx,
++                piece,
+                 repairs: n_repairs,
+                 cf: n.cf,
+             };
+@@ -364,6 +424,7 @@ where
+         &self,
+         finish_by: Instant,
+         in_laidx: usize,
++        in_piece: usize,
+         cnds: Vec<PathFNode<StorageT>>,
+     ) -> Option<Vec<Vec<Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>>>>> {
+         fn traverse<StorageT: PrimInt>(
+@@ -412,7 +473,7 @@ where
+             all_rprs.push(
+                 traverse(finish_by, &cnd.repairs)?
+                     .into_iter()
+-                    .map(|x| self.repair_to_parse_repair(in_laidx, &x))
++                    .map(|x| self.repair_to_parse_repair(in_laidx, in_piece, &x))
+                     .collect::<Vec<_>>(),
+             );
+         }
+@@ -422,10 +483,20 @@ where
+     fn repair_to_parse_repair(
+         &self,
+         mut laidx: usize,
++        mut piece: usize,
+         from: &[Repair<StorageT>],
+     ) -> Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>> {
+         from.iter()
+             .map(|y| match *y {
++                Repair::DeletePiece | Repair::ShiftPiece => {
++                    let lexeme = self.parser.piece_lexeme(laidx, piece);
++                    (laidx, piece) = self.parser.next_piece(laidx, piece);
++                    if *y == Repair::DeletePiece {
++                        ParseRepair::Delete(lexeme)
++                    } else {
++                        ParseRepair::Shift(lexeme)
++                    }
++                }
+                 Repair::InsertTerm(token_idx) => ParseRepair::Insert(token_idx),
+                 Repair::Delete => {
+                     let rpr = ParseRepair::Delete(self.parser.next_lexeme(laidx));
+@@ -453,18 +524,30 @@ fn apply_repairs<
+ >(
+     parser: &Parser<StorageT, LexerTypesT, ActionT, ParamT>,
+     mut laidx: usize,
++    mut piece: usize,
+     pstack: &mut Vec<StIdx<StorageT>>,
+     astack: &mut Option<&mut Vec<AStackType<LexerTypesT::LexemeT, ActionT>>>,
+     spans: &mut Option<&mut Vec<Span>>,
+     repairs: &[ParseRepair<LexerTypesT::LexemeT, StorageT>],
+-) -> usize
++) -> (usize, usize)
+ where
+     usize: AsPrimitive<StorageT>,
+ {
+     for r in repairs.iter() {
+         match *r {
++            ParseRepair::Delete(lexeme) | ParseRepair::Shift(lexeme)
++                if piece > 0 || lexeme != parser.next_lexeme(laidx) =>
++            {
++                if let ParseRepair::Shift(_) = r
++                    && parser.lr_upto(Some(lexeme), laidx, laidx + 1, pstack, astack, spans)
++                        == laidx
++                {
++                    break;
++                }
++                (laidx, piece) = parser.next_piece(laidx, piece);
++            }
+             ParseRepair::Insert(tidx) => {
+-                let next_lexeme = parser.next_lexeme(laidx);
++                let next_lexeme = parser.lexeme_at(laidx, piece);
+                 let new_lexeme = Lexeme::new_faulty(
+                     StorageT::from(u32::from(tidx)).unwrap(),
+                     next_lexeme.span().start(),
+@@ -480,7 +563,7 @@ where
+             }
+         }
+     }
+-    laidx
++    (laidx, piece)
+ }
+ 
+ /// Simplifies repair sequences, removes duplicates, and sorts them into order.
+@@ -554,6 +637,7 @@ fn rank_cnds<
+     parser: &Parser<StorageT, LexerTypesT, ActionT, ParamT>,
+     finish_by: Instant,
+     in_laidx: usize,
++    in_piece: usize,
+     in_pstack: &[StIdx<StorageT>],
+     in_cnds: Vec<Vec<Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>>>>,
+ ) -> Vec<Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>>>
+@@ -561,32 +645,50 @@ where
+     usize: AsPrimitive<StorageT>,
+ {
+     let mut cnds = Vec::new();
+-    let mut furthest = 0;
++    let mut furthest = (0, 0);
+     for rpr_seqs in in_cnds {
+         if Instant::now() >= finish_by {
+             return vec![];
+         }
+         let mut pstack = in_pstack.to_owned();
+-        let mut laidx = apply_repairs(
++        let (mut laidx, mut piece) = apply_repairs(
+             parser,
+             in_laidx,
++            in_piece,
+             &mut pstack,
+             &mut None,
+             &mut None,
+             &rpr_seqs[0],
+         );
+-        laidx = parser.lr_upto(
+-            None,
+-            laidx,
+-            in_laidx + TRY_PARSE_AT_MOST,
+-            &mut pstack,
+-            &mut None,
+-            &mut None,
+-        );
+-        if laidx >= furthest {
+-            furthest = laidx;
++        while piece > 0 {
++            let lexeme = parser.lexeme_at(laidx, piece);
++            if parser.lr_upto(
++                Some(lexeme),
++                laidx,
++                laidx + 1,
++                &mut pstack,
++                &mut None,
++                &mut None,
++            ) == laidx
++            {
++                break;
++            }
++            (laidx, piece) = parser.next_piece(laidx, piece);
++        }
++        if piece == 0 {
++            laidx = parser.lr_upto(
++                None,
++                laidx,
++                in_laidx + TRY_PARSE_AT_MOST,
++                &mut pstack,
++                &mut None,
++                &mut None,
++            );
++        }
++        if (laidx, piece) >= furthest {
++            furthest = (laidx, piece);
+         }
+-        cnds.push((pstack, laidx, rpr_seqs));
++        cnds.push((pstack, (laidx, piece), rpr_seqs));
+     }
+ 
+     // Remove any elements except those which parsed as far as possible.
+@@ -605,8 +707,8 @@ fn ends_with_parse_at_least_shifts<StorageT: PrimInt + Unsigned>(
+     let mut shfts = 0;
+     for x in repairs.vals().take(PARSE_AT_LEAST) {
+         match *x {
+-            RepairMerge::Repair(Repair::Shift) => shfts += 1,
+-            RepairMerge::Merge(Repair::Shift, _) => shfts += 1,
++            RepairMerge::Repair(Repair::Shift | Repair::ShiftPiece) => shfts += 1,
++            RepairMerge::Merge(Repair::Shift | Repair::ShiftPiece, _) => shfts += 1,
+             _ => return false,
+         }
+     }
+diff --git a/lrpar/src/lib/parser.rs b/lrpar/src/lib/parser.rs
+index 34ca6ad..e83a717 100644
+--- a/lrpar/src/lib/parser.rs
++++ b/lrpar/src/lib/parser.rs
+@@ -98,6 +98,12 @@ type ActionFn<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT> = &'a dyn
+     ParamT,
+ ) -> ActionT;
+ 
++pub(super) enum Reading<LexemeT> {
++    AsLexed,
++    Replaced(Vec<LexemeT>),
++    Unreadable,
++}
++
+ #[derive(Debug)]
+ pub enum AStackType<LexemeT, ActionT> {
+     ActionType(ActionT),
+@@ -317,10 +323,31 @@ where
+     ) -> Option<ActionT> {
+         let mut recoverer = None;
+         let mut recovery_budget = Duration::from_millis(RECOVERY_TIME_BUDGET);
++        let mut piece = 0;
+         loop {
+             debug_assert_eq!(astack.len(), spans.len());
++            if piece == 0
++                && let Reading::Replaced(lexemes) = self.reading(laidx, || pstack.clone())
++            {
++                for lexeme in lexemes {
++                    self.lr_upto(
++                        Some(lexeme),
++                        laidx,
++                        laidx + 1,
++                        pstack,
++                        &mut Some(&mut *astack),
++                        &mut Some(&mut *spans),
++                    );
++                }
++                laidx += 1;
++                continue;
++            }
+             let stidx = *pstack.last().unwrap();
+-            let la_tidx = self.next_tidx(laidx);
++            let la_tidx = if piece == 0 {
++                self.next_tidx(laidx)
++            } else {
++                TIdx(self.lexeme_at(laidx, piece).tok_id())
++            };
+ 
+             match self.stable.action(stidx, la_tidx) {
+                 Action::Reduce(pidx) => {
+@@ -351,12 +378,16 @@ where
+                     astack.push(v);
+                 }
+                 Action::Shift(state_id) => {
+-                    let la_lexeme = self.next_lexeme(laidx);
++                    let la_lexeme = self.lexeme_at(laidx, piece);
+                     pstack.push(state_id);
+                     astack.push(AStackType::Lexeme(la_lexeme));
+ 
+                     spans.push(la_lexeme.span());
+-                    laidx += 1;
++                    (laidx, piece) = if piece == 0 {
++                        (laidx + 1, 0)
++                    } else {
++                        self.next_piece(laidx, piece)
++                    };
+                 }
+                 Action::Accept => {
+                     debug_assert_eq!(la_tidx, self.grm.eof_token_idx());
+@@ -371,7 +402,7 @@ where
+                         recoverer = Some(match self.rcvry_kind {
+                             RecoveryKind::CPCTPlus => cpctplus::recoverer(self),
+                             RecoveryKind::None => {
+-                                let la_lexeme = self.next_lexeme(laidx);
++                                let la_lexeme = self.lexeme_at(laidx, piece);
+                                 errors.push(
+                                     ParseError {
+                                         stidx,
+@@ -387,17 +418,17 @@ where
+ 
+                     let before = Instant::now();
+                     let finish_by = before + recovery_budget;
+-                    let (new_laidx, repairs) = recoverer
++                    let (new_laidx, new_piece, repairs) = recoverer
+                         .as_ref()
+                         .unwrap()
+                         .as_ref()
+-                        .recover(finish_by, self, laidx, pstack, astack, spans);
++                        .recover(finish_by, self, laidx, piece, pstack, astack, spans);
+                     let after = Instant::now();
+                     recovery_budget = recovery_budget
+                         .checked_sub(after - before)
+                         .unwrap_or_else(|| Duration::new(0, 0));
+                     let keep_going = !repairs.is_empty();
+-                    let la_lexeme = self.next_lexeme(laidx);
++                    let la_lexeme = self.lexeme_at(laidx, piece);
+                     errors.push(
+                         ParseError {
+                             stidx,
+@@ -410,6 +441,7 @@ where
+                         return None;
+                     }
+                     laidx = new_laidx;
++                    piece = new_piece;
+                 }
+             }
+         }
+@@ -430,6 +462,15 @@ where
+     ) -> usize {
+         assert!(lexeme_prefix.is_none() || end_laidx == laidx + 1);
+         while laidx != end_laidx && laidx <= self.lexemes.len() {
++            if lexeme_prefix.is_none()
++                && let Reading::Replaced(lexemes) = self.reading(laidx, || pstack.clone())
++            {
++                for lexeme in lexemes {
++                    self.lr_upto(Some(lexeme), laidx, laidx + 1, pstack, astack, spans);
++                }
++                laidx += 1;
++                continue;
++            }
+             let stidx = *pstack.last().unwrap();
+             let la_tidx = if let Some(l) = lexeme_prefix {
+                 TIdx(l.tok_id())
+@@ -539,6 +580,109 @@ where
+         }
+     }
+ 
++    /// Decide how the lexeme at `laidx` is read from the configuration `pstack`: as lexed, as the
++    /// lexemes given by its `%fallback` or `%split` declaration, or not at all.
++    pub(super) fn reading(
++        &self,
++        laidx: usize,
++        pstack: impl FnOnce() -> PStack<StorageT>,
++    ) -> Reading<LexerTypesT::LexemeT> {
++        let Some(&lexeme) = self.lexemes.get(laidx) else {
++            return Reading::AsLexed;
++        };
++        let tidx = TIdx(lexeme.tok_id());
++        let fallback = self.grm.token_fallback(tidx);
++        let split = self.grm.token_split(tidx);
++        if fallback.is_none() && split.is_none() {
++            return Reading::AsLexed;
++        }
++        let pstack = pstack();
++        if self.can_shift_all(&pstack, &[tidx]) {
++            return Reading::AsLexed;
++        }
++        if let Some(fb_tidx) = fallback {
++            if self.can_shift_all(&pstack, &[fb_tidx]) {
++                let span = lexeme.span();
++                return Reading::Replaced(vec![LexerTypesT::LexemeT::new(
++                    fb_tidx.as_storaget(),
++                    span.start(),
++                    span.len(),
++                )]);
++            }
++            return Reading::Unreadable;
++        }
++        match self.split_pieces(laidx) {
++            Some(pieces) if self.can_shift_all(&pstack, split.unwrap()) => {
++                Reading::Replaced(pieces)
++            }
++            _ => Reading::Unreadable,
++        }
++    }
++
++    /// If the lexeme at `laidx` has a `%split` declaration and is exactly as long as its token's
++    /// name, return its pieces, each covering as much of its span as the piece's name is long.
++    pub(super) fn split_pieces(&self, laidx: usize) -> Option<Vec<LexerTypesT::LexemeT>> {
++        let lexeme = *self.lexemes.get(laidx)?;
++        let pieces = self.grm.token_split(TIdx(lexeme.tok_id()))?;
++        let span = lexeme.span();
++        let mut start = span.start();
++        let mut lexemes = Vec::with_capacity(pieces.len());
++        for &p_tidx in pieces {
++            let len = self.grm.token_name(p_tidx).unwrap().len();
++            lexemes.push(LexerTypesT::LexemeT::new(p_tidx.as_storaget(), start, len));
++            start += len;
++        }
++        (start == span.end()).then_some(lexemes)
++    }
++
++    /// Return the position following the piece `piece` of the split lexeme at `laidx`.
++    pub(super) fn next_piece(&self, laidx: usize, piece: usize) -> (usize, usize) {
++        if piece + 1 < self.split_pieces(laidx).map_or(0, |p| p.len()) {
++            (laidx, piece + 1)
++        } else {
++            (laidx + 1, 0)
++        }
++    }
++
++    /// Return the lexeme at position (`laidx`, `piece`), where a non-zero `piece` is an index into
++    /// the pieces of a split lexeme.
++    pub(super) fn lexeme_at(&self, laidx: usize, piece: usize) -> LexerTypesT::LexemeT {
++        if piece == 0 {
++            self.next_lexeme(laidx)
++        } else {
++            self.piece_lexeme(laidx, piece)
++        }
++    }
++
++    /// Return the piece `piece` of the split lexeme at `laidx`.
++    pub(super) fn piece_lexeme(&self, laidx: usize, piece: usize) -> LexerTypesT::LexemeT {
++        self.split_pieces(laidx).unwrap()[piece]
++    }
++
++    /// Can each token in `tidxs` be shifted in turn starting from the configuration `pstack`?
++    /// Operates on a copy of `pstack` and runs no actions.
++    fn can_shift_all(&self, pstack: &[StIdx<StorageT>], tidxs: &[TIdx<StorageT>]) -> bool {
++        let mut pstack = pstack.to_vec();
++        for &tidx in tidxs {
++            loop {
++                match self.stable.action(*pstack.last().unwrap(), tidx) {
++                    Action::Reduce(pidx) => {
++                        let ridx = self.grm.prod_to_rule(pidx);
++                        pstack.truncate(pstack.len() - self.grm.prod(pidx).len());
++                        let prior = *pstack.last().unwrap();
++                        pstack.push(self.stable.goto(prior, ridx).unwrap());
++                    }
++                    Action::Shift(stidx) => {
++                        pstack.push(stidx);
++                        break;
++                    }
++                    Action::Accept | Action::Error => return false,
++                }
++            }
++        }
++        true
++    }
++
+     /// Start parsing text at `laidx` (using the lexeme in `lexeme_prefix`, if it is not `None`,
+     /// as the first lexeme) up to (but excluding) `end_laidx`. If an error is encountered, parsing
+     /// immediately terminates (without recovery).
+@@ -557,6 +701,21 @@ where
+     ) -> (usize, Cactus<StIdx<StorageT>>) {
+         assert!(lexeme_prefix.is_none() || end_laidx == laidx + 1);
+         while laidx != end_laidx {
++            if lexeme_prefix.is_none()
++                && let Reading::Replaced(lexemes) = self.reading(laidx, || {
++                    let mut v = pstack.vals().copied().collect::<Vec<_>>();
++                    v.reverse();
++                    v
++                })
++            {
++                for lexeme in lexemes {
++                    pstack = self
++                        .lr_cactus(Some(lexeme), laidx, laidx + 1, pstack, tstack)
++                        .1;
++                }
++                laidx += 1;
++                continue;
++            }
+             let stidx = *pstack.val().unwrap();
+             let la_tidx = if let Some(l) = lexeme_prefix {
+                 TIdx(l.tok_id())
+@@ -622,10 +781,15 @@ pub(super) trait Recoverer<
+         finish_by: Instant,
+         parser: &Parser<StorageT, LexerTypesT, ActionT, ParamT>,
+         in_laidx: usize,
++        in_piece: usize,
+         in_pstack: &mut PStack<StorageT>,
+         astack: &mut Vec<AStackType<LexerTypesT::LexemeT, ActionT>>,
+         spans: &mut Vec<Span>,
+-    ) -> (usize, Vec<Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>>>);
++    ) -> (
++        usize,
++        usize,
++        Vec<Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>>>,
++    );
+ }
+ 
+ /// What recovery algorithm should be used when a syntax error is encountered?

@@ -1,6 +1,6 @@
 # feedback.md - bayesopt-search-space-migration
 
-NEXT (human): round-7 artifact (tests + meta changed 2026-09-24; solution unchanged since round 6) needs prechecks, then a FULL batch.
+STATUS: ✅ ACCEPTED 2026-09-25 at 3/10 (batch 2). Finalized 2026-09-26.
 
 Repo: bayesian-optimization/BayesianOptimization (MIT, 8,714 stars), base af8b928 (master HEAD 2026-08-21).
 Hunt: Instructions/repo-hunt-logs/REPO-HUNT-2026-09-23-E.md (RANK 1). Mode: factory SLICE.
@@ -184,4 +184,25 @@ Hunt: Instructions/repo-hunt-logs/REPO-HUNT-2026-09-23-E.md (RANK 1). Mode: fact
   bounds_transformer.bounds the same way). The reviewer's mutant (re-init kept params whose global bounds moved) is KILLED.
 - P4 (Low): split the long transformer sentence in meta (493 words, unchanged count).
 - Tests 83 cases. Host full suite: 250 passed.
+
+## Auto Review round 8 (2026-09-25): Description 3/3, Tests 1/3, Solution 3/3
+- T3/T4 (High): a pure category reorder keeps the one-hot size, so an agent could keep GPHedge's raw candidate arrays and swap
+  a<->c unnoticed. First try (gains vs an identity-change twin) could NOT see it: upstream CategoricalParameter.kernel_transform
+  does res[:, np.argmax(value, axis=1)] = 1, which marks every row's argmax column in EVERY row, so over a batch all categories
+  collapse and the GP never learns a category effect (base code predicts the same value for every category). A swapped-category
+  candidate therefore gets the same reward: behaviorally equivalent here. Left the upstream bug alone (out of scope).
+- Fix: test_gphedge_candidates_keep_their_categories_through_a_reorder decodes get_acquisition_params()["previous_candidates"]
+  through optimizer.space.array_to_params before (old space) and after (new space); categories must match, x approx. Candidates
+  are relaxed vectors (e.g. [0.62, 0.47, 0.41]); decoding takes the argmax, as the repo does.
+- T4 (Medium): constrained fallback. Added a constrained EI optimizer whose points all leave the bounds; first suggestion equals a
+  fresh constrained optimizer's.
+- Mutants: raw candidates when dims match, fallback unconstrained-only: both KILLED.
+- Tests 85 cases. Host full suite: 252 passed.
+
+## ACCEPTED 2026-09-25 (batch 2, 3/10, Auto Review Approved 3/2/2)
+- 3/10 all Nova. Band decider: ConstantLiar collision dedup (F-10 holder cell) 6/10, sole failure of
+  both 84/85 near-misses. Transformer continuity (F-56) 5/10, non-finite values (F-57) 2/10.
+- The GPHedge per-candidate rule that killed 11/11 while implied killed 0/10 once stated (L97).
+- Open Mediums: 10**10000 fill -> OverflowError; ConstantLiar pending categories untested under reorder.
+- Finalized: F-56, F-57, L97, L98, Pattern 106 in failure-patterns.md / PATTERNS-ADVANCED.md; skills updated.
 

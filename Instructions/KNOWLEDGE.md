@@ -1260,3 +1260,41 @@ Cross-agent blind spots, 10-Nova accepted batch (4/10).
   reference's nine source files.
 - Effort: 9.5M-20.4M prompt tokens per run; passers 12.9M-20.4M. Passing production diffs ~425
   effective lines (reference 298). Auto Review counted 116-158 messages.
+
+## bayesopt-search-space-migration (APPROVED Olympus 2026-09-25)
+
+- **A rule applied to the registry but not to a second holder of points (F-10, 6/10).** Every run
+  deduplicated registered points after a change; six carried ConstantLiar's pending points with the
+  duplicates kept. Both 84/85 near-misses failed only this. Evaluators: described and inferable.
+- **Learned collaborator state rebuilt instead of carried (F-56, 5/10).** Agents called the domain
+  reduction transformer's `initialize()` or recomputed its contraction radius from the clipped window;
+  everything stayed in range, only the later course changed. Always compounded with the F-10 miss.
+- **Type test for a value rule (F-57, 2/10).** `isinstance(x, Real)` or a NaN-only guard let infinity
+  or NaN through the "real number" rule.
+- **Unanimous alternative design when a choice is only implied.** 11/11 (10 Nova, 1 Orion) dropped all
+  GPHedge candidates when one could not be carried, several explaining why in comments. Stated: 0/10.
+- **What every agent got right (batch 2):** value-based carry of points through add/remove/retype,
+  queue migration, GPHedge per-candidate scoring once stated, the out-of-bounds random fallback,
+  integer rounding ties, complex categories, transactional failure.
+- Effort: median 82 model requests (batch 2), 79 (batch 1); passing diffs +529 to +656 raw lines,
+  ~430 effective (reference 242). Batch 2 all Nova: 3/10.
+
+## piscsi-image-reservation-identity (APPROVED Olympus 2026-09-26)
+
+- **Identity re-derived from the name (F-59, 8 runs over two batches).** Agents captured device and
+  inode, then rebuilt them from the name map on the dry-run snapshot restore, or fell back to the name
+  when the queried path had no identity. Rename-then-reuse made the old holder "hold" the new file.
+- **Staging with the object's own identity before it is registered (F-58, 5 runs).** Dry-run
+  reservations recorded `GetId()` of a device not yet attached, so conflict messages named `-1:0`.
+  Sole failure of a 65/66 near-miss. This was designed with zero description words.
+- **Whole-path resolution in a containment check (F-60, 5 runs).** `filesystem::relative`/`canonical`
+  on the full path judged an in-folder symlink image by its target and refused it.
+- **Library API success-with-null (F-39, 9 runs).** `getpwuid_r` returning 0 with a null result was
+  read as found; one run used `SUDO_GID` instead. Still 3/10 after the rule was stated.
+- **Refusal leaving side effects (F-61, 2/10 batch 1).** A refused INSERT left the medium loaded because
+  the read-only check had to open it first.
+- **Unanimous miss of an implied extension (L100).** All 10 batch-1 solutions looked up a device's own
+  holders by its stored name; none carried the rename rule into reporting.
+- **What every agent got right:** alias identity through dot segments, `..`, symlinks and hard links,
+  reader/writer sharing, per-holder release, protobuf holder fields, scsictl text.
+- Effort: Nova only; passing diffs +354, +499, +575 raw lines against the reference's 294 (Counter 1).

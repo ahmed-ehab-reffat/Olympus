@@ -119,3 +119,33 @@ Hook: human-effective 242, 5 files.
 | 2026-09-24 | Docker x3 runs x3 uids | all four cells | 500 verdicts | identical across all 9 |
 
 Hook: human-effective 242, 5 files.
+
+## Local validation, round 8 (2026-09-25, tests changed)
+
+| Date | Where | Mode | Cases | Result |
+|---|---|---|---|---|
+| 2026-09-25 | Docker, uid 0/1000/4242, offline | base on base | 167 | 167 pass |
+| 2026-09-25 | Docker, uid 0/1000/4242, offline | new on base | 85 | 85 fail (all AttributeError set_space) |
+| 2026-09-25 | Docker, uid 0/1000/4242, offline | base on solution | 167 | 167 pass |
+| 2026-09-25 | Docker, uid 0/1000/4242, offline | new on solution | 85 | 85 pass |
+| 2026-09-25 | Docker x3 runs x3 uids | all four cells | 504 verdicts | identical across all 9 |
+
+Hook: human-effective 242, 5 files.
+
+## Batch 2 (2026-09-25, platform, round-8 artifact): 3/10 PASS, ACCEPTED (all Nova, graded by Nova)
+
+| Run | Verdict | Requests | +LOC | Failed tests | Approach note |
+|---|---|---|---|---|---|
+| Nova #1 (Nova_Nova_10) | PASS | 82 | 529 | - | legitimate |
+| Nova #8 (Nova_Nova_3) | PASS | 104 | 656 | - | legitimate |
+| Nova #4 (Nova_Nova_7) | PASS | 83 | 642 | - | legitimate |
+| Nova #5 (Nova_Nova_6) | FAIL 84/85 | 70 | 621 | liar_coincide[False] | pending points carried without dedup |
+| Nova #3 (Nova_Nova_8) | FAIL 84/85 | 99 | 661 | liar_coincide[False] | pending points carried without dedup |
+| Nova #7 (Nova_Nova_4) | FAIL 81/85 | 77 | 565 | liar_coincide[False], undo twins x2, moved bounds | no dedup; contraction state changed |
+| Nova #9 (Nova_Nova_2) | FAIL 80/85 | 108 | 586 | liar_coincide[False], undo twins x2, trims, moved bounds | no dedup; transformer history/state reset |
+| Nova #2 (Nova_Nova_9) | FAIL 80/85 | 79 | 676 | liar_coincide[False], undo twins x2, trims, moved bounds | no dedup; window/contraction not carried |
+| Nova #6 (Nova_Nova_5) | FAIL 79/85 | 82 | 644 | added start, undo twins x2, NaN point, NaN queue, moved bounds | `_is_real` accepts NaN/inf; transformer state |
+| Nova #10 (Nova_Nova_1) | FAIL 78/85 | 77 | 636 | liar_coincide[False], added start, removed twin, undo twins x2, NaN point, moved bounds | no dedup; rejects NaN not inf; transformer rebuilt |
+
+Kills: liar_coincide[False] 6, undo twins 5+5, moved-bounds window 5, added start 2, NaN point 2, trims 2, removed twin 1, NaN queue 1.
+76/85 tests killed nothing (all GPHedge, fallback, ties, complex, rollback, attribution, warmed-gains tests).

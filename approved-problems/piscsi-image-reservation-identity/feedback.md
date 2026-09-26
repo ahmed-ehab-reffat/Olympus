@@ -1,6 +1,9 @@
-NEXT (human): Requirement 0 picker check + upload this slice to the platform precheck, then write the verdict in pipeline/INBOX.md
 
 # feedback — piscsi-image-reservation-identity
+
+## 2026-09-26 ACCEPTED (human reviewer). Batch 2: 3/10 (Nova #10, #9, #4), Auto Review Approved 3/3/3
+- One Medium advisory: a passing agent used an ambient SUDO_GID for a passwd-less creator; the test clears SUDO_UID but never sets a conflicting SUDO_GID. Not a reference defect.
+- Finalized: F-58..F-61 (new), F-39/F-6/F-10 evidence, L99, L100, Pattern 107. Archived to approved-problems/; agent runs and clones deleted.
 
 ## 2026-09-24 BATCH 1 (10 x Nova): 1/10 pass, then Auto Review REVISION (Desc 3/3, Tests 2/3, Solution 1/3)
 - Pass rate 10%: in band. Failures cluster on stated requirements (see eval-results.md): no-passwd create 6, rename/reuse 5, batch/refusal messages 3+3, cwd device holders 3.

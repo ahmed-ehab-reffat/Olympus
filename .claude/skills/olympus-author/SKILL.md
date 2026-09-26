@@ -339,6 +339,25 @@ cell (**F-54**: "without X every pass behaves as it does today" plus one off-pat
 the base code ignores, 2/10) and, if the pass stores keys for a join, the straight-line vs join split
 (**F-55**, 2/10).
 
+**A rule written for the main registry, extended "under the same rules" to a second holder of
+points, decides the band (F-10 holder cell, L97).** bayesopt: the duplicate rule reached
+ConstantLiar's pending points through one clause; 6/10, the sole failure of both 84/85 near-misses,
+ruled fair. The same clause did NOT carry a DESIGN CHOICE (GPHedge keeping surviving candidates):
+11/11 took the other defensible design, 0/10 once stated. Extensions may stay implied; choices must
+be written. Pair it with **learned collaborator state that must continue through the change (F-56)**,
+stated, and tested with a change-then-undo twin (5/10, L98).
+
+**An implied extension can still read 10/10 wrong (L100).** piscsi stated "a hold stays with the file
+after its name is reused" but not that a device's own report follows it; a replay of the ten saved
+batch-1 patches failed the new report test **10/10**, so a re-eval would have read unsolvable. Stated
+in one sentence: 2/10 in the fresh batch. Replay before any re-eval that adds a test.
+
+**Compiled suites whose new tests call the new API (L99).** Build base mode WITHOUT the new test file
+(a make/cmake override of the test source list), and make the new-mode build-failure fallback write
+one failing testcase per real test name parsed from the file, never a synthetic `build::compile`.
+Root-graded permission semantics (read-only by mode, no passwd entry) need a forked child that drops
+privileges when it starts as root and reports through its exit code (Pattern 107).
+
 **Turn every reference bug a gate finds into a test (L90).** On pyfakefs all three accepted-batch
 near-miss killers were bugs Solution Quality had first found in the reference. When you fix one,
 add the discriminating test in the same round; probe the saved agent patches first if you have them. **But L90 has counter-evidence:** pyocd's eleven gate-found bugs each got a test and killed NOTHING in
@@ -814,6 +833,14 @@ Wrong Logic % constraint: <25%. ≥25% → Olympus territory. Downgrade trap or 
       never built summaries, a Solution Quality FAIL.**
 - [ ] **No unobservable frequency in meta.md (L96): drop "once", "lazily", "cached", "only after X"
       unless a test can see it. teavm's "once per build" cost a Tests 1/3.**
+- [ ] **Choice-vs-extension audit (L97): for every behaviour a gate asks for, ask whether an
+      implementer could defensibly choose the opposite. If yes, state it in meta.md before the batch;
+      "under the same rules" does not carry a choice. bayesopt: GPHedge per-candidate scoring was only
+      implied and killed 11/11 (batch 0/11); stated, 0/10.**
+- [ ] **Hidden state through public behaviour (L98, Pattern 106): test carried state with a
+      change-then-undo twin, not attribute reads; a precheck rejected `liar.dummies`/`hedge.gains`
+      reads as implementation tests. Check first that the base model can SEE the state (bayesopt's
+      categorical kernel transform collapses categories, so a category swap is invisible to it).**
 - [ ] **Loader-attribute audit (F-41): if the feature creates objects at runtime, diff the batch
       loader's call into the factory against the factory's public signature. Every argument the loader
       injects per entry (group index, owner, id) is a seam; test one object that depends only on it.**
@@ -1204,6 +1231,17 @@ Mars: 1–3 rounds. Olympus: 3–5 rounds. >5 on Mars = playbook patterns not fo
    recursive call graph and an existing per-method analysis to prove the fact with. Companions:
    F-54 compatibility path "fixed" (2/10) and F-55 wildcard sentinel through a join (2/10).
 
+0a-ter. **A registry rule extended to a second holder of points (F-10 holder cell)** — **6/10 on the
+   accepted bayesopt batch, sole failure of both 84/85 near-misses**, with one "under the same rules"
+   clause. Companion: **learned collaborator state rebuilt from its initializer (F-56)**, 5/10 through a
+   change-then-undo twin. Needs a feature that reconfigures a stateful object with auxiliary holders.
+
+0a-quater. **An identity ledger that must survive rename-and-reuse (F-59)** — **8 runs over two
+   piscsi batches**, with companions **a dry-run staged record stamped with an unregistered object's
+   identity (F-58)**, 5 runs and the sole failure of a 65/66 run, and **containment decided on the fully
+   resolved path (F-60)**, 5 runs. Needs a name-keyed ledger with a restore or reporting path, a
+   validate-then-commit loop, and a confinement rule with a last-component exception. The pick's own
+   alias-identity headline killed 0 of 20 runs: budget it as insurance.
 0b. **"Unlimited" reported as a figure and enforced as a limit (F-50)** — 2/10 on the accepted
    pyfakefs batch (116/117 near-miss), 4 runs on an earlier artifact. Free with any accounting pick
    that has an unlimited mode.

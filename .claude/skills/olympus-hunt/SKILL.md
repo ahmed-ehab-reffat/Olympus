@@ -1034,6 +1034,44 @@ stores its key for a later join or frontier replay and the feature needs an "all
 Dossier rows: `F-53 seam: yes/no + the per-method analysis + the recursive call graph`,
 `F-54 seam: yes/no + the case the base pass ignores`, `F-55 seam: yes/no + the deferred path that stores the key`.
 
+### F-56 / F-10-holder seam probe — live reconfiguration of a stateful optimizer (bayesopt)
+
+```bash
+# F-56: an optional collaborator with learned positional state behind an initialize() entry point
+grep -rnE "def initialize\(self, (target_)?space" --include=*.py . | grep -v test | head
+grep -rnE "self\.(current_optimal|previous_optimal|r|window|bounds) = " --include=*.py . | grep -v test | head
+# F-10 holder cell: state that stores POINTS outside the main registry (pending, candidates, queue)
+grep -rnE "self\.(dummies|pending|previous_candidates|_queue)\b" --include=*.py . | grep -v test | head
+```
+
+F-56 is live when the feature changes the configuration a collaborator's state is indexed by
+(dimensions, columns) and the collaborator already has an initializer: 5/10 rebuilt the state on the
+accepted bayesopt batch. The holder cell is live when a rule written for the main registry (dedup,
+drop, rounding) must also reach a second holder of points: 6/10, the sole failure of both near-misses.
+Dossier rows: `F-56 seam: yes/no + the collaborator + its positional state`,
+`F-10 holder: yes/no + every structure that stores points outside the registry`.
+
+### F-58 / F-59 / F-60 seam probe — a name-keyed resource ledger (piscsi)
+
+```bash
+# F-59: a ledger keyed by a name string (path, host, label) with no identity beside it
+grep -rnE "(map|unordered_map)<string, *(id_set|pair<int, *int>|int)>|reserved_(files|names)|in_use|is already being used" --include=*.{cpp,h,go,rs,py} . | grep -vi test | head
+# F-58: a validate-then-commit dry run over several items, and identity assigned by the container
+grep -rnE "dry_?[Rr]un|isDryRun|validate_only|DryRun" --include=*.{cpp,h,go,rs,py} . | grep -vi test | head
+grep -rnE "GetId\(\) *const|controller.*GetTargetId|parent->index" --include=*.{cpp,h} . | head
+# F-60: a folder-confinement check (depth limit, default folder) with symlinked images allowed
+grep -rnE "CheckDepth|default_folder|is_symlink|weakly_canonical|lexically_normal" --include=*.{cpp,h,go,rs,py} . | grep -vi test | head
+```
+
+All three were live on piscsi at once: a string-keyed reservation map, a multi-device ATTACH dry run
+whose temporary devices had no controller id yet, and image commands confined to a folder by a
+slash-count depth check. Measured: F-59 8 runs, F-58 5 runs (sole failure of a 65/66 run), F-60 5 runs
+over two batches; the alias-identity headline itself killed 0 of 20. Also check any base helper that
+wraps `getpwuid_r`/`getgrgid_r` without testing the result pointer (F-39 library instance, 9 runs).
+Dossier rows: `F-59 seam: yes/no + the ledger key + every rebuild/restore/report path`,
+`F-58 seam: yes/no + the dry-run loop + where item identity comes from`,
+`F-60 seam: yes/no + the confinement rule + its last-component exception`.
+
 **F-20, repo-helper variant.** F-20 does not need an agent refactor: if the repo already routes a
 sibling operation through the primitive the feature changes (`add_real_directory` -> `create_dir`),
 a new rule on the primitive leaks by itself (3/10 on pyfakefs). Grep the callers of whatever the

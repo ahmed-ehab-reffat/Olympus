@@ -1541,3 +1541,28 @@ Olympus, accepted 4/10 on batch 1. 9 files, 298 human-effective LOC, 26 new test
 - **Wire and test every pipeline the driver has.** Loop the end-to-end test over all optimization
   levels with a stub backend (Pattern 105).
 - **40% is accepted, with no margin.** Batch variance alone could have read 5/10.
+
+## bayesopt-search-space-migration (APPROVED Olympus 2026-09-25)
+
+Olympus, accepted 3/10 on batch 2 after 0/11. 5 files, 242 human-effective LOC, 85 new tests, Python.
+
+- **"Reconfigure a live stateful object" is a good Olympus lane.** A search-space change touches the
+  registry, its cache, the queue, nested acquisition state and an optional transformer; each holder is
+  a place a rule can fail to reach (F-10 holder cell, F-56).
+- **Every gate-demanded design choice goes in meta.md before the first batch (L97).** One implied
+  choice cost a full batch at 0/11.
+- **Twin tests beat attribute reads** for a precheck that scores "behaviour, not implementation".
+- **Eight gate rounds before the first batch was too many (L91).** Batch after the second.
+
+## piscsi-image-reservation-identity (APPROVED Olympus 2026-09-26)
+
+Olympus, accepted 3/10 on batch 2 after 1/10. 10 files, 221 human-effective LOC (294 Counter 1),
+66 new tests, C++ with gtest.
+
+- **A name-keyed resource ledger is a good Olympus lane.** Turning "reserved by string" into "reserved by
+  file identity" reaches the executor, image commands, response, protobuf and CLI, and every rebuild,
+  restore or report path is a place identity can be re-derived from the name (F-59).
+- **Scope up by adding coupled behaviour, not breadth.** Read-only sharing plus holder reporting took the
+  slice from 132 to 216 effective lines and supplied three of the five killer clusters.
+- **Replay saved patches before re-eval (L100); at 10/10 missed, state the rule and pay the batch.**
+- **Compiled-language harness: base build without the new test file, fallback with real test ids (L99).**

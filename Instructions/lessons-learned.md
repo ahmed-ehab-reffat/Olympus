@@ -1876,3 +1876,47 @@ Accepted at 4/10 on the first batch, after four platform gate rounds and no earl
   counting could see it.
 - **Gate-requested tests bought no difficulty.** 11 of them, 0 kills. The band came from the design's
   mutual-recursion test and one coverage suggestion that asserted legacy behaviour.
+
+## bayesopt-search-space-migration (APPROVED Olympus 2026-09-25)
+
+- **Say the design choice, not just "the same rules".** A gate made GPHedge keep the candidates that
+  survive a change; the prompt only implied it. All 11 agents chose "drop them all", batch 0/11.
+  One explicit sentence: 0/10 on those tests. Before a batch, ask of every gate-demanded behaviour
+  whether a competent implementer could defensibly do the opposite (L97).
+- **Graders reject tests that read internal attributes.** `liar.dummies`, `hedge.gains` and
+  `optimizer._queue` reads failed the tests-quality precheck. Change-then-undo twins passed it and
+  still caught rebuilt state (L98). Later reviewers asked for state reads through the public
+  `get_acquisition_params()`; those were accepted.
+- **Check what the base model can see before designing a behavioural test on it.** bayes_opt's
+  categorical kernel transform collapses every category in a batch, so a swapped-category candidate
+  scores identically. The only test that can see it decodes state.
+- **Probe saved patches before trusting a divergence.** 7/11 solutions diverged on constrained
+  suggestions; the cause was RNG sharing in a rebuilt constraint model. Not a fair lever.
+- **"Real number" means NaN and infinity too.** Test non-finite values on every path that stores the
+  value (registered point, queued probe, fill); the reference had it wrong on all three.
+- **pytest `-x` in a mutation loop hides which tests kill.** Run the whole file per mutant and list the
+  failing names; several mutants that "survived" on an early fixture were fixture artefacts (linear
+  objective, flat GP).
+
+## piscsi-image-reservation-identity (APPROVED Olympus 2026-09-26)
+
+- **The pick's headline can be the part nobody fails.** The whole premise, one image under every
+  spelling (dot segments, `..`, symlinks, hard links), was 16+ tests that killed 0 of 20 runs. The band
+  came from edges the gates added: rename-and-reuse, passwd-less create, dry-run staging, the final
+  image link. Treat the core as insurance and look for the edges early.
+- **Replay the saved patches before a re-eval that adds a test (L100).** The new device-report test
+  failed 10/10 on replay, the only passer included. A re-eval would have read 0/10 and been rejected.
+  Stating the rule and paying for a fresh batch gave 3/10.
+- **Compiled suites need the base build to leave the new test file out, and the fallback to emit the
+  real test names (L99).** Otherwise the whole baseline fails without the solution, and Verify
+  Solution rejects the synthetic `build::compile` case.
+- **Root-graded permission rules need a forked, privilege-dropping test (Pattern 107).** Read-only by
+  file mode and "no passwd entry" cannot exist as root; the platform grades as root and also validates
+  as an unmapped uid (4242). Test both in a child that drops to 65534/4242 and exits with a check code.
+- **A clean-room replay container shares `/tmp` between patches.** A stale `.moved` file from one
+  patch failed the next; clear every fixed outside-folder name at the start of the test.
+- **Keep a held file descriptor for any captured inode identity.** Deleting a reserved file freed its
+  inode, the next temp file reused it, and a base test (`PiscsiExecutorTest.Attach`) flagged a false
+  "in use". Holding the descriptor keeps the inode allocated.
+- **A 23-line slice grew to 294 over thirteen gate rounds.** Every round added a requirement (L91); it
+  stayed solvable only because each one was stated in meta.md before the first batch.
