@@ -1,0 +1,306 @@
+diff --git a/aerich/__init__.py b/aerich/__init__.py
+index 5367bc6..d46b282 100644
+--- a/aerich/__init__.py
++++ b/aerich/__init__.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import pkgutil
+ import warnings
+ from collections.abc import Generator
++from datetime import datetime
+ from contextlib import AbstractAsyncContextManager
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, Literal, cast, overload
+@@ -18,7 +19,7 @@ from aerich.exceptions import DowngradeError, NotInitedError
+ from aerich.inspectdb.mysql import InspectMySQL
+ from aerich.inspectdb.postgres import InspectPostgres
+ from aerich.inspectdb.sqlite import InspectSQLite
+-from aerich.migrate import Migrate
++from aerich.migrate import Migrate, MigrationStep
+ from aerich.models import Aerich
+ from aerich.utils import (
+     decompress_dict,
+@@ -107,7 +108,13 @@ class Command(TortoiseContext):
+         version_file: str,
+         fake: bool = False,
+         version_module: pkgutil.ModuleInfo | None = None,
++        step: MigrationStep | None = None,
+     ) -> None:
++        if step is not None:
++            if not fake:
++                await conn.execute_script(step.upgrade_sql)
++            await Aerich.create(version=version_file, app=self.app, content=step.models_state)
++            return
+         if version_module is not None:
+             m = import_py_module(version_module)
+         else:
+@@ -122,67 +129,127 @@ class Command(TortoiseContext):
+         )
+         await Aerich.create(version=version_file, app=self.app, content=models_state)
+ 
++    async def _applied_entries(
++        self, plan: list[tuple[str, pkgutil.ModuleInfo, MigrationStep | None]]
++    ) -> list[tuple[Aerich, str]]:
++        try:
++            rows = await Aerich.filter(app=self.app).order_by("id")
++        except OperationalError:
++            return []
++        squashed: dict[str, list[str]] = {}
++        for version, version_module, step in plan:
++            if step is not None:
++                squashed.setdefault(version_module.name + ".py", []).append(version)
++        return [(row, v) for row in rows for v in squashed.get(row.version, [row.version])]
++
+     async def upgrade(self, run_in_transaction: bool = True, fake: bool = False) -> list[str]:
+         migrated = []
+-        for version_module in Migrate.get_all_version_modules():
+-            version_file = version_module.name + ".py"
+-            try:
+-                exists = await Aerich.exists(version=version_file, app=self.app)
+-            except OperationalError:
+-                exists = False
+-            if not exists:
++        plan = Migrate.get_version_plan()
++        applied = {v for _, v in await self._applied_entries(plan)}
++        for version_file, version_module, step in plan:
++            if version_file not in applied:
+                 app_conn_name = get_app_connection_name(self.tortoise_config, self.app)
+                 m = import_py_module(version_module)
+                 migration_run_in_transaction = getattr(m, "RUN_IN_TRANSACTION", run_in_transaction)
+                 if migration_run_in_transaction:
+                     async with in_transaction(app_conn_name) as conn:
+-                        await self._upgrade(conn, version_file, fake, version_module)
++                        await self._upgrade(conn, version_file, fake, version_module, step)
+                 else:
+                     app_conn = get_app_connection(self.tortoise_config, self.app)
+-                    await self._upgrade(app_conn, version_file, fake, version_module)
++                    await self._upgrade(app_conn, version_file, fake, version_module, step)
+                 migrated.append(version_file)
+         return migrated
+ 
+     async def downgrade(self, version: int, delete: bool, fake: bool = False) -> list[str]:
+         ret: list[str] = []
++        plan = Migrate.get_version_plan()
++        steps = {v: (m, step) for v, m, step in plan if step is not None}
++        entries = await self._applied_entries(plan)
+         if version == -1:
+-            specified_version = await Migrate.get_last_version()
++            start = len(entries) - 1
+         else:
+-            specified_version = await Aerich.filter(
+-                app=self.app, version__startswith=f"{version}_"
+-            ).first()
+-        if not specified_version:
++            prefix = f"{version}_"
++            start = next((i for i, (_, v) in enumerate(entries) if v.startswith(prefix)), -1)
++        if start < 0:
+             raise DowngradeError("No specified version found")
+-        if version == -1:
+-            versions = [specified_version]
+-        else:
+-            versions = await Aerich.filter(app=self.app, pk__gte=specified_version.pk)
+-        for version_obj in versions:
+-            file = version_obj.version
++        await self._expand_squashed_rows(entries[start:], steps)
++        removed: dict[Path, list[str]] = {}
++        for _, file in reversed(entries[start:]):
+             async with in_transaction(
+                 get_app_connection_name(self.tortoise_config, self.app)
+             ) as conn:
+-                module_info = file_module_info(Migrate.migrate_location, Path(file).stem)
+-                m = import_py_module(module_info)
+-                downgrade = m.downgrade
+-                downgrade_sql = await downgrade(conn)
++                if file in steps:
++                    module_info, step = steps[file]
++                    downgrade_sql = step.downgrade_sql
++                else:
++                    module_info = file_module_info(Migrate.migrate_location, Path(file).stem)
++                    downgrade_sql = await import_py_module(module_info).downgrade(conn)
+                 if not downgrade_sql.strip():
+                     raise DowngradeError("No downgrade items found")
+                 if not fake:
+                     await conn.execute_script(downgrade_sql)
+-                await version_obj.delete()
++                await Aerich.filter(app=self.app, version=file).delete()
+                 if delete:
+-                    py_module_path(module_info).unlink()
++                    removed.setdefault(py_module_path(module_info), []).append(file)
+                 ret.append(file)
++        for path, versions in removed.items():
++            self._remove_from_migration_file(path, versions)
+         return ret
+ 
++    async def _expand_squashed_rows(
++        self,
++        entries: list[tuple[Aerich, str]],
++        steps: dict[str, tuple[pkgutil.ModuleInfo, MigrationStep]],
++    ) -> None:
++        first_row = entries[0][0]
++        if first_row.version == entries[0][1] and all(row.version == v for row, v in entries):
++            return
++        tail = [(row, v) for row, v in await self._applied_entries(Migrate.get_version_plan())]
++        tail = [(row, v) for row, v in tail if row.pk >= first_row.pk]
++        for row in {row.pk: row for row, _ in tail}.values():
++            await row.delete()
++        for row, v in tail:
++            content = row.content if row.version == v else steps[v][1].models_state
++            await Aerich.create(version=v, app=self.app, content=content)
++
++    @staticmethod
++    def _remove_from_migration_file(path: Path, versions: list[str]) -> None:
++        steps = Migrate.get_squashed_steps(import_py_file(path))
++        path.unlink()
++        if steps is None or not (kept := [s for s in steps if s.version not in versions]):
++            return
++        number = kept[-1].version.split("_", 1)[0]
++        new_path = path.with_name(f"{number}_{path.name.split('_', 1)[1]}")
++        new_path.write_text(Migrate.build_squashed_file_text(kept), encoding="utf-8")
++
++    async def squash(self, start: int, end: int, name: str = "squashed") -> str:
++        modules = {int(m.name.split("_")[0]): m for m in Migrate.get_all_version_modules()}
++        if start >= end or start not in modules or end not in modules:
++            raise DowngradeError(f"Cannot squash migrations {start} to {end}")
++        members = [m for number, m in modules.items() if start <= number <= end]
++        connection = get_app_connection(self.tortoise_config, self.app)
++        steps = [s for m in members for s in await Migrate.read_migration_steps(m, connection)]
++        entries = await self._applied_entries(Migrate.get_version_plan())
++        version = f"{end}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{name}.py"
++        target = Path(Migrate.migrate_location, version)
++        target.write_text(Migrate.build_squashed_file_text(steps), encoding="utf-8")
++        for m in members:
++            if (path := py_module_path(m)) != target:
++                path.unlink()
++        squashed = {s.version for s in steps}
++        rows = {row.pk: row for row, v in entries if v in squashed}
++        if squashed <= {v for _, v in entries}:
++            *older, last = rows.values()
++            for row in older:
++                await row.delete()
++            last.version = version
++            await last.save()
++        return version
++
+     async def heads(self) -> list[str]:
+-        ret = []
+-        versions = Migrate.get_all_version_files()
+-        for version in versions:
+-            if not await Aerich.exists(version=version, app=self.app):
+-                ret.append(version)
+-        return ret
++        plan = Migrate.get_version_plan()
++        applied = {v for _, v in await self._applied_entries(plan)}
++        return [version for version, _, _ in plan if version not in applied]
+ 
+     async def history(self) -> list[str]:
+         versions = Migrate.get_all_version_files()
+diff --git a/aerich/cli.py b/aerich/cli.py
+index 0d38dc2..4ffdbad 100644
+--- a/aerich/cli.py
++++ b/aerich/cli.py
+@@ -227,6 +227,17 @@ async def heads(ctx: Context) -> None:
+         click.secho(version, fg=Color.green)
+ 
+ 
++@cli.command(help="Squash a range of migrations into one migration file.")
++@click.option("--from", "start", required=True, type=int, help="First version of the range.")
++@click.option("--to", "end", required=True, type=int, help="Last version of the range.")
++@click.option("--name", default="squashed", show_default=True, help="Migration name.")
++@click.pass_context
++async def squash(ctx: Context, start: int, end: int, name: str) -> None:
++    command = ctx.obj["command"]
++    version = await command.squash(start, end, name)
++    click.secho(f"Success squashing migrations into {version}", fg=Color.green)
++
++
+ @cli.command(help="List all migrations.")
+ @click.pass_context
+ async def history(ctx: Context) -> None:
+diff --git a/aerich/migrate.py b/aerich/migrate.py
+index 4fbe80a..4c860c1 100644
+--- a/aerich/migrate.py
++++ b/aerich/migrate.py
+@@ -26,6 +26,7 @@ from aerich.enums import Color
+ from aerich.exceptions import NotSupportError
+ from aerich.models import MAX_VERSION_LENGTH, Aerich
+ from aerich.utils import (
++    compress_dict,
+     decompress_dict,
+     get_app_connection,
+     get_dict_diff_by_key,
+@@ -69,6 +70,14 @@ class MigrationFile:
+     models_state: dict[str, Any] | None  # e.g.: aerich.utils.get_models_describe(app='models')
+ 
+ 
++@dataclass
++class MigrationStep:
++    version: str
++    upgrade_sql: str
++    downgrade_sql: str
++    models_state: dict[str, Any]
++
++
+ class Migrate:
+     upgrade_operators: list[str] = []
+     downgrade_operators: list[str] = []
+@@ -109,6 +118,61 @@ class Migrate:
+     def get_all_version_files(cls) -> list[str]:
+         return [m.name + ".py" for m in cls.get_all_version_modules()]
+ 
++    @staticmethod
++    def get_squashed_steps(module: ModuleType) -> list[MigrationStep] | None:
++        if (items := getattr(module, "SQUASHED_MIGRATIONS", None)) is None:
++            return None
++        return [
++            MigrationStep(version, upgrade_sql, downgrade_sql, decompress_dict(state))
++            for version, upgrade_sql, downgrade_sql, state in items
++        ]
++
++    @classmethod
++    def get_version_plan(cls) -> list[tuple[str, pkgutil.ModuleInfo, MigrationStep | None]]:
++        plan: list[tuple[str, pkgutil.ModuleInfo, MigrationStep | None]] = []
++        for version_module in cls.get_all_version_modules():
++            steps = cls.get_squashed_steps(import_py_module(version_module))
++            if steps is None:
++                plan.append((version_module.name + ".py", version_module, None))
++            else:
++                plan.extend((step.version, version_module, step) for step in steps)
++        return plan
++
++    @classmethod
++    async def read_migration_steps(
++        cls, version_module: pkgutil.ModuleInfo, connection: BaseDBAsyncClient
++    ) -> list[MigrationStep]:
++        module = import_py_module(version_module)
++        if (steps := cls.get_squashed_steps(module)) is not None:
++            return steps
++        if not (models_state := getattr(module, "MODELS_STATE", None)):
++            raise NotSupportError(
++                f"Migration file {version_module.name} has no MODELS_STATE, "
++                "run `aerich fix-migrations` first"
++            )
++        return [
++            MigrationStep(
++                version_module.name + ".py",
++                await module.upgrade(connection),
++                await module.downgrade(connection),
++                decompress_dict(models_state),
++            )
++        ]
++
++    @classmethod
++    def build_squashed_file_text(cls, steps: list[MigrationStep]) -> str:
++        text = cls.build_migration_file_text(
++            upgrade_sql="\n        ".join(s.upgrade_sql.strip() for s in steps),
++            downgrade_sql="\n        ".join(s.downgrade_sql.strip() for s in reversed(steps)),
++            models_state=steps[-1].models_state,
++        )
++        items = "".join(
++            f"    ({s.version!r}, {s.upgrade_sql!r}, {s.downgrade_sql!r}, "
++            f"{compress_dict(s.models_state)!r}),\n"
++            for s in steps
++        )
++        return f"{text}\nSQUASHED_MIGRATIONS = [\n{items}]\n"
++
+     @classmethod
+     def _get_model(cls, model: str) -> type[Model]:
+         model_class = Tortoise.apps[cls.app].get(model)

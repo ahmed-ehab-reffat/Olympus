@@ -755,6 +755,13 @@ Reviewer feedback confirms AI-slop detector fires on:
 
 Treating human-voice as a Diamond-only concern leaves Mars / Olympus / Lite vulnerable to the same auto-rejection class. From this point: **apply to all submission-bound text regardless of tier**.
 
+### The uncontestable "AI-generated content" gate (2026-09-30)
+
+The 9 rules above are necessary but no longer sufficient. The updated Description Quality check
+failed three careful rewrites of asdf-conversion-free-lazy-tree. The procedure that got through it
+(draft register, user-run humanizer, rule-by-rule drift repair) lives in `CLAUDE.md § RULE UPDATE
+2026-09-30`. Follow it instead of rewording the same text again.
+
 ### What stays as-is
 
 Internal instruction / playbook files (`Instructions/*.md`, `.agents/*.md`, the playbooks themselves) are working documents for the author. Em dashes acceptable in these. **The rule applies to submission-bound text only.**

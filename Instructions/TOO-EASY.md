@@ -24,13 +24,13 @@ Catalog of picks that were authored, batched, and SHELVED because they could not
 | **Maintainer-invited, PR-free lane in a competitor-visited repo** (DERIVATIVE — the numeric-library twin of the two rows above) | a scientific / numerical library where the maintainer has said "should be possible, not supported" in 2-3 issues or a discussion, the subsystem is cold, no PR exists, and the repo already shows one merged competitor-signature PR or a prior submission of ours | every hunt signal that ranks the lane first (cold code, invited feature, no PR, reproducible crash on base) is equally visible to every other author, and the platform pipeline is the only place their picks live. Three foreign scikit-fem submissions landed within eleven minutes on 2026-09-06; GitHub queries return clean on all of them. The dedupe compares the CORE (the generalised mapping); bolt-ons (orientation, smoothing, trace tags, guards) are rated incremental by default | scikit-fem-embedded-meshes (dedupe `derivative` 0.79 / conf 0.90, three days after a rival's identical lane; shelved after full authoring + Docker validation) |
 | **Repo publishes a support matrix** (DERIVATIVE — the sharpest form of the famous-feature rows above) | the target repo's README/docs carry a conformance or support TABLE of the standard it implements, with rows marked "Planned" / "Partially done" / an empty checkbox (CSS property tables, supported-opcode lists, spec-conformance checklists, "what works" matrices) | the table IS a public, pre-ranked, pre-filtered pick list. Every author handed the repo reads the same rows, and the "Planned" rows are exactly the authorable ones (defined behavior, absent implementation, maintainer-blessed). Collision odds are maximal and GitHub queries cannot see the collision, because the rivals' picks live only in the submission pipeline. **A roadmap row is NOT the maintainer-wants-it mitigation it looks like** — it is the strongest collision tell in the taxonomy, and reading it as fairness comfort inverts the signal | dropflow-min-max-sizing (overlap `Blocker`, 204/290 authored lines = 70.3% against an OLDER same-repo submission; the README's CSS table marked `max-height, max-width, min-height, min-width` as "Planned" and the audit logged that as a *mitigation*) |
 | **Maintainer roadmap issue in a small proven repo** (DERIVATIVE — the tracker twin of the support-matrix row) | a small repo whose open issues are the maintainer's own terse to-do list ("implement X", "add opcode Y"), none commented, none with a PR; we already have an accepted pick from the same list | the list is short and every author who opens the repo reads all of it, so each open item is a first-come lane. An accepted pick from item N says nothing about item M: the pipeline holds rivals the SIX-CHECK cannot see. A scope gate that PASSED on the core slice is no protection either — the later re-run compared against an older candidate the first one never surfaced. Being a SUPERSET of the rival (more targets, a second implementation, parity) is read as elaboration, not a new core | cwerg-memory-passed-parameters (overlap `Blocker` after a clean first scope gate; 72/163 rival lines = 44.2%, 72/347 ours = 20.7%; rival = C++-only a64/x64 signature-rewrite pass for issue #3, ours = push/pop lowering on a32/a64/x64 in Python and C++. Same repo list as the ACCEPTED cwerg-bcopy-bzero-lowering, issue #45) |
-| **Reverse direction of a one-way converter** (DERIVATIVE, the converter-package twin of the support-matrix row) | a package converts format A to format B only (its README says so, its API is `aToB` / `aToBData`), and the pick is the missing `bToA`, however much selection, escaping or locale machinery the reverse genuinely needs | the reverse of an existing converter is the first thing every author reads off the package's own export list, and it is fully specified by the forward direction plus the round-trip law, so independent authors converge on the same core pipeline (resolve expressions, nest selectors, convert patterns, escape, serialize). Traps, coupled bug fixes and locale depth are rated "additions around that shared core". The hunt gate that softens "outsider-nameable" to a mitigation (09-09-B item 6) does NOT hold for this shape | messageformat-mf2-to-mf1 (overlap `Blocker`, 270/354 authored lines = 76.3% against TWO older candidates that each independently hold the MF2-to-MF1 core; killed at the core-slice precheck, no batch) |
-| **Open-but-unimplemented feature request** (DERIVATIVE) | a repo issue asking for a well-known language/spec feature, OPEN for years, zero comments, no PR | the SIX-CHECK reads clean precisely because nobody upstream engaged; but every problem author sees the same issue and picks it, so the prior art lives in the submission pipeline where GitHub queries cannot see it. Uncommented + unimplemented + famous = maximum collision odds | lol-html-sibling-combinators (dedupe `duplicate` 0.91); weasyprint-page-floats (overlap `Blocker`, 156/254 discounted lines = 61.4% and 103/254 = 40.6% against TWO older same-repo submissions, issue #259 open since 2016; rejected after 19 review rounds and one batch) |
+| **Reverse direction of a one-way converter** (DERIVATIVE, the converter-package twin of the support-matrix row) | a package converts format A to format B only (its README says so, its API is `aToB` / `aToBData`), and the pick is the missing `bToA`, however much selection, escaping or locale machinery the reverse genuinely needs | the reverse of an existing converter is the first thing every author reads off the package's own export list, and it is fully specified by the forward direction plus the round-trip law, so independent authors converge on the same core pipeline (resolve expressions, nest selectors, convert patterns, escape, serialize). Traps, coupled bug fixes and locale depth are rated "additions around that shared core". The hunt gate that softens "outsider-nameable" to a mitigation (09-09-B item 6) does NOT hold for this shape | messageformat-mf2-to-mf1 (overlap `Blocker`, 270/354 authored lines = 76.3% against TWO older candidates that each independently hold the MF2-to-MF1 core; killed at the core-slice precheck, no batch); protobuf-es-proto-source-printer (the same shape one level up: a model-to-source PRINTER for a format the ecosystem compiles, descriptor back to `.proto` under a protoc round-trip law. Overlap `Blocker` 373/559 = 66.7% against an older foreign printer; comment preservation, editions and registry selection rated bolt-ons. Killed at platform review, no batch) |
+| **Open-but-unimplemented feature request** (DERIVATIVE) | a repo issue asking for a well-known language/spec feature, OPEN for years, zero comments, no PR | the SIX-CHECK reads clean precisely because nobody upstream engaged; but every problem author sees the same issue and picks it, so the prior art lives in the submission pipeline where GitHub queries cannot see it. Uncommented + unimplemented + famous = maximum collision odds | lol-html-sibling-combinators (dedupe `duplicate` 0.91); weasyprint-page-floats (overlap `Blocker`, 156/254 discounted lines = 61.4% and 103/254 = 40.6% against TWO older same-repo submissions, issue #259 open since 2016; rejected after 19 review rounds and one batch); pianoplayer-performed-order-timeline (overlap `Blocker` 88/206 = 42.7% against an older same-repo repeat-fingering task; the lane is issue #8, CLOSED 2018 as "a bit difficult", so closed-without-decline counts as open) |
 | **Scope-lever-doubles-the-collision-surface** (DERIVATIVE) | a pick that needs a SECOND feature bolted on to clear the LOC floor | the dedup engine matches on the CORE task; a bolted-on second feature does not differentiate, it just adds a second independent chance to collide with different prior art. Extras "change scope but not the central lesson" | orb-ring-role-preservation (dedupe `derivative` 0.70; core AND lever AND API each hit different prior art) |
 | **Spec-knowable predicate domain** | the feature's semantics are fixed by an RFC / standard the agent can DERIVE from first principles (IP-CIDR containment, date arithmetic, unicode classes, checksum families), and the only remaining work is threading it through the host language | distinct from saturated-reference-port: the agent has not memorised a library, it can simply RE-DERIVE the whole spec, so no fair test can ever split correct implementations. Difficulty collapses onto the WIRING (new enum variant through exhaustive matches, reporters, parser ordering), which is derivable from the repo's own existing variants. A differential harness will find NO fair discriminator | cfn-guard-cidr-operator (5/10 then 6/10 across two batches) |
 | **Textbook SQL-standard feature** (DERIVATIVE **or** TOO-EASY — same tell, two death mechanisms) | a named standard-SQL feature in a SQL engine: GROUPING SETS/ROLLUP/CUBE, window fns, CTE/recursive CTE, EXCEPT/INTERSECT, LATERAL, MERGE, PIVOT | the SQL standard fixes both the behavior AND the obvious data model, so independent AUTHORS converge on a near-identical feature core -> platform similarity/dedupe compares the CORE -> >0.90 DERIVATIVE flag (repo coldness does NOT protect; it guards maintainer/issue dedup, not another author picking the same famous feature). The SAME convergence also happens one level down: independent AGENTS solving it converge on the identical implementation because they already know the standard's semantics cold, so contract-stated fairness traps get satisfied as a side effect of implementing the well-known algorithm correctly -> TOO-EASY even with zero prior-art collision. Either way, no packaging change clears it | kitesql-grouping-sets (precheck 93.6%, derivative); gql-window-cumulative-rank (89% aggregate across 5 batches, too-easy — thoroughness-gate convergence, not a dedupe collision) |
 | **New value kind in a generic evaluator** (TOO-EASY even when LOC clears — the difficulty twin of the row below) | add a new kind of VALUE (fractions, decimals, a new numeric or scalar type) to an expression evaluator whose symbols, resolver, user functions, conditionals and macro/ruledef arguments all store values generically, plus builtins whose math the description has to state exactly | the generic storage carries the new variant through every other stage for free, so the only real work is the arm itself and a formula the spec must write out to be fair. LOC can be plentiful (a whole rational module) and still no trap exists: a differential harness finds no stage that quietly mishandles the new kind. Any lever whose WRONG version breaks the existing suite is self-revealing, because agents run that suite | customasm-exact-fractional-values (8/8 then 7/8 across two batches, 368 human-eff; 35 fair probes x 16 saved solutions found zero divergence outside the stated formula) |
-| **Machinery-absorbed capability** (UNDER-FLOOR, not too-easy) | the repo already owns a primitive that does the hard half of your capability (`Settle`, a generic walker, a resolver, a complete interface, an enum that already IS the identity key you need) and your fix is "call it at N sites" or "add a lookup in front of it" | the correct implementation is a 2-6 line call-through per site, so the whole feature lands far under the 200 effective-LOC floor no matter how many sites there are. Site COUNT does not buy LOC: N thin call-throughs is still thin, and genuine bolt-on companion features that route through the SAME absorbed primitive inherit its thinness rather than escaping it. Estimating "restructure the emission" before checking what the primitive already does overshoots by 3-5x, and trap-seam RICHNESS (F-9/F-10/F-18 all present) does not substitute for missing SIZE | canvas-fill-rule-backends (44 eff vs 200 floor; DESIGN.md sketched 213); iced-x86-pointer-data-dedup (126 eff after 2 genuine expansion rounds vs 200 floor; DESIGN.md sketched 180-220); vrp-initial-clustering-roundtrip (155 eff slice, 168 with every genuine extra; hunt sketched ~260; the loader's `restore()` recomputes all schedules) |
+| **Machinery-absorbed capability** (UNDER-FLOOR, not too-easy) | the repo already owns a primitive that does the hard half of your capability (`Settle`, a generic walker, a resolver, a complete interface, an enum that already IS the identity key you need) and your fix is "call it at N sites" or "add a lookup in front of it" | the correct implementation is a 2-6 line call-through per site, so the whole feature lands far under the 200 effective-LOC floor no matter how many sites there are. Site COUNT does not buy LOC: N thin call-throughs is still thin, and genuine bolt-on companion features that route through the SAME absorbed primitive inherit its thinness rather than escaping it. Estimating "restructure the emission" before checking what the primitive already does overshoots by 3-5x, and trap-seam RICHNESS (F-9/F-10/F-18 all present) does not substitute for missing SIZE | canvas-fill-rule-backends (44 eff vs 200 floor; DESIGN.md sketched 213); iced-x86-pointer-data-dedup (126 eff after 2 genuine expansion rounds vs 200 floor; DESIGN.md sketched 180-220); vrp-initial-clustering-roundtrip (155 eff slice, 168 with every genuine extra; hunt sketched ~260; the loader's `restore()` recomputes all schedules); healthchecks-lateness-ledger (194 hook / 136 hand-written Python for the FULL scope incl. the coupled lever; hunt sketched ~240; `create_flip`, `get_grace_start(with_started=False)` and the flip replay absorbed it); vega-keyed-dataset-reconciliation (123 hook for the FULL lane, 10 files / 5 packages; hunt sketched 180-265; the input Collect plus one `ChangeSet.replace` absorbed all five replacement surfaces); capa-process-tree-scope (117 hook for the full lane; hunt sketched ~250; the #2532 span template and one-branch renderers); aerich-migration-squash (157 hook for the full lane; hunt sketched ~250; the per-file executor loop ran unchanged over a member-level plan); sqlalchemy-continuum-transaction-squash (146 hook for the full lane; hunt sketched 310; one Core fold covered every version table); teavm-incremental-fact-reuse (192 hook for the full lane; hunt sketched 205-315; a fingerprint of the resolved input program plus the existing `String[]` dependency channel absorbed resolution paths and all four cache formats); pyocd deferred register/memory writes (132 hook; hunt sketched ~237; the coherent value dict and the byte interval tree absorbed overlay reads and coalescing) |
 | **Textbook numerical algorithm already implemented in a SIBLING library** (EXCLUSIVITY, cross-repo) | the capability's hard core is a named textbook algorithm (arc-length/Crisfield continuation, and by extension Newmark, return mapping, Gauss-Kronrod, CQC, ...), and ANY public repo in the same language and domain has a working implementation, even with a different data model | the scope gate searches public code ACROSS repos and rules the pick not exclusive when the corrector/root-selection/loop can be cribbed, leaving "primarily integration and policy/status work". Checking only the target repo, its tracker and its parent/reference toolchain is not enough. **Pick-time check:** search GitHub code for the algorithm's signature formula in the language (`gh search code '<formula or function name>' --language=python`) and in the 3-5 nearest sibling libraries (sfepy -> jax-fem, scikit-fem, dolfinx, GetFEM, FEniCS, pyiron). One working hit = dead | sfepy-arc-length-continuation (JAX-FEM `solver.py:595` arc-length engine, 7/15 cases) |
 | **Repo is a PORT of a reference tool** (EXCLUSIVITY, repo-level — the strongest form of the row below) | the target repo vendors, ports or reimplements a canonical reference tool (pandapower vendors 69 PYPOWER files carrying PSERC's MATPOWER copyright; 25 more reference MATPOWER) | a port **inherits its parent's ENTIRE feature list as prior art**, so every capability the parent ships is dead in the child — and worse, the child's internal data structures are usually the parent's, so a solver can port the parent's implementation almost line-for-line (saturated-reference-port on top of the scope-gate reject). **Check this ONCE at repo level, not per capability**, and treat the parent's function list as a blocklist | pandapower continuation power flow (MATPOWER ships the whole `runcpf` + `cpf_*` family) |
 | **Sibling-ecosystem-tool implements the core algorithm** (EXCLUSIVITY / publicly-solved) | your target library parses/emits one half of a widely standardized binary or text format (SPIR-V, DWARF, ELF, WASM, a bytecode ISA, a protocol wire format) and there exists a separate, often reference-maintainer-published, tool for that SAME format that already performs the algorithm you are about to add | the same-repo GitHub PR/issue search (`CLAUDE.md § Exclusivity`) only ever looks inside the target repo; it cannot see a public implementation living in a DIFFERENT project. Format-standard ecosystems always grow a canonical toolchain (Khronos's SPIRV-Tools/SPIRV-Cross for SPIR-V, `llvm-dwarfdump`/`gimli` for DWARF, `wabt`/`binaryen` for WASM) that agents can be assumed to have seen; if that toolchain already ships your feature's core algorithm as a named pass or function, the Scope Gate rejects on sight, quoting its source, regardless of how much of the target repo's OWN history is clean | rspirv-decoration-group-resolution (SPIRV-Tools' `--flatten-decoration` optimizer pass performs the identical two-pass group-to-concrete-decoration expansion) |
@@ -194,6 +194,170 @@ regardless of how good its trap seams look. Seam richness does NOT substitute fo
 
 ---
 
+## teavm-incremental-fact-reuse + pyocd deferred register/memory writes (Java / Python, SHELVED 2026-10-05 - machinery-absorbed UNDER-FLOOR, both killed at the measure-first spike)
+
+**Repos:** konsoletyper/teavm (3.1k stars, base `11a50bc0`), hunt #53 RANK 1
+(`repo-hunt-logs/REPO-HUNT-2026-10-05-E.md`, second teavm lane), and its FALLBACKS[0] pyocd/pyOCD lane K
+(base develop `ce6386fc`). One factory SLICE run, no tests written, no precheck spent.
+
+**teavm lane:** reuse cached method bodies across incremental builds while the facts they were compiled
+against still hold: the member-level API of each class named, the method's own body, the resolution path,
+and (AST entries) the async split of each call. Hunt priced 205-315 eff (mid ~260). **Full-scope spike: 192
+hook human-effective** (247 raw, 11 files, padding-floor 67): a `CacheFacts` helper (class API fingerprint,
+program fingerprint via `ListingBuilder`, fact strings, per-lookup validator), a `CacheStatus` default
+method, the status rework (method gate = noCache + plugin deps; the interface-loop and UNDECIDED-memo base
+bugs fixed), both program-cache sites in `TeaVM`, the regular and async AST sites in the JS `Renderer`, the C
+backend AST site, and all four in-memory/disk caches. 102 of the 192 are the one new helper class.
+- The resolution-path decision point (priced 30-45) vanished: hashing the RESOLVED input program that
+  `dependencyAnalyzer.getClassSource()` hands out already changes when resolution changes. No
+  `ReferenceResolver` edit at all.
+- The "two dependency kinds x four cache formats" point (priced 60-90) vanished: facts ride the existing
+  `Supplier<String[]>` dependency channel that both disk caches already persist, so each cache changes one
+  token (`isStaleClass` -> `isStaleDependency`).
+- Async facts (priced 35-55) became one split-point signature through the splitter's own decision function.
+
+**pyOCD lane K:** `cache.write_back` holds core-register and cacheable-memory writes in
+`CachingDebugContext` until run/reset/disconnect/flash/`flush()`, in a physical-register normal form
+(CFBP and XPSR folds, D/S alias, SP write-through), coalesced memory blocks, non-cacheable barriers, and a
+commit before `BreakpointManager` plants software breakpoints. Hunt priced ~237 (210-260). **Full-scope
+spike: 132 hook human-effective** (150 raw, 7 files). The register normal form is ~68 because the existing
+cache dict already serves overlay reads once the fold keeps it coherent; the memory buffer is ~27 because
+the interval tree already holds the written bytes and `merge_overlaps` + `_merge_data` produce the blocks;
+the triggers are five `subscribe` lines and one `flush()` in the breakpoint handler.
+
+**Law.** For a cache-validity or write-deferral lane, price the KEY and the CHANNEL before the sites. If the
+cache already keys on something you can fingerprint (a resolved program, a coherent value dict, an interval
+tree of bytes) and already persists an opaque dependency list, every "new kind of fact" is a string through
+that list and every "new format" is free. Both hunts here priced per-site and per-format work that the
+existing key and channel absorbed (0.74x and 0.56x). Both spikes were also correct-by-design on the hunt's
+traps (async split, resolution path, breakpoint order), so the trap material would have been FP insurance,
+not LOC.
+
+Real base bugs found on the way (usable by a future lane, not a lane on their own): teavm
+`DiskMethodNodeCache.flush` writes regular AST entries to the `-async` file and never creates the
+directory, so regular AST entries never reload from disk; `AnnotationAwareCacheStatus` re-checks the parent
+once per interface and memoises a cycle's UNDECIDED hit as FRESH. pyOCD `CortexM.read16`/`write16` go to the
+AP directly, so software breakpoints bypass the caching context.
+
+Artifacts: `rejected/teavm-incremental-fact-reuse/` (DESIGN.md with the absorption table, spike as
+`solution.patch`, draft Dockerfile, feedback.md) and `rejected/pyocd-deferred-register-memory-writes/`
+(spike as `solution.patch`, feedback.md).
+
+## aerich-migration-squash + sqlalchemy-continuum-transaction-squash (Python, SHELVED 2026-10-05 - machinery-absorbed UNDER-FLOOR, both killed at the measure-first spike)
+
+**Repos:** tortoise/aerich (1083 stars, base `6333068e`), hunt #48 RANK 1
+(`repo-hunt-logs/REPO-HUNT-2026-10-03-B.md`), and its FALLBACKS[0] sqlalchemy-continuum (644 stars, base
+`a84e8286`, hunt #41 L1). One factory SLICE run, no code shipped, no precheck spent.
+
+**aerich lane:** `squash(A, B)` folds migration files A..B into one file and compacts the `aerich` rows;
+afterwards every command except `history` behaves as if unsquashed (upgrade on DBs holding none/some/all
+members, downgrade -1 and -v N with N a member, heads, migrate online and offline, init-db replay).
+Exclusivity was clean and the hunt's W1 reproduction was real (a naive compaction makes the next
+`migrate` re-emit a column). **Full-scope spike: 157 hook human-effective** (hunt ~250), correct end to
+end in the image. Each wall collapsed to a line or two: W1 is an in-place update of the last member
+row (its pk is the ledger position), the offline/online baseline origins are free once the file
+carries B's number and B's MODELS_STATE, init-db replay and nested flatten are free, and mixed
+`RUN_IN_TRANSACTION` is unobservable on SQLite (`executescript` commits first; probed with VACUUM).
+
+**continuum lane:** `squash_transactions(first, last)` with the op algebra, validity restitch, `_mod`
+recompute, TransactionChanges/Meta/Activity and a rebuilt `vacuum`. **Full-scope spike: 146 hook
+human-effective** (hunt sketch 310, repriced 180-230), 16/16 on a probe over all 8 setting variants.
+Every version table, joined-inheritance child and association table included, carries the same
+tx / end_tx / op columns, so one Core fold handles all of them.
+
+**Law.** A "rewrite history so every reader still agrees" lane is priced by the expansion between the
+new representation and the old one, not by the readers. When the readers consume an ordered list
+(files, ledger rows, version rows) and the new form can be expanded back into that list with one
+function, the existing loops run unchanged and the lane is that function plus a writer. Before
+sketching such a lane, write the expansion first and count what is left; both hunts here priced each
+reader as its own work and landed at 0.47x and 0.63x. The interdependence that makes these lanes look
+hard (every command shares the resolver) is the same property that makes them small.
+
+Artifacts: `rejected/aerich-migration-squash/` and `rejected/sqlalchemy-continuum-transaction-squash/`
+(DESIGN.md with absorption tables, spikes as `solution.patch`, Dockerfiles). Probes and spikes:
+`worktrees/aerich-squash-tools/`.
+
+## vega-keyed-dataset-reconciliation + capa-process-tree-scope (JS / Python, SHELVED 2026-09-29 - machinery-absorbed UNDER-FLOOR, both killed at the measure-first spike)
+
+**Repos:** vega/vega (12k stars, base `b570ef37`) and mandiant/capa (6.2k, base `497120ff`), hunt #39
+fallbacks 1 and 2 (`repo-hunt-logs/REPO-HUNT-2026-09-29-E.md`), taken after the RANK 1 healthchecks
+lane died the same way.
+
+**vega lane:** a data set declares `key`; every whole-dataset replacement (view.data, `setdata`,
+setState, signal-driven Load, preload) keeps the tuple for each matching key (same object and id,
+fields updated in place, dropped fields deleted, MOD with the changed fields), removes missing keys,
+inserts new ones and follows the new array's order, including through derived data sets. Everything
+the hunt reproduced was true (ids churn on base, the add/remove cancel at `ChangeSet.js:84-85` swallows
+a re-passed mutated object, `Relay` never deletes a field). Exclusivity and six-check clean; the v2.6.5
+`upsert` trigger was ruled a distinct capability (single datum, no removal, no order).
+
+**Killed by size, measured on a WORKING spike.** Full lane with every dossier decision point kept
+(snapshot of the last-supplied fields, order through Relay, field deletion, Load holder): **123 hook
+human-effective**, 168 raw, 10 files in 5 packages. It passed an 8-scenario probe in the built image
+and every base suite (dataflow 125, transforms 4168, parser 143, view 37, runtime 44, functions 205,
+vega 311). **The chokepoint:** `Dataflow.pulse` runs `changeset.pulse` synchronously against the
+input Collect's tuples, and every replacement surface pulses that Collect. One `replace(values)`
+method that carries the full new array, plus a ~70-line reconcile inside Collect, absorbs all five
+surfaces (one line each), the Load `op.value` holder (the kernel ignores Load's `rem`) and the
+add/remove cancel (the replacement list carries the re-passed objects). Two of the dossier's four
+walls (F-58 holder, F-47 cancel) evaporated by construction.
+
+**capa lane:** a `process tree` scope (subtree feature union, minimal-subtree reporting with a
+dependency carve-out, file visibility, layout, -v/-vv). Working spike: **117 hook human-effective**
+(5 files); scope plumbing is the #2532 span template and each renderer is one branch.
+
+**Law.** A lane whose surfaces all feed ONE operator (here the input Collect; for healthchecks
+`create_flip`) is priced by that operator, not by the surfaces. Before trusting any hunt sketch in the
+150-265 band, find the first shared operator downstream of the listed call sites and spike there. In
+this hunt series every such sketch measured 0.5-0.8x (healthchecks 240 -> 194, vrp 260 -> 155, vega
+180-265 -> 123, capa 250 -> 117). A hunt sketch under ~350 is not evidence of a 200-floor lane.
+
+Artifacts: `rejected/vega-keyed-dataset-reconciliation/` (DESIGN.md with the absorption table, spike as
+`solution.patch`, validated Dockerfile, probe) and `rejected/capa-process-tree-scope/` (spike, probe).
+
+## healthchecks-lateness-ledger (Python, SHELVED 2026-09-29 - machinery-absorbed UNDER-FLOOR, killed at the SLICE LOC spike)
+
+**Repo:** healthchecks/healthchecks (10.4k stars, base `14008860`), hunt #39 RANK 1
+(`repo-hunt-logs/REPO-HUNT-2026-09-29-E.md`). **Lane:** a lateness ledger. An up check that reaches
+its schedule-only grace start gets an `up -> late` flip at exactly that moment (recorded by sendalerts
+or by the next ping), the interval closes on recovery / going down / pause / an edit, nothing about it
+is notified, and the flip replay accounts late time and late counts per period next to downtime.
+
+**Everything the hunt measured was true.** Gate 1 and both headline traps reproduced in the clean
+image (no late record on base; a persisted `status="late"` makes `get_grace_start` return None so the
+check never goes down; `/start` moves the default grace start). Exclusivity with PRs disabled was
+settled by a fork scan (1014 forks, 385 branch compares, no lateness code) plus code search. #377
+declines late NOTIFICATIONS only; the lane never notifies. SIX-CHECK clean.
+
+**Killed by size, measured on the real kernel.** Full scope: worker timer and sendalerts step, ping-
+first recording, create_flip closing, both view modules (edit, pause, resume, clear events), the replay
+with late count/duration plus the hunt's coupled lever (monitored time + `uptime()` for any period),
+Get Flips v3 `late` with a v1/v2 compatibility filter, details page and all three report templates.
+**194 hook human-effective, of which 25 is a generated migration and 33 Django templates: 136 lines
+of hand-written Python.** The hunt sketched ~240. Base suite 1757/1757 green with it applied.
+
+**Why the sketch overshot:** the sketch priced SITES, the repo had one DECISION per concept.
+"Clear the marker at 8 reset sites" was one line in `create_flip`, which every pause, edit and ping
+flip already calls. "Record ping-first" was one call, because `get_grace_start(with_started=False)` is
+already the schedule-only late moment. "Replay with four kinds" reused a loop that already walks every
+segment. The surfaces were template lines. Same law as dinit (count decision points, not surfaces)
+and vrp (check what the existing machinery recomputes before pricing it).
+
+**A second finding the next healthchecks lane needs:** the sketch's "`alert_after` becomes a min of
+two events at 5 sites" was not a trap but a wall. Four base tests pin `alert_after ==
+going_down_after()` and `test_it_creates_a_flip_when_check_goes_down` pins exactly ONE flip, so any
+earlier wake needs its own timer column and no down-time backfill. That kept the design correct and
+made it smaller still.
+
+**Law.** For a "record a state the repo only computes" lane, find the chokepoint the new state must
+pass through (here `create_flip` + one timer + one replay loop). If every surface already funnels
+through it, the capability is thin no matter how many surfaces the hunt lists. Run the spike before
+the dossier's total is trusted; this one took under two hours and saved a full authoring cycle.
+
+Artifacts: `rejected/healthchecks-lateness-ledger/` (DESIGN.md with the absorption table and the
+reproduced trap matrix, the measured spike as `solution.patch`, Dockerfile, feedback.md). Fork-scan
+evidence: `worktrees/healthchecks-lateness-scratch/`.
+
 ## vrp-initial-clustering-roundtrip (Rust, SHELVED 2026-09-23 - machinery-absorbed UNDER-FLOOR, killed at the core slice)
 
 **Repo:** reinterpretcat/vrp (508 stars, base `e49bee0e`), hunt RANK 1 of
@@ -225,6 +389,104 @@ end-to-end oracle in this repo, which is worth reusing on any future vrp lane.
 
 Artifacts: `rejected/vrp-initial-clustering-roundtrip/` (DESIGN.md, meta.md draft, both patches,
 Dockerfile, fixtures in test.patch). Tooling and probes: `worktrees/_vrp_probe/`.
+
+## gonum-plot-exact-glyph-layout (Go, SHELVED 2026-10-13 - DERIVATIVE, overlap `Blocker` 110/236 = 46.6%)
+
+**Pick:** replace the two-extreme `padX`/`padY` closed form with an exact glyph-aware layout (the widest
+and tallest data rectangle that keeps every glyph box inside the canvas, axis labels and title
+included), make `WriterTo`/`Save` return an error for the #773 no-room case without touching the file,
+and make `Align` give every data canvas exactly the same size by a largest-fitting-width solve per
+column and row. 167 human-eff / 3 files (core slice; FINISH sketched 235-260), 11 F2P + guard tests,
+37 golden checks moved to `CheckPlotApprox(..., 0.1)`. Hunt #46 (2026-10-02), factory slice
+2026-10-03, reverted 2026-10-09 before any batch. Dockerfile and category prechecks were fixed the same
+day the overlap verdict landed.
+
+**Verdict (platform review):** *"Derivative of older gonum/plot task."* The submission "re-delivers the
+older candidate's glyph-bound envelope and maximum-fitting grid-span engine (110/236 discounted
+subject lines, 46.6%)"; "standalone sizing and no-touch export errors extend the previously submitted
+constraint machinery rather than replacing its core".
+
+**Why the audit could not see it.** SIX-CHECK, exclusivity (19 feature-class PR searches, diffs read)
+and self-collision were all clean, and layout had been cold since 2021. But the lane is the repo's own
+open-bug cluster: #773 (both maintainers want an error), #733 (Align widths differ), #722/#723
+(rotated labels clipped), #724. That is the tracker magnet again, on a bigger repo than pianoplayer
+(gonum/plot ~3k stars), so the law is not only about small repos. The error return and the Align
+solve were exactly the parts the rival had too; nothing in the pick was outside the shared engine.
+
+**Law:** a cluster of open maintainer-acknowledged bugs in one subsystem is a rival-held lane at any
+repo size. Third Blocker in two days at 42-67% (pianoplayer 42.7%, this 46.6%, protobuf-es 66.7%):
+when the core engine is shared, the Blocker fires below 50%.
+
+**Repo verdict:** gonum/plot layout lane DEAD (padding/glyph-box solve, Align, axis-label placement and
+rotated extents, WriterTo/Save overflow errors). Other surfaces (plotters, `vg` backends, `text`,
+palettes) were not surveyed; treat any tracker-named gonum/plot bug as rival-held.
+
+Artifacts: `rejected/gonum-plot-exact-glyph-layout/`. Clone and tooling deleted 2026-10-13.
+
+## pianoplayer-performed-order-timeline (Python, SHELVED 2026-10-13 - DERIVATIVE, overlap `Blocker` 88/206 = 42.7%)
+
+**Pick:** `unfold_repeats` option on `reader` / `AnnotateOptions` / `run_annotate` / `--unfold-repeats`:
+read a MusicXML score in performed order (backward/forward repeats with `times`, numbered endings with
+the pass count restarting per section, D.C./D.S. to segno, Fine and To Coda after the jump), onsets in
+seconds from a `<sound tempo>` map, `Hand.generate` window on every pass, first-pass fingering written
+back by element identity. 207 human-eff / 6 files, 13 tests. Hunt 10-05-J RANK 1 (WEAK), factory slice
+2026-10-06, reverted 2026-10-09 before any new-gate batch.
+
+**Verdict (platform review):** *"The performed-order fingering core is derivative of an older task in
+the same repo."* 88/206 discounted subject lines (42.7%) align with the older task's repeat-fingering
+engine and workflow; it "re-delivers the older task's central played-measure fingering capability,
+notwithstanding its additional jump and tempo behavior". A second foreign task overlapped 9/206 (4.4%)
+on note-element mapping, rated distinct. Issue #8 ("Fingering with voltas", closed 2018, owner: "this
+would actually be a bit difficult to implement") was rated a Medium historical signal only.
+
+**Why the audit could not see it.** Our count on the repo was 0, SIX-CHECK and exclusivity were clean,
+and `git log -S` showed no repeat expansion ever shipped. But the lane is named by the repo's own issue
+#8, and on an ~892-star repo with one maintainer and thin lanes (the hunt's best sketch was 219, an
+edge return) the issue tracker is the first thing every author reads. A closed-as-difficult issue is
+the same magnet as an open uncommented one. The D.C./D.S. jumps and the tempo map were added to clear
+the floor, and the dedupe rated them bolt-ons (Scope-lever-doubles-the-collision-surface).
+
+**Law:** a capability named in the target repo's issue tracker, open OR closed without a decline or a
+shipped fix, is rival-held by default on a small repo. 42.7% was enough for `Blocker`: the threshold
+is lower than our earlier kills (61-79%) suggested, so a pick that shares only its core with a rival
+is not safe because the rest is new.
+
+**Repo verdict:** pianoplayer DO-NOT-PICK. Repeat/played-order fingering is consumed by the older
+task, note-element mapping is touched by a second foreign task, and the hunt found no other lane above
+~160 written.
+
+Artifacts: `rejected/pianoplayer-performed-order-timeline/`. Clone and tooling deleted 2026-10-13.
+
+## protobuf-es-proto-source-printer (TypeScript, SHELVED 2026-10-12 - DERIVATIVE, overlap `Blocker` 373/559 = 66.7%)
+
+**Pick:** `getProtoSource(file, options?)` in `@bufbuild/protoplugin`: print a `DescFile` back to
+`.proto` source so that protoc recompiles it to the same `FileDescriptorProto` (source info aside),
+for proto2, proto3 and editions 2023/2024, keeping leading/trailing/detached `//` comments and
+decoding custom options from unknown fields via `options.registry` or the file's imports. 459
+human-eff / 2 files, 9 tests. Hunt 10-05-I, factory slice 2026-10-06, reverted 2026-10-09 before
+any new-gate batch.
+
+**Verdict (platform review):** *"an older protobuf-es task already delivers the same
+descriptor-to-.proto printing engine; comments and registry selection do not make this a distinct
+core task."* 373/559 discounted subject lines (66.7%) match the older printer's core, 373/515 of its
+authored lines (72.4%).
+
+**Why the audit could not see it.** SIX-CHECK and exclusivity were clean (no PR, #440 a closed
+question). The builder's feedback had already listed the two risks that killed it: sibling-ecosystem
+prior art (protobufjs `proto.js`, Go `protoprint`, C++ `DebugString`) and "outsider-nameable feature,
+a rival submission would be visible only to the platform dedupe". The user's 2026-10-05 ruling waived
+the standalone-file guard for this lane on the theory that its wall (editions features, comment
+attribution, unknown-field options) was internal to the repo. The dedupe does not care where the
+wall is: it compares the engine, and "print the descriptor back to source" is the engine.
+
+**Law:** a printer / serializer back to a format the ecosystem already compiles (descriptor to
+`.proto`, AST to source, model to the input DSL) is the reverse-converter shape, whatever internal
+depth it needs. Treat it as rival-held unless the hunt has a reason to believe otherwise, and run
+the core-slice precheck before anything else. The 10-05 Q3 waiver must not be used for printers.
+
+**Repo verdict:** protobuf-es printer lane CONSUMED. With codec, naming, options and the two
+pre-designed capabilities already closed (SATURATED-REPOS 09-10-B), and at least two foreign tasks
+in the pool (this printer, plus whatever the dedupe pool holds), treat the repo as DO-NOT-PICK.
 
 ## messageformat-mf2-to-mf1 (TypeScript, SHELVED 2026-09-19 - DERIVATIVE, overlap `Blocker` 270/354 = 76.3%)
 
@@ -1854,3 +2116,36 @@ subsystems were not surveyed.
 
 Artifacts: `rejected/dyn4j-world-copy/` (full slice + DESIGN.md). Clones `worktrees/dyn4j`,
 `worktrees/dyn4j-cleanroom`, `worktrees/dyn4j-probe` (41M total).
+
+## eventsourcing-system-consistent-cut (Python, SHELVED 2026-10-11 - TOO-EASY under the new-model gate, stated surface converged)
+
+pyeventsourcing/eventsourcing 9.5, BASE 575d42c1. Runner.cut(bounds) over a per-step ledger (no-op
+processing steps and multi-event saves are whole steps, greatest fixed point for loops), cut.get(), and
+cut.fork(env) restoring events under original ids, tracking, and recorder-owned step state; SQLite
+reopen. Reference 414 human-effective across 7 files. Seven Solution Quality rounds (multi-event saves,
+Postgres db-function path, explicit-id restore, FTS/timestamps recorder state, no pickle), Auto Review
+3/1/3 then fixed.
+
+Batches: b1 0/10 Nova (all on the then-unstated recorder-state rule), b2 3/11 graded, all 3 FP-voided
+(reopen + recorder state, reopen-then-record step cache, Postgres gaps), b3 0/11 incl. Vega (8/11 sole
+failure = UNSTATED "save kwargs a recorder ignores may be unstorable" test), b4 (new gate) Nova 1/4 legit
+pass, avg sequence length ~584k.
+
+**ROOT CAUSE - the stated contract converges.** A differential fuzz (87 random scenarios: 4 systems x
+POPO/SQLite/reopen, random-bound cuts, get, fork agreement, post-fork continuation) found 0 divergence
+between the reference and both the Nova passer and the best Nova near-miss. Every stated rule is
+transcribed; the only Nova killer was an unstated rule, and the extra recorder-state requirements the
+gate rounds added only became fair once stated, at which point Nova cleared them too.
+
+**LAW:** a feature whose semantics are a precise algorithm over the repo's own recording path (prefix +
+fixed point + restore) is transcribed once stated; gate rounds that add "exactly the state" obligations
+turn into either unstated walls (unfair) or stated, transcribable rules. Under the Nova 0/8 gate this
+shape needs a cross-subsystem dependency Nova must discover, not more cells.
+
+**Revisit at hunt time (user, 2026-10-11):** the unused scope is (a) forks carrying each aggregate's
+snapshots up to the cut and none taken after it, and (b) a notification log presented as at the cut
+(followers reading a cut). Both are new requirements, untested against Nova; only worth it as part of a
+redesign with a genuinely hidden cross-subsystem fix, and the repo quota (1 sub) is still open.
+
+Artifacts: `rejected/eventsourcing-system-consistent-cut/` (all deliverables, DESIGN.md, feedback.md,
+eval-results.md, agent-runs/1-4). Fuzzer: `worktrees/_es_fuzz/`. Clones and Docker images deleted 2026-10-11.

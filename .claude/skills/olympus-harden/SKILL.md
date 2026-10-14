@@ -1,6 +1,6 @@
 ---
 name: olympus-harden
-description: Use when an in-flight Olympus problem is (or is predicted to be) too easy — a batch came back above the 40% ceiling, a wall was removed for fairness, or the design rests on one trap. Diagnoses WHY from the actual evidence (agent runs first, mutations only as a fallback), picks the fair re-hardening lever the diagnosis implies rather than the one that is easiest to write, and verifies the result with trap-proof plus full clean-room validation. Triggers on "too easy", "harden this", "make it harder", "raise difficulty", "pass rate too high", ">40%", "add a trap", or after a batch reads soft. Source of truth: Olympus/Instructions/HARDENING.md (doctrine + arsenal), Olympus/failure-patterns.md (measured patterns + laws), Olympus/Instructions/TOO-EASY.md (death classes).
+description: Use when an in-flight Olympus problem is (or is predicted to be) too easy — a Nova run passed or Orion/Vega passed more than 1 in 4 under the 2026-10-09 new-model gate, a wall was removed for fairness, or the design rests on one trap. Diagnoses WHY from the actual evidence (agent runs first, mutations only as a fallback), picks the fair re-hardening lever the diagnosis implies rather than the one that is easiest to write, and verifies the result with trap-proof plus full clean-room validation. Triggers on "too easy", "harden this", "make it harder", "raise difficulty", "pass rate too high", "Nova passed", "Orion 2/4", "add a trap", or after a batch reads soft. Source of truth: Olympus/Instructions/HARDENING.md (doctrine + arsenal), Olympus/failure-patterns.md (measured patterns + laws), Olympus/Instructions/TOO-EASY.md (death classes).
 ---
 
 # Olympus Harden — raise difficulty without buying it unfairly
@@ -13,6 +13,41 @@ Two rules govern everything below.
    CONTRACT-STATED / FIX-HIDDEN (`HARDENING.md § 1`): the meta states the behaviour, and the
    statement does not hand the fix. A trap that only works because the spec omits something dies
    at Test Fairness, and the round you spend defending it is a round you do not get back.
+
+---
+
+## ★ The gate you are hardening against (new models, 2026-10-09)
+
+The platform swapped the models behind Nova, Orion and Vega and replaced the single pass-rate
+ceiling with a per-agent gate. This block OVERRIDES every "40%" / "50%" / "over the ceiling" /
+"10-run batch" figure further down; those rows are measurements from the OLD models and stay as
+evidence of which levers move kills, not of where a problem lands now.
+
+| Gate | Requirement | Reads as |
+|---|---|---|
+| Nova | >= 8 runs, **0 passes** | any Nova pass = too easy |
+| Orion OR Vega | >= 4 runs of ONE agent, **> 0% and <= 25%** | 0 passes = unsolvable; 2/4 = too easy |
+| Sequence length | average over all Nova runs **> 256k** tokens (max input+output per step; compaction windows summed) | Nova failing fast = gate miss even at 0/8 |
+
+How to read the old rows below under the new gate:
+- **"Too easy" / "over the ceiling" / ">40%"** now means: a Nova pass, or Orion/Vega above 1/4.
+- **"Batch reads 0%"** now means: the Orion/Vega side read 0. A Nova 0 is REQUIRED, not a problem.
+  The 0%-recovery rows (cut a rule, state a choice, fix a fixture) apply to the Orion/Vega side.
+- **"Append Orion or Vega runs" (L65)** is the cheapest way out of an Orion 0/4. The gate is a
+  minimum, so 1/8 is a pass; confirm on the platform that appending is allowed before relying on it.
+
+The window is now two-sided by AGENT: Nova must fail every run, the stronger agent must pass about
+one in four. A lever is only useful if it separates the two. So mine the batch by agent: list what
+the Orion/Vega passer got right that every Nova run got wrong, and harden THERE. A lever that kills
+Orion as readily as Nova just moves you from "too easy" to "unsolvable".
+
+Variance is large at these run counts. At a true Orion rate of 25%, 4 runs give exactly 1 pass only
+42% of the time (0 passes 32%); at 40% it is 35%. 8 Orion runs (1-2 passes allowed) raise the odds
+to about 58-63% for true rates of 15-25%. Nova needs a true rate near zero: at 5% it still passes at
+least once in 8 runs 34% of the time. Do not read a single 4-run batch as a precise rate.
+
+Order (admin tip): 1 Nova smoke run first. If it passes, harden for Nova before spending anything
+else. Then Orion x4, then the rest of the Nova runs.
 
 ---
 
@@ -41,6 +76,18 @@ sound rather than ones tuned to a mutation.
 
 | Evidence | Diagnosis | Lever |
 |---|---|---|
+| **A Nova run passed** (smoke or batch) | Too easy for the weakest agent. The trap set is reachable by a straightforward reading | Compare the Nova passer with the Nova failers and with Orion/Vega. Harden on what only careful cross-file reasoning catches (F-9 cross-stage, F-10 cells, F-1 convergent wall), not on more instances of a stated rule. Re-measure with one Nova smoke run before anything else |
+| **Orion/Vega at 2/4 or more**, Nova at 0 | The window is right for Nova, too wide for the strong agent | Add a discriminator the Orion failers already miss and the passers barely clear (a near-miss cell). Tests-only, so re-eval the same batch. A new test can only remove passes, so the one thing to confirm is that at least 1 Orion/Vega pass survives |
+| **Orion/Vega 4/4 (too easy), Nova 0**, and the Orion solutions behave IDENTICALLY under a differential fuzz | Every stated axis has converged for the strong agent; no new test on a stated rule can split them (it kills all or none) | Look for an IMPLIED boundary of the input domain the contract's promise already covers (integer width, top of the address space, encoding range) and assert only the promise there (L115, F-73). Measured on pyocd-dwt-watchpoint-planner: 3400 scenarios found 0 divergence; the 32-bit top split Orion **1/3**, re-eval read **Orion 1/4, Nova 0/8**, ruled fair. Make the test fail-to-pass on base with a follow-up placement only the feature can make |
+| **Orion/Vega 2/4**, Nova at 0 or 1, and probes of every stated axis (coverage suggestions, trap variants) show ZERO divergence between the passers | The stated surface is exhausted; a new test on it kills both passers or neither | Re-replay the edges you HELD BACK earlier for killing too many strong-agent runs, especially gate findings on your own reference (L117). Measured on cwerg-fe-address-constants: 11 probes gave 0 divergence; the held-back empty-span `front` (F-75) split the Orion passers 1/1 and killed the Nova pass: re-eval **Nova 0/8, Orion 1/4**. Pair it with a line base cannot run so it is fail-to-pass on every implementation |
+| **Orion/Vega 2/4** and the FP panel ran on both passes with a **dissenting judge** whose probe fails the candidate and passes the reference | The panel already found the near-miss cell for you; the adjudicator overruled it only as "not stated" | Replay the dissent probe on every saved strong run; if it kills exactly one passer and lands on a stated promise, add it as one test and re-eval (L126). Skip a dissent where the reference is the less correct side. Measured on hayro-optional-content-baking: indirect ExtGState font size (F-84 variant), **Orion 2/4 → 1/4**, Nova 0/8, accepted |
+| **Orion/Vega 3/4 or more**, Nova 0, every stated cell converged, and the stated rules are already at the requirement-count limit | No stated rule left to add, and no room to state one | Probe what BASE preserves that the passers' new code path bypasses: identity of shared references, existing output lines, existing invariants documented in the repo's own comments. Test the invariant with no meta sentence. Measured on asdf-conversion-free-lazy-tree: shared-alias write (F-80) split Orion 3/1 against base, then killed **15/20** in the accepted batch, Auto Review "subtle but fair" |
+| **Orion/Vega 3/4**, Nova 0, probes on the stated surface give 0 divergence, and the repo has a **second evidence path the default flags take** (local assembly, a fallback engine) | The passers' remaining bugs live where the meta says nothing but base already defines the answer | Probe that path with inputs where the new rule is a no-op and compare the passers against the option-off output; assert option-on == option-off (L128). Also add every FP-panel scenario from the batch (crash cases, judge probes, L126). Measured on macs-callvar-fragment-phasing: assembled depth 29 vs 30 + quiet-peak crash + read-1-outside-peaks, each killing a different Orion run: **Orion 3/4 → 1/4**, Nova 0/8, accepted |
+| **Strong agents fail ONLY on a warning** (pytest `filterwarnings = error`, a base warning on that path) | A hidden rule, not a hard one: graders mark it agentBlameUnfair | Suppress the base warning in the test (repo's own ignore flag) and re-eval (L122). Measured on asdf-conversion-free-lazy-tree: batch 11 **0/20** → re-eval **Orion 1/8, Vega 2/4** |
+| **The FP panel voids the only Orion pass** with a concrete scenario | A hole in the tests, and fixing it removes the pass | Add the panel's scenario as a test sized to stay out of base-library leaks, replay it on every saved strong solution (only the voided pass may flip), re-eval, then add fresh runs of the same agent: the pool is cumulative (L121). Measured on libspatialindex-mvr-history-pruning: re-eval **Orion 0/4**, fresh 2/2 then 0/2, accepted **2/8** |
+| **Task Prompt "too many requirements"** forces cuts | Rules are the cost, not words | Cut whole rules with their tests, choosing rules nobody would break if unstated. A rule whose tests killed 0 BECAUSE it was stated can become the lead trap once cut (L120: 0/5 → 4/8 Orion on libspatialindex-mvr-history-pruning). Replay the saved pool after each cut |
+| **Orion/Vega 0/4**, Nova 0, near-misses at N-1 / N-2 | Could be variance (32% at a true 25% rate) or one wall too many | Read the Orion near-misses' sole failure first (the 0%-rows below). If they fail stated rules for real, append Orion runs before cutting anything (L65) |
+| **Nova 0/8 but average sequence length under 256k** | Nova is failing FAST: setup errors, early termination, or a task small enough to finish (wrongly) in a few steps | Not a difficulty problem, a SCOPE problem. Check the Nova trajectories for a build/setup blocker first (fix it in the Dockerfile or test harness). Otherwise widen the reading surface: more files the solution must understand and touch, behaviour that only shows after integration across subsystems. Shrinking the problem or making it fail earlier makes this worse |
 | Failures are **scattered singletons**, no dominant cause | The domain is SEPARABLE. Stacking more traps will not help (L3) | Find what the convergent architecture structurally cannot do (**F-1**). Read the PASSING patches — you cannot guess it |
 | Several agents at **20/21 or 19/21**, each failing a different single test | Near the ceiling. The set is fair but the walls are low | Fill the empty **F-10** cross-product cells. Cheapest lever measured, zero description words |
 | **Everyone passes**, few or no failures | One weak or self-revealing trap | Do NOT add wording. Add a second mechanism on a DIFFERENT axis, then re-check the composition cells |
@@ -121,6 +168,17 @@ sound rather than ones tuned to a mutation.
 | Rate reads soft on a reconfiguration feature (change a space, schema or topology of a live object) | The rule holders and collaborators were each tested alone | Extend one stated rule to every secondary holder of points (**F-10 holder cell**, 6/10) and test collaborator state with a change-then-undo twin (**F-56**, 5/10). bayesopt |
 | A review-requested test replays at **10/10 failing** (the only passer too) although the rule it extends IS stated | An implied EXTENSION missed unanimously (**L100**, refining L97); a re-eval would read 0% | State the extension in one sentence and pay for a fresh batch; do not re-eval. piscsi device report after name reuse: 10/10 on replay → **2/10** once stated, accepted at 3/10 |
 | Rate reads soft on an identity feature (paths, inodes, handles) and every alias test passes | Aliases are the easy half; nothing tests an identity that outlives its NAME | Rename the held object away and create a new one under the old name (**F-59**, 8 runs over two piscsi batches); add a later-vs-earlier conflict inside one staged command (**F-58**, 5 runs) |
+| FP panel flags the only passer(s) and the judges' shape breaks EVERY saved full-suite passer while the reference copes | A domain the contract cannot hold agents to (**L101**) | Replay passers on the shape, then seed-fuzz its input class. One class separating every crash = state a precondition excluding it (description delta, fresh batch). pict: starved values, then exclusions touching negative-bearing parameters (4/4 passers crashed; 0/40 when confined); accepted 3/10 after the cap |
+| A near-miss's sole failure is a CRASH inside a test about something else (a deletion test aborting in generation) | An accidental wall in the fixture (**L102**) | Brute-force the fixture's feasibility and run it through base; fix the fixture (test-only, re-eval eligible). pict: a starving exclusion in the lifecycle fixture, sole failure of 33/34 |
+| Batch reads **0%** and several runs read ZERO records/fragments from a generated input file | The fixture is valid only for the reference's parsing strategy (**L105**) | Fix the fixture the way a real producer writes it (test-only, re-eval eligible), then replay. macs: mates with different QNAMEs zeroed 4/11 BAMPE solutions; fixed, Vega went 9 fails -> 3 |
+| One cluster of invariance tests kills **N/N**, every run taking the coordinate origin as the cut | The law's degenerate case (full wrap, ties) has no stated canonical choice (**L104**) | Replay without the cluster; if a run passes, drop the tests (keep the reference's canonical rule) or state the rule and pay a batch. macs: 3 tests 11/11 -> dropped -> re-eval 1/11, accepted |
+| Two batches read the SAME soft rate before and after adding scope to a stated formula/physics model, and a probe shows zero divergence | The model is transcribed at any size (**L106**); the derivation traps you added are dead | Check which engine the product runs by DEFAULT (**L108**). If the feature only lives in the newer one, state the default engine's behaviour in one paragraph and drive it headlessly (**F-67**). ray-optics-sp-coherence-transport: 7/10, 7/10, then **3/10** accepted |
+| Several runs fail one exact-composite test (full extinction, crossed pair) and evaluators split between "logic" and "numerics" | Maybe cancellation meeting a strict repo guard, not physics (**F-66**) | Replay the failing patches at perturbed parameters (L107). Equal to the reference off the cell = numerics: fair when the guard is pre-existing, but batch-variant (4/10 then 0/10 on the same test) |
+| One test kills **most** runs and every failing patch picked the same reading of a boundary the contract never defines | An undefined boundary, not a trap (**L110**) | Move the discriminating fixture across a boundary where every reading agrees (a separate file or hunk): tests-only, re-eval eligible. riff: out-of-order set end 9/11 -> the remaining 2 were real line-loss bugs |
+| Every pass is FP-voided batch after batch, and each flag comes from a different edge | Implied rules and one edge family keep producing holes | Name each implied rule in meta.md (it will kill ~0, **L109**) and cap the family base itself mishandles (**L101**). riff: 4 batches of voided passes -> accepted 1/10 after no-final-newline went out of scope |
+| Batch reads **0%** and a near-miss's failing repair/report sets equal the expected ones except for trailing items the base code normally strips | The test pins a normalization the new feature has a reason to bypass (**L112**) | Assert modulo the normalization (test-only, re-eval eligible); diff every near-miss this way before calling a batch 0/N |
+| One edge is the sole failure of several near-misses, each breaking it a DIFFERENT way, and stating it in meta did not help | An edge the contract cannot transmit (**L113**) | Cap the input domain so the edge cannot arise (validation rule + declaration-error test), replay counting "fails only the cap test" as a pass, then pay the fresh batch |
+| Rate reads soft on a topology/coordinate feature and every exact-value test switches an estimator off | The estimator stage is untested on the new topology | One default-mode test where the linear estimator provably fails (**F-64**, 10/11 on macs); rotation tests per derived output mode (**F-65**, 8/11) |
 
 **Before writing anything, check `TOO-EASY.md` death classes.** If the whole pick is a uniform
 wrap, a pointwise-decoupled rule set, or a memorised spec port, hardening will not save it —
@@ -133,7 +191,7 @@ that is a redesign or a shelve, and saying so early is cheaper than three more r
 1. **F-10 cross-product cells.** Write the axes as a matrix (`olympus-author` DESIGN.md § 11b).
    One axis with multiplicity (one/many, single/repeated), one with polarity (in/out, which side
    is anchored). Every off-diagonal cell needs a test. Measured as the sole failure of both
-   near-miss runs on neva — the difference between a 20% and a 40% batch. Costs ~20 test lines
+   near-miss runs on neva — the difference between a 20% and a 40% batch on the old models. Costs ~20 test lines
    and NO new description words, because a contract stating both axes already covers their
    composition.
    Also measured as RULE x RULE on csbindgen: two independently stated type rewrites (alias

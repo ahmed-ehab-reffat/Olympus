@@ -1,0 +1,459 @@
+diff --git a/pyfakefs/fake_file.py b/pyfakefs/fake_file.py
+index 4e30676..5b14d5b 100644
+--- a/pyfakefs/fake_file.py
++++ b/pyfakefs/fake_file.py
+@@ -32,6 +32,7 @@ from typing import (
+     TYPE_CHECKING,
+     Any,
+     AnyStr,
++    NamedTuple,
+     NoReturn,
+     TextIO,
+     Union,
+@@ -70,6 +71,21 @@ AnyFileWrapper = Union[
+ ]
+ AnyFile = Union["FakeFile", "FakeDirectory"]
+ 
++PROCESS_LOCK_OWNER = object()
++
++
++class RangeLock(NamedTuple):
++    owner: Any
++    exclusive: bool
++    start: int
++    end: int | None
++
++
++def ranges_overlap(
++    start1: int, end1: int | None, start2: int, end2: int | None
++) -> bool:
++    return (end1 is None or start2 < end1) and (end2 is None or start1 < end2)
++
+ 
+ class FakeLargeFileIoException(Exception):
+     """Exception thrown on unsupported operations for fake large files.
+@@ -188,6 +204,8 @@ class FakeFile:
+         self.xattr: dict = {}
+         self.opened_as: AnyString = ""
+         self.open_modes = open_modes
++        self.range_locks: list[RangeLock] = []
++        self.flock_owners: dict[Any, bool] = {}
+ 
+     def __getstate__(self):
+         """Handle weakref to allow pickling of the filesystem and parent dir"""
+@@ -211,6 +229,59 @@ class FakeFile:
+         assert fs is not None
+         return fs
+ 
++    def range_lock_conflicts(
++        self, owner: Any, exclusive: bool, start: int, end: int | None
++    ) -> list[RangeLock]:
++        return [
++            lock
++            for lock in self.range_locks
++            if lock.owner is not owner
++            and (exclusive or lock.exclusive)
++            and ranges_overlap(lock.start, lock.end, start, end)
++        ]
++
++    def set_range_lock(
++        self, owner: Any, exclusive: bool | None, start: int, end: int | None
++    ) -> None:
++        kept = []
++        for lock in self.range_locks:
++            if lock.owner is not owner or not ranges_overlap(
++                lock.start, lock.end, start, end
++            ):
++                kept.append(lock)
++                continue
++            if lock.start < start:
++                kept.append(lock._replace(end=start))
++            if end is not None and (lock.end is None or lock.end > end):
++                kept.append(lock._replace(start=end))
++        if exclusive is not None:
++            for lock in list(kept):
++                if (
++                    lock.owner is owner
++                    and lock.exclusive == exclusive
++                    and (end is None or lock.start <= end)
++                    and (lock.end is None or start <= lock.end)
++                ):
++                    kept.remove(lock)
++                    start = min(start, lock.start)
++                    end = (
++                        None if end is None or lock.end is None else max(end, lock.end)
++                    )
++            kept.append(RangeLock(owner, exclusive, start, end))
++        self.range_locks = sorted(kept, key=lambda lock: lock.start)
++
++    def flock_conflicts(self, owner: Any, exclusive: bool) -> bool:
++        return any(
++            other is not owner and (exclusive or other_exclusive)
++            for other, other_exclusive in self.flock_owners.items()
++        )
++
++    def release_locks(self, owner: Any) -> None:
++        self.range_locks = [
++            lock for lock in self.range_locks if lock.owner is not owner
++        ]
++        self.flock_owners.pop(owner, None)
++
+     @property
+     def byte_contents(self) -> bytes | None:
+         """Return the contents as raw byte array."""
+diff --git a/pyfakefs/fake_filesystem.py b/pyfakefs/fake_filesystem.py
+index 6110aa5..3ab19da 100644
+--- a/pyfakefs/fake_filesystem.py
++++ b/pyfakefs/fake_filesystem.py
+@@ -926,13 +926,14 @@ class FakeFilesystem:
+             if new_fd < size:
+                 open_files = self.open_files[new_fd]
+                 if open_files:
+-                    for f in open_files:
++                    for f in list(open_files):
+                         try:
+-                            f.close()
++                            f.close_fd(new_fd)
+                         except OSError:
+                             pass
+                 if new_fd in self._free_fd_heap:
+                     self._free_fd_heap.remove(new_fd)
++                    heapq.heapify(self._free_fd_heap)
+                 self.open_files[new_fd] = [file_obj]
+             else:
+                 for fd in range(size, new_fd):
+@@ -959,8 +960,25 @@ class FakeFilesystem:
+             file_des: Descriptor of file object to be removed from
+             open files list.
+         """
++        wrappers = self.open_files[file_des] or []
+         self.open_files[file_des] = None
+         heapq.heappush(self._free_fd_heap, file_des)
++        for wrapper in wrappers:
++            if not isinstance(
++                wrapper, (fake_file.FakeFileWrapper, fake_file.FakeDirWrapper)
++            ):
++                continue
++            file_object = wrapper.get_object()
++            file_object.release_locks(fake_file.PROCESS_LOCK_OWNER)
++            remaining = [
++                fd
++                for fd, open_files in enumerate(self.open_files)
++                if open_files and wrapper in open_files
++            ]
++            if not remaining:
++                file_object.release_locks(wrapper)
++            elif wrapper.filedes == file_des:
++                wrapper.filedes = remaining[0]
+ 
+     def get_open_file(self, file_des: int) -> AnyFileWrapper:
+         """Return an open file.
+diff --git a/pyfakefs/fake_io.py b/pyfakefs/fake_io.py
+index 8f3bd6f..6f4c62e 100644
+--- a/pyfakefs/fake_io.py
++++ b/pyfakefs/fake_io.py
+@@ -19,7 +19,10 @@ fake ``io`` module replacement.
+ from __future__ import annotations
+ 
+ import _io  # pytype: disable=import-error
++import errno
+ import io
++import os
++import struct
+ import sys
+ from collections.abc import Callable
+ from enum import Enum
+@@ -30,7 +33,12 @@ from typing import (
+     AnyStr,
+ )
+ 
+-from pyfakefs.fake_file import AnyFileWrapper
++from pyfakefs.fake_file import (
++    PROCESS_LOCK_OWNER,
++    AnyFileWrapper,
++    FakeDirWrapper,
++    FakeFileWrapper,
++)
+ from pyfakefs.fake_open import fake_open
+ from pyfakefs.helpers import IS_PYPY, is_called_from_skipped_module
+ 
+@@ -140,10 +148,104 @@ class FakeIoModule2(FakeIoModule):
+ if sys.platform != "win32":
+     import fcntl
+ 
++    FLOCK_FORMAT = "qqihh" if sys.platform == "darwin" else "hhqqi"
++    RANGE_LOCK_COMMANDS = {fcntl.F_GETLK, fcntl.F_SETLK, fcntl.F_SETLKW}
++    OFD_LOCK_COMMANDS = {
++        getattr(fcntl, name)
++        for name in ("F_OFD_GETLK", "F_OFD_SETLK", "F_OFD_SETLKW")
++        if hasattr(fcntl, name)
++    }
++    GET_LOCK_COMMANDS = {
++        getattr(fcntl, name)
++        for name in ("F_GETLK", "F_OFD_GETLK")
++        if hasattr(fcntl, name)
++    }
++    WAITING_LOCK_COMMANDS = {
++        getattr(fcntl, name)
++        for name in ("F_SETLKW", "F_OFD_SETLKW")
++        if hasattr(fcntl, name)
++    }
++
++    def unpack_flock(arg: bytes) -> tuple[int, int, int, int, int]:
++        fields = struct.unpack_from(FLOCK_FORMAT, arg)
++        if sys.platform == "darwin":
++            start, length, pid, lock_type, whence = fields
++            return lock_type, whence, start, length, pid
++        return fields
++
++    def pack_flock(
++        arg: bytes, lock_type: int, whence: int, start: int, length: int, pid: int
++    ) -> bytes:
++        if sys.platform == "darwin":
++            packed = struct.pack(FLOCK_FORMAT, start, length, pid, lock_type, whence)
++        else:
++            packed = struct.pack(FLOCK_FORMAT, lock_type, whence, start, length, pid)
++        return packed + bytes(arg[len(packed) :])
++
++    def lockable_file(filesystem: FakeFilesystem, fd: Any) -> Any:
++        if not isinstance(fd, int):
++            fd = fd.fileno()
++        wrapper = filesystem.get_open_file(fd)
++        if isinstance(wrapper, (FakeFileWrapper, FakeDirWrapper)):
++            return wrapper
++        return None
++
++    def lock_range(
++        filesystem: FakeFilesystem,
++        wrapper: Any,
++        whence: int,
++        start: int,
++        length: int,
++    ) -> tuple[int, int | None]:
++        if whence == os.SEEK_CUR:
++            start += wrapper.tell() if isinstance(wrapper, FakeFileWrapper) else 0
++        elif whence == os.SEEK_END:
++            start += wrapper.get_object().size
++        elif whence != os.SEEK_SET:
++            filesystem.raise_os_error(errno.EINVAL)
++        end: int | None = None
++        if length < 0:
++            start, end = start + length, start
++        elif length > 0:
++            end = start + length
++        if start < 0:
++            filesystem.raise_os_error(errno.EINVAL)
++        return start, end
++
++    def set_range_lock(
++        filesystem: FakeFilesystem,
++        wrapper: Any,
++        owner: Any,
++        lock_type: int,
++        start: int,
++        end: int | None,
++        wait: bool,
++    ) -> None:
++        file_object = wrapper.get_object()
++        if lock_type == fcntl.F_UNLCK:
++            file_object.set_range_lock(owner, None, start, end)
++            return
++        if lock_type not in (fcntl.F_RDLCK, fcntl.F_WRLCK):
++            filesystem.raise_os_error(errno.EINVAL)
++        if isinstance(wrapper, FakeFileWrapper):
++            modes = wrapper.open_modes
++            if not (modes.can_read if lock_type == fcntl.F_RDLCK else modes.can_write):
++                filesystem.raise_os_error(errno.EBADF)
++        exclusive = lock_type == fcntl.F_WRLCK
++        if file_object.range_lock_conflicts(owner, exclusive, start, end):
++            filesystem.raise_os_error(errno.EDEADLK if wait else errno.EAGAIN)
++        file_object.set_range_lock(owner, exclusive, start, end)
++
++    def lowest_range_conflict(
++        wrapper: Any, owner: Any, exclusive: bool, start: int, end: int | None
++    ) -> Any:
++        conflicts = wrapper.get_object().range_lock_conflicts(
++            owner, exclusive, start, end
++        )
++        return min(conflicts, key=lambda lock: lock.start) if conflicts else None
++
+     class FakeFcntlModule:
+-        """Replaces the fcntl module. Only valid under Linux/MacOS,
+-        currently just mocks the functionality away.
+-        """
++        """Replaces the fcntl module. Only valid under Linux/MacOS."""
+ 
+         @staticmethod
+         def dir() -> list[str]:
+@@ -156,13 +258,54 @@ if sys.platform != "win32":
+             """
+             Args:
+                 filesystem: FakeFilesystem used to provide file system
+-                    information (currently not used).
++                    information.
+             """
+             self.filesystem = filesystem
+             self._fcntl_module = fcntl
+ 
+         def fcntl(self, fd: int, cmd: int, arg: int = 0) -> int | bytes:
+-            return 0 if isinstance(arg, int) else arg
++            if cmd not in RANGE_LOCK_COMMANDS | OFD_LOCK_COMMANDS or not isinstance(
++                arg, (bytes, bytearray)
++            ):
++                return 0 if isinstance(arg, int) else arg
++            wrapper = lockable_file(self.filesystem, fd)
++            if wrapper is None:
++                return arg
++            lock_type, whence, start, length, pid = unpack_flock(arg)
++            owner = PROCESS_LOCK_OWNER
++            if cmd in OFD_LOCK_COMMANDS:
++                if pid != 0:
++                    self.filesystem.raise_os_error(errno.EINVAL)
++                owner = wrapper
++            lock_start, lock_end = lock_range(
++                self.filesystem, wrapper, whence, start, length
++            )
++            if cmd not in GET_LOCK_COMMANDS:
++                set_range_lock(
++                    self.filesystem,
++                    wrapper,
++                    owner,
++                    lock_type,
++                    lock_start,
++                    lock_end,
++                    cmd in WAITING_LOCK_COMMANDS,
++                )
++                return bytes(arg)
++            if lock_type not in (fcntl.F_RDLCK, fcntl.F_WRLCK):
++                self.filesystem.raise_os_error(errno.EINVAL)
++            lock = lowest_range_conflict(
++                wrapper, owner, lock_type == fcntl.F_WRLCK, lock_start, lock_end
++            )
++            if lock is None:
++                return pack_flock(arg, fcntl.F_UNLCK, whence, start, length, pid)
++            return pack_flock(
++                arg,
++                fcntl.F_WRLCK if lock.exclusive else fcntl.F_RDLCK,
++                os.SEEK_SET,
++                lock.start,
++                0 if lock.end is None else lock.end - lock.start,
++                os.getpid() if lock.owner is PROCESS_LOCK_OWNER else -1,
++            )
+ 
+         def ioctl(
+             self, fd: int, request: int, arg: int = 0, mutate_flag: bool = True
+@@ -170,12 +313,53 @@ if sys.platform != "win32":
+             return 0 if isinstance(arg, int) else arg
+ 
+         def flock(self, fd: int, operation: int) -> None:
+-            pass
++            wrapper = lockable_file(self.filesystem, fd)
++            if wrapper is None:
++                return
++            file_object = wrapper.get_object()
++            command = operation & ~fcntl.LOCK_NB
++            if command == fcntl.LOCK_UN:
++                file_object.flock_owners.pop(wrapper, None)
++                return
++            if command not in (fcntl.LOCK_SH, fcntl.LOCK_EX):
++                self.filesystem.raise_os_error(errno.EINVAL)
++            exclusive = command == fcntl.LOCK_EX
++            if file_object.flock_owners.get(wrapper) == exclusive:
++                return
++            file_object.flock_owners.pop(wrapper, None)
++            if file_object.flock_conflicts(wrapper, exclusive):
++                self.filesystem.raise_os_error(
++                    errno.EAGAIN if operation & fcntl.LOCK_NB else errno.EDEADLK
++                )
++            file_object.flock_owners[wrapper] = exclusive
+ 
+         def lockf(
+             self, fd: int, cmd: int, len: int = 0, start: int = 0, whence=0
+         ) -> Any:
+-            pass
++            wrapper = lockable_file(self.filesystem, fd)
++            if wrapper is None:
++                return None
++            if cmd == fcntl.LOCK_UN:
++                lock_type = fcntl.F_UNLCK
++            elif cmd & fcntl.LOCK_SH:
++                lock_type = fcntl.F_RDLCK
++            elif cmd & fcntl.LOCK_EX:
++                lock_type = fcntl.F_WRLCK
++            else:
++                raise ValueError("unrecognized lockf argument")
++            lock_start, lock_end = lock_range(
++                self.filesystem, wrapper, whence, start, len
++            )
++            set_range_lock(
++                self.filesystem,
++                wrapper,
++                PROCESS_LOCK_OWNER,
++                lock_type,
++                lock_start,
++                lock_end,
++                not cmd & fcntl.LOCK_NB,
++            )
++            return None
+ 
+         def __getattribute__(self, name):
+             """Prevents patching of skipped modules."""
+diff --git a/pyfakefs/fake_os.py b/pyfakefs/fake_os.py
+index 2576443..afd2bc6 100644
+--- a/pyfakefs/fake_os.py
++++ b/pyfakefs/fake_os.py
+@@ -37,6 +37,7 @@ from typing import (
+     cast,
+ )
+ 
++from pyfakefs import fake_io
+ from pyfakefs.fake_file import (
+     AnyFileWrapper,
+     FakeDirectory,
+@@ -143,6 +144,7 @@ class FakeOsModule:
+             _dir += [
+                 "getgid",
+                 "getuid",
++                "lockf",
+             ]
+         return _dir
+ 
+@@ -1410,6 +1412,38 @@ class FakeOsModule:
+             raise NameError("name 'getgid' is not defined")
+         return get_gid()
+ 
++    if sys.platform != "win32":
++
++        def lockf(self, fd: int, cmd: int, len: int) -> None:
++            wrapper = fake_io.lockable_file(self.filesystem, fd)
++            if wrapper is None:
++                return
++            start, end = fake_io.lock_range(
++                self.filesystem, wrapper, os.SEEK_CUR, 0, len
++            )
++            if cmd == os.F_TEST:
++                if fake_io.lowest_range_conflict(
++                    wrapper, fake_io.PROCESS_LOCK_OWNER, False, start, end
++                ):
++                    self.filesystem.raise_os_error(errno.EACCES)
++                return
++            lock_types = {
++                os.F_ULOCK: fake_io.fcntl.F_UNLCK,
++                os.F_LOCK: fake_io.fcntl.F_WRLCK,
++                os.F_TLOCK: fake_io.fcntl.F_WRLCK,
++            }
++            if cmd not in lock_types:
++                self.filesystem.raise_os_error(errno.EINVAL)
++            fake_io.set_range_lock(
++                self.filesystem,
++                wrapper,
++                fake_io.PROCESS_LOCK_OWNER,
++                lock_types[cmd],
++                start,
++                end,
++                cmd == os.F_LOCK,
++            )
++
+     if sys.version_info >= (3, 14):
+ 
+         def readinto(self, fd, buffer):

@@ -1,0 +1,313 @@
+diff --git a/pyocd/cache/memory.py b/pyocd/cache/memory.py
+index cf74c67..245d07b 100644
+--- a/pyocd/cache/memory.py
++++ b/pyocd/cache/memory.py
+@@ -39,9 +39,11 @@ class MemoryCache(object):
+     region's cacheability flag is honoured.
+     """
+ 
+-    def __init__(self, context, core):
++    def __init__(self, context, core, write_back=False):
+         self._context = context
+         self._core = core
++        self._write_back = write_back
++        self._dirty = IntervalTree()
+         self._run_token = -1
+         self._reset_cache()
+ 
+@@ -53,10 +55,12 @@ class MemoryCache(object):
+         """@brief Invalidates the cache if appropriate."""
+         if not self._core.is_halted():
+             LOG.debug("core is not halted; invalidating cache")
++            self.flush()
+             self._reset_cache()
+         elif self._run_token != self._core.run_token:
+             self._dump_metrics()
+             LOG.debug("out of date run token; invalidating cache")
++            self._dirty = IntervalTree()
+             self._reset_cache()
+             self._run_token = self._core.run_token
+ 
+@@ -248,6 +252,7 @@ class MemoryCache(object):
+         # Validate memory regions.
+         if not self._check_regions(addr, size):
+             LOG.debug("range [%x:%x] is not cacheable", addr, addr+size)
++            self.flush()
+             return self._context.read_memory_block8(addr, size)
+ 
+         # Get the cached and uncached subranges of the requested read.
+@@ -276,8 +281,15 @@ class MemoryCache(object):
+         # Validate memory regions.
+         cacheable = self._check_regions(addr, len(value))
+ 
+-        # Write to the target first, so if it fails we don't update the cache.
+-        result = self._context.write_memory_block8(addr, value)
++        if not cacheable:
++            self.flush()
++            return self._context.write_memory_block8(addr, value)
++        if self._write_back:
++            self._dirty.addi(addr, addr + len(value))
++            result = None
++        else:
++            # Write to the target first, so if it fails we don't update the cache.
++            result = self._context.write_memory_block8(addr, value)
+ 
+         if cacheable:
+             size = len(value)
+@@ -303,6 +315,22 @@ class MemoryCache(object):
+     def write_memory_block32(self, addr, data):
+         return self.write_memory_block8(addr, conversion.u32le_list_to_byte_list(data))
+ 
++    def flush(self):
++        """@brief Writes pending memory to the target as one block per contiguous range."""
++        if not self._dirty:
++            return
++        dirty = self._dirty
++        self._dirty = IntervalTree()
++        dirty.merge_overlaps(strict=False)
++        for iv in sorted(dirty):
++            cached = sorted(self._cache.overlap(iv.begin, iv.end), key=lambda x: x.begin)
++            data = self._merge_data(cached, iv.begin, iv.end - iv.begin)
++            self._context.write_memory_block8(iv.begin, list(data))
++
++    def discard(self):
++        self._dirty = IntervalTree()
++        self._reset_cache()
++
+     def invalidate(self):
+         self._reset_cache()
+ 
+diff --git a/pyocd/cache/register.py b/pyocd/cache/register.py
+index 951dff1..6b3b791 100644
+--- a/pyocd/cache/register.py
++++ b/pyocd/cache/register.py
+@@ -57,9 +57,11 @@ class RegisterCache(object):
+         index_for_reg(name) for name in ['sp', 'msp', 'psp', 'msp_s', 'psp_s', 'msp_ns', 'psp_ns']
+     ]
+ 
+-    def __init__(self, context, core):
++    def __init__(self, context, core, write_back=False):
+         self._context = context
+         self._core = core
++        self._write_back = write_back
++        self._pending = {}
+         self._run_token = -1
+         self._reset_cache()
+ 
+@@ -77,11 +79,13 @@ class RegisterCache(object):
+         """@brief Invalidates the cache if needed and returns whether the core is not halted."""
+         if not self._core.is_halted():
+             LOG.debug("core is not halted; invalidating cache")
++            self.flush()
+             self._reset_cache()
+             return True
+         elif self._run_token != self._core.run_token:
+             self._dump_metrics()
+             LOG.debug("out of date run token; invalidating cache")
++            self._pending = {}
+             self._reset_cache()
+             self._run_token = self._core.run_token
+         return False
+@@ -98,6 +102,7 @@ class RegisterCache(object):
+             return self._context.read_core_registers_raw(reg_list)
+ 
+         reg_list = self._convert_and_check_registers(reg_list)
++        self._compose_pending_doubles(reg_list)
+         reg_set = set(reg_list)
+ 
+         # Get list of values we have cached.
+@@ -161,7 +166,70 @@ class RegisterCache(object):
+ 
+         return results
+ 
+-    # TODO only write dirty registers to target right before running.
++    def _compose_pending_doubles(self, reg_list):
++        for r in reg_list:
++            if r < 0 and r not in self._cache and (-r in self._pending or -r + 1 in self._pending):
++                lo, hi = self.read_core_registers_raw([-r, -r + 1])
++                self._cache[r] = lo | (hi << 32)
++
++    def _physical_writes(self, r, v):
++        if r < 0:
++            return [(-r, v & 0xffffffff), (-r + 1, (v >> 32) & 0xffffffff)]
++        for index, regs in zip(self.CFBP_INDEX_LIST, self.CFBP_REGS_LIST):
++            if r in regs:
++                shift = (r & 3) * 8
++                word = self.read_core_registers_raw([index])[0]
++                return [(index, (word & ~(0xff << shift)) | ((v & 0xff) << shift))]
++        if r in self.XPSR_REGS:
++            mask = CortexMCoreRegisterInfo.get(r).psr_mask
++            word = self.read_core_registers_raw([self.XPSR_INDEX])[0]
++            return [(self.XPSR_INDEX, (word & ~mask) | (v & mask))]
++        return [(r, v)]
++
++    def _set_physical(self, r, v):
++        self._pending.pop(r, None)
++        self._pending[r] = v
++        self._cache[r] = v
++        for index, regs in zip(self.CFBP_INDEX_LIST, self.CFBP_REGS_LIST):
++            if r == index:
++                for sub in regs:
++                    self._cache[sub] = (v >> ((sub & 3) * 8)) & 0xff
++        if r == self.XPSR_INDEX:
++            for sub in self.XPSR_REGS:
++                self._cache[sub] = v & CortexMCoreRegisterInfo.get(sub).psr_mask
++        if 0x40 <= r <= 0x5f:
++            first = r & ~1
++            if first in self._cache and first + 1 in self._cache:
++                self._cache[-first] = self._cache[first] | (self._cache[first + 1] << 32)
++            else:
++                self._cache.pop(-first, None)
++
++    def _write_pending(self, reg_list, data_list):
++        for r, v in zip(reg_list, data_list):
++            if r in self.SP_REGS:
++                self.flush()
++                self._write_through([r], [v])
++                continue
++            for phys, value in self._physical_writes(r, v):
++                self._set_physical(phys, value)
++
++    def flush(self):
++        """@brief Writes every pending register value to the target in one call."""
++        if not self._pending:
++            return
++        regs = list(self._pending)
++        values = [self._pending[r] for r in regs]
++        self._pending = {}
++        try:
++            self._context.write_core_registers_raw(regs, values)
++        except exceptions.CoreRegisterAccessError:
++            self._reset_cache()
++            raise
++
++    def discard(self):
++        self._pending = {}
++        self._reset_cache()
++
+     def write_core_registers_raw(self, reg_list, data_list):
+         # Check and invalidate the cache. If the core is not halted, just pass the writes
+         # to our context.
+@@ -171,6 +239,12 @@ class RegisterCache(object):
+ 
+         reg_list = self._convert_and_check_registers(reg_list)
+         self._metrics.writes += len(reg_list)
++        if self._write_back:
++            self._write_pending(reg_list, data_list)
++        else:
++            self._write_through(reg_list, data_list)
++
++    def _write_through(self, reg_list, data_list):
+ 
+         # Update cached register values.
+         for i, r in enumerate(reg_list):
+diff --git a/pyocd/core/options.py b/pyocd/core/options.py
+index cff12df..a9b95e8 100644
+--- a/pyocd/core/options.py
++++ b/pyocd/core/options.py
+@@ -39,6 +39,8 @@ BUILTIN_OPTIONS = [
+         "Enable the memory read cache. Default is enabled."),
+     OptionInfo('cache.enable_register', bool, True,
+         "Enable the core register cache. Default is enabled."),
++    OptionInfo('cache.write_back', bool, False,
++        "Hold cached register and memory writes until the core runs, resets or disconnects. Default is disabled."),
+     OptionInfo('cache.read_code_from_elf', bool, True,
+         "Controls whether reads of code sections will be taken from an attached ELF file instead of the "
+         "target memory."),
+diff --git a/pyocd/core/soc_target.py b/pyocd/core/soc_target.py
+index 9a61204..545f72d 100644
+--- a/pyocd/core/soc_target.py
++++ b/pyocd/core/soc_target.py
+@@ -146,6 +146,7 @@ class SoCTarget(TargetGraphNode):
+                 core,
+                 enable_memory=self.session.options['cache.enable_memory'],
+                 enable_register=self.session.options['cache.enable_register'],
++                write_back=self.session.options['cache.write_back'],
+                 )
+         core.set_target_context(ctx)
+         self.cores[core.core_number] = core
+diff --git a/pyocd/debug/breakpoints/manager.py b/pyocd/debug/breakpoints/manager.py
+index 13c8160..c0fa9e4 100644
+--- a/pyocd/debug/breakpoints/manager.py
++++ b/pyocd/debug/breakpoints/manager.py
+@@ -310,6 +310,7 @@ class BreakpointManager:
+ 
+     def _pre_run_handler(self, notification: "Notification") -> None:
+         if not self._ignore_notifications:
++            self._core.get_target_context().flush()
+             is_step = notification.data == Target.RunType.STEP
+             self.flush(is_step)
+ 
+diff --git a/pyocd/debug/cache.py b/pyocd/debug/cache.py
+index bcec2dc..5565911 100644
+--- a/pyocd/debug/cache.py
++++ b/pyocd/debug/cache.py
+@@ -16,18 +16,50 @@
+ # limitations under the License.
+ 
+ from .context import DebugContext
++from ..core.target import Target
+ from ..cache.memory import MemoryCache
+ from ..cache.register import RegisterCache
+ 
+ class CachingDebugContext(DebugContext):
+     """@brief Debug context combining register and memory caches."""
+ 
+-    def __init__(self, parent, enable_memory: bool = True, enable_register: bool = True) -> None:
++    def __init__(self, parent, enable_memory: bool = True, enable_register: bool = True,
++            write_back: bool = False) -> None:
+         super().__init__(parent)
+         self._enable_memory = enable_memory
+         self._enable_register = enable_register
+-        self._regcache = RegisterCache(parent, self.core) if enable_register else parent
+-        self._memcache = MemoryCache(parent, self.core) if enable_memory else parent
++        self._regcache = RegisterCache(parent, self.core, write_back) if enable_register else parent
++        self._memcache = MemoryCache(parent, self.core, write_back) if enable_memory else parent
++        if write_back and (enable_memory or enable_register):
++            self.session.subscribe(self._pre_run_handler, Target.Event.PRE_RUN)
++            self.session.subscribe(self._pre_reset_handler, Target.Event.PRE_RESET)
++            self.session.subscribe(self._flush_handler, Target.Event.PRE_DISCONNECT)
++            self.session.subscribe(self._flush_memory_handler, Target.Event.PRE_FLASH_ERASE)
++            self.session.subscribe(self._flush_memory_handler, Target.Event.PRE_FLASH_PROGRAM)
++
++    def flush(self):
++        if self._enable_memory:
++            self._memcache.flush()
++        if self._enable_register:
++            self._regcache.flush()
++
++    def _flush_handler(self, notification):
++        self.flush()
++
++    def _flush_memory_handler(self, notification):
++        if self._enable_memory:
++            self._memcache.flush()
++
++    def _pre_run_handler(self, notification):
++        if notification.source is self.core:
++            self.flush()
++        else:
++            self._flush_memory_handler(notification)
++
++    def _pre_reset_handler(self, notification):
++        self._flush_memory_handler(notification)
++        if self._enable_register and notification.source is self.core:
++            self._regcache.discard()
+ 
+     def write_memory(self, addr, value, transfer_size=32):
+         return self._memcache.write_memory(addr, value, transfer_size)
+diff --git a/pyocd/debug/context.py b/pyocd/debug/context.py
+index 1e6b1eb..d2b4270 100644
+--- a/pyocd/debug/context.py
++++ b/pyocd/debug/context.py
+@@ -62,6 +62,10 @@ class DebugContext(MemoryInterface):
+     def session(self):
+         return self.core.session
+ 
++    def flush(self):
++        if isinstance(self._parent, DebugContext):
++            self._parent.flush()
++
+     def write_memory(self, addr, value, transfer_size=32):
+         return self._parent.write_memory(addr, value, transfer_size)
+ 

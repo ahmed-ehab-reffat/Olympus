@@ -1,0 +1,1012 @@
+diff --git a/BE/Elf/elf_unit.h b/BE/Elf/elf_unit.h
+index 5056d85a..5234be0b 100644
+--- a/BE/Elf/elf_unit.h
++++ b/BE/Elf/elf_unit.h
+@@ -128,9 +128,8 @@ struct Unit {
+                   std::string_view mem_name,
+                   uint32_t addend) {
+     ASSERT(current_mem_sec != nullptr, "memaddr outside of mem");
+-    ASSERT(addend == 0, "NYI");
+     auto* sym = FindOrAddSymbol(mem_name, false);
+-    AddReloc(reloc_kind, current_mem_sec, sym, 0);
++    AddReloc(reloc_kind, current_mem_sec, sym, addend);
+     current_mem_sec->AddDataRepeatedBytes(size, 0);
+   }
+ 
+diff --git a/FE/canonicalize.cc b/FE/canonicalize.cc
+index 9061531c..02cf7088 100644
+--- a/FE/canonicalize.cc
++++ b/FE/canonicalize.cc
+@@ -222,13 +222,15 @@ Node MakeValSpanFromArray(Node node, CanonType expected_ct, CanonType uint_ct,
+   SizeOrDim dim = CanonType_vec_dim(Node_x_type(node));
+   const SrcLoc& sl = Node_srcloc(node);
+   CanonType ptr_ct = GetFrontTypeForVec(expected_ct, tc);
+-  Node sym = node.kind() == NT::Id ? Node_x_symbol(node) : kNodeInvalid;
++  Const addr = AddressOfPlace(node);
++  Node sym = addr.isnull() ? kNodeInvalid : ConstGetSymbolAddr(addr);
++  SizeOrDim offset = addr.kind() == BASE_TYPE_KIND::GLOBAL_ADDR
++                         ? ConstGetGlobalAddrWithOffset(addr).offset
++                         : 0;
+   Node front = NodeNew(NT::ExprFront);
+   NodeInitExprFront(front, node, CanonType_mut(expected_ct) ? Mask(BF::MUT) : 0,
+                     kStrInvalid, sl, ptr_ct);
+-  Node_x_eval(front) = sym == kNodeInvalid
+-                           ? kConstInvalid
+-                           : ConstNewSymbolAddr(Node_x_symbol(node));
++  Node_x_eval(front) = addr;
+ 
+   Node length = NodeNew(NT::ValNum);
+   NodeInitValNum(length, StrNew(EVAL_STR), kStrInvalid, sl, uint_ct);
+@@ -237,7 +239,7 @@ Node MakeValSpanFromArray(Node node, CanonType expected_ct, CanonType uint_ct,
+   //
+   Node span = NodeNew(NT::ValSpan);
+   NodeInitValSpan(span, front, length, kStrInvalid, sl, expected_ct);
+-  Const v_span = ConstNewSpan({sym, dim, kConstInvalid});
++  Const v_span = ConstNewSpan({sym, dim, kConstInvalid, offset});
+   Node_x_eval(span) = v_span;
+   return span;
+ }
+diff --git a/FE/canonicalize.py b/FE/canonicalize.py
+index bcb6775c..e79073a6 100644
+--- a/FE/canonicalize.py
++++ b/FE/canonicalize.py
+@@ -431,17 +431,19 @@ def _MakeValSpanFromArray(node, expected_ct: cwast.CanonType,
+                           uint_type: cwast.CanonType, tc: type_corpus.TypeCorpus) -> cwast.ValSpan:
+     assert node.x_type.is_vec() and expected_ct.is_span()
+     ptr_ct = _GetFrontTypeForVec(expected_ct, tc)
+-    sym = node.x_symbol if isinstance(node, cwast.Id) else None
++    addr = eval.AddressOfPlace(node)
+ 
+     # assert not isinstance(node, (cwast.ValCompound, cwast.ValString)), f"{node.x_srcloc}"
+     front = cwast.ExprFront(
+         node, x_srcloc=node.x_srcloc, mut=expected_ct.mut, x_type=ptr_ct,
+-        x_eval=eval.MakeEvalVarOrGlobalAddr(sym) if sym else None)
++        x_eval=addr)
+     dim = node.x_type.vec_dim()
+     length = cwast.ValNum(eval.EVAL_STR, x_eval=eval.EvalNum(dim, uint_type.base_type_kind),
+                           x_srcloc=node.x_srcloc, x_type=uint_type)
+     # TODO: propagate content for mut=false
+-    v_span = eval.EvalSpan(sym if sym else None, dim, None)
++    sym = addr.sym if isinstance(addr, (eval.EvalGlobalAddr, eval.EvalVarAddr)) else None
++    v_span = eval.EvalSpan(sym, dim, None,
++                           addr.offset if isinstance(addr, eval.EvalGlobalAddr) else 0)
+     return cwast.ValSpan(front, length, x_srcloc=node.x_srcloc, x_type=expected_ct, x_eval=v_span)
+ 
+ 
+diff --git a/FE/canonicalize_span.cc b/FE/canonicalize_span.cc
+index 5f32c4a5..8ecf471a 100644
+--- a/FE/canonicalize_span.cc
++++ b/FE/canonicalize_span.cc
+@@ -83,8 +83,11 @@ void ReplaceSpans(Node mod) {
+         Node pointer_field = CanonType_get_rec_field(rec_ct, 0);
+         const SrcLoc& sl = Node_srcloc(node);
+         Node container = Node_container(node);
++        Const val = Node_x_eval(node);
+         NodeFree(node);
+-        return MakeExprField(container, pointer_field, sl);
++        Node field = MakeExprField(container, pointer_field, sl);
++        Node_x_eval(field) = val;
++        return field;
+       }
+     }
+ 
+@@ -107,7 +110,9 @@ void ReplaceSpans(Node mod) {
+       case NT::ExprCall:
+       case NT::ExprDeref:
+       case NT::ExprField:
++      case NT::ExprFront:
+       case NT::ExprNarrow:
++      case NT::ExprPointer:
+       case NT::ExprStmt:
+       case NT::ExprUnionUntagged:
+       case NT::ExprUnwrap:
+diff --git a/FE/canonicalize_span.py b/FE/canonicalize_span.py
+index d38953db..943f2aa1 100644
+--- a/FE/canonicalize_span.py
++++ b/FE/canonicalize_span.py
+@@ -116,7 +116,9 @@ def ReplaceSpans(node):
+                 # because of the post-order traversal, node.container has already been processed
+                 assert cont_ct.original_type.is_span()
+                 pointer_field = cont_ct.get_rec_field(0)
+-                return canonicalize.MakeExprField(node.container,  pointer_field, node.x_srcloc)
++                field = canonicalize.MakeExprField(node.container,  pointer_field, node.x_srcloc)
++                field.x_eval = node.x_eval
++                return field
+ 
+         # len of array is constant and should have already been eliminated
+         elif isinstance(node, cwast.ExprLen):
+@@ -134,7 +136,8 @@ def ReplaceSpans(node):
+                 if isinstance(node, (cwast.DefVar, cwast.DefGlobal, cwast.DefFun,
+                                      #
+                                      cwast.Expr3, cwast.ExprAddrOf, cwast.ExprCall,
+-                                     cwast.ExprDeref, cwast.ExprField, cwast.ExprNarrow,
++                                     cwast.ExprDeref, cwast.ExprField, cwast.ExprFront,
++                                     cwast.ExprNarrow, cwast.ExprPointer,
+                                      cwast.ExprStmt, cwast.ExprUnionUntagged, cwast.ExprUnwrap,
+                                      cwast.ExprWiden,
+                                      #
+diff --git a/FE/emit_ir.cc b/FE/emit_ir.cc
+index a0e94575..b80e4b19 100644
+--- a/FE/emit_ir.cc
++++ b/FE/emit_ir.cc
+@@ -1311,12 +1311,18 @@ SizeOrDim EmitInitializerRec(Node node, CanonType ct, SizeOrDim offset,
+   }
+ }
+ 
+-SizeOrDim EmitDataAddress(Node node, SizeOrDim offset,
+-                          const TargetArchConfig& ta, std::ostream* fout) {
+-  ASSERT(node.kind() == NT::Id, "");
+-  Name name = Node_name(Node_x_symbol(node));
+-  *fout << ".addr.mem " << ta.data_addr_bitwidth / 8 << " " << NameData(name)
+-        << " " << 0 << "\n";
++SizeOrDim EmitDataAddress(Node node, const TargetArchConfig& ta,
++                          std::ostream* fout) {
++  Const val = Node_x_eval(node);
++  if (val.kind() != BASE_TYPE_KIND::GLOBAL_ADDR) {
++    Node sym = node.kind() == NT::ExprFront ? Node_container(node)
++                                            : Node_expr_lhs(node);
++    ASSERT(sym.kind() == NT::Id, "");
++    val = ConstNewGlobalAddr(Node_x_symbol(sym));
++  }
++  EvalGlobalAddr addr = ConstGetGlobalAddrWithOffset(val);
++  *fout << ".addr.mem " << ta.data_addr_bitwidth / 8 << " "
++        << NameData(Node_name(addr.sym)) << " " << addr.offset << "\n";
+   return ta.data_addr_bitwidth / 8;
+ }
+ 
+@@ -1328,6 +1334,43 @@ SizeOrDim EmitCodeAddress(Node node, SizeOrDim offset,
+   return ta.code_addr_bitwidth / 8;
+ }
+ 
++SizeOrDim EmitEvaluatedSpan(EvalSpan es, CanonType ct, SizeOrDim offset,
++                            const TargetArchConfig& ta, std::ostream* fout) {
++  if (es.pointer.isnull()) {
++    return EmitMemRepeatedByte(BYTE_ZERO, CanonType_size(ct), offset, "auto ",
++                               NameData(CanonType_name(ct)), fout);
++  }
++  *fout << "# rec: " << NameData(CanonType_name(ct)) << "\n";
++  Node len_field = CanonType_get_rec_field(ct, 1);
++  CanonType len_ct = Node_x_type(len_field);
++  ASSERT(Node_x_offset(len_field) == ta.data_addr_bitwidth / 8, "");
++  *fout << ".addr.mem " << ta.data_addr_bitwidth / 8 << " "
++        << NameData(Node_name(es.pointer)) << " " << es.offset << "\n";
++  std::string data = ConstBaseTypeSerialize(
++      ConstNewUnsigned(es.size, CanonType_base_type_kind(len_ct)));
++  return Node_x_offset(len_field) +
++         EmitMem(data, offset + Node_x_offset(len_field),
++                 NameData(CanonType_name(len_ct)), fout);
++}
++
++SizeOrDim EmitEvaluatedAggregate(Const val, CanonType ct, SizeOrDim offset,
++                                 const TargetArchConfig& ta,
++                                 std::ostream* fout) {
++  if (val.kind() == BASE_TYPE_KIND::SPAN) {
++    return EmitEvaluatedSpan(ConstGetSpan(val), ct, offset, ta, fout);
++  }
++  if (val.kind() == BASE_TYPE_KIND::BYTES) {
++    return EmitMem(ConstBytesData(val), offset, NameData(CanonType_name(ct)),
++                   fout);
++  }
++  Node init = ConstGetCompound(val);
++  if (init.isnull()) {
++    return EmitMemRepeatedByte(BYTE_ZERO, CanonType_size(ct), offset, "auto ",
++                               NameData(CanonType_name(ct)), fout);
++  }
++  return EmitInitializerRecursively(init, ct, offset, ta, fout);
++}
++
+ SizeOrDim EmitInitializerRecursively(Node node, CanonType ct, SizeOrDim offset,
+                                      const TargetArchConfig& ta,
+                                      std::ostream* fout) {
+@@ -1349,9 +1392,9 @@ SizeOrDim EmitInitializerRecursively(Node node, CanonType ct, SizeOrDim offset,
+                                         offset, ta, fout);
+     }
+     case NT::ExprFront:
+-      return EmitDataAddress(Node_container(node), offset, ta, fout);
+     case NT::ExprAddrOf:
+-      return EmitDataAddress(Node_expr_lhs(node), offset, ta, fout);
++    case NT::ExprPointer:
++      return EmitDataAddress(node, ta, fout);
+     case NT::ExprWiden: {
+       uint32_t target = CanonType_size(ct);
+       uint32_t count = EmitInitializerRecursively(
+@@ -1369,6 +1412,27 @@ SizeOrDim EmitInitializerRecursively(Node node, CanonType ct, SizeOrDim offset,
+     default:
+       break;
+   }
++  if (CanonType_is_ptr(ct) &&
++      Node_x_eval(node).kind() == BASE_TYPE_KIND::GLOBAL_ADDR) {
++    return EmitDataAddress(node, ta, fout);
++  }
++  if (CanonType_is_ptr(ct) && node.kind() == NT::ExprField &&
++      Node_x_eval(Node_container(node)).kind() == BASE_TYPE_KIND::SPAN &&
++      ConstGetSpan(Node_x_eval(Node_container(node))).pointer.isnull() &&
++      ConstGetSpan(Node_x_eval(Node_container(node))).size == 0) {
++    return EmitMemRepeatedByte(BYTE_ZERO, CanonType_size(ct), offset, "auto ",
++                               NameData(CanonType_name(ct)), fout);
++  }
++  if ((node.kind() == NT::ExprDeref || node.kind() == NT::ExprIndex ||
++       node.kind() == NT::ExprField) &&
++      (Node_x_eval(node).kind() == BASE_TYPE_KIND::COMPOUND ||
++       Node_x_eval(node).kind() == BASE_TYPE_KIND::BYTES ||
++       (Node_x_eval(node).kind() == BASE_TYPE_KIND::SPAN &&
++        (ConstGetSpan(Node_x_eval(node)).pointer.kind() == NT::DefGlobal ||
++         (ConstGetSpan(Node_x_eval(node)).pointer.isnull() &&
++          ConstGetSpan(Node_x_eval(node)).size == 0))))) {
++    return EmitEvaluatedAggregate(Node_x_eval(node), ct, offset, ta, fout);
++  }
+   switch (CanonType_kind(ct)) {
+     case NT::DefType:
+       return EmitInitializerRecursively(
+@@ -1392,8 +1456,12 @@ uint32_t EmitDefGlobal(Node node, const TargetArchConfig& ta,
+   }
+   *fout << "\n.mem " << Node_name(node) << " " << CanonType_alignment(def_type)
+         << " " << (Node_has_flag(node, BF::MUT) ? "RW" : "RO") << "\n";
+-  return EmitInitializerRecursively(Node_initial_or_undef_or_auto(node),
+-                                    def_type, 0, ta, fout);
++  SizeOrDim count = EmitInitializerRecursively(
++      Node_initial_or_undef_or_auto(node), def_type, 0, ta, fout);
++  if (count == 0) {
++    count = EmitMemRepeatedByte(BYTE_PADDING, 1, 0, "padding", "", fout);
++  }
++  return count;
+ }
+ 
+ }  // namespace cwerg::fe
+\ No newline at end of file
+diff --git a/FE/emit_ir.py b/FE/emit_ir.py
+index cfdffc13..3129bcda 100755
+--- a/FE/emit_ir.py
++++ b/FE/emit_ir.py
+@@ -914,14 +914,39 @@ def _EmitInitializerVec(node, ct: cwast.CanonType, offset: int, ta: type_corpus.
+         return ct.size
+ 
+ 
+-def _EmitDataAddress(node, ct, offset, ta, fp) -> int:
+-    assert isinstance(node, cwast.Id), f"{node} is not a symbol"
+-    assert isinstance(node.x_symbol, cwast.DefGlobal), f"{node.x_symbol}"
+-    name = node.x_symbol.name
+-    print(f".addr.mem {ta.get_data_address_size()} {name} 0", file=fp)
++def _EmitDataAddress(node, ta, fp) -> int:
++    val = node.x_eval
++    if not isinstance(val, eval.EvalGlobalAddr):
++        sym = node.container if isinstance(node, cwast.ExprFront) else node.expr_lhs
++        assert isinstance(sym, cwast.Id), f"{sym} is not a symbol"
++        assert isinstance(sym.x_symbol, cwast.DefGlobal), f"{sym.x_symbol}"
++        val = eval.EvalGlobalAddr(sym.x_symbol)
++    print(f".addr.mem {ta.get_data_address_size()} {val.sym.name} {val.offset}", file=fp)
+     return ta.get_data_address_size()
+ 
+ 
++def _EmitEvaluatedSpan(val: eval.EvalSpan, ct: cwast.CanonType, offset: int, ta: type_corpus.TargetArchConfig, fp) -> int:
++    if val.pointer is None:
++        return _EmitMemRepeatedByte(_BYTE_ZERO, ct.size, offset, "auto ", ct.name, fp)
++    print(f"# rec: {ct.name}", file=fp)
++    len_field = ct.get_rec_field(1)
++    assert len_field.x_offset == ta.get_data_address_size()
++    print(f".addr.mem {ta.get_data_address_size()} {val.pointer.name} {val.offset}", file=fp)
++    len_ct = len_field.x_type
++    data = _InitDataForBaseType(len_ct, eval.EvalNum(val.size, len_ct.base_type_kind))
++    return len_field.x_offset + _EmitMem(data, offset + len_field.x_offset, len_ct.name, fp)
++
++
++def _EmitEvaluatedAggregate(val, ct: cwast.CanonType, offset: int, ta: type_corpus.TargetArchConfig, fp) -> int:
++    if isinstance(val, eval.EvalSpan):
++        return _EmitEvaluatedSpan(val, ct, offset, ta, fp)
++    if isinstance(val, eval.EvalBytes):
++        return _EmitMem(val.data, offset, ct.name, fp)
++    if val.init_node is None:
++        return _EmitMemRepeatedByte(_BYTE_ZERO, ct.size, offset, "auto ", ct.name, fp)
++    return _EmitInitializerRecursively(val.init_node, ct, offset, ta, fp)
++
++
+ def _EmitCodeAddress(node, ct, offset, ta, fp) -> int:
+     assert isinstance(node, cwast.DefFun), f"{node}"
+     print(f".addr.fun {ta.get_code_address_size()} {node.name}", file=fp)
+@@ -943,10 +968,20 @@ def _EmitInitializerRecursively(node, ct: cwast.CanonType, offset: int, ta: type
+             return _EmitCodeAddress(node_def, ct, offset, ta, fp)
+         assert isinstance(node_def, cwast.DefGlobal), f"{node_def}"
+         return _EmitInitializerRecursively(node_def.initial_or_undef_or_auto, ct, offset, ta, fp)
+-    elif isinstance(node, cwast.ExprFront):
+-        return _EmitDataAddress(node.container, ct, offset, ta, fp)
+-    elif isinstance(node, cwast.ExprAddrOf):
+-        return _EmitDataAddress(node.expr_lhs, ct, offset, ta, fp)
++    elif isinstance(node, (cwast.ExprFront, cwast.ExprAddrOf, cwast.ExprPointer)):
++        return _EmitDataAddress(node, ta, fp)
++    elif ct.is_ptr() and isinstance(node.x_eval, eval.EvalGlobalAddr):
++        return _EmitDataAddress(node, ta, fp)
++    elif (ct.is_ptr() and isinstance(node, cwast.ExprField) and
++          isinstance(node.container.x_eval, eval.EvalSpan) and
++          node.container.x_eval.pointer is None and node.container.x_eval.size == 0):
++        return _EmitMemRepeatedByte(_BYTE_ZERO, ct.size, offset, "auto ", ct.name, fp)
++    elif (isinstance(node, (cwast.ExprDeref, cwast.ExprIndex, cwast.ExprField)) and
++          (isinstance(node.x_eval, (eval.EvalCompound, eval.EvalBytes)) or
++           isinstance(node.x_eval, eval.EvalSpan) and
++           (isinstance(node.x_eval.address(), eval.EvalGlobalAddr) or
++            node.x_eval.pointer is None and node.x_eval.size == 0))):
++        return _EmitEvaluatedAggregate(node.x_eval, ct, offset, ta, fp)
+     elif isinstance(node, cwast.ExprWiden):
+         count = _EmitInitializerRecursively(
+             node.expr, node.expr.x_type, offset, ta, fp)
+@@ -986,8 +1021,11 @@ def EmitDefGlobal(node: cwast.DefGlobal, ta: type_corpus.TargetArchConfig, fp) -
+     print(
+         f"\n.mem {node.name} {def_type.alignment} {'RW' if node.mut else 'RO'}", file=fp)
+ 
+-    return _EmitInitializerRecursively(node.initial_or_undef_or_auto,
+-                                       node.type_or_auto.x_type, 0, ta, fp)
++    count = _EmitInitializerRecursively(node.initial_or_undef_or_auto,
++                                        node.type_or_auto.x_type, 0, ta, fp)
++    if count == 0:
++        count = _EmitMemRepeatedByte(_BYTE_PADDING, 1, 0, "padding", "", fp)
++    return count
+ 
+ 
+ def EmitFunctionHeader(sig_name, kind, ct: cwast.CanonType, fp):
+diff --git a/FE/eval.cc b/FE/eval.cc
+index ecf18f2d..991efce3 100644
+--- a/FE/eval.cc
++++ b/FE/eval.cc
+@@ -137,6 +137,12 @@ Const EvalValWithPossibleImplicitConversion(CanonType dst_type, Node src_node) {
+     return src_value;
+   }
+   if (IsVecToSpanConversion(src_type, dst_type)) {
++    Const addr = AddressOfPlace(src_node);
++    if (addr.kind() == BASE_TYPE_KIND::GLOBAL_ADDR) {
++      EvalGlobalAddr a = ConstGetGlobalAddrWithOffset(addr);
++      return ConstNewSpan(
++          {a.sym, CanonType_vec_dim(src_type), src_value, a.offset});
++    }
+     if (src_value.isnull()) {
+       return ConstNewSpan(
+           {kNodeInvalid, CanonType_vec_dim(src_type), kConstInvalid});
+@@ -204,19 +210,22 @@ Const GetValForVecAtPos(Const container_val, uint64_t index, CanonType ct) {
+   }
+ 
+   ASSERT(init_node.kind() == NT::ValCompound, "");
++  Const last = GetDefaultForType(ct);
+   uint64_t n = 0;
+   for (Node point = Node_inits(init_node); !point.isnull();
+        point = Node_next(point)) {
+     ASSERT(point.kind() == NT::ValPoint, "");
+     Node p = Node_point_or_undef(point);
+     if (p.kind() != NT::ValUndef) {
+-      n = ConstGetUnsigned(Node_x_eval(p));
++      uint64_t target = ConstGetUnsigned(Node_x_eval(p));
++      if (index < target) return last;
++      n = target;
+     }
+-    if (n == index) return Node_x_eval(Node_value_or_undef(point));
+-    if (n > index) return GetDefaultForType(ct);
++    last = Node_x_eval(point);
++    if (n == index) return last;
+     ++n;
+   }
+-  return kConstInvalid;
++  return last;
+ }
+ 
+ Const GetValForRecAtField(Const container, Node target_field) {
+@@ -239,11 +248,69 @@ Const GetValForRecAtField(Const container, Node target_field) {
+       if (point.isnull()) {
+         return GetDefaultForType(Node_x_type(field));
+       }
+-      return Node_x_eval(Node_value_or_undef(point));
++      return Node_x_eval(point);
+     }
+   }
+ }
+ 
++Const AddOffset(Const addr, int64_t delta) {
++  if (addr.kind() != BASE_TYPE_KIND::GLOBAL_ADDR) return kConstInvalid;
++  EvalGlobalAddr a = ConstGetGlobalAddrWithOffset(addr);
++  return ConstNewGlobalAddr(a.sym, a.offset + delta);
++}
++
++Const SpanAddress(Const span) {
++  if (span.kind() != BASE_TYPE_KIND::SPAN) return kConstInvalid;
++  EvalSpan es = ConstGetSpan(span);
++  if (es.pointer.isnull()) return kConstInvalid;
++  if (es.pointer.kind() == NT::DefGlobal) {
++    return ConstNewGlobalAddr(es.pointer, es.offset);
++  }
++  return es.offset == 0 ? ConstNewVarAddr(es.pointer) : kConstInvalid;
++}
++
++Const EvalFront(Node cont) {
++  if (CanonType_is_vec(Node_x_type(cont))) return AddressOfPlace(cont);
++  return SpanAddress(Node_x_eval(cont));
++}
++
++SizeOrDim ElementStride(CanonType ct) {
++  return CanonType_aligned_size(CanonType_underlying_type(ct));
++}
++
++Const GetValAtOffset(Const val, CanonType val_ct, SizeOrDim offset,
++                     CanonType ct) {
++  if (val.isnull()) return kConstInvalid;
++  if (offset == 0 && val_ct == ct) return val;
++  if (CanonType_is_vec(val_ct)) {
++    CanonType et = CanonType_underlying_type(val_ct);
++    SizeOrDim stride = CanonType_aligned_size(et);
++    SizeOrDim index = offset / stride;
++    if (index >= CanonType_vec_dim(val_ct)) return kConstInvalid;
++    return GetValAtOffset(GetValForVecAtPos(val, index, et), et,
++                          offset % stride, ct);
++  }
++  if (CanonType_is_rec(val_ct)) {
++    for (Node field = Node_fields(CanonType_ast_node(val_ct)); !field.isnull();
++         field = Node_next(field)) {
++      SizeOrDim start = Node_x_offset(field);
++      CanonType field_ct = Node_x_type(field);
++      if (start <= offset && offset < start + CanonType_size(field_ct)) {
++        return GetValAtOffset(GetValForRecAtField(val, field), field_ct,
++                              offset - start, ct);
++      }
++    }
++  }
++  return kConstInvalid;
++}
++
++Const EvalDeref(Const addr, CanonType ct) {
++  if (addr.kind() != BASE_TYPE_KIND::GLOBAL_ADDR) return kConstInvalid;
++  EvalGlobalAddr a = ConstGetGlobalAddrWithOffset(addr);
++  return GetValAtOffset(Node_x_eval(a.sym),
++                        Node_x_type(Node_type_or_auto(a.sym)), a.offset, ct);
++}
++
+ Const EvalExpr1(UNARY_EXPR_KIND op, Const e, CanonType ct) {
+   BASE_TYPE_KIND bt = CanonType_get_unwrapped_base_type_kind(ct);
+   switch (op) {
+@@ -420,7 +487,6 @@ Const EvalExpr2(BINARY_EXPR_KIND op, Const e1, Const e2, CanonType ct,
+     } else if (op == BINARY_EXPR_KIND::NE) {
+       return ConstNewBool(e1 != e2);
+     } else {
+-      ASSERT(false, "UNREACHABLE");
+       return kConstInvalid;
+     }
+   }
+@@ -549,8 +615,17 @@ Const EvalNode(Node node) {
+     case NT::ExprIndex: {
+       Const index_val = Node_x_eval(Node_expr_index(node));
+       if (index_val.isnull()) return kConstInvalid;
+-      Const container_val = Node_x_eval(Node_container(node));
++      Node cont = Node_container(node);
++      Const container_val = Node_x_eval(cont);
+       if (container_val.isnull()) return kConstInvalid;
++      if (container_val.kind() == BASE_TYPE_KIND::SPAN &&
++          ConstGetSpan(container_val).content.isnull()) {
++        return EvalDeref(
++            AddOffset(SpanAddress(container_val),
++                      ConstGetUnsigned(index_val) *
++                          ElementStride(Node_x_type(cont))),
++            Node_x_type(node));
++      }
+       return GetValForVecAtPos(container_val, ConstGetUnsigned(index_val),
+                                Node_x_type(node));
+     }
+@@ -622,22 +697,8 @@ Const EvalNode(Node node) {
+       return Node_x_eval(Node_expr(node));
+     case NT::ExprIs:
+       return EvalExprIs(node);
+-    case NT::ExprFront: {
+-      Node cont = Node_container(node);
+-      if (CanonType_kind(Node_x_type(cont)) == NT::TypeVec) {
+-        if (Node_kind(cont) == NT::Id) {
+-          return ConstNewSymbolAddr(Node_x_symbol(cont));
+-        }
+-      } else {
+-        ASSERT(CanonType_kind(Node_x_type(cont)) == NT::TypeSpan,
+-               "unexpected " << Node_x_type(cont));
+-        Const val_cont = Node_x_eval(cont);
+-        if (!val_cont.isnull() && !ConstGetSpan(val_cont).pointer.isnull()) {
+-          return ConstNewSymbolAddr(ConstGetSpan(val_cont).pointer);
+-        }
+-      }
+-      return kConstInvalid;
+-    }
++    case NT::ExprFront:
++      return EvalFront(Node_container(node));
+     case NT::ExprLen: {
+       Node cont = Node_container(node);
+       BASE_TYPE_KIND bt =
+@@ -655,10 +716,7 @@ Const EvalNode(Node node) {
+       return kConstInvalid;
+     }
+     case NT::ExprAddrOf:
+-      if (Node_kind(Node_expr_lhs(node)) == NT::Id) {
+-        return ConstNewSymbolAddr(Node_x_symbol(Node_expr_lhs(node)));
+-      }
+-      return kConstInvalid;
++      return AddressOfPlace(Node_expr_lhs(node));
+     case NT::ExprOffsetof:
+       return ConstNewUnsigned(
+           Node_x_offset(Node_x_symbol(Node_field(node))),
+@@ -670,6 +728,7 @@ Const EvalNode(Node node) {
+     case NT::ValSpan: {
+       Node sym = kNodeInvalid;
+       SizeOrDim size = kSizeOrDimInvalid;
++      SizeOrDim offset = 0;
+       Const p = Node_x_eval(Node_pointer(node));
+       Const s = Node_x_eval(Node_expr_size(node));
+       if (p.isnull() && s.isnull()) return kConstInvalid;
+@@ -678,12 +737,15 @@ Const EvalNode(Node node) {
+                    p.kind() == BASE_TYPE_KIND::GLOBAL_ADDR,
+                " " << Node_srcloc(node) << " " << p);
+         sym = ConstGetSymbolAddr(p);
++        if (p.kind() == BASE_TYPE_KIND::GLOBAL_ADDR) {
++          offset = ConstGetGlobalAddrWithOffset(p).offset;
++        }
+       }
+       if (!s.isnull()) {
+         ASSERT(IsUint(s.kind()), Node_srcloc(node) << node);
+         size = ConstGetUnsigned(s);
+       }
+-      return ConstNewSpan({sym, size, kConstInvalid});
++      return ConstNewSpan({sym, size, kConstInvalid, offset});
+     }
+     case NT::ExprParen:
+       return Node_x_eval(Node_expr(node));
+@@ -729,10 +791,19 @@ Const EvalNode(Node node) {
+     case NT::ExprStmt:
+     case NT::ExprUnionUntagged:
+     case NT::ExprUnionTag:
+-    case NT::ExprPointer:
+       return kConstInvalid;
+-    case NT::EnumVal:
++    case NT::ExprPointer: {
++      Const delta = Node_x_eval(Node_expr2(node));
++      if (Node_pointer_expr_kind(node) != POINTER_EXPR_KIND::INCP ||
++          delta.isnull()) {
++        return kConstInvalid;
++      }
++      return AddOffset(Node_x_eval(Node_expr1(node)),
++                       ConstGetUnsigned(delta) * ElementStride(Node_x_type(node)));
++    }
+     case NT::ExprDeref:
++      return EvalDeref(Node_x_eval(Node_expr(node)), Node_x_type(node));
++    case NT::EnumVal:
+     case NT::ValAuto:
+       return kConstInvalid;
+       // not evaluatable:
+@@ -793,6 +864,34 @@ bool _EvalRecursively(Node mod) {
+ 
+ }  // namespace
+ 
++Const AddressOfPlace(Node node) {
++  switch (node.kind()) {
++    case NT::Id: {
++      Node sym = Node_x_symbol(node);
++      if (sym.kind() == NT::DefGlobal || sym.kind() == NT::DefVar) {
++        return ConstNewSymbolAddr(sym);
++      }
++      return kConstInvalid;
++    }
++    case NT::ExprDeref: {
++      Const p = Node_x_eval(Node_expr(node));
++      return p.kind() == BASE_TYPE_KIND::GLOBAL_ADDR ? p : kConstInvalid;
++    }
++    case NT::ExprField:
++      return AddOffset(AddressOfPlace(Node_container(node)),
++                       Node_x_offset(Node_x_symbol(Node_field(node))));
++    case NT::ExprIndex: {
++      Const index = Node_x_eval(Node_expr_index(node));
++      if (index.isnull()) return kConstInvalid;
++      Node cont = Node_container(node);
++      return AddOffset(EvalFront(cont), ConstGetUnsigned(index) *
++                                            ElementStride(Node_x_type(cont)));
++    }
++    default:
++      return kConstInvalid;
++  }
++}
++
+ Const ConstNewUnsigned(uint64_t val, BASE_TYPE_KIND kind) {
+   ASSERT(IsUint(kind), "bad base type kind " << EnumToString(kind));
+   if (ValIsShortConstUnsigned(val)) {
+@@ -943,8 +1042,12 @@ std::ostream& operator<<(std::ostream& os, Const c) {
+                 << EnumToString_BASE_TYPE_KIND_LOWER(c.kind()) << "]";
+     case BASE_TYPE_KIND::VAR_ADDR:
+       return os << "EvalVarAddr[" << Node_name(ConstGetVarAddr(c)) << "]";
+-    case BASE_TYPE_KIND::GLOBAL_ADDR:
+-      return os << "EvalGlobalAddr[" << Node_name(ConstGetGlobalAddr(c)) << "]";
++    case BASE_TYPE_KIND::GLOBAL_ADDR: {
++      EvalGlobalAddr a = ConstGetGlobalAddrWithOffset(c);
++      os << "EvalGlobalAddr[" << Node_name(a.sym);
++      if (a.offset != 0) os << "+" << a.offset;
++      return os << "]";
++    }
+     case BASE_TYPE_KIND::FUN_ADDR:
+       return os << "EvalFunAddr[" << Node_name(ConstGetFunAddr(c)) << "]";
+     case BASE_TYPE_KIND::COMPOUND: {
+@@ -953,8 +1056,10 @@ std::ostream& operator<<(std::ostream& os, Const c) {
+     }
+     case BASE_TYPE_KIND::SPAN: {
+       EvalSpan es = ConstGetSpan(c);
+-      return os << "EvalSpan[" << es.pointer << ", " << es.size << ", "
+-                << es.content << "]{" << c.index() << "}";
++      os << "EvalSpan[" << es.pointer;
++      if (es.offset != 0) os << "+" << es.offset;
++      return os << ", " << es.size << ", " << es.content << "]{" << c.index()
++                << "}";
+     }
+     default:
+       ASSERT(false, "unknown eval " << int(c.kind()));
+@@ -990,14 +1095,17 @@ std::string to_string(Const c,
+         ss << "EvalVarAddr[DANGLING:" << Node_name(ConstGetVarAddr(c)) << "]";
+       }
+       break;
+-    case BASE_TYPE_KIND::GLOBAL_ADDR:
+-      if (labels->contains(ConstGetGlobalAddr(c))) {
+-        ss << "EvalGlobalAddr[" << labels->at(ConstGetGlobalAddr(c)) << "]";
++    case BASE_TYPE_KIND::GLOBAL_ADDR: {
++      EvalGlobalAddr a = ConstGetGlobalAddrWithOffset(c);
++      if (labels->contains(a.sym)) {
++        ss << "EvalGlobalAddr[" << labels->at(a.sym);
+       } else {
+-        ss << "EvalGlobalAddr[DANGLING:" << Node_name(ConstGetGlobalAddr(c))
+-           << "]";
++        ss << "EvalGlobalAddr[DANGLING:" << Node_name(a.sym);
+       }
++      if (a.offset != 0) ss << "+" << a.offset;
++      ss << "]";
+       break;
++    }
+     case BASE_TYPE_KIND::FUN_ADDR:
+       ss << "EvalFunAddr[" << labels->at(ConstGetFunAddr(c)) << "]";
+       break;
+@@ -1028,6 +1136,7 @@ std::string to_string(Const c,
+       } else {
+         ss << labels->at(es.pointer);
+       }
++      if (es.offset != 0) ss << "+" << es.offset;
+       ss << ", " << es.size << ", ";
+       ss << to_string(es.content, labels);
+ 
+diff --git a/FE/eval.h b/FE/eval.h
+index 7b9111c2..352312c1 100644
+--- a/FE/eval.h
++++ b/FE/eval.h
+@@ -39,6 +39,12 @@ struct EvalSpan {
+   Node pointer;    // invalid or DefVar or DefGlobal
+   SizeOrDim size;  // invalid if < 0
+   Const content;   // usually a compound
++  SizeOrDim offset = 0;
++};
++
++struct EvalGlobalAddr {
++  Node sym;
++  SizeOrDim offset;
+ };
+ 
+ inline Const ConstNewSpan(EvalSpan span) {
+@@ -91,14 +97,20 @@ inline Node ConstGetVarAddr(Const c) {
+   return Node(NT::DefVar, c.index());
+ }
+ 
+-inline Const ConstNewGlobalAddr(Node sym) {
++inline Const ConstNewGlobalAddr(Node sym, SizeOrDim offset = 0) {
+   ASSERT(sym.kind() == NT::DefGlobal, "");
+-  return Const(sym.index(), BASE_TYPE_KIND::GLOBAL_ADDR);
++  EvalGlobalAddr addr = {sym, offset};
++  return Const(ConstPool.Intern(std::string_view((char*)&addr, sizeof(addr))),
++               BASE_TYPE_KIND::GLOBAL_ADDR);
+ }
+ 
+-inline Node ConstGetGlobalAddr(Const c) {
++inline EvalGlobalAddr ConstGetGlobalAddrWithOffset(Const c) {
+   ASSERT(c.kind() == BASE_TYPE_KIND::GLOBAL_ADDR, "");
+-  return Node(NT::DefGlobal, c.index());
++  return *(EvalGlobalAddr*)ConstPool.Data(c.index());
++}
++
++inline Node ConstGetGlobalAddr(Const c) {
++  return ConstGetGlobalAddrWithOffset(c).sym;
+ }
+ 
+ inline Const ConstNewSymbolAddr(Node node) {
+@@ -253,6 +265,8 @@ extern std::string to_string(
+ 
+ extern void DecorateASTWithPartialEvaluation(const std::vector<Node>& mods);
+ 
++extern Const AddressOfPlace(Node node);
++
+ extern Const GetDefaultForBaseType(BASE_TYPE_KIND bt);
+ 
+ class GlobalConstantPool {
+diff --git a/FE/eval.py b/FE/eval.py
+index 49df1132..498433f1 100755
+--- a/FE/eval.py
++++ b/FE/eval.py
+@@ -69,23 +69,27 @@ class EvalVarAddr(EvalBase):
+ 
+ 
+ class EvalGlobalAddr(EvalBase):
+-    def __init__(self, sym):
++    def __init__(self, sym, offset=0):
+         assert isinstance(sym, cwast.DefGlobal), f"{sym}"
+         self.sym = sym
++        self.offset = offset
+ 
+     def __eq__(self, other):
+         if not isinstance(other, EvalGlobalAddr):
+             return False
+-        return self.sym == other.sym
++        return self.sym == other.sym and self.offset == other.offset
++
++    def _suffix(self) -> str:
++        return f"+{self.offset}" if self.offset else ""
+ 
+     @override
+     def render(self, label_map: dict[Any, str]) -> str:
+         if self.sym not in label_map:
+-            return f"EvalGlobalAddr[DANGLING: {self.sym}]"
+-        return f"EvalGlobalAddr[{label_map[self.sym]}]"
++            return f"EvalGlobalAddr[DANGLING: {self.sym}{self._suffix()}]"
++        return f"EvalGlobalAddr[{label_map[self.sym]}{self._suffix()}]"
+ 
+     def __str__(self):
+-        return f"EvalGlobalAddr[{self.sym.name}]"
++        return f"EvalGlobalAddr[{self.sym.name}{self._suffix()}]"
+ 
+ 
+ def MakeEvalVarOrGlobalAddr(sym) -> Any:
+@@ -149,7 +153,7 @@ class EvalCompound(EvalBase):
+ 
+ 
+ class EvalSpan(EvalBase):
+-    def __init__(self, pointer, size, content):
++    def __init__(self, pointer, size, content, offset=0):
+         assert pointer is None or isinstance(
+             pointer, (cwast.DefGlobal, cwast.DefVar)), f"unexpected pointer {pointer}"
+         assert size is None or isinstance(size, int), f"{size}"
+@@ -158,16 +162,26 @@ class EvalSpan(EvalBase):
+         self.pointer = pointer
+         self.size = size
+         self.content = content
++        self.offset = offset
++
++    def address(self) -> Optional[EvalBase]:
++        if self.pointer is None:
++            return None
++        if isinstance(self.pointer, cwast.DefGlobal):
++            return EvalGlobalAddr(self.pointer, self.offset)
++        return EvalVarAddr(self.pointer) if self.offset == 0 else None
+ 
+     @override
+     def render(self, label_map: dict[Any, str]) -> str:
+         pointer = label_map[self.pointer] if self.pointer else "null"
+         dim = -1 if self.size is None else self.size
+         content = self.content.render(label_map) if self.content else "null"
+-        return f"EvalSpan[{pointer}, {dim}, {content}]"
++        suffix = f"+{self.offset}" if self.offset else ""
++        return f"EvalSpan[{pointer}{suffix}, {dim}, {content}]"
+ 
+     def __str__(self):
+-        return f"EvalSpan[{self.pointer if self.pointer else "@NULL@"}, {self.size}]"
++        suffix = f"+{self.offset}" if self.offset else ""
++        return f"EvalSpan[{self.pointer if self.pointer else "@NULL@"}{suffix}, {self.size}]"
+ 
+ 
+ class EvalNum(EvalBase):
+@@ -481,6 +495,8 @@ def _EvalExpr2(node: cwast.Expr2) -> Optional[EvalBase]:
+     bt = ct.base_type_kind
+     ct_operand = node.expr1.x_type
+     if ct_operand.is_ptr() or ct_operand.is_fun():
++        if op not in _EVAL_EQ_NE:
++            return None
+         return EvalNum(_EVAL_EQ_NE[op](e1, e2), bt)
+     # Note, we can compare pointers but there seem to few useful case
+     # where we want to compare them at compile time.
+@@ -549,10 +565,10 @@ def _GetValForVecAtPos(container_val: EvalBase, index: int, ct: cwast.CanonType)
+     assert index < width
+ 
+     assert isinstance(init_node, cwast.ValCompound), f"{init_node}"
+-    last: Optional[EvalBase] = None
++    last: Optional[EvalBase] = GetDefaultForType(ct)
+     for n, point in enumerate(IterateValVec(init_node.inits, width, init_node.x_srcloc)):
+         if point is not None:
+-            last = point.value_or_undef.x_eval
++            last = point.x_eval
+         if n == index:
+             return last
+     assert False
+@@ -573,6 +589,68 @@ def _GetValForRecAtField(container_val, field: cwast.RecField):
+     return None
+ 
+ 
++def _GetValAtOffset(val, val_ct: cwast.CanonType, offset: int,
++                    ct: cwast.CanonType) -> Optional[EvalBase]:
++    if val is None:
++        return None
++    if offset == 0 and val_ct is ct:
++        return val
++    if val_ct.is_vec():
++        et = val_ct.underlying_type()
++        index, rest = divmod(offset, et.aligned_size())
++        if index >= val_ct.vec_dim():
++            return None
++        return _GetValAtOffset(_GetValForVecAtPos(val, index, et), et, rest, ct)
++    if val_ct.is_rec():
++        rec = val_ct.ast_node
++        assert isinstance(rec, cwast.DefRec)
++        for field in rec.fields:
++            if field.x_offset <= offset < field.x_offset + field.x_type.size:
++                return _GetValAtOffset(_GetValForRecAtField(val, field), field.x_type,
++                                       offset - field.x_offset, ct)
++    return None
++
++
++def _EvalDeref(addr, ct: cwast.CanonType) -> Optional[EvalBase]:
++    if not isinstance(addr, EvalGlobalAddr):
++        return None
++    return _GetValAtOffset(addr.sym.x_eval, addr.sym.type_or_auto.x_type, addr.offset, ct)
++
++
++def _AddOffset(addr, delta) -> Optional[EvalBase]:
++    if not isinstance(addr, EvalGlobalAddr):
++        return None
++    return EvalGlobalAddr(addr.sym, addr.offset + delta)
++
++
++def _EvalFront(cont) -> Optional[EvalBase]:
++    if cont.x_type.is_vec():
++        return AddressOfPlace(cont)
++    span = cont.x_eval
++    return span.address() if isinstance(span, EvalSpan) else None
++
++
++def AddressOfPlace(node) -> Optional[EvalBase]:
++    if isinstance(node, cwast.Id):
++        sym = node.x_symbol
++        if isinstance(sym, (cwast.DefGlobal, cwast.DefVar)):
++            return MakeEvalVarOrGlobalAddr(sym)
++        return None
++    elif isinstance(node, cwast.ExprDeref):
++        return node.expr.x_eval if isinstance(node.expr.x_eval, EvalGlobalAddr) else None
++    elif isinstance(node, cwast.ExprField):
++        field = node.field.x_symbol
++        assert isinstance(field, cwast.RecField)
++        return _AddOffset(AddressOfPlace(node.container), field.x_offset)
++    elif isinstance(node, cwast.ExprIndex):
++        index = node.expr_index.x_eval
++        if not isinstance(index, EvalNum):
++            return None
++        stride = node.container.x_type.underlying_type().aligned_size()
++        return _AddOffset(_EvalFront(node.container), index.val * stride)
++    return None
++
++
+ def _EvalValWithPossibleImplicitConversion(dst_type: cwast.CanonType,
+                                            src_node):
+     src_value = src_node.x_eval
+@@ -583,6 +661,9 @@ def _EvalValWithPossibleImplicitConversion(dst_type: cwast.CanonType,
+         return src_value
+ 
+     if type_corpus.IsVecToSpanConversion(src_type, dst_type):
++        addr = AddressOfPlace(src_node)
++        if isinstance(addr, EvalGlobalAddr):
++            return EvalSpan(addr.sym, src_type.vec_dim(), src_value, addr.offset)
+         if src_value is None:
+             return EvalSpan(None, src_type.vec_dim(), None)
+ 
+@@ -672,7 +753,10 @@ def _EvalNode(node: cwast.NODES_EXPR_T) -> Optional[EvalBase]:
+         container_val = node.container.x_eval
+         if container_val is None:
+             return None
+-
++        if isinstance(container_val, EvalSpan) and container_val.content is None:
++            stride = node.container.x_type.underlying_type().aligned_size()
++            return _EvalDeref(_AddOffset(container_val.address(), index_val.val * stride),
++                              node.x_type)
+         return _GetValForVecAtPos(container_val, index_val.val, node.x_type)
+     elif isinstance(node, cwast.ExprField):
+         if node.container.x_type.is_enum():
+@@ -688,8 +772,9 @@ def _EvalNode(node: cwast.NODES_EXPR_T) -> Optional[EvalBase]:
+     elif isinstance(node, cwast.Expr2):
+         return _EvalExpr2(node)
+     elif isinstance(node, cwast.Expr3):
+-        if node.cond.x_eval is not None:
+-            if node.cond.x_eval:
++        cond = node.cond.x_eval
++        if isinstance(cond, EvalNum):
++            if cond.val:
+                 return node.expr_t.x_eval
+             else:
+                 return node.expr_f.x_eval
+@@ -714,18 +799,7 @@ def _EvalNode(node: cwast.NODES_EXPR_T) -> Optional[EvalBase]:
+     elif isinstance(node, cwast.ExprIs):
+         return _EvalExprIs(node)
+     elif isinstance(node, cwast.ExprFront):
+-        cont = node.container
+-        ct_container = cont.x_type
+-        if ct_container.is_vec():
+-            if isinstance(cont, cwast.Id):
+-                return MakeEvalVarOrGlobalAddr(cont.x_symbol)
+-        else:
+-            assert ct_container.is_span()
+-            val_cont = cont.x_eval
+-            if val_cont is not None and val_cont.pointer is not None:
+-                assert isinstance(val_cont, EvalSpan), f"{val_cont}"
+-                return MakeEvalVarOrGlobalAddr(val_cont.pointer)
+-        return None
++        return _EvalFront(node.container)
+     elif isinstance(node, cwast.ExprLen):
+         cont = node.container
+         bt_src = node.x_type.base_type_kind
+@@ -735,9 +809,7 @@ def _EvalNode(node: cwast.NODES_EXPR_T) -> Optional[EvalBase]:
+             return EvalNum(cont.x_eval.size, bt_src)
+         return None
+     elif isinstance(node, cwast.ExprAddrOf):
+-        if isinstance(node.expr_lhs, cwast.Id):
+-            return MakeEvalVarOrGlobalAddr(node.expr_lhs.x_symbol)
+-        return None
++        return AddressOfPlace(node.expr_lhs)
+     elif isinstance(node, cwast.ExprOffsetof):
+         # assert node.x_field.x_offset > 0
+         return EvalNum(node.field.x_symbol.x_offset, node.x_type.base_type_kind)
+@@ -748,13 +820,15 @@ def _EvalNode(node: cwast.NODES_EXPR_T) -> Optional[EvalBase]:
+         s = node.expr_size.x_eval
+         if p is None and s is None:
+             return None
++        offset = 0
+         if p:
+             assert isinstance(p, (EvalVarAddr, EvalGlobalAddr))
++            offset = p.offset if isinstance(p, EvalGlobalAddr) else 0
+             p = p.sym
+         if s:
+             assert isinstance(s, EvalNum)
+             s = s.val
+-        return EvalSpan(p, s, None)
++        return EvalSpan(p, s, None, offset)
+     elif isinstance(node, cwast.ExprParen):
+         return node.expr.x_eval
+     elif isinstance(node, cwast.DefEnum):
+@@ -801,11 +875,13 @@ def _EvalNode(node: cwast.NODES_EXPR_T) -> Optional[EvalBase]:
+     elif isinstance(node, cwast.ExprUnionTag):
+         return None
+     elif isinstance(node, cwast.ExprPointer):
+-        # TODO: we can do better here
+-        return None
++        delta = node.expr2.x_eval
++        if node.pointer_expr_kind is not cwast.POINTER_EXPR_KIND.INCP or not isinstance(delta, EvalNum):
++            return None
++        stride = node.x_type.underlying_type().aligned_size()
++        return _AddOffset(node.expr1.x_eval, delta.val * stride)
+     elif isinstance(node, cwast.ExprDeref):
+-        # TODO maybe track symbolic addresses
+-        return None
++        return _EvalDeref(node.expr.x_eval, node.x_type)
+     elif isinstance(node, cwast.EnumVal):
+         return None  # handles as part of DefEnum
+     elif isinstance(node, cwast.ValAuto):
+diff --git a/FE/typify.cc b/FE/typify.cc
+index 3ac6833c..4ba98cd2 100644
+--- a/FE/typify.cc
++++ b/FE/typify.cc
+@@ -162,9 +162,11 @@ CanonType TypifyDefGlobalOrDefVar(Node node, TypeCorpus* tc, PolyMap* pm) {
+     TypifyExprOrType(type, tc, ct, pm);
+   } else {
+     ct = TypifyExprOrType(type, tc, kCanonTypeInvalid, pm);
++    NodeSetType(node, ct);
+     if (Node_kind(initial) != NT::ValUndef) {
+       TypifyExprOrType(initial, tc, ct, pm);
+     }
++    return ct;
+   }
+   return NodeSetType(node, ct);
+ }
+diff --git a/FE/typify.py b/FE/typify.py
+index dd6124ed..2467b27c 100755
+--- a/FE/typify.py
++++ b/FE/typify.py
+@@ -257,8 +257,10 @@ def _TypifyDefGlobalOrDefVar(node, tc: type_corpus.TypeCorpus,
+         _TypifyExprOrType(type, tc, ct, pm)
+     else:
+         ct = _TypifyExprOrType(type, tc, cwast.NO_TYPE, pm)
++        _NodeSetType(node, ct)
+         if not isinstance(initial, cwast.ValUndef):
+             _TypifyExprOrType(initial, tc, ct, pm)
++        return ct
+     return _NodeSetType(node, ct)
+ 
+ 

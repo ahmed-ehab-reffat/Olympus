@@ -1368,3 +1368,230 @@ Approved 3/3/3.
 **Carried forward**: F-58, F-59, F-60, F-61 (new), F-39 library-contract instance, F-6 and F-10 evidence,
 L99 (compiled-suite harness), L100 (replay before re-eval; state unanimous extensions), Pattern 107
 (forked privilege-dropping test).
+
+## pict-engine-negative-values (C++ / PICT combinatorial generator: negative values in the engine and C API) — ACCEPTED 2026-09-29, 3/10
+
+**What made it hard.** Negative values move from the CLI into the engine: a positive-only phase and a
+one-negative phase with pair masks, positive partner rows for child models, the model tree saved and
+restored per phase and per call, a result layout kept apart from the restored tree, recursive tree
+deletion, and two C API functions. The band came from **whole child rows at the parent (F-62, 5/10, the
+sole failure of two 33/34 runs)**, **the #44 partner-row cluster (5/10)**, **two coverage regimes merged
+into one pass (F-63, 3/10)**, **order 1 (sole failure of 32/34)** and one perl-harness regression.
+
+**The fixes, and what each cost.** (1) Five Auto Review rounds each added a High coverage cell (leak,
+header compile, tree and CLI exclusions, order 3 across models, CLI constraints and seeds, isolated
+PictDeleteModel, pict.def, ordinary-model column mapping): batch 1 0/11. (2) Cut CLI parity and
+cross-model exclusions, priced by replay at 1/11; the cut also exposed that base aborts on exclusions in
+two child models. (3) Batch 2 0/11: Nova #7's only failure was my own lifecycle fixture starving a value;
+fixed, re-eval 1/11, then FP on the same starved shape: precondition in meta. (4) Whole-row composition
+test from an Auto Review finding. (5) Batch 3 re-eval 2/10, both FP (exclusions constraining negative-row
+fillers; all 4 passers ever seen crashed; seeded fuzz 0/40 when exclusions avoid negative-bearing
+parameters): contract confined exclusions to plain parameters. (6) Batch 4 0/11 (7 single-pass runs),
+mixed-parent whole-group checks added. (7) Batch 5 3/10, accepted.
+
+## macs-circular-chromosomes (Python+Cython / MACS3 peak caller: circular chromosomes in callpeak) — ACCEPTED 2026-09-29, 1/11
+
+**What made it hard.** One `--circular` option that every callpeak stage must honour: header validation
+across pooled BAM/BAMPE files, BAMPE origin-spanning pairs, SE/PE pileups, multi-lap local-lambda
+windows, statistics over every base, narrow/broad/subpeak joining across the origin, the fragment
+model and output coordinates, all under one rotation law. The band came from **PeakModel left linear
+(F-64, 10/11, sole failure of a 46/47 run)** and **gapped blocks / subpeak summits left
+origin-dependent (F-65, 8/11 and 5/11)**; Vega was the only pass.
+
+**The fixes, and what each cost.** (1) Precheck: editable install on a Cython repo (seed build/lib, wrap
+the copied script). (2) Seven gate rounds, 9 reference bugs, ~30 tests of which 17 of the final 47
+killed nothing. (3) Batch 1 0/11: test BAMs gave mates different QNAMEs (4/11 read 0 fragments, L105),
+and whole-circle / tied-gap tests killed 11/11 for one reason (L104). Fixture fixed and the three tests
+dropped, priced by replaying the 11 saved patches. (4) Re-eval 1/11, exactly as replayed; accepted.
+
+## ray-optics-sp-coherence-transport (JavaScript / ray-optics: s/p coherence transport, Polarizer and Retarder objects, Detector polarimetry, legacy engine) — ACCEPTED 2026-09-30, 3/10
+
+**What made it hard.** Not the optics. A complex s/p coherence term carried through every CPU stage,
+object-fixed polarizer and retarder axes, and Stokes readings were all transcribed from the contract.
+The band came from **the legacy `Simulator`, the app's default engine, which the objects must also
+drive (F-67, 3/10; two runs missed the null-default intersection hook)**, **an exact double-pass
+isolator whose zero component cancelled to -1e-17 against the engine's negative-power guard (F-66,
+4/10, sole failure of two 53/54 runs)** and **a pairing rule applied to reserved-input reads (F-68)**.
+
+**The fixes, and what each cost.** (1) Slice through four Auto Review rounds: overflow and validation
+edge cases fixed, coverage tests added, a TIR formula sentence corrected after a literal-reading mutant
+(r_s r_p vs r_s conj(r_p)). (2) Batch 1 7/10: 31-scene probe showed zero divergence; added Polarizer,
+Retarder and polarimetry (192 → 480 effective). (3) Batch 2 7/10 again: 23-scene probe, zero divergence,
+but every run ignored the legacy default engine. (4) One paragraph stating the legacy behaviour plus 4
+headless legacy tests: batch 3 3/10, accepted. The acceptance review still flagged a legacy Retarder
+absorbing sub-cutoff rays through a shared cutoff helper (untested reference bug).
+
+## riff-unified-conflict-regions (Rust / riff diff highlighter: conflict regions in one-column unified diffs) — ACCEPTED 2026-09-30, 1/10
+
+**What made it hard.** Conflict markers inside ordinary `git diff` / `--remerge-diff` output: marker
+grammar with per-set lengths, resolved vs unresolved regions, diff3 bases, several sets per block,
+regions across hunks, whole-text word refinement per role, and an exact "as today" fallback. No single
+wall; the band came from four stated seams: **empty sides reaching riff's refiner, which panics on
+empty text (F-39, 4/10)**, **unresolved context lines rendered raw like resolved ones (F-69, 4/10)**,
+**a removed opener after added lines starting a new block (F-70, 4/10, Nova_4's only failure)** and
+**multi-set cells (F-10, Nova_10's only failures)**. Vega was the only pass, on the fewest requests.
+
+**The fixes, and what each cost.** (1) Three Auto Review revisions, each finding a reference bug
+(context prefix, a second set in one block, resolution vs base); tests grew 9 → 29. (2) Batch 1 0/11:
+where an out-of-order set ends was never stated (9/11); the later valid region moved into a separate
+file, tests-only (L110). (3) Three batches of FP-voided passes: empty sides, then `\ No newline at end
+of file` three different ways, then a second opener and stray markers after a close (the fourth
+reference bug). Named the implied rules, put the no-newline family out of scope (base riff mishandles it
+too), tests 29 → 38. (4) Fresh batch 1/10 with a clean panel; the named rules killed 0/10 (L109).
+
+## grmtools-contextual-lexeme-readings (Rust / grmtools lrpar: context-dependent token readings with CPCT+ recovery) — ACCEPTED 2026-09-30, 2/10
+
+**What made it hard.** `%fallback` / `%split` declarations in grmtools Yacc grammars, read per lookahead
+from the pre-reduction configuration (reductions simulated), in the LR loop and in CPCT+ search, ranking
+and replay, with piecewise repair of an unreadable split at per-piece cost. The band came from
+bookkeeping, not the designed trap: **declared names never registered as terminals (F-71, 4/10; 14 runs
+over three batches)**, **the recovery stack read top-first by a helper written for the bottom-first Vec
+(F-72, 3/10, Nova_2's only failure)**, and exact declaration diagnostics (duplicates, target rules).
+
+**The fixes, and what each cost.** (1) Two Solution Quality rounds and one Auto Review found four
+reference bugs (bare names, whole-lexeme delete, empty split, four-piece recovery loop); tests 15 → 36.
+(2) Batch 1 **0/25**: 20/25 read "can be shifted" as "the table action is Shift"; defined in meta (L111).
+(3) Batch 2 **0/12**: the four-piece recovery edge was the only failure of two runs; stated, plus Auto
+Review's bytes-vs-characters fix. (4) Batch 3 **0/10**: the same edge broken a third way; splits capped at
+three pieces (L113). (5) Batch 4 **2/10**, accepted. Missed on the way: batch 3 Nova_9 failed only on
+keeping trailing piece shifts the base simplifier strips (L112).
+
+**Zero-kill investments.** The DESIGN lead trap (decide before reductions) and all six reduction-dependent
+tests killed 0/10 once the verb was defined; 14 of 37 tests killed nothing.
+
+
+## pyocd-dwt-watchpoint-planner (Python / pyOCD Cortex-M DWT: range watchpoints, comparator planning, hit reporting) — ACCEPTED 2026-10-10, Nova 0/8 + Orion 1/4
+
+**What made it hard.** Range watchpoints planned over DWT v1 comparators with different MASK limits and DWT
+v2 linked pairs, all-or-nothing with rollback, plus the halt's first-set hit reported in GDB stop replies
+and the commander. Under the new per-agent gate: **stale read-to-clear MATCHED bits across resume, step and
+reset (F-74, 8/8 Nova, 0/4 Orion)** kept Nova at zero, and **a range past 0xFFFFFFFF wrapping into low
+memory (F-73, 8/8 Nova and 3/4 Orion, the sole failure of all three Orion near-misses)** gave Orion its
+1-of-4. Nova sequence length averaged 521k.
+
+**The fixes, and what each cost.** (1) Four Solution Quality rounds and three Auto Reviews found reference
+bugs (lazy init touching FUNCTION, unbounded split, no flush, PSoC resets keeping hits) and coverage gaps.
+(2) Old models, batches 1-4 **0/11, 0/10, 0/10, 0/10**: unfair deferred-write tests, acknowledgement
+wording, humanizer drifts, and family-reset tests whose `pyocd/target/` edits the agent export dropped; the
+PSoC rule was cut and a `_run_token` setter covered it. (3) Batch 6 **3/10**, FP upheld; one over-strict
+probe test narrowed. (4) Admin revert 2026-10-09. Batch 7 **Nova 0/11, Orion 0/4**, but Orion failed only
+an unfair lswatch-on-uninitialized-DWT test: true Orion 4/4. (5) The four Orion runs were fuzz-identical, so
+a patch read found the one split, the 32-bit top; two tests asserting only "low memory is not watched"
+(tests-only), plus three reference fixes. Re-eval (batch 8) matched the local replay: **Nova 0/8, Orion 1/4**,
+accepted. Open Medium: rollback stops at the first cleanup fault.
+
+
+## cwerg-fe-address-constants (Python + C++ / Cwerg twin front ends: constant addresses of globals and subobjects) — ACCEPTED 2026-10-11, Nova 0/8 + Orion 1/4
+
+**What made it hard.** Address constants as (global, byte offset) through field, index, deref, `front` and
+`ptr_inc`, folded and emitted identically by the Python and C++ front ends on x64/a64/a32. Under the new
+gate: **aggregate read-through `global copy = p^` (F-77, 5/12, all Nova)** and **padded-record stride on the
+64-bit targets (F-76, 2/12 Nova)** kept Nova at zero; **`front` of an empty default global span reaching an
+emitter keyed on the lowered node (F-75, 11/12, sole failure of a Nova run, the former Nova pass and Orion
+#4)** gave Orion its 1-of-4. One C++ ELF line (`addend == 0` NYI) had to change too. Nova sequence length
+averaged 995k.
+
+**The fixes, and what each cost.** (1) Old models: batch 1 **0/10** on pre-existing span-in-literal gaps,
+cut; then three passes in a row **FP-voided** on pre-existing C++ gaps the reference fixed (sparse vec
+defaults, reads past the last element, a record-with-span copy). Ended by capping those inputs in meta.
+(2) Admin revert. Batch 5 **Nova 1/8** → cross-global compile-error rules → batch 6 Nova 0/6, **Orion 3/4** →
+typed self/mutual references in typify (killed nobody) → three humanizer rounds → the requirement-count
+check forced a sentence-deletion cut (the compile-error rules went, at no cost). (3) Batch 8 **Nova 0/8**,
+one ELF-addend environment-blocker contest upheld. (4) Batch 9 **Nova 1/8, Orion 2/4**: eleven probes found
+no divergence between the Orion passers; the empty-span edge held back since an earlier Solution Quality
+round split them. Tests only, re-eval: **Nova 0/8, Orion 1/4**, a second blocker contest upheld, accepted.
+Auto Review 3/3/3.
+
+**Zero-kill investments.** Both new-model harden levers (cross-global errors, typify cycles); 12 of 18
+programs, including the three coverage programs added in the last round on purpose.
+
+## libspatialindex-mvr-history-pruning (C++ / MVR-tree: history pruning, page reclamation, statistics, archive of discarded versions) — ACCEPTED 2026-10-11, Nova 0/8 + Orion 2/8
+
+**What made it hard.** Pruning a multi-version R-tree to a horizon: purge every page no live path reaches,
+compact the nodes that stay, keep node/dead/level statistics exact, clip queries, persist the horizon and
+read old-format indexes, and hand every discarded record version to an archive exactly once although version
+copies overwrite an entry's start. Under the new gate: **freeing pages while the kept parents still point at
+them (F-78, 12/16, 4/8 Orion)** broke later deletes and queries once the storage manager reused the ids, and
+**resuming the next purge from the previous horizon (F-79)** was the sole failure of both 34/35 Orion runs.
+Nova sequence length averaged 543k.
+
+**The fixes, and what each cost.** (1) Old models: batch 1 **0/10** on a query ending at the horizon (stated
+in the repo's half-open reading); four Solution Quality rounds on the reference (same-instant archive
+merges, DBL_MAX horizon, header overread); batch 3 pool **2/21**, both FP (old-format node pages untested,
+zero-duration versions), so the same-instant domain was capped; accepted, then reverted 2026-10-09.
+(2) New models: Nova **2/4**, nine probe-derived tests, re-eval 0/4. Orion **3/3**, then **4/4** plus Vega
+1/1: fuzz found no split, so statistics after a purge became the lever (base deleteData's wrong-entry defect
+fixed in the reference too). (3) Task Prompt "too many requirements" twice: retention, the C API, the rejection
+rules, the contains/point clauses and the compaction sentence were cut with their tests. The cut sentence
+became the lead trap (L120). (4) Batch 8 **Orion 1/4**, voided by the FP panel (F-79); the panel's scenario
+became a test, Solution Quality S1 (erase markers keyed by id and time) was fixed, 3D and listing-exit
+coverage added. Re-eval **Orion 0/4**; fresh Orion 2/2, then 0/2: accepted at **2/8**, Auto Review 3/3/3.
+
+## asdf-conversion-free-lazy-tree (Python / asdf lazy tree: conversion-free info, search and schema_info; tag-preserving write_to and update) — ACCEPTED 2026-10-11, Nova 0/8 + Orion 1/8 (Vega 2/4)
+
+**What made it hard.** Lazily opened files must be inspected and searched without running converters
+(convert only for container/traversable declared types, `value`/`filter_`, or `node(s)`; key/type before
+value/filter across a chain), and written back with untouched nodes in their original tags, their
+extensions in history, raw ndarray sources renumbered on update, and non-array nodes converted when the
+opened file had blocks. Under the new gate: **a shared container with one alias accessed and one left raw
+was written twice (F-80, 15/20, 6/8 Orion)**, and **the new view changed the existing `asdf_library
+(Software)` line (F-81, 4/8 Orion)**. Nova also lost history, update renumbering and search-result
+materialization. Nova sequence length averaged 902k.
+
+**The fixes, and what each cost.** (1) Old models: batch 1 **0/11**; the near-miss Vega's only failures
+used a re-tag as the conversion witness, switched to the converter log; Vega passed and was FP-flagged
+(read tag on block conversion), so meta allowed either tag. Auto Review S1 found shared-block index
+corruption on reorder in reference and agents; a renumbering "retry" design cost four 0/10 Nova batches
+and was replaced by "convert non-array nodes when the file has blocks". Batch 7's Vega pass was FP-voided
+(multi-type on write, history in block files): tests added. Meta also failed the AI detector three times
+(humanizer + drift repair). (2) New models: Orion 1/4, then **4/7** and **3/4**; a base-differential probe
+found F-80 (Pattern 116). (3) Task Prompt "too many requirements": 6 rules and 7 tests cut; Solution
+Quality then failed twice on cut-rule behaviour still in the reference (L123). (4) Batch 11 **0/20**: the
+unknown-tag test failed on base's own warning under `filterwarnings = error` (L122); fixed tests-only with
+a multi-type `info()` check, re-eval **Orion 1/8, Vega 2/4** (L124), FP panel genuine x3. Auto Review asked
+for revision on a held-back edge (extension removal after a lazy open); accepted anyway.
+
+## hayro-optional-content-baking (Rust / hayro PDF: hayro-write page extraction baking default optional-content visibility into pages, Forms, tiling patterns, Type 3 fonts and soft masks) — ACCEPTED 2026-10-12, Nova 0/8 + Orion 1/4
+
+**What made it hard.** Extracted pages must look the same in viewers without optional content: hidden
+sections are not drawn but keep their graphics state, clip (including clip-mode glyph outlines) and text
+position, inside every stream the page reaches. Under the new gate Nova was held by **Forms baked from the
+default render mode instead of the caller's (F-83, 8/8 Nova, 0/4 Orion)** and **Type 3 fonts reached only
+through `/Font`, never through an ExtGState (F-84, 9/12)**, plus a hidden soft-mask group (F-85, 5/8
+Nova). Nova sequence length averaged 636k.
+
+**The fixes, and what each cost.** (1) Old models: batch 1 **0/11** on the per-caller Form mode (cut);
+then four FP-voided passes over three batches, each on a place hayro's renderer departs from the spec
+(tag, Properties inheritance, caller mode, direct/inline OCMD), fixed by stating or capping each; batch 9
+**1/10** genuine, approved, then admin-reverted for a rule-by-rule meta; short meta rewritten and pushed
+through the AI gate several times. (2) New models: Orion 2/8 and 1/6, all FP-voided on shared callee
+contexts and the pattern start mode, closed by caps; Orion **0/18** while the inline `/OC` rule was implied
+(sole failure in 8/18). (3) Round 30 stated it and restored F-83 under "drawn only once"; three Task Prompt
+rounds (requirement count twice, AI once) cut the Watermark example and the /Intent cap. (4) Batch 14 Orion
+**2/4**; the FP panel's overruled dissent (indirect ExtGState font size) became one test; re-eval + Nova x8
+read **Nova 0/8, Orion 1/4**, FP genuine. Auto Review asked for revision (S1: reference hides non-`/OC`
+`BDC` with a hidden-group property, copied from the renderer; T4: inline `/OC` -> OCMD untested);
+accepted anyway.
+
+
+## macs-callvar-fragment-phasing (Python+Cython / MACS3 callvar: `--pair-aware` fragment counting and chromosome-wide read-backed phasing) — ACCEPTED 2026-10-13, Nova 0/8 + Orion 1/4
+
+**What made it hard.** One flag, two halves. With `--pair-aware`, callvar counts DNA molecules instead of
+reads (same-name reads are one fragment, at most one observation per position, -Q before grouping,
+concordant mates once, discordant mates nothing, strand from read 1) on both the raw-read and the
+local-assembly paths. It then phases each chromosome's 0/1 calls from those fragments and writes PS and a
+treatment-only BAR. Nova was held by **a per-fragment table built for linking (REF/ALT only) that cannot
+keep a fragment with an uncalled allele off both haplotypes (F-86, 8/8 Nova, 0/4 Orion)**. That was my own
+precheck round-1 reference bug. Also **strand taken from read 2 when read 1 lies outside every peak (F-87,
+8/12)**. Nova sequence length averaged 565k.
+
+**The fixes, and what each cost.** (1) Old models: 9/10, then 6/10 after nearest-earlier linking; four
+batches of FP-voided passes on the fermi-lite path; fermi scoped out; 3/10. (2) Admin revert: Nova 3/5.
+Phasing went chromosome-wide across peaks, then Nova 1/7, 1/8, 0/8. Orion's only pass was FP-voided (its own
+deletion normalizer). (3) The requirement-count gate cut ~27 rules to ~14 and 22 tests, then Orion read
+2/4 twice. The records sentence was deleted and assembly restored (Auto Review S1): Orion 3/4. The strand
+rule was stated: Orion 3/4 again, one FP. (4) Tests only: the FP panel's quiet-peak crash, its judge's
+read-1-outside-peaks probe, and pair-aware == read mode on assembled calls (F-67, L128). Re-eval read
+**Orion 1/4**, and 8 fresh Nova read **0/8**. Four Auto Review tests were added (3 killed nothing), then a
+final re-eval on 55 tests: **Nova 0/8, Orion 1/4**, FP genuine, Auto Review approved (Tests 2/3: BAR
+upward rounding and exact deletion DPT unpinned).

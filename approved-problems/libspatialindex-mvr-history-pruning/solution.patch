@@ -1,0 +1,553 @@
+diff --git a/include/spatialindex/MVRTree.h b/include/spatialindex/MVRTree.h
+index 492e742..e371559 100644
+--- a/include/spatialindex/MVRTree.h
++++ b/include/spatialindex/MVRTree.h
+@@ -84,5 +84,7 @@ namespace SpatialIndex
+ 			IStorageManager& in,
+ 			id_type indexIdentifier
+ 		);
++		SIDX_DLL void pruneHistory(ISpatialIndex& index, double horizon);
++		SIDX_DLL void pruneHistory(ISpatialIndex& index, double horizon, IVisitor& archive);
+ 	}
+ }
+diff --git a/src/mvrtree/Leaf.cc b/src/mvrtree/Leaf.cc
+index 3074de3..4886db1 100644
+--- a/src/mvrtree/Leaf.cc
++++ b/src/mvrtree/Leaf.cc
+@@ -24,6 +24,7 @@
+  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+  * DEALINGS IN THE SOFTWARE.
+ ******************************************************************************/
++#include <limits>
+ #include <spatialindex/SpatialIndex.h>
+ 
+ #include "MVRTree.h"
+@@ -54,7 +55,8 @@ NodePtr Leaf::findLeaf(const TimeRegion& mbr, id_type id, std::stack<id_type>&)
+ 	{
+ 		// should make sure to relinquish other PoolPointer lists that might be pointing to the
+ 		// same leaf.
+-		if (m_pIdentifier[cChild] == id && static_cast<Region>(mbr) == static_cast<Region>(*(m_ptrMBR[cChild])))
++		if (m_pIdentifier[cChild] == id && m_ptrMBR[cChild]->m_endTime == std::numeric_limits<double>::max() &&
++			static_cast<Region>(mbr) == static_cast<Region>(*(m_ptrMBR[cChild])))
+ 			return NodePtr(this, &(m_pTree->m_leafPool));
+ 	}
+ 
+diff --git a/src/mvrtree/MVRTree.cc b/src/mvrtree/MVRTree.cc
+index c4c22c0..530f87d 100644
+--- a/src/mvrtree/MVRTree.cc
++++ b/src/mvrtree/MVRTree.cc
+@@ -25,6 +25,7 @@
+  * DEALINGS IN THE SOFTWARE.
+ ******************************************************************************/
+ 
++#include <cmath>
+ #include <limits>
+ 
+ #include <spatialindex/SpatialIndex.h>
+@@ -34,7 +35,9 @@
+ #include "Index.h"
+ #include "MVRTree.h"
+ 
++#include <algorithm>
+ #include <cstring>
++#include <map>
+ 
+ // set to 1 to enable debugging output
+ #define SI_DEBUG_OUTPUT 0
+@@ -200,6 +203,20 @@ SpatialIndex::ISpatialIndex* SpatialIndex::MVRTree::loadMVRTree(IStorageManager&
+ 	return returnMVRTree(sm, ps);
+ }
+ 
++void SpatialIndex::MVRTree::pruneHistory(ISpatialIndex& index, double horizon)
++{
++	MVRTree* tree = dynamic_cast<MVRTree*>(&index);
++	if (tree == nullptr) throw Tools::IllegalArgumentException("pruneHistory: The index is not an MVR-tree.");
++	tree->pruneHistory(horizon, nullptr);
++}
++
++void SpatialIndex::MVRTree::pruneHistory(ISpatialIndex& index, double horizon, IVisitor& archive)
++{
++	MVRTree* tree = dynamic_cast<MVRTree*>(&index);
++	if (tree == nullptr) throw Tools::IllegalArgumentException("pruneHistory: The index is not an MVR-tree.");
++	tree->pruneHistory(horizon, &archive);
++}
++
+ SpatialIndex::MVRTree::MVRTree::MVRTree(IStorageManager& sm, Tools::PropertySet& ps) :
+ 	m_pStorageManager(&sm),
+ 	m_headerID(StorageManager::NewPage),
+@@ -217,6 +234,7 @@ SpatialIndex::MVRTree::MVRTree::MVRTree(IStorageManager& sm, Tools::PropertySet&
+ 	m_bTightMBRs(true),
+ 	m_bHasVersionCopied(false),
+ 	m_currentTime(0.0),
++	m_horizon(-std::numeric_limits<double>::max()),
+ 	m_pointPool(500),
+ 	m_regionPool(1000),
+ 	m_indexPool(100),
+@@ -571,6 +589,252 @@ void SpatialIndex::MVRTree::MVRTree::flush()
+ 	storeHeader();
+ }
+ 
++void SpatialIndex::MVRTree::MVRTree::pruneHistory(double horizon, IVisitor* archive)
++{
++	if (! std::isfinite(horizon)) throw Tools::IllegalArgumentException("pruneHistory: The horizon must be a finite number.");
++	if (horizon > m_currentTime) throw Tools::IllegalArgumentException("pruneHistory: The horizon is later than the tree current time.");
++	if (horizon <= m_horizon) return;
++
++	if (archive != nullptr) archiveEndedVersions(horizon, *archive);
++
++	std::set<id_type> kept;
++	std::vector<id_type> pruned;
++	collectPrunedNodes(horizon, kept, pruned);
++
++	for (id_type id : pruned)
++	{
++		NodePtr n = readNode(id);
++		m_stats.m_nodesInLevel.at(n->m_level) = m_stats.m_nodesInLevel[n->m_level] - 1;
++		uint32_t& dead = (n->m_level > 0) ? m_stats.m_u32DeadIndexNodes : m_stats.m_u32DeadLeafNodes;
++		if (dead > 0) --dead;
++		deleteNode(n.get());
++	}
++	while (m_stats.m_nodesInLevel.size() > 1 && m_stats.m_nodesInLevel.back() == 0) m_stats.m_nodesInLevel.pop_back();
++
++	for (id_type id : kept) compactNode(id, horizon);
++
++	std::vector<RootEntry> roots;
++	std::vector<uint32_t> heights;
++	for (size_t cRoot = 0; cRoot < m_roots.size(); ++cRoot)
++	{
++		if (! endsAfter(m_roots[cRoot].m_endTime, horizon)) continue;
++		roots.push_back(m_roots[cRoot]);
++		heights.push_back(m_stats.m_treeHeight[cRoot]);
++	}
++	m_roots.swap(roots);
++	m_stats.m_treeHeight.swap(heights);
++
++	refreshLiveBounds(m_roots.back().m_id);
++
++	for (std::set<ErasedVersion>::iterator it = m_erasedVersions.begin(); it != m_erasedVersions.end();)
++	{
++		if (endsAfter(std::get<1>(*it), horizon)) ++it;
++		else it = m_erasedVersions.erase(it);
++	}
++
++	m_horizon = horizon;
++	storeHeader();
++}
++
++bool SpatialIndex::MVRTree::MVRTree::endsAfter(double endTime, double horizon) const
++{
++	return endTime > horizon || endTime == std::numeric_limits<double>::max();
++}
++
++SpatialIndex::MVRTree::ErasedVersion SpatialIndex::MVRTree::MVRTree::erasedVersion(id_type id, double time, const Region& box)
++{
++	std::vector<double> coords(box.m_pLow, box.m_pLow + box.m_dimension);
++	coords.insert(coords.end(), box.m_pHigh, box.m_pHigh + box.m_dimension);
++	return ErasedVersion(id, time, coords);
++}
++
++void SpatialIndex::MVRTree::MVRTree::collectPrunedNodes(double horizon, std::set<id_type>& kept, std::vector<id_type>& pruned)
++{
++	std::stack<id_type> st;
++
++	for (const RootEntry& e : m_roots)
++	{
++		if (endsAfter(e.m_endTime, horizon) && kept.insert(e.m_id).second) st.push(e.m_id);
++	}
++
++	while (! st.empty())
++	{
++		NodePtr n = readNode(st.top()); st.pop();
++		if (n->m_level == 0) continue;
++
++		for (uint32_t cChild = 0; cChild < n->m_children; ++cChild)
++		{
++			if (endsAfter(n->m_ptrMBR[cChild]->m_endTime, horizon) && kept.insert(n->m_pIdentifier[cChild]).second)
++				st.push(n->m_pIdentifier[cChild]);
++		}
++	}
++
++	std::set<id_type> visited;
++
++	for (const RootEntry& e : m_roots)
++	{
++		if (visited.insert(e.m_id).second) st.push(e.m_id);
++	}
++
++	while (! st.empty())
++	{
++		id_type id = st.top(); st.pop();
++		if (kept.find(id) == kept.end()) pruned.push_back(id);
++
++		NodePtr n = readNode(id);
++		if (n->m_level == 0) continue;
++
++		for (uint32_t cChild = 0; cChild < n->m_children; ++cChild)
++		{
++			if (visited.insert(n->m_pIdentifier[cChild]).second) st.push(n->m_pIdentifier[cChild]);
++		}
++	}
++}
++
++void SpatialIndex::MVRTree::MVRTree::archiveEndedVersions(double horizon, IVisitor& archive)
++{
++	std::map<id_type, double> lifetimeEnd;
++	std::stack<id_type> st;
++
++	for (const RootEntry& e : m_roots)
++	{
++		std::map<id_type, double>::iterator it = lifetimeEnd.find(e.m_id);
++		if (it != lifetimeEnd.end() && it->second >= e.m_endTime) continue;
++		lifetimeEnd[e.m_id] = e.m_endTime;
++		st.push(e.m_id);
++	}
++
++	while (! st.empty())
++	{
++		id_type id = st.top(); st.pop();
++		double end = lifetimeEnd[id];
++		NodePtr n = readNode(id);
++		if (n->m_level == 0) continue;
++
++		for (uint32_t cChild = 0; cChild < n->m_children; ++cChild)
++		{
++			double childEnd = std::min(end, n->m_ptrMBR[cChild]->m_endTime);
++			std::map<id_type, double>::iterator it = lifetimeEnd.find(n->m_pIdentifier[cChild]);
++			if (it != lifetimeEnd.end() && it->second >= childEnd) continue;
++			lifetimeEnd[n->m_pIdentifier[cChild]] = childEnd;
++			st.push(n->m_pIdentifier[cChild]);
++		}
++	}
++
++	std::vector<VersionFragment> fragments;
++
++	for (const std::pair<const id_type, double>& node : lifetimeEnd)
++	{
++		NodePtr n = readNode(node.first);
++		if (n->m_level != 0) continue;
++
++		for (uint32_t cChild = 0; cChild < n->m_children; ++cChild)
++		{
++			VersionFragment f;
++			f.m_id = n->m_pIdentifier[cChild];
++			f.m_region = *(n->m_ptrMBR[cChild]);
++			f.m_deleted = f.m_region.m_endTime <= node.second;
++			f.m_region.m_endTime = std::min(node.second, f.m_region.m_endTime);
++			if (m_erasedVersions.count(erasedVersion(f.m_id, f.m_region.m_endTime, f.m_region)) > 0) f.m_deleted = true;
++			if (f.m_region.m_endTime <= f.m_region.m_startTime) continue;
++			if (n->m_pDataLength[cChild] > 0) f.m_data.assign(n->m_pData[cChild], n->m_pData[cChild] + n->m_pDataLength[cChild]);
++			fragments.push_back(f);
++		}
++	}
++
++	std::sort(fragments.begin(), fragments.end(),
++		[](const VersionFragment& a, const VersionFragment& b)
++		{
++			if (a.m_region.m_startTime != b.m_region.m_startTime) return a.m_region.m_startTime < b.m_region.m_startTime;
++			return a.m_region.m_endTime < b.m_region.m_endTime;
++		});
++
++	std::vector<bool> continued(fragments.size(), false);
++
++	for (size_t cFragment = 0; cFragment < fragments.size(); ++cFragment)
++	{
++		if (continued[cFragment]) continue;
++		VersionFragment version = fragments[cFragment];
++
++		for (size_t cNext = cFragment + 1; cNext < fragments.size() && ! version.m_deleted; ++cNext)
++		{
++			const VersionFragment& next = fragments[cNext];
++			if (continued[cNext] || next.m_region.m_startTime != version.m_region.m_endTime) continue;
++			if (next.m_id != version.m_id || next.m_data != version.m_data) continue;
++			if (! (static_cast<Region>(next.m_region) == static_cast<Region>(version.m_region))) continue;
++			version.m_region.m_endTime = next.m_region.m_endTime;
++			version.m_deleted = next.m_deleted;
++			continued[cNext] = true;
++		}
++
++		if (endsAfter(version.m_region.m_endTime, horizon)) continue;
++		version.m_region.m_startTime = std::max(version.m_region.m_startTime, m_horizon);
++		Data data(static_cast<uint32_t>(version.m_data.size()), version.m_data.data(), version.m_region, version.m_id);
++		archive.visitData(data);
++	}
++}
++
++void SpatialIndex::MVRTree::MVRTree::compactNode(id_type id, double horizon)
++{
++	NodePtr n = readNode(id);
++	double startTime = n->m_nodeMBR.m_startTime;
++	double endTime = n->m_nodeMBR.m_endTime;
++	bool changed = false;
++
++	for (uint32_t cChild = n->m_children; cChild > 0; --cChild)
++	{
++		if (endsAfter(n->m_ptrMBR[cChild - 1]->m_endTime, horizon)) continue;
++		n->deleteEntry(cChild - 1);
++		changed = true;
++	}
++
++	if (! changed) return;
++
++	n->m_nodeMBR.m_startTime = startTime;
++	n->m_nodeMBR.m_endTime = endTime;
++	writeNode(n.get());
++}
++
++void SpatialIndex::MVRTree::MVRTree::refreshLiveBounds(id_type id)
++{
++	NodePtr n = readNode(id);
++	if (n->m_level == 0) return;
++
++	bool changed = false;
++
++	for (uint32_t cChild = 0; cChild < n->m_children; ++cChild)
++	{
++		if (n->m_ptrMBR[cChild]->m_endTime < std::numeric_limits<double>::max()) continue;
++
++		refreshLiveBounds(n->m_pIdentifier[cChild]);
++		NodePtr child = readNode(n->m_pIdentifier[cChild]);
++		if (static_cast<Region>(*(n->m_ptrMBR[cChild])) == static_cast<Region>(child->m_nodeMBR)) continue;
++
++		memcpy(n->m_ptrMBR[cChild]->m_pLow, child->m_nodeMBR.m_pLow, m_dimension * sizeof(double));
++		memcpy(n->m_ptrMBR[cChild]->m_pHigh, child->m_nodeMBR.m_pHigh, m_dimension * sizeof(double));
++		changed = true;
++	}
++
++	if (! changed) return;
++
++	if (m_bTightMBRs)
++	{
++		for (uint32_t cDim = 0; cDim < m_dimension; ++cDim)
++		{
++			n->m_nodeMBR.m_pLow[cDim] = std::numeric_limits<double>::max();
++			n->m_nodeMBR.m_pHigh[cDim] = -std::numeric_limits<double>::max();
++
++			for (uint32_t cChild = 0; cChild < n->m_children; ++cChild)
++			{
++				n->m_nodeMBR.m_pLow[cDim] = std::min(n->m_nodeMBR.m_pLow[cDim], n->m_ptrMBR[cChild]->m_pLow[cDim]);
++				n->m_nodeMBR.m_pHigh[cDim] = std::max(n->m_nodeMBR.m_pHigh[cDim], n->m_ptrMBR[cChild]->m_pHigh[cDim]);
++			}
++		}
++	}
++
++	writeNode(n.get());
++}
++
+ void SpatialIndex::MVRTree::MVRTree::initNew(Tools::PropertySet& ps)
+ {
+ 	Tools::Variant var;
+@@ -877,7 +1141,11 @@ void SpatialIndex::MVRTree::MVRTree::storeHeader()
+ 		sizeof(double) +											// m_currentTime
+ 		sizeof(uint32_t) +											// m_nodesInLevel size
+ 		static_cast<uint32_t>(m_stats.m_nodesInLevel.size())
+-		* sizeof(uint32_t);											// m_nodesInLevel values
++		* sizeof(uint32_t) +										// m_nodesInLevel values
++		sizeof(double) +											// m_horizon
++		sizeof(uint32_t) +											// m_erasedVersions size
++		static_cast<uint32_t>(m_erasedVersions.size())
++		* (sizeof(id_type) + sizeof(double) + 2 * m_dimension * sizeof(double));	// m_erasedVersions values
+ 
+ 	uint8_t* header = new uint8_t[headerSize];
+ 	uint8_t* ptr = header;
+@@ -958,6 +1226,23 @@ void SpatialIndex::MVRTree::MVRTree::storeHeader()
+ 		ptr += sizeof(uint32_t);
+ 	}
+ 
++	memcpy(ptr, &m_horizon, sizeof(double));
++	ptr += sizeof(double);
++
++	uint32_t erased = static_cast<uint32_t>(m_erasedVersions.size());
++	memcpy(ptr, &erased, sizeof(uint32_t));
++	ptr += sizeof(uint32_t);
++
++	for (const ErasedVersion& e : m_erasedVersions)
++	{
++		memcpy(ptr, &std::get<0>(e), sizeof(id_type));
++		ptr += sizeof(id_type);
++		memcpy(ptr, &std::get<1>(e), sizeof(double));
++		ptr += sizeof(double);
++		memcpy(ptr, std::get<2>(e).data(), 2 * m_dimension * sizeof(double));
++		ptr += 2 * m_dimension * sizeof(double);
++	}
++
+ 	m_pStorageManager->storeByteArray(m_headerID, headerSize, header);
+ 
+ 	delete[] header;
+@@ -1051,6 +1336,32 @@ void SpatialIndex::MVRTree::MVRTree::loadHeader()
+ 		m_stats.m_nodesInLevel.push_back(u32I);
+ 	}
+ 
++	if (headerSize - static_cast<uint32_t>(ptr - header) >= sizeof(double))
++	{
++		memcpy(&m_horizon, ptr, sizeof(double));
++		ptr += sizeof(double);
++	}
++
++	if (headerSize - static_cast<uint32_t>(ptr - header) >= sizeof(uint32_t))
++	{
++		uint32_t erased;
++		memcpy(&erased, ptr, sizeof(uint32_t));
++		ptr += sizeof(uint32_t);
++
++		for (uint32_t cErased = 0; cErased < erased; ++cErased)
++		{
++			ErasedVersion e;
++			std::get<2>(e).resize(2 * m_dimension);
++			memcpy(&std::get<0>(e), ptr, sizeof(id_type));
++			ptr += sizeof(id_type);
++			memcpy(&std::get<1>(e), ptr, sizeof(double));
++			ptr += sizeof(double);
++			memcpy(std::get<2>(e).data(), ptr, 2 * m_dimension * sizeof(double));
++			ptr += 2 * m_dimension * sizeof(double);
++			m_erasedVersions.insert(e);
++		}
++	}
++
+ 	delete[] header;
+ }
+ 
+@@ -1113,7 +1424,8 @@ bool SpatialIndex::MVRTree::MVRTree::deleteData_impl(const TimeRegion& mbr, id_t
+ 
+ 	if (l.get() != nullptr)
+ 	{
+-		l->deleteData(id, mbr.m_endTime, pathBuffer);
++		Region box(mbr.m_pLow, mbr.m_pHigh, mbr.m_dimension);
++		l->deleteData(id, mbr.m_endTime, pathBuffer, false, &box);
+ 		--(m_stats.m_u64Data);
+ 		return true;
+ 	}
+@@ -1243,6 +1555,17 @@ void SpatialIndex::MVRTree::MVRTree::rangeQuery(RangeQueryType type, const IShap
+ 	const Tools::IInterval* ti = dynamic_cast<const Tools::IInterval*>(&query);
+ 	if (ti == nullptr) throw Tools::IllegalArgumentException("rangeQuery: Shape does not support the Tools::IInterval interface.");
+ 
++	if (ti->getUpperBound() <= m_horizon) return;
++
++	TimeRegion window;
++	if (ti->getLowerBound() < m_horizon)
++	{
++		Region mbr;
++		query.getMBR(mbr);
++		window = TimeRegion(mbr, m_horizon, ti->getUpperBound());
++		ti = &window;
++	}
++
+ 	std::set<id_type> visitedNodes;
+ 	std::set<id_type> visitedData;
+ 	std::stack<NodePtr> st;
+diff --git a/src/mvrtree/MVRTree.h b/src/mvrtree/MVRTree.h
+index 071c05e..ebd4450 100644
+--- a/src/mvrtree/MVRTree.h
++++ b/src/mvrtree/MVRTree.h
+@@ -31,6 +31,7 @@
+ #include "Node.h"
+ #include "PointerPoolNode.h"
+ #include <memory>
++#include <tuple>
+ 
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wcast-qual"
+@@ -39,6 +40,8 @@ namespace SpatialIndex
+ {
+ 	namespace MVRTree
+ 	{
++		typedef std::tuple<id_type, double, std::vector<double> > ErasedVersion;
++
+ 		class MVRTree : public ISpatialIndex
+ 		{
+ 			class NNEntry;
+@@ -88,6 +91,8 @@ namespace SpatialIndex
+ 			virtual void getStatistics(IStatistics** out) const ;
+ 			virtual void flush() ;
+ 
++			void pruneHistory(double horizon, IVisitor* archive);
++
+ 		private:
+ 			void initNew(Tools::PropertySet&);
+ 			void initOld(Tools::PropertySet& ps);
+@@ -104,6 +109,13 @@ namespace SpatialIndex
+ 
+ 			void rangeQuery(RangeQueryType type, const IShape& query, IVisitor& v);
+ 
++			bool endsAfter(double endTime, double horizon) const;
++			static ErasedVersion erasedVersion(id_type id, double time, const Region& box);
++			void collectPrunedNodes(double horizon, std::set<id_type>& kept, std::vector<id_type>& pruned);
++			void archiveEndedVersions(double horizon, IVisitor& archive);
++			void compactNode(id_type id, double horizon);
++			void refreshLiveBounds(id_type id);
++
+ 			void findRootIdentifiers(const Tools::IInterval& ti, std::vector<id_type>& ids);
+ 			std::string printRootInfo() const;
+ 
+@@ -151,6 +163,11 @@ namespace SpatialIndex
+ 
+ 			double m_currentTime;
+ 
++			double m_horizon;
++
++
++			std::set<ErasedVersion> m_erasedVersions;
++
+ 			Tools::PointerPool<Point> m_pointPool;
+ 			Tools::PointerPool<TimeRegion> m_regionPool;
+ 			Tools::PointerPool<Node> m_indexPool;
+@@ -171,6 +188,15 @@ namespace SpatialIndex
+ 				double m_endTime;
+ 			}; // RootEntry
+ 
++			class VersionFragment
++			{
++			public:
++				id_type m_id;
++				TimeRegion m_region;
++				std::vector<uint8_t> m_data;
++				bool m_deleted;
++			}; // VersionFragment
++
+ 			class NNEntry
+ 			{
+ 			public:
+diff --git a/src/mvrtree/Node.cc b/src/mvrtree/Node.cc
+index d2b0ffa..9e96133 100644
+--- a/src/mvrtree/Node.cc
++++ b/src/mvrtree/Node.cc
+@@ -669,7 +669,7 @@ void Node::insertData(TimeRegion& mbr1, id_type id1, TimeRegion& mbr2, id_type i
+ 	}
+ }
+ 
+-bool Node::deleteData(id_type id, double delTime, std::stack<id_type>& pathBuffer, bool bForceAdjust)
++bool Node::deleteData(id_type id, double delTime, std::stack<id_type>& pathBuffer, bool bForceAdjust, const Region* box)
+ {
+ 	// it returns true if a new root has been created because all the entries of the old root have died.
+ 	// This is needed in case the root dies while there are pending reinsertions from multiple levels
+@@ -687,7 +687,9 @@ bool Node::deleteData(id_type id, double delTime, std::stack<id_type>& pathBuffe
+ 	{
+ 		assert(m_level != 0 || (m_ptrMBR[cChild]->m_startTime != m_ptrMBR[cChild]->m_endTime));
+ 		if (! (m_ptrMBR[cChild]->m_endTime < std::numeric_limits<double>::max())) ++alive;
+-		if (m_pIdentifier[cChild] == id) child = cChild;
++		if (m_pIdentifier[cChild] != id) continue;
++		if (box == nullptr || (m_ptrMBR[cChild]->m_endTime == std::numeric_limits<double>::max() &&
++			static_cast<Region>(*(m_ptrMBR[cChild])) == *box)) child = cChild;
+ 	}
+ 
+ 	assert(child < m_capacity);
+@@ -698,6 +700,7 @@ bool Node::deleteData(id_type id, double delTime, std::stack<id_type>& pathBuffe
+ 
+ 	if (m_level == 0 && m_ptrMBR[child]->m_startTime == delTime)
+ 	{
++		m_pTree->m_erasedVersions.insert(MVRTree::erasedVersion(id, delTime, *(m_ptrMBR[child])));
+ 		bAdjusted = deleteEntry(child);
+ 		bAdjustParent = bAdjusted;
+ 	}
+diff --git a/src/mvrtree/Node.h b/src/mvrtree/Node.h
+index 63f9a53..148460e 100644
+--- a/src/mvrtree/Node.h
++++ b/src/mvrtree/Node.h
+@@ -88,7 +88,7 @@ namespace SpatialIndex
+ 				uint32_t dataLength, uint8_t* pData, TimeRegion& mbr, id_type id, std::stack<id_type>& pathBuffer,
+ 				TimeRegion& mbr2, id_type id2, bool bInsertMbr2 = false, bool forceAdjust = false);
+ 			virtual void insertData(TimeRegion& mbr1, id_type id1, TimeRegion& mbr2, id_type id2, Node* oldVersion, std::stack<id_type>& pathBuffer);
+-			virtual bool deleteData(id_type id, double delTime, std::stack<id_type>& pathBuffer, bool adjustMBR = false);
++			virtual bool deleteData(id_type id, double delTime, std::stack<id_type>& pathBuffer, bool adjustMBR = false, const Region* box = nullptr);
+ 
+ 			virtual void rtreeSplit(
+ 				uint32_t dataLength, uint8_t* pData, TimeRegion& mbr, id_type id, std::vector<uint32_t>& group1, std::vector<uint32_t>& group2,

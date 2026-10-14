@@ -2452,3 +2452,222 @@ the platform also validates as an unmapped uid (4242), so the test must be deter
 and `create_works_for_a_user_without_a_passwd_entry` passed identically as root, uid 1000 and uid 4242;
 the passwd-less create killed 3/10 in the accepted batch. The repo's own `StorageDeviceTest.ValidateFile`
 (red as root) went back into base mode the same way, through `setpriv` in test.sh.
+
+## Pattern 108 — Output-derived whole-unit oracle for composed coverage
+
+**When.** A parent combines composite values (a child model's rows, a sub-query's tuples, a nested
+record) and the contract says the parent covers combinations of those units. Pinning the reference's
+unit values breaks on any agent that generates its child rows differently.
+
+**Procedure.**
+1. Generate once. For each unit, read its projections from the output: the set seen in rows WITHOUT the
+   special value, and the set that carries it.
+2. For every combination of units at the parent's order, require every product of ordinary projections to
+   appear in an ordinary row, and every product with exactly one special projection to appear somewhere.
+3. Use a small parent (two children, nothing else, order 2) so the product is exhaustive and cheap; add a
+   mixed parent (direct parameters plus children) and an order-3 parent as separate cells.
+4. Keep leaf-pair checks too: they name the failing value when the unit check is too coarse to read.
+
+**Measured.** pict-engine-negative-values: `test_child_models_combine_as_whole_rows` killed 5/10 in the
+accepted batch and was the sole failure of two 33/34 runs; both earlier full-suite passers passed it, so
+it cut no legitimate solution. The one-partner-row mutant failed only this test.
+
+## Pattern 109 — Contract as an invariance law, tests as rotate-and-compare pairs
+
+**When.** A feature changes the geometry of a coordinate domain (circular, periodic, re-based origin,
+shifted frame) across a whole pipeline, and pinning exact outputs would pin the reference's arithmetic.
+
+**Procedure.**
+1. Write the contract as one law: "transforming every input by T transforms every output position by T
+   and leaves every score, count and estimate unchanged", plus the few coordinate conventions the
+   outputs need (crossing intervals reported once, start inside, end past the length).
+2. Test each output mode with a pair of runs: data as generated, then every input transformed so the
+   interesting structure moves (e.g. an origin-straddling site moved mid-chromosome). Map the second
+   run's coordinates back and compare every column.
+3. Choose the transform with a safe cut (no read body spans it) so both runs are valid inputs.
+4. Add independent oracles only where a value is cheap to compute exactly (per-base coverage, per-base
+   local lambda), and one absolute check for a statistic rotation cannot see (top-rank q = p - log10 N).
+5. Keep every optional estimator ON in one test of its own (F-64).
+6. Do not test the law's degenerate cases (full wrap, ties) unless the canonical choice is stated (L104).
+
+**Measured.** macs-circular-chromosomes: no reference value pinned, Description 3/3 in every review
+round; the rotation pairs carried every killer (model 10/11, broad 8/11, subpeak 5/11), and the local
+replay of saved patches matched the re-eval run for run.
+
+## Pattern 110 — Independent-algebra oracle plus one exact composite as the convention proof
+
+**When.** A physics or math feature whose reference is written in closed forms (a Jones/Mueller
+transform, a rotation, a Fresnel product) and whose tests would otherwise copy those same forms.
+
+**Recipe.**
+1. Write the oracle in a different algebra from the reference: complex 2x2 Jones matrices applied to
+   the full coherency matrix M' = J M J^H in WORLD coordinates, where the reference works in the local
+   frame with expanded real arithmetic.
+2. Derive each element's matrix from the contract sentence alone (axis projected onto the ray's
+   transverse plane and renormalised), so the oracle tests the contract, not the reference.
+3. Add one textbook composite whose answer is known independently of any convention (a double-pass
+   quarter-wave plate around a mirror turns s light into pure p light). If the reference passes it, the
+   sign conventions (back-side flip, mirror sign, retarder phase) are mutually consistent.
+4. Keep that composite: its exact zero is also an F-66 cell against expanded arithmetic.
+
+**Measured.** ray-optics-sp-coherence-transport: the oracle covered 16 element and legacy tests, no
+fairness finding across six reviews; the isolator killed 4/10 in the accepted batch (numerics, F-66)
+and proved the reference's conventions before any batch.
+
+## Pattern 111 — FP-hole triage: name it, move it, or cap it
+
+**When.** The FP panel voids passes batch after batch, each for a different edge, and every fix risks
+the solvability floor.
+
+**Recipe.**
+1. Replay every saved solution through a probe library (all fixtures written so far) against the
+   reference. Divergences are the next FP flags; fix them before a batch finds them.
+2. If the edge follows from a rule the description only implies, name it in one sentence and test it.
+   Named rules cost ~0 in pass rate (L109).
+3. If the description never defines the boundary and runs split between readings, move the fixture
+   across a boundary where every reading agrees (L110). Tests-only, re-eval eligible.
+4. If base itself mishandles the input family, or the family has produced FPs in several different
+   ways, put it out of scope in one sentence (L101) and drop its tests.
+5. Replay again after each step; ship the round only when some saved solution still passes or the
+   remaining near-misses each fail one stated seam.
+
+**Measured.** riff-unified-conflict-regions: four batches of voided passes (empty sides, no-final-newline
+x3, second opener, stray markers). After naming two rules and capping one family, the accepted batch read
+1/10 with a clean panel, and the named rules killed 0/10.
+
+## Pattern 112 — Zero-batch triage from assertion diffs
+
+**When.** A batch reads 0/N (or a near-miss list looks thin) and you are about to choose a cut.
+
+**Recipe.**
+1. Parse every failing JUnit cell and bucket it by its ASSERTION DIFF, never by test name: load-time
+   rejections (grammar/schema refused, compile error), normalization-only diffs (expected and actual
+   equal once the base code's own post-processing is applied, e.g. trailing shifts stripped), and real
+   behavioural diffs.
+2. Normalization-only runs are hidden passes: relax the assertion to compare modulo the normalization
+   (tests-only, re-eval eligible) before touching meta.md (L112).
+3. Load-time rejections concentrated on one fixture property (a symbol declared only by the new
+   directive) are one pattern taxing many tests; report it once, not per test (F-71).
+4. For each run whose real diffs reduce to ONE edge, check whether the near-misses fail that edge the
+   same way (state it) or differently (cap the domain, L113).
+5. Replay the saved patches with the chosen cut and count "fails only the new cap/definition test" as a
+   pass before paying for the fresh batch.
+
+**Measured.** grmtools-contextual-lexeme-readings: bucketing by diff showed most batch 2-4 "recovery"
+kills were grammars rejected at load (F-71, 14 runs), and that batch 3 Nova_9 failed only on retained
+trailing piece shifts (a hidden pass in a 0/10 batch). The cap chosen this way took the next batch to 2/10.
+
+## Pattern 113 — Split a converged strong agent at an implied domain boundary
+
+**When.** Under the 2026-10-09 gate the Orion/Vega side reads too easy (2/4 or more, or 4/4 once an unfair
+test is removed), Nova is at 0, and you have the strong agent's saved patches.
+
+**Recipe.**
+1. Replay the saved patches on the current suite to get the true rate (re-eval would give the same number).
+2. Fuzz the strong agent's solutions against EACH OTHER and the reference with a seeded scenario generator
+   over the public API and the test fake. Zero divergence means every stated axis has converged: a new test
+   on a stated rule will kill all of them or none.
+3. Fix any divergence where the agents beat the reference first (it is a reference bug, not a lever).
+4. Have a subagent read the patches for behaviour that only differs at the EDGE of the input domain: integer
+   width, top of an address space, encoding range, empty or maximal sizes. Keep only a split the contract's
+   existing promise already decides.
+5. Write the test against the promise (here "low memory is not watched"), accepting every reading the
+   contract allows, and make it fail-to-pass on base with a follow-up step only the feature can do.
+6. Replay: target exactly the 1-of-4 and confirm no Nova run flips. Do not add a meta sentence (L109).
+
+**Measured.** pyocd-dwt-watchpoint-planner: 3400 differential scenarios, 0 divergence among four Orion runs;
+the 32-bit top split them 1/3; replay and re-eval both read Orion 1/4, Nova 0/8; Auto Review "subtle but
+fair", FP panel genuine.
+
+## Pattern 114 — Re-replay the edges you held back before inventing a new lever
+
+**When.** The strong agent reads 2/4 or more, Nova is near zero, and probes of every stated axis (Test
+Quality coverage suggestions, variants of the traps that already killed) show zero divergence between the
+strong agent's passes.
+
+**Recipe.**
+1. Keep a ledger from the first gate round: every edge you found (usually a Solution Quality or FP finding
+   on your own reference), fixed in the reference, and left untested because a replay said it killed too
+   many runs. Record the replay numbers and the meta sentence that covers it.
+2. When the strong agent converges, replay each held-back edge against the CURRENT passers. The agents and
+   suite have changed since it was shelved; a cut that once killed 2/3 may now split 1/1.
+3. Test it as the contract states it ("compiles and runs with identical output"), never the value the
+   reference picks, and pair it with a line base cannot run so it is fail-to-pass on every implementation.
+4. Close Test Quality "partial" coverage items in the same tests-only round with programs that killed no
+   saved patch: they cost nothing at the gate.
+5. Retry the export download for any passer whose patch is missing before spending the re-eval.
+
+**Measured.** cwerg-fe-address-constants: 11 probes, 0 divergence between two Orion passers; the held-back
+empty-span `front` (F-75) split them 1/1 and killed the batch-9 Nova pass; re-eval Nova 0/8, Orion 1/4,
+Auto Review "subtle but fair". Sibling of Pattern 113 (implied domain boundary).
+
+## Pattern 115 — Take the FP panel's scenario even when it removes the only pass
+
+When the FP panel voids the strong agent's only pass with a concrete, legal scenario, write that scenario
+as a test, replay it on every saved strong solution (only the voided pass should flip), size it to avoid
+base-library leaks the oracle cannot model, and re-eval. Then add fresh runs of the same agent: the gate
+pool is cumulative across re-evals and fresh runs (L121). libspatialindex-mvr-history-pruning: the
+previous-horizon shortcut (F-79) voided batch 8's only Orion pass; re-eval read Orion 0/4, fresh runs
+read 2/2 and then 0/2, accepted at Orion 2/8, and the same test was the sole failure of both 34/35 Orion
+near-misses.
+
+## Pattern 116 — Split a converged strong agent on an invariant base keeps and the new path bypasses
+
+When every stated cell has converged for the strong agent and the meta is at the requirement-count limit,
+stop looking for rules to add. Run the passers, the reference AND base through probes of what base already
+guarantees on the paths the feature reroutes: identity of shared references, existing output lines,
+invariants the repo documents in its own comments or existing tests. A cell where base and the reference
+agree and some passers differ is a fair, sentence-free discriminator.
+
+1. List the base guarantees on every rerouted path (write, render, search), with the repo line that
+   documents each.
+2. Probe base (without the feature's inputs), the reference and every saved strong solution.
+3. Keep only cells where base and the reference agree; test the invariant, not the reference's shape.
+4. Replay on the whole saved pool; confirm at least one strong pass survives.
+
+**Measured.** asdf-conversion-free-lazy-tree: after Orion 3/4, a shared-container probe split the passers
+3/1 with base on the reference's side; as a test it killed 15/20 in the accepted batch (6/8 Orion, the sole
+failure of three) and Auto Review called it "subtle but fair, inferable from lazy_nodes.py:45-46". Sibling of
+Pattern 113 (implied boundary) and Pattern 114 (held-back edges).
+
+## hayro-optional-content-baking (APPROVED Olympus 2026-10-12)
+
+## Pattern 117 — Mine the FP panel's dissent for the 1-of-4 lever
+
+When the strong agent reads 2/4 and the FP panel has run on both passes, its dissenting judges have
+already probed each passer for exactly the near-miss you need. A dissent the adjudicator overruled as
+"not a stated requirement" is free evidence: the probe fails the candidate and passes the reference.
+
+1. Collect every dissenting probe from the panel text, per passer.
+2. Drop dissents where the reference is the less correct side (the panel often says so).
+3. Replay the rest on every saved strong solution and the reference; keep one that kills exactly one
+   passer and lands on a stated promise.
+4. Add it as one test, re-eval the batch (tests-only), then run the remaining Nova.
+
+**Measured.** hayro-optional-content-baking batch 14, Orion 2/4: judge-c's indirect ExtGState font-size
+probe on one passer; replay killed only that passer; re-eval graded it FAIL_MISSED_REQUIREMENT and read
+**Orion 1/4**, Nova 0/8, accepted. The other passer's dissent (Type 3 glyphs under `Tr 7`) was skipped
+because the reference was the less correct side. Sibling of Pattern 114 (held-back edges) and Pattern 115
+(the panel's scenario).
+
+## macs-callvar-fragment-phasing (APPROVED Olympus 2026-10-13)
+
+## Pattern 118 — Option-off equality on the path the meta never mentions
+
+When the stated surface has converged (probes give 0 divergence) and the strong agent still passes too
+often, look at the repo paths the default flags take that the meta does not name (a local-assembly
+recall, a fallback engine, a legacy mode). The base already defines the right answer there for any input
+where the new rule changes nothing.
+
+1. Build a fixture where the feature is a no-op by construction (here: no fragment has two reads over the
+   site, so fragment depth must equal read depth).
+2. Route it through the unnamed path under default flags (and the forced mode).
+3. Run each saved strong solution with the option on and off; keep the fixture if a passer differs.
+4. Assert option-on == option-off on the counts (not on fields the feature may legitimately change), add
+   one test, re-eval.
+
+**Measured.** macs-callvar-fragment-phasing batch 17, Orion 3/4: on -F auto/on assembled calls two passers
+placed reads by substring and lost one (29 vs 30). The test killed Orion #3 alone (sole failure) and #4,
+and in the accepted batch **7/12** (5/8 Nova); the evaluator graded it FAIL_MISSED_REQUIREMENT. Together
+with the FP panel's quiet-peak crash and read-1 cell: **Orion 3/4 → 1/4**, accepted. Siblings: Pattern 116
+(base invariants the new path bypasses), Pattern 117 (FP-panel dissent).

@@ -1,10 +1,12 @@
 ---
 name: olympus-review
-description: Use when reviewing an Olympus / Diamond submission (one tier since the 2026-07 sprint merged Mars into Olympus; current floor >=200 effective LOC / >=2 files / >=40 solver-median messages, pass ceiling <=40%). Applies the 7-stage evidence-based Reviewer process (hard-block precheck, Pattern 22 GitHub audit, submission understanding, rejection eligibility, description, tests, solution, subtle bugs, Diamond branch). Reviewer scope = visible artifacts only: meta.md + test.patch + solution.patch + Dockerfile (Olympus) + failure-qa.md + test-groups.md + solution-approach.md + Env Description (Diamond). NEVER base review on author-only files (DESIGN.md, feedback.md, eval-results.md). Triggers when user mentions "review submission", "Mars review", "review this problem", "check this submission", "/review", or opens a problem folder containing meta.md + test.patch + solution.patch + Dockerfile. Source of truth: Admin-Review/docs/MARS-REVIEW-GUIDE.md and .agents/workflows/review.md. Evidence: Admin-Review/docs/REVIEWER-PATTERNS.md (26-sub mined dataset, 23 patterns ranked by hit count). CLAUDE.md RULE UPDATE 2026-07 (SPRINT).
+description: Use when reviewing an Olympus / Diamond submission (one tier since the 2026-07 sprint merged Mars into Olympus; since 2026-10-09 the gate is per agent: Nova >=8 runs at 0%, Orion or Vega >=4 runs at >0% and <=25%, Nova average sequence length >256k). Applies the 7-stage evidence-based Reviewer process (hard-block precheck, Pattern 22 GitHub audit, submission understanding, rejection eligibility, description, tests, solution, subtle bugs, Diamond branch). Reviewer scope = visible artifacts only: meta.md + test.patch + solution.patch + Dockerfile (Olympus) + failure-qa.md + test-groups.md + solution-approach.md + Env Description (Diamond). NEVER base review on author-only files (DESIGN.md, feedback.md, eval-results.md). Triggers when user mentions "review submission", "Mars review", "review this problem", "check this submission", "/review", or opens a problem folder containing meta.md + test.patch + solution.patch + Dockerfile. Source of truth: Admin-Review/docs/MARS-REVIEW-GUIDE.md and .agents/workflows/review.md. Evidence: Admin-Review/docs/REVIEWER-PATTERNS.md (26-sub mined dataset, 23 patterns ranked by hit count). CLAUDE.md RULE UPDATE 2026-07 (SPRINT).
 ---
 
 # Olympus / Mars / Diamond Submission Review
 
+> **NEW-MODEL GATE 2026-10-09 (supersedes every pass band and long-horizon floor below):** the models behind Nova, Orion and Vega changed. **Nova: >=8 runs, 0 passes** (any Nova pass = too easy). **Orion OR Vega: >=4 runs of the same agent, >0% and <=25%** (4 runs = exactly 1 pass; 0 = unsolvable; 2/4 = too easy). **Sequence length replaces the long-horizon metrics:** the average over all Nova runs must be >256k (max input+output tokens per step, compaction windows summed). FP panel, Auto Review and the other checks are unchanged. A batch measured before 2026-10-09 is old-model data and does not show the gate is met.
+>
 > **SPRINT UPDATE 2026-07 (supersedes 2026-06-26 bands below where they conflict):** Mars merged into Olympus -- ONE TIER now, author/review everything as Olympus. New long-horizon floor: **>=2 file changes, >=40 agent messages (solver median), >=200 effective LOC** (down from 3 files / 100 msgs / 450 LOC). Pass-rate ceiling raised to **<=40%** (up from 20%/30%). FP Check now MANDATORY (final gate, after solvability). See CLAUDE.md RULE UPDATE 2026-07 (SPRINT).
 >
 > Bands updated 2026-06-26 (historical, superseded on conflict): Mars <=30%, Olympus <=20% (down from 30%); flakiness verification now MANDATORY. See CLAUDE.md RULE UPDATE 2026-06-26.
@@ -271,27 +273,28 @@ Top patterns:
 5. **A16** -- concurrency / lock-scope (6/26): RWMutex precision, `-race` flag as universal blocker
 6. **A17** -- constructor / factory defaults (8/26): `|| Infinity` vs `?? Infinity` (0 vs nullish)
 
-**Current sprint floor (2026-07, ONE TIER -- Mars merged into Olympus):**
+**Current floor (2026-07 one-tier sprint, with the 2026-10-09 gate rows):** the files / LOC rows are no longer named in the 2026-10-09 update; keep them as the review baseline until the platform says otherwise.
 
 | Metric | Floor (hard gate) | Notes |
 |---|---|---|
 | Solution LOC | **>=200 effective/meaningful** (Counter 2 / human-effective) | Down from 450. Gate on the human-effective count, not raw. |
 | Files modified | **>=2** | Down from 3. Median observed in older approveds (~17) is historical data, not a floor -- do not reject a submission for being below it. |
-| Agent messages (solver median) | **>=40** | Down from 100. |
-| Pass-rate ceiling | **<=40%** | Up from 20%/30%. 0% = reject (unsolvable); >40% = reject (too easy). |
+| Agent messages (solver median) | ~~>=40~~ | **Gone 2026-10-09.** Replaced by Nova average sequence length >256k. |
+| Pass-rate gate | **Nova 0/8+; Orion or Vega 1-25% of 4+ same-agent runs** | 2026-10-09. Any Nova pass = too easy; Orion/Vega 0 = unsolvable; >25% = too easy. |
 | Diamond | Same floor + Castor-targeted (<=30% Castor: 1-3 of 10); NO upper LOC ceiling | |
 
-Older per-shape LOC/file/test figures elsewhere in this doc (e.g. Mars-shape tables in `olympus-author`, "8-35 files" bands) are OBSERVATIONAL DATA from specific approved problems under the old two-tier regime -- useful as precedent, but the hard gate for every NEW submission is the row above. Do not reject solely for sitting below an old shape's historical average once it clears >=200 LOC / >=2 files / >=40 messages.
+Older per-shape LOC/file/test figures elsewhere in this doc (e.g. Mars-shape tables in `olympus-author`, "8-35 files" bands) are OBSERVATIONAL DATA from specific approved problems under the old two-tier regime -- useful as precedent, but the hard gate for every NEW submission is the row above. Do not reject solely for sitting below an old shape's historical average once it clears >=200 LOC / >=2 files and the 2026-10-09 agent gate.
 
-**Pass-rate ceiling (0% any tier = reject) -- current sprint, superseded from the table below:**
+**Pass gate (current, 2026-10-09):**
 
-| | Pass band | Too easy (reject) |
+| | Must show | Reject |
 |---|---|---|
-| Olympus (one tier, non-Diamond) | **<=40%** | >40% (up from 20%/30% -- 2026-07 sprint) |
+| Olympus, Nova | >=8 runs, 0 passes; average sequence length >256k | any Nova pass (too easy); average <=256k |
+| Olympus, Orion OR Vega | >=4 runs of ONE agent, >=1 pass, <=25% | 0 passes (unsolvable); >25% (too easy) |
 | Diamond | <=30% Castor (1-3 of 10) | >30% (unchanged) |
 
 <details>
-<summary>Historical Mars/Olympus split (pre-2026-07, superseded)</summary>
+<summary>Historical bands (pre-2026-10-09, superseded): Olympus <=40% (2026-07 sprint); earlier Mars/Olympus split below</summary>
 
 | Tier | Pass band | Too easy (reject) |
 |---|---|---|

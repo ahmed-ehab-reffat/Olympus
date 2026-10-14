@@ -15,6 +15,30 @@ the line to "Processed".
 
 ## Processed
 
+    gonum-plot-exact-glyph-layout: dead derivative overlap Blocker 46.6% (glyph-bound envelope + max-fit Align engine)   (said in session 2026-10-13; handled)
+
+    protobuf-es-proto-source-printer: dead derivative overlap Blocker 66.7% (descriptor-to-.proto printer engine)   (said in session 2026-10-12; handled)
+
+    eventsourcing-system-consistent-cut / mirrorbits-mirror-sync-point / micasa-field-level-sync-merge: claimed   (said in session 2026-10-05; handled)
+
+    mirrorbits-mirror-sync-point: clean   (scope gate passed; Dockerfile and tests-quality fixes + meta trim made in session 2026-10-04; handled)
+    mirrorbits-mirror-sync-point: claimed   (said in session 2026-10-04; handled)
+
+    micasa-field-level-sync-merge: clean   (scope gate passed; Dockerfile, length and tests-quality fixes made in session 2026-10-04; handled)
+    micasa-field-level-sync-merge: claimed   (said in session 2026-10-04; handled)
+
+    pyfakefs-advisory-file-locks: dead derivative overlap Blocker 79.3% (advisory-lock engine)   (said in session 2026-10-01; handled)
+
+    libspatialindex-mvr-history-pruning / csbindgen-const-expression-values: claimed   (said in session 2026-09-29; handled)
+
+    pyocd-dwt-watchpoint-planner: claimed   (said in session 2026-09-29; handled)
+
+    macs-callvar-fragment-phasing: claimed   (said in session 2026-09-29; handled)
+
+    cwerg-fe-address-constants: claimed   (said in session 2026-09-29; handled)
+
+    grmtools-contextual-lexeme-readings / asdf-conversion-free-lazy-tree: claimed   (said in session 2026-09-28; handled)
+
     hayro-optional-content-baking / ray-optics-sp-coherence-transport / riff-unified-conflict-regions / macs-circular-chromosomes: claimed   (said in session 2026-09-26; handled)
 
     dyn4j-world-copy: dead derivative overlap Blocker 52.9% of rival   (said in session 2026-09-24; handled)

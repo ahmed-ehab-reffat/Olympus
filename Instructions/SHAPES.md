@@ -618,3 +618,18 @@ every object that holds state about the old configuration (registry + cache, laz
 acquisition functions, an optional transformer). The value conversions are transcribed; the band
 lives in the holders a stated rule has to reach (F-10) and in collaborator state that must continue
 rather than restart (F-56). Pass rate 3/10.
+
+## Shape note — macs-circular-chromosomes (APPROVED 2026-09-29)
+
+O-Pipeline-hard confirmed on a scientific CLI: one coordinate-topology option that every stage of a
+pipeline must honour (parser, pileup, background model, statistics, peak joining, estimator, output).
+The contract is a single invariance law; the band lives in the stage the tests do not normally reach
+(an estimator switched off for exact-value tests, F-64) and in structures derived inside each group
+(F-65). Pass rate 1/11.
+
+## Shape note — macs-callvar-fragment-phasing (APPROVED 2026-10-13)
+
+O-Pipeline-hard confirmed for Python+Cython with one flag driving two halves (evidence regrouping, then
+cross-site inference) over two evidence paths. Nova grinds (565k avg) and fails the data-structure seam
+between the halves (F-86); the strong agent splits only on path edges (assembly, window edge, no-call
+peak). 10 files, 325 human-effective, 55 tests, Nova 0/8 + Orion 1/4.

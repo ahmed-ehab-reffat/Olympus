@@ -1,0 +1,343 @@
+diff --git a/capa/capabilities/dynamic.py b/capa/capabilities/dynamic.py
+index 67f3aaea..a84532a1 100644
+--- a/capa/capabilities/dynamic.py
++++ b/capa/capabilities/dynamic.py
+@@ -23,7 +23,7 @@ import capa.features.freeze as frz
+ import capa.render.result_document as rdoc
+ from capa.rules import Scope, RuleSet
+ from capa.engine import FeatureSet, MatchResults
+-from capa.features.address import _NoAddress
++from capa.features.address import _NoAddress, ProcessAddress
+ from capa.capabilities.common import Capabilities, find_file_capabilities
+ from capa.features.extractors.base_extractor import CallHandle, ThreadHandle, ProcessHandle, DynamicFeatureExtractor
+ 
+@@ -211,6 +211,7 @@ def find_thread_capabilities(
+ 
+ @dataclass
+ class ProcessCapabilities:
++    features: FeatureSet
+     process_matches: MatchResults
+     thread_matches: MatchResults
+     span_matches: MatchResults
+@@ -259,13 +260,107 @@ def find_process_capabilities(
+ 
+     _, process_matches = ruleset.match(Scope.PROCESS, process_features, ph.address)
+ 
++    for rule_name, res in itertools.chain(
++        process_matches.items(), thread_matches.items(), span_matches.items(), call_matches.items()
++    ):
++        rule = ruleset[rule_name]
++        capa.engine.index_rule_matches(process_features, rule, [addr for addr, _ in res])
++
+     logger.debug(
+         "analyzed process %d and extracted %d features with %d matches",
+         ph.address.pid,
+         len(process_features),
+         len(process_matches),
+     )
+-    return ProcessCapabilities(process_matches, thread_matches, span_matches, call_matches, len(process_features))
++    return ProcessCapabilities(
++        process_features, process_matches, thread_matches, span_matches, call_matches, len(process_features)
++    )
++
++
++def get_process_tree(processes: list[ProcessAddress]) -> tuple[list[ProcessAddress], dict[ProcessAddress, list[ProcessAddress]]]:
++    """
++    link each process to its parent, by the parent's pid.
++    a process whose parent is not in the trace, is itself, or is ambiguous, is a root.
++    """
++    by_pid: dict[int, list[ProcessAddress]] = collections.defaultdict(list)
++    for p in processes:
++        by_pid[p.pid].append(p)
++
++    children: dict[ProcessAddress, list[ProcessAddress]] = {p: [] for p in processes}
++    roots: list[ProcessAddress] = []
++    for p in processes:
++        parents = by_pid.get(p.ppid, [])
++        if p.ppid == p.pid or len(parents) != 1:
++            roots.append(p)
++        else:
++            children[parents[0]].append(p)
++
++    # break any cycle by promoting its lowest member to a root.
++    reachable: set[ProcessAddress] = set()
++    stack = list(roots)
++    while True:
++        while stack:
++            p = stack.pop()
++            if p not in reachable:
++                reachable.add(p)
++                stack.extend(children[p])
++        remaining = sorted(p for p in processes if p not in reachable)
++        if not remaining:
++            break
++        root = remaining[0]
++        for siblings in children.values():
++            if root in siblings:
++                siblings.remove(root)
++        roots.append(root)
++        stack.append(root)
++
++    return sorted(roots), children
++
++
++def find_process_tree_capabilities(
++    ruleset: RuleSet, processes: dict[ProcessAddress, ProcessCapabilities]
++) -> MatchResults:
++    """
++    match process tree rules at every process, over the features of the process and all its descendants.
++    a rule is reported only at the smallest subtrees that match it,
++    unless a match reported at an ancestor depends on it.
++    """
++    roots, children = get_process_tree(list(processes.keys()))
++
++    matches_at: dict[ProcessAddress, MatchResults] = {}
++    matched_below: dict[ProcessAddress, set[str]] = {}
++
++    def rec(p: ProcessAddress) -> FeatureSet:
++        features: FeatureSet = collections.defaultdict(set)
++        for feature, vas in processes[p].features.items():
++            features[feature].update(vas)
++
++        below: set[str] = set()
++        for child in children[p]:
++            for feature, vas in rec(child).items():
++                features[feature].update(vas)
++            below.update(matched_below[child])
++            below.update(matches_at[child].keys())
++
++        _, matches = ruleset.match(Scope.PROCESS_TREE, features, p)
++        matches_at[p] = matches
++        matched_below[p] = below
++        return features
++
++    for root in roots:
++        rec(root)
++
++    tree_matches: MatchResults = collections.defaultdict(list)
++    for p, matches in matches_at.items():
++        reported = {name for name in matches if name not in matched_below[p]}
++        wanted = set(reported)
++        for name in reported:
++            wanted.update(ruleset.rules[name].get_dependencies(ruleset.rules_by_namespace))
++        for name, res in matches.items():
++            if name in wanted:
++                tree_matches[name].extend(res)
++
++    return tree_matches
+ 
+ 
+ def find_dynamic_capabilities(
+@@ -275,6 +370,7 @@ def find_dynamic_capabilities(
+     all_thread_matches: MatchResults = collections.defaultdict(list)
+     all_span_matches: MatchResults = collections.defaultdict(list)
+     all_call_matches: MatchResults = collections.defaultdict(list)
++    process_capabilities_by_address: dict[ProcessAddress, ProcessCapabilities] = {}
+ 
+     # Accumulate into a list to avoid O(n²) tuple concatenation.
+     # Tuples are immutable, so `t += (x,)` copies the entire tuple each time.
+@@ -290,6 +386,7 @@ def find_dynamic_capabilities(
+         task = pbar.add_task("matching", total=n_processes, unit="processes")
+         for p in processes:
+             process_capabilities = find_process_capabilities(ruleset, extractor, p)
++            process_capabilities_by_address[p.address] = process_capabilities
+             process_feature_counts.append(
+                 rdoc.ProcessFeatureCount(
+                     address=frz.Address.from_capa(p.address), count=process_capabilities.feature_count
+@@ -307,11 +404,17 @@ def find_dynamic_capabilities(
+ 
+             pbar.advance(task)
+ 
++    all_process_tree_matches = find_process_tree_capabilities(ruleset, process_capabilities_by_address)
++
+     # collection of features that captures the rule matches within process and thread scopes.
+     # mapping from feature (matched rule) to set of addresses at which it matched.
+     process_and_lower_features: FeatureSet = collections.defaultdict(set)
+     for rule_name, results in itertools.chain(
+-        all_process_matches.items(), all_thread_matches.items(), all_span_matches.items(), all_call_matches.items()
++        all_process_tree_matches.items(),
++        all_process_matches.items(),
++        all_thread_matches.items(),
++        all_span_matches.items(),
++        all_call_matches.items(),
+     ):
+         locations = {p[0] for p in results}
+         rule = ruleset[rule_name]
+@@ -333,6 +436,7 @@ def find_dynamic_capabilities(
+             all_span_matches.items(),
+             all_thread_matches.items(),
+             all_process_matches.items(),
++            all_process_tree_matches.items(),
+             all_file_capabilities.matches.items(),
+         )
+     )
+diff --git a/capa/loader.py b/capa/loader.py
+index b0895b25..7a223c0b 100644
+--- a/capa/loader.py
++++ b/capa/loader.py
+@@ -688,16 +688,21 @@ def compute_dynamic_layout(
+     assert isinstance(extractor, DynamicFeatureExtractor)
+ 
+     matched_calls: set[Address] = set()
++    matched_process_locations: set[Address] = set()
+ 
+     def result_rec(result: capa.features.common.Result):
+         for loc in result.locations:
+             if isinstance(loc, capa.features.address.DynamicCallAddress):
+                 matched_calls.add(loc)
++            elif isinstance(loc, capa.features.address.ProcessAddress):
++                matched_process_locations.add(loc)
+         for child in result.children:
+             result_rec(child)
+ 
+     for matches in capabilities.values():
+-        for _, result in matches:
++        for addr, result in matches:
++            if isinstance(addr, capa.features.address.ProcessAddress):
++                matched_process_locations.add(addr)
+             result_rec(result)
+ 
+     names_by_process: dict[Address, str] = {}
+@@ -724,7 +729,7 @@ def compute_dynamic_layout(
+                 matched_threads.add(t.address)
+                 threads_by_process[p.address].append(t.address)
+ 
+-        if threads_by_process[p.address]:
++        if threads_by_process[p.address] or p.address in matched_process_locations:
+             matched_processes.add(p.address)
+             names_by_process[p.address] = extractor.get_process_name(p)
+ 
+diff --git a/capa/render/verbose.py b/capa/render/verbose.py
+index 4afb4638..27720691 100644
+--- a/capa/render/verbose.py
++++ b/capa/render/verbose.py
+@@ -121,6 +121,13 @@ def render_process(layout: rd.DynamicLayout, addr: frz.Address) -> str:
+     return f"{name}{{pid:{process.pid}}}"
+ 
+ 
++def render_process_tree(layout: rd.DynamicLayout, addr: frz.Address) -> str:
++    process = addr.to_capa()
++    assert isinstance(process, capa.features.address.ProcessAddress)
++    name = _get_process_name(layout, addr)
++    return f"{name}{{pid:{process.pid}}} and descendants"
++
++
+ def render_thread(layout: rd.DynamicLayout, addr: frz.Address) -> str:
+     thread = addr.to_capa()
+     assert isinstance(thread, capa.features.address.ThreadAddress)
+@@ -351,7 +358,9 @@ def render_rules(console: Console, doc: rd.ResultDocument):
+                 assert rule.meta.scopes.dynamic is not None
+                 assert isinstance(doc.meta.analysis.layout, rd.DynamicLayout)
+ 
+-                if rule.meta.scopes.dynamic == capa.rules.Scope.PROCESS:
++                if rule.meta.scopes.dynamic == capa.rules.Scope.PROCESS_TREE:
++                    lines = [render_process_tree(doc.meta.analysis.layout, loc) for loc in locations]
++                elif rule.meta.scopes.dynamic == capa.rules.Scope.PROCESS:
+                     lines = [render_process(doc.meta.analysis.layout, loc) for loc in locations]
+                 elif rule.meta.scopes.dynamic == capa.rules.Scope.THREAD:
+                     lines = [render_thread(doc.meta.analysis.layout, loc) for loc in locations]
+diff --git a/capa/render/vverbose.py b/capa/render/vverbose.py
+index b6b13163..e6340050 100644
+--- a/capa/render/vverbose.py
++++ b/capa/render/vverbose.py
+@@ -533,7 +533,9 @@ def render_rules(console: Console, doc: rd.ResultDocument):
+ 
+                     console.write(rule.meta.scopes.dynamic.value + " @ ")
+ 
+-                    if rule.meta.scopes.dynamic == capa.rules.Scope.PROCESS:
++                    if rule.meta.scopes.dynamic == capa.rules.Scope.PROCESS_TREE:
++                        console.write(v.render_process_tree(doc.meta.analysis.layout, location))
++                    elif rule.meta.scopes.dynamic == capa.rules.Scope.PROCESS:
+                         console.write(v.render_process(doc.meta.analysis.layout, location))
+                     elif rule.meta.scopes.dynamic == capa.rules.Scope.THREAD:
+                         console.write(v.render_thread(doc.meta.analysis.layout, location))
+diff --git a/capa/rules/__init__.py b/capa/rules/__init__.py
+index ef4e372c..74e9d0b2 100644
+--- a/capa/rules/__init__.py
++++ b/capa/rules/__init__.py
+@@ -83,6 +83,7 @@ HIDDEN_META_KEYS = ("capa/nursery", "capa/path")
+ 
+ class Scope(str, Enum):
+     FILE = "file"
++    PROCESS_TREE = "process tree"
+     PROCESS = "process"
+     THREAD = "thread"
+     SPAN_OF_CALLS = "span of calls"
+@@ -112,6 +113,7 @@ STATIC_SCOPES = {
+ DYNAMIC_SCOPES = {
+     Scope.FILE,
+     Scope.GLOBAL,
++    Scope.PROCESS_TREE,
+     Scope.PROCESS,
+     Scope.THREAD,
+     Scope.SPAN_OF_CALLS,
+@@ -196,6 +198,9 @@ SUPPORTED_FEATURES: dict[str, set] = {
+         capa.features.common.Characteristic("mixed mode"),
+         capa.features.common.Characteristic("forwarded export"),
+     },
++    Scope.PROCESS_TREE: {
++        capa.features.common.MatchedRule,
++    },
+     Scope.PROCESS: {
+         capa.features.common.MatchedRule,
+     },
+@@ -265,6 +270,8 @@ SUPPORTED_FEATURES[Scope.SPAN_OF_CALLS].update(SUPPORTED_FEATURES[Scope.CALL])
+ SUPPORTED_FEATURES[Scope.THREAD].update(SUPPORTED_FEATURES[Scope.SPAN_OF_CALLS])
+ # all thread scope features are also process features
+ SUPPORTED_FEATURES[Scope.PROCESS].update(SUPPORTED_FEATURES[Scope.THREAD])
++# all process scope features are also process tree features
++SUPPORTED_FEATURES[Scope.PROCESS_TREE].update(SUPPORTED_FEATURES[Scope.PROCESS])
+ 
+ # all instruction scope features are also basic block features
+ SUPPORTED_FEATURES[Scope.BASIC_BLOCK].update(SUPPORTED_FEATURES[Scope.INSTRUCTION])
+@@ -603,6 +610,7 @@ STATIC_SCOPE_ORDER = [
+ 
+ DYNAMIC_SCOPE_ORDER = [
+     Scope.FILE,
++    Scope.PROCESS_TREE,
+     Scope.PROCESS,
+     Scope.THREAD,
+     Scope.SPAN_OF_CALLS,
+@@ -881,9 +889,22 @@ def build_statements(d, scopes: Scopes):
+             description=description,
+         )
+ 
++    elif key == "process tree":
++        if not is_subscope_compatible(scopes.dynamic, Scope.PROCESS_TREE):
++            raise InvalidRule("`process tree` subscope supported only for `file` scope")
++
++        if len(d[key]) != 1:
++            raise InvalidRule("subscope must have exactly one child statement")
++
++        return ceng.Subscope(
++            Scope.PROCESS_TREE,
++            build_statements(d[key][0], Scopes(dynamic=Scope.PROCESS_TREE)),
++            description=description,
++        )
++
+     elif key == "process":
+         if not is_subscope_compatible(scopes.dynamic, Scope.PROCESS):
+-            raise InvalidRule("`process` subscope supported only for `file` scope")
++            raise InvalidRule("`process` subscope supported only for the `file` and `process tree` scopes")
+ 
+         if len(d[key]) != 1:
+             raise InvalidRule("subscope must have exactly one child statement")
+@@ -1554,6 +1575,7 @@ class RuleSet:
+             Scope.SPAN_OF_CALLS,
+             Scope.THREAD,
+             Scope.PROCESS,
++            Scope.PROCESS_TREE,
+             Scope.INSTRUCTION,
+             Scope.BASIC_BLOCK,
+             Scope.FUNCTION,
+@@ -1581,6 +1603,10 @@ class RuleSet:
+     def file_rules(self):
+         return self.rules_by_scope[Scope.FILE]
+ 
++    @property
++    def process_tree_rules(self):
++        return self.rules_by_scope[Scope.PROCESS_TREE]
++
+     @property
+     def process_rules(self):
+         return self.rules_by_scope[Scope.PROCESS]

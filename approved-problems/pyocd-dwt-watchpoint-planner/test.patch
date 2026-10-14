@@ -1,0 +1,1104 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..730ef54
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,50 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++
++MODE="${MODE:-base}"
++OUTPUT_PATH="${OUTPUT_PATH:-/tmp/results.xml}"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++cd "$(dirname "$0")"
++
++PYTHON="python3"
++command -v "$PYTHON" >/dev/null 2>&1 || PYTHON="python"
++
++NEW_TESTS="test/unit/test_dwt_watchpoints_26e946.py"
++LOG_FILE="$(mktemp)"
++
++if [ "$MODE" = "new" ]; then
++    $PYTHON -m pytest "$NEW_TESTS" \
++        -p no:cacheprovider --junitxml="$OUTPUT_PATH" 2>&1 | tee "$LOG_FILE"
++else
++    $PYTHON -m pytest test/unit --ignore="$NEW_TESTS" \
++        -p no:cacheprovider --junitxml="$OUTPUT_PATH" 2>&1 | tee "$LOG_FILE"
++fi
++EXIT_CODE=${PIPESTATUS[0]}
++
++if [ ! -s "$OUTPUT_PATH" ] || ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++    DIAGNOSTIC=$(tail -c 3000 "$LOG_FILE" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
++    cat > "$OUTPUT_PATH" <<XMLEOF
++<?xml version="1.0" encoding="utf-8"?>
++<testsuites><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="0">
++<testcase classname="pyocd.dwt_watchpoints" name="test_runner_produced_no_results" time="0">
++<failure message="pytest produced no test results">${DIAGNOSTIC}</failure>
++</testcase>
++</testsuite></testsuites>
++XMLEOF
++    EXIT_CODE=1
++fi
++
++rm -f "$LOG_FILE"
++exit $EXIT_CODE
+diff --git a/test/unit/test_dwt_watchpoints_26e946.py b/test/unit/test_dwt_watchpoints_26e946.py
+new file mode 100644
+index 0000000..deb104e
+--- /dev/null
++++ b/test/unit/test_dwt_watchpoints_26e946.py
+@@ -0,0 +1,1042 @@
++# pyOCD debugger
++# Copyright (c) 2026 Arm Limited
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import contextlib
++import io
++import re
++
++import pytest
++
++from pyocd.core import exceptions
++from pyocd.commands import commands
++from pyocd.commands.execution_context import CommandExecutionContext
++from pyocd.core.target import Target
++from pyocd.coresight.cortex_m import CortexM
++from pyocd.coresight.cortex_m_core_registers import (
++    CoreRegisterGroups,
++    index_for_reg,
++)
++from pyocd.coresight.dwt import (DWT, DWTv2)
++from pyocd.debug.context import DebugContext
++from pyocd.debug.elf.decoder import SymbolInfo
++from pyocd.gdbserver.context_facade import GDBDebugContextFacade
++from pyocd.utility.graph import GraphNode
++from pyocd.utility.notification import Notifier
++
++WRITE = Target.WatchpointType.WRITE
++READ = Target.WatchpointType.READ
++ACCESS = Target.WatchpointType.READ_WRITE
++
++DHCSR = 0xE000EDF0
++DCRSR = 0xE000EDF4
++DCRDR = 0xE000EDF8
++DEMCR = 0xE000EDFC
++DFSR = 0xE000ED30
++DWT_BASE = 0xE0001000
++
++C_DEBUGEN = 1 << 0
++C_HALT = 1 << 1
++C_STEP = 1 << 2
++S_REGRDY = 1 << 16
++S_HALT = 1 << 17
++
++DFSR_HALTED = 1 << 0
++DFSR_BKPT = 1 << 1
++DFSR_DWTTRAP = 1 << 2
++
++MATCHED = 1 << 24
++
++
++class FakeDP:
++    def flush(self):
++        pass
++
++
++class FakeDebugAP:
++    def __init__(self, version=1, comparators=4, max_mask=15, pair_flag="base"):
++        self.version = version
++        self.count = comparators
++        if isinstance(max_mask, int):
++            max_mask = [max_mask] * comparators
++        self.max_mask = max_mask
++        self.pair_flag = pair_flag
++        self.comp = [0] * comparators
++        self.mask = [0] * comparators
++        self.mask_writes = [[] for _ in range(comparators)]
++        self.function = [0] * comparators
++        self.matched = [False] * comparators
++        self.halted = True
++        self.dfsr = 0
++        self.demcr = 0
++        self.dcrdr = 0
++        self.regs = {}
++        self.step_accesses = []
++        self.run_accesses = []
++        self.steps = 0
++        self.fail_enable_at = None
++        self.enables = 0
++        self.fail_register = None
++        self.fail_register_at = None
++        self.register_writes = 0
++        self.dp = FakeDP()
++
++    def _comparator(self, addr):
++        offset = addr - DWT_BASE - 0x20
++        if offset < 0 or offset >= 0x10 * self.count:
++            return None, None
++        return offset // 0x10, offset % 0x10
++
++    def _read(self, addr):
++        if addr == DHCSR:
++            value = C_DEBUGEN | S_REGRDY
++            if self.halted:
++                value |= C_HALT | S_HALT
++            return value
++        if addr == DFSR:
++            return self.dfsr
++        if addr == DEMCR:
++            return self.demcr
++        if addr == DCRDR:
++            return self.dcrdr
++        if addr == DWT_BASE:
++            return self.count << 28
++        n, reg = self._comparator(addr)
++        if n is None:
++            return 0
++        if reg == 0:
++            return self.comp[n]
++        if reg == 4:
++            return self.mask[n] if self.version == 1 else 0
++        if reg == 8:
++            value = self.function[n] | (MATCHED if self.matched[n] else 0)
++            self.matched[n] = False
++            return value
++        return 0
++
++    def _write(self, addr, value):
++        value &= 0xFFFFFFFF
++        if addr == DHCSR:
++            if value & C_HALT:
++                if not self.halted:
++                    self.dfsr |= DFSR_HALTED
++                self.halted = True
++            elif value & C_STEP:
++                self.halted = False
++                self.steps += 1
++                if self.step_accesses:
++                    step_access = self.step_accesses.pop(0)
++                    if step_access is not None:
++                        self.access(*step_access)
++                self.halted = True
++                self.dfsr |= DFSR_HALTED
++            else:
++                self.halted = False
++                if self.run_accesses:
++                    self.access(*self.run_accesses.pop(0))
++        elif addr == DFSR:
++            self.dfsr &= ~value
++        elif addr == DEMCR:
++            self.demcr = value
++        elif addr == DCRDR:
++            self.dcrdr = value
++        elif addr == DCRSR:
++            reg = value & 0x7F
++            if value & (1 << 16):
++                self.regs[reg] = self.dcrdr
++            else:
++                self.dcrdr = self.regs.get(reg, 0)
++        else:
++            n, reg = self._comparator(addr)
++            if n is None:
++                return
++            if reg == self.fail_register:
++                self.register_writes += 1
++                if self.register_writes == self.fail_register_at:
++                    raise exceptions.TransferError("fault writing comparator register")
++            if reg == 0:
++                self.comp[n] = value
++            elif reg == 4 and self.version == 1:
++                self.mask_writes[n].append(value & 0x1F)
++                self.mask[n] = min(value & 0x1F, self.max_mask[n])
++            elif reg == 8:
++                if value & 0xF:
++                    self.enables += 1
++                    if self.enables == self.fail_enable_at:
++                        raise exceptions.TransferError("fault writing FUNCTION")
++                self.function[n] = value & ~MATCHED
++
++    def read_memory(self, addr, transfer_size=32, now=True):
++        value = self._read(addr)
++        if now:
++            return value
++        return lambda: value
++
++    def write_memory(self, addr, value, transfer_size=32):
++        self._write(addr, value)
++
++    def read32(self, addr, now=True):
++        return self.read_memory(addr, 32, now)
++
++    def write32(self, addr, value):
++        self.write_memory(addr, value)
++
++    V1_KINDS = {5: "r", 6: "w", 7: "rw"}
++    V2_KINDS = {4: "rw", 5: "w", 6: "r"}
++
++    def _hits_v1(self, addr, kind):
++        hits = []
++        for n in range(self.count):
++            code = self.function[n] & 0xF
++            if kind not in self.V1_KINDS.get(code, ""):
++                continue
++            m = self.mask[n]
++            if (addr >> m) == (self.comp[n] >> m):
++                hits.append(n)
++        return hits
++
++    def _hits_v2(self, addr, kind):
++        hits = []
++        n = 0
++        while n < self.count:
++            code = self.function[n] & 0xF
++            action = (self.function[n] >> 4) & 0x3
++            linked = (n % 2 == 0 and n + 1 < self.count
++                      and (self.function[n + 1] & 0xF) == 0b0111)
++            if action == 1 and kind in self.V2_KINDS.get(code, ""):
++                if linked:
++                    if self.comp[n] <= addr <= self.comp[n + 1]:
++                        if self.pair_flag in ("base", "both"):
++                            hits.append(n)
++                        if self.pair_flag in ("limit", "both"):
++                            hits.append(n + 1)
++                else:
++                    size = 1 << ((self.function[n] >> 10) & 0x3)
++                    low = self.comp[n] & ~(size - 1)
++                    if low <= addr < low + size:
++                        hits.append(n)
++            n += 2 if linked else 1
++        return hits
++
++    def hits(self, addr, kind):
++        if self.version == 1:
++            return self._hits_v1(addr, kind)
++        return self._hits_v2(addr, kind)
++
++    def access(self, addr, kind):
++        hits = self.hits(addr, kind)
++        for n in hits:
++            self.matched[n] = True
++        if hits:
++            self.dfsr |= DFSR_DWTTRAP
++            self.halted = True
++        return bool(hits)
++
++    def watched(self, low, high, kind):
++        return [a for a in range(low, high) if self.hits(a, kind)]
++
++    def enabled(self):
++        return [n for n in range(self.count) if self.function[n] & 0xF]
++
++
++class FakeOptions(dict):
++    def get(self, key, default=None):
++        return super().get(key, default)
++
++
++class FakePrintProxy:
++    def push_target(self, target):
++        return contextlib.nullcontext()
++
++
++class FakeSymbols:
++    def __init__(self, symbols):
++        self.symbols = {sym.name: sym for sym in symbols}
++
++    def get_symbol_for_name(self, name):
++        return self.symbols.get(name)
++
++
++class FakeElf:
++    def __init__(self, *symbols):
++        self.symbol_decoder = FakeSymbols(symbols)
++
++
++class FakeTarget:
++    def __init__(self):
++        self.selected_core = None
++        self.svd_device = None
++        self.elf = None
++        self.cores = {}
++
++    def is_locked(self):
++        return False
++
++    def add_target_command_groups(self, command_set):
++        pass
++
++
++class FakeBoard:
++    def __init__(self):
++        self.target = FakeTarget()
++
++
++class FakeSession(Notifier):
++    def __init__(self):
++        super().__init__()
++        self.options = FakeOptions()
++        self.probe = None
++        self.is_open = True
++        self.board = FakeBoard()
++        self.target = self.board.target
++        self.user_script_print_proxy = FakePrintProxy()
++
++
++class FakeRoot(GraphNode):
++    def flush(self):
++        pass
++
++
++def make_core(version=1, comparators=4, max_mask=15, pair_flag="base"):
++    ap = FakeDebugAP(version, comparators, max_mask, pair_flag)
++    core = CortexM(FakeSession(), ap)
++    core.core_registers.add_group(CoreRegisterGroups.M_PROFILE_COMMON)
++    FakeRoot().add_child(core)
++    unit = DWT(ap, None, DWT_BASE) if version == 1 else DWTv2(ap, None, DWT_BASE)
++    core.add_child(unit)
++    ap.regs[index_for_reg('pc')] = 0x00000400
++    ap.regs[index_for_reg('sp')] = 0x20001000
++    return core, ap
++
++
++def run_and_hit(core, ap, addr, kind):
++    core.resume()
++    assert ap.access(addr, kind)
++
++
++def stop_reply(core):
++    return GDBDebugContextFacade(DebugContext(core)).get_t_response()
++
++
++def watch_fields(reply):
++    fields = {}
++    for key, value in re.findall(rb"(rwatch|awatch|watch):([0-9a-fA-F]+);", reply):
++        fields.setdefault(key.decode(), []).append(int(value, 16))
++    assert len(re.findall(rb"watch:", reply)) == sum(len(values) for values in fields.values())
++    return fields
++
++
++class ResetHandledElsewhere:
++    def will_reset(self, core, reset_type):
++        return True
++
++
++def run_command(ctx, out, line):
++    out.truncate(0)
++    out.seek(0)
++    ctx.process_command_line(line)
++    return out.getvalue()
++
++
++def commander(core):
++    out = io.StringIO()
++    ctx = CommandExecutionContext(no_init=True, output_stream=out)
++    core.session.board.target.selected_core = core
++    core.session.board.target.cores = {0: core}
++    ctx.attach_session(core.session)
++    ctx.selected_core = core
++    return ctx, out
++
++
++class TestWatchCoverage:
++    def test_v1_unaligned_word_watches_exactly_its_bytes(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000012, 4, ACCESS)
++        expected = list(range(0x20000012, 0x20000016))
++        assert ap.watched(0x20000000, 0x20000030, "w") == expected
++        assert ap.watched(0x20000000, 0x20000030, "r") == expected
++
++    def test_v1_odd_length_watches_exactly_its_bytes(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000003, 6, READ)
++        assert ap.watched(0x20000000, 0x20000020, "r") == list(range(0x20000003, 0x20000009))
++        assert ap.watched(0x20000000, 0x20000020, "w") == []
++
++    def test_one_byte_watches_and_zero_length_is_refused(self):
++        core, ap = make_core(comparators=2)
++        assert core.set_watchpoint(0x20000010, 0, WRITE) is False
++        assert ap.enabled() == []
++        assert core.set_watchpoint(0x20000013, 1, WRITE)
++        assert core.set_watchpoint(0x20000021, 1, READ)
++        assert ap.watched(0x20000000, 0x20000030, "w") == [0x20000013]
++        assert ap.watched(0x20000000, 0x20000030, "r") == [0x20000021]
++
++    def test_range_past_the_top_of_memory_watches_no_low_address(self):
++        core, ap = make_core()
++        core.set_watchpoint(0xFFFFFFFE, 4, WRITE)
++        assert ap.watched(0, 0x10, "w") == []
++        assert core.set_watchpoint(0x20000011, 6, WRITE)
++        assert ap.watched(0x20000000, 0x20000020, "w") == list(range(0x20000011, 0x20000017))
++
++    @pytest.mark.parametrize("version", [1, 2])
++    def test_lengths_below_one_write_no_comparator(self, version):
++        core, ap = make_core(version=version)
++        assert core.set_watchpoint(0x20000010, 0, WRITE) is False
++        assert core.set_watchpoint(0x20000010, -1, WRITE) is False
++        assert core.set_watchpoint(0x20000010, -16, READ) is False
++        assert ap.enabled() == []
++        assert core.set_watchpoint(0x20000011, 2, WRITE)
++        before = (list(ap.comp), list(ap.mask), list(ap.function))
++        assert core.set_watchpoint(0x20000040, -4, ACCESS) is False
++        assert (list(ap.comp), list(ap.mask), list(ap.function)) == before
++        assert ap.watched(0x20000000, 0x20000050, "w") == [0x20000011, 0x20000012]
++
++    def test_v2_one_byte_at_an_odd_address_uses_one_comparator(self):
++        core, ap = make_core(version=2, comparators=2)
++        assert core.set_watchpoint(0x20000013, 0, READ) is False
++        assert core.set_watchpoint(0x20000013, 1, READ)
++        assert core.set_watchpoint(0x20000021, 2, WRITE) is False
++        assert ap.watched(0x20000000, 0x20000030, "w") == []
++        assert ap.watched(0x20000000, 0x20000030, "r") == [0x20000013]
++        assert len(ap.enabled()) == 1
++
++    def test_v1_block_larger_than_max_mask_is_split(self):
++        core, ap = make_core(max_mask=4)
++        assert core.set_watchpoint(0x20000100, 64, WRITE)
++        assert ap.watched(0x200000F0, 0x20000150, "w") == list(range(0x20000100, 0x20000140))
++
++    def test_v2_unaligned_halfword_uses_a_pair(self):
++        core, ap = make_core(version=2)
++        assert core.set_watchpoint(0x20000022, 2, WRITE)
++        assert core.set_watchpoint(0x20000031, 2, WRITE)
++        assert ap.watched(0x20000000, 0x20000040, "w") == [0x20000022, 0x20000023, 0x20000031, 0x20000032]
++        assert len(ap.enabled()) == 3
++        limits = [n for n in ap.enabled() if ap.function[n] & 0xF == 0b0111]
++        assert len(limits) == 1
++        limit = limits[0]
++        assert limit % 2 == 1
++        assert (ap.comp[limit - 1], ap.comp[limit]) == (0x20000031, 0x20000032)
++
++    def test_v2_range_uses_a_linked_pair(self):
++        core, ap = make_core(version=2)
++        assert core.set_watchpoint(0x20000005, 11, ACCESS)
++        assert ap.watched(0x20000000, 0x20000020, "r") == list(range(0x20000005, 0x20000010))
++        assert len(ap.enabled()) == 2
++
++
++class TestComparatorLimits:
++    def test_large_block_goes_to_the_comparator_that_can_hold_it(self):
++        core, ap = make_core(max_mask=[2, 6, 2, 2])
++        assert core.set_watchpoint(0x20000100, 64, WRITE)
++        assert ap.watched(0x200000C0, 0x20000180, "w") == list(range(0x20000100, 0x20000140))
++        assert len(ap.enabled()) == 1
++
++    def test_a_comparator_limit_is_probed_with_31_before_it_is_used(self):
++        core, ap = make_core(max_mask=[3, 6, 2, 9])
++        assert core.set_watchpoint(0x20000200, 0x200, READ)
++        assert ap.enabled()
++        assert all(31 in ap.mask_writes[n] for n in ap.enabled())
++        assert ap.watched(0x200001F0, 0x20000410, "r") == list(range(0x20000200, 0x20000400))
++        assert len(ap.enabled()) == 1
++
++    def test_block_too_large_for_the_rest_is_split(self):
++        core, ap = make_core(max_mask=[2, 4, 2, 2])
++        assert core.set_watchpoint(0x20000200, 24, WRITE)
++        assert ap.watched(0x200001F0, 0x20000230, "w") == list(range(0x20000200, 0x20000218))
++        assert len(ap.enabled()) == 3
++
++    def test_request_needing_more_large_comparators_than_exist_is_refused(self):
++        core, ap = make_core(max_mask=[4, 2, 2, 2])
++        assert core.set_watchpoint(0x20000200, 32, WRITE) is False
++        assert ap.enabled() == []
++        assert core.set_watchpoint(0x20000200, 24, WRITE)
++        assert ap.watched(0x200001F0, 0x20000230, "w") == list(range(0x20000200, 0x20000218))
++
++    def test_used_large_comparator_is_not_counted(self):
++        core, ap = make_core(max_mask=[2, 6, 2, 2])
++        assert core.set_watchpoint(0x20000400, 64, READ)
++        assert core.set_watchpoint(0x20000100, 16, WRITE) is False
++        assert core.set_watchpoint(0x20000100, 12, WRITE)
++        assert ap.watched(0x200000F0, 0x20000120, "w") == list(range(0x20000100, 0x2000010C))
++        assert ap.watched(0x200003F0, 0x20000450, "r") == list(range(0x20000400, 0x20000440))
++        assert len(ap.enabled()) == 4
++
++
++class TestV2Singles:
++    def test_range_without_a_free_pair_uses_single_comparators(self):
++        core, ap = make_core(version=2, comparators=3)
++        assert core.set_watchpoint(0x20000100, 4, READ)
++        assert core.set_watchpoint(0x20000002, 6, WRITE)
++        assert ap.watched(0x20000000, 0x20000010, "w") == list(range(0x20000002, 0x20000008))
++        assert ap.watched(0x20000100, 0x20000104, "r") == list(range(0x20000100, 0x20000104))
++        assert len(ap.enabled()) == 3
++
++    def test_odd_range_without_a_free_pair_uses_one_two_and_four_byte_pieces(self):
++        core, ap = make_core(version=2, comparators=6)
++        for n in range(6):
++            assert core.set_watchpoint(0x20000100 + 4 * n, 4, READ)
++        for n in (1, 3, 5):
++            core.remove_watchpoint(0x20000100 + 4 * n, 4, READ)
++        assert core.set_watchpoint(0x20000001, 7, WRITE)
++        assert ap.watched(0x20000000, 0x20000010, "w") == list(range(0x20000001, 0x20000008))
++        assert len(ap.enabled()) == 6
++
++    def test_range_without_a_free_pair_that_needs_too_many_singles_is_refused(self):
++        core, ap = make_core(version=2, comparators=3)
++        assert core.set_watchpoint(0x20000100, 4, READ)
++        before = (list(ap.comp), list(ap.function))
++        assert core.set_watchpoint(0x20000001, 7, WRITE) is False
++        assert (list(ap.comp), list(ap.function)) == before
++        assert core.set_watchpoint(0x20000002, 6, WRITE)
++        assert ap.watched(0x20000000, 0x20000010, "w") == list(range(0x20000002, 0x20000008))
++
++    def test_hit_on_a_later_single_names_the_request(self):
++        core, ap = make_core(version=2, comparators=3)
++        assert core.set_watchpoint(0x20000100, 4, READ)
++        assert core.set_watchpoint(0x20000002, 6, WRITE)
++        run_and_hit(core, ap, 0x20000006, "w")
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000002]}
++
++    def test_pair_freed_by_removal_is_used_again(self):
++        core, ap = make_core(version=2, comparators=2)
++        assert core.set_watchpoint(0x20000100, 4, READ)
++        assert core.set_watchpoint(0x20000003, 6, WRITE) is False
++        core.remove_watchpoint(0x20000100, 4, READ)
++        assert core.set_watchpoint(0x20000003, 6, WRITE)
++        assert ap.watched(0x20000000, 0x20000010, "w") == list(range(0x20000003, 0x20000009))
++
++
++class TestWriteFailure:
++    def test_failed_write_disables_what_was_written(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000100, 4, READ)
++        ap.fail_enable_at = 3
++        with pytest.raises(exceptions.TransferError):
++            core.set_watchpoint(0x20000003, 6, WRITE)
++        assert ap.watched(0x20000000, 0x20000010, "w") == []
++        assert len(ap.enabled()) == 1
++        ap.fail_enable_at = None
++        assert core.set_watchpoint(0x20000003, 6, WRITE)
++        assert ap.watched(0x20000000, 0x20000010, "w") == list(range(0x20000003, 0x20000009))
++
++    @pytest.mark.parametrize("register", [0x0, 0x4])
++    def test_failed_comp_or_mask_write_disables_what_was_written(self, register):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000100, 4, READ)
++        ap.fail_register = register
++        ap.fail_register_at = 3
++        with pytest.raises(exceptions.TransferError):
++            core.set_watchpoint(0x20000003, 6, WRITE)
++        assert ap.watched(0x20000000, 0x20000010, "w") == []
++        assert len(ap.enabled()) == 1
++        ap.fail_register = None
++        assert core.set_watchpoint(0x20000003, 6, WRITE)
++        assert ap.watched(0x20000000, 0x20000010, "w") == list(range(0x20000003, 0x20000009))
++
++    @pytest.mark.parametrize("register", [0x0, 0x8])
++    def test_failed_v2_single_write_frees_its_comparator(self, register):
++        core, ap = make_core(version=2, comparators=2)
++        assert core.set_watchpoint(0x20000100, 4, READ)
++        ap.fail_register = register
++        ap.fail_register_at = 1
++        with pytest.raises(exceptions.TransferError):
++            core.set_watchpoint(0x20000010, 2, WRITE)
++        assert ap.watched(0x20000000, 0x20000020, "w") == []
++        assert len(ap.enabled()) == 1
++        ap.fail_register = None
++        assert core.set_watchpoint(0x20000010, 2, WRITE)
++        assert ap.watched(0x20000000, 0x20000020, "w") == [0x20000010, 0x20000011]
++
++    @pytest.mark.parametrize("register, at", [(0x0, 1), (0x0, 2), (0x8, 1)])
++    def test_failed_pair_register_write_disables_what_was_written(self, register, at):
++        core, ap = make_core(version=2)
++        assert core.set_watchpoint(0x20000100, 4, READ)
++        ap.fail_register = register
++        ap.fail_register_at = at
++        with pytest.raises(exceptions.TransferError):
++            core.set_watchpoint(0x20000005, 11, ACCESS)
++        assert ap.watched(0x20000000, 0x20000020, "r") == []
++        assert len(ap.enabled()) == 1
++        ap.fail_register = None
++        assert core.set_watchpoint(0x20000005, 11, ACCESS)
++        assert ap.watched(0x20000000, 0x20000020, "w") == list(range(0x20000005, 0x20000010))
++
++    def test_failed_pair_write_leaves_nothing_listed(self):
++        core, ap = make_core(version=2)
++        ctx, out = commander(core)
++        ap.fail_enable_at = 2
++        with pytest.raises(exceptions.TransferError):
++            core.set_watchpoint(0x20000005, 11, ACCESS)
++        assert ap.enabled() == []
++        output = run_command(ctx, out, "lswatch")
++        assert "No watchpoints installed" in output
++        assert "4 hardware watchpoint comparators available" in output
++
++
++class TestWatchAllocation:
++    def test_request_that_does_not_fit_changes_nothing(self):
++        core, ap = make_core(comparators=2)
++        assert core.set_watchpoint(0x20000100, 4, WRITE)
++        before = (list(ap.comp), list(ap.mask), list(ap.function))
++        assert core.set_watchpoint(0x20000003, 6, WRITE) is False
++        assert (list(ap.comp), list(ap.mask), list(ap.function)) == before
++        assert core.set_watchpoint(0x20000200, 4, READ)
++        assert ap.watched(0x20000200, 0x20000204, "r") == list(range(0x20000200, 0x20000204))
++
++    def test_v2_pair_needs_an_even_comparator(self):
++        core, ap = make_core(version=2, comparators=4)
++        assert core.set_watchpoint(0x20000100, 4, WRITE)
++        assert core.set_watchpoint(0x20000003, 6, WRITE)
++        assert ap.watched(0x20000000, 0x20000010, "w") == list(range(0x20000003, 0x20000009))
++        assert ap.watched(0x20000100, 0x20000104, "w") == list(range(0x20000100, 0x20000104))
++
++    def test_removing_a_multi_comparator_watch_frees_all_of_it(self):
++        core, ap = make_core(comparators=3)
++        assert core.set_watchpoint(0x20000003, 6, WRITE)
++        core.remove_watchpoint(0x20000003, 6, WRITE)
++        assert ap.enabled() == []
++        assert core.set_watchpoint(0x20000003, 6, READ)
++        assert ap.watched(0x20000000, 0x20000010, "r") == list(range(0x20000003, 0x20000009))
++
++    def test_setting_the_same_watchpoint_again_changes_nothing(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000003, 6, WRITE)
++        before = (list(ap.comp), list(ap.mask), list(ap.function))
++        assert core.set_watchpoint(0x20000003, 6, WRITE)
++        assert (list(ap.comp), list(ap.mask), list(ap.function)) == before
++        core.remove_watchpoint(0x20000003, 6, WRITE)
++        assert ap.enabled() == []
++
++    def test_same_range_with_another_type_gets_its_own_comparators(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000011, 2, WRITE)
++        assert core.set_watchpoint(0x20000011, 2, READ)
++        assert len(ap.enabled()) == 4
++        core.remove_watchpoint(0x20000011, 2, WRITE)
++        assert ap.watched(0x20000000, 0x20000020, "w") == []
++        assert ap.watched(0x20000000, 0x20000020, "r") == [0x20000011, 0x20000012]
++
++    def test_contained_watch_of_the_same_type_gets_its_own_comparator(self):
++        core, ap = make_core(comparators=2)
++        assert core.set_watchpoint(0x20000010, 4, WRITE)
++        assert core.set_watchpoint(0x20000012, 2, WRITE)
++        assert len(ap.enabled()) == 2
++        core.remove_watchpoint(0x20000010, 4, WRITE)
++        assert ap.watched(0x20000000, 0x20000020, "w") == [0x20000012, 0x20000013]
++        run_and_hit(core, ap, 0x20000013, "w")
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000012]}
++
++    @pytest.mark.parametrize("version", [1, 2])
++    def test_disconnect_releases_every_comparator_of_every_watchpoint(self, version):
++        core, ap = make_core(version=version, comparators=8)
++        ctx, out = commander(core)
++        assert core.set_watchpoint(0x20000003, 6, WRITE)
++        assert core.set_watchpoint(0x20000105, 11, READ)
++        assert len(ap.enabled()) == (6 if version == 1 else 4)
++        core.disconnect(resume=False)
++        assert ap.enabled() == []
++        assert ap.watched(0x20000000, 0x20000120, "w") == []
++        assert ap.watched(0x20000000, 0x20000120, "r") == []
++        output = run_command(ctx, out, "lswatch").splitlines()
++        assert re.match(r"8 hardware watchpoint comparators available\b", output[0])
++        assert "No watchpoints installed" in output[1]
++
++    def test_remove_with_no_type_removes_every_match(self):
++        core, ap = make_core(comparators=8)
++        assert core.set_watchpoint(0x20000011, 2, WRITE)
++        assert core.set_watchpoint(0x20000011, 2, READ)
++        assert core.set_watchpoint(0x20000011, 6, WRITE)
++        core.remove_watchpoint(0x20000011, 2, None)
++        assert ap.watched(0x20000000, 0x20000020, "r") == []
++        assert ap.watched(0x20000000, 0x20000020, "w") == list(range(0x20000011, 0x20000017))
++
++    def test_remove_with_no_length_removes_every_match(self):
++        core, ap = make_core(comparators=10)
++        assert core.set_watchpoint(0x20000011, 2, WRITE)
++        assert core.set_watchpoint(0x20000011, 2, READ)
++        assert core.set_watchpoint(0x20000011, 6, WRITE)
++        assert core.set_watchpoint(0x20000041, 2, WRITE)
++        core.remove_watchpoint(0x20000011, None, WRITE)
++        assert ap.watched(0x20000000, 0x20000050, "w") == [0x20000041, 0x20000042]
++        assert ap.watched(0x20000000, 0x20000050, "r") == [0x20000011, 0x20000012]
++        core.remove_watchpoint(0x20000011, None, None)
++        assert ap.watched(0x20000000, 0x20000050, "r") == []
++        assert ap.watched(0x20000000, 0x20000050, "w") == [0x20000041, 0x20000042]
++
++    @pytest.mark.parametrize("version", [1, 2])
++    def test_long_range_that_cannot_fit_is_refused(self, version):
++        core, ap = make_core(version=version, comparators=4 if version == 1 else 1, max_mask=0)
++        assert core.set_watchpoint(0x20000011, 2, READ) is (version == 1)
++        before = (list(ap.comp), list(ap.mask), list(ap.function))
++        assert core.set_watchpoint(0x20000001, 0x10000, WRITE) is False
++        assert (list(ap.comp), list(ap.mask), list(ap.function)) == before
++        assert ap.watched(0x20000000, 0x20000020, "w") == []
++
++    def test_second_request_keeps_the_first_programmed(self):
++        core, ap = make_core(max_mask=4)
++        assert core.set_watchpoint(0x20000040, 16, WRITE)
++        assert core.set_watchpoint(0x20000003, 6, READ)
++        assert ap.watched(0x20000000, 0x20000080, "w") == list(range(0x20000040, 0x20000050))
++
++
++class TestStopReply:
++    def test_write_watch_hit_is_reported_with_its_address(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000010, 4, WRITE)
++        run_and_hit(core, ap, 0x20000012, "w")
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000010]}
++
++    def test_hit_in_a_later_block_reports_the_address_it_was_set_at(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000003, 6, READ)
++        run_and_hit(core, ap, 0x20000007, "r")
++        assert watch_fields(stop_reply(core)) == {"rwatch": [0x20000003]}
++
++    def test_access_watch_uses_awatch(self):
++        core, ap = make_core(version=2)
++        assert core.set_watchpoint(0x20000005, 11, ACCESS)
++        run_and_hit(core, ap, 0x2000000F, "w")
++        assert watch_fields(stop_reply(core)) == {"awatch": [0x20000005]}
++
++    def test_asking_again_gives_the_same_answer(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000010, 4, WRITE)
++        run_and_hit(core, ap, 0x20000010, "w")
++        first = stop_reply(core)
++        assert watch_fields(first) == {"watch": [0x20000010]}
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000010]}
++
++    def test_hit_from_an_unreported_halt_is_not_carried_over(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000010, 4, WRITE)
++        assert core.set_watchpoint(0x20000100, 4, WRITE)
++        run_and_hit(core, ap, 0x20000010, "w")
++        run_and_hit(core, ap, 0x20000100, "w")
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000100]}
++
++    def test_halt_without_a_watch_event_names_none(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000010, 4, WRITE)
++        run_and_hit(core, ap, 0x20000013, "w")
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000010]}
++        core.resume()
++        core.halt()
++        assert watch_fields(stop_reply(core)) == {}
++
++    def test_several_matches_name_the_watchpoint_set_first(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000012, 2, WRITE)
++        assert core.set_watchpoint(0x20000010, 4, WRITE)
++        run_and_hit(core, ap, 0x20000013, "w")
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000012]}
++
++    def test_earlier_access_watch_wins_over_a_later_read_watch(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000010, 8, ACCESS)
++        assert core.set_watchpoint(0x20000012, 2, READ)
++        run_and_hit(core, ap, 0x20000013, "r")
++        assert watch_fields(stop_reply(core)) == {"awatch": [0x20000010]}
++
++    def test_pair_hit_flagged_on_the_limit_comparator(self):
++        core, ap = make_core(version=2, pair_flag="limit")
++        assert core.set_watchpoint(0x20000005, 11, WRITE)
++        run_and_hit(core, ap, 0x20000009, "w")
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000005]}
++
++
++class TestHaltAnswer:
++    def test_removing_the_watchpoint_that_fired_keeps_the_answer(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000010, 4, WRITE)
++        run_and_hit(core, ap, 0x20000011, "w")
++        core.remove_watchpoint(0x20000010, 4, WRITE)
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000010]}
++
++    def test_comparator_reused_before_the_query_keeps_the_answer(self):
++        core, ap = make_core(comparators=1)
++        assert core.set_watchpoint(0x20000010, 4, WRITE)
++        run_and_hit(core, ap, 0x20000010, "w")
++        core.remove_watchpoint(0x20000010)
++        assert core.set_watchpoint(0x20000200, 4, READ)
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000010]}
++        run_and_hit(core, ap, 0x20000202, "r")
++        assert watch_fields(stop_reply(core)) == {"rwatch": [0x20000200]}
++
++    def test_v2_pair_removed_before_the_query_keeps_the_answer(self):
++        core, ap = make_core(version=2, pair_flag="both")
++        assert core.set_watchpoint(0x20000005, 11, READ)
++        run_and_hit(core, ap, 0x20000009, "r")
++        core.remove_watchpoint(0x20000005, 11, READ)
++        assert core.set_watchpoint(0x20000041, 3, WRITE)
++        assert watch_fields(stop_reply(core)) == {"rwatch": [0x20000005]}
++
++    def test_setting_a_watchpoint_after_a_plain_halt_names_none(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000100, 4, READ)
++        run_and_hit(core, ap, 0x20000101, "r")
++        assert watch_fields(stop_reply(core)) == {"rwatch": [0x20000100]}
++        core.resume()
++        core.halt()
++        assert core.set_watchpoint(0x20000010, 4, WRITE)
++        assert watch_fields(stop_reply(core)) == {}
++
++    def test_hit_during_a_step_is_reported(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000010, 4, READ)
++        ap.step_accesses = [(0x20000012, "r")]
++        core.step()
++        assert watch_fields(stop_reply(core)) == {"rwatch": [0x20000010]}
++
++    def test_step_discards_a_hit_from_an_unreported_halt(self):
++        core, ap = make_core(version=2)
++        assert core.set_watchpoint(0x20000010, 4, WRITE)
++        assert core.set_watchpoint(0x20000031, 3, READ)
++        run_and_hit(core, ap, 0x20000010, "w")
++        ap.step_accesses = [(0x20000033, "r")]
++        core.step()
++        assert watch_fields(stop_reply(core)) == {"rwatch": [0x20000031]}
++
++    def test_step_without_a_watch_event_names_none(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000010, 4, WRITE)
++        run_and_hit(core, ap, 0x20000010, "w")
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000010]}
++        core.step()
++        assert watch_fields(stop_reply(core)) == {}
++
++    def test_reset_discards_a_hit_from_an_unreported_halt(self):
++        core, ap = make_core()
++        core.delegate = ResetHandledElsewhere()
++        core.session.options["reset_type"] = "default"
++        assert core.set_watchpoint(0x20000010, 4, WRITE)
++        assert core.set_watchpoint(0x20000100, 4, WRITE)
++        run_and_hit(core, ap, 0x20000010, "w")
++        core.reset()
++        assert ap.access(0x20000100, "w")
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000100]}
++
++    def test_plain_halt_after_a_reset_names_none(self):
++        core, ap = make_core()
++        core.delegate = ResetHandledElsewhere()
++        core.session.options["reset_type"] = "default"
++        assert core.set_watchpoint(0x20000011, 2, WRITE)
++        run_and_hit(core, ap, 0x20000012, "w")
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000011]}
++        run_and_hit(core, ap, 0x20000011, "w")
++        core.reset()
++        core.halt()
++        assert watch_fields(stop_reply(core)) == {}
++
++    def test_reporting_a_hit_leaves_dwttrap_set(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000011, 2, WRITE)
++        run_and_hit(core, ap, 0x20000012, "w")
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000011]}
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000011]}
++        assert ap.dfsr & DFSR_DWTTRAP
++        assert core.get_halt_reason() == Target.HaltReason.WATCHPOINT
++        core.resume()
++        assert not ap.dfsr & DFSR_DWTTRAP
++
++    def test_breakpoint_and_watchpoint_in_one_halt_names_the_watchpoint(self):
++        core, ap = make_core()
++        assert core.set_watchpoint(0x20000010, 4, WRITE)
++        run_and_hit(core, ap, 0x20000010, "w")
++        ap.dfsr |= DFSR_BKPT
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000010]}
++
++
++class TestCommanderReports:
++    def test_status_names_the_watchpoint(self):
++        core, ap = make_core()
++        ctx, out = commander(core)
++        run_command(ctx, out, "watch 0x20000003 rw 6")
++        run_and_hit(core, ap, 0x20000007, "r")
++        status = run_command(ctx, out, "status")
++        assert re.search(r"Core 0 .*Halted \(stopped by access watchpoint at 0x20000003\)", status)
++
++    def test_status_names_the_watchpoint_only_on_the_core_it_stopped(self):
++        core, ap = make_core()
++        other, other_ap = make_core()
++        ctx, out = commander(core)
++        core.session.board.target.cores = {0: core, 1: other}
++        assert core.set_watchpoint(0x20000011, 2, WRITE)
++        assert other.set_watchpoint(0x20000011, 2, WRITE)
++        run_and_hit(core, ap, 0x20000012, "w")
++        other.resume()
++        other.halt()
++        lines = run_command(ctx, out, "status").splitlines()
++        assert len(lines) == 2
++        assert lines[0].startswith("Core 0")
++        assert lines[0].endswith("Halted (stopped by write watchpoint at 0x20000011)")
++        assert lines[1].startswith("Core 1")
++        assert lines[1].endswith("Halted")
++
++    def test_status_without_a_watch_event_is_unchanged(self):
++        core, ap = make_core()
++        ctx, out = commander(core)
++        run_command(ctx, out, "watch 0x20000010 w")
++        run_and_hit(core, ap, 0x20000012, "w")
++        assert "(stopped by write watchpoint at 0x20000010)" in run_command(ctx, out, "status")
++        core.resume()
++        core.halt()
++        status = run_command(ctx, out, "status")
++        assert "stopped by" not in status
++        assert re.search(r"Core 0 .*Halted", status)
++
++    def test_continue_reports_an_immediate_hit(self):
++        core, ap = make_core(version=2)
++        ctx, out = commander(core)
++        run_command(ctx, out, "watch 0x20000021 r 5")
++        ap.run_accesses = [(0x20000024, "r")]
++        output = run_command(ctx, out, "continue")
++        assert "Device is halted; stopped by read watchpoint at 0x20000021" in output
++
++    def test_step_stops_at_the_step_that_hit(self, monkeypatch):
++        monkeypatch.setattr(commands, "IS_CAPSTONE_AVAILABLE", False)
++        core, ap = make_core()
++        core.session.options["step_into_interrupt"] = False
++        ctx, out = commander(core)
++        run_command(ctx, out, "watch 0x20000010 w 2")
++        ap.step_accesses = [None, (0x20000011, "w"), None, None]
++        output = run_command(ctx, out, "step 4")
++        assert ap.steps == 2
++        assert output.count("Stopped by write watchpoint at 0x20000010") == 1
++
++    def test_step_after_an_unreported_hit_takes_every_step(self, monkeypatch):
++        monkeypatch.setattr(commands, "IS_CAPSTONE_AVAILABLE", False)
++        core, ap = make_core()
++        core.session.options["step_into_interrupt"] = False
++        ctx, out = commander(core)
++        run_command(ctx, out, "watch 0x20000011 w 3")
++        run_and_hit(core, ap, 0x20000013, "w")
++        output = run_command(ctx, out, "step 3")
++        assert ap.steps == 3
++        assert "Stopped by" not in output
++        ap.step_accesses = [(0x20000011, "w")]
++        output = run_command(ctx, out, "step 3")
++        assert ap.steps == 4
++        assert "Stopped by write watchpoint at 0x20000011" in output
++
++    def test_lswatch_after_discovery_counts_every_comparator(self):
++        core, ap = make_core(comparators=6)
++        core.dwt.init()
++        ctx, out = commander(core)
++        output = run_command(ctx, out, "lswatch").splitlines()
++        assert re.match(r"6 hardware watchpoint comparators available\b", output[0])
++        assert "No watchpoints installed" in output[1]
++
++    def test_watch_on_a_zero_sized_data_object_sets_nothing(self):
++        core, ap = make_core()
++        core.session.board.target.elf = FakeElf(
++            SymbolInfo(name="g_marker", address=0x20000104, size=0, type="STT_OBJECT"),
++            SymbolInfo(name="g_state", address=0x20000108, size=6, type="STT_OBJECT"),
++            )
++        ctx, out = commander(core)
++        run_command(ctx, out, "watch g_marker w")
++        assert ap.watched(0x20000100, 0x20000120, "w") == []
++        run_command(ctx, out, "watch g_state w")
++        assert ap.watched(0x20000100, 0x20000120, "w") == list(range(0x20000108, 0x2000010E))
++
++    def test_lswatch_counts_free_comparators(self):
++        core, ap = make_core()
++        ctx, out = commander(core)
++        run_command(ctx, out, "watch 0x20000003 r 6")
++        output = run_command(ctx, out, "lswatch").splitlines()
++        assert re.match(r"1 hardware watchpoint comparators available\b", output[0])
++        assert re.match(r"0: 0x20000003, 6 bytes, r", output[1])
++
++    def test_watch_on_a_data_object_covers_the_object(self):
++        core, ap = make_core()
++        core.session.board.target.elf = FakeElf(
++            SymbolInfo(name="g_state", address=0x20000104, size=12, type="STT_OBJECT"),
++            SymbolInfo(name="main", address=0x00000400, size=40, type="STT_FUNC"),
++            )
++        ctx, out = commander(core)
++        run_command(ctx, out, "watch g_state w")
++        run_command(ctx, out, "watch main r")
++        run_command(ctx, out, "watch g_state r 2")
++        assert ap.watched(0x20000100, 0x20000120, "w") == list(range(0x20000104, 0x20000110))
++        assert ap.watched(0x20000100, 0x20000120, "r") == [0x20000104, 0x20000105]
++        assert ap.watched(0x00000400, 0x00000430, "r") == list(range(0x00000400, 0x00000404))
++        lines = re.findall(r"(\d+): 0x([0-9a-f]{8}), (\d+) bytes, (\w+)", run_command(ctx, out, "lswatch"))
++        assert lines == [("0", "20000104", "12", "w"), ("1", "00000400", "4", "r"), ("2", "20000104", "2", "r")]
++
++
++class TestWatchCommands:
++    def test_lswatch_lists_each_watchpoint_once(self):
++        core, ap = make_core()
++        ctx, out = commander(core)
++        ctx.process_command_line("watch 0x20000003 r 6")
++        ctx.process_command_line("watch 0x20000100 w 4")
++        out.truncate(0)
++        out.seek(0)
++        ctx.process_command_line("lswatch")
++        lines = re.findall(r"(\d+): 0x([0-9a-f]{8}), (\d+) bytes, (\w+)", out.getvalue())
++        assert lines == [("0", "20000003", "6", "r"), ("1", "20000100", "4", "w")]
++
++    def test_lswatch_keeps_creation_order_after_a_comparator_is_reused(self):
++        core, ap = make_core()
++        ctx, out = commander(core)
++        ctx.process_command_line("watch 0x20000011 w 2")
++        ctx.process_command_line("watch 0x20000100 w 4")
++        ctx.process_command_line("rmwatch 0x20000011 w 2")
++        ctx.process_command_line("watch 0x20000102 w 2")
++        lines = re.findall(r"(\d+): 0x([0-9a-f]{8}), (\d+) bytes, (\w+)", run_command(ctx, out, "lswatch"))
++        assert lines == [("0", "20000100", "4", "w"), ("1", "20000102", "2", "w")]
++        run_and_hit(core, ap, 0x20000103, "w")
++        assert watch_fields(stop_reply(core)) == {"watch": [0x20000100]}
++
++    def test_watch_reports_a_range_that_cannot_fit(self):
++        core, ap = make_core(max_mask=0)
++        ctx, out = commander(core)
++        run_command(ctx, out, "watch 0x20000011 w 2")
++        run_command(ctx, out, "watch 0x20000000 r 0x10000")
++        assert ap.watched(0x20000000, 0x20000020, "r") == []
++        lines = re.findall(r"(\d+): 0x([0-9a-f]{8}), (\d+) bytes, (\w+)", run_command(ctx, out, "lswatch"))
++        assert lines == [("0", "20000011", "2", "w")]
++
++    def test_watch_past_the_top_of_memory_watches_no_low_address(self):
++        core, ap = make_core()
++        ctx, out = commander(core)
++        run_command(ctx, out, "watch 0xfffffffc w 8")
++        assert ap.watched(0, 0x10, "w") == []
++
++    def test_watch_and_rmwatch_with_a_length_below_one_change_nothing(self):
++        core, ap = make_core()
++        ctx, out = commander(core)
++        ctx.process_command_line("watch 0x20000003 w 6")
++        before = (list(ap.comp), list(ap.mask), list(ap.function))
++        run_command(ctx, out, "watch 0x20000010 w 0")
++        run_command(ctx, out, "watch 0x20000010 w -4")
++        run_command(ctx, out, "rmwatch 0x20000003 w 0")
++        run_command(ctx, out, "rmwatch 0x20000003 w -6")
++        assert (list(ap.comp), list(ap.mask), list(ap.function)) == before
++        lines = re.findall(r"(\d+): 0x([0-9a-f]{8}), (\d+) bytes, (\w+)", run_command(ctx, out, "lswatch"))
++        assert lines == [("0", "20000003", "6", "w")]
++
++    def test_rmwatch_removes_a_long_watchpoint(self):
++        core, ap = make_core()
++        ctx, out = commander(core)
++        ctx.process_command_line("watch 0x20000003 r 6")
++        ctx.process_command_line("watch 0x20000100 w 4")
++        ctx.process_command_line("rmwatch 0x20000003 r 6")
++        assert ap.watched(0x20000000, 0x20000010, "r") == []
++        ctx.process_command_line("watch 0x20000021 w 7")
++        assert ap.watched(0x20000020, 0x20000030, "w") == list(range(0x20000021, 0x20000028))
++        ctx.process_command_line("rmwatch 0x20000021 w 7")
++        assert ap.watched(0x20000020, 0x20000030, "w") == []
++        lines = re.findall(r"(\d+): 0x([0-9a-f]{8}), (\d+) bytes, (\w+)", run_command(ctx, out, "lswatch"))
++        assert lines == [("0", "20000100", "4", "w")]

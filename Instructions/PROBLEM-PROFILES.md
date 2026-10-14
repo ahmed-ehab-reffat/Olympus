@@ -3397,3 +3397,221 @@ broken. The Dockerfile must not fetch the repo, even though `.dockerignore` stri
 rounds each added a requirement; twelve reference bugs, all found by gates. After batch 1 a replay of
 the saved patches showed a new test at 10/10 failing, so the rule was stated and a fresh batch run
 instead of a re-eval.
+
+## pict-engine-negative-values (APPROVED Olympus 2026-09-29)
+
+**Outcome.** Accepted 3/10 on batch 5 (all Nova), Auto Review Approved 3/2/2 (Mediums: a one-value
+parameter's index 0 untested; a seed repeating one parameter with two negatives reaches a bind assert).
+Earlier: batch 1 0/11, batch 2 0/11, its re-eval 1/11 (FP), batch 3 re-eval 2/10 (both FP), batch 4 0/11.
+
+**Shape + stats.** O-Pipeline-hard. `api/task.cpp` two-phase `Task::Generate` with state save/restore,
+unique parameter sequences, cleared exclusion back-pointers, `PictSetNegativeValue`,
+`PictGetResultParameter`, recursive `PictDeleteModel`. 7 files, 214 human-effective LOC, meta.md 354
+words, 34 tests; base = 588 perl harness commands as JUnit.
+
+**Decisive difficulty drivers.** `test_child_models_combine_as_whole_rows` (F-62, 5/10, sole failure of
+Nova #1), the #44 cluster (`test_children_negative_values_all_appear` and 4 siblings, 5/10),
+`test_flat_valid_pairs_come_from_rows_without_negative_values` (F-63, 3/10), the order-1 pair (sole
+failure of Nova #3), one perl-harness regression.
+
+**Iteration lessons.** Five review rounds grew the scope to 0/11; the replay-priced cut recovered it.
+Three FP rounds, each answered with a domain cap after probing every saved passer and fuzzing. Three of
+my own fixtures were walls. Median ~118-140 requests per run across batches.
+
+## macs-circular-chromosomes (APPROVED Olympus 2026-09-29)
+
+**Outcome.** Accepted at 1/11 (re-eval of batch 1 after a fixture fix and a 3-test cut). Auto Review
+Approved 3/3/3.
+
+**Shape + stats.** O-Pipeline-hard on MACS3 (Python + Cython). `--circular` for callpeak: header
+validation across pooled BAM/BAMPE files, BAMPE origin-spanning pairs, SE/PE pileups with multi-lap
+local-lambda windows, q-values and cutoff analysis over every base, narrow/broad/subpeak joining across
+the origin, PeakModel, output coordinates. 11 files, 421 human-effective, 47 tests, 117 base tests.
+Agent patches 9-12 files, +480 to +1008 lines, 108-267 model requests.
+
+**Decisive difficulty drivers.** F-64 PeakModel left linear (10/11; sole failure of Nova #2 at 46/47);
+F-65 broad blocks / subpeak summits origin-dependent (8/11, 5/11); BAMPE long origin pairs plus a
+reverse/reverse decoy (5/11).
+
+**Iteration lessons.** (1) Editable-install precheck: seed build/lib, wrap `bin/macs3`. (2) Seven gate
+rounds found 9 reference bugs (BAMPE filter bits, header-only validation, full-wrap component, singleton
+whole region, pooled INT_MAX length, summit ties split at the origin, one-lap local windows, tied-gap
+argmax, read-less contigs). (3) Batch 1 0/11: QNAME fixture (L105) + degenerate-case tests (L104).
+(4) Local replay of the saved patches matched the re-eval exactly (L68).
+
+## ray-optics-sp-coherence-transport (APPROVED Olympus 2026-09-30)
+
+**Outcome.** Accepted at 3/10 (Nova 3/10; batches 7/10, 7/10, 3/10; 30 Nova runs, no other agent).
+
+**Shape + stats.** O-Pipeline-hard grown twice. A complex coherence term C = E_s conj(E_p) through the
+CPU primitive engine (sources, formula slots explicit/default, Fresnel/TIR, GRIN, detectors, sampling,
+WebGPU decline), Polarizer and Retarder objects with object-fixed axes, Detector polarimetry, and all of
+it in the legacy `Simulator`. 16 files, 480 human-effective, 54 tests, 1301 base tests. Agent patches
+12-20 files, sandbox LOC 871-1139, 36-125 exec calls.
+
+**Decisive difficulty drivers.** F-66 exact double-pass isolator (4/10; sole failure of N9 and N10 at
+53/54; numerics, confirmed by perturbed replay); F-67 legacy default engine (3/10; two missed the
+null-default intersection hook); F-68 pairing rule applied to C_0r reads (1/10, 3/30 overall).
+
+**Iteration lessons.** (1) Auto Review x6 before and between batches: overflow at 1e160 (two paths),
+hypot overflow, degenerate-curve validation bypass, slot-2 and WebGPU coverage; none of their tests
+killed. (2) My own literal-reading mutant caught the meta's r_s r_p vs r_s conj(r_p) TIR error before
+batch 1. (3) Differential probes (31 + 23 scenes) showed zero divergence among passers twice; the
+second one pointed at the legacy engine. (4) Acceptance review flagged a legacy Retarder absorbing
+sub-cutoff rays (reference bug, untested) and an untested app-default engine choice.
+
+## riff-unified-conflict-regions (APPROVED Olympus 2026-09-30)
+
+**Outcome.** Accepted at 1/10 (fresh batch 5). Auto Review Approved 2/2/3 (Description minor: one
+dense validity sentence; Tests minor: no unresolved empty-base case).
+
+**Shape + stats.** O-Composite-add on riff (Rust). Conflict regions in one-column unified diffs: marker
+grammar with per-set lengths, resolved (removed markers) vs unresolved (added markers), diff3 bases,
+several sets per block, cross-hunk regions, whole-text word refinement per role, "as today" fallback.
+6 files, 503 human-effective, 38 tests, 62 base tests. Agent patches 4-7 files, +960 to +1186 lines,
+47-109 model requests (median 72).
+
+**Decisive difficulty drivers.** Empty sides into `refiner::diff` (F-39, 4/10), unresolved context
+lines rendered raw (F-69, 4/10), a removed opener after added lines (F-70, 4/10, Nova_4's only failure),
+multi-set cells (F-10, 2/10; Nova_10's only failures).
+
+**Iteration lessons.** Slice → 3 Auto Review revisions (each found a reference bug) → batch 1 0/11 on an
+unstated boundary (L110) → three batches of FP-voided passes (empty sides; no-final-newline x3; second
+opener, stray markers) → cap + named rules → 1/10. Zero-kill tests: 11 of 38, including every grammar
+test and the DESIGN lead trap (kept line, 2/11 in batch 1).
+
+## grmtools-contextual-lexeme-readings (APPROVED Olympus 2026-09-30)
+
+**Outcome.** Accepted at 2/10 (batch 4, all Nova). A final Auto Review asked for one more revision
+(reading not latched across reductions in a reduce/reduce-conflicted Pager table); acceptance came
+first and the reference was left as is.
+
+**Shape + stats.** O-Pipeline-hard on grmtools (Rust). `%fallback T A B` and `%split S P1 P2` (two or
+three pieces, names spelling `S`, lengths in characters); a reading per lookahead chosen from the
+pre-reduction configuration with reductions simulated; CPCT+ reading the same way in search, ranking
+and replay, with piecewise shift/delete of an unreadable split at per-piece cost. 5 files, 367
+human-effective, 37 tests, 296 base tests. Agent patches 6-8 files, +605 to +1095 lines.
+
+**Decisive difficulty drivers.** Declared names never registered (F-71, 4/10; 5/12 and 5/10 earlier),
+reversed recovery stack (F-72, 3/10, Nova_2's only failure at 36/37), duplicate and target-declared
+diagnostics (5/10 each, diverse causes).
+
+**Iteration lessons.** Slice (15 tests) → Solution Quality x2 (+18 tests, 4 reference bugs) → Auto Review
+(four-piece loop) → 0/25 (undefined "can be shifted") → 0/12 (four-piece edge unstated) → Auto Review
+bytes vs characters → 0/10 (edge stated, broken a new way) → cap at three pieces → 2/10. Zero-kill tests:
+14 of 37, including the DESIGN lead trap and every reduction-timing and span-shape test.
+
+## pyocd-dwt-watchpoint-planner (APPROVED Olympus 2026-10-10)
+
+**Outcome.** Accepted at Nova 0/8 + Orion 1/4 under the 2026-10-09 gate (batch 8 = re-eval of batch 7).
+Auto Review approved with one Medium (double-fault rollback in `_disable_comparators`); FP panel ruled the
+Orion pass genuine after a 3000-scenario fuzz against the reference.
+
+**Shape + stats.** O-Composite-extend on pyOCD (Python). DWT v1 ranges as aligned power-of-two blocks over
+comparators with per-comparator MASK limits (probed by writing 31); DWT v2 1/2/4-byte singles, even/odd
+linked pairs (MATCH 0b0111), aligned-piece fallback; all-or-nothing placement with rollback; first-set hit
+named in GDB `watch:`/`rwatch:`/`awatch:`; sessions on resume/step/reset; commander watch/rmwatch/lswatch
+and hit phrases in status/continue/step. 7 files, ~252 human-effective, 78 tests. Agent patches 6-10 files,
++673 to +1147 lines.
+
+**Decisive difficulty drivers.** Stale MATCHED across sessions (F-74, 8/8 Nova, 0/4 Orion), 32-bit wrap
+(F-73, 8/8 Nova + 3/4 Orion, sole failure of three 76/78 Orion runs), comparator capacity cells (3-4 Nova).
+64 of 78 tests killed nothing.
+
+**Iteration lessons.** Six old-model batches were fairness repairs; the new-model gate was met by one
+tests-only round chosen by fuzzing the saved Orion solutions against each other (L115). Ten reference bugs.
+
+## cwerg-fe-address-constants (APPROVED Olympus 2026-10-11)
+
+**Outcome.** Accepted at Nova 0/8 + Orion 1/4 (re-eval of batch 9 with `emptyspan` added). Auto Review 3/3
+on all three bands; FP panel ruled the Orion pass genuine after its own probes (mutable writes through
+constant pointers, typed 3-cycles). Two environment-blocker contests on the C++ ELF addend upheld.
+
+**Shape + stats.** O-Composite-extend on Cwerg (Python + C++ twin front ends). Address constants =
+(global, byte offset) through field, index (any constant expression), deref, `front`, `ptr_inc`; equality by
+global and offset; read-through of scalars and whole aggregates; spans sharing global storage; typed
+self/forward references; `.addr.mem` addends; zero-size globals padded. 12 files, 365 human-effective,
+162 new cases, 242 base. Meta 273 body words after the requirement-count cut.
+
+**Decisive difficulty drivers.** Empty-span `front` (F-75, 11/12, sole failure of Nova #1, the former
+Nova pass, and Orion #4); aggregate read-through (F-77, 5/12 Nova); padded stride (F-76, 2/12 Nova on
+x64/a64). 12 of 18 programs killed nothing, including all the typify cycle tests and the coverage programs.
+
+**Iteration lessons.** Old-model FP voids came from pre-existing twin gaps and were ended by a meta cap;
+the new-model harden levers I designed killed nobody; the separator was an edge I had held back (L117).
+
+## libspatialindex-mvr-history-pruning (APPROVED Olympus 2026-10-11)
+
+**Outcome.** Accepted 2026-10-11, Nova 0/8 + Orion 2/8 (accepted once on the old models, reverted 2026-10-09).
+
+**Shape + stats.** O-Composite-extend in one C++ library: MVR-tree `pruneHistory` (with and without an
+archive visitor), reachability purge, node compaction, statistics, query clipping, horizon persistence,
+old-format reads, a live-entry delete fix. 6 files, 259 human-effective, 35 gtest cases, meta 281 words.
+
+**Decisive drivers.** F-78 dangling parent entries after the purge (12/16); F-79 previous-horizon shortcut
+(the sole failure of both Orion near-misses); F-47-style version lineage the tree never stores (7/16).
+17 of 35 tests killed nothing.
+
+**Iteration lessons.** Old models: the same-instant domain produced three FP/SQ findings until capped.
+New models: Nova 2/4 then probe tests; Orion 3/3, 4/4 until statistics after a purge; two requirement-count
+cuts (retention, C API, rejection rules, the compaction sentence); one FP-voided pass fixed with the panel's
+scenario; the pool reached 2/8 with fresh runs.
+
+## asdf-conversion-free-lazy-tree (APPROVED Olympus 2026-10-11)
+
+**Outcome.** Accepted 2026-10-11, Nova 0/8 + Orion 1/8 (Vega 2/4) via re-eval of batch 11 (reverted 2026-10-09
+with the other in-flight problems; never accepted on the old models).
+
+**Shape + stats.** O-Composite-extend over asdf's lazy tree: conversion-free `info`/`search`/`schema_info`
+(LazyView) and tag-preserving `write_to`/`update` (PassThrough), 7 source files + news fragment, 25 tests,
+base 2195, meta ~254 words / ~12 rules.
+
+**Decisive drivers.** F-80 shared-alias write (15/20, the Orion discriminator); F-81 asdf_library line (6/20);
+F-82 multi-type converter in info (2/4 Vega); Nova-only write-side tests (history, block renumbering on
+update, search-result materialization). 13 of 25 tests killed nothing.
+
+**Iteration lessons.** Old models: 0/11, then a Vega pass voided twice by FP panels (read tag on block
+conversion, multi-type on write), four 0/10 Nova batches on block renumbering, then the "simple cap". New
+models: Orion 1/4, 4/7, 3/4 until a base-differential probe found F-80; Task Prompt "too many requirements"
+cut 6 rules; the reference had to be cut too; batch 11 0/20 on a warnings-as-errors hidden rule, fixed
+tests-only.
+
+## hayro-optional-content-baking (APPROVED Olympus 2026-10-12)
+
+**Outcome.** Accepted Nova 0/8 + Orion 1/4 (re-eval of batch 14 + 8 fresh Nova), Nova sequence length avg
+636k. Auto Review at acceptance: Description 3/3, Tests 2/3 (T4 inline `/OC` -> OCMD untested),
+Solution 1/3 (S1: reference hides non-`/OC` `BDC` with a hidden-group property).
+
+**Shape + stats.** O-Pipeline-hard in Rust: a content-stream baker in hayro-write over pages, Forms, tiling
+patterns, Type 3 procs and soft-mask groups, for both extraction modes. 4 source files, 519
+human-effective, 74 new tests + 4 base plain-extraction tests, meta 254 body words. Oracle = hayro's own
+renderer, hand oracles where it departs.
+
+**Decisive drivers.** F-84 Type 3 via ExtGState (9/12); F-83 caller render mode in Forms (8/12, all Nova);
+F-85 hidden soft-mask group (5/8 Nova); the Orion separator was F-84's indirect-size variant, taken from
+an FP-panel dissent.
+
+**Iteration lessons.** Old models: nine batches, four FP-voided passes, one genuine pass that was approved
+and then reverted by an admin for a rule-by-rule meta. New models: two more FP-voided rounds closed by
+caps, Orion 0/18 while the inline `/OC` rule was implied, 2/4 once it was stated and F-83 restored, 1/4
+after one tests-only lever. Three Task Prompt Quality rounds (requirement count twice, AI once) before
+the last batch.
+
+## macs-callvar-fragment-phasing (APPROVED Olympus 2026-10-13)
+
+**Outcome.** Accepted Nova 0/8 + Orion 1/4 (re-eval on 55 tests of batch 18: 8 fresh Nova + the batch-17
+Orion runs), Nova sequence length avg 565k. Auto Review at acceptance: Description 3/3, Tests 2/3 (T3/T4:
+no upward-rounding BAR fixture; deletion DPT only bounded), Solution 3/3. FP panel: Orion pass genuine.
+
+**Shape + stats.** O-Pipeline-hard in Python+Cython (MACS3 callvar): `--pair-aware` fragment counting on
+the raw and local-assembly paths, chromosome-wide phasing of 0/1 calls incl. indels, PS + treatment-only
+BAR. 10 files, 325 human-effective, 55 CLI tests on synthetic BAM+BAI writers, 117 base, meta ~384 words.
+
+**Decisive drivers.** F-86 uncalled allele off both haplotypes (8/8 Nova, 0/4 Orion); F-87 strand of read 1
+outside the peaks (8/12); F-67 option-on == option-off on assembled calls (7/12, sole failure of Orion
+#3); F-18 `*` deletion after an SNV (5/12); quiet-peak crash (Orion #2).
+
+**Iteration lessons.** Old models: 9/10 → 6/10 → a run of FP-voided batches on the fermi path → scope-down
+→ 3/10. New models: Nova 3/5 → cross-peak phasing → Nova 1/7, 1/8, 0/8 → requirement-count cut (~27 → ~14
+rules) → Orion 2/4, 2/4, 3/4 → strand rule stated → 3/4 → three tests-only cells from the FP panel and
+assembly-path probes → 1/4 → four Auto Review tests (3 killed nothing) → accepted.

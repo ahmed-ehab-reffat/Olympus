@@ -1,6 +1,6 @@
 ---
 name: olympus-finalize
-description: Use AFTER a problem is accepted by a human reviewer — the carry-forward pass that turns one success into reproducible method. Mines every agent run in the problem folder (per-test kill counts, failure clusters, near-miss margins, tests that killed nothing, agent split, long-horizon metrics), classifies each failure against the F-ids in failure-patterns.md, extends that catalogue with new patterns/dossiers/laws, folds the findings back into the olympus-hunt and olympus-author skills, archives the problem into approved-problems/, and reclaims the disk the batch artifacts and worktree clone were holding. Triggers when the user says "it got accepted", "problem approved", "finalize this problem", "we shipped it", or pastes an acceptance notice. Source of truth: Olympus/failure-patterns.md § 4 (adding a new problem), CLAUDE.md § After Approval, Instructions/HARDENING.md, Instructions/TOO-EASY.md.
+description: Use AFTER a problem is accepted by a human reviewer — the carry-forward pass that turns one success into reproducible method. Mines every agent run in the problem folder (per-test kill counts, failure clusters, near-miss margins, tests that killed nothing, agent split, Nova sequence length), classifies each failure against the F-ids in failure-patterns.md, extends that catalogue with new patterns/dossiers/laws, folds the findings back into the olympus-hunt and olympus-author skills, archives the problem into approved-problems/, and reclaims the disk the batch artifacts and worktree clone were holding. Triggers when the user says "it got accepted", "problem approved", "finalize this problem", "we shipped it", or pastes an acceptance notice. Source of truth: Olympus/failure-patterns.md § 4 (adding a new problem), CLAUDE.md § After Approval, Instructions/HARDENING.md, Instructions/TOO-EASY.md.
 ---
 
 # Olympus Finalize — turn one accepted problem into reusable method
@@ -94,7 +94,7 @@ for d in sorted(glob.glob('*/')):
 "
 ```
 
-Long-horizon and scope facts, from the patches and trajectories:
+Scope facts, from the patches and trajectories (the long-horizon floor is gone since 2026-10-09, but files and LOC still drive payout):
 
 ```bash
 python3 -c "
@@ -112,6 +112,12 @@ for d in sorted(glob.glob('*/')):
 `trajectory.json` `steps` is a truncated summary (often 6 entries) — it is NOT a message count.
 Use prompt-token totals as the effort proxy and say so rather than inventing a message count.
 
+**Sequence length (the 2026-10-09 gate):** the platform requires the AVERAGE over all Nova runs to
+be > 256k, where a run's sequence length is the largest input+output token count of any single step,
+summed across compaction windows. Read the platform's reported value per Nova run and record the
+average in the dossier. `total_prompt_tokens` is a cumulative total over all steps, so it is NOT this
+number; do not substitute it.
+
 ---
 
 ## Stage 2 — Analyse (the stage that produces the lessons)
@@ -120,13 +126,13 @@ Answer all seven. Each maps to a law that already exists or a new one.
 
 | # | Question | Read it as |
 |---|---|---|
-| 1 | **Pass rate**, and where in the ≤40% band | ≤40% and ≥1 pass = healthy. Near 40% = the next problem needs a stronger lead trap |
+| 1 | **Per-agent result** under the 2026-10-09 gate: Nova x/8, Orion or Vega x/4, Nova average sequence length | Nova 0, Orion/Vega 1-25%, sequence length > 256k = healthy. Record how close each side came: a Nova near-miss (N-1) means the next problem needs a stronger lead trap; a lone Orion pass at N-1 elsewhere means it nearly read unsolvable. Pre-2026-10-09 batches are old-model data; label them so |
 | 2 | **Failure clusters** — do N runs fail the IDENTICAL test set? | One dominant cause is FAIR if anyone cleared it (L18). Check: passes exist? near-misses got everything else? evaluators said `description_clear: true`? FP clean? |
 | 3 | **Near-misses** (20/21, 19/21) — what was their SOLE failure? | This is the band decider. Almost always an F-10 cross-product cell. Record it by name |
 | 4 | **Which tests killed NOTHING?** | Not waste (fairness + FP insurance), but proof that effort there bought no difficulty. Name them so the next problem does not repeat the spend |
 | 5 | **Did a deliberately-authored wall kill zero agents?** | L15. Say it out loud. A trap justified on mutation evidence is unproven until a batch |
 | 6 | **Where did the decisive test come from** — your design, or a reviewer's coverage suggestion? | L17. If it was the reviewer's, that is the finding |
-| 7 | **Agent split** (Nova vs Orion vs Vega) | Orion has been load-bearing on every problem so far. A batch without it reads lower than the truth |
+| 7 | **Agent split** (Nova vs Orion vs Vega) | Now the gate itself: what did the Orion/Vega passer get right that every Nova run got wrong? That gap is the lever the next problem should reuse. (On the old models Orion was load-bearing on every problem.) |
 
 Also: what did HARDENING find in **your own reference** before the batch? Every problem so far
 has produced ~3 reference bugs, and each would have been an FP (L7). Count them.
@@ -144,7 +150,7 @@ Map every distinct failure cause to an F-id.
   a single failure is agent noise. Give it the next F-number and write the full block:
   Mechanism / Why it misdirects / Evidence (verbatim evaluator quotes) / Precondition /
   How to build / Arsenal mapping.
-- **Read >40% twice across problems** → demote to the DEAD list in `TOO-EASY.md`.
+- **Passed by Nova on two problems** (or read >40% twice on the old models) → demote to the DEAD list in `TOO-EASY.md`.
 
 ---
 

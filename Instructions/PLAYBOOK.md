@@ -1566,3 +1566,107 @@ Olympus, accepted 3/10 on batch 2 after 1/10. 10 files, 221 human-effective LOC 
   slice from 132 to 216 effective lines and supplied three of the five killer clusters.
 - **Replay saved patches before re-eval (L100); at 10/10 missed, state the rule and pay the batch.**
 - **Compiled-language harness: base build without the new test file, fallback with real test ids (L99).**
+
+## pict-engine-negative-values (APPROVED Olympus 2026-09-29)
+
+Olympus, accepted 3/10 on batch 5 after 0/11, 0/11, 1/11 (FP) and 2/10 (FP). 7 files, 214
+human-effective LOC, 34 new tests (ctypes plus a compiled C API client), C++ with a perl base harness.
+
+- **A generator with nested units is a good Olympus lane.** Negative values touch the engine's phase
+  structure, the model tree's state, the result layout and deletion; the whole-row composition at each
+  parent is where the band came from.
+- **Keep the contract to the surface you can defend.** CLI parity and cross-model exclusions each looked
+  cheap and each killed the batch; drop them before the first batch, not after.
+- **Replay the saved patches to price every cut (L86) and fuzz before answering an FP (L101).**
+- **Test oracles derived from the output survive agent variation:** whole child rows are read from each
+  run's own rows, so no reference row set is pinned.
+
+## macs-circular-chromosomes (APPROVED Olympus 2026-09-29)
+
+Accepted at **1/11** (Vega; Nova 0/10) on a re-eval after batch 1 read 0/11. Contract written as one
+rotation LAW ("rotating every read ... leaves every score, count and the fragment length unchanged"),
+tested with rotate-and-compare pairs plus per-base oracles, never pinning a reference value (Pattern
+109): Description 3/3 in every review round. Band from a default-mode estimator test (F-64, 10/11) and
+derived-structure rotation (F-65, 8/11). Recovery steps: fix a fixture only the reference tolerated
+(L105), then drop the three degenerate-case tests that killed 11/11 for one reason (L104), both priced
+by replaying the 11 saved patches (identical to the re-eval, L68). Seven gate rounds added ~30 tests;
+17 of 47 tests killed nothing.
+
+## ray-optics-sp-coherence-transport (APPROVED Olympus 2026-09-30)
+
+Accepted at **3/10** (all Nova) on the third full batch. Grew in two scope rounds from a 192-line
+coherence slice to 480 effective lines over 16 files: CPU transport of a complex s/p coherence term,
+Polarizer/Retarder objects with an object-fixed axis, Detector polarimetry, and the same objects in the
+legacy default engine. Batches: 7/10, 7/10 (after the object scope), 3/10 (after one legacy-engine
+paragraph). The band came from the second engine (F-67, 3/10) and an exact isolator cell (F-66, 4/10),
+not from the optics. Description 3/3 in every review; the meta ran to 846 words (over 500 only warns;
+1000 rejects). Second ray-optics acceptance (quota 2/6).
+
+## riff-unified-conflict-regions (APPROVED Olympus 2026-09-30)
+
+Accepted at **1/10** (Vega; Nova 0/9) after five batches. Rust, 6 files, human-effective 503, 38 tests
+comparing visible text and reverse-video spans through an SGR parser, with base-binary ANSI literals
+only where the contract says "exactly as riff shows it today". Band from four stated seams: empty sides
+(F-39), mode-split context lines (F-69), the block unit (F-70), multi-set cells (F-10). The long tail was
+false positives, not difficulty: fix each by naming the implied rule (L109), moving a fixture across an
+undefined boundary (L110), or capping a family base mishandles (L101). meta.md grew to 541 words; the
+platform only warns above 500.
+
+## grmtools-contextual-lexeme-readings (APPROVED Olympus 2026-09-30)
+
+Accepted at **2/10** (both Nova) after 0/25, 0/12, 0/10. Rust, 5 files over cfgrammar and lrpar,
+human-effective 367, 37 tests in one lrlex integration file, 296 base tests. Band from diverse causes:
+declared names not registered (F-71), reversed recovery stack (F-72), exact declaration diagnostics. The
+three zero batches were each fixed on the solver-visible side (a verb defined, an edge stated, the domain
+capped), so each fix cost a full batch; settle meta.md with a replay before the first batch. The
+designed lead trap (decide before reductions) killed 0/10 once "can be shifted" was defined.
+
+## pyocd-dwt-watchpoint-planner (APPROVED Olympus 2026-10-10)
+
+Accepted at **Nova 0/8, Orion 1/4** (batch 8, a re-eval of batch 7 on the hardened suite), Nova sequence
+length avg 521k. Python, 7 files over coresight/dwt, cortex_m, gdbserver and commands, ~252
+human-effective, 78 tests with a FakeDebugAP, 1100 base tests. Two walls with different owners: a stale
+read-to-clear latch (F-74) holds Nova at zero; a 32-bit wrap (F-73) gives Orion's 1-of-4. Hardening for the
+new gate was tests-only: replay the saved Orion patches, fuzz them against each other, and add a test only
+where they disagree. The re-eval matched the local replay run for run.
+
+## cwerg-fe-address-constants (APPROVED Olympus 2026-10-11)
+
+Accepted at **Nova 0/8, Orion 1/4** (re-eval of batch 9), Nova sequence length avg 995k. Python + C++ twin
+front ends, 12 files (evaluator, span lowering, data emitter, type checker, one C++ ELF line), 365
+human-effective, 18 programs x py/cc x 3 targets + output parity = 162 cases. Nova is held at zero by
+emitter walls (aggregate read-through F-77, padded stride F-76); Orion's 1-of-4 came from an empty-span
+case held back earlier for being too strong (F-75, L117). Playbook points: cap pre-existing twin
+divergences in meta instead of testing them (L60, four FP-voided passes); budget a contest when the feature
+needs one line outside the title's subsystem (L118); re-run the noisy requirement-count check before cutting.
+
+## libspatialindex-mvr-history-pruning (APPROVED Olympus 2026-10-11)
+
+Accepted at Nova 0/8 + Orion 2/8 after ten batches across both model generations. Playbook points: under
+the requirement-count gate cut rules nobody would break if unstated, and replay the saved pool after each
+cut (L120); take an FP panel's scenario as a test even when it removes the only pass, then append fresh runs
+of the same agent rather than re-rolling (L121); size same-instant bursts to stay clear of base storage leaks.
+
+## asdf-conversion-free-lazy-tree (APPROVED Olympus 2026-10-11)
+
+Accepted at Nova 0/8 + Orion 1/8 (Vega 2/4) after 12 batches across both model generations. Playbook
+points: when the strong agent converges on every stated cell, probe what base preserves that the new
+path bypasses and test that invariant without a sentence (Pattern 116); check pytest's
+`filterwarnings` before writing any test on a path where base warns (L122); align the reference with a
+cut meta (L123); one agent in the window passes the Orion/Vega check (L124).
+
+## hayro-optional-content-baking (APPROVED Olympus 2026-10-12)
+
+Accepted at Nova 0/8 + Orion 1/4 after 15 batches across both model generations. Playbook points: after
+a model change, replay walls you cut for killing everyone (L125); treat every S1 on your reference as a
+trap candidate (L17); at Orion 2/4, replay the FP panel's dissenting probes before inventing a lever
+(Pattern 117, L126); when the oracle is the repo's own engine, make the reference follow the spec just
+outside each meta cap (L127).
+
+## macs-callvar-fragment-phasing (APPROVED Olympus 2026-10-13)
+
+Accepted at Nova 0/8 + Orion 1/4 after 19 batches across both model generations. Playbook points: a
+precheck reference bug is a calibrated Nova trap (F-86, L90); at Orion 3/4, take the FP panel's scenario
+and judge probes and probe the default alternate path before any meta change (L126); where the meta is
+silent, assert equality with the option-off output on inputs where the new rule is a no-op (Pattern 118,
+L128).

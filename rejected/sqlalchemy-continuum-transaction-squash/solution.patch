@@ -1,0 +1,280 @@
+diff --git a/sqlalchemy_continuum/__init__.py b/sqlalchemy_continuum/__init__.py
+index cf2f641..e6c10a7 100644
+--- a/sqlalchemy_continuum/__init__.py
++++ b/sqlalchemy_continuum/__init__.py
+@@ -5,6 +5,7 @@ from .exc import ImproperlyConfigured as ImproperlyConfigured
+ from .manager import VersioningManager
+ from .operation import Operation as Operation
+ from .transaction import TransactionFactory as TransactionFactory
++from .squash import squash_transactions as squash_transactions
+ from .unit_of_work import UnitOfWork as UnitOfWork
+ from .utils import (
+     changeset as changeset,
+diff --git a/sqlalchemy_continuum/plugins/activity.py b/sqlalchemy_continuum/plugins/activity.py
+index 6fd1af4..25d2afc 100644
+--- a/sqlalchemy_continuum/plugins/activity.py
++++ b/sqlalchemy_continuum/plugins/activity.py
+@@ -303,3 +303,12 @@ class ActivityPlugin(Plugin):
+ 
+     def after_version_class_built(self, parent_cls, version_cls):
+         pass
++
++    def after_squash_transactions(self, manager, session, merged_ids, last_id):
++        table = self.activity_cls.__table__
++        for column in ('transaction_id', 'object_tx_id', 'target_tx_id'):
++            session.execute(
++                sa.update(table)
++                .where(table.c[column].in_(merged_ids))
++                .values({column: last_id})
++            )
+diff --git a/sqlalchemy_continuum/plugins/base.py b/sqlalchemy_continuum/plugins/base.py
+index ee720ec..1696d2d 100644
+--- a/sqlalchemy_continuum/plugins/base.py
++++ b/sqlalchemy_continuum/plugins/base.py
+@@ -32,6 +32,9 @@ class Plugin:
+     def after_construct_changeset(self, version_obj, changeset):
+         pass
+ 
++    def after_squash_transactions(self, manager, session, merged_ids, last_id):
++        pass
++
+ 
+ class PluginCollection:
+     def __init__(self, plugins=None):
+diff --git a/sqlalchemy_continuum/plugins/transaction_changes.py b/sqlalchemy_continuum/plugins/transaction_changes.py
+index 77e7086..dc6a515 100644
+--- a/sqlalchemy_continuum/plugins/transaction_changes.py
++++ b/sqlalchemy_continuum/plugins/transaction_changes.py
+@@ -73,5 +73,26 @@ class TransactionChangesPlugin(Plugin):
+                 )
+                 session.add(changes)
+ 
++    def after_squash_transactions(self, manager, session, merged_ids, last_id):
++        table = self.model_class.__table__
++        ids = [*merged_ids, last_id]
++        names = set(
++            session.scalars(
++                sa.select(table.c.entity_name).where(table.c.transaction_id.in_(ids))
++            )
++        )
++        session.execute(sa.delete(table).where(table.c.transaction_id.in_(ids)))
++        for parent_cls, version_cls in manager.version_class_map.items():
++            if parent_cls.__name__ not in names:
++                continue
++            tx_column = getattr(version_cls, manager.option(parent_cls, 'transaction_column_name'))
++            if session.scalar(sa.select(sa.func.count()).where(tx_column == last_id)):
++                session.execute(
++                    sa.insert(table).values(
++                        transaction_id=last_id, entity_name=parent_cls.__name__
++                    )
++                )
++                names.discard(parent_cls.__name__)
++
+     def after_version_class_built(self, parent_cls, version_cls):
+         parent_cls.__versioned__['transaction_changes'] = self.model_class
+diff --git a/sqlalchemy_continuum/plugins/transaction_meta.py b/sqlalchemy_continuum/plugins/transaction_meta.py
+index 65d60ed..c0890ad 100644
+--- a/sqlalchemy_continuum/plugins/transaction_meta.py
++++ b/sqlalchemy_continuum/plugins/transaction_meta.py
+@@ -100,3 +100,17 @@ class TransactionMetaPlugin(Plugin):
+     def after_build_models(self, manager):
+         self.model_class = TransactionMetaFactory()(manager)
+         manager.transaction_meta_cls = self.model_class
++
++    def after_squash_transactions(self, manager, session, merged_ids, last_id):
++        table = self.model_class.__table__
++        ids = [*merged_ids, last_id]
++        rows = session.execute(
++            sa.select(table.c.key, table.c.value)
++            .where(table.c.transaction_id.in_(ids))
++            .order_by(table.c.transaction_id)
++        ).all()
++        session.execute(sa.delete(table).where(table.c.transaction_id.in_(ids)))
++        for key, value in dict(rows).items():
++            session.execute(
++                sa.insert(table).values(transaction_id=last_id, key=key, value=value)
++            )
+diff --git a/sqlalchemy_continuum/squash.py b/sqlalchemy_continuum/squash.py
+new file mode 100644
+index 0000000..6cfe882
+--- /dev/null
++++ b/sqlalchemy_continuum/squash.py
+@@ -0,0 +1,115 @@
++import sqlalchemy as sa
++
++from .operation import Operation
++
++
++def _version_tables(manager):
++    tables = {}
++    for parent_cls, version_cls in manager.version_class_map.items():
++        for table in sa.inspect(version_cls).tables:
++            tables.setdefault(table, parent_cls)
++    for table in manager.association_version_tables:
++        tables.setdefault(table, None)
++    return tables
++
++
++def _option(manager, parent_cls, name):
++    if parent_cls is None:
++        return manager.options[name]
++    return manager.option(parent_cls, name)
++
++
++def _fold_operation(previous, last, op_column):
++    existed = previous is not None and previous[op_column] != Operation.DELETE
++    if last[op_column] == Operation.DELETE:
++        return Operation.DELETE if existed else None
++    return Operation.UPDATE if existed else Operation.INSERT
++
++
++def _squash_table(session, table, names, first_id, last_id, mod_suffix):
++    tx, end_tx, op = names
++    key_columns = [c for c in table.primary_key.columns if c.name != tx]
++    rows = (
++        session.execute(
++            sa.select(table)
++            .where(table.c[tx] >= first_id, table.c[tx] <= last_id)
++            .order_by(table.c[tx])
++        )
++        .mappings()
++        .all()
++    )
++    groups = {}
++    for row in rows:
++        groups.setdefault(tuple(row[c.name] for c in key_columns), []).append(row)
++    for key, group in groups.items():
++        key_clause = sa.and_(*(c == value for c, value in zip(key_columns, key)))
++        previous = (
++            session.execute(
++                sa.select(table)
++                .where(key_clause, table.c[tx] < first_id)
++                .order_by(table.c[tx].desc())
++                .limit(1)
++            )
++            .mappings()
++            .first()
++        )
++        final = dict(group[-1])
++        operation = _fold_operation(previous, final, op)
++        session.execute(
++            sa.delete(table).where(
++                key_clause, table.c[tx] >= first_id, table.c[tx] <= last_id
++            )
++        )
++        if operation is not None:
++            final[tx] = last_id
++            final[op] = operation
++            for column in table.c:
++                if mod_suffix and column.name.endswith(mod_suffix):
++                    base = column.name[: -len(mod_suffix)]
++                    if operation == Operation.UPDATE and base in table.c:
++                        final[column.name] = previous[base] != final[base]
++                    else:
++                        final[column.name] = any(r[column.name] for r in group)
++            session.execute(sa.insert(table).values(**final))
++        if end_tx and previous is not None:
++            successor = last_id if operation is not None else final[end_tx]
++            session.execute(
++                sa.update(table)
++                .where(key_clause, table.c[tx] == previous[tx])
++                .values({end_tx: successor})
++            )
++
++
++def squash_transactions(session, first_id, last_id, manager=None):
++    """
++    Merge the transactions ``first_id`` to ``last_id`` into transaction
++    ``last_id``.
++    """
++    if manager is None:
++        from . import versioning_manager as manager
++    tx_cls = manager.transaction_cls
++    ids = session.scalars(
++        sa.select(tx_cls.id)
++        .where(tx_cls.id >= first_id, tx_cls.id <= last_id)
++        .order_by(tx_cls.id)
++    ).all()
++    if first_id >= last_id or not ids or ids[0] != first_id or ids[-1] != last_id:
++        raise ValueError(f'Cannot squash transactions {first_id} to {last_id}')
++    mod_suffix = next(
++        (p.column_suffix for p in manager.plugins if hasattr(p, 'column_suffix')), None
++    )
++    for table, parent_cls in _version_tables(manager).items():
++        names = tuple(
++            _option(manager, parent_cls, name)
++            for name in (
++                'transaction_column_name',
++                'end_transaction_column_name',
++                'operation_type_column_name',
++            )
++        )
++        if _option(manager, parent_cls, 'strategy') != 'validity':
++            names = (names[0], None, names[2])
++        _squash_table(session, table, names, first_id, last_id, mod_suffix)
++    manager.plugins.after_squash_transactions(manager, session, ids[:-1], last_id)
++    session.execute(sa.delete(tx_cls.__table__).where(tx_cls.id.in_(ids[:-1])))
++    session.expire_all()
+diff --git a/sqlalchemy_continuum/utils.py b/sqlalchemy_continuum/utils.py
+index faf678d..b201a57 100644
+--- a/sqlalchemy_continuum/utils.py
++++ b/sqlalchemy_continuum/utils.py
+@@ -1,4 +1,3 @@
+-from collections import defaultdict
+ from inspect import isclass
+ from itertools import chain
+ 
+@@ -9,9 +8,9 @@ from sqlalchemy.orm.util import AliasedClass
+ from ._compat import (
+     get_primary_keys,
+     identity,
+-    naturally_equivalent,
+ )
+ from .exc import ClassNotVersioned
++from .operation import Operation
+ 
+ 
+ def get_versioning_manager(obj_or_class):
+@@ -228,24 +227,28 @@ def vacuum(session, model, yield_per=1000):
+     :param yield_per: how many rows to process at a time
+     """
+     version_cls = version_class(model)
+-    versions = defaultdict(list)
++    previous = {}
++    tx_column = option(model, 'transaction_column_name')
++    end_tx_column = option(model, 'end_transaction_column_name')
++    validity = option(model, 'strategy') == 'validity'
++    keys = [p.key for p in versioned_column_properties(model)]
+ 
+-    query = (
+-        session.query(version_cls).order_by(
+-            option(version_cls, 'transaction_column_name')
+-        )
+-    ).yield_per(yield_per)
+-
+-    primary_key_col = sa.inspection.inspect(model).primary_key[0].name
++    query = (session.query(version_cls).order_by(tx_column)).yield_per(yield_per)
++    primary_keys = [c.key for c in sa.inspection.inspect(model).primary_key]
+ 
+     for version in query:
+-        version_id = getattr(version, primary_key_col)
+-        if versions[version_id]:
+-            prev_version = versions[version_id][-1]
+-            if naturally_equivalent(prev_version, version):
+-                session.delete(version)
++        version_id = tuple(getattr(version, key) for key in primary_keys)
++        prev_version = previous.get(version_id)
++        if (
++            prev_version is not None
++            and version.operation_type == Operation.UPDATE
++            and all(getattr(prev_version, k) == getattr(version, k) for k in keys)
++        ):
++            if validity:
++                setattr(prev_version, end_tx_column, getattr(version, end_tx_column))
++            session.delete(version)
+         else:
+-            versions[version_id].append(version)
++            previous[version_id] = version
+ 
+ 
+ def is_table_column(column):

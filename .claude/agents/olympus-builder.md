@@ -15,7 +15,7 @@ mandatory first reads it names (`failure-patterns.md`, `Instructions/HARDENING.m
 
 ## MODE=SLICE (author skill Step 0 through Step 4b)
 
-1. Clone into `worktrees/<repo>/`, choose the base commit, create `problems/<repo>-<slug>/` with
+1. Clone into `worktrees/<repo>/`, choose the base commit, create `new-problems/<repo>-<slug>/` with
    `BASE_COMMIT.txt`, and create `feedback.md` and `eval-results.md` right away.
 2. Run Phases 1-5 and write `DESIGN.md`. Run the scope-lock gates before any code: PICK-FILTER gates
    1, 5, 6, 7b and 8, the SIX-CHECK, and the canonical-org exclusivity PR-DIFF check.
@@ -31,7 +31,7 @@ mandatory first reads it names (`failure-patterns.md`, `Instructions/HARDENING.m
 
 ## MODE=FINISH (author skill Step 4b onward)
 
-1. Read the problem folder (`DESIGN.md`, `feedback.md`) and the precheck feedback you were given. Fix
+1. Read the problem folder `new-problems/<slug>/` (`DESIGN.md`, `feedback.md`) and the precheck feedback you were given. Fix
    every quality or description warning the feedback names, or record in `feedback.md` why it was
    declined.
 2. Build the full scope from DESIGN.md: traps, F-10 cells, integrations. Target >= 250 human-effective
@@ -39,7 +39,7 @@ mandatory first reads it names (`failure-patterns.md`, `Instructions/HARDENING.m
 3. Complete the author skill's pre-submit checklist:
    - Docker clean room (uid 1000, `--network none`), `test.sh base` and `test.sh new`.
    - Flakiness: base and new runs 3 times each, with identical results.
-   - `python3 .claude/hooks/effective_loc_check.py problems/<slug>/solution.patch`. Pass the path
+   - `python3 .claude/hooks/effective_loc_check.py new-problems/<slug>/solution.patch`. Pass the path
      explicitly because other problems exist.
    - `test.sh` shows as mode 100755 in the patch. No `shipd`/`datacurve` in names, no `::` in JUnit
      names. Added comments match repo convention (default none). `meta.md` is ASCII human-voice with
@@ -47,19 +47,20 @@ mandatory first reads it names (`failure-patterns.md`, `Instructions/HARDENING.m
    - The mutation / FP self-check the skill prescribes.
    - Re-run the SIX-CHECK and exclusivity right before the final patch generation.
 4. Update `feedback.md` with a short status block and
-   `NEXT (human): first platform batch (freeze meta.md/Dockerfile/base first; steer with re-eval)`.
+   `NEXT (human): 1 Nova smoke run, then Orion x4 and Nova to 8 (2026-10-09 gate: Nova 0/8, Orion/Vega 1-25%, Nova avg sequence length >256k; freeze meta.md/Dockerfile/base first; steer with re-eval)`.
    Log the local validation numbers in `eval-results.md`.
 
 ## Death (either mode)
 
 Shelve by the CLAUDE.md rule: append a case-study entry to `Instructions/TOO-EASY.md` when the death is
 a difficulty or triviality class, record exclusivity or dedupe deaths in `Instructions/SATURATED-REPOS.md`,
-and `git mv problems/<slug> rejected/<slug>` (plain `mv` if the folder is untracked). Keep the artifacts.
+and `git mv new-problems/<slug> rejected/<slug>` (plain `mv` if the folder is untracked). Keep the artifacts.
 
 ## Hard limits
 
-- Touch only your own `problems/<slug>/`, your own `worktrees/<repo>*` dirs, and the shelving files above.
-  Other problem folders belong to sessions running in parallel.
+- Touch only your own `new-problems/<slug>/`, your own `worktrees/<repo>*` dirs, and the shelving files above.
+  Other problem folders belong to sessions running in parallel. Never create, edit or move anything
+  under `problems/`: that is where the human puts a problem once they start work on it.
 - Disk: check `df -h /` and `df -h /var/lib/docker` before every build and stop building below 8G free.
   Remove `worktrees/<repo>/target` and other build output as soon as a measurement is recorded, and at
   the end of the run.

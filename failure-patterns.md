@@ -452,6 +452,18 @@ holders for a device that had opened its image from the daemon's working directo
 (`devices_sharing_an_image_from_the_working_directory_report_each_other`, ruled subtle but fair). 0/10
 in the accepted batch.
 
+`pict-engine-negative-values` adds an ORDER cell: axis 1 = negative values, axis 2 = the model's order,
+order 1 being the degenerate one (every value shown once, so the negative pass has no partner to pick).
+Covered by "every combination the orders require". `test_flat_order_one_shows_every_value` killed
+**3/11, 5/11, 5/10, 8/11 and 3/10** across the five batches, and in the accepted batch it was the SOLE
+cause of the 32/34 near-miss (Nova #3: both order-one tests abort on `Model::gcd` `choice != -1`).
+
+`riff-unified-conflict-regions` adds a MULTI-SET cell: axis 1 = several marker sets in one block
+(their between lines belong to every side), axis 2 = the comparison mode (two-way, diff3, resolved
+diff3). Every single-set test of every mode passed. Accepted batch: **2/10**, and the three multi-set
+tests were the ONLY failures of Nova_10 (35/38): *"its token-to-line comparison/rendering does not
+correctly preserve the whole-region comparisons across multiple marker sets"*.
+
 **Precondition.** Any feature stated as "X must work for all forms of Y". Two axes is enough;
 one of them wants multiplicity (fan-out, N receivers, repeated rounds) and the other wants
 polarity (direction, which side is anchored, in vs out).
@@ -1284,6 +1296,22 @@ a passwd entry too, keeping that user's group") and still: **6/10** in batch 1 a
 accepted batch (one of them the `SUDO_GID` variant: *"GetUidAndGid uses SUDO_GID for a UID without a
 passwd entry"*). Stating the rule does not transmit a latent library-API edge.
 
+`pict-engine-negative-values` adds an IDENTITY instance: base `PictAddParameter` numbers parameters per
+model, and exclusion ordering asserts that distinct parameters have distinct sequence numbers. Base
+itself aborts on a tree with exclusions in two child models. The feature's masking exclusions (one per
+pair of negative values) are the first caller that spans models, so they reach it. Batch 1: **8/11**
+runs crashed on the sequence assert or on the stale back-pointer assert of a second derivation; one run
+hit it on every child-model test. The reference hit both before any agent did.
+
+`riff-unified-conflict-regions` adds an EMPTY-INPUT instance: `refiner::diff` ends in
+`bridge_consecutive_highlighted_tokens`, whose `for i in 1..(tokens.len()-1)` underflows on an empty
+token slice. Every existing caller compares non-empty texts; conflict regions produce empty sides and
+empty resolutions routinely. riff renders a panicking future by dropping its output, so the whole region
+vanishes. Accepted batch: **4/10** (Nova_3, Nova_5, Nova_6, Nova_9; Nova_5 *"calls the refiner with empty
+source groups instead of handling empty sides/resolutions as specified, causing panics"*). Batch 1:
+**3/11** on the diff3 empty-side tests. The only pass of batch 2 was FP-voided for the same panic on
+resolved and two-way empty sides, which no test covered yet.
+
 **Precondition.** A small allocation, cursor or range-arithmetic helper whose loop exits early and
 rebuilds its result from only the items it touched, used today only by callers whose input keeps the
 bug unreachable (one element, contiguous input, partial fills). Confirm by calling it with the new
@@ -1536,6 +1564,9 @@ persistence, a run that passed all 73 new and 27 baseline tests and was STILL fa
 *"Node::loadFromByteArray always reads that extra field and does not inspect a format/version flag."* The
 two deep stopped-entry scenes were the joint top killers (4/12 each). Measured lift from introducing the
 axis: batch 1 (no expiry) read 7/10; the accepted batch read 5/12.
+libspatialindex-mvr-history-pruning: **7/16 runs** on version lineage the MVR-tree never stores (a version
+copy overwrites an entry's start; old-format pages carry no lineage): identical-record reinsertion and
+old-index archive cells (7 each), plus 6/16 on the old-index workloads.
 
 Designed layers that killed NOBODY in the accepted pool: containment split at stop instants
 (`ContainmentSeesAnEntryStopInsideTheInterval`, 0/12) and a single-piece distance solver
@@ -2047,6 +2078,859 @@ inserted. Assert the object's state after the refusal, not only the return value
 
 ---
 
+### F-62. A composite value's partners sized by its parts, not its whole rows ★ 5/10 in the accepted batch on pict-engine-negative-values, sole failure of two near-misses
+
+**Mechanism.** At a parent, a child model is ONE value per generated child row (PICT's pseudo-parameter).
+A row carrying a negative value from one child needs non-negative partners from its siblings. Two
+depths of the same mistake: (a) the negative pass regenerates the sibling too, so all its rows carry a
+negative and the first child's negatives never appear (issue #44, inherited from the CLI's two-run
+template); (b) the negative pass adds SOME positive sibling rows, enough that every leaf value of the
+sibling meets the negative, but not every whole row.
+
+**Why it misdirects.** Depth (b) passes every leaf-pair and leaf-triple check, and the agent's own
+fixtures (small children, few rows) usually cover the whole rows by accident. The failing message names
+row tuples, which reads like an over-strict oracle rather than a coverage gap.
+
+**Evidence.** pict-engine-negative-values: depth (a) `test_children_negative_values_all_appear`
+**7/11, 10/11, 6/10, 9/11, 5/10** across the five batches. Depth (b)
+`test_child_models_combine_as_whole_rows` (added in R10 from an Auto Review coverage finding) **5/10,
+4/11, 5/10**; the sole failure of batch-4 Vega (33/34) and of accepted-batch Nova #1 (33/34):
+*"negative child rows were not combined with every valid sibling child row"*, ruled mentioned and
+inferable. Batch-2 Nova #7 and batch-1 Nova #2, the earlier passers, pass it.
+
+**Precondition.** A hierarchical generator or aggregator where a child's result enters the parent as
+one opaque value (pseudo-parameter, sub-query row, nested record) and the new feature splits results
+into regimes that pair differently.
+
+**How to build.** Test with an oracle derived from the OUTPUT: collect each child's rows with and
+without the special value, then require every cross product at the parent's order. Use two children
+and nothing else at an order-2 root so the product is exhaustive and cheap. Zero contract words beyond
+"between the parameters and child models of a model at that model's order".
+
+**Arsenal mapping.** HARDENING S2 composition; the whole-unit sibling of F-10.
+
+---
+
+### F-63. Two coverage regimes merged into one pass — 7/11 in batch 4 on pict-engine-negative-values
+
+**Mechanism.** The contract asks for two disjoint guarantees: rows WITHOUT a negative value cover every
+positive combination on their own, and each negative value gets the same coverage separately. The cheap
+design runs the existing generator once with pair masks so no row holds two negatives. Negative rows
+then absorb positive combinations, and the positive-only rows are incomplete.
+
+**Why it misdirects.** Every row is valid, every negative value appears with every partner, and a
+coverage check over ALL rows passes. Only an oracle that restricts itself to rows without negatives sees
+the hole, and the missing pairs look arbitrary.
+
+**Evidence.** pict-engine-negative-values `test_flat_valid_pairs_come_from_rows_without_negative_values`:
+**3/11, 4/11, 5/10, 8/11, 3/10** across the five batches; batch 4 had **7/11** runs on the identical
+17/34 failure set (*"negative values therefore consume ordinary coverage rows instead of being generated
+alongside a complete positive-only suite"*). The sentence was unchanged between batches that read 3 and
+8, so the swing is batch variance, not wording.
+
+**Precondition.** A generator or scheduler whose new mode adds "special" items that must not dilute an
+existing guarantee over the ordinary items.
+
+**How to build.** One sentence ("Rows without a negative value cover every combination ...") and a test
+that computes coverage over the ordinary-only rows. Keep the all-rows checks too, so the failure is
+unambiguous.
+
+**Arsenal mapping.** HARDENING S2; a regime-separation trap. Expect it to read 30-70% alone.
+
+---
+
+### F-64. The topology change reaches the output path but not the estimator that runs first ★ 10/11 on macs-circular-chromosomes, sole failure of the best near-miss
+
+**Mechanism.** A feature changes the SHAPE of a coordinate domain (linear to circular). Agents patch
+every stage the outputs visibly come from (pileups, lambda, peak joining, bedGraph, summits) and leave
+an upstream ESTIMATOR on the old topology: MACS3's shifting model (`PeakModel`) pairs + and - strand
+tag peaks on raw linear coordinates before any peak is called. On data whose sites straddle the
+origin it finds zero pairs and callpeak exits; with fewer straddling sites it silently estimates a
+different fragment length and every downstream score moves.
+
+**Why it misdirects.** Every other test is run with the estimator switched off (`--nomodel`, fixed
+extension), because that is how you pin exact pileups. So the whole suite, and the agent's own
+checks, exercise the patched path, and the estimator is only reached by the one default-mode test.
+The failure reads as "cannot build the model", which points at data or MFOLD, not at the feature.
+
+**Evidence.** macs-circular-chromosomes accepted batch (re-eval of batch 1): **10/11** (all 10
+Nova), and the SOLE failure of Nova #2 at 46/47. *"The agent did not adapt PeakModel to circular
+coordinates. Its patch changes the circular pileup and peak-calling paths but does not modify
+MACS3/Signal/PeakModel.py."* Nine failed on zero paired peaks; Nova #3 built a model but reported
+unwrapped summit offsets on the model contigs (*"142 versus -2881"*). Every evaluator: mentioned in
+the description AND inferable. Only Vega passed. The test came from an Auto Review T4 finding
+("every successful circular single-end call disables PeakModel"), not from the design.
+
+**Precondition.** A pipeline with an optional estimator stage that consumes the same coordinates
+before the main computation (model fitting, calibration, auto-tuning, bandwidth selection), and a
+contract promise that covers its output ("rotation leaves the fragment length unchanged").
+
+**How to build.** State the estimator's output in the invariance sentence (the fragment length is
+named, nothing about the model). Build one default-mode fixture where the linear estimator provably
+fails: many small circular contigs, one strand-paired site straddling each origin, rotated to
+mid-contig in the second run; compare the reported estimate and the rotated outputs.
+
+**Arsenal mapping.** F-3 (one rule, two holders) across pipeline STAGES instead of collections;
+HARDENING S-tier when the estimator is switched off everywhere else in the suite.
+
+---
+
+### F-65. The wrap is joined at the top level but not in the structures derived from it — 8/11 and 5/11 on macs-circular-chromosomes
+
+**Mechanism.** Agents handle a circular feature by joining the first and last linear groups at the
+origin. Everything built INSIDE a group afterwards is still computed on the pre-join linear pieces:
+broad regions' gapped blocks (nested strong regions plus endpoint blocks) and subpeak summit offsets.
+The outer peak comes out right; its inner representation depends on where the origin fell.
+
+**Why it misdirects.** The peak rows (chromosome, start, end, score) match after rotation, so a
+rotation check on the main output passes. The difference is in a secondary column (blockCount,
+blockSizes, summit offset), which looks like formatting.
+
+**Evidence.** macs-circular-chromosomes accepted batch: broad/gapped rotation **8/11**, subpeak
+summit rotation **5/11**; three near-misses at 44/47 and 43/47 failed exactly these plus F-64.
+*"changed narrowPeak summit offsets after rotation (126 versus -19874), changed gappedPeak block
+structure (3 blocks versus 2)"*; *"The broad circular path does not preserve the canonical
+gappedPeak block representation across rotations."* Ruled mentioned and inferable.
+
+**Precondition.** A top-level grouping that the feature makes cyclic, with nested or derived
+structures (blocks, sub-intervals, relative offsets) computed from the group's pieces.
+
+**How to build.** One rotation test per derived output mode (broad + gapped, subpeaks), with a site
+straddling the origin, comparing every column of the rotated rows. No extra contract words: "rotating
+every read rotates every peak, summit and track position" already covers them.
+
+**Arsenal mapping.** F-10 cross-product cell (wrap x output mode); pairs naturally with F-64.
+
+---
+
+### F-66. A physically exact zero reached by cancellation, where the repo rejects the out-of-domain sign ★ 4/10 on ray-optics-sp-coherence-transport, sole failure of two 53/54 near-misses
+
+**Mechanism.** A composite scene drives one output to an EXACT physical zero: a double pass through a
+quarter-wave retarder around a mirror turns s light into pure p light, so P_s must be 0. An
+implementation that expands the transform into a sum of large terms (Jones matrix products written out
+as A/B/F coefficients) lands on about -1e-17 instead of 0. The repo's pre-existing validity guard
+treats any negative power as an invalid ray and zeroes the WHOLE output, so the detector reads
+[0, 0, 0, 0] where [0, 1, 0, 0] is expected.
+
+**Why it misdirects.** The physics is right. Every failing run matched the reference to six digits at
+89.9, 90.1 and 80 degrees of retardance and failed only at exactly 90. The assertion reports a missing
+full-power p ray, which reads as a sign or basis error in the retarder or the mirror, and evaluators
+said so ("coherent round-trip/basis-transport logic defect"). Only one of four evaluators traced the
+cancellation.
+
+**Evidence.** ray-optics-sp-coherence-transport accepted batch 3: **4/10** (N3, N8, N9, N10), the SOLE
+failure of N9 and N10 at 53/54. Perturbed-retardance replay: all four equal the reference off the exact
+cell. *"floating-point cancellation can produce a tiny negative computed power; cpuOutgoingRays.js
+treats any negative power as invalid and replaces the entire output ray with zero power. A numerically
+stable coherency rearrangement, as used by the reference, preserves the expected [0, 1, 0, 0]."* The
+same test killed **0/10** in batch 2 (N9 there failed every element test for another reason): which
+arrangement agents write is batch variance, so the kill count swings.
+
+**Precondition.** A repo with a strict domain guard on a quantity (negative power, negative
+probability, negative variance) that the feature's formula can drive to exactly its boundary, plus a
+composite fixture whose physics lands ON the boundary rather than near it.
+
+**How to build.** Pick the textbook composite that extinguishes one component exactly (isolator,
+crossed elements, full cancellation) and assert the full state. Write the reference in a numerically
+stable form (non-negative sums of squares times non-negative factors) and confirm it gives exact 0.
+Before calling the kill fair or unfair, replay the failing patches at perturbed parameters: identical
+off-cell values mean numerics, not logic.
+
+**Arsenal mapping.** F-10 cell (exact composite x strict repo guard). A numerical-robustness wall,
+not a physics trap: count it as batch-variant difficulty.
+
+---
+
+### F-67. The feature must also run in the repo's second engine, and a new object inherits that engine's hook as a no-op ★ 10/10 missed while unstated, 3/10 once stated on ray-optics-sp-coherence-transport
+
+**Mechanism.** ray-optics keeps a legacy `Simulator` (the app's DEFAULT engine) beside the primitive
+engines. A new scene object needs `getPrimitives` for the primitive engines AND `checkRayIntersects` +
+`onRayIncident` for the legacy one. `BaseSceneObj.checkRayIntersects` returns null, so an object that
+implements `onRayIncident` but not the intersection hook is silently skipped: rays pass through
+untouched and nothing throws.
+
+**Why it misdirects.** Every visible test path and the whole new contract ran through the primitive
+engines. Unstated, no agent implemented the legacy path at all (10/10, batch 2). Stated, the failure is
+an object that "does nothing", which reads as wrong optics, not as a missing hook one class up.
+
+**Evidence.** ray-optics-sp-coherence-transport batch 2 probe: **10/10** runs gave the new Polarizer
+and Retarder no legacy behaviour (unstated, not a kill). Batch 3, one paragraph stating it:
+**3/10** failed all four legacy tests (N4, N5 at 50/54: *"Polarizer.js and Retarder.js implement
+onRayIncident but do not implement checkRayIntersects; the inherited BaseSceneObj implementation
+returns null"*; N8 projected the axis on the ray vector instead of p1 to p2). Ruled "subtle but fair".
+**macs-callvar-fragment-phasing: 7/12 in the accepted batch (5/8 Nova, Orion #4 and #3).** The second
+engine is callvar's local assembly (-F auto, the default, recalls indel peaks from fermi-lite unitigs).
+Nova #7, #6, #5, #4, #3 counted fragments on the raw-read path only (*"pair-aware calling bypasses the
+existing local-assembly pipeline"*). Orion #3's SOLE failure and half of Orion #4: the assembly path
+places each read by `seq.find` in the unitig, so a read running 1 bp past the unitig end is never placed
+and DPT reads 29 where the per-read mode counts 30. The killing test asserts pair-aware == read mode on
+assembled calls where no fragment has two reads over the site (L128).
+
+**Precondition.** Two execution engines over one object model, one of them the product default, with a
+base-class hook that defaults to "not involved" rather than throwing.
+
+**How to build.** One paragraph saying which engine the app uses by default and what the objects must
+do there (here: power-only, C treated as 0, polarimetry sums S1). Drive that engine headlessly in the
+test (jest.unmock the engine, construct it without canvases) and assert through the object's own
+readings. Add a lifecycle cell (readings start at zero each simulation), which the hook-less
+implementations also fail.
+
+**Arsenal mapping.** F-9 origin (the second consumer of the same objects); the lever L83 points to
+when probes converge.
+
+---
+
+### F-68. A pairing rule stated for output LABELS applied to input READS of the same symbol family — 3 runs across 3 batches on ray-optics-sp-coherence-transport
+
+**Mechanism.** The contract said a type that labels only one component of a C pair is rejected, and
+that C_0r / C_0i are reserved inputs. Agents applied the pairing rule to the inputs as well and
+rejected a surface formula that reads only C_0r (a polarizer's natural formula).
+
+**Why it misdirects.** Labels and reads share a naming scheme (C_jr / C_ji vs C_0r / C_0i), and "pair"
+reads as a property of the symbols. The failing tests are the polarizer tests, which point at optics.
+
+**Evidence.** ray-optics-sp-coherence-transport: batch 1 **2/10** (N2, N7), batch 2 **0/10**, batch 3
+**1/10** (N1 at 52/54: *"calls validatePair on the incoming parameters C_0r and C_0i"*). Ruled fair
+every time ("the paired-label rule applies to source and outgoing-slot labels").
+
+**Precondition.** A validation rule on one role of a symbol family (outputs) and a second role
+(inputs) with visually identical names.
+
+**How to build.** State the rule on the labels only and keep a fixture whose natural formula reads just
+one member of the input pair. No extra words.
+
+**Arsenal mapping.** L52's cousin (a qualifier reaching the neighbouring subject), at the level of a
+symbol family.
+
+---
+
+### F-69. A rule written for one regime applied to its sibling regime ★ 4/10 in the accepted batch on riff-unified-conflict-regions, and 4/10 in an earlier fresh batch
+
+**Mechanism.** One concept (a context line inside a conflict region) behaves differently in two regimes
+of the same feature. In a RESOLVED region a context line is in a side and in the resolution, so it never
+differs and is printed raw. In an UNRESOLVED region the same kind of line belongs to one side only, is
+compared with the other side or the base, and must keep a plain prefix while its differing words are
+reversed. Agents write the first rule, then route every context line through it.
+
+**Why it misdirects.** The raw rendering is right in half the fixtures and the line's text is intact
+everywhere, so the failure reads as "a missing highlight" on an otherwise correct unresolved region. The
+two sentences sit in different paragraphs and look like one convention stated twice.
+
+**Evidence.** riff-unified-conflict-regions accepted batch: **4/10** runs (Nova_2, Nova_3, Nova_5,
+Nova_9) failed the five unresolved-region tests together. Verbatim: Nova_2 *"its ordinary conflict
+renderer deliberately outputs context members as entirely plain text. In unresolved regions, context
+lines are part of each side/base and must retain a plain prefix while still receiving inverse word
+highlights"*; Nova_3 *"its valid-region renderer emits every context line completely raw"*; Nova_5
+*"render_region_line returns context lines unchanged even for unresolved regions"*. The same test
+(`unresolved_context_lines_stay_plain_in_every_section`) failed **4/10** in the earlier fresh batch 3.
+The reference had the mirror bug first: an Auto Review S1 finding caught it reversing the context
+prefix in unresolved regions.
+
+**Precondition.** A feature with two modes (resolved/unresolved, read/write, strict/lenient) where one
+line class is inert in one mode and live in the other.
+
+**How to build.** State each regime's rule in its own paragraph, the inert one short ("keep their plain
+look"), the live one with both halves ("a plain prefix and plain text outside highlighted parts"). Test
+a live-regime line with a highlighted word AND a style check on its prefix.
+
+**Arsenal mapping.** Cousin of F-68 (a rule for one role applied to a look-alike role) and the inverse of
+F-3 (a carve-out applied to one axis only): here the carve-out is applied to both.
+
+---
+
+### F-70. The contract's unit boundary differs from the run the new buffer accumulates ★ sole failure of the best near-miss in two batches on riff-unified-conflict-regions
+
+**Mechanism.** The feature starts at "the start of the block holding the opening marker", and a block is
+a run of removed lines followed by added lines, so a removed line after an added line starts a NEW
+block. riff's streaming highlighter already splits there. Agents who buffer lines to look for a marker
+re-derive the unit as "every changed line since the last context line", absorb the finished `-a +b`
+pair into the region, or hand the pending lines to a helper that renders them wrong.
+
+**Why it misdirects.** The fixture looks like an ordinary resolved conflict with one edited line above
+it, and the failing assertion is a line-text or refinement mismatch on that unrelated edit, not on the
+conflict. L24 says to state the extent of a noun the format defines; it was stated here, in one
+sentence, and still killed.
+
+**Evidence.** riff-unified-conflict-regions accepted batch:
+`removed_opening_marker_after_added_lines_starts_a_new_block` killed **4/10** (Nova_2, Nova_4, Nova_7,
+Nova_9) and was the ONLY failure of Nova_4 (37/38). Verbatim: Nova_9 *"a removed opening marker after an
+added line is not separated from the preceding ordinary block for normal refinement"*; Nova_4 takes the
+pending lines and renders them through `Formatter::format`, which *"returns strings without newline
+separators ... so the removed line, added line, and following marker are emitted as one logical output
+line"*. In the re-eval of batch 1 the same test killed **2/11** and was the sole failure of Nova_2
+(29/30). It was added as an FP fix after a differential probe showed the batch-1 near-miss missing it.
+
+**Precondition.** The feature's anchor is a unit the repo's existing streaming code already delimits
+(a +/- block, a paragraph, a record), and the new code has to buffer ahead of that code to decide.
+
+**How to build.** Define the unit in one sentence and put an ordinary edit immediately before the
+anchor, inside the same hunk, with no context line between them.
+
+**Arsenal mapping.** F-13's cousin (unit granularity), with F-39 riding along when the pending lines go
+through a repo helper built for another caller.
+
+---
+
+### F-71. A declaration whose side effect introduces grammar terminals, stored as metadata but never registered ★ 14 runs across 3 batches on grmtools-contextual-lexeme-readings, and in the reference first
+
+**Mechanism.** A new directive (`%fallback T A B`, `%split S P1 P2`) declares its operands as tokens
+of the grammar as a side effect. Agents parse it into a new map and validate its targets against the
+existing terminal set, but never insert the declared names into that set, or into the second set
+that says a bare (unquoted) name may be read as a terminal (grmtools keeps `tokens` and
+`token_directives` apart). A token that appears only in the directive is then unknown: quoted it
+fails as `Unknown token '>='`, bare it is parsed as a rule reference (`Unknown reference to rule 'A'`).
+
+**Why it misdirects.** Every fixture where the declared token is also used in a rule or on a `%token`
+line passes, so the feature works on the natural examples. The error names a rule body or a token
+lookup, never the directive, and with two membership sets, fixing one still leaves the other. The
+reference had the bare half of this bug until Solution Quality round 1.
+
+**Evidence.** grmtools-contextual-lexeme-readings, runs with a grammar rejected for this reason:
+batch 2 **5/12**, batch 3 **5/10**, accepted batch **4/10**. In the accepted batch that is 22 failing
+cells spread over the bare-name, piece-cost, piecewise-delete, named-piece, length and Unicode tests,
+because those fixtures declare the split source only in its `%split` line; the test names say
+"recovery" and "spans", the diffs say "grammar rejected" (L92). *"Names introduced by %fallback and
+%split are not registered as grammar tokens, so bare declared tokens, split sources, targets, and
+pieces are treated as unknown."* Ruled mentioned and inferable.
+
+**Precondition.** A declarative front end (grammar, schema, config DSL) with a symbol table other
+passes consult, a new directive that declares symbols as a side effect, and ideally more than one
+membership set per symbol kind.
+
+**How to build.** One sentence "X declares the tokens ..." in the contract. Give several fixtures a
+symbol that appears ONLY in the directive (one of them bare-named) and spread them over unrelated
+behaviour tests, so the pattern taxes the whole suite instead of one test.
+
+**Arsenal mapping.** F-3 (one rule, two holders) on a symbol table; sibling of F-14 declared-vs-derived
+state.
+
+---
+
+### F-72. A persistent stack iterated top-first, handed to a helper written for the bottom-first stack ★ 7 runs across 4 batches on grmtools-contextual-lexeme-readings, sole failure of three near-misses
+
+**Mechanism.** The repo keeps one logical parse stack in two containers: a `Vec` in the main loop
+(bottom first, top is `last()`) and a persistent `Cactus` in error recovery, whose `vals()` yields
+top first. Agents write one reading helper against the Vec and call it from recovery with
+`cactus.vals().collect()`, unreversed, so every reading decision made during repair search is made
+against the BOTTOM state.
+
+**Why it misdirects.** Normal parsing is right and recovery still returns plausible repairs. It only
+misses the repairs that need a LATER lexeme read the new way, so the symptom is a costlier alternative
+repair set (`insert id, delete =@8, delete if@10` instead of `delete =@8`), which reads as a ranking
+or cost difference, not a stack bug.
+
+**Evidence.** grmtools-contextual-lexeme-readings: the identical repair diff on
+`recovery_reads_a_later_keyword_as_its_fallback` in batch 1 Nova #11 and Nova #20 (both sole
+failures), batch 2 and batch 3 one run each, accepted batch Nova #2 (sole failure, 36/37), #5 and #8.
+Confirmed in the code of three (`n.pstack.vals().copied().collect()` passed with no reverse). The test
+came from a Solution Quality coverage suggestion ("Fallback under CPCT+"), not the design.
+
+**Precondition.** Two containers for one logical stack or list with opposite iteration orders
+(persistent or functional vs mutable), and a new decision that has to run on both.
+
+**How to build.** State that the new decision is made "the same way while it searches for, ranks and
+applies repairs". Test a recovery whose cheapest repair depends on reading a LATER lexeme through the
+new rule, so the decision must run on the recovery stack with a non-trivial top.
+
+**Arsenal mapping.** F-3 (two holders of one rule), misdirecting through the symptom.
+
+---
+
+### F-73. A range past the top of a fixed-width address space wraps into low memory through register truncation ★ 11/12 runs in the accepted batch of pyocd-dwt-watchpoint-planner, the sole failure of all three failing Orion runs
+
+**Mechanism.** The feature takes `(address, length)` and splits the range into hardware-sized blocks.
+Python integers are unbounded, so `0xFFFFFFFE + 4` is `0x100000002`; the block splitter happily emits
+a block at `0x100000000`, and the 32-bit comparator register write keeps only the low bits. The
+watchpoint is accepted (`True`) and silently watches `0x0`-`0x1` as well as the two real bytes. On DWT
+v2 the linked pair's end address wraps to `0x1`, so the pair watches nothing at all.
+
+**Why it misdirects.** Nothing fails while the agent works: every natural fixture lives at
+`0x2000xxxx`, the placement succeeds, and the comparator count is minimal. The bug only shows when a
+test asks what LOW memory is watching, which no implementation-driven check looks at. The rule is
+already in the contract ("set for exactly the address range from address to address + length - 1",
+"a watchpoint that doesn't fit returns False and does nothing"); nothing in it says "32-bit", so the
+boundary has to come from knowing the target.
+
+**Evidence.** pyocd-dwt-watchpoint-planner batch 8 (re-eval of batch 7 on the hardened suite): both
+top-of-memory tests failed in **8/8 Nova** and **3/4 Orion**; for each of the three Orion runs it was
+the SOLE failure (76/78). The one Orion pass and the reference both refuse with
+`addr + size > (1 << 32)`. *"failed two tests because it did not check for 32-bit address overflow
+(addr + size > 2^32), causing ranges past 0xFFFFFFFF to wrap around into low memory."* Ruled
+mentioned and inferable; Auto Review: "subtle but fair ... follows from the exact-range and
+binary-placement requirements"; FP panel: the pass genuine.
+
+**Precondition.** A host language with unbounded (or wider) integers driving a fixed-width hardware or
+wire field (address register, offset, sequence number), plus a contract that promises an EXACT range
+and all-or-nothing placement.
+
+**How to build.** Do not state the width (L109: a named case kills ~0). Test the promise, not the
+mechanism: place a range that crosses the top, then assert low memory is not watched (accepts refusing
+and clamping), and follow it with a normal placement that only the feature can do so the test is
+fail-to-pass on base. Add the same probe through a second entry point (the commander) if one exists.
+
+**Arsenal mapping.** F-57 (type membership where a value check is needed) on an integer width;
+sibling of F-30 (a low-bits invariant broken by a full-width consumer).
+
+---
+
+### F-74. A read-to-clear hardware latch left armed when the software session resets ★ 18/19 new-model Nova runs over batches 7-8 on pyocd-dwt-watchpoint-planner, 0/4 Orion
+
+**Mechanism.** DWT `FUNCTION.MATCHED` (bit 24) is cleared by READING the register, and the contract
+says resuming, stepping and `CortexM.reset()` begin a new execution session whose halt lists only that
+session's hits. Agents add a per-halt Python cache (hit token, cached answer) and reset THAT on every
+session boundary, but never read the comparators to drain a MATCHED bit that fired in a halt nobody
+asked about. The next halt reads the stale bit and reports the old watchpoint.
+
+**Why it misdirects.** Every test that queries each halt passes, because the query itself reads and
+clears MATCHED. Only a halt that ends unreported, followed by resume/step/reset and a plain halt,
+exposes it, and the failing assertion names a stop reply, not the session boundary. Agents see their
+cache reset and believe the session is clean.
+
+**Evidence.** pyocd-dwt-watchpoint-planner: the three unreported-halt tests (resume, step, reset)
+failed in **10/11 Nova** in batch 7 and **8/8 Nova** in batch 8; **0/4 Orion** in either. On the OLD
+models the same artifact read **2/10** (batch 6, 3/10 passing). *"failing to clear hardware MATCHED
+bits when starting new execution sessions (causing hits from unreported halts to carry over across
+resume, step, or reset)."* Ruled mentioned and inferable.
+
+**Precondition.** Hardware (or a protocol peer) with sticky or read-to-clear status bits, a new
+software-side cache over them, and a contract that defines session boundaries in terms of public
+operations (resume, step, reset).
+
+**How to build.** State both halves in the contract: the bit's clear-on-read semantics and the
+session boundary. Test an UNREPORTED hit before each boundary with a second, later-set watchpoint in
+the next session, so a stale first hit wins the first-set tiebreak and the assertion is fail-to-pass.
+
+**Arsenal mapping.** F-14 (declared vs derived state), split across a cache and the hardware it
+mirrors. Under the 2026-10-09 gate it is a Nova/Orion separator, not an Orion discriminator (L114).
+
+---
+
+### F-75. A lowering pass rewrites the operand the emitter dispatches on, and the default value of the new kind has nothing to relocate against ★ 11/12 runs in the accepted batch of cwerg-fe-address-constants, the sole failure of three runs (including the batch-9 Nova pass and Orion #4)
+
+**Mechanism.** Cwerg's span lowering (`canonicalize_span`) replaces a span operand by a record field
+access, `front(empty)` becoming `ExprField(empty, pointer)`. The global-data emitter dispatches on the
+NODE kind (`Id`, `ExprFront`, `ExprAddrOf`, ...), so a pointer global initialized with `front(span)`
+reaches an `ExprField` branch that does not exist, or one that only knows how to relocate against a
+symbol. For a non-empty span the evaluated value carries (global, offset); for a span global declared
+with no initializer the value is `EvalSpan(pointer=None, size=0)`, so there is no symbol at all and the
+right output is a pointer-width zero. Agents crash (`AssertionError: unhandled node: [.] [Id] empty
+field:[Id] pointer`), segfault in C++, or reject the initializer as "not constant".
+
+**Why it misdirects.** Every hand-written check uses a span over real data, where some `ExprField`
+branch keyed on the evaluated address works. The empty span compiles in the C++ front end on base, and
+`len(empty)` already works, so nothing points at the emitter. The failing case names a lowered node the
+agent never wrote, two passes after the code it changed. The twin front ends fail differently (Python
+asserts, C++ writes one padding byte or segfaults), so fixing one side does not reveal the other.
+
+**Evidence.** cwerg-fe-address-constants accepted batch (re-eval of batch 9 plus the contest
+replacement): `emptyspan` failed in **8/8 Nova and 3/4 Orion**; it was the SOLE failure of Nova #1
+(new run), Nova #8 (the batch-9 Nova PASS, re-graded) and Orion #4. The same lowering also killed
+Orion #1 and #2 through a span global used inside a record literal (`{view: 7, middle, @arr[3]}`,
+Python only). In an earlier batch the empty-span probe killed 2/3 saved Orion passers and was held
+back. *"Python frontend crashes with an unhandled node assertion when compiling global pointer
+initializers that take the front of an uninitialized/empty global span."* Ruled mentioned and
+inferable in every run; Auto Review: "subtle but fair ... the description expressly includes start
+addresses of constant spans and says a span stored in a global is constant."
+
+**Precondition.** A compiler (or any multi-pass pipeline) where a later pass lowers a new value kind
+into a different node shape before a late consumer runs, and that consumer dispatches on syntax
+rather than on the folded value. Strongest when the kind has a default/zero value with no backing
+object (empty span, nil slice, null reference, empty string view).
+
+**How to build.** Do not state the empty case (L109). Keep the contract's general sentence ("start
+addresses of ... constant spans", "a span stored in a global is a constant span") and test only that
+the program compiles and runs with identical output, not what pointer value it gets. Pair it with a
+line base cannot compile (here `static_assert` over `front` of a non-empty span) so the case is
+fail-to-pass on BOTH front ends; the bare empty-span program passes the C++ side on base.
+
+**Arsenal mapping.** F-18 (one rule, two spellings) across a lowering pass; sibling of F-67 (the
+second engine inherits a no-op). The empty value is an F-10 cross-product cell: kind x {default}.
+
+---
+
+### F-76. Element stride taken from the type's size instead of its aligned size, visible only on wide-pointer targets ★ 2/12 in the accepted batch of cwerg-fe-address-constants, x64/a64 only, plus 1/5 in batch 7
+
+**Mechanism.** Address arithmetic over an array of records (`@ring[i]`, `ptr_inc(@pts[0], 2)`) needs the
+array STRIDE, which Cwerg keeps as `aligned_size`. Agents multiply by `size`. A record `{next ^node,
+val u32}` is 8 bytes on a32 (no padding) and 12 bytes of fields padded to 16 on x64/a64, so the
+offsets agree on a32 and are wrong on the 64-bit targets: a ring of linked records points into the
+middle of the next element.
+
+**Why it misdirects.** The failing targets are the two the agent is least likely to check by hand
+first, and the symptom is a runtime value (a wrong `val` read through a chain), not a compile error.
+a32 passing makes the offset logic look right. The repo has both fields on the canonical type, and
+`size` is the one used in most nearby code.
+
+**Evidence.** cwerg-fe-address-constants accepted batch: `ring` failed on x64 and a64 only in **Nova
+#3 and Nova #5** (two independent trajectories); batch 7 Nova #8 the same. *"Array element offset
+calculation used unaligned type size instead of aligned stride on 64-bit architectures."* (graded
+WRONG_LOGIC). Killed no Orion run.
+
+**Precondition.** A multi-target code generator (or serializer) where element types have tail
+padding on some targets only, and the feature computes element addresses itself instead of reusing
+an existing indexing helper.
+
+**How to build.** One array of records whose last field is narrower than the pointer, with the
+first field a pointer, walked through address constants and checked at runtime on every target.
+Do not state the stride rule; "runs correctly on x64, a64 and a32" is the contract.
+
+**Arsenal mapping.** F-62 (sized by parts, not whole rows) on a memory layout; F-10 target cell.
+
+---
+
+### F-77. A constant read through an address yields a whole aggregate, and the emitter only knows how to write scalars ★ 5/12 runs in the accepted batch of cwerg-fe-address-constants (aggregate 2, spancopy 2, defspan 1), the lead killer of batches 1-7
+
+**Mechanism.** Once `p^` folds at compile time, `global copy = p^` initializes a global from an
+evaluated RECORD, VECTOR or SPAN value rather than from a literal. The data emitter walks literal
+syntax (`ValCompound`, `ValPoint`) and has no branch for an evaluated compound (`EvalCompound`,
+`EvalBytes`, `EvalSpan`). Variants: a record with an omitted (default) field, a byte string field,
+a span copied through `(@s)^` whose evaluated value was dropped by span lowering, an array element
+`sp[1]` of record type.
+
+**Why it misdirects.** Scalar reads through the same pointer (`p^.x`, `copy.tag`) already work, so
+the agent believes read-through is done. The aggregate path is a different emitter branch, and its
+failure names an emitter assertion, not dereference.
+
+**Evidence.** cwerg-fe-address-constants accepted batch: `aggregate` failed in Nova #2 and #7,
+`spancopy` in Nova #4 and #6, `defspan` in Nova #4. *"Failed to support initializing global span
+variables from dereferenced span pointers (copy = p^)"*; *"IR emission fails ... when initializing
+globals from dereferenced default-initialized subobjects."* Batch 1 (old models): aggregate 5/10;
+batches 5-7 (new models): aggregate was the sole failure of four Nova runs. Orion cleared it 4/4 in
+the accepted batch.
+
+**Precondition.** A constant evaluator that can now produce aggregate values from a non-literal
+expression, and an emitter written against literal syntax.
+
+**How to build.** Copy each aggregate kind through `^` once (record with a pointer field and a
+default sub-record, vector, byte string, span), and read a field of each at runtime. Keep the meta
+sentence general ("can initialize other globals, including complete records and vectors and spans",
+"you can write `global copy = p^`").
+
+**Arsenal mapping.** F-12 kind cross-product on value kinds; a Nova separator under the 2026-10-09
+models (L114), not an Orion discriminator.
+
+---
+
+### F-78. Storage reclaimed but the surviving parent still points at it, and the page id comes back ★ 12/16 runs in the accepted pool of libspatialindex-mvr-history-pruning (4/8 Orion, 8/8 Nova), the lead wall
+
+**Mechanism.** History pruning deletes every page no live path reaches. Agents compute the dead set and
+call `deleteByteArray` on it, but leave the expired child entries inside the parents they keep. Nothing
+breaks yet: those entries end at or before the horizon, so clipped queries never descend into them. Then
+the storage manager hands the freed page ids to new nodes, the stale entries now point at live pages, and
+the next delete misses its record (`deleteData` returns false), queries return records from an unrelated
+subtree, the next prune walks into reused pages and purges live ones, and `isIndexValid()` fails.
+
+**Why it misdirects.** The pruning call itself is correct by every immediate check: the stored page set,
+`getNumberOfNodes()`, the archive and the clipped query results all match. The failure surfaces hundreds
+of operations later in an unrelated delete or query assertion, and identical page sets across four
+different solutions read like a test bug (page reuse is deterministic) until you replay them.
+
+**Evidence.** libspatialindex-mvr-history-pruning accepted pool (8 Nova + 8 Orion): the four long oracle
+workloads (seeded, every variant with unequal capacities, many archived prunes, same-id records in one
+leaf) failed **12/16**, and four Orion runs plus one Nova failed exactly that set plus the F-79 test.
+*"left expired entries inside retained nodes instead of compacting them. This corrupted tree capacity
+accounting and structural invariants during subsequent insertions, deletions, and prunes."* Auto Review:
+*"shared blind spot, 12 runs"*, ruled fair because the reachability rule and "other operations work as
+before" are stated. While the meta said "Kept pages lose entries that expire at or before the horizon"
+(batch 7) it killed **0/5** strong runs; after that sentence was cut for the requirement-count gate it
+killed **4/8 Orion** (L120).
+
+**Precondition.** A store that recycles freed ids (page files, slab allocators, id pools), a structure
+whose parents hold child ids, and a feature that frees children without the parents being the obvious
+thing to rewrite.
+
+**How to build.** State the reachability rule and the continuity rule ("other operations work as
+before"), not the compaction. Test with long post-prune workloads that allocate enough new nodes to reuse
+the freed ids, then delete, query and prune again, and compare against an oracle built from the page graph.
+
+**Arsenal mapping.** F-14 (declared vs derived state) across a store and its index; the Orion
+discriminator of the accepted batch once the stating sentence was gone.
+
+---
+
+### F-79. An incremental pass trusts the previous boundary as already handled, but the boundary instant is still writable ★ 2/16, the sole failure of both 34/35 Orion near-misses on libspatialindex-mvr-history-pruning
+
+**Mechanism.** The second prune skips every child entry that ended at or before the PREVIOUS horizon,
+reasoning that the earlier prune already purged those pages. But a prune may run at the current time,
+and later operations at that same instant still split nodes, ending fresh entries exactly at the old
+horizon. Those pages are skipped forever: they leak from storage and from the statistics.
+
+**Why it misdirects.** The shortcut is a natural optimisation and is right for every page that existed
+when the earlier prune ran. Tests that advance time after each prune (every workload helper did) never
+reach it, so the run passes 34/35 and looks complete.
+
+**Evidence.** libspatialindex-mvr-history-pruning: batch 8 Orion #4 passed the 32-test suite and was
+voided by the FP panel (*"skips every child entry with end <= the previous horizon ... pages whose
+entries ended exactly at the previous horizon after that prune are never deleted or counted"*). The
+test built from that scenario (prune at now, 24 spread inserts at now, run on, prune again) was the
+sole failure of **2/16** runs in the accepted pool, both Orion, from two different batches; Auto Review
+*"subtle but fair"*. It also failed the 12 runs that had F-78.
+
+**Precondition.** A monotone watermark (horizon, checkpoint, compaction LSN) that the contract allows to
+equal the current time, plus operations at that same instant after the watermark moves.
+
+**How to build.** Allow the watermark to equal "now" in the contract, then test watermark-at-now,
+several same-instant mutations, a later watermark, and an exact storage/statistics oracle. Size the
+burst so it stays clear of base-library leaks (here a node created and killed in one instant is
+orphaned by the base tree), and check the reference against the oracle on that exact input.
+
+**Arsenal mapping.** F-10 cross-product cell (watermark x same-instant write); it came from the FP
+panel, not the design (L17).
+
+---
+
+### F-80. A new raw path writes one alias through the converted wrapper and the other from the raw backing object, so a shared container is written twice ★ 15/20 runs in the accepted batch of asdf-conversion-free-lazy-tree (8/8 Nova, 6/8 Orion, 1/4 Vega), the sole failure of 3 Orion runs
+
+**Mechanism.** A lazy tree wraps a container on first access (`AsdfDictNode` around a raw `dict`) and
+caches wrapper-by-raw-object so every alias of that container resolves to the same wrapper. The
+feature adds a writer that walks untouched parts of the tree RAW. When one alias was accessed
+(`af["a"]["items"]`) and the other was not (`af["b"]`), the writer meets the wrapper on one path and
+the raw backing dict on the other. `walk_and_modify` memoizes by the identity of the incoming node, so
+the two are serialized as two separate containers: the YAML anchor is lost and the file gets a copy.
+
+**Why it misdirects.** Every tag-preservation test passes: both copies carry the right tags. The
+failing assertion is `tree["a"] is tree["b"]` on the re-read file, which looks unrelated to the tag
+feature, and base never had the problem because base only walked converted wrappers.
+
+**Evidence.** asdf-conversion-free-lazy-tree accepted batch: `test_shared_containers_stay_shared_after_they_are_accessed`
+failed in all 8 Nova, Orion #2, #3, #5, #6, #7, #8 and Vega #3; it was the ONLY failure of Orion #3,
+#5 and #8. Graders: *"The writer does not resolve the remaining raw alias through the existing
+tagged-object cache before serialization. This violates a pre-existing invariant: _TaggedObjectCache
+explicitly documents that it is critical for references to the same object at multiple tree
+locations."* Auto Review: *"subtle but fair ... inferable from asdf/lazy_nodes.py:45-46"*, 15 runs.
+Found by a differential probe (`battery5.py`) after batch 10 read Orion 3/4: Orion #1-#3 lost the
+sharing, the reference and Orion #4 kept it; batches 8/9 had kept it in 6 of 7 Orion runs.
+
+**Precondition.** A lazily materialized object graph with an identity cache (wrapper per raw node),
+YAML/JSON anchors or any shared-reference format, and a feature that adds a second traversal over the
+UNmaterialized parts (write-through, diff, export).
+
+**How to build.** One shared container with a nested node, one shared list holding a tagged node;
+access ONE alias of each through plain indexing, then write with every write path and assert `is`
+identity on the re-read file plus the tags. No meta sentence: the cache comment and existing alias
+tests make it a repository invariant.
+
+**Arsenal mapping.** F-4 aliasing family on a serialization path; the Orion discriminator under the
+2026-10-09 models (the strong agent splits on it, Nova never clears it).
+
+---
+
+### F-81. The new conversion-free path also takes over nodes the old path already rendered, and changes their existing output ★ 6/20 runs in the accepted batch of asdf-conversion-free-lazy-tree (4/8 Orion, 2/8 Nova)
+
+**Mechanism.** `info()` gains a view that shows untouched tagged nodes without converting them, and
+converts only when a node's declared type is a container. Nodes the old renderer already handled
+(`asdf_library`, a `Software` dict subclass) now flow through the new branch, which either hides their
+children (declared type not seen as a dict) or attaches the tag schema's title to the line
+(`asdf_library (Software) # Describes a software package.`), so an existing line of output changes.
+
+**Why it misdirects.** The task is about NOT converting. The failing line is a node the agent never
+thought of as "new", in the file's own metadata, and the assertion is an exact existing line, so it
+reads as an incidental rendering nit rather than a missed rule.
+
+**Evidence.** accepted batch: `test_info_and_search_convert_nodes_whose_object_is_needed` failed in
+Orion #2, #4, #6, #7 (#4 sole failure) and Nova #2, #4 (with the schema_info twin). Graders: *"asdf/_node_info.py:451
+now unconditionally loads the tag schema even after a dict-subclass node has been converted, and the
+renderer appends that schema's title"*; Auto Review *"subtle but fair"*, 4 runs. The asdf_library
+assertion was added in round 27 because the dict-type rule covers it, after a replay showed old Orion
+passes hid its children.
+
+**Precondition.** A presentation or inspection API that the feature reroutes, and nodes in every
+real input (file metadata, headers, root objects) that the new route reaches by default.
+
+**How to build.** Assert one exact existing line for a metadata node that falls under a STATED
+trigger, next to the feature's own lines. Requires a stated rule that already covers it (here: "declared
+type is a dict"), or it is an unstated preservation demand.
+
+**Arsenal mapping.** F-10 old-x-new cross-product cell (existing node kind x new view).
+
+---
+
+### F-82. A converter that declares several classes is treated as a reason to convert during inspection ★ 2/4 Vega in the accepted batch of asdf-conversion-free-lazy-tree, plus the FP-voided Vega pass of batch 7 and our own reference (two Solution Quality FAILs)
+
+**Mechanism.** The view decides "convert only when needed" from the converter's declared type. A
+converter with `types = [Heads, Tails]` has no single declared type, and the simple fallback is to
+convert to find out. With a bad node that runs the converter inside `info()` or a key-only search and
+crashes it, which is exactly what the feature promised to prevent.
+
+**Why it misdirects.** Every single-type test passes, and the agent's fallback looks conservative
+("when unsure, convert"), so the failure reads as a converter error, not a trigger-rule error.
+
+**Evidence.** accepted batch: `test_untouched_nodes_of_multiple_type_converters_keep_their_tag` failed
+in Vega #1 (sole failure; `info()` raised the coin converter's `ValueError`) and Vega #3. Batch 7: the
+Vega pass was FP-voided for converting multi-type nodes on write. Round 29: Solution Quality failed
+twice on OUR reference for converting them during a key-only search. FP panels on the accepted passes
+called the display choice (first type vs raw tag) underspecified, so test only the no-conversion half.
+
+**Precondition.** A registry where one handler can claim several runtime types, and a rule that keys
+behaviour on "the" declared type.
+
+**How to build.** A multi-type converter whose classes are neither containers nor traversable, one
+bad node; call the inspection API and a key-only search and assert the converter never ran. Do not
+assert how the node is displayed.
+
+**Arsenal mapping.** F-12 kind cross-product (one, many, no declared type); a Vega-only killer here.
+
+---
+
+### F-83. A content rewriter bakes each Form XObject from the default graphics state, but a Form inherits the caller's text render mode ★ 8/12 runs in the accepted batch of hayro-optional-content-baking (8/8 Nova, 0/4 Orion), and 11/11 in batch 1 on the old models
+
+**Mechanism.** The feature rewrites content streams (hidden text becomes `3 Tr ... restore`, or `7 Tr`
+in clip modes) and recurses into Form XObjects. Every agent writes one `bake(stream)` that starts its
+tracked state at the defaults, so inside a Form the "restore" after hidden text writes back `0 Tr`. A
+Form does not start fresh: it runs in the caller's graphics state, so a caller that set `1 Tr`
+(stroke), `2 Tr` or `5 Tr` (fill + clip) sees the Form's later visible text filled instead of stroked,
+or the clip lost. Tiling patterns, Type 3 procs and soft-mask groups DO start fresh, so the right
+seed depends on how the stream is reached.
+
+**Why it misdirects.** The hidden text itself is handled correctly; the failing pixels are VISIBLE text
+after it, in a stream that has no `Tr` of its own. The agent's per-stream unit tests all pass because
+they start from mode 0, and the state that matters lives in a different stream (the caller).
+
+**Evidence.** hayro accepted batch: `form_text_after_hidden_text_keeps_the_callers_render_mode`,
+`..._clip_mode` and `nested_form_text_keeps_the_render_mode_of_the_page` failed in all 8 Nova, 0/4
+Orion. Graders: *"Existing hayro-interpret/src/x_object/form.rs:72 saves the current state and
+interprets the Form using the existing context ... without resetting text rendering mode"*; Auto
+Review: *"shared blind spot, 8 runs ... subtle and fair"*. Old models: the per-caller variant (two
+callers, two modes) killed **11/11** in batch 1 including Vega and my own reference, was cut, came
+back in round 30 under the cap "a Form XObject with hidden text is drawn only once by a Do".
+
+**Precondition.** A stream rewriter (PDF, PostScript, SVG `<use>`, template expansion) where a callee
+inherits mutable state from its caller and some sibling callee kinds do not.
+
+**How to build.** Cap the domain to one caller per stream (so one rewritten copy is enough), then test
+caller modes 1/2 and 5 (hand oracle for clip modes if the engine drops hidden glyphs from the clip), a
+nested Form, a `q/Q` restore inside the Form, and a Form drawn from a tiling pattern (which must NOT
+inherit). The meta sentence "hidden sections still affect graphics states and clipping" is enough.
+
+**Arsenal mapping.** F-10 cross-product (callee kind x inherited state); the Nova separator under the
+2026-10-09 models.
+
+---
+
+### F-84. The resource walk follows the obvious dictionary only, so an object selected through a second dictionary is never rewritten ★ 9/12 runs in the accepted batch of hayro-optional-content-baking (8/8 Nova, Orion #4), plus Orion #1 on the indirect-size variant, and my own reference at batch 1 (Auto Review S1)
+
+**Mechanism.** Type 3 fonts carry content (glyph procs) that the feature must rewrite. Agents find
+fonts by walking `Resources /Font`. A PDF can also select a font through an ExtGState
+(`/GS1 << /Font [7 0 R 40] >>` then `/GS1 gs`), with no `/Font` resource entry at all, so the
+glyph procs are never baked and hidden content inside them is drawn. The variant: the size in that
+array can be an indirect object; an agent that reads only direct numbers seeds hidden Type 3 text
+with size 0, and the font restore after it leaves later visible text at size 0.
+
+**Why it misdirects.** The agent has a working Type 3 path and tests for it; the failing page has no
+font resource to look at, and the selector looks like an unrelated graphics-state operator.
+
+**Evidence.** accepted batch: `type3_font_chosen_by_a_graphics_state_hides_its_content` failed in all
+8 Nova and Orion #4 (sole failure); `type3_font_size_given_by_reference_in_a_graphics_state_keeps_hidden_text_advancing`
+was the sole failure of Orion #1 (added from an FP-panel dissent, L126). Graders: *"pre-existing
+hayro-interpret/src/interpret/state.rs:398 handles the 'Font' graphics-state entry by reading its
+array, resolving the font dictionary, and setting the text-state font and size"*; *"array.rs:35
+documents iter() as returning resolved objects, unlike raw_iter()"*. Earlier batches: Nova 6/9 (b10),
+7/8 (b11), 8/8 (b12). Auto Review: shared blind spot, 9 runs, fair.
+
+**Precondition.** A resource kind reachable through two dictionaries (fonts via `/Font` and ExtGState,
+images via XObject and inline, colour spaces via name and direct), and a feature that must visit
+every instance.
+
+**How to build.** One test per secondary route with the content that must change living inside the
+reached object; then a variant with an indirect operand on that route. No meta sentence beyond naming
+the object kind; the repo's own interpreter shows the route.
+
+**Arsenal mapping.** F-12 kind cross-product (route x object kind); Nova killer, 1-of-4 Orion separator
+in its indirect variant.
+
+---
+
+### F-85. An object-level visibility switch on a stream reached without a Do is ignored, and "hidden" means empty, not absent ★ 5/12 runs in the accepted batch of hayro-optional-content-baking (5/8 Nova)
+
+**Mechanism.** A soft-mask group XObject (`/SMask << /G 7 0 R >>` in an ExtGState) can carry its own
+`/OC`. Agents check XObject `/OC` only at `Do`. The mask group is reached through `gs`, so its `/OC`
+is never read and the group draws its white fill: the masked content shows. The right reading is
+that a hidden group draws nothing, so the mask luminosity is zero and everything under it is masked
+out, which is the opposite of dropping the mask.
+
+**Why it misdirects.** The agent already handles XObject `/OC` (it passes those tests), and the
+obvious fix, "skip the hidden group", removes the mask and makes the content visible: still wrong.
+
+**Evidence.** accepted batch: `soft_mask_group_with_hidden_optional_content_masks_everything` failed
+Nova #1, #2, #3, #4 (platform #8, #7, #6, #4) and #7 (platform #2). Graders: *"optional visibility on
+a soft-mask group itself"*. Batch 12: sole failure of one Orion run (1/10).
+
+**Precondition.** An object-level enable/visibility flag that the base engine honours on every entry
+path, and an object kind reached by a path other than the obvious one.
+
+**How to build.** Two masks side by side, one with a hidden group and one with a shown group, over
+plain fills; render oracle. Meta names the object kind (soft masks), not the semantics.
+
+**Arsenal mapping.** F-84 sibling (second entry path) plus a "hidden is empty" polarity trap.
+
+---
+
+### F-86. The evidence store built for the first consumer keeps two states, and the second consumer needs a third ★ 8/12 runs in the accepted batch of macs-callvar-fragment-phasing (8/8 Nova, 0/4 Orion), the Nova separator
+
+**Mechanism.** Two stated rules read the same per-fragment evidence with different eligibility. Linking
+counts only fragments with a CALLED allele (REF or ALT) at both sites. Haplotype membership (and so BAR)
+needs every allele the fragment carries at the block's sites to sit on one side, so a fragment with a
+third base, or a plain base where the call is a deletion, goes on neither haplotype. Agents write the
+linking rule first and build the per-fragment table for it: REF/ALT only, everything else dropped at
+insert time. By the time membership runs, the uncalled observation no longer exists, so the fragment
+looks like it simply did not cover that site and lands on a haplotype through its other sites.
+
+**Why it misdirects.** The agent has read the rule. Nova trajectories say it out loud ("Fragments with
+uncalled alleles ... are excluded", step 150) and still ship the reduced map, because the exclusion
+looks already handled: the linking filter "excludes" those fragments. The failure is a BAR off by a few
+hundredths (0.32 vs 0.24), which reads as a rounding or denominator slip, not as a missing state.
+
+**Evidence.** accepted batch (re-eval of batch 18): `test_uncalled_allele_keeps_fragment_out_of_both_haplotypes`
+and `test_uncalled_base_at_a_deletion_keeps_fragment_off_both_haplotypes` failed together in **8/8
+Nova**, **0/4 Orion**. Evaluator, Nova #7: *"callvar_cmd.py:426 stores only REF/ALT observations, and
+callvar_cmd.py:223 checks only that reduced map."* Auto Review: *"The runs implemented called-allele
+linkage but incorrectly reused that narrower called-allele filter for BAR eligibility."* Earlier: batch 11
+Nova 4/7, batch 12 Nova 7/8, batch 13 Orion 2/6, batch 15 Orion 2/4, batch 16 Vega **4/4**. And it was
+my own reference's bug first (precheck round 1, Solution Quality FAIL): the block test admitted a
+third-allele fragment because fragment_sides dropped that observation.
+
+**Precondition.** Two consumers of one evidence table with different eligibility, where the first
+consumer is the one an implementer builds first and only needs a binary classification.
+
+**How to build.** State both eligibility rules in separate sentences, the narrower first. One fixture per
+evidence kind (third base at an SNV, a base at a deletion call) where the excluded fragments decide the
+ratio; assert the ratio exactly.
+
+**Arsenal mapping.** F-69 sibling (one concept, two regimes) at the data-structure level; L90 (a gate-found
+reference bug is a calibrated trap).
+
+---
+
+### F-87. An attribute the contract assigns to a partner record, read from the record the window query returned ★ 8/12 runs in the accepted batch of macs-callvar-fragment-phasing (7/8 Nova, Orion #2)
+
+**Mechanism.** callvar fetches reads per peak. With `--pair-aware`, a fragment's SB strand is the strand
+of its FIRST read in the pair, even at a position only read 2 covers. When read 1 lies outside every
+peak it is never fetched, so agents that take the strand from "the first read of the group I hold"
+fall back to read 2's own strand. The BAM record of read 2 already carries the answer: flag 0x40/0x80
+says which read it is and 0x20 gives the mate's strand.
+
+**Why it misdirects.** Every fixture where both mates sit in the peak passes, including the dedicated
+strand test, so the agent believes the rule is done. The failure is an SB tuple (`13,7,4,4` vs
+`15,11,2,0`), nowhere near the grouping code.
+
+**Evidence.** accepted batch: `test_strand_comes_from_a_first_read_outside_the_peaks` failed Nova #8, #6,
+#5, #4, #3, #2, #1 and Orion #2. Evaluator, Nova #7: *"it does not limit this to first mates overlapping
+a peak. Original BAM.py already parses the complete bitwise BAM flag."* The in-peak strand test
+(`test_strand_counts_follow_the_first_read_of_each_fragment`) killed 0/12. The out-of-peak cell came from
+an FP judge's probe on batch-17 Orion #2.
+
+**Precondition.** A record-level attribute defined by a partner record, a fetch window narrower than the
+partner span, and partner metadata carried on each record (mate flags, back-pointers, header fields).
+
+**How to build.** State the rule with "even when only the other record is present". Fixture with the
+owning record outside the window on a fraction of the units; assert the exact counts and that the
+observing-record answer differs.
+
+**Arsenal mapping.** F-10 cross-product cell (rule x window edge); F-9 (resolution dropped across a
+stage boundary).
+
+---
+
 ### F-11. Local-vs-global selection scope ★ the band decider on customasm (9/10)
 
 **Mechanism.** A recursive decision procedure must choose each sub-part by a metric scoped to
@@ -2113,6 +2997,12 @@ unit specs, still in base mode. The natural move is to make those helpers three-
 batch 1 and 4/10 in batch 2 (7 of 20 runs)** did exactly that, passed every new test (28/28, then
 33/33) and failed 20 to 36 helper specs. It was not an authored trap: the reference simply put the new
 kernel in a new module and left the helpers alone. The meta names only `applyContextToDatafile`.
+
+`pict-engine-negative-values` adds a SHARED-ENGINE variant: after the scope cut the task never
+mentions the CLI, but the repo's perl harness (587 commands) drives the same engine through it, and
+engine edits that assert where base returned a constraint error fail it. Runs with base failures:
+**6/11, 7/11, 6/10, 2/11, 1/10** over the five batches. In batch 3 it was the sole failure of a run
+that passed all 35 new tests (Nova #10: `cons020/021/400/401`, `real201` exit 134 where base expects 5).
 
 **Precondition.** A single implementation file that (a) the feature forces you to rewrite,
 (b) carries `#[cfg(test)] mod tests`, and (c) whose tests call a private fn of that same file.
@@ -2343,6 +3233,13 @@ SOLE failure of the closest near-miss. Their line-comment twins at the identical
 0-1 each: `trailing_comment_on_last_record_field` 0, `own_line_comment_before_closing_brace` 0,
 `trailing_comment_on_a_let_binding` 0. Same rule, same positions, different lexical form, and all
 the difficulty sat in the form nobody was thinking about.
+**macs-callvar-fragment-phasing (VCF deletion spellings): 5/12 in the accepted batch** (Nova #8, #4, #3,
+#1, Orion #4). A 1-bp deletion right after a het SNV is written by base MACS as REF base / ALT `*`, not
+in the anchored form. `test_deletion_right_after_a_snv_call_joins_the_block` failed four Nova runs with
+the deletion left `0/1` (their fragment table never matches `*` observations to the record), and Orion #4
+with BAR 1.00 vs 0.50 (deletion evidence misread at membership). The anchored-deletion twin
+`test_deletion_phases_with_a_linked_snv` killed 0/12. Before the meta sentence about records was cut it
+killed 4/6 Orion (batch 13), after it 0/8 (batches 14-15).
 
 **Precondition.** Two or more spellings of one concept that the contract treats as equivalent: line
 vs block comments, short vs long option flags, single vs triple-quoted strings, `.0`/`.field` tuple
@@ -4004,13 +4901,502 @@ device holders looked up under the default folder; per-device holders re-resolve
 image commands rejecting absolute names; relative `GetIdsForReservedFile` resolved against the CWD
 (contract narrowed); base `GetUidAndGid` passwd bug (fixed and stated).
 
+### pict-engine-negative-values (C++ / PICT combinatorial generator: negative values in the engine and C API) — ACCEPTED 2026-09-29, 3/10
+
+| | |
+|---|---|
+| Shape | O-Pipeline-hard. Two-phase generation (positive-only, then one-negative with pair masks and positive partner rows for child models), model-tree state saved and restored per phase and per call, result-column layout kept apart from the restored tree, recursive tree deletion, two new C API functions and a return code |
+| Final artifact | 7 files (api/task.cpp, generator.h, pictapi.cpp, pictapi.h, parameter.cpp, deriver.cpp, pict.def), hook human-effective 214, 34 new tests (ctypes on `make libpict.so`, plus a C++ client compiled against pictapi.h with a counting allocator), base = the repo's perl CLI harness (588 JUnit cases) |
+| Pass-rate history | slice (engine + API + CLI parity) → 5 Auto Review rounds, each adding a High coverage cell (leak/header/tree exclusions, order 3 across models + CLI constraints/seeds, isolated PictDeleteModel, pict.def, ordinary-model column map) → batch 1 **0/11** → R6 cut: CLI parity and cross-model exclusions dropped (replay 1/11) → batch 2 **0/11**, Nova #7's sole failure my own lifecycle fixture → fixture fixed, re-eval **1/11**, FP: hangs on a starved value → R9 precondition + R10 whole-row test → batch 3 re-eval **2/10**, both FP: crash when exclusions constrain negative-row fillers → R11 plain-exclusion contract → batch 4 **0/11** (7 single-pass) → R12 mixed-parent whole groups → batch 5 **3/10** accepted (Auto Review Approved 3/2/2) |
+| Patterns used | **F-62** (new, lead: depth a 5/10, depth b 5/10 incl. a sole failure), **F-63** (new, 3/10; 7/11 in batch 4), **F-10** order-1 cell (3/10, sole failure of 32/34), **F-12** shared-engine variant (1/10; 6-7/11 in early batches), **F-39** identity instance (8/11 in batch 1) |
+| Agent split | Nova 3/10 in the accepted batch. Across the other four batches the two Vega runs never passed |
+
+**Why it held.** Every failing run in the accepted batch fell to a different stated requirement: whole
+child rows (Nova #1, 33/34), order 1 (Nova #3, 32/34), the #44 partner-row cluster, single-pass coverage,
+invalid flattening of child rows, and one base regression. The evaluators ruled each mentioned and
+inferable.
+
+**What the batches taught.**
+
+- **The gate rounds ratcheted the task to 0/11 before any agent saw it** (L91 again). Five Auto Review
+  rounds each asked for one more surface. The cut that worked was picked by replaying the saved batch-1
+  patches (L86): drop CLI parity and cross-model exclusions, 1/11 counterfactual.
+- **Three FP rounds, all fixed by capping the input domain, never by a test (L101).** Probing every
+  saved full-suite passer showed each FP shape broke ALL of them while the reference coped. Seeded
+  fuzzing located the class that separated the crashes: exclusions touching parameters with negative
+  values (0/40 bad when confined, 9-14/40 otherwise).
+- **My own fixtures were walls three times (L102).** A deletion test's exclusion starved a value and was
+  the only failure of a 33/34 run. A tree with user exclusions in two children aborts in BASE, so the
+  fixture silently demanded a pre-existing fix. Three fixtures created implied exclusions that the
+  reference correctly refused to cover; each needed a brute-force feasibility check to see.
+- **The decisive test came from a reviewer** (L50/L17): `test_child_models_combine_as_whole_rows`, from
+  an R10 Auto Review coverage finding, killed 5/10 and decided both near-misses it touched.
+- **Killed nothing in the accepted batch:** the header compile test, the pict.def export test and the
+  ordinary-model column-mapping test, all reviewer-requested boundary checks. The lifecycle test killed
+  2/10, both runs with other failures.
+- **Shared test modules must not bind the new API at import (L103):** the CLI tests imported the ctypes
+  module, so on base every CLI test died on "undefined symbol" and one that passed on base behaviourally
+  hid behind it.
+
+**Reference bugs found: 6.** PictDeleteModel leaked child parameters once the tree was restored after
+generation (Auto Review R1); per-model parameter sequences collided in cross-model exclusions; a second
+derivation asserted on stale exclusion back-pointers; restoring the tree lost the result-column layout;
+exclusions leaving only negative values asserted instead of returning an error; the Makefile's missing
+header dependencies linked stale objects (test.sh uses `make -B`).
+
+### macs-circular-chromosomes (Python+Cython / MACS3 ChIP-seq peak caller: circular chromosomes in callpeak) — ACCEPTED 2026-09-29, 1/11
+
+| | |
+|---|---|
+| Shape | O-Pipeline-hard. One `--circular` option that has to reach every stage of callpeak: BAM header validation (all pooled files), BAMPE origin-spanning pair recovery, SE/PE pileups, multi-lap local-lambda windows, q-value/cutoff statistics over every base, narrow/broad/subpeak peak joining across the origin, PeakModel, and output coordinates. Contract written as a ROTATION LAW: rotating every read rotates every output and changes no score, count or fragment length |
+| Final artifact | 11 files (callpeak_cmd, Parser, PeakIO, CallPeakUnit, FixWidthTrack, PairedEndTrack, PeakDetect, PeakModel, PileupV2, OptValidator, bin/macs3), hook human-effective 421, 47 new tests (metamorphic rotation pairs + per-base oracles), 117 base tests |
+| Pass-rate history | slice 326 eff → 7 gate rounds (editable-install precheck, Test Quality, Solution Quality x3, Auto Review x4) growing it to 421 eff and 50 tests → batch 1 **0/11** → fixture fix + three tests dropped (replay-chosen) → re-eval **1/11** (accepted, Auto Review Approved 3/3/3) |
+| Patterns used | **F-64** (10 runs, new, sole failure of the best near-miss), **F-65** (8 + 5 runs, new), F-3/F-10 wrap x output-mode cells, reference-bug regression tests (long BAMPE pairs 5/11) |
+| Agent split | Nova 0/10, Vega 1/1 (the only pass, also the only run past F-64) |
+
+**Why it held.** A rotation law is one sentence that every stage must honour, and agents patched the
+stages the outputs visibly come from. The near-misses were decided by F-64 alone (46/47), F-64 plus
+the long-pair/decoy regression (45/47), and F-64 plus F-65 (44/47 twice). All failures were ruled
+mentioned and inferable.
+
+**What the batches taught.**
+
+- **The decisive test came from a reviewer (L22).** Auto Review's T4 finding ("every circular
+  single-end call disables PeakModel") produced the fragment-model test: 10/11 kills, and it also
+  exposed a real reference bug (summit ties split by the origin). Nothing I designed killed as much.
+- **17 of 47 tests killed nothing, and every one was reviewer-requested coverage** (the 9-format
+  rejection matrix, 5 BAM pooled-header cases, both q-value population tests, unknown-name BAM). L95
+  again: they bought approval, not difficulty.
+- **An invariance law does not transmit its degenerate case (L104).** When significant regions
+  connected all the way round the circle, all 11 batch-1 runs cut at the coordinate origin, and the
+  whole-circle and tied-gap tests killed 11/11 for that one reason. Dropped; the solution still
+  handles it.
+- **A fixture only the reference's parser tolerated cost a batch (L105).** Test BAMs named every
+  record separately, so mates of a pair had different QNAMEs; 4/11 runs (incl. Vega) paired by name
+  and read 0 fragments. Fixing it moved Vega from 9 failures to 3.
+- **The replay predicted the re-eval run for run (L68):** 11/11 identical failure counts, 1/11
+  predicted and measured.
+- **Editable installs on Cython repos** (precheck "installs are editable"): pip builds extensions in
+  a temporary build_lib and copies `scripts=`; seed `build/lib` and wrap the script, or test.sh
+  recompiles everything and the CLI goes stale.
+
+**Reference bugs found: 9**, 8 by gates and 1 by my own model test: BAMPE origin filter (duplicate
+bit, mate-orientation bit, a half-chromosome length cap); names validated against reads instead of
+the header; all-connected component losing its origin gap; a whole-circle singleton region counted as
+empty in cutoff analysis; pooled headers resetting a circular length to INT_MAX; summit ties split by
+the origin (found by the F-64 test); long local-lambda windows capped at one lap but normalised by
+full width; tied widest gaps resolved by coordinate order; read-less contigs (contract narrowed to
+"skipped"). Of their regression tests only the long-pair/decoy one killed (5/11).
+
+### ray-optics-sp-coherence-transport (JavaScript / ray-optics primitive engine: s/p coherence transport, Polarizer and Retarder objects, Detector polarimetry, legacy Simulator) — ACCEPTED 2026-09-30, 3/10
+
+| | |
+|---|---|
+| Shape | O-Pipeline-hard, grown twice. Core: a complex coherence term C = E_s conj(E_p) carried through every CPU ray-producing stage (sources, formula surfaces with explicit/default slots, Fresnel and TIR boundaries, GRIN, detectors, weak-ray sampling), WebGPU declines. FINISH: Polarizer and Retarder scene objects whose axis is fixed to the object (sigma back-side flip, oblique projection in the local frame), Detector polarimetry. Legacy round: the same objects and polarimetry in the legacy `Simulator`, the app default |
+| Final artifact | 16 files (coherence.js, preprocess, CpuSimulationEngine, cpuOutgoingRays, stableRayPowerSampling, WebGPU prepare, types.js docs, Detector, Polarizer, Retarder, polarizationElementPrimitive, sceneObjs, Scene theme, toolbar, 2 en locales), human-effective 480, 54 new tests, 1301 base, meta 846 words |
+| Pass-rate history | slice (192 eff) through 4 Auto Review rounds → batch 1 **7/10** (32 tests) → FINISH scope (+Polarizer/Retarder/polarimetry, 480 eff) → batch 2 **7/10** (50 tests) → legacy-engine paragraph → batch 3 **3/10** (54 tests), accepted |
+| Patterns used | **F-66** (4/10, new, sole failure of two near-misses), **F-67** (3/10, new), **F-68** (1/10, 3 across batches), F-26-style TIR arithmetic (1/10 in batches 1 and 2), reflection sign (1/10) |
+| Agent split | Nova only, all 30 runs across three batches: 7/10, 7/10, 3/10 |
+
+**Why it held.** Batch 3's near-misses were decided by F-66 alone (N9, N10 at 53/54), F-68 alone (N1 at
+52/54) and F-67 (N4, N5 at 50/54). Everything else passed everywhere. All failures were ruled fair.
+
+**What the batches taught.**
+
+- **A fully stated physics contract is transcribed, however much of it there is (L106).** Batches 1 and
+  2 read 7/10 each, before and after adding three scene objects, polarimetry and ~290 effective lines.
+  The designed derivation traps (sigma back-side flip, oblique axis projection, Retarder Jones algebra,
+  smoothLineSegment side test, mirror default sign) killed **0 runs** across batches 2 and 3 except by
+  a whole-object bug; 31 + 23 probe scenes found zero divergence among passers.
+- **The rate moved only when the feature reached the repo's second engine (L83 extended).** The
+  batch-2 probe showed every run ignoring the legacy Simulator, the app's default engine; one
+  paragraph stating it took the rate from 7/10 to 3/10 (F-67 3/10) and drew no fairness objection.
+- **The lead killer was numerical, not physical (F-66, L107).** The double-pass quarter-wave isolator I
+  built as a physics consistency check killed 4/10 in batch 3 and 0/10 in batch 2. A perturbed-
+  retardance replay showed every failing run correct off the exact cell. Evaluators called two of them
+  logic defects.
+- **Reviewer-requested coverage killed nothing (L95 again).** Slot-2 labels, reversed/slanted Retarder,
+  saved type names, oblique force readings, non-finite imaginary parts, zero-incoming-product slots,
+  Brewster-adjacent reflection and every WebGPU read case: 0 kills in batches 2 and 3.
+- **An independent Jones oracle caught the design's own sign conventions.** The isolator expecting
+  pure p light is only true if the back-side flip, mirror sign and retarder phase all agree; the
+  reference passing it was the proof the model was physically consistent.
+
+**Reference bugs found: 7.** Overflow of sqrt(P_s P_p) at 1e160 (two paths, Auto Review), Math.hypot
+overflow at 1.3e308 (Auto Review), degenerate curves skipping coherence validation (Auto Review), the
+meta's TIR product written as r_s r_p where tests used r_s conj(r_p) (found by me with a literal-reading
+mutant, before any batch), and at acceptance review a legacy Retarder absorbing lossless sub-cutoff
+rays through a shared pass-through helper's cutoff check (S1, not covered by any test). The app-default
+engine choice was also flagged as untested (T4). None of the regression tests for these killed anyone.
+
+### riff-unified-conflict-regions (Rust / riff diff highlighter: conflict regions in one-column unified diffs) — ACCEPTED 2026-09-30, 1/10
+
+| | |
+|---|---|
+| Shape | O-Composite-add with a state machine across hunks. Marker grammar (count, prefix, labels, order, several sets per block), resolved vs unresolved regions, diff3 bases, whole-text word refinement per role, cross-hunk regions, and an exact "as today" fallback for any bad or unfinished region |
+| Final artifact | 6 files (new unified_conflicts_highlighter.rs + hunk/file/lines highlighter wiring), hook human-effective 503, 38 new tests (text + inverse spans + base-binary ANSI literals for fallback), 62 base tests, meta.md 541 words |
+| Pass-rate history | slice 445 eff, 9 tests → Auto Review x3 (S1 context prefix; multi-set blocks; resolution vs base) → approved, 29 tests → batch 1 **0/11** (out-of-order set end unstated, 9/11) → tests-only split + FP hole → re-eval 0/11 + 1 fresh FP (empty sides) → fresh batch 3 **2/10**, both passes FP-voided (no-final-newline comparison; sentinel order + second opener) → no-final-newline put out of scope, second-opener and stray-marker rules named, reference fix → accepted batch **1/10** (Auto Review approved 2/2/3) |
+| Patterns used | **F-39** empty-input panic (4/10), **F-69** (4/10, new), **F-70** (4/10, sole failure of the best near-miss, new), F-10 multi-set cell (2/10) |
+| Agent split | Nova 0/9 (one scratched run excluded), Vega 1/1 with the fewest requests (47) and tokens (3.7M vs 5.2-12.5M) |
+
+**Why it held.** Four independent seams, each stated: empty texts reaching a repo helper that panics,
+two context-line regimes, the block unit, and multi-set whole-text attribution. The three best runs each
+missed exactly one (Nova_4 F-70, Nova_6 empty sides, Nova_10 multi-set). All failures ruled mentioned
+and inferable.
+
+**What the batches taught.**
+
+- **Rules added to close FP holes killed ~0 once named (L109).** The stray-marker and second-opener
+  tests failed 11/22 and 4/13 of saved solutions written before the sentences existed, and **0/10**
+  in the accepted batch. The accepted batch's killers were all in the slice design. The feared ratchet
+  (gate-rounds memory) came from IMPLIED rules, not named ones.
+- **An undefined boundary killed 9/11; moving the fixture fixed it tests-only (L110).** Where an
+  out-of-order set ends was never stated. Moving the valid region after it into a separate file made
+  both readings agree and kept the re-eval lane.
+- **Every pass over four batches was FP-voided until the no-final-newline family was capped.** Three
+  FP grounds came from `\ No newline at end of file` in three batches (an ordinary empty line, the
+  comparison text, sentinel order), and base riff itself crashes or drops lines on part of that family.
+  Out of scope in one sentence; the next batch's pass survived the panel (L101 again).
+- **The DESIGN lead trap killed nothing in the accepted batch.** The resolved kept-line trap (M1) killed
+  2/11 in batch 1 and **0/10** here. 11 of 38 tests killed nothing, including all six grammar and
+  ordering tests.
+- **A no-final-newline test cannot pin text equality.** riff's usual refinement appends a `⏎` glyph
+  to the side lines, so "every line keeps its text" and "riff's usual refinement" disagree there.
+  Assert marked spans without the text check, or scope the input out.
+
+**Reference bugs found: 4**, all by AI reviewers, none by my mutation batteries: unresolved context
+prefix reversed (Auto Review S1); a second marker set in one block ignored (Solution Quality); resolution
+not highlighted against the base (Solution Quality); stray markers after a close kept as content
+(Solution Quality). Each became a test; the last two killed 0 and 1/10.
+
+### grmtools-contextual-lexeme-readings (Rust / grmtools lrpar: context-dependent token readings with CPCT+ recovery) — ACCEPTED 2026-09-30, 2/10
+
+| | |
+|---|---|
+| Shape | O-Pipeline-hard over 2 crates. `%fallback` / `%split` declarations: grammar reader, validation and usage warnings (cfgrammar); a reading chosen per lookahead from the pre-reduction configuration with the reductions simulated (lrpar main loop, `lr_upto`, `lr_cactus`); CPCT+ reading every lexeme the same way while it searches, ranks and replays, and repairing an unreadable split piece by piece at per-piece cost |
+| Final artifact | 5 files (ast.rs, grammar.rs, cfgrammar parser.rs, lrpar parser.rs, cpctplus.rs), hook human-effective 367, 37 new tests in one lrlex test file, 296 base tests |
+| Pass-rate history | slice 362 eff / 15 tests → Solution Quality x2 (+12, +6 tests) → Auto Review (four-piece loop, fallback log, two T4 gaps) → batch 1 **0/25** → "can be shifted" defined → batch 2 **0/12** → Auto Review bytes-vs-characters + three meta rules → batch 3 **0/10** → splits capped at three pieces → batch 4 **2/10** (accepted) |
+| Patterns used | **F-71** (14 runs over 3 batches, new), **F-72** (7 runs, sole failure of 3 near-misses, new), F-10 recovery x reading cells, reference-bug regression tests |
+| Agent split | Nova 2/50, Orion 0/2, Vega 0/5 over four batches; the accepted batch was all Nova |
+
+**Why it held.** The accepted batch's failures were diverse (L4): declaration registration (F-71, 4
+runs), exact declaration diagnostics (duplicates 5, target-declared 5, arity 2-3), recovery reading
+through the reversed stack (F-72, 3), and one run that recognised the directives for one grammar kind
+only (wiped). The near-miss, Nova #2 at 36/37, was F-72 alone. Passers: +932 and +605 raw lines over 6
+files, about 90 and 134 messages.
+
+**What the batches taught.**
+
+- **The designed lead trap died the moment it was stated fairly (L111).** Batch 1: 20/25 decided a
+  reading from the current state's table action alone, and the reading-before-reduction test killed
+  18/25. Once "can be shifted" meant "shifted after the reductions it triggers": 1/12, then 0/10. In
+  the accepted batch it and the other five reduction-dependent tests killed nothing.
+- **The band came from a gate-found reference bug (L90).** Solution Quality round 1 found my own
+  reference not registering bare declared names; as F-71 it killed 14 runs over three batches, most
+  of them through fixtures in tests named for recovery and spans. Read the diffs (L92).
+- **An exact repair-set assertion pinned an unstated report format (L112).** CPCT+ strips trailing
+  shifts; five runs kept trailing piece shifts on purpose so replay could resume inside a split.
+  Batch 3 Nova #9 failed only on this (4/37), so batch 3 was plausibly 1/10, not 0/10. My replays
+  counted kills and never diffed near-misses modulo the normalization.
+- **One edge broken three ways survived being stated; capping the domain ended it (L113).** Four-piece
+  split recovery was the sole failure of batch 2 Nova #7 (looped) and Orion (ended the repair early),
+  then, after meta stated the rule, of batch 3 Nova #1 (misreported repair). Splits capped at two or
+  three pieces: next batch 2/10. The cap also settled two reviewers who had asked for opposite
+  versions of the same CPCT+ shift-count predicate.
+- **A regression test written in the reference's exact output shape killed 23/25 replayed runs,
+  every candidate included;** relaxed to the promised property it killed only the 16 real violators.
+
+**Reference bugs found: 7**, all by AI reviewers: bare declared names not registered (Solution
+Quality r1; its test family is F-71); whole-lexeme delete kept at piece 0 (SQ r1); empty `%split`
+failing with ReachedEOL (SQ r1, 2/10); last piece taking the lexeme remainder (SQ r2); four-piece
+CPCT+ loop, three piece shifts ending a repair that replay restarts at the whole lexeme (Auto Review);
+byte instead of character piece lengths (Auto Review; its 4 kills were all F-71 fixture rejections);
+a reading not latched across reductions in a reduce/reduce-conflicted Pager table (final Auto Review,
+after acceptance, unfixed).
+
+### pyocd-dwt-watchpoint-planner (Python / pyOCD Cortex-M DWT: range watchpoints, comparator planning, hit reporting) — ACCEPTED 2026-10-10, Nova 0/8 + Orion 1/4
+
+| | |
+|---|---|
+| Shape | O-Composite-extend over 4 subsystems: DWT v1/v2 range planner over comparators with per-comparator MASK limits and even/odd linked pairs (coresight/dwt.py), per-halt hit cache and session boundaries (cortex_m.py, target.py, soc_target.py), GDB stop-reply fields (context_facade.py), commander watch/rmwatch/lswatch/status/continue/step (commands.py) |
+| Final artifact | 7 files, hook human-effective ~252, 78 new tests in one pytest module with a FakeDebugAP, 1100 base tests; meta 383 words |
+| Pass-rate history | OLD models: batch 1 **0/11** (deferred-write tests unfair) → 2 **0/10** (ack wording) → 3 **0/10** (humanizer drifts) → 4 **0/10** (+1 FP, family-reset tests hit by the export bug) → PSoC rule dropped, token setter → 6 **3/10** (FP upheld). Admin revert 2026-10-09. NEW models: batch 7 Nova **0/11**, Orion **0/4** only via an unfair uninitialized-DWT lswatch test (true 4/4 = too easy) → test fixed + 2 top-of-memory tests → batch 8 (re-eval) Nova **0/8**, Orion **1/4** (accepted) |
+| Patterns used | **F-74** stale read-to-clear latch (Nova separator, new), **F-73** 32-bit wrap (Orion discriminator, new), heterogeneous-capacity planner cells, F-10 halt x boundary cells |
+| Agent split | Batch 8: Nova 0/8 (68-73/78), Orion 1/4 (three at 76/78). Nova sequence length avg **521k** (500k-605k); Orion avg 76k |
+
+**Why it held.** Two independent walls with different owners. F-74 killed 8/8 Nova and no Orion; F-73
+killed 8/8 Nova and 3/4 Orion. Nova runs also lost 3-4 runs each to comparator-limit cells (v1 blocks
+too large for the remaining comparators, v2 too many singles). The Orion pass and the three failers
+were indistinguishable everywhere else.
+
+**What the batches taught.**
+
+- **The new models flipped one trap's owner (L114).** On the same artifact the stale-MATCHED tests
+  killed 2/10 old Nova (batch 6) and 18/19 new Nova; new Orion cleared them 8/8 times.
+- **When four Orion solutions are fuzz-identical, the 1-of-4 lever is an implied domain boundary
+  (L115).** 400-seed and 1500-seed differential fuzzes plus a 1500-case optimality oracle found zero
+  divergence between the four Orion runs; a subagent's read of the patches found exactly one split,
+  the top of the 32-bit space. Two tests asserting only "low memory not watched" read 1/4, ruled fair.
+- **The re-eval reproduced the local replay run for run** (12/12 verdicts), as expected for a
+  test-only delta.
+- **The first wrap test passed on base** (base refuses the range too). The clean room's "no-solution
+  new" count caught it (77 of 78 failing); a follow-up placement only the feature can make fixed it.
+- **Nova sequence length came from one compaction per run** (largest window ~262k + removed ~245k),
+  so a 7-file reading surface cleared the >256k average with 2x margin (L116).
+- **Killed nothing: 64 of 78 tests**, including all GDB field-format, rollback-on-fault, linked-pair
+  MATCHED placement and commander-format tests. They are fairness and FP insurance, not difficulty.
+
+**Reference bugs found: 10.** Solution Quality: zero-length request touched FUNCTION during lazy init;
+unbounded v1 split; programming never flushed; PSoC reset overrides advanced the run token without
+clearing hits (fixed with a `_run_token` setter). Hardening audit: largest block to the widest
+comparator burned wide comparators (now best fit); `init()` appended comparators without clearing;
+rollback caught only TransferError. Gates: lswatch on an uninitialized DWT; eager probing of every
+comparator. Auto Review on the accepted artifact (Medium, unfixed): `_disable_comparators` wraps the
+whole cleanup loop in one `try`, so a second fault during rollback skips the remaining disables.
+
+### cwerg-fe-address-constants (Python + C++ / Cwerg twin compiler front ends: constant evaluator, span lowering, global data emitter, type checker, ELF relocations) — ACCEPTED 2026-10-11, Nova 0/8 + Orion 1/4
+
+| | |
+|---|---|
+| Shape | O-Composite-extend over twin front ends: address constants = (global, byte offset) through `eval.{py,cc,h}` (field/index/deref/front/ptr_inc, equality, read-through of scalars AND aggregates), `canonicalize{,_span}.{py,cc}` (keep the folded value when spans are lowered), `emit_ir.{py,cc}` (`.addr.mem` with addend, evaluated aggregates, empty span), `typify.{py,cc}` (explicit type before the initializer, for self/forward references), `BE/Elf/elf_unit.h` (non-zero addend) |
+| Final artifact | 12 files, hook human-effective 365, 18 `FE/AddrTest` programs x (py, cc) x (x64, a64, a32) + py/cc output parity per target = 162 new cases, 242 base cases; meta 273 body words |
+| Pass-rate history | OLD models: batch 1 Nova **0/10** (span-in-literal walls were pre-existing gaps) → cut → re-eval 2 **1/10 FP-voided** (C++ sparse-vec default) → re-eval 4 **1/10 FP-voided** (read past last vec element) → batch 4 **1/10 FP-voided** (record-with-span copy) → meta capped those inputs. Admin revert. NEW models: batch 5 Nova **1/8** → harden 1 (cross-global ptr_diff/order compile errors) → batch 6 Nova 0/6, Orion **3/4** → harden 2 (typed self/mutual references in typify) + 3 humanizer rounds → batch 7 void (meta cut for "Too many requirements") → batch 8 Nova **0/8** (one ELF-addend contest upheld, run replaced) → batch 9 Nova **1/8**, Orion **2/4** → `emptyspan` + 3 coverage programs (tests only) → re-eval Nova **0/8**, Orion **1/4** (accepted) |
+| Patterns used | **F-75** empty-span lowering (Orion discriminator, from a Solution Quality finding), **F-77** aggregate read-through (Nova separator), **F-76** aligned stride (x64/a64 only), ELF addend NYI in the C++ backend (6/7 Nova found it, contested twice) |
+| Agent split | Accepted batch: Nova 0/8 (6-27 of 162 failed; two failed only `emptyspan`), Orion 1/4 (#4 failed only `emptyspan`; #1, #2 `emptyspan` + `tables`). Nova sequence length avg **995k** (0.79M-1.58M, platform `compacted: false`); Orion 145k-468k |
+
+**Why it held.** Three independent emitter walls (F-75, F-77, F-76) plus a backend line nobody is told
+about but every pipeline run hits. Nova runs each lost one or two of them; the Orion pass was the only
+run whose emitter keyed on the evaluated value (`EvalSpan` with no pointer → pointer-width zero)
+rather than on the lowered node.
+
+**What the batches taught.**
+
+- **The 1-of-4 Orion separator was an edge I had held back for being too strong (L117).** The
+  empty-span `front` case came from a Solution Quality S1 finding on my OWN reference (Python assert,
+  C++ wrote one padding byte). Replayed then, it killed 2/3 Orion passers, so I fixed the reference and
+  left it untested. At batch 9 (Orion 2/4), 11 probe programs (the 3 coverage suggestions plus 8 trap
+  variants) showed ZERO divergence between the two Orion passers; the held-back edge split them 1/1 and
+  also killed the batch-9 Nova pass. Auto Review called it "subtle but fair".
+- **Both designed hardening levers on the new models killed nothing.** Harden 1 (cross-global
+  ptr_diff/ordering as compile errors) killed 0 live runs in batches 6-7 and was then cut whole for
+  the requirement-count check. Harden 2 (typed self and mutual references through typify) killed 0:
+  `mutual` and `selfref` passed in 12/12, and `ring`'s two kills were the x64/a64 stride bug (F-76),
+  not the cycle.
+- **A one-line backend precondition outside the "front end" title drew an environment-blocker verdict
+  twice, and both contests were upheld (L118).** The winning argument: the stated py/cc x
+  x64/a64/a32 promise, `FE/Makefile_cc` pairing `-fe c++ -be c++`, 6 of 7 sibling Nova runs fixing
+  `elf_unit.h` themselves, and the run's own trajectory testing only `-be py`. A re-eval regraded an
+  UNCHANGED trajectory from "unverified assumption" to "undocumented requirement + blocker".
+- **Twin-implementation parity imported four FP-voided passes on the old models** (L60): sparse vec
+  defaults, reads past the last vec element, a record-with-span copy, all pre-existing C++ gaps the
+  reference fixed. Ended by capping the domain in meta ("all vec literals are complete", no vecs of
+  spans, no complete copies of records containing spans), not by testing them.
+- **Programs that killed nothing: 12 of 18** (alias, deref, eqfield, globals, idxptr, indexexpr,
+  mutfield, mutual, nestinc, runtime, selfref, static). The three coverage programs added at the end
+  (nestinc, eqfield, selfref) were chosen because they killed nobody: they closed Test Quality partials
+  at zero gate cost.
+- **Nova sequence length was ~1M per run without compaction,** 2.5-3.6x the largest single step
+  (275k-539k), so the platform figure is not the largest window (L119).
+
+**Reference bugs found: at least 11,** all by gates: Solution Quality `pp^` fall-through, vec-literal
+span elements lost, `ps^` span copy, `Expr3` testing a truthy EvalNum object, 9 new mypy errors, C++
+`GetValForVecAtPos` gaps, leading holes and empty vec literals, an omitted span field read through `^`,
+empty-span `front` (Python assert + C++ padding byte), zero-size globals sharing one address; FP panels
+added three more pre-existing C++ gaps (above). Every round found one more py/cc asymmetry (L60).
+
+### libspatialindex-mvr-history-pruning (C++ / MVR-tree multi-version index: history pruning, page reclamation, statistics, archive of discarded versions, old-format compatibility) — ACCEPTED 2026-10-11, Nova 0/8 + Orion 2/8
+
+| | |
+|---|---|
+| Shape | O-Composite-extend inside one library: `pruneHistory` with and without an archive visitor (include/spatialindex/MVRTree.h), reachability purge + node compaction + root trim + statistics (MVRTree.cc), query clipping, header persistence of the horizon and erase markers with byte-guarded old-format reads, live-entry delete fix (Leaf.cc, Node.cc/.h) |
+| Final artifact | 6 files, hook human-effective 259 (raw 362), 35 gtest cases in one file run per-test by a Python JUnit runner, meta 281 words |
+| Pass-rate history | OLD models: batch 1 **0/10** (query ending at the horizon, 9/10 shared) → 2 **0/12** → 3 pool **2/21**, both FP (old-format node pages never tested; same-instant zero-duration versions) → same-instant domain capped → accepted, then reverted 2026-10-09. NEW models: batch 4 Nova **2/4** → 9 probe tests, re-eval 0/4 → batch 5 Nova 0/8, Orion **3/3** → batch 7 Orion **4/4**, Vega 1/1 → statistics lever (dead/level counts after a prune) → Task Prompt "too many requirements" twice: retention, C API, rejection rules, contains/point clauses and the compaction sentence cut → batch 8 Nova 0/8, Orion 1/4 FP-voided (F-79) → FP test + S1 fix → re-eval Orion 0/4 → 2 fresh Orion 2/2 → 2 more 0/2 → accepted **Orion 2/8**, Nova 0/8 |
+| Patterns used | **F-78** dangling parent entries after reclaim (lead, new), **F-79** previous-horizon shortcut (near-miss decider, new, FP-sourced), F-47 version lineage the store never keeps, statistics recomputed from node end times the tree does not maintain, L84 old-format pages |
+| Agent split | Nova 0/8 (5-17 fails, all F-78); Orion 2/8: two passes, two 34/35 (F-79 alone), four F-78. Nova sequence length avg **543k** (521k-562k), Orion 101k-144k |
+
+**Why it held.** One shared blind spot did most of the work: freeing pages without rewriting the
+parents that keep pointing at them (F-78, 12/16). The two strongest non-passers cleared it and then
+fell to a single same-instant boundary cell (F-79). The passers differed from the 34/35 runs only in
+walking every reachable entry on each prune instead of resuming from the previous horizon.
+
+**What the batches taught.**
+
+- **The lead trap was created by a requirement-count cut (L120).** "Kept pages lose entries that expire
+  at or before the horizon" killed 0 of 5 strong runs while stated; it was deleted only because the
+  Task Prompt gate wanted fewer rules, and its behaviour then killed 4/8 Orion. Auto Review still ruled
+  it fair through the reachability rule and "other operations work as before".
+- **Identical failures across different patches were real.** Four solutions printed the same page ids
+  because the storage manager's id reuse is deterministic; a regex JUnit parse had misattributed the
+  messages to other tests and made it look like a harness bug. Parse with ElementTree.
+- **The test oracle inherited a base leak.** "Unreferenced page = root" treats base orphan pages (a
+  node created and killed in one instant loses its parent entry but stays stored) as live roots. The
+  first FP-test burst (40 inserts at one instant) hit it and failed the reference; 24 spread inserts
+  kept the F-79 cell with no orphans. Run the reference against the oracle on every new input shape.
+- **Probe convergence held on the passers:** 600 wide cases plus contains/point-query hashes after each
+  prune found zero divergence between the two passers and the reference; burst cases diverged only in
+  orphan territory. The FP panel, not the design, supplied the near-miss decider (L17).
+- **Pool arithmetic (L121):** the gate counted all eight Orion runs on the final version, re-evaled and
+  fresh, so 2/2 fresh passes became an acceptable 2/8 after two more fresh runs.
+- **Killed nothing: 17 of 35 tests**, including every query-clipping, horizon persistence, empty-record,
+  page-count, 3D and archive-boundary test. Fairness and FP insurance.
+
+**Reference bugs found: 9.** Archive merged a delete and an identical reinsert at one instant (SQ r2);
+"query ending exactly at the horizon is a single instant" unimplementable on the repo's half-open
+intervals (SQ r4); DBL_MAX horizon removed every root (SQ r4); old-format header check read past the
+buffer (SQ r4); archive merged across a same-instant version copy (SQ r5); empty-payload copy (Auto
+Review S2); base `deleteData` ending the wrong same-id entry (found by fuzzing, fixed in the reference
+in round 14); `legacyHeader` writing zero dead counts in the test harness; erase markers keyed by (id,
+time) archiving a live same-id record (Solution Quality S1, round 17).
+
+### asdf-conversion-free-lazy-tree (Python / asdf: lazy-tree info, search, schema_info and tag-preserving write_to/update) — ACCEPTED 2026-10-11, Nova 0/8 + Orion 1/8 (Vega 2/4)
+
+| | |
+|---|---|
+| Shape | O-Composite-extend across 7 modules: a `LazyView` threaded through `_display`/`_node_info`/`search` (show and match untouched tagged nodes by declared type, convert only for container/traversable types, `value`/`filter_` or `node(s)`; key/type before value/filter across the chain), and a `PassThrough` in `yamlutil`/`_asdf`/`_serialization_context` (write untouched nodes raw with their original tag, record their extensions in history, renumber raw ndarray sources on update, convert non-array nodes when the opened file had blocks) |
+| Final artifact | 8 files (7 source + news fragment), 25 tests, base 2195; meta ~254 body words, ~12 rules |
+| Pass-rate history | OLD models: batch 1 **0/11** → round 14 (conversion witnessed by the converter log, not a tag) → re-eval **1/11** (Vega) → FP flag, either-tag meta → batches 4, 5, 6 Nova **0/10** each (block-renumbering family killed 16-19/21) → round 20 "simple cap" (convert non-array nodes when the file has blocks) → batch 7 **0 genuine/16** (Vega pass FP-voided: multi-type on write, history in block files) → round 23 tests. Admin revert. NEW models: batch 8 Nova **0/8**, Orion **1/4** (2/5 with a late run) → batch 9 two more Orion pass, **4/7** → round 24-25 (version rule restored) → batch 10 Nova **0/8**, Orion **3/4** → probes: shared-container alias (F-80) → TPQ "too many requirements" → round 27 cut 6 rules / 7 tests + asdf_library line → r29 reference aligned to the cut → batch 11 Nova **0/8**, Orion **0/8**, Vega **0/4** (unknown-tag warning test unfair) → round 30 tests-only → re-eval **Nova 0/8, Orion 1/8, Vega 2/4** (accepted) |
+| Patterns used | **F-80** shared-alias write (lead, Orion discriminator, 15/20), **F-81** existing metadata line through the new view (6/20), **F-82** multi-type converter in info (2/4 Vega), plus Nova-only separators: history entries 4, block shared with an array 4, every alias matched 4, search-result edit 3, iteration/search nodes 3, update with blocks 3, chained key-before-filter 2 |
+| Agent split | Accepted batch: Nova 0/8 (2-7 of 25 failed; Nova #8 only alias + shared containers), Orion 1/8 (#3, #5, #8 failed only F-80; #4 only F-81), Vega 2/4 (#1 only F-82). Nova sequence length avg **902k** (742k-1.17M); Orion 105k-149k, Vega 150k-204k |
+
+**Why it held.** Nova never cleared the write side: every Nova run lost the alias sharing (F-80) and each
+also missed one or more of history, block renumbering on update, or search-result materialization. The
+strong agents implemented all of that and split only on F-80 and F-81, both repository invariants the
+new path bypasses, which Auto Review called "subtle but fair".
+
+**What the batches taught.**
+
+- **The Orion discriminator was found by probing what BASE keeps that passers break, not by a new
+  rule.** After batch 10 (Orion 3/4) every stated cell had converged; the shared-container probe split
+  the passers 3/1 with base and the reference on the same side. It became the lead killer (15/20) with
+  no meta sentence at all.
+- **Repo `filterwarnings = error` made a base warning into a hidden rule (L122).** The unknown-tag
+  test failed on the first `info()` with the `AsdfConversionWarning` base itself emits. It killed 4/8
+  Orion and 4/4 Vega in batch 11 (0/20 overall); the Vega graders flagged it agentBlameUnfair.
+  Opening with `ignore_unrecognized_tag=True` turned the same runs into Orion 1/8, Vega 2/4. The same
+  failure had already killed Orion b8 #3 and b10 #4, and I read it as a fair miss both times.
+- **The requirement-count cut needs the reference cut too (L123).** After round 27 deleted 6 rules,
+  Solution Quality failed twice on behaviour from cut rules the reference still did (multi-type
+  conversion during traversal, `to_info`, version conversion). Probe diff old vs new reference: only
+  cut-rule cells moved.
+- **Vega above 25% did not block the gate (L124).** The Orion/Vega check passed on Orion 1/8 with
+  Vega 2/4 in the same pool.
+- **Held-back edges stayed held back and the reviewer still accepted.** Extension removal after a lazy
+  open kills all Orion (probe r25) and was never tested; Auto Review raised it as S1/S2 High plus a T4
+  (delete the last array before writing) and asked for revision, and the human reviewer accepted
+  anyway.
+- **Killed nothing: 13 of 25 tests** (info renders untouched, search by key/type, filter scope,
+  value/filter wait, value matches converted object, keep tags, convert only accessed, write blocks
+  rule, scalar/sequence extensions, render/replace, alias via search, unknown tags after the fix).
+  They are the stated contract and FP insurance; the batch was decided by the 3 invariant tests above
+  plus the Nova-only write-side group.
+- **Old-model walls that cost 10+ rounds were cut:** the block-renumbering retry (round 17), version
+  migration, list-form arrays, import-path types, external storage. None of them ever separated a
+  strong agent on the new models.
+
+**Reference bugs found: at least 9,** all by gates or probes: shared-block index corruption on
+reorder (Auto Review S1, base correct), alias dropped from search results (Auto Review S1), history
+extension lost after removing an extension (Solution Quality), multi-type conversion during key
+search (Solution Quality x2), stale `to_info` trigger and version conversion after the cut, validate()
+converting untouched nodes (probe), truthiness on a cached object in `LazyView.resolved` (Solution
+Quality), and extension removal with blocks (Auto Review S1/S2 at acceptance, left unfixed).
+
+### hayro-optional-content-baking (Rust / hayro PDF: hayro-write page extraction baking default optional-content visibility through pages, Forms, tiling patterns, Type 3 fonts and soft masks) — ACCEPTED 2026-10-12, Nova 0/8 + Orion 1/4
+
+| | |
+|---|---|
+| Shape | O-Pipeline-hard: a content-stream baker in a new `hayro-write/src/optional_content.rs` (default-config evaluation with BaseState/ON/OFF and OCMD AnyOn/AllOn; hidden paints to `n`, hidden text to clip-only modes with the tracked mode restored, hidden `Do`/`sh`/inline images dropped), per-stream variants keyed by (scope, kind, name, render mode) for Forms, tiling patterns, Type 3 procs and soft-mask groups, wired into both extraction modes; `UntypedIter::offset()` and a larger operand bound in hayro-syntax |
+| Final artifact | 4 source files, 519 human-effective, 74 new tests + 4 base-mode plain-extraction tests (base 478); meta 254 body words; render oracle = hayro's own renderer, hand oracles where it departs |
+| Pass-rate history | OLD models: batch 1 **0/11** (per-caller Form mode 11/11, cut) → re-eval **2/11** both FP (tag, Properties inheritance, caller mode) → batch 3 **1/11** Vega FP → batches 4, 5 **0/13, 0/11** → batch 6 **1/12** FP → batches 7, 8 **0/11** → batch 9 **1/10** genuine, approved, admin-REVERTED (meta "rule-by-rule spec") → round 21 short meta. NEW models: batch 10 Nova **0/9**, Orion **2/8** both FP-voided (shared Type 3/pattern) → cap → batch 11 Nova **0/8**, Orion **1/6** FP-voided (pattern start mode) → tests → batch 12 Orion **0/10**, Vega **0/4** → batch 13 Orion **0/8** (inline sole failure 8/18) → round 30 (inline stated, F-83 uncapped) → 3 TPQ rounds (requirementCount, AI) → batch 14 Orion **2/4** → round 31 tests-only (+F-84 indirect size, from an FP-panel dissent) → re-eval + Nova x8: **Nova 0/8, Orion 1/4** (accepted) |
+| Patterns used | **F-84** Type 3 via ExtGState (9/12, lead), **F-83** caller render mode in Forms (8/12, Nova separator), **F-85** hidden soft-mask group (5/12), F-84 indirect size (1/12, the Orion separator), inherited image in an empty-resource Form (1/12, Orion #2) |
+| Agent split | Nova 0/8: 4-5 of 74 failed in six runs (always F-83 x3 + F-84, plus F-85 in four), 15 in two (also ignored XObject-level `/OC`). Orion 1/4: #3 passed, #4, #1, #2 each failed one test. Nova sequence length avg **636k** (505k-886k, largest step 261k-362k); Orion ptok 2.4-4.7M vs Nova 32-46M |
+
+**Why it held.** Nova never cleared the reach of the baker: every run seeded Forms from the default
+state (F-83) and walked fonts only through `/Font` (F-84). The strong agent cleared both and split only
+on second-order edges of the same seams (indirect operand on the ExtGState route, caller-resource
+fallback for an empty `/Resources`).
+
+**What the batches taught.**
+
+- **An old-model universal wall came back as the Nova separator (L125).** The per-caller Form render
+  mode killed 11/11 (incl. Vega and my reference) in batch 1 and was cut as a defect. Under the new
+  models, capped to one caller per Form, the same behaviour killed 8/8 Nova and 0/4 Orion.
+- **Both lead killers were Auto Review S1 findings on my own reference.** Type 3 via ExtGState was an
+  S1 at batch 1 (withheld for a while because it killed the near-miss), the inherited clip mode an S1 at
+  round 9. L17 extends from coverage suggestions to S1s: if I got it wrong, agents will too.
+- **The 2/4 → 1/4 lever came from the FP panel's own dissent (L126).** Judge-c's indirect-size probe
+  on Orion #1 was overruled as "not a stated requirement", but it lands on stated promises (Type 3,
+  graphics state, text position). One test, re-eval, the evaluator ruled FAIL_MISSED_REQUIREMENT
+  ("not singled out ... inferable"), Auto Review called the runs fair.
+- **Stating the inline `/OC` rule moved it from lead Orion killer to zero (L109).** Implied: 16/18
+  Orion failed it, sole failure in 8/18. Stated in round 30: 0/12.
+- **Each FP-voided strong pass was closed by a cap, not a test.** Shared Type 3/pattern contexts
+  (batch 10) and the pattern/soft-mask start mode (batch 11) both replayed as killing most strong runs,
+  so the fix was "used from only one place" and "starts from its own render mode" plus a test.
+- **The requirement-count and AI gates cost three meta rounds after the content was done.**
+  Deleting example sentences and one cap passed the count; the "Add support for ..." opener was the
+  AI trigger again.
+- **Killed nothing: 57 of 74 tests**, including the former lead killer `inline_property_list_is_honoured`
+  and the tiling start-mode test (4/8 Orion in batch 13). They are the stated contract and FP insurance.
+
+**Reference bugs found: at least 12** that gates or probes caught: six Solution Quality
+comprehensiveness FAILs in precheck rounds 1-6, Auto Review S1s (ExtGState Type 3 font never baked;
+per-caller clip mode; direct and inline OCMD ignored; a visible BI with its own hidden `/OC`; `q` before
+hidden text and `Q` after it in a Form; kept `/OC ... BDC` wrappers), `/DP` kept on rewritten streams,
+and an unbounded operand stack. Left at acceptance: Auto Review S1 High, the reference hides any `BDC`
+whose property list points at a hidden group, not only `/OC`-tagged ones (it copies hayro's renderer,
+which was the oracle; L127), and T4 Medium, no inline `/OC` → OCMD test.
+
+### macs-callvar-fragment-phasing (Python+Cython / MACS3 callvar: `--pair-aware` fragment counting and chromosome-wide read-backed phasing with PS/BAR) — ACCEPTED 2026-10-13, Nova 0/8 + Orion 1/4
+
+| | |
+|---|---|
+| Shape | O-Pipeline-hard: one flag drives both halves. Fragment evidence (same-name reads = one molecule, at most one observation per position, -Q exclusion before grouping, concordant mates once at best quality, discordant mates nothing, strand from read 1 via mate flags) on BOTH the raw-read path (RACollection/PosReadsInfo) and the local-assembly path (UnitigRACollection, read names carried through), then phasing over each chromosome's 0/1 calls incl. indels (uneven split of treatment+control fragments links; each site joins its nearest earlier linked site), PS + treatment-only BAR |
+| Final artifact | 10 files (callvar_cmd, BAM.py, PeakVariants, PosReadsInfo, RACollection, ReadAlignment, UnitigRACollection, bin/macs3, 2 docs), hook human-effective 325, 55 new tests through the real CLI on synthetic BAM+BAI writers, 117 base tests; meta ~384 body words, ~14 rules |
+| Pass-rate history | OLD models: batch 1 **9/10** → nearest-earlier linking → **6/10** → fragment -D, 399-word meta → **1/10** FP → **7/10** → stated passer gaps → batch 6 **1/10** legit (4 FP-voided, mostly on the fermi path) → **1/10** legit → **0/10** legit → scope-down (fermi off) → batch 9 **3/10**. NEW models (admin revert): batch 10 Nova **3/5** → cross-peak chromosome-wide phasing → Nova **1/7**, **1/8** → batch 13 Nova **0/8**, Orion **1/6** FP-voided (own deletion normalizer) → requirement-count gate: ~27 → ~14 rules, 22 tests cut → batch 14 Nova **0/8**, Orion **2/4** → +4 Orion **2/4** (4/8) → records sentence deleted, -F honoured again → batch 16 Orion **3/4**, Vega **0/4** → strand rule stated → batch 17 Orion **3/4** (one FP) → tests-only: quiet peak, read 1 outside peaks, assembled depth = read mode → batch 18 re-eval **Orion 1/4** + fresh Nova **0/8** → 4 Auto Review tests → re-eval on 55 tests: **Nova 0/8, Orion 1/4** (accepted) |
+| Patterns used | **F-86** uncalled allele kept off both haplotypes (8/12, Nova separator, 0/4 Orion), **F-87** strand from a read 1 outside the peaks (8/12), **F-67** second engine = local assembly (7/12, Orion #3's sole failure), **F-18** `*` deletion right after an SNV (5/12), F-18 under -F on/auto (2/12), quiet-peak crash (1/12, Orion #2), assembled control votes (1/12) |
+| Agent split | Nova 0/8: 3-6 of 55 failed per run, always F-86 x2, plus F-87 in 7 and F-67 in 5; best Nova 52/55 (#7, #2). Orion 1/4: #1 passed; #3 54/55 (assembled depth 29 vs 30), #2 53/55 (quiet-peak UnboundLocalError + F-87), #4 53/55 (F-18 + F-67). Nova sequence length avg **565k** (521k-793k, every run compacted, largest step 269k-285k); Orion ptok 2.3-3.1M vs Nova 21.8-35.4M |
+
+**Why it held.** The two halves are wired through different layers (Cython BAM flags, per-position evidence,
+two evidence paths, a chromosome collector), so Nova spent ~200 steps getting counting and phasing working
+and then shipped evidence tables shaped for linking only (F-86). Orion cleared F-86 every time and split
+only on the edges: the assembly path, the read-1-outside-the-window cell and a no-call peak.
+
+**What the batches taught.**
+
+- **The Nova separator was my own round-1 reference bug (L90).** Solution Quality's first FAIL was the
+  block test admitting a third-allele fragment. That fix became F-86, 8/8 Nova and 0/4 Orion at acceptance.
+- **Orion 3/4 → 1/4 with tests only, from two sources (L126, L128).** The FP panel's false-positive on
+  batch-17 Orion #2 gave the quiet-peak crash and its judge's read-1-outside-peaks probe; my probing of the
+  genuine passers on the default -F auto assembly path gave the substring-placement miss. Each test kills a
+  different Orion run, and the assembled-depth one also killed 5/8 Nova.
+- **A stated rule kills nothing; its window-edge cell kills 8/12 (F-10, F-87).** The strand rule added at
+  Orion 3/4 was transcribed by every run (in-peak test 0/12); only the cell where read 1 is never fetched killed.
+- **Deleting a meta sentence disarms its trap, but the test can come back alive.** The deletion-after-SNV
+  test went 4/6 Orion → 0/8 once "calls keep POS/REF/ALT" was cut; at acceptance it killed 5/12 for
+  a different reason (`*` observations never matched).
+- **The requirement-count gate cost 22 tests and two rules families** (fragment-level -D/outliers, BAS model,
+  half-open peaks, fermi). The cut contract was still hard enough for Nova; Orion needed one new stated rule.
+- **Scoping assembly out to stop FP voids (batch 8) had to be undone (batch 14 S1).** "Calls keep the
+  records written without the option" made forcing -F off a reference bug; restoring the assembly path
+  later produced the F-67 killer. Scope away a path only if the contract never touches its output.
+- **Killed nothing: 47 of 55**, incl. all control-side tests, chromosome isolation, multiprocessing, the
+  in-peak strand test, nearest-earlier linking, and 3 of the 4 batch-18 Auto Review additions (collapse of
+  overlapping assembled mates, control outweighing treatment, nonblock FORMAT).
+
+**Reference bugs found: about 10** — third allele in the block test (precheck round 1), peak-end mate in the
+-D key (BAMaccessor inclusive end), fermi deletion branch giving `*` to every unitig read (twice: covered_only
+predicate, then the pair-aware path), boundary-D reads, alignment-interval guard in one of four unitig loops,
+in-peak vs whole-template duplicate key, -F forced off contradicting the records sentence (S1), "Read depth"
+header text. Left at acceptance: Auto Review T3/T4 Medium x2 (no BAR fixture forcing upward rounding, e.g.
+2:1 = 0.67; deletion DPT bounded `carrying <= DPT <= covering` instead of exact).
+
 ## 3. CROSS-PROBLEM LAWS
 
 | # | Law | Evidence |
 |---|---|---|
 | L1 | **Enumerated rules get transcribed; architectural impossibilities do not.** | pulldown 67% with every rule listed → 40% from one wall |
 | L2 | **Globally-coupled beats pointwise, always.** Fixed points over a whole program hold their band across many batches; independently-implementable rule sets do not. | calyx held 10-40% over 13 batches; pulldown's rule set read 67% |
-| L3 | **Scattered singleton failures mean the domain is separable — stop stacking traps.** | pulldown's 4 failures had 4 causes and no lever; adding rules would not have moved it |
+| L3 | **Scattered singleton failures mean the domain is separable — stop stacking traps.** | pulldown's 4 failures had 4 causes and no lever; adding rules would not have moved it **ray-optics-sp-coherence-transport:** batch 2's three failures had three causes (label regex, Detector slot overlap, reflecting elements); more cells of the same kind would not move it, a second engine did (L108). |
 | L4 | **Diverse failure causes at a low rate = healthy. One shared cause = unfair.** | calyx runs13: 6 failures, 6 root causes, all agent-fault |
 | L5 | **The second axis of a one-sentence rule is free difficulty.** | calyx `@fixed_signature` ref cells, 28% kill |
 | L6 | **Name-based shortcuts pass name-shaped suites.** Include one instance whose name breaks the pattern. | calyx v7 `std_mult_pipe`; costs zero pass-rate; csbindgen-struct-layout-fidelity: 1/10 treated any `NonZero*`-named struct as a niche integer (sole failure of an otherwise 70/70 run) |
@@ -4024,12 +5410,12 @@ image commands rejecting absolute names; relative `GetIdsForReservedFile` resolv
 | L14 | **A false positive is not always "the reference is buggy" — verify the reference before touching the solution.** A candidate's own extra defensive check can be the actual bug; the real gap is often that the hidden suite never exercised the input that exposes it. | lyon-arcs-join: candidate added `!miter_limit.is_finite() -> None`; reference verified bug-free by direct probe (infinity == 1e6 output); fix was 3 new tests, zero solution changes |
 | L15 | **Mutation-kill counts do not predict agent-kill counts.** Mutations measure what your tests can DETECT; a batch measures what agents actually get WRONG. Build mutation coverage for FP protection; build composition cells (F-10) for difficulty. Never justify a hardening round on mutation evidence alone. | neva: the WaitAll barrier took mutation V10 from 0/12 to 2/15 and killed 0 of 10 agents; the trap that decided the band killed only 2 mutations. rust-minidump: the baseline-preservation axis was justified on "it reds 11 existing tests" and produced **0 baseline failures across 10/10 runs**. worldengine-orographic-precipitation: four of six DESIGN § 11 traps (wrap seam, steady state, mountain-start span, blend placement) killed 0 of 20 runs; the serialiser trap killed 11/20 through a mechanism I did not predict (F-28) |
 | L16 | **One test usually decides the band.** Redundant tests still earn their place (fairness, FP insurance, coverage review), but hardening effort belongs on the un-tested intersections, not on more instances of a covered axis. | neva: 20 of 21 tests changed no outcome; the F-10 cell alone separated 2/10 from 4/10. datafixerupper-ordered-alternatives batch 9: **156 of 173 tests (90%) killed nothing**, 17 carried the band, and one of those 17 decided it. worldengine batch 2: 52 of 66 killed nothing, and three round-trip tests carried 23 of 46 kill events |
-| L17 | **Reviewer coverage suggestions are free difficulty — take them.** They are written to close fairness gaps, and a fairness gap is by definition a behaviour the contract states but nothing tests, which is exactly where an agent can be wrong for free. | neva: the decisive test came from a Test Fairness coverage suggestion, not from the trap design **teavm-method-summaries:** 1 of 9 coverage-suggestion tests killed (null-summary fallback, 2/10, F-54); the rest 0 |
+| L17 | **Reviewer coverage suggestions are free difficulty — take them.** They are written to close fairness gaps, and a fairness gap is by definition a behaviour the contract states but nothing tests, which is exactly where an agent can be wrong for free. | neva: the decisive test came from a Test Fairness coverage suggestion, not from the trap design **teavm-method-summaries:** 1 of 9 coverage-suggestion tests killed (null-summary fallback, 2/10, F-54); the rest 0 **hayro-optional-content-baking:** both lead killers began as Auto Review S1s on my reference (Type 3 via ExtGState 9/12, caller Form mode 8/12) |
 | L18 | **Refines L4 — a shared failure cause is unfair only when NO agent cleared it.** The test is reachability, not diversity. Check: did anyone pass? did near-misses get everything else? did the evaluators mark `description_clear: true`? was the FP panel clean? If yes, one dominant cause is a legitimate design wall (F-1/F-9 family), not a hidden requirement. | neva: 6 of 8 failures on one root cause, 2 passes + 2 at 20/21, accepted |
 | L19 | **A wall that contradicts the repo's own published docs is a fairness bug that happens to be hard.** Concede it; do not buy it back by writing the contradiction into the meta. | neva: injected-dependency port remapping was the sole failure of 4 agents in an earlier round, and died to one line of the repo's own book |
 | L20 | **A single-seam problem is BIMODAL: its pass rate is a coin flip, not a difficulty.** If one decision gates every killer test, batches swing wildly while the artifact only improves. The tell is a per-test kill table where the killers are perfectly correlated — every failing run fails the IDENTICAL set. Adding tests to that seam cannot stabilise it; they all die together. Fix by adding a lever whose failures are INDEPENDENT of the seam, and confirm via a kill table with two separated clusters. | customasm: 0/13 -> 90% -> 20% -> 57% -> 9%; agent-runs 3 had 3 failures on the identical 13 tests; the accepted batch showed a near-miss cluster (1-2 fails) and a deep cluster (18-19) |
 | L21 | **An EXAMPLE appended to a general rule is read as the rule's scope, and can disarm the whole problem.** Rule-7 applies to examples, not just instance lists: keep the rule, delete the example. Note the example is usually added in good faith to clear a fairness flag — check the next batch's rate, because the fairness fix and the difficulty collapse arrive together. | customasm: "and spelling that width out explicitly leaves it whole" repaired a real 0/6 unfairness and took the batch to 90%; a later one-sided "contributing fewer than that does not" would have licensed a `>=` implementation |
-| L22 | **Ask where the decisive test came from.** On two consecutive problems the band-deciding test came from a reviewer or FP-judge finding, not from the trap design. Budget review-response time as difficulty work, not as compliance overhead. | customasm: F-11 came from an FP-panel dissent and then killed 9/10; neva: the decisive cell came from a Test Fairness suggestion; rust-minidump: the top TWO killers (6/10 and 4/10) were both written in review response, rounds 25 and 26 of 28 |
+| L22 | **Ask where the decisive test came from.** On two consecutive problems the band-deciding test came from a reviewer or FP-judge finding, not from the trap design. Budget review-response time as difficulty work, not as compliance overhead. | customasm: F-11 came from an FP-panel dissent and then killed 9/10; neva: the decisive cell came from a Test Fairness suggestion; rust-minidump: the top TWO killers (6/10 and 4/10) were both written in review response, rounds 25 and 26 of 28 **macs-circular-chromosomes (third case):** an Auto Review T4 finding ("every circular SE call disables PeakModel") produced the fragment-model test, 10/11 kills and the sole failure of the best near-miss (F-64). |
 | L23 | **Before complying with a review finding, check the repo.** A finding can be factually wrong, and complying can make your solution internally inconsistent or unsolvable. Verify the premise, then comply, contest, or comply differently. | numbat: Auto Review S1 demanded alias rejection that Test Fairness then failed; two fairness flags rested on a false claim about `unit_name`; S2's requested skip removal would have taken 2/10 to 0/10 because both passers deleted the tests it wanted graded |
 | L24 | **A noun the format already defines needs its EXTENT stated, or agents read it in its natural-language sense.** Contract words like record / entry / block / section have a precise composite meaning in the file format and a smaller, more local meaning in ordinary English. The local reading is the one agents implement, and it is invisible to any fixture where the two coincide. | rust-minidump: "a single **record** that declares no caller and also computes one is discarded" — 6 of 10 runs discarded only the offending ROW and kept the record live; the twin fixture with the contradiction in the header killed 0 (F-13) |
 | L25 | **For a tolerance rule ("allow one, stop at the second"), the discriminating fixture is the UNDER-threshold case.** The at-threshold fixture — the one the rule is literally written about — passes under both the correct reading and the stop-at-first reading. Author the N-1 case and assert that nothing happened. | rust-minidump: `a_second_reduced_frame_ends_the_walk` (two events) killed 0; `degradation_is_summarised_over_the_whole_walk` (one event, asserts the walk continued and stayed `Ok`) killed 4 (F-15) |
@@ -4065,17 +5451,17 @@ image commands rejecting absolute names; relative `GetIdsForReservedFile` resolv
 | L55 | **L50 has a budget: a regression test for EVERY reviewer finding multiplies to zero.** Each finding is a 30-60% trap and eight independent ones give ~0%. Test the few with the highest predicted kill, preferably sharing a root cause with a designed trap; fix the rest in the reference only. | ray-optics: 11 precheck rounds, one test per finding, batch 1 **0/11**; a local re-grade with both description walls removed still read 0/11 (1-8 failures per run). After pruning, three reviewer-finding tests carried 17 of 40 kill events at an accepted 1/10 |
 | L56 | **A test that shells out to a tool the Dockerfile installs will fail Verify Solution, whatever the local clean-room says.** Keep validators in-process, inside the test file. | ray-optics: a `naga-wasi-cli` WGSL validity test passed every local clean-room (fresh clone, `--network none`, non-root) and failed Verify Solution on two separate platform runs; Task Quality called it an undeclared dependency once and passed it once. An in-process operator / bool-`select` check replaced it: 0 false rejections over 43 shaders x 22 implementations, both injected defects caught |
 | L57 | **Placement prose about a NEW stage is read as a statement about where the EXISTING stages stop.** "A new X step between A and B" makes agents repair step A to stop before X, even when the repo's A already runs past B. Nothing in the feature tests it, so the regression ships inside a grader PASS. State in one clause that existing steps keep every stage they run today, and pin that end to end. | worldengine-orographic-precipitation batch 1: **10/10** runs deleted `Step.plates`'s precipitation, erosion and biome flags; the two 65/65 runs carried the identical hunk and were graded PASS_LEGITIMATE and FAIL_REGRESSION. One sentence plus one end-to-end test: **0/10** in batch 2 |
-| L58 | **Refines L1: on a cross-cutting feature a fully specified numerical kernel is free, including a closed-form fixed point. The band lives in the integration shape** (the concept's container representation, accessor form, lifecycle guards). Spend no hardening rounds on kernel cases; count them as LOC and FP insurance. | worldengine: 24 transport tests killed **0 of 20** runs across two batches, including the steady-state and weak-wind cases chosen as the harder reading; all 46 batch-2 kill events came from serialisation, pipeline, accessor and CLI integration. tippecanoe-tile-join-size-recourses: shedding order, attribute-pool compaction, the booking restructure and extent rescaling drew no failure attribution in 10 runs; 7 of 9 failures were `strategies` accounting cells. featurevisor-minimal-rebucketing: twelve allocation-kernel tests (lowest-first retention, declared-order refill, region cuts through later slots, sort-and-merge, idempotent rebuild) killed 0 of 11; all 16 kill events were a host-language key edge and an inherited helper. |
+| L58 | **Refines L1: on a cross-cutting feature a fully specified numerical kernel is free, including a closed-form fixed point. The band lives in the integration shape** (the concept's container representation, accessor form, lifecycle guards). Spend no hardening rounds on kernel cases; count them as LOC and FP insurance. | worldengine: 24 transport tests killed **0 of 20** runs across two batches, including the steady-state and weak-wind cases chosen as the harder reading; all 46 batch-2 kill events came from serialisation, pipeline, accessor and CLI integration. tippecanoe-tile-join-size-recourses: shedding order, attribute-pool compaction, the booking restructure and extent rescaling drew no failure attribution in 10 runs; 7 of 9 failures were `strategies` accounting cells. featurevisor-minimal-rebucketing: twelve allocation-kernel tests (lowest-first retention, declared-order refill, region cuts through later slots, sort-and-merge, idempotent rebuild) killed 0 of 11; all 16 kill events were a host-language key edge and an inherited helper. **ray-optics-sp-coherence-transport:** Fresnel/TIR/GRIN/sampling kernels and the Polarizer/Retarder transforms killed 0-1 runs per batch across 30 runs; see L106. |
 | L59 | **Never assert exact equality on a value a formula produces, even at a mathematically exact point.** Equivalent algebra lands a few ulps away, the review flags it as over-pinning (T5), and correct agents fail. Compare with a tolerance and keep discrete parts (direction, sign) exact. | worldengine batch 1: **5/10** runs returned 0.9999999999999993 or 0.9999999999999998 for a band-centre strength through `wind_at`; Auto Review Tests 1/3 cited it |
 | L60 | **A parity promise between twin implementations imports every pre-existing divergence into review scope. Fix them all in the reference, but test only the divergences the feature's own inputs reach.** Each Solution Quality round finds another py/cc or undefined-behaviour asymmetry, and a regression test for one is a fresh trap unrelated to the feature (L55 through a new door). The FP adjudicator scopes "identical output" to what the feature exercises only when the fixtures stay inside that range. | cwerg-bcopy-bzero-lowering: about nine pre-existing divergences fixed over rounds 10-27. Testing float-DIV parity and narrow DIV/REM/CNTPOP chains took batch 5 to **0/9** (9/9 and 8-9/9 kills); a Docker replay without them read 3/9, and batch 6 was accepted at **3/10**. All three passes still fold signed DIV differently in Python and C++; every FP judge dissent on it was overruled as "pre-existing, task-unrelated... the hidden bulkwrap programs deliberately use only wrapping ops for lengths" |
 | L61 | **Bisect a test that kills everyone against the near-miss's OWN patch before you touch the description: a breadth-only program can be reaching a pre-existing bug outside the feature.** Coverage programs added for reviewer breadth pick up whatever else the repo gets wrong for those inputs. | cwerg: the parity-only `bulkshapes` program killed **11/11** in batch 2 (1/10 in batch 1, before typed constants were loaded into it for reviewer findings). Bisecting Nova #10's build showed x64 diverging only on typed constants and a32/a64 failing in the Python backend on callee-parameter widening. Dropping it: re-eval **1/11**, projection exact |
 | L62 | **The platform's environment start timeout (600 s) includes the Docker image build. Measure a cold `--no-cache` build, not a warm one.** Verify Solution reports `EnvironmentStartTimeoutError` while every local run is green. A C++ tool build followed by `chmod -R` over files from a lower `COPY` layer pays an overlayfs copy-up of the whole tree. | cwerg: cold build 704 s, `chmod -R a+rwX /app` alone 261 s. Moving COPY, build and chmod into one `RUN --mount=type=bind,source=.,target=/src` layer: 413 s, `/app` byte-identical (3080 hashes + modes), and batch 5 built in all nine runs. **2026-09-23: the platform Dockerfile check now FAILS a bind mount + `cp` (must use COPY).** Use `COPY --chown=1000:1000 . .` and chmod only directories and root-owned build outputs (`find /app \( -type d -o -user 0 \) -exec chmod a+rwX {} +`): teavm 431 s vs 816 s for a full `chmod -R`, and unmapped uid 4242 still applies patches (Pattern 91) |
 | L63 | **In a compiled repo whose Dockerfile builds into `/app`, the build outputs are tracked files in the solver's sandbox. Agents `git restore` them to keep a source-only diff, the restore makes them newer than the edited sources, and a plain incremental `make` in test.sh then grades the BASELINE binary.** The batch reads as universal failure with no per-test signal, and evaluators flag runs as verifier blockers. Make test.sh rebuild what it tests regardless of timestamps (`make -B <targets>`, or delete the tracked outputs first), or be ready to contest every flagged run with the trajectory call that did the restore. | tippecanoe-tile-join-size-recourses: 9 of 10 trajectories restored `.o` files or `tile-join`; evaluators said 7 runs were graded against stale or unlinked binaries, each failing 49/49. The only run that never restored was the only pass. Two ENV-blocked flags were contested with the restore call and upheld. All seven also had a separate source defect, so forcing the rebuild would likely have left the rate at 1/10 while keeping the JUnit files usable |
 | L64 | **The working pool is cumulative: a later batch folder re-lists every earlier run under new numbers and appends the new ones. Fingerprint runs (added LOC plus prompt tokens) before mining, or every kill counts twice and the appended runs look like repeats.** Mine only the latest folder. | sfepy: the accepted folder held batch 10's 12 runs renumbered plus 4 appended (Nova, Orion, Vega x2); Auto Review's "2 of 15" is the pool |
-| L65 | **A zero from a Nova-heavy batch, with near-misses failing STATED sentences, measures the agent, not solvability. Add Orion or Vega runs before cutting a fair requirement.** Check fairness first: probe the near-miss patches to confirm they truly violate the sentence (Pattern 93). | sfepy: Nova 0/11 with two runs at 116/117; the 4 appended runs held both passes (Orion 1/1, Vega 1/2) |
+| L65 | **A zero from a Nova-heavy batch, with near-misses failing STATED sentences, measures the agent, not solvability. Add Orion or Vega runs before cutting a fair requirement.** Check fairness first: probe the near-miss patches to confirm they truly violate the sentence (Pattern 93). | sfepy: Nova 0/11 with two runs at 116/117; the 4 appended runs held both passes (Orion 1/1, Vega 1/2) **macs-circular-chromosomes:** Nova 0/10, Vega 1/1, and the Vega was the only run past F-64. |
 | L66 | **When a reviewer flags PRE-EXISTING behaviour next to the feature, fix it in the reference and add a test only if meta.md already states that behaviour.** Otherwise the test is a hidden requirement, and it reads as a same-reason wipeout, not as difficulty. Sharper than L55: one such test is enough. | mwparserfromhell: Solution Quality R6 flagged base tag pairing (`lower()`), a test for `<ß>x</SS>` followed, and batch 1 read **0/20** with 19/20 failing it identically; meta.md only stated caseless RECOGNITION. Dropping the one test: **2/19**, accepted, and no reviewer re-raised it |
 | L67 | **An "identical output" contract between twin implementations is satisfiable by delegation, and FP panels uphold it. Never count the second arm's machinery as a trap.** Budget LOC and difficulty as if the passer implements one arm plus a forwarding stub. | mwparserfromhell: both passes forward from the C tokenizer to the Python tokenizer when a site is given, 8 of 20 batch-1 runs delegated, the FP adjudicator called it "correct for tree parity", and the leanest passer measured 221 human-effective against the reference's 405 |
-| L68 | **For a tests-only change, a local Docker replay of the batch's saved patches predicts the re-eval run for run. Project from the pool, not the folder: the pool can drop runs.** | mwparserfromhell: identical failure counts on all 19 runs the re-eval kept; the pool dropped a projected passer that had edited repo tests, so 3/20 projected, 2/19 measured. featurevisor-minimal-rebucketing: the R4 replay matched the re-eval on 11 of 11 runs (2/11, same failing tests); only two Vega run labels swapped between folders. |
+| L68 | **For a tests-only change, a local Docker replay of the batch's saved patches predicts the re-eval run for run. Project from the pool, not the folder: the pool can drop runs.** | mwparserfromhell: identical failure counts on all 19 runs the re-eval kept; the pool dropped a projected passer that had edited repo tests, so 3/20 projected, 2/19 measured. featurevisor-minimal-rebucketing: the R4 replay matched the re-eval on 11 of 11 runs (2/11, same failing tests); only two Vega run labels swapped between folders. **macs-circular-chromosomes:** local replay of the 11 saved patches vs the re-eval: identical failure counts on 11/11 runs, 1/11 predicted and measured. |
 | L69 | **A kill cluster that fails at the SAME index with a sentinel value (silence, zero, empty, timeout) is a harness boundary until a replay says otherwise, and L18's checklist cannot tell.** Passes exist, near-misses clear everything else, every evaluator writes `description_clear: true`, the FP panel is clean, and the cluster is still unfair. Replay the failing patches with the boundary relaxed before believing the pass rate. | kira-loop-crossfade: 6 of 7 failures at frame 47 (one at 24) reading 0.0; the relaxed replay passed all six at 55/55; 7/7 evaluators called them fair; accepted 3/10, fair suite 9/10 |
 | L70 | **A test that throttles one resource and asserts on another encodes the reference's exchange rate between them** (decoder calls to output frames, packets to bytes, allocations to items). Assert only what the throttle provably yields in the worst case, or render until the first gap, then release and check the transition. This is L13 one level down: replacing a named constant with a gate just moves the constant into a ratio. | kira: round 1 removed a hard-coded 16384; round 4's 60-call gate plus 48-frame assertion matched only the reference's queueing (eager-prepare schedulers queue 47) |
 | L71 | **An "eventually settles to X" assertion is vacuous unless X is impossible without the action under test. Run the action-ignored mutant on every such test.** Periodic output (loops, retries, polling) produces the expected steady state by itself, and a duplicated first frame lets a settle window step past a wrong one. Seek after the first pass, or require every heard value to be legitimate. | kira: 4 of 4 seek tests of this shape passed with the seek ignored or unblended (past-end static and streaming, forward seek-into-fade x2), all caught by mutants before the batch |
@@ -4090,24 +5476,52 @@ image commands rejecting absolute names; relative `GetIdsForReservedFile` resolv
 | L80 | **A contract sentence that promises a host-language semantic in full (name resolution, module scoping, overload rules) turns Solution Quality into an unbounded ratchet. Narrow the contract instead of chasing.** Each fix exposes a narrower corner the reviewer can ground in the same sentence. | csbindgen-struct-layout-fidelity: "a const or alias name resolves in the module that uses it" -> **11 consecutive Solution Quality FAILs**, each a deeper scoping corner, with the pass rate unmeasured throughout; deleting the sentence and the const-name feature -> next Auto Review **approved 3/3/3**, batch accepted at 1/10 |
 | L81 | **An enumerated list in a contract sentence reads as exhaustive.** Agents treat anything the list omits as unsupported, even when the general rule covers it. Name every member the tests use, or state the rule without a list. Extends L1. | csbindgen-struct-layout-fidelity: "pointers, `usize`, `isize`, `c_long` and `c_ulong` take 8 bytes" -> **7/16** gave `c_float`/`c_double` no layout; adding "`c_float` takes 4 and `c_double` 8" -> **1/10** |
 | L82 | **Never assert the repo's own self-consistency checker once the feature changes what it checks.** `isIndexValid()`-style validators recompute internal bookkeeping their own way and demand exact equality, so any sound-but-different representation fails while every query answer is right. That is a representation pin, not a behaviour. Assert the behaviour (oracle comparisons on a deep tree) instead; the base suite's own calls stay as they are. | libspatialindex-tpr-temporal-knn batch 2: **9 of 10** blocking failures were `ASSERT_TRUE(scene.tree->isIndexValid())` after entry expiry changed node-bound maintenance; five runs failed ONLY that. Removed, the same ten solutions replayed at **5/10**, and the five near-misses passed the very oracle comparisons the ASSERT had been aborting |
-| L83 | **When a differential probe finds zero divergence among passers, the derivable surface is exhausted: stop adding cells and look for state the repo discards.** Grep the persistence and aggregation layers for a field the write path never mentions, a commented-out read, or a sentinel assigned on load, and make the feature depend on it (F-47). Reviewer coverage suggestions (L17) buy nothing against a converged population. | libspatialindex-tpr-temporal-knn: 57 probes x 7 passers = 0 divergences, 16 coverage tests (every advisory suggestion) = 0 new kills, 4 composition cells = 0; the per-entry end of motion `Node.cc` never persisted moved the rate **7/10 → 5/12** and carried the lead wall (4/12) |
+| L83 | **When a differential probe finds zero divergence among passers, the derivable surface is exhausted: stop adding cells and look for state the repo discards.** Grep the persistence and aggregation layers for a field the write path never mentions, a commented-out read, or a sentinel assigned on load, and make the feature depend on it (F-47). Reviewer coverage suggestions (L17) buy nothing against a converged population. | libspatialindex-tpr-temporal-knn: 57 probes x 7 passers = 0 divergences, 16 coverage tests (every advisory suggestion) = 0 new kills, 4 composition cells = 0; the per-entry end of motion `Node.cc` never persisted moved the rate **7/10 → 5/12** and carried the lead wall (4/12) **ray-optics-sp-coherence-transport:** 31 + 23 probe scenes = 0 divergence; the lever was the legacy default engine rather than discarded state (L108), 7/10 → 3/10. |
 | L84 | **A feature that widens a persisted record will be probed for loading the OLD format, stated or not. Version per record, not per header.** Evaluators fail 100% runs on it and FP judges split on whether it is in scope. A header flag cannot describe a tree that mixes old and new pages, and a "legacy mode" that keeps writing the old layout silently loses the new field for new data. | libspatialindex-tpr-temporal-knn: a run with 73/73 + 27/27 was failed by its evaluator for an unversioned page; FP judges raised the same probe on 4 more passers across batches 3-4 (upheld 1, over-ruled 3); the reference's header-level `LegacyEntries` mode was itself a Solution Quality FAIL (a reopened old tree dropped new inserts' end times) until the flag moved into the node type word |
 | L85 | **A 0% batch is a claim about the ARTIFACT, not the design — mine it before changing anything.** Separate causes you own (a helper calling reference-only API, an ambiguous sentence, a wall a review round added) from difficulty, then re-measure. | siliconcompiler-flist-roundtrip batch 1: 0/11, of which a helper calling `get_filetypes()` masked 5-7 tests per run, one ambiguous spelling sentence took 4 tests at 9-11/11, and a `file://` requirement added in a Solution Quality round killed 11/11. The real trap (F-49, 7/10) was invisible until all three were removed; batch 2 read 2/10 **pyocd-sequence-expression-kernel** batch 1: 0/11, and one rule added in a review round (a control predicate must produce a value) killed 8/11 and was both near-misses' sole failure; batch 2 read 5/10. |
 | L86 | **Price every candidate cut by replaying the saved patches against it; do not cut by intuition.** Each option has a measurable rate, and the difference between "fair" and "too easy" is usually one sentence. | siliconcompiler-flist-roundtrip: fixing the unfair items alone projected 0/11, also cutting the `file://` case 3/11, additionally clarifying the edge-ownership sentence **9/11**. The last option looked like the same class of fairness fix as the others and would have destroyed the problem **pyocd-sequence-expression-kernel:** the replay chose the cut (2/11) after an intuitive broader cut fell under the LOC floor, and after batch 1 it withheld three reviewer-requested tests that each replayed at 0/11 (undocumented JTAG bytes, `DAP_WriteABORT`, a string-returning statement). |
 | L87 | **Explicitness is a measurable dial on a single axis, not a fairness switch.** Naming both readings of an ambiguous noun can take an axis from band-carrying to free, with no code change. | siliconcompiler-flist-roundtrip: the pre-existing-data-root test killed **6/11** under "a root registered earlier" and **0/10** once the sentence named both kinds of existing root **pyocd-sequence-expression-kernel:** one concrete consequence sentence took a scope test 6/11 -> 0/10 and call-boundary under-reduction 7/11 -> 0/10; the same batch then showed 2/10 OVER-applying the now-concrete rule one layer early (F-52). The dial moves the error, it does not delete the boundary. |
 | L88 | **A mutation that kills nothing is a test-gap signal, and closing it can produce the band decider.** L15 still holds for justifying a TRAP on mutation evidence; this is the converse use — a surviving mutation names a behaviour no fixture reaches. | siliconcompiler-flist-roundtrip: the "edges recorded on the reading design" mutation survived the whole suite, which forced a three-level chain fixture; that fixture became the 7/10 lead killer and the sole failure of five near-misses. A two-level sibling graph cannot see it |
 | L89 | **A carve-out that names only the exception pulls look-alikes across the boundary.** When a contract splits calls into two classes, name members of BOTH, with every tested call placed by name. Naming only the stepwise class made agents file anything that LOOKS stepwise with it. | pyfakefs-block-inode-accounting: five `create_dir`/`create_file` rollback tests, tests and solution unchanged: 0/11 (universal sentence) → 9-10/12 (one-sided carve-out) → 0/10 (both sides named) |
-| L90 | **The reference bugs Solution Quality finds are the batch's near-miss killers — build a test for each one.** An author who has just made a mistake in their own reference has located a place a capable implementer goes wrong. Keep the fix AND add the discriminating test; it is the cheapest calibrated trap you will get. | pyfakefs-block-inode-accounting: all three accepted-batch near-miss causes (unlimited placeholder as a limit, Windows symlink sized by stat, imports inheriting `create_dir` rollback) were reference bugs found at R4, R5 and R17 **Counter-evidence, pyocd-sequence-expression-kernel:** eleven reference bugs found by gates, each given a test; in the accepted batch they killed NOTHING, except that the test built for the round-1 finding (results not reduced) caught the OPPOSITE error (arguments over-narrowed, F-52, 2/10). L90 holds when the reviewer finds a place implementers go wrong; it fails when the finding is a reviewer-invented input (L93) or a contract gap no implementer reaches. **teavm-method-summaries (second counter-case):** two real Solution Quality reference bugs (absent-class VIRTUAL call, unwired `SIMPLE` pipeline), each with a test: 0/10 kills; see L95. **bayesopt-search-space-migration (confirmation):** all three accepted-batch killers were gate-found reference bugs (ConstantLiar dedup 6/10, transformer continuity 5/10, non-finite values 2/10); the gate findings that chose a design (GPHedge per-candidate, EI/PI fallback) killed 0/10 once stated, see L97. |
+| L90 | **The reference bugs Solution Quality finds are the batch's near-miss killers — build a test for each one.** An author who has just made a mistake in their own reference has located a place a capable implementer goes wrong. Keep the fix AND add the discriminating test; it is the cheapest calibrated trap you will get. | pyfakefs-block-inode-accounting: all three accepted-batch near-miss causes (unlimited placeholder as a limit, Windows symlink sized by stat, imports inheriting `create_dir` rollback) were reference bugs found at R4, R5 and R17 **Counter-evidence, pyocd-sequence-expression-kernel:** eleven reference bugs found by gates, each given a test; in the accepted batch they killed NOTHING, except that the test built for the round-1 finding (results not reduced) caught the OPPOSITE error (arguments over-narrowed, F-52, 2/10). L90 holds when the reviewer finds a place implementers go wrong; it fails when the finding is a reviewer-invented input (L93) or a contract gap no implementer reaches. **teavm-method-summaries (second counter-case):** two real Solution Quality reference bugs (absent-class VIRTUAL call, unwired `SIMPLE` pipeline), each with a test: 0/10 kills; see L95. **bayesopt-search-space-migration (confirmation):** all three accepted-batch killers were gate-found reference bugs (ConstantLiar dedup 6/10, transformer continuity 5/10, non-finite values 2/10); the gate findings that chose a design (GPHedge per-candidate, EI/PI fallback) killed 0/10 once stated, see L97. **macs-circular-chromosomes:** of 9 reference bugs, only the BAMPE long-pair/decoy regression killed (5/11); the rest killed 0-2. **grmtools-contextual-lexeme-readings (confirmation):** the Solution Quality round-1 bare-name reference bug became F-71, 14 runs over three batches and the accepted batch's widest killer. **macs-callvar-fragment-phasing (confirmation):** the precheck round-1 Solution Quality bug (third-allele fragment admitted to a haplotype) became F-86, **8/8 Nova, 0/4 Orion** in the accepted batch, the Nova separator. |
 | L91 | **Refines L80 — Solution Quality only ever ADDS requirements, and their sum can pass solvable with every round individually fair.** Batch after the second gate round, not after the eighth. When a finding says "the contract promises X, so this path must do X too", prefer narrowing the sentence over implementing the Nth path. | pyfakefs-block-inode-accounting: Description 3/3 and Solution & Code 3/3 before any batch, then **0/11** with six tests at 11/11, all added between R4 and R9 **pyocd-sequence-expression-kernel:** eleven review rounds after the core slice; batch 1 0/11 was the round-3 predicate rule (8/11). Of the ~100 test cases added in review, only the round-1 argument test killed anyone in the accepted batch. **bayesopt-search-space-migration:** four gate rounds, then **0/11** from one round-3 requirement the prompt only implied (L97); fixed by stating it, 3/10 in the next full batch. |
 | L92 | **An arbitrary value for an argument the rule under test does not govern is an accidental trap, and read the assertion diff, never the test name, before attributing a kill.** Pass every non-governed argument an in-contract value. A test name says which rule the test was FOR; the diff says which rule the agent broke. | pyocd-sequence-expression-kernel: `tms=3` (the probe API documents 0 or 1, and the CMSIS-DAP layer masks it itself) killed 3/10 in the accepted batch, one near-miss on its own, plus Vega in batch 1: the only run-deciding trap that nobody designed. Batch 1's Vega failure had been read from test names as "JTAG width", and that misreading framed a keep-or-cut decision |
 | L93 | **A requirement a reviewer derives from a HYPOTHETICAL input costs rounds, not difficulty. Check whether the repo's own contract ever produces that input.** If it never does, satisfy the reviewer in the solution and keep the contract silent on the one case the tests cannot afford. A boundary sentence stating the repo's real contract may be overridden anyway. | pyocd-sequence-expression-kernel: rounds 8, 10 and 11 argued over a `-> str` sequence function; the repo has none (23 return `int`, 16 return `None`, and the delegate docstring says fixed-zero functions return `None`). The sentence saying so was overridden in round 11. Final design: static STRING rejection plus no-value at run time, contract silent on a bare string statement. Its tests killed 0/10 |
 | L94 | **A sentence can state an algorithm's DIRECTION and still not transmit it.** Where the natural construction starts from the wrong end of a fixed point, the sentence stays a trap after it is written down, and evaluators rule it fair. | teavm-method-summaries: "the most precise facts that hold for all methods at once, so recursion and mutual recursion lose nothing by themselves", and still **4/10** initialized never-null to false and promoted (F-53), three of them 25/26; all judged described AND inferable |
-| L95 | **Gate-found tests land where agents already converge.** A gate reads the reference, so its finding marks a place the AUTHOR went wrong, not a place implementers do. Budget them as insurance, not difficulty; the one that kills is the test asserting behaviour agents have a reason to change. | teavm-method-summaries: 2 Solution Quality reference bugs + 9 Auto Review / coverage cells, **0/10 kills** across all 11; the single coverage-suggestion kill (2/10) asserted the OLD no-summaries output (F-54). Second problem after pyocd (L90 counter-evidence) **bayesopt-search-space-migration refines it:** gate tests that assert a stated CHOICE killed 0/10; gate tests that EXTEND a stated rule to another holder killed 6/10 and 5/10 (L97). |
+| L95 | **Gate-found tests land where agents already converge.** A gate reads the reference, so its finding marks a place the AUTHOR went wrong, not a place implementers do. Budget them as insurance, not difficulty; the one that kills is the test asserting behaviour agents have a reason to change. | teavm-method-summaries: 2 Solution Quality reference bugs + 9 Auto Review / coverage cells, **0/10 kills** across all 11; the single coverage-suggestion kill (2/10) asserted the OLD no-summaries output (F-54). Second problem after pyocd (L90 counter-evidence) **bayesopt-search-space-migration refines it:** gate tests that assert a stated CHOICE killed 0/10; gate tests that EXTEND a stated rule to another holder killed 6/10 and 5/10 (L97). **macs-circular-chromosomes:** 17 of 47 tests killed nothing and all 17 were reviewer-requested coverage (9-format rejection matrix, 5 BAM pooled-header cells, both q-value population tests, unknown-name BAM). **ray-optics-sp-coherence-transport:** every Auto Review coverage request across 6 rounds (slot 2, Retarder orientation, saved types, force readings, non-finite C_i, zero incoming product, Brewster, WebGPU reads) killed 0 in batches 2-3. |
 | L96 | **Never put a frequency or timing property in the contract (once, lazily, cached, only after X) unless a test can observe it.** Reviewers score it as an untested requirement, and the only discriminators are bytecode counting or timing, both unfair. | teavm-method-summaries: "builds the summaries once per build" drew a High "untested" finding and Tests 1/3; counting `MethodSummaries.build` would also fail an agent building through its own overload. Dropped from meta.md; the Tests band came back to 2/3 |
 | L97 | **When a gate demands a behaviour that CHOOSES between two defensible designs, state the choice in the contract. A behaviour that only EXTENDS an already-stated rule to another holder can stay implied, and it is where the band comes from.** Agents take the other defensible reading unanimously and write down why; they miss an unstated extension one at a time. | bayesopt-search-space-migration: GPHedge per-candidate scoring, implied by "under the same rules": **11/11** chose drop-all (batch 1), **0/10** once stated; ConstantLiar dedup, equally implied: 4/11 then **6/10**, sole failure of both near-misses, ruled fair |
 | L98 | **To test hidden state through public behaviour, change it and undo it, then compare with an untouched twin.** Graders accept it where attribute reads draw "tests implementation, not behaviour", and it catches state that is rebuilt instead of carried. Build the twin with the same seed so the course is deterministic. | bayesopt-search-space-migration: undo-twin tests passed the internals precheck and killed **5/10** (transformer rebuilt, F-56); the later `get_acquisition_params()` reads the Auto Review demanded killed 0/10 |
 | L99 | **A compiled suite whose new tests call the new API needs TWO harness fixes: build base mode without the new test file, and make the new-mode build-failure fallback emit one failing case per REAL test name.** Otherwise the whole baseline "fails" without the solution, and Verify Solution rejects the synthetic case as outside p2p/f2p. | piscsi-image-reservation-identity: base mode compiled `image_reservation_e3806d_test.cpp` into `bin/piscsi_test`, so all 316 base tests failed without the solution (fixed with a make override of `SRC_PISCSI_TEST`); then Verify Solution FAILED on `build.compile`; the fallback now parses `TEST_F(Suite, name)` and the no-solution id set equals the solution id set |
 | L100 | **Refines L97: an implied EXTENSION of a stated rule can still be missed unanimously. Replay the saved patches before re-evaluating a new test; at 10/10 missed, state the extension and pay the fresh batch.** | piscsi-image-reservation-identity: "a hold stays with the file after its name is reused" was stated, its extension to a device's own report was not; replay of 10 batch-1 patches read **10/10** failing the new device-list test (re-eval would have read 0/10, unsolvable); stated in one sentence, **2/10** in the fresh batch, which was accepted at 3/10 |
+| L101 | **When an FP probe breaks EVERY saved full-suite passer, measure before choosing the fix: replay all passers on the judges' model, then seed-fuzz that input class. If one class separates every crash and the reference is clean on it, cap the contract to exclude it; a test would measure 0.** A test is the right fix only when some passer survives the shape. | pict-engine-negative-values: FP 1 (a starved value) broke both passers ever seen, 13 of 22 saved solutions survived it, and required coverage for it was ill-defined, so a precondition. FP 2 (exclusions constraining negative-row fillers) broke 4/4 passers; seeded fuzz, 40 models each: exclusions only over parameters without negatives 0/40 bad for every passer, unrestricted 9-14/40. Capped to "only parameters that have no negative values"; the next batch read 3/10 with a clean FP panel |
+| L102 | **Every fixture must be legal on BASE and non-degenerate. Brute-force its own feasibility (every value still reachable, no implied exclusion the assertions count) and run its shape through the base engine before it ships.** A degenerate fixture inside an unrelated test is a hidden wall, and a fixture base itself rejects silently demands a pre-existing fix. | pict-engine-negative-values: a deletion test's exclusion used a parameter's only non-negative value and was the sole failure of batch-2 Nova #7 (33/34), a crash in generation, not a leak. User exclusions in two child models abort in base (per-model sequences). Three coverage fixtures created implied exclusions, caught only when the reference failed its own test |
+| L103 | **Shared test modules must not bind the new API at import.** On base, every test that imports them dies on the missing symbol, which reads as F2P and hides tests that actually pass on base. Keep API-bound helpers in their own module and run each surface's tests against a BASE build. | pict-engine-negative-values: the CLI tests imported the ctypes support module; all failed on base with "undefined symbol"; after the split, one CLI test passed on base behaviourally and had to be rebuilt |
+| L104 | **An invariance law transmits the common case, not its degenerate one. Where the structure has no natural cut (a component that wraps all the way round, a tie), agents fall back to the coordinate origin unanimously; state the canonical choice or do not test it.** Evaluators still rule the law fair, so the kill reads as difficulty until a replay shows 11/11 for one reason. Sibling of L97/L100: the degenerate case is an implied extension nobody takes. | macs-circular-chromosomes batch 1: whole-circle component + two tied-gap tests killed **11/11**, every run cutting at the origin; the rotation law was stated. Replay with the three dropped: Vega 3 fails to 0, re-eval **1/11**, accepted. The solution keeps the canonical cut (widest gap, cyclic tie-break) untested |
+| L105 | **A synthetic input file must be written the way a real producer writes it, not just the way the reference READS it.** When the reference parses one record per pair, a fixture with inconsistent pair metadata still passes the reference while zeroing every implementation that reads the other field. Complements L102 (legal on base): legal for every reasonable reader. | macs-circular-chromosomes batch 1: test BAMs named each record `r<i>`, so mates had different QNAMEs; **4/11** runs (incl. the only Vega) paired mates by QNAME, read 0 fragments and lost 7-13 tests each. Shared names moved Vega 9 fails to 3; evaluators had called the zero-fragment runs implementation defects |
+| L106 | **A fully stated physics or formula contract is transcribed at any size: adding objects and scope to it does not move the rate.** Derivation traps inside a stated model (sign flips, projections, closed-form transforms) die to a careful reading; the band has to come from a second consumer of the objects or from numerics at exact cells. Sibling of L58. | ray-optics-sp-coherence-transport: batch 1 **7/10** on the core; batch 2 **7/10** after adding Polarizer, Retarder, polarimetry and ~290 effective lines; the sigma back-side flip and oblique projection killed 0 of 20 runs in batches 2-3 outside a whole-object bug |
+| L107 | **Before calling a failure at an exact physical cell a logic error, replay the failing patches at perturbed parameters.** If they match the reference off the cell, the kill is floating-point cancellation meeting a repo guard (F-66). That is fair when the repo's guard is pre-existing, but it is batch-variant, so do not budget the band on it. | ray-optics-sp-coherence-transport: the isolator killed 4/10 (0/10 in batch 2); at 89.9/90.1/80 degrees all four failing runs equal the reference to 6 digits; evaluators called two of them logic defects |
+| L108 | **Extends L83: when passers converge on every derivable axis, check which ENGINE the product runs by default before looking for discarded state.** A feature built for the new engine can be absent from the default one in every run; stating it is one paragraph and needs a headless driver for that engine. | ray-optics-sp-coherence-transport: 23 FINISH probes found zero divergence; 10/10 runs had no legacy-Simulator behaviour; stating it moved **7/10 → 3/10** (F-67 3/10) with no fairness finding |
+| L109 | **A rule added to close an FP hole costs pass rate only while it is implied. Name the case in meta.md and it kills ~0; the difficulty stays in the design's original seams.** Do not fear FP rounds as a ratchet when the fix is a named sentence plus a test; fear implied rules and untested edges. Sibling of L34 (a disclosure hands over its trap). | riff-unified-conflict-regions: stray markers after a close and a second opener before the closer failed **11/22** and **4/13** of saved solutions written before the sentences existed, and **0/10** in the accepted batch after both were named. That batch's killers were empty sides (6), unresolved context (5) and the block unit (4), all from the slice **hayro-optional-content-baking:** the inline `/OC` entry failed 16/18 Orion while implied (sole failure in 8/18), **0/12** once stated |
+| L110 | **When a boundary the contract never defines splits the runs, move the discriminating fixture across a boundary where every reading gives the same output, instead of adding a sentence.** A separate file, hunk or input ends every reading at once. It is tests-only, so the re-eval lane survives, and it removes the unfair axis without handing over a trap. | riff-unified-conflict-regions batch 1: where an out-of-order marker set ends was unstated; 9/11 runs kept it open and swallowed the next valid region. The valid region moved into a second file; the replayed failures on that test went from 9 to 2, both real line-loss bugs, and the re-eval matched the replay run for run |
+| L111 | **A domain verb with a narrow and a broad technical reading is read narrowly by most agents, and once it is defined the trap is gone.** Define it in the sentence and budget the trap at zero. Contrast L94, where a stated direction did not transmit. | grmtools-contextual-lexeme-readings: "can shift it from that configuration" read as "the state's action is Shift" by **20/25** in batch 1 (reading-before-reduction test 18/25); defined as "shifted after carrying out the reductions it triggers": **1/12**, then **0/10** |
+| L112 | **An existing output normalization that discards state the new feature needs makes the reported form an unstated design choice.** Implementations that keep the state visible are right by the contract and fail an exact assertion. Assert modulo the normalization or state the reported form, and before calling a batch 0/N, diff the near-misses modulo it. | grmtools-contextual-lexeme-readings: CPCT+ strips trailing shifts; 5 runs over 3 batches kept trailing piece shifts so replay could resume inside a split; batch 3 Nova #9 failed only on this (4/37). The same collision produced the reference's four-piece recovery loop |
+| L113 | **When one edge is the sole failure of several near-misses and each breaks it differently, stating it does not help; cap the domain so it cannot arise.** Clarify only when the near-misses fail it the same way. Replay with "fails only the new cap test" counted as a pass. | grmtools-contextual-lexeme-readings four-piece split recovery: batch 2 Nova #7 looped, Orion ended the repair early; stated in meta, batch 3 Nova #1 misreported the repair (0/47 over three batches); splits capped at three pieces, accepted batch **2/10** |
+| L114 | **The 2026-10-09 models moved trap ownership: re-read every old-model kill count before reusing it as a Nova or Orion lever.** A stated lifecycle rule that spans a software cache AND the hardware latch it mirrors is a clean Nova/Orion separator on the new models. | pyocd-dwt-watchpoint-planner: stale MATCHED across resume/step/reset killed **2/10** old Nova (batch 6, same tests and meta) and **18/19** new Nova (batches 7-8); new Orion **0/8** missed it |
+| L115 | **When the strong agent's runs are fuzz-identical, look for an IMPLIED boundary of the input domain (integer width, address space, encoding range) and test only the stated promise at it.** Every stated axis has converged; an implied one is the only place 1-of-4 variance lives. Keep it implied (L109) and assert the promise rather than the reference's output shape, so refusing and clamping both pass. | pyocd-dwt-watchpoint-planner: 3400 differential scenarios found 0 divergence among 4 Orion runs; the top-of-32-bit range split them 1/3 and re-eval read **Orion 1/4, Nova 0/8**, Auto Review "subtle but fair" |
+| L116 | **The Nova sequence-length gate is a sum over compaction windows, so one compaction per run roughly doubles it.** A multi-subsystem feature (6-8 files to read and edit) drove every Nova run to one ~250k compaction and an average of 2x the 256k floor; read `final_metrics.extra.sequence_length` from trajectory.json, not total_prompt_tokens. | pyocd-dwt-watchpoint-planner batch 8: Nova sequence_length 500k-605k (avg **521k**), each = largest window ~262k + removed ~245k; Orion 72k-81k |
+| L117 | **Keep a ledger of edges you held back for killing the strong agent. When probes of the stated surface show zero divergence between the strong agent's passes, the held-back edge is the 1-of-4 separator.** Most of them come from gate findings on your own reference; re-replay them against the current passers before inventing a new lever. | cwerg-fe-address-constants: empty-span `front` (a Solution Quality S1 finding on the reference) killed 2/3 Orion passers when found and was left untested. Batch 9 read Orion 2/4; 11 probe programs gave 0 divergence on both passers; the held-back case split them 1/1 and killed the batch-9 Nova pass: re-eval **Nova 0/8, Orion 1/4**, Auto Review "subtle but fair" |
+| L118 | **An environment-blocker verdict for a one-line precondition outside the title's subsystem is contestable with sibling runs, and a re-eval can re-issue it on an unchanged trajectory.** Contest with: the stated end-to-end promise, the repo's own pipeline that reaches the line, how many sibling runs fixed it unprompted, and the run's own commands showing it never ran that path. Re-read every verdict after a re-eval, not just the counts. | cwerg-fe-address-constants: C++ ELF `ASSERT(addend == 0, "NYI")`; batch 8 run 5 (117/126 failed) contested with 6/7 siblings fixing it: upheld, run replaced. Batch-9 Nova #7, graded UNVERIFIED_ASSUMPTION, came back from the re-eval as UNDOCUMENTED_REQUIREMENT + blocker; its trajectory ran only `-fe c++ -be py`: upheld again |
+| L119 | **The platform's Nova sequence length is not the largest single step even without compaction; read `final_metrics.extra.sequence_length`.** A twin-implementation feature (Python + C++ front ends, 12 files) put every Nova run near 1M with `compacted: false`. Refines L116. | cwerg-fe-address-constants accepted batch: Nova sequence_length 0.79M-1.58M (avg **995k**) vs largest step 275k-539k (2.5-3.6x); Orion 145k-468k |
+| L120 | **Cutting a stated rule whose tests killed nobody is not free: the rule can become the lead trap once it is only implied.** Before deleting a sentence for the requirement-count gate, ask whether the kill count was zero BECAUSE it was stated (L109). Prefer cutting rules nobody would have broken anyway. | libspatialindex-mvr-history-pruning: "Kept pages lose entries that expire at or before the horizon" killed **0/5** strong runs in batch 7; cut in round 16 (its one test deleted, reachability and "other operations work as before" kept), the same behaviour (F-78) killed **4/8 Orion** and 8/8 Nova in the accepted pool, ruled fair by Auto Review |
+| L121 | **The gate pool for an agent is cumulative across re-evals and fresh runs on the current version, so a fresh pair that both pass can be diluted by more runs of the same agent.** Re-eval re-grades every saved run; fresh runs are appended, not substituted. | libspatialindex-mvr-history-pruning: re-eval read Orion **0/4**, 2 fresh Orion both passed (2/6, over), 2 more fresh Orion both failed, accepted at **Orion 2/8** with Nova 0/8 (Auto Review counted all eight) |
+| L122 | **In a repo whose pytest config sets `filterwarnings = error`, every new test silently asserts "no warning", including warnings base itself emits on that path.** Suppress the known base warning inside the test (or open with the repo's own ignore flag) unless meta states the no-warning rule. A strong-agent failure that is ONLY a warning is a fairness bug first. | asdf-conversion-free-lazy-tree batch 11: the unknown-tag test died on base's `AsdfConversionWarning` in 4/8 Orion and 4/4 Vega (graders: agentBlameUnfair x3), batch 0/20; with `ignore_unrecognized_tag=True` the re-eval read **Orion 1/8, Vega 2/4** |
+| L123 | **After cutting rules for the requirement-count gate, cut the behaviour from the reference too and probe old vs new reference over every battery: only cut-rule cells may move.** A reference that still does a cut rule contradicts the shorter meta's stated triggers, and Solution Quality reads it as a bug. | asdf-conversion-free-lazy-tree: round 27 cut 6 rules; Solution Quality then FAILED twice on the reference converting multi-type nodes during a key-only search (a cut rule); round 29 removed it plus `to_info` and version conversion, probe diff touched only cut cells, Solution Quality PASSED |
+| L124 | **The Orion/Vega gate needs ONE agent in the window; a too-easy reading on the other does not block.** Running 8 Orion gives a 1-2 pass window and a second agent is a free second chance, not a second constraint. | asdf-conversion-free-lazy-tree: re-eval read Orion **1/8** and Vega **2/4** in the same pool; the check "at least 4 runs on Orion or 4 runs on Vega, >0% and <=25%" PASSED, then FP panel genuine x3 and human acceptance |
+| L125 | **An old-model wall that killed every run, including the strong agent and your reference, can be the clean Nova separator on the new models once the domain is capped to make it tractable.** Re-test cut walls before inventing new ones (extends L114). | hayro-optional-content-baking: per-caller Form render mode killed **11/11** in batch 1 (Vega + reference too) and was cut; restored in round 30 under "a Form with hidden text is drawn only once": **8/8 Nova, 0/4 Orion** in the accepted batch |
+| L126 | **At Orion 2/4, read the FP panel's dissenting judge probes first: a reference-passes / candidate-fails probe overruled as "not a stated requirement" is a ready-made 1-of-4 lever when it lands on a stated promise.** Replay it on every saved run, keep the reference behaviour, add one test, re-eval. | hayro-optional-content-baking batch 14: judge-c's indirect ExtGState font-size probe on Orion #1 (overruled, "exotic serialization"); as a test it killed only #1 of 4 Orion, the re-eval evaluator graded it FAIL_MISSED_REQUIREMENT (inferable from the repo's resolved iter()), accepted at **Orion 1/4** **macs-callvar-fragment-phasing (second case):** the FP panel's false positive on batch-17 Orion #2 (crash on a peak with no calls) plus its judge's probe (read 1 outside every peak) became two tests; with the assembled-depth test (L128) they took Orion 3/4 to **1/4** in a re-eval, and the read-1 cell also killed **7/8 Nova**. |
+| L127 | **A meta domain cap does not shield the reference from Solution S1: reviewers probe it just outside the cap against the general promise.** Where your oracle's quirk lies outside the cap, make the reference follow the spec there; no test pins either side, so it costs nothing. | hayro-optional-content-baking: the cap "sections are tagged with /OC" left the reference hiding `/Span << /OC hidden >> BDC` (hayro's renderer does the same); Auto Review at acceptance: Solution **1/3**, S1 High. Human accepted anyway (as on asdf, held-back S1s) |
+| L128 | **Where the meta is silent on a second engine, the fair oracle is the option-off output on inputs where the feature cannot change the value.** Build a fixture where the new rule is a no-op (no fragment has two reads over the site), run it through the repo's other path under default flags, and assert option-on == option-off. Evaluators rule it a missed requirement, because the base already defines the answer. | macs-callvar-fragment-phasing: probes on the derivable surface gave 0 divergence across 94 cases; on the default -F auto assembly path the passers placed reads by substring and lost one (29 vs 30). `test_assembled_calls_count_one_molecule_per_read` (pair-aware DPT == per-read DPT) killed **7/12** in the accepted batch (5/8 Nova, Orion #4) and was the SOLE failure of Orion #3 (FAIL_MISSED_REQUIREMENT, "loss of one observation rather than ... a new requirement") |
 
 ---
 
@@ -4161,6 +5575,17 @@ problems**. Until then it lives here as problem-specific evidence. Demote to the
 
 | Repo has… | Reach for | Expected |
 |---|---|---|
+| A host language with unbounded integers feeding a fixed-width hardware/wire field, and a contract promising an exact range with all-or-nothing placement | **F-73** — keep the width implied; test a range crossing the top and assert low memory is untouched, then a placement only the feature can make | 3/4 Orion + 8/8 Nova; the sole failure of three Orion near-misses. The Orion discriminator when stated axes have converged (L115) |
+| Read-to-clear or sticky hardware status bits under a new software cache, with session boundaries (resume, step, reset) in the contract | **F-74** — state clear-on-read and the boundary; test an UNREPORTED hit before each boundary with a later-set watchpoint in the next session | 18/19 new Nova, 0/8 Orion: a Nova separator, not an Orion lever (L114) |
+| A store that recycles freed ids (page files, slab or id pools) under a structure whose parents hold child ids, and a feature that frees children | **F-78** — state reachability and "other operations work as before", not the compaction; long post-free workloads that reuse the ids, then delete/query/prune against a page-graph oracle | 12/16 on libspatialindex-mvr-history-pruning (4/8 Orion) |
+| A monotone watermark (horizon, checkpoint, compaction point) the contract lets equal "now", with writes still legal at that instant | **F-79** — watermark at now, same-instant writes, a later watermark, exact storage oracle; keep the burst clear of base leaks | 2/16, sole failure of both Orion near-misses |
+| A declarative front end whose new directive declares symbols as a side effect, with more than one membership set per symbol (is-a-token, may-be-written-bare) | **F-71** — "X declares the tokens ..." in the contract; several fixtures whose declared symbol appears only in the directive, one bare-named, spread over behaviour tests | 4-5 runs per batch over three batches; taxes the whole suite |
+| One logical stack kept in two containers with opposite iteration orders (a mutable Vec and a persistent cactus or list), and a new decision that must run on both | **F-72** — "reads the same way while it searches for, ranks and applies repairs"; a recovery whose cheapest repair needs a LATER lexeme read the new way | 1-3 per batch, sole failure of three near-misses |
+| A feature with two modes where one line class is inert in one mode (printed raw) and compared in the other | **F-69** — one paragraph per mode, the live one stating both halves; test a live-mode line with a highlighted word and its prefix style | 4/10 in two batches, ruled fair |
+| A streaming highlighter or parser that already splits the input into units, and a feature anchored at "the start of the unit holding X" | **F-70** — one sentence defining the unit; an ordinary edit immediately before the anchor in the same hunk | 4/10, sole failure of the best near-miss twice |
+| Two execution engines over one object model, the product defaulting to the OLDER one, and a base-class hook that defaults to "not involved" | **F-67** — one paragraph naming the default engine and what new objects must do there; drive it headlessly in the test; add a start-of-simulation reading | 3/10 once stated; 10/10 omitted it while unstated. The lever when probes converge (L108) |
+| A strict domain guard (negative power / probability / variance invalidates the item) and a feature formula that a textbook composite drives exactly to that boundary | **F-66** — assert the full state of the exact composite (isolator, crossed pair); write the reference as non-negative products | 4/10 in one batch, 0/10 in another on the same test: batch-variant. Replay at perturbed parameters before calling it logic (L107) |
+| A validation rule on one role of a symbol family (output labels) beside a second role with look-alike names (reserved inputs) | **F-68** — state the rule on labels only; keep a fixture that reads one input of the pair | 1-2/10 per batch, ruled fair each time |
 | A whole-program analysis computing a MUST fact (never null, never throws) over a call graph with cycles, next to a MAY fact the same pass computes | **F-53** — state "most precise facts for all methods at once"; test a jointly never-null cycle with one anchored exit, plus a cycle a null reaches | 4/10, sole failure of three 25/26 near-misses. Stays hard after it is stated (L94) |
 | An opt-in feature whose OFF state is promised unchanged, where the ON state must handle a case the base code silently ignores (arguably wrongly) | **F-54** — one "without X every pass behaves as it does today" sentence and one off-path test across the newly handled case | 2/10, one sole failure. Came from a coverage suggestion |
 | A pass keyed by a variable/node index with a second deferred path (join, frontier, replay queue) that stores the key, and a feature that needs "all of them" | **F-55** — test the "all" case on the straight line AND across a join, separately | 2/10, compound. Free if both paths exist |
@@ -4205,6 +5630,9 @@ problems**. Until then it lives here as problem-specific evidence. Demote to the
 | A "record what the recourse did" rule (counters, a report entry, a `strategies` row) beside a recourse that can be attempted without effect | **F-15** accounting variant | 4/10 on tippecanoe. Test the degenerate attempt: one unsheddable item, with and without inherited records |
 | A pass that widens / promotes / boxes values under a documented low-bits invariant, run only on some pipelines (optimizer, some targets), plus a new consumer that reads the value at full width | **F-30** | Lead wall on cwerg: 10/10 → 2/10 over five batches, and still killing after the rule was stated. Run one golden program through every pipeline the repo already has |
 | Twin implementations (Python spec + C++ port, interpreter + JIT) under an identical-output contract, with different host integer semantics in their constant folders | **F-31** | 2/10 on cwerg with an identical 5-test failure set. Fixture only the arithmetic the feature reaches (L60); a pre-existing DIV/float divergence is FP noise, not difficulty |
+| A multi-pass compiler where a later pass lowers a new value kind into a different node shape before a late emitter that dispatches on syntax, and the kind has a default value with no backing object (empty span, nil slice, null view) | **F-75** | 11/12 on cwerg-fe-address-constants, the sole failure of a Nova and an Orion run; the Orion 1-of-4 separator. Test "compiles and runs" only, never the value |
+| A multi-target backend where records have tail padding on some targets only, and the feature computes element addresses itself | **F-76** | 2/12 Nova on cwerg (x64/a64 only). One array of records ending in a narrow field, walked at runtime on every target |
+| A constant evaluator that newly yields whole aggregates from a non-literal expression (`p^`), and an emitter written against literal syntax | **F-77** | 5/12 on cwerg; Nova separator, Orion 4/4 cleared it. One copy per aggregate kind (record with default sub-record, vec, bytes, span) |
 | A CFG-editing feature in a manual-memory twin, plus two output paths with different strictness (text renderer vs binary emitter) | **F-32** | 2-3 per batch on cwerg once "however many times" is stated. One program with dozens of occurrences through the strict path |
 | An iterative solver that writes its iterate into the caller's state vector, plus a feature that returns a state from before a solve | **F-34** | 8/13 on sfepy, sole failure of both 116/117 near-misses; state the outcome, never the copy |
 | A stepper or cursor that advances its index before the attempt, plus a stop rule that rolls data back | **F-35** | 2/13 on sfepy; one index-relation assert per stop kind |
@@ -4229,7 +5657,21 @@ problems**. Until then it lives here as problem-specific evidence. Demote to the
 | A name-keyed ledger (paths, hosts, labels) with a derived identity beside it, and any restore, reload or reporting path that re-derives it | **F-59** | 8 runs over 2 batches on piscsi-image-reservation-identity; hold A, rename A away, create B under the old name; B free, A still held, A's report excludes B's holder |
 | A path-confinement rule with a stated exception for the last component (symlink image, mount point) and operations on the link itself | **F-60** | 5 runs over 2 batches on piscsi-image-reservation-identity, one sole failure; test folder-link escape, `..` after a folder link, an in-folder folder link and a final link to an outside file |
 | A property only known after opening the resource (read-only on open) deciding a conflict on an existing object (insert into a drive) | **F-61** | 2/10 then 0/10 on piscsi-image-reservation-identity; assert the object's state after every refusal |
+| A hierarchical generator or aggregator where a child's result enters the parent as ONE value (pseudo-parameter, sub-query row, nested record), and a feature that splits results into regimes that pair differently | **F-62** — test with an output-derived whole-row oracle: two children, nothing else, order-2 root; require every cross product of each child's rows with and without the special value | 5/10, the sole failure of two 33/34 near-misses. Came from an Auto Review coverage finding; leaf-pair checks miss it |
+| A coverage or scheduling guarantee over ordinary items, and a feature that adds special items that must not dilute it | **F-63** — one sentence that the ordinary-only rows keep the full guarantee, and a test whose oracle looks only at those rows | 3/10 accepted, 7/11 in one batch on the same sentence. High variance; do not rely on it alone |
+| A coordinate-topology feature (circular, periodic, wrapped, re-based) in a pipeline with an optional ESTIMATOR stage that reads the same coordinates first (model fitting, calibration, auto-tuning), switched off in every exact-value test | **F-64** — name the estimator's output in the invariance sentence; one default-mode test on many small wrapped units, each with one straddling site | 10/11 on macs-circular-chromosomes, sole failure of the best near-miss; Vega was the only run past it |
+| A top-level grouping the feature makes cyclic, with nested or derived structures built from its pieces (blocks, sub-intervals, relative offsets, sub-summits) | **F-65** — one rotation test per derived output mode, every column compared | 8/11 and 5/11 on macs-circular-chromosomes; pairs with F-64 |
 | A base helper wrapping a POSIX API with a "success but no result" return (`getpwuid_r`, `getgrgid_r`, `getaddrinfo`) that only a new caller's environment reaches | **F-39** (library-contract instance) | 6/10 then 3/10 on piscsi-image-reservation-identity, still after the rule was stated; construct the environment in the test (Pattern 107) |
+| A lazily materialized object graph with an identity cache (wrapper per raw node) and shared references (YAML anchors), plus a feature that walks the UNmaterialized parts (write-through, export, diff) | **F-80** — access one alias, leave the other raw, write, assert `is` identity on re-read; no meta sentence needed | 15/20 on asdf-conversion-free-lazy-tree, the sole failure of 3 Orion runs; find it by probing what base keeps |
+| An inspection/rendering API the feature reroutes, and metadata nodes every real input has (file header, library info) that fall under a stated trigger | **F-81** — one exact existing output line for that node beside the new lines | 6/20 on asdf-conversion-free-lazy-tree (4/8 Orion) |
+| A handler registry where one handler may claim several runtime types, and a rule keyed on "the" declared type | **F-82** — multi-type handler, one bad node, call inspection + key-only search, assert the handler never ran; do not pin the display | 2/4 Vega on asdf-conversion-free-lazy-tree; also tripped our own reference twice |
+
+| A stream rewriter whose callees inherit the caller's mutable state (PDF Form XObjects, `<use>`, macros) while sibling callee kinds start fresh | **F-83** — cap to one caller per callee; test caller modes, a nested callee and a fresh-start sibling | 8/8 Nova, 0/4 Orion on hayro-optional-content-baking; 11/11 uncapped on the old models |
+| A resource kind reachable through two dictionaries (fonts via `/Font` and ExtGState, images via XObject and inline) under a feature that must visit every instance | **F-84** — one test per secondary route, then an indirect operand on it | 9/12 (8/8 Nova) on hayro-optional-content-baking; the indirect variant was the 1-of-4 Orion separator |
+| An object-level enable/visibility flag the engine honours on every entry path, on an object reached without the usual call (soft-mask groups via `gs`) | **F-85** — hidden and shown variant side by side over plain content, render oracle | 5/8 Nova on hayro-optional-content-baking |
+| Two stated rules over the same per-unit evidence with different eligibility (votes count only classified values; membership excludes any unit carrying an unclassified one) | **F-86** — state both eligibility rules separately, narrower first; one fixture per evidence kind where the excluded units decide an exact ratio | 8/8 Nova, 0/4 Orion on macs-callvar-fragment-phasing (the Nova separator) |
+| A per-record attribute the contract defines through a partner record (mate, parent, header), a fetch window narrower than the partner span, and partner metadata carried on each record | **F-87** — "even when only the other record is present"; put the owning record outside the window on some units; exact counts plus an assert that the observing-record answer differs | 7/8 Nova + 1/4 Orion on macs-callvar-fragment-phasing; the in-window test killed 0/12 |
+| A repo with a second evidence path the default flags take (local assembly, a fallback engine) that the meta never mentions | **F-67 / L128** — assert option-on == option-off on that path for inputs where the new rule is a no-op | 7/12 on macs-callvar-fragment-phasing, sole failure of an Orion 54/55 |
 
 **Ship-in-every-problem shortlist.** F-10 has no precondition worth calling a precondition —
 almost every multi-capability contract has two axes — and it is the only pattern measured to

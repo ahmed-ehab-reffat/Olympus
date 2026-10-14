@@ -1,0 +1,783 @@
+diff --git a/eventsourcing/persistence.py b/eventsourcing/persistence.py
+index 496fde6e..02badfc2 100644
+--- a/eventsourcing/persistence.py
++++ b/eventsourcing/persistence.py
+@@ -644,6 +644,42 @@ class ApplicationRecorder(AggregateRecorder):
+         Notifications will have IDs greater than the optional `gt` argument.
+         """
+ 
++    @abstractmethod
++    def select_steps(self) -> Sequence[RecordedStep]:
++        """Returns the recorded steps of an application sequence, in the order
++        they were recorded.
++        """
++
++    @abstractmethod
++    def restore_step(
++        self, step: RecordedStep, stored_events: Sequence[StoredEvent]
++    ) -> None:
++        """Records the given stored events under the notification IDs of the
++        given step, together with the step's tracking object and the keyword
++        arguments decoded from the step's state, as one step.
++        """
++
++    def encode_step_state(self, **kwargs: Any) -> dict[str, Any] | None:
++        """Returns the JSON-compatible state this recorder needs from the keyword
++        arguments of a recording to restore it, or None if it needs none.
++        """
++        return None
++
++    def decode_step_state(self, state: dict[str, Any]) -> dict[str, Any]:
++        """Returns the keyword arguments that restore the given step state."""
++        return {}
++
++    def step_kwargs(self, step: RecordedStep) -> dict[str, Any]:
++        return {} if step.state is None else self.decode_step_state(step.state)
++
++    def _encode_step_state(self, **kwargs: Any) -> str | None:
++        state = self.encode_step_state(**kwargs)
++        return None if state is None else json.dumps(state)
++
++    @staticmethod
++    def _decode_step_state(text: str | None) -> dict[str, Any] | None:
++        return cast("dict[str, Any]", json.loads(text)) if text else None
++
+ 
+ class TrackingRecorder(Recorder, ABC):
+     """Abstract base class for recorders that record tracking
+@@ -1026,6 +1062,19 @@ class Tracking:
+     notification_id: int
+ 
+ 
++@dataclass(frozen=True)
++class RecordedStep:
++    """Frozen dataclass representing one atomic recording of an application
++    recorder: the tracking object it recorded, if any, the notification IDs
++    of the events it recorded, if any, and the JSON-compatible state the
++    recorder kept from the recording's other keyword arguments, if any.
++    """
++
++    tracking: Tracking | None
++    notification_ids: tuple[int, ...]
++    state: dict[str, Any] | None = None
++
++
+ Params = Sequence[Any] | Mapping[str, Any]
+ 
+ 
+diff --git a/eventsourcing/popo.py b/eventsourcing/popo.py
+index 8c96ca89..282f0cdb 100644
+--- a/eventsourcing/popo.py
++++ b/eventsourcing/popo.py
+@@ -3,7 +3,7 @@ from __future__ import annotations
+ import contextlib
+ from collections import defaultdict
+ from threading import Event, RLock
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, cast
+ 
+ from eventsourcing.persistence import (
+     AggregateRecorder,
+@@ -13,6 +13,7 @@ from eventsourcing.persistence import (
+     ListenNotifySubscription,
+     Notification,
+     ProcessRecorder,
++    RecordedStep,
+     StoredEvent,
+     Subscription,
+     Tracking,
+@@ -33,7 +34,7 @@ class POPORecorder:
+ class POPOAggregateRecorder(POPORecorder, AggregateRecorder):
+     def __init__(self) -> None:
+         super().__init__()
+-        self._stored_events: list[StoredEvent] = []
++        self._stored_events: list[StoredEvent | None] = []
+         self._stored_events_index: dict[str, dict[int, int]] = defaultdict(dict)
+ 
+     def insert_events(
+@@ -96,7 +97,7 @@ class POPOAggregateRecorder(POPORecorder, AggregateRecorder):
+                     continue
+                 if lte is not None and not p <= lte:
+                     continue
+-                s = self._stored_events[index[p]]
++                s = cast("StoredEvent", self._stored_events[index[p]])
+                 results.append(s)
+                 if len(results) == limit:
+                     break
+@@ -107,6 +108,7 @@ class POPOApplicationRecorder(POPOAggregateRecorder, ApplicationRecorder):
+     def __init__(self) -> None:
+         super().__init__()
+         self._listeners: set[Event] = set()
++        self._steps: list[RecordedStep] = []
+ 
+     def insert_events(
+         self, stored_events: Sequence[StoredEvent], **kwargs: Any
+@@ -115,6 +117,52 @@ class POPOApplicationRecorder(POPOAggregateRecorder, ApplicationRecorder):
+         self._notify_listeners()
+         return notification_ids
+ 
++    def _update_table(
++        self, stored_events: Sequence[StoredEvent], **kwargs: Any
++    ) -> Sequence[int] | None:
++        restoring: Sequence[int] | None = kwargs.get("notification_ids")
++        if restoring is None:
++            notification_ids = super()._update_table(stored_events, **kwargs) or []
++        else:
++            notification_ids = []
++            for s, notification_id in zip(stored_events, restoring, strict=True):
++                gap = notification_id - 1 - len(self._stored_events)
++                self._stored_events.extend([None] * gap)
++                notification_ids += super()._update_table([s]) or []
++        t: Tracking | None = kwargs.get("tracking")
++        if t or notification_ids:
++            self._steps.append(
++                RecordedStep(
++                    t, tuple(notification_ids), self.encode_step_state(**kwargs)
++                )
++            )
++        return notification_ids
++
++    def select_steps(self) -> Sequence[RecordedStep]:
++        with self._database_lock:
++            return list(self._steps)
++
++    def restore_step(
++        self, step: RecordedStep, stored_events: Sequence[StoredEvent]
++    ) -> None:
++        ids = step.notification_ids
++        if len(ids) != len(stored_events):
++            msg = f"Expected {len(ids)} stored events, got {len(stored_events)}"
++            raise ValueError(msg)
++        with self._database_lock:
++            previous = len(self._stored_events)
++            for notification_id in ids:
++                if notification_id <= previous:
++                    msg = f"Notification ID {notification_id} already issued"
++                    raise IntegrityError(msg)
++                previous = notification_id
++            kwargs = self.step_kwargs(step)
++            self._assert_uniqueness(stored_events, tracking=step.tracking, **kwargs)
++            self._update_table(
++                stored_events, notification_ids=ids, tracking=step.tracking, **kwargs
++            )
++        self._notify_listeners()
++
+     def select_notifications(
+         self,
+         start: int | None,
+@@ -141,7 +189,7 @@ class POPOApplicationRecorder(POPOAggregateRecorder, ApplicationRecorder):
+                 except IndexError:
+                     break
+                 i += 1
+-                if topics and s.topic not in topics:
++                if s is None or (topics and s.topic not in topics):
+                     continue
+                 n = Notification(
+                     id=i,
+diff --git a/eventsourcing/postgres.py b/eventsourcing/postgres.py
+index 65061593..73a33ff7 100644
+--- a/eventsourcing/postgres.py
++++ b/eventsourcing/postgres.py
+@@ -42,6 +42,7 @@ from eventsourcing.persistence import (
+     PersistenceError,
+     ProcessRecorder,
+     ProgrammingError,
++    RecordedStep,
+     StoredEvent,
+     Subscription,
+     Tracking,
+@@ -585,6 +586,49 @@ class PostgresApplicationRecorder(PostgresAggregateRecorder, ApplicationRecorder
+             ),
+         ]
+ 
++        suffix = "_steps"
++        self.steps_table_name = (
++            self.events_table_name[: self.MAX_IDENTIFIER_LEN - len(suffix)] + suffix
++        )
++        self.sql_create_statements.append(
++            SQL(
++                "CREATE TABLE IF NOT EXISTS {0}.{1} ("
++                "position bigserial PRIMARY KEY, "
++                "application_name text, "
++                "notification_id bigint, "
++                "notification_ids bigint[] NOT NULL, "
++                "state text)"
++            ).format(
++                Identifier(self.datastore.schema),
++                Identifier(self.steps_table_name),
++            )
++        )
++        self.insert_step_statement = SQL(
++            "INSERT INTO {0}.{1} "
++            "(application_name, notification_id, notification_ids, state) "
++            "VALUES (%s, %s, %s, %s)"
++        ).format(
++            Identifier(self.datastore.schema),
++            Identifier(self.steps_table_name),
++        )
++        self.select_steps_statement = SQL(
++            "SELECT * FROM {0}.{1} ORDER BY position"
++        ).format(
++            Identifier(self.datastore.schema),
++            Identifier(self.steps_table_name),
++        )
++        self.restore_event_statement = SQL(
++            "INSERT INTO {0}.{1} "
++            "(notification_id, originator_id, originator_version, topic, state) "
++            "VALUES (%s, %s, %s, %s, %s)"
++        ).format(
++            Identifier(self.datastore.schema),
++            Identifier(self.events_table_name),
++        )
++        self.advance_sequence_statement = SQL(
++            "SELECT setval(pg_get_serial_sequence(%s, 'notification_id'), %s)"
++        )
++
+         self.pg_function_name_insert_events = (
+             f"es_insert_events_{self.datastore.originator_id_type}"
+         )
+@@ -638,13 +682,21 @@ class PostgresApplicationRecorder(PostgresAggregateRecorder, ApplicationRecorder
+                 )
+                 for e in stored_events
+             ]
+-            with self.datastore.get_connection() as conn, conn.cursor() as curs:
++            with (
++                self.datastore.get_connection() as conn,
++                conn.transaction(),
++                conn.cursor() as curs,
++            ):
++                self._lock_table(curs)
++                self._insert_events(curs, stored_events, **kwargs)
+                 curs.execute(
+                     self.sql_invoke_pg_function_insert_events,
+                     (pg_stored_events,),
+                     prepare=True,
+                 )
+-                return [r[self.pg_function_name_insert_events] for r in curs.fetchall()]
++                ids = [r[self.pg_function_name_insert_events] for r in curs.fetchall()]
++                self._insert_step(curs, ids, **kwargs)
++                return ids
+ 
+         exc: Exception | None = None
+         notification_ids: Sequence[int] | None = None
+@@ -668,6 +720,9 @@ class PostgresApplicationRecorder(PostgresAggregateRecorder, ApplicationRecorder
+                         except Exception as e:
+                             # Avoid psycopg emitting a pipeline warning.
+                             exc = e
++                if exc is None:
++                    with conn.cursor() as curs:
++                        self._insert_step(curs, notification_ids or [], **kwargs)
+             if exc:
+                 # Reraise exception after pipeline context manager has exited.
+                 raise exc
+@@ -681,6 +736,91 @@ class PostgresApplicationRecorder(PostgresAggregateRecorder, ApplicationRecorder
+     ) -> None:
+         pass
+ 
++    def _insert_step(
++        self,
++        curs: Cursor[DictRow],
++        notification_ids: Sequence[int],
++        **kwargs: Any,
++    ) -> None:
++        tracking: Tracking | None = kwargs.get("tracking")
++        if tracking is None and not notification_ids:
++            return
++        if not notification_ids:
++            self._lock_table(curs)
++        curs.execute(
++            self.insert_step_statement,
++            (
++                tracking.application_name if tracking else None,
++                tracking.notification_id if tracking else None,
++                list(notification_ids),
++                self._encode_step_state(**kwargs),
++            ),
++            prepare=True,
++        )
++
++    @retry((InterfaceError, OperationalError), max_attempts=10, wait=0.2)
++    def select_steps(self) -> Sequence[RecordedStep]:
++        with self.datastore.get_connection() as conn, conn.cursor() as curs:
++            curs.execute(self.select_steps_statement, prepare=True)
++            return [
++                RecordedStep(
++                    (
++                        Tracking(row["application_name"], row["notification_id"])
++                        if row["application_name"] is not None
++                        else None
++                    ),
++                    tuple(row["notification_ids"]),
++                    self._decode_step_state(row["state"]),
++                )
++                for row in curs.fetchall()
++            ]
++
++    @retry((InterfaceError, OperationalError), max_attempts=10, wait=0.2)
++    def restore_step(
++        self, step: RecordedStep, stored_events: Sequence[StoredEvent]
++    ) -> None:
++        ids = step.notification_ids
++        if len(ids) != len(stored_events):
++            msg = f"Expected {len(ids)} stored events, got {len(stored_events)}"
++            raise ValueError(msg)
++        with (
++            self.datastore.get_connection() as conn,
++            conn.transaction(),
++            conn.cursor() as curs,
++        ):
++            self._lock_table(curs)
++            curs.execute(self.max_notification_id_statement)
++            fetchone = curs.fetchone()
++            assert fetchone is not None
++            previous = fetchone["max"] or 0
++            for notification_id in ids:
++                if notification_id <= previous:
++                    msg = f"Notification ID {notification_id} already issued"
++                    raise IntegrityError(msg)
++                previous = notification_id
++            self._insert_events(
++                curs, stored_events, tracking=step.tracking, **self.step_kwargs(step)
++            )
++            for notification_id, s in zip(ids, stored_events, strict=True):
++                curs.execute(
++                    self.restore_event_statement,
++                    (
++                        notification_id,
++                        s.originator_id,
++                        s.originator_version,
++                        s.topic,
++                        s.state,
++                    ),
++                    prepare=True,
++                )
++            if ids:
++                table = f'"{self.datastore.schema}"."{self.events_table_name}"'
++                curs.execute(self.advance_sequence_statement, (table, ids[-1]))
++                self._notify_channel(curs)
++            self._insert_step(
++                curs, ids, tracking=step.tracking, **self.step_kwargs(step)
++            )
++
+     def _insert_stored_events(
+         self,
+         curs: Cursor[DictRow],
+diff --git a/eventsourcing/sqlite.py b/eventsourcing/sqlite.py
+index 2cf6afe9..449ec2ff 100644
+--- a/eventsourcing/sqlite.py
++++ b/eventsourcing/sqlite.py
+@@ -23,6 +23,7 @@ from eventsourcing.persistence import (
+     PersistenceError,
+     ProcessRecorder,
+     ProgrammingError,
++    RecordedStep,
+     Recorder,
+     StoredEvent,
+     Subscription,
+@@ -385,10 +386,24 @@ class SQLiteApplicationRecorder(
+         datastore: SQLiteDatastore,
+         events_table_name: str = "stored_events",
+     ):
++        self.steps_table_name = events_table_name + "_steps"
+         super().__init__(datastore, events_table_name)
+         self.select_max_notification_id_statement = (
+             f"SELECT MAX(rowid) FROM {self.events_table_name}"
+         )
++        self.restore_event_statement = (
++            f"INSERT INTO {self.events_table_name} "
++            "(rowid, originator_id, originator_version, topic, state) "
++            "VALUES (?,?,?,?,?)"
++        )
++        self.insert_step_statement = (
++            f"INSERT INTO {self.steps_table_name} "
++            "(application_name, notification_id, notification_ids, state) "
++            "VALUES (?,?,?,?)"
++        )
++        self.select_steps_statement = (
++            f"SELECT * FROM {self.steps_table_name} ORDER BY position"
++        )
+ 
+     def construct_create_table_statements(self) -> list[str]:
+         statement = (
+@@ -401,32 +416,109 @@ class SQLiteApplicationRecorder(
+             "PRIMARY KEY "
+             "(originator_id, originator_version))"
+         )
+-        return [statement]
++        steps_statement = (
++            "CREATE TABLE IF NOT EXISTS "
++            f"{self.steps_table_name} ("
++            "position INTEGER PRIMARY KEY, "
++            "application_name TEXT, "
++            "notification_id INTEGER, "
++            "notification_ids TEXT, "
++            "state TEXT)"
++        )
++        return [statement, steps_statement]
+ 
+     def _insert_events(
+         self,
+         c: SQLiteCursor,
+         stored_events: Sequence[StoredEvent],
+-        **_: Any,
++        **kwargs: Any,
+     ) -> Sequence[int] | None:
++        restoring: Sequence[int] | None = kwargs.get("notification_ids")
+         returning = []
+-        for s in stored_events:
+-            c.execute(
+-                self.insert_events_statement,
++        for i, s in enumerate(stored_events):
++            params = (
+                 (
+-                    (
+-                        s.originator_id.hex
+-                        if isinstance(s.originator_id, UUID)
+-                        else s.originator_id
+-                    ),
+-                    s.originator_version,
+-                    s.topic,
+-                    s.state,
++                    s.originator_id.hex
++                    if isinstance(s.originator_id, UUID)
++                    else s.originator_id
+                 ),
++                s.originator_version,
++                s.topic,
++                s.state,
+             )
++            if restoring is None:
++                c.execute(self.insert_events_statement, params)
++            else:
++                c.execute(self.restore_event_statement, (restoring[i], *params))
+             returning.append(c.lastrowid)
+         return returning
+ 
++    def insert_events(
++        self, stored_events: Sequence[StoredEvent], **kwargs: Any
++    ) -> Sequence[int] | None:
++        with self.datastore.transaction(commit=True) as c:
++            notification_ids = self._insert_events(c, stored_events, **kwargs)
++            self._insert_step(c, notification_ids or [], **kwargs)
++            return notification_ids
++
++    def _insert_step(
++        self, c: SQLiteCursor, notification_ids: Sequence[int], **kwargs: Any
++    ) -> None:
++        tracking: Tracking | None = kwargs.get("tracking")
++        if tracking is None and not notification_ids:
++            return
++        c.execute(
++            self.insert_step_statement,
++            (
++                tracking.application_name if tracking else None,
++                tracking.notification_id if tracking else None,
++                ",".join(str(i) for i in notification_ids),
++                self._encode_step_state(**kwargs),
++            ),
++        )
++
++    def select_steps(self) -> Sequence[RecordedStep]:
++        with self.datastore.transaction(commit=False) as c:
++            c.execute(self.select_steps_statement)
++            steps = []
++            for row in c.fetchall():
++                tracking = None
++                if row["application_name"] is not None:
++                    tracking = Tracking(row["application_name"], row["notification_id"])
++                ids = row["notification_ids"]
++                steps.append(
++                    RecordedStep(
++                        tracking,
++                        tuple(int(i) for i in ids.split(",") if i),
++                        self._decode_step_state(row["state"]),
++                    )
++                )
++            return steps
++
++    def restore_step(
++        self, step: RecordedStep, stored_events: Sequence[StoredEvent]
++    ) -> None:
++        ids = step.notification_ids
++        if len(ids) != len(stored_events):
++            msg = f"Expected {len(ids)} stored events, got {len(stored_events)}"
++            raise ValueError(msg)
++        with self.datastore.transaction(commit=True) as c:
++            previous = self._max_notification_id(c) or 0
++            for notification_id in ids:
++                if notification_id <= previous:
++                    msg = f"Notification ID {notification_id} already issued"
++                    raise IntegrityError(msg)
++                previous = notification_id
++            kwargs = self.step_kwargs(step)
++            restored = self._insert_events(
++                c,
++                stored_events,
++                notification_ids=ids,
++                tracking=step.tracking,
++                **kwargs,
++            )
++            self._insert_step(c, restored or [], tracking=step.tracking, **kwargs)
++
+     def select_notifications(
+         self,
+         start: int | None,
+diff --git a/eventsourcing/system.py b/eventsourcing/system.py
+index 1fc38665..b7f81bf4 100644
+--- a/eventsourcing/system.py
++++ b/eventsourcing/system.py
+@@ -11,6 +11,7 @@ from types import FrameType, ModuleType
+ from typing import TYPE_CHECKING, Any, ClassVar, Generic, cast
+ 
+ from eventsourcing.application import (
++    AggregateNotFoundError,
+     Application,
+     NotificationLog,
+     ProgrammingError,
+@@ -26,14 +27,16 @@ from eventsourcing.persistence import (
+     Mapper,
+     Notification,
+     ProcessRecorder,
++    RecordedStep,
+     Recording,
++    StoredEvent,
+     Tracking,
+ )
+ from eventsourcing.projection import EventSourcedProjection
+ from eventsourcing.utils import EnvType, get_topic, resolve_topic
+ 
+ if TYPE_CHECKING:
+-    from collections.abc import Iterable, Iterator
++    from collections.abc import Iterable, Iterator, Mapping
+     from typing import Self
+ 
+ 
+@@ -355,6 +358,12 @@ class Runner(ABC, Generic[TAggregateID]):
+     def get(self, cls: type[TApplication]) -> TApplication:
+         """Returns an application instance for given application class."""
+ 
++    def cut(self, bounds: Mapping[str, int] | None = None) -> SystemCut:
++        """Returns the greatest consistent cut of the system within the given
++        bounds on the applications' notification IDs.
++        """
++        return SystemCut(self, bounds or {})
++
+     def __enter__(self) -> Self:
+         self.start()
+         return self
+@@ -363,6 +372,130 @@ class Runner(ABC, Generic[TAggregateID]):
+         self.stop()
+ 
+ 
++class SystemCut:
++    """A consistent cut across the applications of a running system."""
++
++    def __init__(self, runner: Runner[Any], bounds: Mapping[str, int]):
++        self.runner = runner
++        system = runner.system
++        for name, bound in bounds.items():
++            if name not in system.nodes:
++                msg = f"Application not in system: {name}"
++                raise ValueError(msg)
++            if bound < 0:
++                msg = f"Invalid bound for {name}: {bound}"
++                raise ValueError(msg)
++        self._steps: dict[str, list[RecordedStep]] = {}
++        self._lengths: dict[str, int] = {}
++        for name in system.nodes:
++            steps = self._select_steps(name)
++            limit = bounds.get(name)
++            length = 0
++            for step in steps:
++                if limit is not None and any(i > limit for i in step.notification_ids):
++                    break
++                length += 1
++            self._steps[name] = steps
++            self._lengths[name] = length
++        changed = True
++        while changed:
++            changed = False
++            for name in system.followers:
++                limits = {
++                    leader: self._position(leader) for leader in system.follows[name]
++                }
++                length = 0
++                for step in self._steps[name][: self._lengths[name]]:
++                    t = step.tracking
++                    if (
++                        t is not None
++                        and t.application_name in limits
++                        and t.notification_id > limits[t.application_name]
++                    ):
++                        break
++                    length += 1
++                if length < self._lengths[name]:
++                    self._lengths[name] = length
++                    changed = True
++        self.positions: dict[str, int] = {
++            name: self._position(name) for name in system.nodes
++        }
++        self.processed: dict[str, dict[str, int]] = {}
++        for name in system.followers:
++            self.processed[name] = {}
++            for leader in system.follows[name]:
++                self.processed[name][leader] = max(
++                    (
++                        step.tracking.notification_id
++                        for step in self._prefix(name)
++                        if step.tracking is not None
++                        and step.tracking.application_name == leader
++                    ),
++                    default=0,
++                )
++
++    def _app(self, runner: Runner[Any], name: str) -> Application[Any]:
++        return runner.get(runner.system.get_app_cls(name))
++
++    def _select_steps(self, name: str) -> list[RecordedStep]:
++        return list(self._app(self.runner, name).recorder.select_steps())
++
++    def _prefix(self, name: str) -> list[RecordedStep]:
++        return self._steps[name][: self._lengths[name]]
++
++    def _position(self, name: str) -> int:
++        return max(
++            (i for step in self._prefix(name) for i in step.notification_ids),
++            default=0,
++        )
++
++    def _notifications(self, name: str) -> list[Notification]:
++        position = self.positions[name]
++        if not position:
++            return []
++        recorder = self._app(self.runner, name).recorder
++        return list(
++            recorder.select_notifications(start=1, limit=position, stop=position)
++        )
++
++    def get(self, cls: type[Application[Any]], aggregate_id: Any) -> Any:
++        """Returns the aggregate as it was at the cut."""
++        version = None
++        for notification in self._notifications(cls.name):
++            if str(notification.originator_id) == str(aggregate_id):
++                version = notification.originator_version
++        if version is None:
++            raise AggregateNotFoundError(aggregate_id)
++        return self.runner.get(cls).repository.get(aggregate_id, version=version)
++
++    def fork(self, env: EnvType | None = None) -> Runner[Any]:
++        """Returns a new started runner, constructed with the given environment,
++        whose applications hold exactly the state of the system at the cut.
++        """
++        runner = type(self.runner)(self.runner.system, env=env)
++        for name in self.runner.system.nodes:
++            if self._app(runner, name).recorder.max_notification_id():
++                runner.stop()
++                msg = f"Application {name} already has events in the fork environment"
++                raise ValueError(msg)
++        for name in self.runner.system.nodes:
++            recorder = self._app(runner, name).recorder
++            by_id = {n.id: n for n in self._notifications(name)}
++            for step in self._prefix(name):
++                stored_events = [
++                    StoredEvent(
++                        originator_id=by_id[i].originator_id,
++                        originator_version=by_id[i].originator_version,
++                        topic=by_id[i].topic,
++                        state=by_id[i].state,
++                    )
++                    for i in step.notification_ids
++                ]
++                recorder.restore_step(step, stored_events)
++        runner.start()
++        return runner
++
++
+ class RunnerAlreadyStartedError(Exception):
+     """Raised when runner is already started."""
+ 
+diff --git a/examples/ftscontentmanagement/persistence.py b/examples/ftscontentmanagement/persistence.py
+index 9def1e14..dd40dca4 100644
+--- a/examples/ftscontentmanagement/persistence.py
++++ b/examples/ftscontentmanagement/persistence.py
+@@ -2,13 +2,13 @@ from __future__ import annotations
+ 
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Any
++from uuid import UUID
+ 
+ from eventsourcing.persistence import Recorder
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Sequence
+-    from uuid import UUID
+ 
+ 
+ @dataclass(frozen=True)
+@@ -36,6 +36,19 @@ class FtsRecorder(Recorder, ABC):
+     def select_page(self, page_id: UUID) -> PageInfo:
+         """Returns slug, title and body for given ID."""
+ 
++    def encode_step_state(self, **kwargs: Any) -> dict[str, Any] | None:
++        state = {
++            key: [[str(p.id), p.slug, p.title, p.body] for p in kwargs.get(key, ())]
++            for key in ("insert_pages", "update_pages")
++        }
++        return state if any(state.values()) else None
++
++    def decode_step_state(self, state: dict[str, Any]) -> dict[str, Any]:
++        return {
++            key: [PageInfo(UUID(i), slug, title, body) for i, slug, title, body in rows]
++            for key, rows in state.items()
++        }
++
+     def search(self, query: str) -> Sequence[PageInfo]:
+         pages = []
+         for page_id in self.search_pages(query):
+diff --git a/examples/searchabletimestamps/persistence.py b/examples/searchabletimestamps/persistence.py
+index 088b331a..6bac9404 100644
+--- a/examples/searchabletimestamps/persistence.py
++++ b/examples/searchabletimestamps/persistence.py
+@@ -1,14 +1,12 @@
+ from __future__ import annotations
+ 
+ from abc import abstractmethod
+-from typing import TYPE_CHECKING
++from datetime import datetime
++from typing import Any
++from uuid import UUID
+ 
+ from eventsourcing.persistence import ApplicationRecorder
+ 
+-if TYPE_CHECKING:
+-    from datetime import datetime
+-    from uuid import UUID
+-
+ 
+ class SearchableTimestampsRecorder(ApplicationRecorder):
+     @abstractmethod
+@@ -16,3 +14,22 @@ class SearchableTimestampsRecorder(ApplicationRecorder):
+         self, originator_id: UUID, timestamp: datetime
+     ) -> int | None:
+         """Returns originator version at timestamp for given originator ID."""
++
++    def encode_step_state(self, **kwargs: Any) -> dict[str, Any] | None:
++        data = kwargs.get("event_timestamps_data")
++        if data is None:
++            return None
++        return {
++            "event_timestamps_data": [
++                [str(originator_id), timestamp.isoformat(), version]
++                for originator_id, timestamp, version in data
++            ]
++        }
++
++    def decode_step_state(self, state: dict[str, Any]) -> dict[str, Any]:
++        return {
++            "event_timestamps_data": [
++                (UUID(originator_id), datetime.fromisoformat(timestamp), version)
++                for originator_id, timestamp, version in state["event_timestamps_data"]
++            ]
++        }

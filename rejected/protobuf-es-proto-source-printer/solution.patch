@@ -1,0 +1,659 @@
+diff --git a/packages/protoplugin/src/index.ts b/packages/protoplugin/src/index.ts
+index 572714e..1f675fe 100644
+--- a/packages/protoplugin/src/index.ts
++++ b/packages/protoplugin/src/index.ts
+@@ -34,3 +34,5 @@ export type { ImportSymbol } from "./import-symbol.js";
+ export { createImportSymbol } from "./import-symbol.js";
+ export type { Printable } from "./printable.js";
+ export { safeIdentifier } from "./safe-identifier.js";
++export { getProtoSource } from "./proto-source.js";
++export type { ProtoSourceOptions } from "./proto-source.js";
+diff --git a/packages/protoplugin/src/proto-source.ts b/packages/protoplugin/src/proto-source.ts
+new file mode 100644
+index 0000000..eb02932
+--- /dev/null
++++ b/packages/protoplugin/src/proto-source.ts
+@@ -0,0 +1,643 @@
++// Copyright 2021-2026 Buf Technologies, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++import {
++  type AnyDesc,
++  type DescEnum,
++  type DescExtension,
++  type DescField,
++  type DescFile,
++  type DescMessage,
++  type DescMethod,
++  type DescOneof,
++  type DescService,
++  type Message,
++  type Registry,
++  createFileRegistry,
++  getExtension,
++  isFieldSet,
++  ScalarType,
++} from "@bufbuild/protobuf";
++import { protoCamelCase, reflect } from "@bufbuild/protobuf/reflect";
++import type { ReflectMessage } from "@bufbuild/protobuf/reflect";
++import { toText } from "@bufbuild/protobuf/txtpb";
++import {
++  Edition,
++  FieldDescriptorProto_Label,
++  FieldDescriptorProto_Type,
++  FieldDescriptorProtoSchema,
++  type DescriptorProto,
++  type DescriptorProto_ExtensionRange,
++  type FieldDescriptorProto,
++  EnumOptionsSchema,
++  EnumValueOptionsSchema,
++  ExtensionRangeOptionsSchema,
++  FieldOptionsSchema,
++  FileOptionsSchema,
++  MessageOptionsSchema,
++  MethodOptionsSchema,
++  OneofOptionsSchema,
++  ServiceOptionsSchema,
++  SymbolVisibility,
++} from "@bufbuild/protobuf/wkt";
++import { getComments } from "./source-code-info.js";
++
++const maxFieldNumber = 536870911;
++const maxEnumNumber = 2147483647;
++
++const optionSchemas = new Map<string, DescMessage>(
++  [
++    FileOptionsSchema,
++    MessageOptionsSchema,
++    FieldOptionsSchema,
++    OneofOptionsSchema,
++    EnumOptionsSchema,
++    EnumValueOptionsSchema,
++    ServiceOptionsSchema,
++    MethodOptionsSchema,
++    ExtensionRangeOptionsSchema,
++  ].map((s) => [s.typeName, s]),
++);
++
++/**
++ * Options for getProtoSource().
++ */
++export interface ProtoSourceOptions {
++  /**
++   * Registry used to look up custom options. Defaults to the file and the
++   * files it imports.
++   */
++  registry?: Registry;
++}
++
++/**
++ * Return Protobuf source for the given file descriptor. Compiling the source
++ * yields the same descriptor, and comments are kept on their elements.
++ */
++export function getProtoSource(
++  file: DescFile,
++  options?: ProtoSourceOptions,
++): string {
++  const p = new SourcePrinter(file, options?.registry ?? fileRegistry(file));
++  p.printFile();
++  return p.out.join("\n") + "\n";
++}
++
++function fileRegistry(file: DescFile): Registry {
++  const files = new Map<string, DescFile>();
++  const add = (f: DescFile) => {
++    if (!files.has(f.proto.name)) {
++      files.set(f.proto.name, f);
++      f.dependencies.forEach(add);
++    }
++  };
++  add(file);
++  return createFileRegistry(file.proto, (name) => files.get(name));
++}
++
++type Member = DescField | DescOneof | DescExtension;
++
++class SourcePrinter {
++  readonly out: string[] = [];
++  private depth = 0;
++
++  constructor(
++    private readonly file: DescFile,
++    private readonly registry: Registry,
++  ) {}
++
++  private line(text: string) {
++    this.out.push(text === "" ? "" : "  ".repeat(this.depth) + text);
++  }
++
++  private blank() {
++    if (this.out.length > 0 && this.out[this.out.length - 1] !== "") {
++      this.out.push("");
++    }
++  }
++
++  private commentBlock(text: string) {
++    const body = text.endsWith("\n") ? text.slice(0, -1) : text;
++    for (const l of body.split("\n")) {
++      this.line("//" + l);
++    }
++  }
++
++  private declare(desc: Exclude<AnyDesc, DescFile>, text: string, open: boolean) {
++    const c = getComments(desc);
++    if (c.leadingDetached.length > 0) {
++      this.blank();
++      for (const detached of c.leadingDetached) {
++        this.commentBlock(detached);
++        this.line("");
++      }
++    }
++    if (c.leading !== undefined) {
++      this.commentBlock(c.leading);
++    }
++    this.line(open ? text + " {" : text + ";");
++    if (open) {
++      this.depth++;
++    }
++    if (c.trailing !== undefined) {
++      this.commentBlock(c.trailing);
++      this.line("");
++    }
++  }
++
++  private close() {
++    this.depth--;
++    this.line("}");
++  }
++
++  printFile() {
++    const f = this.file;
++    if (f.edition === Edition.EDITION_PROTO2) {
++      this.line('syntax = "proto2";');
++    } else if (f.edition === Edition.EDITION_PROTO3) {
++      this.line('syntax = "proto3";');
++    } else {
++      this.line(`edition = "${Edition[f.edition].replace("EDITION_", "")}";`);
++    }
++    if (f.proto.package !== "") {
++      this.line("");
++      this.line(`package ${f.proto.package};`);
++    }
++    if (f.proto.dependency.length + f.proto.optionDependency.length > 0) {
++      this.line("");
++    }
++    f.proto.dependency.forEach((dep, i) => {
++      const mod = f.proto.publicDependency.includes(i)
++        ? "public "
++        : f.proto.weakDependency.includes(i)
++          ? "weak "
++          : "";
++      this.line(`import ${mod}"${dep}";`);
++    });
++    for (const dep of f.proto.optionDependency) {
++      this.line(`import option "${dep}";`);
++    }
++    this.optionStatements(f.proto.options);
++    for (const e of f.enums) {
++      this.blank();
++      this.printEnum(e);
++    }
++    this.printScope([], f.extensions, f.proto.messageType, f.messages);
++    for (const s of f.services) {
++      this.blank();
++      this.printService(s);
++    }
++  }
++
++  private printScope(
++    fields: (DescField | DescOneof)[],
++    extensions: DescExtension[],
++    nestedProtos: DescriptorProto[],
++    nestedDescs: DescMessage[],
++  ) {
++    const members: Member[] = [...fields, ...extensions];
++    const tied = new Map<string, Member>();
++    for (const m of members) {
++      const fieldList = m.kind === "oneof" ? m.fields : [m];
++      for (const f of fieldList) {
++        if (this.isGroup(f) || f.fieldKind === "map") {
++          tied.set(f.proto.typeName.split(".").pop() ?? "", m);
++        }
++      }
++    }
++    let fi = 0;
++    let ei = 0;
++    const printFieldsThrough = (target: Member | undefined) => {
++      while (fi < fields.length) {
++        const m = fields[fi++];
++        if (m.kind === "oneof") {
++          this.printOneof(m);
++        } else {
++          this.printField(m);
++        }
++        if (m === target) {
++          return;
++        }
++      }
++    };
++    const printExtensionsThrough = (target: Member | undefined) => {
++      const start = ei;
++      ei = target === undefined ? extensions.length : extensions.indexOf(target as DescExtension) + 1;
++      this.printExtendBlocks(extensions.slice(start, ei));
++    };
++    for (const nested of nestedProtos) {
++      const owner = tied.get(nested.name);
++      if (owner === undefined) {
++        const desc = nestedDescs.find((d) => d.proto === nested);
++        if (desc !== undefined) {
++          this.blank();
++          this.printMessage(desc);
++        }
++      } else if (owner.kind === "extension") {
++        printExtensionsThrough(owner);
++      } else {
++        printFieldsThrough(owner);
++      }
++    }
++    printFieldsThrough(undefined);
++    if (ei < extensions.length) {
++      printExtensionsThrough(undefined);
++    }
++  }
++
++  private printMessage(m: DescMessage) {
++    this.declare(m, `${visibility(m.proto.visibility)}message ${m.name}`, true);
++    this.printMessageBody(m);
++    this.close();
++  }
++
++  private printMessageBody(m: DescMessage) {
++    this.optionStatements(m.proto.options);
++    for (const e of m.nestedEnums) {
++      this.printEnum(e);
++    }
++    this.printScope(m.members, m.nestedExtensions, m.proto.nestedType, m.nestedMessages);
++    for (const r of m.proto.extensionRange) {
++      this.printExtensionRange(r);
++    }
++    const ranges = m.proto.reservedRange.map((r) =>
++      rangeString(r.start, r.end - 1, maxFieldNumber),
++    );
++    this.printReserved(ranges, m.proto.reservedName);
++  }
++
++  private isGroup(f: DescField | DescExtension): boolean {
++    return (
++      f.proto.type === FieldDescriptorProto_Type.GROUP &&
++      this.file.edition === Edition.EDITION_PROTO2
++    );
++  }
++
++  private printOneof(o: DescOneof) {
++    this.declare(o, `oneof ${o.name}`, true);
++    this.optionStatements(o.proto.options);
++    for (const f of o.fields) {
++      this.printField(f);
++    }
++    this.close();
++  }
++
++  private printExtensionRange(r: DescriptorProto_ExtensionRange) {
++    let s = `extensions ${rangeString(r.start, r.end - 1, maxFieldNumber)}`;
++    const opts = this.compactOptions(r.options);
++    if (opts.length > 0) {
++      s += ` [${opts.join(", ")}]`;
++    }
++    this.line(s + ";");
++  }
++
++  private printReserved(ranges: string[], names: string[]) {
++    if (ranges.length > 0) {
++      this.line(`reserved ${ranges.join(", ")};`);
++    }
++    if (names.length > 0) {
++      const quote = this.file.edition <= Edition.EDITION_PROTO3;
++      const list = names.map((n) => (quote ? `"${n}"` : n));
++      this.line(`reserved ${list.join(", ")};`);
++    }
++  }
++
++  private printExtendBlocks(exts: DescExtension[]) {
++    let i = 0;
++    while (i < exts.length) {
++      const extendee = exts[i].proto.extendee;
++      this.blank();
++      this.line(`extend ${extendee} {`);
++      this.depth++;
++      while (i < exts.length && exts[i].proto.extendee === extendee) {
++        this.printField(exts[i++]);
++      }
++      this.close();
++    }
++  }
++
++  private printField(f: DescField | DescExtension) {
++    const proto = f.proto;
++    const groupType = this.isGroup(f) ? this.groupType(f) : undefined;
++    const parts: string[] = [];
++    const label = this.labelKeyword(f);
++    if (label !== "") {
++      parts.push(label);
++    }
++    if (f.fieldKind === "map") {
++      const value =
++        f.mapKind === "scalar"
++          ? ScalarType[f.scalar].toLowerCase()
++          : "." + (f.mapKind === "enum" ? f.enum.typeName : f.message.typeName);
++      parts.push(`map<${ScalarType[f.mapKey].toLowerCase()}, ${value}>`);
++    } else if (groupType !== undefined) {
++      parts.push("group");
++    } else {
++      parts.push(fieldTypeName(proto));
++    }
++    parts.push(groupType?.name ?? proto.name, "=", String(proto.number));
++    const opts: string[] = [];
++    if (isFieldSet(proto, FieldDescriptorProtoSchema.field.defaultValue)) {
++      opts.push(`default = ${defaultValueString(proto)}`);
++    }
++    if (
++      f.kind === "field" &&
++      isFieldSet(proto, FieldDescriptorProtoSchema.field.jsonName) &&
++      proto.jsonName !== protoCamelCase(proto.name)
++    ) {
++      opts.push(`json_name = ${quoteProtoString(proto.jsonName)}`);
++    }
++    opts.push(...this.compactOptions(proto.options));
++    let decl = parts.join(" ");
++    if (opts.length > 0) {
++      decl += ` [${opts.join(", ")}]`;
++    }
++    if (groupType !== undefined) {
++      this.declare(f, decl, true);
++      this.printMessageBody(groupType);
++      this.close();
++      return;
++    }
++    this.declare(f, decl, false);
++  }
++
++  private groupType(f: DescField | DescExtension): DescMessage | undefined {
++    const candidates = f.parent ? f.parent.nestedMessages : this.file.messages;
++    return candidates.find((m) => "." + m.typeName === f.proto.typeName);
++  }
++
++  private labelKeyword(f: DescField | DescExtension): string {
++    const proto = f.proto;
++    if (f.fieldKind === "map") {
++      return "";
++    }
++    if (proto.label === FieldDescriptorProto_Label.REPEATED) {
++      return "repeated";
++    }
++    switch (this.file.edition) {
++      case Edition.EDITION_PROTO2:
++        if (proto.label === FieldDescriptorProto_Label.REQUIRED) {
++          return "required";
++        }
++        return f.kind === "field" && f.oneof ? "" : "optional";
++      case Edition.EDITION_PROTO3:
++        return proto.proto3Optional ? "optional" : "";
++      default:
++        return "";
++    }
++  }
++
++  private printEnum(e: DescEnum) {
++    this.declare(e, `${visibility(e.proto.visibility)}enum ${e.name}`, true);
++    this.optionStatements(e.proto.options);
++    for (const v of e.values) {
++      let decl = `${v.name} = ${v.number}`;
++      const opts = this.compactOptions(v.proto.options);
++      if (opts.length > 0) {
++        decl += ` [${opts.join(", ")}]`;
++      }
++      this.declare(v, decl, false);
++    }
++    const ranges = e.proto.reservedRange.map((r) =>
++      rangeString(r.start, r.end, maxEnumNumber),
++    );
++    this.printReserved(ranges, e.proto.reservedName);
++    this.close();
++  }
++
++  private printService(s: DescService) {
++    this.declare(s, `service ${s.name}`, true);
++    this.optionStatements(s.proto.options);
++    for (const m of s.methods) {
++      this.printMethod(m);
++    }
++    this.close();
++  }
++
++  private printMethod(m: DescMethod) {
++    const input = (m.proto.clientStreaming ? "stream " : "") + "." + m.input.typeName;
++    const output =
++      (m.proto.serverStreaming ? "stream " : "") + "." + m.output.typeName;
++    const decl = `rpc ${m.name}(${input}) returns (${output})`;
++    const opts = this.optionList(m.proto.options);
++    if (opts.length === 0) {
++      this.declare(m, decl, false);
++      return;
++    }
++    this.declare(m, decl, true);
++    for (const [name, value] of opts) {
++      this.line(`option ${name} = ${value};`);
++    }
++    this.close();
++  }
++
++  private optionStatements(options: Message | undefined) {
++    for (const [name, value] of this.optionList(options)) {
++      this.line(`option ${name} = ${value};`);
++    }
++  }
++
++  private compactOptions(options: Message | undefined): string[] {
++    return this.optionList(options).map(([name, value]) => `${name} = ${value}`);
++  }
++
++  private optionList(options: Message | undefined): [string, string][] {
++    if (options === undefined) {
++      return [];
++    }
++    const desc = optionSchemas.get(options.$typeName);
++    if (desc === undefined) {
++      return [];
++    }
++    const r = reflect(desc, options);
++    const result: [string, string][] = [];
++    for (const field of r.fields) {
++      if (!r.isSet(field) || field.name === "uninterpreted_option" || field.name === "map_entry") {
++        continue;
++      }
++      if (field.name === "features" && field.message) {
++        const features = r.get(field) as ReflectMessage;
++        for (const [name, value] of this.messageOptionPaths(features)) {
++          result.push(["features." + name, value]);
++        }
++        continue;
++      }
++      for (const value of this.fieldValues(r, field)) {
++        result.push([field.name, value]);
++      }
++    }
++    for (const ext of this.setExtensions(options, desc)) {
++      for (const value of this.extensionValues(options, ext)) {
++        result.push([`(${ext.typeName})`, value]);
++      }
++    }
++    return result;
++  }
++
++  private messageOptionPaths(msg: ReflectMessage): [string, string][] {
++    const result: [string, string][] = [];
++    for (const field of msg.fields) {
++      if (msg.isSet(field)) {
++        for (const value of this.fieldValues(msg, field)) {
++          result.push([field.name, value]);
++        }
++      }
++    }
++    for (const ext of this.setExtensions(msg.message, msg.desc)) {
++      if (ext.message !== undefined && ext.fieldKind === "message") {
++        const sub = reflect(ext.message, getExtension(msg.message, ext) as Message);
++        for (const [name, value] of this.messageOptionPaths(sub)) {
++          result.push([`(${ext.typeName}).${name}`, value]);
++        }
++      } else {
++        for (const value of this.extensionValues(msg.message, ext)) {
++          result.push([`(${ext.typeName})`, value]);
++        }
++      }
++    }
++    return result;
++  }
++
++  private setExtensions(message: Message, desc: DescMessage): DescExtension[] {
++    const seen = new Set<number>();
++    const result: DescExtension[] = [];
++    for (const u of message.$unknown ?? []) {
++      if (seen.has(u.no)) {
++        continue;
++      }
++      seen.add(u.no);
++      const ext = this.registry.getExtensionFor(desc, u.no);
++      if (ext !== undefined) {
++        result.push(ext);
++      }
++    }
++    return result;
++  }
++
++  private extensionValues(message: Message, ext: DescExtension): string[] {
++    const value = getExtension(message, ext);
++    const values = ext.fieldKind === "list" ? (value as unknown[]) : [value];
++    return values.map((v) => this.valueString(ext, v));
++  }
++
++  private fieldValues(msg: ReflectMessage, field: DescField): string[] {
++    const value = msg.get(field);
++    if (field.fieldKind === "list") {
++      const out: string[] = [];
++      for (const item of value as Iterable<unknown>) {
++        out.push(this.valueString(field, item));
++      }
++      return out;
++    }
++    return [this.valueString(field, value)];
++  }
++
++  private valueString(field: DescField | DescExtension, value: unknown): string {
++    const enumDesc = field.enum;
++    if (enumDesc !== undefined) {
++      return enumDesc.values.find((v) => v.number === value)?.name ?? String(value);
++    }
++    const message = field.message;
++    if (message !== undefined) {
++      const m = isReflect(value) ? value.message : (value as Message);
++      const text = toText(message, m, { registry: this.registry }).trimEnd();
++      return text === "" ? "{}" : "{ " + text.split("\n").join(" ") + " }";
++    }
++    if (typeof value === "string") {
++      return quoteProtoString(value);
++    }
++    if (value instanceof Uint8Array) {
++      return quoteProtoBytes(value);
++    }
++    if (typeof value === "number" && !Number.isFinite(value)) {
++      return Number.isNaN(value) ? "nan" : value > 0 ? "inf" : "-inf";
++    }
++    return String(value);
++  }
++}
++
++function isReflect(value: unknown): value is ReflectMessage {
++  return typeof value === "object" && value !== null && "desc" in value && "message" in value;
++}
++
++function fieldTypeName(proto: FieldDescriptorProto): string {
++  switch (proto.type) {
++    case FieldDescriptorProto_Type.MESSAGE:
++    case FieldDescriptorProto_Type.GROUP:
++    case FieldDescriptorProto_Type.ENUM:
++      return proto.typeName;
++    default:
++      return FieldDescriptorProto_Type[proto.type].toLowerCase();
++  }
++}
++
++function defaultValueString(proto: FieldDescriptorProto): string {
++  switch (proto.type) {
++    case FieldDescriptorProto_Type.STRING:
++      return quoteProtoString(proto.defaultValue);
++    case FieldDescriptorProto_Type.BYTES:
++      return `"${proto.defaultValue}"`;
++    default:
++      return proto.defaultValue;
++  }
++}
++
++function quoteProtoString(value: string): string {
++  let out = '"';
++  for (const ch of value) {
++    const code = ch.codePointAt(0) as number;
++    if (ch === '"' || ch === "\\") {
++      out += "\\" + ch;
++    } else if (ch === "\n") {
++      out += "\\n";
++    } else if (code < 0x20 || code === 0x7f) {
++      out += "\\" + code.toString(8).padStart(3, "0");
++    } else {
++      out += ch;
++    }
++  }
++  return out + '"';
++}
++
++function quoteProtoBytes(value: Uint8Array): string {
++  let out = '"';
++  for (const b of value) {
++    if (b === 0x22 || b === 0x5c) {
++      out += "\\" + String.fromCharCode(b);
++    } else if (b >= 0x20 && b < 0x7f) {
++      out += String.fromCharCode(b);
++    } else {
++      out += "\\" + b.toString(8).padStart(3, "0");
++    }
++  }
++  return out + '"';
++}
++
++function rangeString(start: number, endInclusive: number, max: number): string {
++  if (start === endInclusive) {
++    return String(start);
++  }
++  return `${start} to ${endInclusive === max ? "max" : endInclusive}`;
++}
++
++function visibility(v: SymbolVisibility): string {
++  switch (v) {
++    case SymbolVisibility.VISIBILITY_LOCAL:
++      return "local ";
++    case SymbolVisibility.VISIBILITY_EXPORT:
++      return "export ";
++    default:
++      return "";
++  }
++}

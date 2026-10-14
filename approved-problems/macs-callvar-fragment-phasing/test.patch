@@ -1,0 +1,1264 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..1d88001
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,85 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++OUTPUT_PATH="${OUTPUT_PATH:-/tmp/macs3-test-results.xml}"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++rm -f "$OUTPUT_PATH"
++
++cd "$(dirname "$0")"
++export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
++
++NEW_TESTS="test/test_callvar_fragments_38c44a.py"
++
++BUILD_LOG="$(mktemp)"
++python setup.py build_ext --inplace -j "$(nproc)" > "$BUILD_LOG" 2>&1
++BUILD_RC=$?
++
++PYTEST_LOG="$(mktemp)"
++if [ "$MODE" = "new" ]; then
++  python -m pytest -p no:cacheprovider -q "$NEW_TESTS" --junitxml="$OUTPUT_PATH" 2>&1 | tee "$PYTEST_LOG"
++else
++  python -m pytest -p no:cacheprovider -q test --ignore="$NEW_TESTS" --junitxml="$OUTPUT_PATH" 2>&1 | tee "$PYTEST_LOG"
++fi
++TEST_RC=$?
++
++python - "$OUTPUT_PATH" "$BUILD_RC" "$BUILD_LOG" "$MODE" "$PYTEST_LOG" <<'PYEOF'
++import os
++import sys
++import xml.etree.ElementTree as ET
++
++path, build_rc, build_log, mode, pytest_log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
++with open(build_log, errors="replace") as f:
++    log_tail = f.read()[-4000:]
++with open(pytest_log, errors="replace") as f:
++    pytest_tail = f.read()[-4000:]
++
++tree = None
++if os.path.exists(path):
++    try:
++        tree = ET.parse(path)
++    except ET.ParseError:
++        tree = None
++
++cases = tree.getroot().iter("testcase") if tree is not None else []
++cases = list(cases)
++if not cases:
++    root = ET.Element("testsuites")
++    suite = ET.SubElement(root, "testsuite", name="macs3-" + mode, tests="1", failures="1")
++    case = ET.SubElement(suite, "testcase", classname="macs3." + mode, name="test_collection")
++    failure = ET.SubElement(case, "failure", message="no test results were produced")
++    failure.text = "pytest output:\n" + pytest_tail + "\n\nextension build output:\n" + log_tail
++    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
++    sys.exit(1)
++
++for case in cases:
++    case.set("classname", case.get("classname", "").replace("::", "."))
++    case.set("name", case.get("name", "").replace("::", "."))
++    if build_rc != 0:
++        outcome = next((child for child in case if child.tag in ("failure", "error")), None)
++        if outcome is None:
++            for child in [c for c in case if c.tag == "skipped"]:
++                case.remove(child)
++            outcome = ET.SubElement(case, "failure", message="extension build failed")
++            outcome.text = ""
++        outcome.text = (outcome.text or "") + "\n\nextension build failed:\n" + log_tail
++tree.write(path, encoding="utf-8", xml_declaration=True)
++sys.exit(1 if build_rc != 0 else 0)
++PYEOF
++POST_RC=$?
++
++rm -f "$BUILD_LOG" "$PYTEST_LOG"
++if [ "$BUILD_RC" -ne 0 ] || [ "$POST_RC" -ne 0 ]; then
++  exit 1
++fi
++exit "$TEST_RC"
+diff --git a/test/test_callvar_fragments_38c44a.py b/test/test_callvar_fragments_38c44a.py
+new file mode 100644
+index 0000000..e8c3799
+--- /dev/null
++++ b/test/test_callvar_fragments_38c44a.py
+@@ -0,0 +1,1167 @@
++import os
++import random
++import struct
++import subprocess
++import sys
++import zlib
++
++
++REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++MACS3 = [sys.executable, os.path.join(REPO, "bin", "macs3")]
++RL = 60
++CHROM = "chrT"
++CHROM_LEN = 5000
++BAM_CODE = "=ACMGRSVTWYHKDBN"
++EOF_BLOCK = bytes.fromhex("1f8b08040000000000ff0600424302001b0003000000000000000000")
++
++
++def reference(seed=7):
++    rng = random.Random(seed)
++    return "".join(rng.choice("ACGT") for _ in range(CHROM_LEN))
++
++
++REF = reference()
++
++
++def alt(pos, k=1):
++    return "ACGT"[("ACGT".index(REF[pos]) + k) % 4]
++
++
++def bgzf(data):
++    comp = zlib.compressobj(6, zlib.DEFLATED, -15)
++    cdata = comp.compress(data) + comp.flush()
++    head = b"\x1f\x8b\x08\x04\x00\x00\x00\x00\x00\xff" + struct.pack("<H", 6)
++    head += b"BC" + struct.pack("<HH", 2, len(cdata) + 25)
++    return head + cdata + struct.pack("<II", zlib.crc32(data) & 0xFFFFFFFF, len(data))
++
++
++def reg2bin(beg, end):
++    end -= 1
++    for shift, base in ((14, 4681), (17, 585), (20, 73), (23, 9), (26, 1)):
++        if beg >> shift == end >> shift:
++            return base + (beg >> shift)
++    return 0
++
++
++class Read:
++    def __init__(self, start, strand, bases, quals, ops=None):
++        self.start = start
++        self.strand = strand
++        self.bases = bases
++        self.quals = quals
++        self.ops = ops or [("M", RL)]
++
++    def encode(self):
++        seq, qual, cigar, md = [], [], [], []
++        run = 0
++        pos = self.start
++        for op, arg in self.ops:
++            if op == "M":
++                for _ in range(arg):
++                    b = self.bases.get(pos, REF[pos])
++                    seq.append(b)
++                    qual.append(self.quals.get(pos, 30))
++                    if b == REF[pos]:
++                        run += 1
++                    else:
++                        md += [str(run), REF[pos]]
++                        run = 0
++                    pos += 1
++                cigar.append((arg, 0))
++            elif op == "I":
++                seq.extend(arg)
++                qual.extend([30] * len(arg))
++                cigar.append((len(arg), 1))
++            elif op == "D":
++                md += [str(run), "^" + REF[pos:pos + arg]]
++                run = 0
++                pos += arg
++                cigar.append((arg, 2))
++        md.append(str(run))
++        return "".join(seq), qual, cigar, "".join(md), pos
++
++    def end(self):
++        return self.encode()[4]
++
++    def covers(self, pos):
++        return self.start <= pos < self.end()
++
++    def deleted(self, pos):
++        ref = self.start
++        for op, arg in self.ops:
++            if op == "D" and ref <= pos < ref + arg:
++                return True
++            if op in ("M", "D"):
++                ref += arg
++        return False
++
++
++class Fragment:
++    def __init__(self, name, reads, unpaired=False):
++        self.name = name
++        self.reads = reads
++        self.unpaired = unpaired
++
++    def observe(self, pos, q=20):
++        seen = []
++        for r in self.reads:
++            if r.covers(pos) and r.deleted(pos):
++                seen.append(("*", 93, r.strand))
++            elif r.covers(pos) and r.quals.get(pos, 30) > q:
++                seen.append((r.bases.get(pos, REF[pos]), r.quals.get(pos, 30), r.strand))
++        if not seen or len({s[0] for s in seen}) > 1:
++            return None
++        return max(seen, key=lambda s: (s[1], -s[2]))
++
++
++def pair(name, left, flen, hap, first_forward=True, bases1=None, bases2=None,
++         quals1=None, quals2=None, ops1=None, ops2=None):
++    b1 = dict(hap)
++    b1.update(bases1 or {})
++    b2 = dict(hap)
++    b2.update(bases2 or {})
++    r1 = Read(left, 0, b1, quals1 or {}, ops1)
++    r2 = Read(left + flen - RL, 1, b2, quals2 or {}, ops2)
++    r1.first = first_forward
++    r2.first = not first_forward
++    return Fragment(name, [r1, r2])
++
++
++def encode_record(name, read, mate, ref_id=0):
++    seq, qual, cigar, md, end = read.encode()
++    rname = name.encode() + b"\0"
++    packed = bytearray()
++    for i in range(0, len(seq), 2):
++        hi = BAM_CODE.index(seq[i])
++        lo = BAM_CODE.index(seq[i + 1]) if i + 1 < len(seq) else 0
++        packed.append(hi << 4 | lo)
++    flag = 16 if read.strand else 0
++    next_ref, next_pos, tlen = -1, -1, 0
++    if mate is not None:
++        flag |= 1 | 2 | (32 if mate.strand else 0) | (64 if read.first else 128)
++        lo_ = min(read.start, mate.start)
++        hi_ = max(end, mate.end())
++        next_ref, next_pos = ref_id, mate.start
++        tlen = hi_ - lo_ if read.start <= mate.start else lo_ - hi_
++    body = struct.pack("<iiBBHHHiiii", ref_id, read.start, len(rname), 60, reg2bin(read.start, end),
++                       len(cigar), flag, len(seq), next_ref, next_pos, tlen)
++    body += rname + b"".join(struct.pack("<I", n << 4 | op) for n, op in cigar)
++    body += bytes(packed) + bytes(qual) + b"MDZ" + md.encode() + b"\0"
++    return read.start, end, struct.pack("<i", len(body)) + body
++
++
++def write_bam(path, fragments, contigs=(CHROM,)):
++    records = []
++    for frag in fragments:
++        ref_id = contigs.index(getattr(frag, "contig", CHROM))
++        for r in frag.reads:
++            mate = [m for m in frag.reads if m is not r]
++            records.append((ref_id,) + encode_record(frag.name, r, mate[0] if mate and not frag.unpaired else None, ref_id))
++    records.sort(key=lambda r: (r[0], r[1], r[2]))
++    text = b"@HD\tVN:1.6\tSO:coordinate\n" + b"".join(b"@SQ\tSN:%s\tLN:%d\n" % (c.encode(), CHROM_LEN) for c in contigs)
++    header = b"BAM\1" + struct.pack("<i", len(text)) + text + struct.pack("<i", len(contigs))
++    for c in contigs:
++        header += struct.pack("<i", len(c) + 1) + c.encode() + b"\0" + struct.pack("<i", CHROM_LEN)
++    out = bytearray(bgzf(header))
++    offsets = []
++    for ref_id in range(len(contigs)):
++        block = bytearray()
++        coffset = len(out)
++        for rid, beg, end, raw in records:
++            if rid == ref_id:
++                offsets.append((ref_id, coffset << 16 | len(block), beg, end, len(raw)))
++                block.extend(raw)
++        if block:
++            out.extend(bgzf(bytes(block)))
++    out.extend(EOF_BLOCK)
++    with open(path, "wb") as f:
++        f.write(bytes(out))
++    bai = bytearray(b"BAI\1" + struct.pack("<i", len(contigs)))
++    for ref_id in range(len(contigs)):
++        bins, linear, spans = {}, {}, []
++        for rid, uoff, beg, end, blen in offsets:
++            if rid != ref_id:
++                continue
++            v0, v1 = uoff, uoff + blen
++            spans.append((v0, v1))
++            chunks = bins.setdefault(reg2bin(beg, end), [])
++            if chunks and chunks[-1][1] == v0:
++                chunks[-1][1] = v1
++            else:
++                chunks.append([v0, v1])
++            for w in range(beg >> 14, ((end - 1) >> 14) + 1):
++                linear.setdefault(w, v0)
++        if not spans:
++            bai += struct.pack("<ii", 0, 0)
++            continue
++        bai += struct.pack("<i", len(bins) + 1)
++        for b, chunks in sorted(bins.items()):
++            bai += struct.pack("<Ii", b, len(chunks))
++            for v0, v1 in chunks:
++                bai += struct.pack("<QQ", v0, v1)
++        bai += struct.pack("<Ii", 37450, 2) + struct.pack("<QQQQ", spans[0][0], spans[-1][1], len(spans), 0)
++        bai += struct.pack("<i", max(linear) + 1)
++        for w in range(max(linear) + 1):
++            bai += struct.pack("<Q", linear.get(w, spans[0][0]))
++    bai += struct.pack("<Q", 0)
++    with open(path + ".bai", "wb") as f:
++        f.write(bytes(bai))
++
++
++def callvar(tmp_path, treat, peaks, ctrl=None, extra=("--pair-aware", "-F", "off"), contigs=(CHROM,)):
++    tfile = os.path.join(str(tmp_path), "t.bam")
++    write_bam(tfile, treat, contigs)
++    bed = os.path.join(str(tmp_path), "peaks.bed")
++    with open(bed, "w") as f:
++        for peak in peaks:
++            chrom, s, e = peak if len(peak) == 3 else (CHROM,) + tuple(peak)
++            f.write("%s\t%d\t%d\n" % (chrom, s, e))
++    out = os.path.join(str(tmp_path), "out.vcf")
++    cmd = MACS3 + ["callvar", "-b", bed, "-t", tfile, "-o", out, "-D", "100"] + list(extra)
++    if ctrl is not None:
++        cfile = os.path.join(str(tmp_path), "c.bam")
++        write_bam(cfile, ctrl, contigs)
++        cmd += ["-c", cfile]
++    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(tmp_path))
++    assert proc.returncode == 0, proc.stderr[-3000:]
++    rows = {}
++    with open(out) as f:
++        for line in f:
++            if line.startswith("#") or not line.strip():
++                continue
++            fs = line.rstrip("\n").split("\t")
++            info = dict(kv.split("=", 1) for kv in fs[7].split(";") if "=" in kv)
++            sample = dict(zip(fs[8].split(":"), fs[9].split(":")))
++            rows[int(fs[1]) - 1] = {"ref": fs[3], "alt": fs[4], "info": info,
++                                    "format": fs[8], "sample": sample}
++    return rows
++
++
++def depth(info, key):
++    return int("".join(c for c in info[key] if c.isdigit()))
++
++
++def n_edits(read):
++    seq, _, cigar, md, _ = read.encode()
++    return sum(1 for c in md if c.isalpha()) + sum(n for n, op in cigar if op == 1)
++
++
++def kept(fragments, others=()):
++    edits = sorted(n_edits(r) for f in list(fragments) + list(others) for r in f.reads)
++    cutoff = edits[int(len(edits) * 0.95)]
++    return [Fragment(f.name, [r for r in f.reads if n_edits(r) <= cutoff]) for f in fragments]
++
++
++def expected_counts(fragments, pos, others=(), q=20):
++    counts = {}
++    for frag in kept(fragments, others):
++        obs = frag.observe(pos, q)
++        if obs is not None:
++            counts[obs[0]] = counts.get(obs[0], 0) + 1
++    return counts
++
++
++def two_site_fragments(n, sites, haps, seed, flens=(80, 90, 100, 150, 170), window=(1100, 1190)):
++    rng = random.Random(seed)
++    frags = []
++    for i in range(n):
++        hap = haps[i % len(haps)]
++        left = rng.randint(*window)
++        frags.append(pair("f%03d" % i, left, rng.choice(flens), hap, first_forward=bool(i % 3)))
++    return frags
++
++
++S1, S2 = 1200, 1240
++HAP_A = {S1: alt(S1)}
++HAP_B = {S2: alt(S2)}
++
++
++def test_overlapping_mates_count_once_per_site(tmp_path):
++    frags = two_site_fragments(40, (S1, S2), [HAP_A, HAP_B], seed=3)
++    rows = callvar(tmp_path, frags, [(1100, 1400)], extra=("--pair-aware", "-F", "off"))
++    for site in (S1, S2):
++        want = expected_counts(frags, site)
++        info = rows[site]["info"]
++        assert depth(info, "DPT") == sum(want.values())
++        got = {info["DP1T"].lstrip("0123456789"): depth(info, "DP1T"),
++               info["DP2T"].lstrip("0123456789"): depth(info, "DP2T")}
++        assert got == want
++        assert int(rows[site]["sample"]["DP"]) == sum(want.values())
++
++
++def test_mates_that_disagree_contribute_nothing(tmp_path):
++    frags = two_site_fragments(40, (S1, S2), [HAP_A, HAP_B], seed=11, flens=(80, 90))
++    both = [f for f in frags if all(r.covers(S1) for r in f.reads)]
++    assert len(both) >= 6
++    for frag in both[:6]:
++        frag.reads[1].bases[S1] = alt(S1, 2)
++    rows = callvar(tmp_path, frags, [(1100, 1400)], extra=("--pair-aware", "-F", "off"))
++    want = expected_counts(frags, S1)
++    assert alt(S1, 2) not in want
++    info = rows[S1]["info"]
++    assert depth(info, "DPT") == sum(want.values())
++    got = {info["DP1T"].lstrip("0123456789"): depth(info, "DP1T"),
++           info["DP2T"].lstrip("0123456789"): depth(info, "DP2T")}
++    assert got == want
++
++
++def test_low_quality_mate_is_ignored_for_the_fragment(tmp_path):
++    frags = two_site_fragments(40, (S1, S2), [HAP_A, HAP_B], seed=12, flens=(80, 90))
++    both = [f for f in frags if all(r.covers(S1) for r in f.reads)]
++    assert len(both) >= 8
++    for frag in both[:8]:
++        frag.reads[1].bases[S1] = alt(S1, 2)
++        frag.reads[1].quals[S1] = 12
++    rows = callvar(tmp_path, frags, [(1100, 1400)], extra=("--pair-aware", "-F", "off"))
++    want = expected_counts(frags, S1)
++    info = rows[S1]["info"]
++    assert depth(info, "DPT") == sum(want.values())
++    assert sorted([depth(info, "DP1T"), depth(info, "DP2T")]) == sorted(want.values())
++
++
++def test_custom_quality_cutoff_ignores_mates_at_the_cutoff(tmp_path):
++    frags = two_site_fragments(40, (S1, S2), [HAP_A, HAP_B], seed=12, flens=(80, 90))
++    for frag in frags:
++        for r in frag.reads:
++            r.quals.update({S1: 35, S2: 35})
++    both = [f for f in frags if all(r.covers(S1) for r in f.reads)]
++    assert len(both) >= 10
++    for i, frag in enumerate(both[:10]):
++        frag.reads[1].bases[S1] = alt(S1, 2)
++        frag.reads[1].quals[S1] = 30 if i % 2 else 31
++    rows = callvar(tmp_path, frags, [(1100, 1400)], extra=("--pair-aware", "-F", "off", "-Q", "30"))
++    want = {}
++    for frag in kept(frags):
++        obs = frag.observe(S1, q=30)
++        if obs is not None:
++            want[obs[0]] = want.get(obs[0], 0) + 1
++    info = rows[S1]["info"]
++    assert depth(info, "DPT") == sum(want.values())
++    assert sorted([depth(info, "DP1T"), depth(info, "DP2T")]) == sorted(want.values())
++
++
++def test_opposite_alleles_phase_in_trans(tmp_path):
++    frags = two_site_fragments(40, (S1, S2), [HAP_A, HAP_B], seed=3)
++    rows = callvar(tmp_path, frags, [(1100, 1400)], extra=("--pair-aware", "-F", "off"))
++    assert rows[S1]["format"] == rows[S2]["format"] == "GT:DP:GQ:PL:PS"
++    assert rows[S1]["sample"]["GT"] == "0|1"
++    assert rows[S2]["sample"]["GT"] == "1|0"
++    assert rows[S1]["sample"]["PS"] == rows[S2]["sample"]["PS"] == str(S1 + 1)
++
++
++def test_shared_alleles_phase_in_cis(tmp_path):
++    hap = {S1: alt(S1), S2: alt(S2)}
++    frags = two_site_fragments(40, (S1, S2), [hap, {}], seed=5)
++    rows = callvar(tmp_path, frags, [(1100, 1400)], extra=("--pair-aware", "-F", "off"))
++    assert rows[S1]["sample"]["GT"] == "0|1"
++    assert rows[S2]["sample"]["GT"] == "0|1"
++    assert rows[S2]["sample"]["PS"] == str(S1 + 1)
++
++
++def block_haplotypes(frags, lefts):
++    hap1, hap2 = [], []
++    for frag in frags:
++        sides = set()
++        best = 0
++        for entry in lefts:
++            site, left = entry[:2]
++            called = entry[2] if len(entry) > 2 else (REF[site], alt(site))
++            obs = frag.observe(site)
++            if obs is None:
++                continue
++            if obs[0] not in called:
++                sides.add(2)
++            else:
++                sides.add(0 if obs[0] == left else 1)
++            best = max(best, obs[1])
++        if sides == {0}:
++            hap1.append(best)
++        elif sides == {1}:
++            hap2.append(best)
++    return hap1, hap2
++
++
++def test_block_ratio_is_the_first_haplotype_share(tmp_path):
++    frags = two_site_fragments(48, (S1, S2), [HAP_A, HAP_A, HAP_A, HAP_B], seed=8)
++    rows = callvar(tmp_path, frags, [(1100, 1400)], extra=("--pair-aware", "-F", "off"))
++    hap1, hap2 = block_haplotypes(kept(frags), ((S1, REF[S1]), (S2, alt(S2))))
++    assert rows[S1]["sample"]["GT"] == "0|1"
++    for site in (S1, S2):
++        assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def test_uncalled_allele_keeps_fragment_out_of_both_haplotypes(tmp_path):
++    frags = two_site_fragments(48, (S1, S2), [HAP_A, HAP_A, HAP_A, HAP_B], seed=8)
++    for i, (left, flen) in enumerate(((1146, 118), (1152, 116), (1160, 104), (1167, 101), (1174, 89))):
++        frags.append(pair("u%02d" % i, left, flen, HAP_B, first_forward=bool(i % 2),
++                          bases1={S1: alt(S1, 2)}))
++    rows = callvar(tmp_path, frags, [(1100, 1400)], extra=("--pair-aware", "-F", "off"))
++    hap1, hap2 = block_haplotypes(kept(frags), ((S1, REF[S1]), (S2, alt(S2))))
++    assert rows[S1]["sample"]["GT"] == "0|1"
++    assert rows[S2]["sample"]["GT"] == "1|0"
++    for site in (S1, S2):
++        assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def spanning(prefix, groups, lefts, flen=200):
++    frags = []
++    for hap, n in groups:
++        for _ in range(n):
++            i = len(frags)
++            frags.append(pair("%s%03d" % (prefix, i), lefts[i % len(lefts)], flen, hap,
++                              first_forward=bool(i % 2)))
++    return frags
++
++
++def test_even_split_leaves_calls_unjoined(tmp_path):
++    s3 = 1280
++    frags = spanning("a", [({S1: alt(S1), S2: alt(S2)}, 8), ({}, 8), (HAP_A, 8), (HAP_B, 8)],
++                     range(1185, 1196))
++    frags += spanning("b", [({S2: alt(S2), s3: alt(s3)}, 10), ({}, 10)], range(1225, 1236))
++    rows = callvar(tmp_path, frags, [(1100, 1450)], extra=("--pair-aware", "-F", "off"))
++    assert rows[S1]["sample"]["GT"] == "0/1"
++    assert rows[S1]["format"] == "GT:DP:GQ:PL"
++    assert "BAR" not in rows[S1]["info"]
++    assert rows[S2]["sample"]["GT"] == "0|1"
++    assert rows[s3]["sample"]["GT"] == "0|1"
++    assert rows[S2]["sample"]["PS"] == rows[s3]["sample"]["PS"] == str(S2 + 1)
++
++
++def test_control_fragments_vote_with_treatment(tmp_path):
++    treat = spanning("f", [({S1: alt(S1), S2: alt(S2)}, 5), ({}, 5), (HAP_A, 5), (HAP_B, 5)],
++                     range(1185, 1196))
++    ctrl = spanning("f", [(HAP_A, 7), (HAP_B, 7)], range(1185, 1196))
++    rows = callvar(tmp_path, treat, [(1100, 1400)], ctrl=ctrl, extra=("--pair-aware", "-F", "off"))
++    assert rows[S1]["sample"]["GT"] == "0|1"
++    assert rows[S2]["sample"]["GT"] == "1|0"
++    assert rows[S2]["sample"]["PS"] == str(S1 + 1)
++    lefts = ((S1, REF[S1]), (S2, alt(S2)))
++    hap1, hap2 = block_haplotypes(kept(treat, ctrl), lefts)
++    for site in (S1, S2):
++        assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def test_block_ratio_counts_treatment_fragments_only(tmp_path):
++    treat = spanning("f", [({S1: alt(S1), S2: alt(S2)}, 5), ({}, 5), (HAP_A, 5), (HAP_B, 5)],
++                     range(1185, 1196))
++    ctrl = spanning("f", [(HAP_A, 12), (HAP_B, 3)], range(1185, 1196))
++    rows = callvar(tmp_path, treat, [(1100, 1400)], ctrl=ctrl, extra=("--pair-aware", "-F", "off"))
++    assert rows[S1]["sample"]["GT"] == "0|1" and rows[S2]["sample"]["GT"] == "1|0"
++    lefts = ((S1, REF[S1]), (S2, alt(S2)))
++    hap1, hap2 = block_haplotypes(kept(treat, ctrl), lefts)
++    ctrl1, ctrl2 = block_haplotypes(kept(ctrl, treat), lefts)
++    assert len(hap1) == len(hap2) and len(ctrl1) != len(ctrl2)
++    for site in (S1, S2):
++        assert rows[site]["info"]["BAR"] == "0.50"
++
++
++def test_control_mates_count_once_per_site(tmp_path):
++    treat = two_site_fragments(40, (S1, S2), [HAP_A, HAP_B], seed=3, flens=(80, 90, 100))
++    ctrl = spanning("c", [(HAP_A, 12), ({}, 12)], range(1150, 1171), flen=90)
++    assert all(r.covers(S1) for f in ctrl for r in f.reads)
++    for f in ctrl[:2] + ctrl[12:14]:
++        f.reads[1].bases[S1] = alt(S1, 2)
++    for f in ctrl[2:4] + ctrl[14:16]:
++        f.reads[1].quals[S1] = 12
++    rows = callvar(tmp_path, treat, [(1100, 1400)], ctrl=ctrl)
++    assert all(len(f.reads) == 2 for f in kept(ctrl, treat))
++    want = expected_counts(ctrl, S1, others=treat)
++    covering = sum(r.covers(S1) for f in ctrl for r in f.reads)
++    assert sum(want.values()) < covering
++    info = rows[S1]["info"]
++    assert depth(info, "DPC") == sum(want.values())
++    got = {info["DP1C"].lstrip("0123456789"): depth(info, "DP1C"),
++           info["DP2C"].lstrip("0123456789"): depth(info, "DP2C")}
++    assert got == want
++
++
++def test_two_alt_call_stays_out_of_the_block(tmp_path):
++    a1, a2 = alt(S1, 1), alt(S1, 2)
++    frags = spanning("f", [({S1: a1, S2: alt(S2)}, 16), ({S1: a2}, 12)], range(1185, 1196))
++    frags += spanning("g", [({S2: alt(S2), C3: alt(C3)}, 10), ({}, 10)], range(1235, 1246), flen=120)
++    rows = callvar(tmp_path, frags, [(1100, 1400)])
++    assert rows[S1]["sample"]["GT"] == "1/2" and rows[S1]["format"] == "GT:DP:GQ:PL"
++    assert "BAR" not in rows[S1]["info"]
++    assert rows[S2]["sample"]["GT"] == rows[C3]["sample"]["GT"] == "0|1"
++    assert rows[S2]["sample"]["PS"] == rows[C3]["sample"]["PS"] == str(S2 + 1)
++
++
++def test_outlier_read_leaves_its_mate_counted(tmp_path):
++    frags = two_site_fragments(40, (S1, S2), [HAP_A, HAP_B], seed=3)
++    for i, left in enumerate((1150, 1156, 1162, 1168)):
++        noisy = {p: alt(p) for p in range(left + 170, left + 200, 5)}
++        frags.append(pair("n%02d" % i, left, 220, HAP_A, bases2=noisy))
++    rows = callvar(tmp_path, frags, [(1100, 1450)], extra=("--pair-aware", "-F", "off"))
++    want = expected_counts(frags, S1)
++    assert all(len(f.reads) == 1 for f in kept(frags)[40:])
++    info = rows[S1]["info"]
++    assert depth(info, "DPT") == sum(want.values())
++    got = {info["DP1T"].lstrip("0123456789"): depth(info, "DP1T"),
++           info["DP2T"].lstrip("0123456789"): depth(info, "DP2T")}
++    assert got == want
++
++
++def test_duplicate_limit_drops_reads_not_fragments(tmp_path):
++    frags = spanning("f", [(HAP_A, 10), ({}, 10)], range(1150, 1170), flen=100)
++    copies = [pair("d%02d" % i, 1171, 150 + 5 * i, HAP_A) for i in range(4)]
++    rows = callvar(tmp_path, frags + copies, [(1100, 1400)], extra=("--pair-aware", "-F", "off", "-D", "1"))
++    want = expected_counts(frags + copies[:1] + [Fragment(f.name, f.reads[1:]) for f in copies[1:]], S1)
++    assert want == {REF[S1]: 10, alt(S1): 11}
++    info = rows[S1]["info"]
++    got = {info["DP1T"].lstrip("0123456789"): depth(info, "DP1T"),
++           info["DP2T"].lstrip("0123456789"): depth(info, "DP2T")}
++    assert got == want
++
++
++def test_agreeing_mates_use_their_best_base_quality(tmp_path):
++    def build(low):
++        frags = []
++        for i in range(30):
++            left = 1150 + i % 20
++            q1, q2 = (low, 35) if i % 2 else (35, low)
++            frags.append(pair("f%03d" % i, left, 90, HAP_A if i % 3 else {}, first_forward=bool(i % 4),
++                              quals1={S1: q1}, quals2={S1: q2}))
++        return frags
++    mixed = callvar(tmp_path, build(25), [(1100, 1400)], extra=("--pair-aware", "-F", "off"))[S1]
++    best = callvar(tmp_path, build(35), [(1100, 1400)], extra=("--pair-aware", "-F", "off"))[S1]
++    for key in ("DPT", "DP1T", "DP2T", "DBIC", "BICHOMOMAJOR", "BICHOMOMINOR", "BICHETERNOAS", "BICHETERAS", "AR"):
++        assert mixed["info"][key] == best["info"][key]
++    for key in ("GT", "GQ", "PL"):
++        assert mixed["sample"][key] == best["sample"][key]
++
++
++def test_uncalled_allele_does_not_vote_on_a_close_join(tmp_path):
++    frags = spanning("f", [(HAP_A, 4), (HAP_B, 4), ({S1: alt(S1), S2: alt(S2)}, 4), ({}, 3),
++                           ({S1: alt(S1, 2), S2: alt(S2)}, 3)], range(1185, 1196))
++    rows = callvar(tmp_path, frags, [(1100, 1400)], extra=("--pair-aware", "-F", "off"))
++    assert rows[S1]["sample"]["GT"] == "0|1"
++    assert rows[S2]["sample"]["GT"] == "1|0"
++    assert rows[S2]["sample"]["PS"] == str(S1 + 1)
++
++
++def test_three_call_block_is_annotated_as_one_block(tmp_path):
++    s3 = 1280
++    groups = [({S1: alt(S1), S2: alt(S2)}, 12), ({s3: alt(s3)}, 12), ({}, 6)]
++    frags = spanning("f", groups, range(1185, 1196), flen=120)
++    rows = callvar(tmp_path, frags, [(1100, 1400)], extra=("--pair-aware", "-F", "off"))
++    assert [rows[p]["sample"]["GT"] for p in (S1, S2, s3)] == ["0|1", "0|1", "1|0"]
++    assert {rows[p]["format"] for p in (S1, S2, s3)} == {"GT:DP:GQ:PL:PS"}
++    hap1, hap2 = block_haplotypes(kept(frags), ((S1, REF[S1]), (S2, REF[S2]), (s3, alt(s3))))
++    for site in (S1, S2, s3):
++        assert rows[site]["sample"]["PS"] == str(S1 + 1)
++        assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def test_homozygous_call_stays_out_of_the_block(tmp_path):
++    mid = 1220
++    frags = spanning("f", [({**HAP_A, mid: alt(mid)}, 10), ({**HAP_B, mid: alt(mid)}, 10)], range(1185, 1196))
++    rows = callvar(tmp_path, frags, [(1100, 1400)], extra=("--pair-aware", "-F", "off"))
++    assert rows[mid]["sample"]["GT"] == "1/1"
++    assert rows[mid]["format"] == "GT:DP:GQ:PL"
++    assert "BAR" not in rows[mid]["info"]
++    assert rows[S1]["sample"]["GT"] == "0|1"
++    assert rows[S2]["sample"]["GT"] == "1|0"
++    assert rows[S2]["sample"]["PS"] == str(S1 + 1)
++
++
++def test_phase_block_spans_adjacent_peaks(tmp_path):
++    frags = spanning("f", [(HAP_A, 10), (HAP_B, 10)], range(1185, 1196))
++    rows = callvar(tmp_path, frags, [(1100, 1220), (1220, 1400)], extra=("--pair-aware", "-F", "off"))
++    assert rows[S1]["sample"]["GT"] == "0|1" and rows[S2]["sample"]["GT"] == "1|0"
++    assert rows[S1]["sample"]["PS"] == rows[S2]["sample"]["PS"] == str(S1 + 1)
++    hap1, hap2 = block_haplotypes(frags, ((S1, REF[S1]), (S2, alt(S2))))
++    for site in (S1, S2):
++        assert rows[site]["format"] == "GT:DP:GQ:PL:PS"
++        assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++C3, C4 = 1300, 1340
++
++
++def test_mates_link_calls_across_an_unlinked_call(tmp_path):
++    frags = spanning("x", [({S1: alt(S1)}, 8), ({C3: alt(C3)}, 8)], range(1150, 1171, 2), flen=170)
++    frags += spanning("y", [({S2: alt(S2)}, 8), ({}, 8)], range(1205, 1216))
++    rows = callvar(tmp_path, frags, [(1100, 1450)], extra=("--pair-aware", "-F", "off"))
++    assert rows[S2]["sample"]["GT"] == "0/1"
++    assert rows[S2]["format"] == "GT:DP:GQ:PL"
++    assert rows[S1]["sample"]["GT"] == "0|1"
++    assert rows[C3]["sample"]["GT"] == "1|0"
++    assert rows[S1]["sample"]["PS"] == rows[C3]["sample"]["PS"] == str(S1 + 1)
++    hap1, hap2 = block_haplotypes(kept(frags), ((S1, REF[S1]), (C3, alt(C3))))
++    for site in (S1, C3):
++        assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def test_interleaved_blocks_keep_their_own_phase_sets(tmp_path):
++    frags = spanning("x", [({S1: alt(S1)}, 9), ({C3: alt(C3)}, 9)], range(1150, 1171, 2), flen=170)
++    frags += spanning("y", [({S2: alt(S2), C4: alt(C4)}, 6), ({}, 10)], range(1205, 1216), flen=160)
++    rows = callvar(tmp_path, frags, [(1100, 1450)], extra=("--pair-aware", "-F", "off"))
++    assert [rows[p]["sample"]["GT"] for p in (S1, S2, C3, C4)] == ["0|1", "0|1", "1|0", "0|1"]
++    assert rows[S1]["sample"]["PS"] == rows[C3]["sample"]["PS"] == str(S1 + 1)
++    assert rows[S2]["sample"]["PS"] == rows[C4]["sample"]["PS"] == str(S2 + 1)
++    for block, lefts in (((S1, C3), ((S1, REF[S1]), (C3, alt(C3)))), ((S2, C4), ((S2, REF[S2]), (C4, REF[C4])))):
++        hap1, hap2 = block_haplotypes(kept(frags), lefts)
++        for site in block:
++            assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def test_call_joins_its_nearest_linked_call(tmp_path):
++    frags = spanning("a", [({S1: alt(S1), S2: alt(S2)}, 6), ({}, 6)], range(1185, 1196))
++    frags += spanning("b", [({S2: alt(S2)}, 3), ({C3: alt(C3)}, 2)], range(1205, 1216), flen=120)
++    frags += spanning("c", [({S1: alt(S1), C3: alt(C3)}, 8), ({}, 8)], range(1150, 1171, 2), flen=170)
++    rows = callvar(tmp_path, frags, [(1100, 1450)], extra=("--pair-aware", "-F", "off"))
++    assert [rows[p]["sample"]["GT"] for p in (S1, S2, C3)] == ["0|1", "0|1", "1|0"]
++    assert rows[S1]["sample"]["PS"] == rows[S2]["sample"]["PS"] == rows[C3]["sample"]["PS"] == str(S1 + 1)
++    hap1, hap2 = block_haplotypes(kept(frags), ((S1, REF[S1]), (S2, REF[S2]), (C3, alt(C3))))
++    for site in (S1, S2, C3):
++        assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def test_call_takes_its_order_from_the_call_it_joined(tmp_path):
++    frags = spanning("b", [({S1: alt(S1), S2: alt(S2)}, 6), ({}, 6)], range(1185, 1196), flen=100)
++    frags += spanning("c", [({S2: alt(S2)}, 5), ({C3: alt(C3)}, 5)], range(1205, 1216), flen=120)
++    frags += spanning("y", [({S2: alt(S2), C4: alt(C4)}, 5), ({}, 5)], range(1205, 1216), flen=160)
++    rows = callvar(tmp_path, frags, [(1100, 1450)], extra=("--pair-aware", "-F", "off"))
++    assert [rows[p]["sample"]["GT"] for p in (S1, S2, C3, C4)] == ["0|1", "0|1", "1|0", "0|1"]
++    assert {rows[p]["sample"]["PS"] for p in (S1, S2, C3, C4)} == {str(S1 + 1)}
++    hap1, hap2 = block_haplotypes(kept(frags), ((S1, REF[S1]), (S2, REF[S2]), (C3, alt(C3)), (C4, REF[C4])))
++    for site in (S1, S2, C3, C4):
++        assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def test_disagreeing_mates_leave_only_that_site_out(tmp_path):
++    frags = spanning("f", [(HAP_A, 10), (HAP_B, 10), (HAP_A, 6)], range(1185, 1196), flen=100)
++    for frag in frags[20:]:
++        frag.reads[1].bases[S2] = alt(S2)
++    rows = callvar(tmp_path, frags, [(1100, 1400)], extra=("--pair-aware", "-F", "off"))
++    assert rows[S1]["sample"]["GT"] == "0|1" and rows[S2]["sample"]["GT"] == "1|0"
++    hap1, hap2 = block_haplotypes(kept(frags), ((S1, REF[S1]), (S2, alt(S2))))
++    assert len(hap2) == 16
++    for site in (S1, S2):
++        assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def test_mixed_side_fragment_joins_neither_haplotype(tmp_path):
++    frags = spanning("f", [(HAP_A, 10), (HAP_B, 10), ({S1: alt(S1), S2: alt(S2)}, 4)], range(1185, 1196))
++    rows = callvar(tmp_path, frags, [(1100, 1400)], extra=("--pair-aware", "-F", "off"))
++    assert rows[S1]["sample"]["GT"] == "0|1" and rows[S2]["sample"]["GT"] == "1|0"
++    hap1, hap2 = block_haplotypes(kept(frags), ((S1, REF[S1]), (S2, alt(S2))))
++    assert len(hap1) + len(hap2) == 20
++    for site in (S1, S2):
++        assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def test_reference_biased_call_counts_fragments(tmp_path):
++    frags = []
++    for i in range(92):
++        hap = {S1: alt(S1)} if i < 12 else {}
++        if i % 2:
++            hap = {**hap, S2: alt(S2)}
++        frags.append(pair("f%03d" % i, 1150 + i % 30, 80, hap, first_forward=bool(i % 3)))
++    rows = callvar(tmp_path, frags, [(1100, 1400)])
++    info = rows[S1]["info"]
++    want = expected_counts(frags, S1)
++    assert depth(info, "DPT") == sum(want.values())
++    got = {info["DP1T"].lstrip("0123456789"): depth(info, "DP1T"),
++           info["DP2T"].lstrip("0123456789"): depth(info, "DP2T")}
++    assert got == want
++    assert rows[S1]["sample"]["GT"] == "0|1" and rows[S2]["sample"]["GT"] == "1|0"
++    assert rows[S2]["sample"]["PS"] == str(S1 + 1)
++
++
++def in_peak(fragments, peak):
++    return [Fragment(f.name, [r for r in f.reads if r.start <= peak[1] and r.end() > peak[0]]) for f in fragments]
++
++
++def test_unpaired_reads_sharing_a_name_form_one_fragment(tmp_path):
++    frags = two_site_fragments(40, (S1, S2), [HAP_A, HAP_B], seed=3)
++    agree = Fragment("n0", [Read(1170, 0, {S1: alt(S1)}, {}), Read(1180, 1, {S1: alt(S1)}, {}),
++                            Read(1190, 0, {S1: alt(S1)}, {S1: 37})], unpaired=True)
++    disagree = Fragment("n1", [Read(1175, 0, {S1: alt(S1)}, {}), Read(1185, 1, {}, {})], unpaired=True)
++    frags += [agree, disagree]
++    rows = callvar(tmp_path, frags, [(1100, 1400)], extra=("--pair-aware", "-F", "off"))
++    want = expected_counts(frags, S1)
++    info = rows[S1]["info"]
++    assert depth(info, "DPT") == sum(want.values())
++    assert sorted([depth(info, "DP1T"), depth(info, "DP2T")]) == sorted(want.values())
++
++
++INS_POS, INS = 1300, "GT"
++
++
++def insertion_ops(start, carries):
++    k = INS_POS - start
++    if carries and 5 < k < RL - len(INS) - 5:
++        return [("M", k), ("I", INS), ("M", RL - k - len(INS))]
++    return None
++
++
++def indel_fragments():
++    rng = random.Random(5)
++    frags = []
++    for i in range(60):
++        carries = i % 2 == 0
++        hap = HAP_A if carries else HAP_B
++        left = rng.randint(1100, 1300)
++        flen = rng.choice([90, 100, 110, 150, 170])
++        frags.append(pair("f%03d" % i, left, flen, hap, first_forward=bool(i % 3),
++                          ops1=insertion_ops(left, carries),
++                          ops2=insertion_ops(left + flen - RL, carries)))
++    return frags
++
++
++def test_insertion_joins_the_phase_block(tmp_path):
++    frags = indel_fragments()
++    rows = callvar(tmp_path, frags, [(1100, 1450)])
++    for site in (S1, S2):
++        assert depth(rows[site]["info"], "DPT") == sum(expected_counts(frags, site).values())
++    assert rows[S1]["sample"]["GT"] == "0|1"
++    assert rows[S2]["sample"]["GT"] == "1|0"
++    assert rows[S2]["sample"]["PS"] == str(S1 + 1)
++    ins = [p for p, r in rows.items() if len(r["alt"]) > len(r["ref"])]
++    assert len(ins) == 1
++    row = rows[ins[0]]
++    assert row["sample"]["GT"] == "0|1"
++    assert row["format"] == "GT:DP:GQ:PL:PS"
++    assert row["sample"]["PS"] == str(S1 + 1)
++    assert row["info"]["BAR"] == rows[S1]["info"]["BAR"]
++
++
++def deletion_fragments(seed=1):
++    rng = random.Random(seed)
++    frags = []
++    for i in range(60):
++        left = rng.randint(1150, 1330)
++        flen = rng.choice([90, 100, 110, 150, 170])
++        ops = [None, None]
++        for j, start in enumerate((left, left + flen - RL)):
++            k = DEL_POS - start
++            if 5 < k < RL - 5:
++                ops[j] = [("M", k), ("D", 2), ("M", RL - k)]
++        frags.append(pair("f%03d" % i, left, flen, HAP_A, first_forward=bool(i % 3), ops1=ops[0], ops2=ops[1]))
++    for i in range(3):
++        frags.append(pair("t%02d" % i, DEL_POS - 58, 200, HAP_A, ops1=[("M", 58), ("D", 2)]))
++    return frags
++
++
++DEL_POS = 1300
++
++
++def test_deletion_counts_only_covering_fragments(tmp_path):
++    frags = deletion_fragments()
++    covering = sum(expected_counts(frags, DEL_POS).values())
++    carrying = expected_counts(frags, DEL_POS)["*"]
++    rows = callvar(tmp_path, frags, [(1100, 1450)])
++    dels = [r for p, r in rows.items() if DEL_POS - 10 <= p <= DEL_POS and len(r["alt"]) < len(r["ref"])]
++    assert len(dels) == 1
++    assert carrying <= depth(dels[0]["info"], "DPT") <= covering
++
++
++def test_deletion_phases_with_a_linked_snv(tmp_path):
++    frags = []
++    for i in range(30):
++        left = 1150 + i % 21
++        carries = i % 2 == 0
++        start2 = left + 180 - RL
++        frags.append(pair("f%03d" % i, left, 180, HAP_A if carries else {}, first_forward=bool(i % 3),
++                          ops2=[("M", DEL_POS - start2), ("D", 2), ("M", RL - DEL_POS + start2)] if carries else None))
++    rows = callvar(tmp_path, frags, [(1100, 1450)], extra=("--pair-aware", "-F", "off"))
++    dels = [p for p, r in rows.items() if DEL_POS - 10 <= p <= DEL_POS and len(r["alt"]) < len(r["ref"])]
++    assert len(dels) == 1
++    assert rows[S1]["sample"]["GT"] == "0|1"
++    assert rows[dels[0]]["sample"]["GT"] == "0|1"
++    assert rows[S1]["sample"]["PS"] == rows[dels[0]]["sample"]["PS"] == str(S1 + 1)
++
++
++def test_uncalled_base_at_a_deletion_keeps_fragment_off_both_haplotypes(tmp_path):
++    frags = []
++    for i in range(30):
++        left = 1150 + i % 21
++        carries = i % 2 == 0
++        start2 = left + 180 - RL
++        frags.append(pair("f%03d" % i, left, 180, HAP_A if carries else {}, first_forward=bool(i % 3),
++                          ops2=[("M", DEL_POS - start2), ("D", 2), ("M", RL - DEL_POS + start2)] if carries else None))
++    for i in range(4):
++        frags.append(pair("x%02d" % i, 1153 + 3 * i, 180, HAP_A, bases2={DEL_POS: alt(DEL_POS)}))
++    rows = callvar(tmp_path, frags, [(1100, 1450)], extra=("--pair-aware", "-F", "off"))
++    dels = [p for p, r in rows.items() if DEL_POS - 10 <= p <= DEL_POS and len(r["alt"]) < len(r["ref"])]
++    assert len(dels) == 1
++    assert rows[S1]["sample"]["GT"] == "0|1" and rows[dels[0]]["sample"]["GT"] == "0|1"
++    hap1, hap2 = block_haplotypes(frags, ((S1, REF[S1]), (DEL_POS, REF[DEL_POS], (REF[DEL_POS], "*"))))
++    assert len(hap1) + len(hap2) == 30
++    for site in (S1, dels[0]):
++        assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def deletion_after_snv(dlen, gap):
++    frags = []
++    for i in range(30):
++        left = 1150 + i % 21
++        carries = i % 2 == 0
++        start2 = left + 180 - RL
++        frags.append(pair("f%03d" % i, left, 180, HAP_A if carries else {}, first_forward=bool(i % 3),
++                          bases2={DEL_POS - gap: alt(DEL_POS - gap)} if carries else None,
++                          ops2=[("M", DEL_POS - start2), ("D", dlen), ("M", RL - DEL_POS + start2)] if carries else None))
++    return frags
++
++
++def test_deletion_right_after_a_snv_call_joins_the_block(tmp_path):
++    rows = callvar(tmp_path, deletion_after_snv(1, 1), [(1100, 1450)], extra=("--pair-aware", "-F", "off"))
++    assert rows[DEL_POS]["alt"] == "*" and rows[DEL_POS]["ref"] == REF[DEL_POS]
++    for site in (S1, DEL_POS - 1, DEL_POS):
++        assert rows[site]["sample"]["GT"] == "0|1"
++        assert rows[site]["sample"]["PS"] == str(S1 + 1)
++        assert rows[site]["info"]["BAR"] == "0.50"
++
++
++def test_longer_deletions_phase_with_their_full_length(tmp_path):
++    for dlen, gap in ((2, 1), (2, 3), (3, 3)):
++        (tmp_path / ("d%d%d" % (dlen, gap))).mkdir()
++        rows = callvar(tmp_path / ("d%d%d" % (dlen, gap)), deletion_after_snv(dlen, gap), [(1100, 1450)])
++        dels = [(p, r) for p, r in rows.items()
++                if DEL_POS - 5 <= p <= DEL_POS and (r["alt"] == "*" or len(r["ref"]) > len(r["alt"]))]
++        assert len(dels) == 1
++        p, row = dels[0]
++        deleted = REF[DEL_POS:DEL_POS + dlen]
++        if row["alt"] == "*":
++            assert p == DEL_POS and row["ref"] == deleted
++        else:
++            assert row["ref"] == row["alt"] + deleted
++        for site in rows.values():
++            assert site["sample"]["GT"] == "0|1" and site["sample"]["PS"] == str(S1 + 1)
++
++
++def test_flag_off_keeps_per_read_output(tmp_path):
++    frags = two_site_fragments(40, (S1, S2), [HAP_A, HAP_B], seed=3)
++    plain = callvar(tmp_path, frags, [(1100, 1400)], extra=("-F", "off"))
++    aware = callvar(tmp_path, frags, [(1100, 1400)], extra=("-F", "off", "--pair-aware"))
++    reads = sum(1 for f in frags for r in f.reads if r.covers(S1))
++    assert depth(plain[S1]["info"], "DPT") == reads
++    assert plain[S1]["format"] == "GT:DP:GQ:PL" and plain[S1]["sample"]["GT"] == "0/1"
++    assert "BAR" not in plain[S1]["info"]
++    assert depth(aware[S1]["info"], "DPT") < reads
++
++
++PEAK_A, PEAK_B = (1100, 1260), (1330, 1460)
++T1, U1 = 1410, 1345
++
++
++def bridging(prefix, groups, lefts=range(1180, 1191), flen=250, **kw):
++    frags = []
++    for hap, n in groups:
++        for _ in range(n):
++            i = len(frags)
++            frags.append(pair("%s%03d" % (prefix, i), lefts[i % len(lefts)], flen, hap,
++                              first_forward=bool(i % 2), **kw))
++    return frags
++
++
++def local(prefix, groups, lefts, flen=100):
++    return spanning(prefix, groups, lefts, flen=flen)
++
++
++def peak_counts(frags, peak, site):
++    return expected_counts(in_peak(frags, peak), site)
++
++
++def test_mates_in_separate_peaks_link_their_calls(tmp_path):
++    frags = bridging("b", [({S1: alt(S1)}, 10), ({T1: alt(T1)}, 10)])
++    for frag in frags[:10:2]:
++        frag.reads[0].quals[S1] = 24
++        frag.reads[1].quals[T1] = 38
++    rows = callvar(tmp_path, frags, [PEAK_A, PEAK_B], extra=("--pair-aware", "-F", "off"))
++    assert rows[S1]["sample"]["GT"] == "0|1" and rows[T1]["sample"]["GT"] == "1|0"
++    assert rows[S1]["sample"]["PS"] == rows[T1]["sample"]["PS"] == str(S1 + 1)
++    hap1, hap2 = block_haplotypes(frags, ((S1, REF[S1]), (T1, alt(T1))))
++    assert len(hap1) == len(hap2) == 10
++    for site in (S1, T1):
++        assert rows[site]["info"]["BAR"] == "0.50"
++
++
++def test_cross_peak_phasing_is_the_same_with_more_processes(tmp_path):
++    frags = bridging("b", [({S1: alt(S1)}, 10), ({T1: alt(T1)}, 10)])
++    frags += local("u", [({U1: alt(U1)}, 6), ({}, 6)], range(1330, 1341), flen=60)
++    (tmp_path / "one").mkdir()
++    (tmp_path / "many").mkdir()
++    one = callvar(tmp_path / "one", frags, [PEAK_A, PEAK_B], extra=("--pair-aware", "-F", "off"))
++    many = callvar(tmp_path / "many", frags, [PEAK_A, PEAK_B], extra=("--pair-aware", "-F", "off", "-m", "3"))
++    assert one == many
++    assert one[T1]["sample"]["PS"] == str(S1 + 1) and one[U1]["sample"]["GT"] == "0/1"
++
++
++def test_call_joins_its_nearest_linked_call_across_peaks(tmp_path):
++    frags = bridging("b", [({S1: alt(S1)}, 8), ({T1: alt(T1)}, 8)])
++    frags += local("u", [({U1: alt(U1), T1: alt(T1)}, 8), ({}, 8)], range(1336, 1344), flen=120)
++    rows = callvar(tmp_path, frags, [PEAK_A, PEAK_B], extra=("--pair-aware", "-F", "off"))
++    assert rows[S1]["sample"]["GT"] == "0/1" and rows[S1]["format"] == "GT:DP:GQ:PL"
++    assert rows[U1]["sample"]["GT"] == "0|1" and rows[T1]["sample"]["GT"] == "0|1"
++    assert rows[U1]["sample"]["PS"] == rows[T1]["sample"]["PS"] == str(U1 + 1)
++    hap1, hap2 = block_haplotypes(frags, ((U1, REF[U1]), (T1, REF[T1])))
++    for site in (U1, T1):
++        assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def test_control_fragments_link_calls_in_two_peaks(tmp_path):
++    treat = local("a", [({S1: alt(S1)}, 12), ({}, 8)], range(1170, 1190), flen=70)
++    treat += local("b", [({T1: alt(T1)}, 10), ({}, 10)], range(1380, 1400), flen=70)
++    ctrl = [pair("c%02d" % k, 1180 + k, 260 - 2 * k, {S1: alt(S1)} if k < 10 else {T1: alt(T1)},
++                 first_forward=bool(k % 2)) for k in range(20)]
++    rows = callvar(tmp_path, treat, [PEAK_A, PEAK_B], ctrl=ctrl)
++    assert rows[S1]["sample"]["GT"] == "0|1" and rows[T1]["sample"]["GT"] == "1|0"
++    assert rows[T1]["sample"]["PS"] == str(S1 + 1)
++    hap1, hap2 = block_haplotypes(treat, ((S1, REF[S1]), (T1, alt(T1))))
++    for site in (S1, T1):
++        assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def test_vcf_header_declares_block_fields(tmp_path):
++    callvar(tmp_path, two_site_fragments(40, (S1, S2), [HAP_A, HAP_B], seed=3), [(1100, 1400)])
++    with open(os.path.join(str(tmp_path), "out.vcf")) as f:
++        header = [line for line in f if line.startswith("##")]
++    bar = [line for line in header if line.startswith("##INFO=<ID=BAR,")]
++    ps = [line for line in header if line.startswith("##FORMAT=<ID=PS,")]
++    assert len(bar) == 1 and "Number=1" in bar[0] and "Type=Float" in bar[0]
++    assert len(ps) == 1 and "Number=1" in ps[0] and "Type=Integer" in ps[0]
++
++
++def test_control_mates_use_their_best_base_quality(tmp_path):
++    treat = spanning("t", [(HAP_A, 15), ({}, 15)], range(1150, 1170), flen=90)
++
++    def build(q1, q2):
++        return [pair("c%03d" % i, 1150 + i % 20, 90, HAP_A if i % 3 else {}, first_forward=bool(i % 4),
++                     quals1={S1: q1 if i % 2 else q2}, quals2={S1: q2 if i % 2 else q1}) for i in range(30)]
++    keys = ("DBIC", "BICHOMOMAJOR", "BICHOMOMINOR", "BICHETERNOAS", "BICHETERAS")
++    mixed = callvar(tmp_path, treat, [(1100, 1400)], ctrl=build(25, 38))[S1]
++    best = callvar(tmp_path, treat, [(1100, 1400)], ctrl=build(38, 38))[S1]
++    low = callvar(tmp_path, treat, [(1100, 1400)], ctrl=build(25, 25))[S1]
++    assert any(low["info"][key] != best["info"][key] for key in keys)
++    for key in keys + ("DPC", "DP1C", "DP2C"):
++        assert mixed["info"][key] == best["info"][key]
++    for key in ("GT", "GQ", "PL"):
++        assert mixed["sample"][key] == best["sample"][key]
++
++
++def test_filters_drop_reads_per_peak_for_a_fragment_in_two_peaks(tmp_path):
++    frags = bridging("b", [({S1: alt(S1)}, 10), ({T1: alt(T1)}, 10)], lefts=range(1170, 1190))
++    copies = [pair("d%02d" % i, 1192, 250 + 3 * i, {S1: alt(S1)}) for i in range(4)]
++    noisy = [pair("n00", 1193, 270, {S1: alt(S1)}, bases2={q: alt(q) for q in range(1405, 1460, 6)})]
++    rows = callvar(tmp_path, frags + copies + noisy, [PEAK_A, PEAK_B], extra=("--pair-aware", "-F", "off", "-D", "1"))
++    kept_frags = frags + copies[:1] + [Fragment(f.name, f.reads[1:]) for f in copies[1:]] + noisy
++    for site, peak in ((S1, PEAK_A), (T1, PEAK_B)):
++        want = peak_counts(kept_frags, peak, site)
++        info = rows[site]["info"]
++        got = {info["DP1T"].lstrip("0123456789"): depth(info, "DP1T"),
++               info["DP2T"].lstrip("0123456789"): depth(info, "DP2T")}
++        assert got == want
++    assert sum(peak_counts(kept_frags, PEAK_A, S1).values()) == 22
++    assert sum(peak_counts(kept_frags, PEAK_B, T1).values()) == 24
++
++
++def test_phase_blocks_stay_on_their_chromosome(tmp_path):
++    other = "chrU"
++    first = spanning("f", [(HAP_A, 10), (HAP_B, 10)], range(1185, 1196)) + [pair("tail", 3000, 100, {})]
++    second = spanning("f", [({S1: alt(S1), S2: alt(S2)}, 10), ({}, 10)], range(1185, 1196))
++    for frag in second:
++        frag.contig = other
++    callvar(tmp_path, first + second, [(1100, 1400), (other, 1100, 1400)], contigs=(CHROM, other))
++    rows = {}
++    with open(os.path.join(str(tmp_path), "out.vcf")) as f:
++        for line in f:
++            if line.startswith("#"):
++                continue
++            fs = line.rstrip("\n").split("\t")
++            rows[(fs[0], int(fs[1]) - 1)] = (dict(kv.split("=", 1) for kv in fs[7].split(";") if "=" in kv),
++                                             dict(zip(fs[8].split(":"), fs[9].split(":"))))
++    for chrom, frags, s2_left, s2_gt in ((CHROM, first, alt(S2), "1|0"), (other, second, REF[S2], "0|1")):
++        assert rows[(chrom, S1)][1]["GT"] == "0|1" and rows[(chrom, S2)][1]["GT"] == s2_gt
++        assert rows[(chrom, S2)][1]["PS"] == str(S1 + 1)
++        assert depth(rows[(chrom, S1)][0], "DPT") == sum(expected_counts(frags, S1).values())
++        hap1, hap2 = block_haplotypes(frags, ((S1, REF[S1]), (S2, s2_left)))
++        for site in (S1, S2):
++            assert rows[(chrom, site)][0]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def test_duplicate_reads_dropped_by_the_limit_do_not_vote(tmp_path):
++    frags = spanning("a", [({S1: alt(S1)}, 8), ({}, 8)], range(1150, 1166), flen=70)
++    frags += spanning("b", [({S2: alt(S2)}, 8), ({}, 8)], range(1215, 1231), flen=70)
++    frags += [pair("t0", 1185, 200, {S1: alt(S1)}), pair("t1", 1187, 200, {S2: alt(S2)})]
++    copies = [pair("d%02d" % i, 1190, 200 + 5 * i, {S1: alt(S1), S2: alt(S2)}) for i in range(4)]
++    rows = callvar(tmp_path, frags + copies, [(1100, 1450)], extra=("--pair-aware", "-F", "off", "-D", "1"))
++    assert rows[S1]["sample"]["GT"] == "0|1" and rows[S2]["sample"]["GT"] == "1|0"
++    assert rows[S2]["sample"]["PS"] == str(S1 + 1)
++    kept_frags = frags + copies[:1] + [Fragment(f.name, f.reads[1:]) for f in copies[1:]]
++    hap1, hap2 = block_haplotypes(kept(kept_frags), ((S1, REF[S1]), (S2, alt(S2))))
++    for site in (S1, S2):
++        assert rows[site]["info"]["BAR"] == "%.2f" % (len(hap1) / (len(hap1) + len(hap2)))
++
++
++def strand_counts(frags, site, alleles, first_read=True):
++    counts = [0, 0, 0, 0]
++    strands = {f.name: next(r.strand for r in f.reads if len(f.reads) == 1 or r.first) for f in frags}
++    for frag in kept(frags):
++        obs = frag.observe(site)
++        if obs is None or obs[0] not in alleles:
++            continue
++        strand = strands[frag.name] if first_read else obs[2]
++        counts[2 * strand + alleles.index(obs[0])] += 1
++    return counts
++
++
++def test_strand_counts_follow_the_first_read_of_each_fragment(tmp_path):
++    frags = []
++    for i in range(32):
++        frags.append(pair("f%03d" % i, 1150 + i % 16, 90 if i % 4 < 2 else 160, HAP_A if i % 3 else {},
++                          first_forward=i % 5 in (0, 2)))
++    frags += [Fragment("s%02d" % i, [Read(1172 + i, 1, {S1: alt(S1)} if i % 2 else {}, {})]) for i in range(4)]
++    rows = callvar(tmp_path, frags, [(1100, 1400)])
++    info = rows[S1]["info"]
++    alleles = (info["DP1T"].lstrip("0123456789"), info["DP2T"].lstrip("0123456789"))
++    want = strand_counts(frags, S1, alleles)
++    assert want != strand_counts(frags, S1, alleles, first_read=False)
++    assert info["SB"] == ",".join(str(n) for n in want)
++
++
++def test_deletion_phases_with_local_assembly(tmp_path):
++    for name, extra in (("auto", ("--pair-aware",)), ("on", ("--pair-aware", "-F", "on"))):
++        (tmp_path / name).mkdir()
++        rows = callvar(tmp_path / name, deletion_after_snv(2, 3), [(1100, 1450)], extra=extra)
++        dels = [p for p, r in rows.items() if DEL_POS - 5 <= p <= DEL_POS and len(r["ref"]) > len(r["alt"])]
++        assert len(dels) == 1 and len(rows) == 3
++        for row in rows.values():
++            assert row["sample"]["GT"] == "0|1" and row["sample"]["PS"] == str(S1 + 1)
++
++
++def test_unpaired_reads_keep_their_own_strand(tmp_path):
++    frags = [pair("f%03d" % i, 1150 + i % 16, 160, HAP_A if i % 2 else {}) for i in range(24)]
++    frags += [Fragment("s%02d" % i, [Read(1170 + i, 1, {S1: alt(S1)}, {})]) for i in range(4)]
++    rows = callvar(tmp_path, frags, [(1100, 1400)])
++    info = rows[S1]["info"]
++    alleles = (info["DP1T"].lstrip("0123456789"), info["DP2T"].lstrip("0123456789"))
++    want = strand_counts(frags, S1, alleles)
++    assert want[2] + want[3] == 4
++    assert info["SB"] == ",".join(str(n) for n in want)
++
++
++def test_single_call_on_a_chromosome_stays_unphased(tmp_path):
++    rows = callvar(tmp_path, spanning("f", [(HAP_A, 12), ({}, 12)], range(1185, 1196)), [(1100, 1400)])
++    assert list(rows) == [S1]
++    assert rows[S1]["sample"]["GT"] == "0/1" and rows[S1]["format"] == "GT:DP:GQ:PL"
++    assert "BAR" not in rows[S1]["info"]
++
++
++def test_peak_without_calls_leaves_the_output_unchanged(tmp_path):
++    frags = two_site_fragments(40, (S1, S2), [HAP_A, HAP_B], seed=3)
++    quiet = [pair("q%03d" % i, 2050 + i % 20, 150, {}) for i in range(20)]
++    for name, extra in (("off", ("--pair-aware", "-F", "off")), ("auto", ("--pair-aware",))):
++        for k, peaks in enumerate(([(1100, 1400)], [(2000, 2300), (1100, 1400)], [(1100, 1400), (2000, 2300)])):
++            (tmp_path / ("%s%d" % (name, k))).mkdir()
++            rows = callvar(tmp_path / ("%s%d" % (name, k)), frags + quiet, peaks, extra=extra)
++            if k == 0:
++                want = rows
++                assert sorted(rows) == [S1, S2] and rows[S2]["sample"]["PS"] == str(S1 + 1)
++            assert rows == want
++
++
++def test_strand_comes_from_a_first_read_outside_the_peaks(tmp_path):
++    frags = [pair("f%03d" % i, 1150 + i % 16, 160, HAP_A if i % 3 else {}) for i in range(20)]
++    frags += [pair("o%03d" % i, 690 + i, 560, HAP_A if i % 2 else {}, first_forward=i % 4 != 3) for i in range(8)]
++    rows = callvar(tmp_path, frags, [(1100, 1400)])
++    info = rows[S1]["info"]
++    alleles = (info["DP1T"].lstrip("0123456789"), info["DP2T"].lstrip("0123456789"))
++    want = strand_counts(frags, S1, alleles)
++    assert want != strand_counts(frags, S1, alleles, first_read=False)
++    assert info["SB"] == ",".join(str(n) for n in want)
++
++
++def insertion_after_snv(gap):
++    frags = []
++    for i in range(30):
++        left = 1150 + i % 21
++        carries = i % 2 == 0
++        k = INS_POS - (left + 180 - RL)
++        frags.append(pair("f%03d" % i, left, 180, HAP_A if carries else {}, first_forward=bool(i % 3),
++                          bases2={INS_POS - gap: alt(INS_POS - gap)} if carries and gap else None,
++                          ops2=[("M", k), ("I", INS), ("M", RL - k - len(INS))] if carries else None))
++    return frags
++
++
++def test_assembled_calls_count_one_molecule_per_read(tmp_path):
++    for gap in (0, 3):
++        for mode in ("auto", "on"):
++            rows = {}
++            for name, extra in (("pair", ("--pair-aware", "-F", mode)), ("read", ("-F", mode))):
++                (tmp_path / ("%s%d%s" % (name, gap, mode))).mkdir()
++                rows[name] = callvar(tmp_path / ("%s%d%s" % (name, gap, mode)), insertion_after_snv(gap),
++                                     [(1100, 1450)], extra=extra)
++            assert any(len(r["alt"]) > len(r["ref"]) for r in rows["read"].values())
++            assert sorted(rows["pair"]) == sorted(rows["read"])
++            for p, row in rows["read"].items():
++                for key in ("DPT", "DP1T", "DP2T"):
++                    assert rows["pair"][p]["info"][key] == row["info"][key]
++
++
++def overlapping_mates(prefix, n, site=1290):
++    frags = []
++    for i in range(n):
++        left = 1236 + i % 15
++        carries = i % 2 == 0
++        frags.append(pair("%s%03d" % (prefix, i), left, 100, {site: alt(site)} if carries else {},
++                          first_forward=bool(i % 3), ops1=insertion_ops(left, carries),
++                          ops2=insertion_ops(left + 40, carries)))
++    return frags
++
++
++def test_assembled_calls_collapse_overlapping_mates(tmp_path):
++    site = 1290
++    for mode in ("auto", "on"):
++        rows = {}
++        for name, extra in (("pair", ("--pair-aware", "-F", mode)), ("read", ("-F", mode))):
++            (tmp_path / (name + mode)).mkdir()
++            rows[name] = callvar(tmp_path / (name + mode), overlapping_mates("f", 30), [(1100, 1450)],
++                                 ctrl=overlapping_mates("f", 20), extra=extra)
++        assert any(len(r["alt"]) > len(r["ref"]) for r in rows["pair"].values())
++        read, frag = rows["read"][site]["info"], rows["pair"][site]["info"]
++        assert (depth(read, "DPT"), depth(read, "DPC")) == (60, 40)
++        assert (depth(frag, "DPT"), depth(frag, "DPC")) == (30, 20)
++        assert [depth(frag, k) for k in ("DP1T", "DP2T", "DP1C", "DP2C")] == [15, 15, 10, 10]
++        assert rows["pair"][site]["sample"]["DP"] == "50"
++
++
++def test_assembled_control_fragments_vote_on_links(tmp_path):
++    a, b = 1280, 1300
++    treat = spanning("f", [({a: alt(a), b: alt(b)}, 5), ({}, 5), ({a: alt(a)}, 5), ({b: alt(b)}, 5)],
++                     range(1236, 1251), flen=100)
++    ctrl = spanning("f", [({a: alt(a), b: alt(b)}, 8), ({}, 8)], range(1236, 1251), flen=100)
++    (tmp_path / "t").mkdir()
++    alone = callvar(tmp_path / "t", treat, [(1100, 1450)], extra=("--pair-aware", "-F", "on"))
++    assert alone[a]["sample"]["GT"] == alone[b]["sample"]["GT"] == "0/1"
++    rows = callvar(tmp_path, treat, [(1100, 1450)], ctrl=ctrl, extra=("--pair-aware", "-F", "on"))
++    assert rows[a]["sample"]["GT"] == rows[b]["sample"]["GT"] == "0|1"
++    assert rows[a]["sample"]["PS"] == rows[b]["sample"]["PS"] == str(a + 1)
++
++
++def test_control_votes_outweigh_a_smaller_treatment_majority(tmp_path):
++    treat = spanning("f", [({S1: alt(S1), S2: alt(S2)}, 3), ({}, 3), (HAP_A, 2), (HAP_B, 2)], range(1185, 1196))
++    ctrl = spanning("f", [(HAP_A, 3), (HAP_B, 3)], range(1185, 1196))
++    (tmp_path / "t").mkdir()
++    alone = callvar(tmp_path / "t", treat, [(1100, 1400)])
++    assert alone[S1]["sample"]["GT"] == alone[S2]["sample"]["GT"] == "0|1"
++    rows = callvar(tmp_path, treat, [(1100, 1400)], ctrl=ctrl)
++    assert rows[S1]["sample"]["GT"] == "0|1" and rows[S2]["sample"]["GT"] == "1|0"
++    assert rows[S2]["sample"]["PS"] == str(S1 + 1)
++
++
++def test_nonblock_call_keeps_its_format_values(tmp_path):
++    single = spanning("s", [(HAP_A, 12), ({}, 12)], range(1185, 1196))
++    block = spanning("g", [({2200: alt(2200), 2240: alt(2240)}, 10), ({}, 10)], range(2185, 2196))
++    runs = {}
++    for name, frags, peaks, extra in (("alone", single, [(1100, 1400)], ("--pair-aware", "-F", "off")),
++                                      ("block", single + block, [(1100, 1400), (2100, 2400)],
++                                       ("--pair-aware", "-F", "off")),
++                                      ("read", single, [(1100, 1400)], ("-F", "off"))):
++        (tmp_path / name).mkdir()
++        runs[name] = callvar(tmp_path / name, frags, peaks, extra=extra)
++    assert runs["block"][2240]["sample"]["GT"] == "0|1"
++    assert runs["alone"][S1]["sample"] == runs["block"][S1]["sample"] == runs["read"][S1]["sample"]
++    assert runs["block"][S1]["format"] == "GT:DP:GQ:PL"
++    assert runs["block"][S1]["sample"]["DP"] == "24"

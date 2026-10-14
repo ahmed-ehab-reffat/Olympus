@@ -1,0 +1,932 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..0328132a
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,61 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path) OUTPUT_PATH="$2"; shift 2 ;;
++    base|new) MODE="$1"; shift ;;
++    *) shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++OUTPUT_PATH="${OUTPUT_PATH:-/tmp/junit-$MODE.xml}"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++cd "$(dirname "$0")"
++export PYTHONHASHSEED=0
++export PYTHONDONTWRITEBYTECODE=1
++
++NEW_TESTS="tests/system_tests/test_system_cut_fb30c2.py"
++LOG="$(mktemp)"
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest "$NEW_TESTS" -p no:cacheprovider -o junit_family=xunit1 \
++    --junitxml="$OUTPUT_PATH" >"$LOG" 2>&1
++  STATUS=$?
++else
++  python -m pytest tests examples -p no:cacheprovider -o junit_family=xunit1 \
++    -k "not Postgres and not postgres and not umadb and not ConnectionPool and not MultiThreadedRunner and not test_concurrent_no_conflicts and not test_subscribe_concurrent_reading_and_writing" \
++    --ignore="$NEW_TESTS" \
++    --ignore=tests/persistence_tests/test_connection_pool.py \
++    --ignore=tests/docs_tests \
++    --ignore=tests/dcb_tests/test_dcb.py \
++    --ignore=tests/benchmark \
++    --ignore=examples/ftsprojection \
++    --junitxml="$OUTPUT_PATH" >"$LOG" 2>&1
++  STATUS=$?
++fi
++
++tail -n 40 "$LOG"
++
++if [ ! -s "$OUTPUT_PATH" ] || ! grep -q "<testcase" "$OUTPUT_PATH"; then
++  python - "$OUTPUT_PATH" "$LOG" <<'PY'
++import sys
++from xml.sax.saxutils import escape
++out, log = sys.argv[1], sys.argv[2]
++text = open(log, errors="replace").read()[-20000:]
++with open(out, "w") as f:
++    f.write('<?xml version="1.0" encoding="utf-8"?>\n')
++    f.write('<testsuites><testsuite name="pytest" tests="1" failures="1" errors="0">\n')
++    f.write('<testcase classname="harness" name="pytest_run">')
++    f.write('<failure message="pytest produced no test results">%s</failure>' % escape(text))
++    f.write('</testcase></testsuite></testsuites>\n')
++PY
++  [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++rm -f "$LOG"
++exit "$STATUS"
+diff --git a/tests/system_tests/test_system_cut_fb30c2.py b/tests/system_tests/test_system_cut_fb30c2.py
+new file mode 100644
+index 00000000..baf978fa
+--- /dev/null
++++ b/tests/system_tests/test_system_cut_fb30c2.py
+@@ -0,0 +1,859 @@
++from __future__ import annotations
++
++import shutil
++import tempfile
++from dataclasses import dataclass
++from datetime import timedelta
++from pathlib import Path
++from typing import TYPE_CHECKING, Any
++from unittest import TestCase
++from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
++
++from eventsourcing.application import (
++    AggregateNotFoundError,
++    Application,
++    ProcessingEvent,
++)
++from eventsourcing.dispatch import singledispatchmethod
++from eventsourcing.domain import Aggregate, datetime_now_with_tzinfo, event
++from eventsourcing.system import (
++    MultiThreadedRunner,
++    NewMultiThreadedRunner,
++    NewSingleThreadedRunner,
++    ProcessApplication,
++    Runner,
++    SingleThreadedRunner,
++    System,
++)
++from eventsourcing.utils import get_topic
++from examples.cargoshipping.domainmodel import Cargo, Location
++from examples.contentmanagement.application import ContentManagement
++from examples.contentmanagement.domainmodel import user_id_cvar
++from examples.ftscontentmanagement.application import FtsContentManagement
++from examples.ftscontentmanagement.sqlite import SQLiteFtsApplicationRecorder
++from examples.ftsprocess.application import FtsProcess
++from examples.ftsprocess.sqlite import SQLiteFtsProcessRecorder
++from examples.ftsprocess.system import ContentManagementSystem
++from examples.searchabletimestamps.application import SearchableTimestampsApplication
++
++if TYPE_CHECKING:
++    from eventsourcing.utils import EnvType
++
++
++class Counter(Aggregate):
++    @dataclass(frozen=True)
++    class Incremented(Aggregate.Event):
++        label: str
++
++    def __init__(self, name: str) -> None:
++        self.name = name
++        self.labels: list[str] = []
++
++    @event(Incremented)
++    def increment(self, label: str) -> None:
++        self.labels.append(label)
++
++
++class Tally(Aggregate):
++    @staticmethod
++    def create_id(name: str) -> UUID:
++        return uuid5(NAMESPACE_URL, f"/tallies/{name}")
++
++    def __init__(self, name: str) -> None:
++        self.name = name
++        self.seen: list[str] = []
++
++    @dataclass(frozen=True)
++    class Seen(Aggregate.Event):
++        label: str
++
++    @event(Seen)
++    def see(self, label: str) -> None:
++        self.seen.append(label)
++
++
++class Note(Aggregate):
++    @dataclass(frozen=True)
++    class Created(Aggregate.Created):
++        label: str
++
++    def __init__(self, label: str) -> None:
++        self.label = label
++
++
++class Ball(Aggregate):
++    @dataclass(frozen=True)
++    class Created(Aggregate.Created):
++        label: str
++
++    def __init__(self, label: str) -> None:
++        self.label = label
++
++
++class Echo(Aggregate):
++    @dataclass(frozen=True)
++    class Created(Aggregate.Created):
++        label: str
++
++    def __init__(self, label: str) -> None:
++        self.label = label
++
++
++class Point(Aggregate):
++    @dataclass(frozen=True)
++    class Created(Aggregate.Created):
++        label: str
++
++    def __init__(self, label: str) -> None:
++        self.label = label
++
++
++class CounterApp(Application[UUID]):
++    def create_counter(self, name: str) -> UUID:
++        counter = Counter(name)
++        self.save(counter)
++        return counter.id
++
++    def increment(self, counter_id: UUID, label: str) -> None:
++        counter: Counter = self.repository.get(counter_id)
++        counter.increment(label)
++        self.save(counter)
++
++    def create_pair(self, first: str, second: str) -> tuple[UUID, UUID]:
++        a = Counter(first)
++        b = Counter(second)
++        self.save(a, b)
++        return a.id, b.id
++
++
++class Left(CounterApp):
++    pass
++
++
++class Right(CounterApp):
++    pass
++
++
++class TallyProcess(ProcessApplication[UUID]):
++    tally_name = "tally"
++
++    def tally(self) -> Tally:
++        try:
++            return self.repository.get(Tally.create_id(self.tally_name))
++        except AggregateNotFoundError:
++            return Tally(self.tally_name)
++
++
++class Merge(TallyProcess):
++    tally_name = "merge"
++
++    @singledispatchmethod
++    def policy(
++        self, domain_event: Any, processing_event: ProcessingEvent[UUID]
++    ) -> None:
++        pass
++
++    @policy.register
++    def _(
++        self, domain_event: Counter.Incremented, processing_event: ProcessingEvent[UUID]
++    ) -> None:
++        tally = self.tally()
++        tally.see(domain_event.label)
++        processing_event.collect_events(tally)
++
++
++class Relay(TallyProcess):
++    tally_name = "relay"
++
++    @singledispatchmethod
++    def policy(
++        self, domain_event: Any, processing_event: ProcessingEvent[UUID]
++    ) -> None:
++        pass
++
++    @policy.register
++    def _(
++        self, domain_event: Tally.Seen, processing_event: ProcessingEvent[UUID]
++    ) -> None:
++        tally = self.tally()
++        tally.see(domain_event.label)
++        processing_event.collect_events(tally)
++
++
++class Spawner(ProcessApplication[UUID]):
++    @singledispatchmethod
++    def policy(
++        self, domain_event: Any, processing_event: ProcessingEvent[UUID]
++    ) -> None:
++        pass
++
++    @policy.register
++    def _(
++        self, domain_event: Counter.Incremented, processing_event: ProcessingEvent[UUID]
++    ) -> None:
++        processing_event.collect_events(Note(domain_event.label))
++
++
++class Ping(ProcessApplication[UUID]):
++    def serve(self, label: str) -> UUID:
++        ball = Ball(label)
++        self.save(ball)
++        return ball.id
++
++    @singledispatchmethod
++    def policy(
++        self, domain_event: Any, processing_event: ProcessingEvent[UUID]
++    ) -> None:
++        pass
++
++    @policy.register
++    def _(
++        self, domain_event: Counter.Incremented, processing_event: ProcessingEvent[UUID]
++    ) -> None:
++        processing_event.collect_events(Ball(domain_event.label))
++
++    @policy.register
++    def _(
++        self, domain_event: Echo.Created, processing_event: ProcessingEvent[UUID]
++    ) -> None:
++        processing_event.collect_events(Point(domain_event.label))
++
++
++class Pong(ProcessApplication[UUID]):
++    @singledispatchmethod
++    def policy(
++        self, domain_event: Any, processing_event: ProcessingEvent[UUID]
++    ) -> None:
++        pass
++
++    @policy.register
++    def _(
++        self, domain_event: Ball.Created, processing_event: ProcessingEvent[UUID]
++    ) -> None:
++        processing_event.collect_events(Echo(domain_event.label))
++
++
++FAN_IN = System(pipes=[[Left, Merge], [Right, Merge]])
++CHAIN = System(pipes=[[Merge, Relay], [Left, Merge], [Right, Merge]])
++SPAWN = System(pipes=[[Left, Spawner]])
++LOOP = System(pipes=[[Ping, Pong, Ping], [Left, Ping]])
++
++
++def sqlite_env(directory: str, tag: str, names: list[str]) -> dict[str, str]:
++    env = {"PERSISTENCE_MODULE": "eventsourcing.sqlite"}
++    for name in names:
++        env[f"{name.upper()}_SQLITE_DBNAME"] = str(Path(directory) / f"{tag}-{name}.db")
++    return env
++
++
++def ids(app: Application[Any]) -> list[tuple[int, str, int, str, bytes]]:
++    return [
++        (n.id, str(n.originator_id), n.originator_version, n.topic, n.state)
++        for n in app.recorder.select_notifications(start=1, limit=1000)
++    ]
++
++
++class FanInHistory:
++    def build(
++        self,
++        env: EnvType | None = None,
++        runner_cls: type[Runner[Any]] = SingleThreadedRunner,
++    ) -> Any:
++        runner = runner_cls(FAN_IN, env=env)
++        left = runner.get(Left)
++        right = runner.get(Right)
++        merge = runner.get(Merge)
++        merge.follow("Left", left.notification_log)
++        merge.follow("Right", right.notification_log)
++        self.l_id = left.create_counter("l")
++        left.increment(self.l_id, "l1")
++        self.r_id = right.create_counter("r")
++        right.increment(self.r_id, "r1")
++        merge.pull_and_process("Left")
++        merge.pull_and_process("Right")
++        left.increment(self.l_id, "l2")
++        merge.pull_and_process("Left")
++        return runner
++
++
++class TestCutPositions(FanInHistory, TestCase):
++    def setUp(self) -> None:
++        self.runner = self.build()
++
++    def tearDown(self) -> None:
++        self.runner.stop()
++
++    def test_unbounded_cut_is_the_current_state(self) -> None:
++        cut = self.runner.cut()
++        self.assertEqual(cut.positions, {"Left": 3, "Right": 2, "Merge": 4})
++        self.assertEqual(cut.processed, {"Merge": {"Left": 3, "Right": 2}})
++
++    def test_follower_stops_at_first_step_beyond_a_leader_bound(self) -> None:
++        cut = self.runner.cut({"Left": 3, "Right": 1})
++        self.assertEqual(cut.positions, {"Left": 3, "Right": 1, "Merge": 2})
++        self.assertEqual(cut.processed, {"Merge": {"Left": 2, "Right": 1}})
++
++    def test_follower_keeps_steps_within_both_bounds(self) -> None:
++        cut = self.runner.cut({"Left": 2, "Right": 2})
++        self.assertEqual(cut.positions, {"Left": 2, "Right": 2, "Merge": 3})
++        self.assertEqual(cut.processed, {"Merge": {"Left": 2, "Right": 2}})
++
++    def test_step_that_recorded_nothing_still_bounds_the_follower(self) -> None:
++        cut = self.runner.cut({"Left": 0})
++        self.assertEqual(cut.positions, {"Left": 0, "Right": 2, "Merge": 0})
++        self.assertEqual(cut.processed, {"Merge": {"Left": 0, "Right": 0}})
++
++    def test_bound_on_follower_keeps_following_steps_that_recorded_nothing(
++        self,
++    ) -> None:
++        cut = self.runner.cut({"Merge": 2})
++        self.assertEqual(cut.positions, {"Left": 3, "Right": 2, "Merge": 2})
++        self.assertEqual(cut.processed, {"Merge": {"Left": 2, "Right": 1}})
++
++    def test_unknown_application_or_negative_bound_raises_value_error(self) -> None:
++        with self.assertRaises(ValueError):
++            self.runner.cut({"Nowhere": 1})
++        with self.assertRaises(ValueError):
++            self.runner.cut({"Left": -1})
++
++
++class TestCutReads(FanInHistory, TestCase):
++    def setUp(self) -> None:
++        self.runner = self.build()
++
++    def tearDown(self) -> None:
++        self.runner.stop()
++
++    def test_get_returns_follower_aggregate_as_at_the_cut(self) -> None:
++        tally_id = Tally.create_id("merge")
++        self.assertEqual(
++            self.runner.cut({"Left": 3, "Right": 1}).get(Merge, tally_id).seen, ["l1"]
++        )
++        self.assertEqual(
++            self.runner.cut({"Left": 2, "Right": 2}).get(Merge, tally_id).seen,
++            ["l1", "r1"],
++        )
++
++    def test_get_returns_leader_aggregate_as_at_the_cut(self) -> None:
++        counter = self.runner.cut({"Left": 2}).get(Left, self.l_id)
++        self.assertEqual(counter.labels, ["l1"])
++        self.assertEqual(counter.version, 2)
++
++    def test_get_raises_for_aggregate_created_after_the_cut(self) -> None:
++        with self.assertRaises(AggregateNotFoundError):
++            self.runner.cut({"Right": 0}).get(Right, self.r_id)
++        with self.assertRaises(AggregateNotFoundError):
++            self.runner.cut({"Left": 1}).get(Merge, Tally.create_id("merge"))
++
++
++class TestCutFixedPoint(TestCase):
++    def test_chain_declared_downstream_first_settles_through_every_follower(
++        self,
++    ) -> None:
++        runner: SingleThreadedRunner[UUID] = SingleThreadedRunner(CHAIN)
++        left = runner.get(Left)
++        right = runner.get(Right)
++        merge = runner.get(Merge)
++        relay = runner.get(Relay)
++        merge.follow("Left", left.notification_log)
++        merge.follow("Right", right.notification_log)
++        relay.follow("Merge", merge.notification_log)
++        l_id = left.create_counter("l")
++        left.increment(l_id, "l1")
++        r_id = right.create_counter("r")
++        right.increment(r_id, "r1")
++        merge.pull_and_process("Left")
++        merge.pull_and_process("Right")
++        left.increment(l_id, "l2")
++        merge.pull_and_process("Left")
++        relay.pull_and_process("Merge")
++
++        cut = runner.cut({"Left": 1})
++        self.assertEqual(cut.positions, {"Left": 1, "Right": 2, "Merge": 0, "Relay": 0})
++        self.assertEqual(
++            cut.processed,
++            {"Merge": {"Left": 1, "Right": 0}, "Relay": {"Merge": 0}},
++        )
++
++        cut = runner.cut({"Right": 1})
++        self.assertEqual(cut.positions, {"Left": 3, "Right": 1, "Merge": 2, "Relay": 2})
++        self.assertEqual(cut.get(Relay, Tally.create_id("relay")).seen, ["l1"])
++        runner.stop()
++
++    def test_loop_with_second_leader_settles_to_greatest_consistent_cut(self) -> None:
++        runner: SingleThreadedRunner[UUID] = SingleThreadedRunner(LOOP)
++        left = runner.get(Left)
++        ping = runner.get(Ping)
++        pong = runner.get(Pong)
++        pong.follow("Ping", ping.notification_log)
++        ping.follow("Pong", pong.notification_log)
++        ping.follow("Left", left.notification_log)
++        ping.serve("s1")
++        pong.pull_and_process("Ping")
++        ping.pull_and_process("Pong")
++        c_id = left.create_counter("c")
++        left.increment(c_id, "k1")
++        ping.pull_and_process("Left")
++        pong.pull_and_process("Ping")
++        ping.pull_and_process("Pong")
++        pong.pull_and_process("Ping")
++
++        cut = runner.cut({"Left": 1})
++        self.assertEqual(cut.positions, {"Ping": 2, "Pong": 1, "Left": 1})
++        self.assertEqual(
++            cut.processed, {"Pong": {"Ping": 2}, "Ping": {"Pong": 1, "Left": 1}}
++        )
++
++        cut = runner.cut({"Pong": 1})
++        self.assertEqual(cut.positions, {"Ping": 3, "Pong": 1, "Left": 2})
++        self.assertEqual(
++            cut.processed, {"Pong": {"Ping": 2}, "Ping": {"Pong": 1, "Left": 2}}
++        )
++        runner.stop()
++
++
++class TestFork(FanInHistory, TestCase):
++    def setUp(self) -> None:
++        self.runner = self.build()
++
++    def tearDown(self) -> None:
++        self.runner.stop()
++
++    def test_fork_holds_the_cut_under_original_notification_ids(self) -> None:
++        fork = self.runner.cut({"Left": 3, "Right": 1}).fork()
++        try:
++            self.assertIsInstance(fork, SingleThreadedRunner)
++            self.assertTrue(fork.is_started)
++            self.assertEqual(ids(fork.get(Left)), ids(self.runner.get(Left)))
++            self.assertEqual(ids(fork.get(Right)), ids(self.runner.get(Right))[:1])
++            self.assertEqual(ids(fork.get(Merge)), ids(self.runner.get(Merge))[:2])
++            self.assertEqual(fork.get(Merge).recorder.max_tracking_id("Left"), 2)
++            self.assertEqual(fork.get(Merge).recorder.max_tracking_id("Right"), 1)
++        finally:
++            fork.stop()
++
++    def test_fork_continues_processing_from_the_processed_positions(self) -> None:
++        fork = self.runner.cut({"Left": 3, "Right": 1}).fork()
++        try:
++            fork.get(Right).increment(self.r_id, "r9")
++            fork.get(Left).increment(self.l_id, "l9")
++            tally: Tally = fork.get(Merge).repository.get(Tally.create_id("merge"))
++            self.assertEqual(tally.seen, ["l1", "r9", "l2", "l9"])
++        finally:
++            fork.stop()
++
++    def test_cuts_of_the_fork_agree_with_cuts_of_the_original(self) -> None:
++        fork = self.runner.cut({"Left": 3, "Right": 1}).fork()
++        try:
++            for bounds in ({}, {"Left": 0}, {"Merge": 0}, {"Merge": 2}, {"Left": 2}):
++                original = self.runner.cut({"Left": 3, "Right": 1, **bounds})
++                forked = fork.cut(bounds)
++                self.assertEqual(forked.positions, original.positions, bounds)
++                self.assertEqual(forked.processed, original.processed, bounds)
++        finally:
++            fork.stop()
++
++    def test_fork_copies_follower_events_instead_of_reprocessing(self) -> None:
++        runner: SingleThreadedRunner[UUID] = SingleThreadedRunner(SPAWN)
++        runner.start()
++        try:
++            left = runner.get(Left)
++            c_id = left.create_counter("c")
++            for label in ("a", "b", "c"):
++                left.increment(c_id, label)
++            fork = runner.cut({"Left": 3}).fork()
++            try:
++                self.assertEqual(ids(fork.get(Spawner)), ids(runner.get(Spawner))[:2])
++            finally:
++                fork.stop()
++        finally:
++            runner.stop()
++
++
++class TestSQLite(FanInHistory, TestCase):
++    def setUp(self) -> None:
++        self.directory = tempfile.mkdtemp()
++        self.env = sqlite_env(self.directory, "source", ["Left", "Right", "Merge"])
++        self.build(self.env).stop()
++
++    def tearDown(self) -> None:
++        shutil.rmtree(self.directory, ignore_errors=True)
++
++    def test_cuts_survive_reopening_the_databases(self) -> None:
++        runner: SingleThreadedRunner[UUID] = SingleThreadedRunner(FAN_IN, env=self.env)
++        try:
++            cut = runner.cut({"Left": 3, "Right": 1})
++            self.assertEqual(cut.positions, {"Left": 3, "Right": 1, "Merge": 2})
++            self.assertEqual(cut.processed, {"Merge": {"Left": 2, "Right": 1}})
++            cut = runner.cut({"Left": 0})
++            self.assertEqual(cut.positions, {"Left": 0, "Right": 2, "Merge": 0})
++            cut = runner.cut({"Merge": 2})
++            self.assertEqual(cut.processed, {"Merge": {"Left": 2, "Right": 1}})
++        finally:
++            runner.stop()
++
++    def test_reopened_runner_keeps_cutting_after_new_events(self) -> None:
++        runner: SingleThreadedRunner[UUID] = SingleThreadedRunner(FAN_IN, env=self.env)
++        try:
++            left = runner.get(Left)
++            merge = runner.get(Merge)
++            merge.follow("Left", left.notification_log)
++            merge.follow("Right", runner.get(Right).notification_log)
++            left.increment(self.l_id, "l3")
++            merge.pull_and_process("Left")
++            cut = runner.cut({"Left": 3, "Right": 1})
++            self.assertEqual(cut.positions, {"Left": 3, "Right": 1, "Merge": 2})
++            self.assertEqual(cut.processed, {"Merge": {"Left": 2, "Right": 1}})
++            cut = runner.cut()
++            self.assertEqual(cut.positions, {"Left": 4, "Right": 2, "Merge": 5})
++            self.assertEqual(cut.processed, {"Merge": {"Left": 4, "Right": 2}})
++        finally:
++            runner.stop()
++
++    def test_fork_into_new_databases_and_refuse_used_ones(self) -> None:
++        runner: SingleThreadedRunner[UUID] = SingleThreadedRunner(FAN_IN, env=self.env)
++        target = sqlite_env(self.directory, "fork", ["Left", "Right", "Merge"])
++        try:
++            cut = runner.cut({"Left": 3, "Right": 1})
++            cut.fork(target).stop()
++            fork: SingleThreadedRunner[UUID] = SingleThreadedRunner(FAN_IN, env=target)
++            try:
++                self.assertEqual(ids(fork.get(Merge)), ids(runner.get(Merge))[:2])
++                self.assertEqual(fork.cut().positions, cut.positions)
++                self.assertEqual(fork.cut({"Merge": 2}).processed, cut.processed)
++            finally:
++                fork.stop()
++            with self.assertRaises(ValueError):
++                cut.fork(self.env)
++        finally:
++            runner.stop()
++
++
++class TestMultiEventSaves(TestCase):
++    def setUp(self) -> None:
++        self.runner: SingleThreadedRunner[UUID] = SingleThreadedRunner(FAN_IN)
++        left = self.runner.get(Left)
++        merge = self.runner.get(Merge)
++        merge.follow("Left", left.notification_log)
++        merge.follow("Right", self.runner.get(Right).notification_log)
++        self.a_id, self.b_id = left.create_pair("a", "b")
++        left.increment(self.a_id, "a1")
++        merge.pull_and_process("Left")
++
++    def tearDown(self) -> None:
++        self.runner.stop()
++
++    def test_bound_inside_one_save_drops_the_whole_save(self) -> None:
++        cut = self.runner.cut({"Left": 1})
++        self.assertEqual(cut.positions, {"Left": 0, "Right": 0, "Merge": 0})
++        self.assertEqual(cut.processed, {"Merge": {"Left": 0, "Right": 0}})
++        with self.assertRaises(AggregateNotFoundError):
++            cut.get(Left, self.a_id)
++
++    def test_bound_after_one_save_keeps_both_aggregates(self) -> None:
++        cut = self.runner.cut({"Left": 2})
++        self.assertEqual(cut.positions, {"Left": 2, "Right": 0, "Merge": 0})
++        self.assertEqual(cut.processed, {"Merge": {"Left": 2, "Right": 0}})
++        self.assertEqual(cut.get(Left, self.b_id).name, "b")
++        self.assertEqual(cut.get(Left, self.a_id).labels, [])
++
++    def test_bound_inside_one_processing_step_drops_the_whole_step(self) -> None:
++        cut = self.runner.cut({"Merge": 1})
++        self.assertEqual(cut.positions, {"Left": 3, "Right": 0, "Merge": 0})
++        self.assertEqual(cut.processed, {"Merge": {"Left": 2, "Right": 0}})
++
++    def test_fork_keeps_saves_whole(self) -> None:
++        fork = self.runner.cut({"Left": 2}).fork()
++        try:
++            self.assertEqual(ids(fork.get(Left)), ids(self.runner.get(Left))[:2])
++            self.assertEqual(fork.cut({"Left": 1}).positions["Left"], 0)
++            fork.get(Left).increment(self.b_id, "b1")
++            tally: Tally = fork.get(Merge).repository.get(Tally.create_id("merge"))
++            self.assertEqual(tally.seen, ["b1"])
++        finally:
++            fork.stop()
++
++
++class TestForkOfLoop(TestCase):
++    def test_cuts_of_a_forked_loop_agree_with_the_original(self) -> None:
++        runner: SingleThreadedRunner[UUID] = SingleThreadedRunner(LOOP)
++        left = runner.get(Left)
++        ping = runner.get(Ping)
++        pong = runner.get(Pong)
++        pong.follow("Ping", ping.notification_log)
++        ping.follow("Pong", pong.notification_log)
++        ping.follow("Left", left.notification_log)
++        ping.serve("s1")
++        pong.pull_and_process("Ping")
++        ping.pull_and_process("Pong")
++        c_id = left.create_counter("c")
++        left.increment(c_id, "k1")
++        ping.pull_and_process("Left")
++        pong.pull_and_process("Ping")
++        ping.pull_and_process("Pong")
++        pong.pull_and_process("Ping")
++        try:
++            fork = runner.cut({"Pong": 2}).fork()
++            try:
++                for bounds in ({}, {"Pong": 1}, {"Ping": 1}, {"Ping": 3}, {"Left": 1}):
++                    original = runner.cut({"Pong": 2, **bounds})
++                    forked = fork.cut(bounds)
++                    self.assertEqual(forked.positions, original.positions, bounds)
++                    self.assertEqual(forked.processed, original.processed, bounds)
++            finally:
++                fork.stop()
++        finally:
++            runner.stop()
++
++
++class TestOtherRunners(FanInHistory, TestCase):
++    def test_new_single_threaded_runner_cuts_and_forks(self) -> None:
++        runner = self.build(runner_cls=NewSingleThreadedRunner)
++        try:
++            cut = runner.cut({"Left": 3, "Right": 1})
++            self.assertEqual(cut.positions, {"Left": 3, "Right": 1, "Merge": 2})
++            fork = cut.fork()
++            try:
++                self.assertIsInstance(fork, NewSingleThreadedRunner)
++                self.assertTrue(fork.is_started)
++                self.assertEqual(ids(fork.get(Merge)), ids(runner.get(Merge))[:2])
++                self.assertEqual(fork.cut().processed, cut.processed)
++            finally:
++                fork.stop()
++        finally:
++            runner.stop()
++
++    def test_threaded_runners_cut_and_fork(self) -> None:
++        for runner_cls in (MultiThreadedRunner, NewMultiThreadedRunner):
++            runner = self.build(runner_cls=runner_cls)
++            try:
++                cut = runner.cut({"Left": 2, "Right": 2})
++                self.assertEqual(cut.positions, {"Left": 2, "Right": 2, "Merge": 3})
++                self.assertEqual(cut.processed, {"Merge": {"Left": 2, "Right": 2}})
++                fork = cut.fork()
++                try:
++                    self.assertIsInstance(fork, runner_cls)
++                    self.assertTrue(fork.is_started)
++                    self.assertEqual(ids(fork.get(Left)), ids(runner.get(Left))[:2])
++                    self.assertEqual(ids(fork.get(Right)), ids(runner.get(Right))[:2])
++                    self.assertEqual(ids(fork.get(Merge)), ids(runner.get(Merge))[:3])
++                    forked = fork.cut()
++                    self.assertEqual(forked.positions, cut.positions)
++                    self.assertEqual(forked.processed, cut.processed)
++                finally:
++                    fork.stop()
++            finally:
++                runner.stop()
++
++    def test_every_runner_validates_bounds_and_cuts_without_them(self) -> None:
++        for runner_cls in (
++            SingleThreadedRunner,
++            NewSingleThreadedRunner,
++            MultiThreadedRunner,
++            NewMultiThreadedRunner,
++        ):
++            runner = self.build(runner_cls=runner_cls)
++            try:
++                cut = runner.cut()
++                self.assertEqual(cut.positions, {"Left": 3, "Right": 2, "Merge": 4})
++                self.assertEqual(cut.processed, {"Merge": {"Left": 3, "Right": 2}})
++                with self.assertRaises(ValueError):
++                    runner.cut({"Nowhere": 1})
++                with self.assertRaises(ValueError):
++                    runner.cut({"Right": -1})
++            finally:
++                runner.stop()
++
++
++class TestForkTargets(FanInHistory, TestCase):
++    def setUp(self) -> None:
++        self.directory = tempfile.mkdtemp()
++        self.runner = self.build()
++
++    def tearDown(self) -> None:
++        self.runner.stop()
++        shutil.rmtree(self.directory, ignore_errors=True)
++
++    def test_fork_ignores_keyword_arguments_the_recorder_does_not_keep(self) -> None:
++        source = sqlite_env(self.directory, "kwargs", ["Left", "Right", "Merge"])
++        runner: SingleThreadedRunner[UUID] = SingleThreadedRunner(FAN_IN, env=source)
++        try:
++            left = runner.get(Left)
++            left.save(Counter("k"), unused=lambda: None)
++            target = sqlite_env(self.directory, "kwfork", ["Left", "Right", "Merge"])
++            fork = runner.cut().fork(target)
++            try:
++                self.assertEqual(ids(fork.get(Left)), ids(left))
++            finally:
++                fork.stop()
++        finally:
++            runner.stop()
++
++    def test_fork_refuses_target_where_one_application_has_events(self) -> None:
++        target = sqlite_env(self.directory, "used", ["Left", "Right", "Merge"])
++        used = Right(env=target)
++        used.create_counter("x")
++        used.close()
++        cut = self.runner.cut({"Left": 3, "Right": 1})
++        with self.assertRaises(ValueError):
++            cut.fork(target)
++
++
++class TestForkOfFollowerRecorderState(TestCase):
++    def test_fork_restores_state_a_follower_recorder_keeps_beside_events(
++        self,
++    ) -> None:
++        env = {
++            "PERSISTENCE_MODULE": "eventsourcing.sqlite",
++            "PROCESS_RECORDER_TOPIC": get_topic(SQLiteFtsProcessRecorder),
++            "SQLITE_DBNAME": ":memory:",
++        }
++        user_id_cvar.set(uuid4())
++        runner: SingleThreadedRunner[UUID] = SingleThreadedRunner(
++            ContentManagementSystem(), env=env
++        )
++        runner.start()
++        try:
++            content = runner.get(ContentManagement)
++            content.create_page(title="Animals", slug="animals")
++            position = content.update_body(slug="animals", body="cat")
++            content.create_page(title="Plants", slug="plants")
++            content.update_body(slug="plants", body="rose")
++            animals = runner.get(FtsProcess).search("cat")
++            self.assertEqual(len(animals), 1)
++            fork = runner.cut({"ContentManagement": position}).fork(env)
++            try:
++                search = fork.get(FtsProcess)
++                self.assertEqual(search.search("cat"), animals)
++                self.assertEqual(search.search("rose"), [])
++                fork.get(ContentManagement).update_body(slug="animals", body="cat dog")
++                self.assertEqual(search.search("dog"), animals)
++            finally:
++                fork.stop()
++        finally:
++            runner.stop()
++
++
++class TestForkOfApplicationRecorderState(TestCase):
++    def test_fork_restores_state_an_application_recorder_keeps_beside_events(
++        self,
++    ) -> None:
++        env = {
++            "PERSISTENCE_MODULE": "eventsourcing.sqlite",
++            "APPLICATION_RECORDER_TOPIC": get_topic(SQLiteFtsApplicationRecorder),
++            "SQLITE_DBNAME": ":memory:",
++        }
++        user_id_cvar.set(uuid4())
++        runner: SingleThreadedRunner[UUID] = SingleThreadedRunner(
++            System(pipes=[[FtsContentManagement]]), env=env
++        )
++        runner.start()
++        try:
++            content = runner.get(FtsContentManagement)
++            content.create_page(title="Animals", slug="animals")
++            position = content.update_body(slug="animals", body="cat")
++            content.update_body(slug="animals", body="dog")
++            content.create_page(title="Plants", slug="plants")
++            cut = runner.cut({"FtsContentManagement": position})
++            fork = cut.fork(env)
++            try:
++                app = fork.get(FtsContentManagement)
++                self.assertEqual([p["slug"] for p in app.search("cat")], ["animals"])
++                self.assertEqual(app.search("dog"), [])
++                again = fork.cut().fork(env)
++                try:
++                    found = again.get(FtsContentManagement).search("cat")
++                    self.assertEqual([p["slug"] for p in found], ["animals"])
++                finally:
++                    again.stop()
++            finally:
++                fork.stop()
++        finally:
++            runner.stop()
++
++    def test_fork_restores_state_a_recorder_requires_for_every_save(self) -> None:
++        env = {
++            "PERSISTENCE_MODULE": "examples.searchabletimestamps.sqlite",
++            "SQLITE_DBNAME": ":memory:",
++        }
++        runner: SingleThreadedRunner[UUID] = SingleThreadedRunner(
++            System(pipes=[[SearchableTimestampsApplication]]), env=env
++        )
++        runner.start()
++        try:
++            app = runner.get(SearchableTimestampsApplication)
++            deadline = datetime_now_with_tzinfo() + timedelta(weeks=3)
++            tracking_id = app.book_new_cargo(Location.HAMBURG, Location.TOKYO, deadline)
++            booked: Cargo = app.repository.get(tracking_id)
++            app.change_destination(tracking_id, Location.NEWYORK)
++            changed: Cargo = app.repository.get(tracking_id)
++            app.change_destination(tracking_id, Location.STOCKHOLM)
++            fork = runner.cut({"SearchableTimestampsApplication": 2}).fork(env)
++            try:
++                forked = fork.get(SearchableTimestampsApplication)
++                at_booking = forked.get_cargo_at_timestamp(
++                    tracking_id, booked.modified_on
++                )
++                self.assertEqual(at_booking.destination, Location.TOKYO)
++                at_change = forked.get_cargo_at_timestamp(
++                    tracking_id, changed.modified_on
++                )
++                self.assertEqual(at_change.destination, Location.NEWYORK)
++                self.assertEqual(forked.get_cargo(tracking_id).version, 2)
++            finally:
++                fork.stop()
++        finally:
++            runner.stop()
++
++
++class TestReopenedRecorderState(TestCase):
++    def setUp(self) -> None:
++        self.directory = tempfile.mkdtemp()
++
++    def tearDown(self) -> None:
++        shutil.rmtree(self.directory, ignore_errors=True)
++
++    def env(self, name: str) -> dict[str, str]:
++        return {
++            "PERSISTENCE_MODULE": "examples.searchabletimestamps.sqlite",
++            "SQLITE_DBNAME": str(Path(self.directory) / f"{name}.db"),
++        }
++
++    def test_fork_after_reopening_keeps_state_a_recorder_requires(self) -> None:
++        system = System(pipes=[[SearchableTimestampsApplication]])
++        runner: SingleThreadedRunner[UUID] = SingleThreadedRunner(
++            system, env=self.env("source")
++        )
++        runner.start()
++        try:
++            app = runner.get(SearchableTimestampsApplication)
++            deadline = datetime_now_with_tzinfo() + timedelta(weeks=3)
++            tracking_id = app.book_new_cargo(Location.HAMBURG, Location.TOKYO, deadline)
++            booked: Cargo = app.repository.get(tracking_id)
++            app.change_destination(tracking_id, Location.NEWYORK)
++            changed: Cargo = app.repository.get(tracking_id)
++            app.change_destination(tracking_id, Location.STOCKHOLM)
++        finally:
++            runner.stop()
++        reopened: SingleThreadedRunner[UUID] = SingleThreadedRunner(
++            system, env=self.env("source")
++        )
++        reopened.start()
++        try:
++            cut = reopened.cut({"SearchableTimestampsApplication": 2})
++            fork = cut.fork(self.env("fork"))
++            try:
++                forked = fork.get(SearchableTimestampsApplication)
++                at_booking = forked.get_cargo_at_timestamp(
++                    tracking_id, booked.modified_on
++                )
++                self.assertEqual(at_booking.destination, Location.TOKYO)
++                at_change = forked.get_cargo_at_timestamp(
++                    tracking_id, changed.modified_on
++                )
++                self.assertEqual(at_change.destination, Location.NEWYORK)
++                self.assertEqual(forked.get_cargo(tracking_id).version, 2)
++            finally:
++                fork.stop()
++        finally:
++            reopened.stop()

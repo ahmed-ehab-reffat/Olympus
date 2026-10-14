@@ -1,11 +1,13 @@
 # SATURATED-REPOS — do-not-pick blocklist (repo-level)
 
-Repos to AVOID at pick time because of over-use / quota exhaustion. Check this file BEFORE scope-locking any repo (`PICK-FILTER.md § Gate 10 REPO-QUOTA`). This is repo-level saturation; for dead DIFFICULTY classes (uniform-wrap, saturated-port, membership-contract, etc.) see `TOO-EASY.md` instead.
+Repos to AVOID at pick time because of platform over-use, reservation or a dead repo, plus lane ledgers for repos that are still pickable. Check this file BEFORE scope-locking any repo. Our own per-repo submission count is a submit-time warning, not a blocklist entry (`PICK-FILTER.md § Gate 10 REPO-QUOTA`, changed 2026-10-05, user decision). This is repo-level saturation; for dead DIFFICULTY classes (uniform-wrap, saturated-port, membership-contract, etc.) see `TOO-EASY.md` instead.
 
 ## ⚠️ THIS FILE HOLDS TWO DIFFERENT KINDS OF ENTRY — do not grep it as one blocklist
 
-- **REPO-DEAD (sections A, B, C, D, E):** the REPO is unpickable — platform saturation, our 6-cap,
-  no commits in 12mo, off-GitHub development, dead upstream. A hit here is a hard reject.
+- **REPO-DEAD (sections A0, A, C, D, E):** the REPO is unpickable — platform reservation, platform
+  saturation, no commits in 12mo, off-GitHub development, dead upstream. A hit here is a hard reject.
+  **Changed 2026-10-05, user decision: section B (our own submission count) is no longer repo-dead.**
+  It is a submit-time platform warning; report the count and never kill or skip a repo for it.
 - **LANE-LEDGER (section B2, and B1/B3 partially):** the repo is **ALIVE and still pickable**; a
   specific FEATURE LANE or SUBSYSTEM is dead. A hit here is **NOT a reject** — it is a briefing.
   Read the entry's *untouched surface* note and pick a different lane.
@@ -21,11 +23,40 @@ main value on a re-visit.
 Every LANE-LEDGER entry should carry: what died, WHY (which gate), what is **untouched**, and a
 **REVISIT condition**.
 
-Two reject reasons live in the REPO-DEAD half:
-- **GLOBAL-SATURATED** — the platform itself flags the repo as heavily over-used (all authors combined). It warns at submit and applies EXTRA review scrutiny; tasks are far more likely to be duplicate / low-novelty. Treat as effectively unpickable.
-- **OUR-CAP-REACHED** — we have already shipped ≥6 submissions for the repo (our per-author 6-cap). The platform warns at submit. Do not add more.
+### ⭐ Verdict scope and expiry (changed 2026-10-05, user decision)
 
-Caps recap (admin 2026): ≤6 per repo per author, ≤3 per repo per week, global ≤50 per repo across the whole quest. Detail: `RULES.md § Repository Requirements` + `CLAUDE.md § RULE UPDATE 2026-06-26`.
+`repo-hunt-logs/HUNT-MISS-DIAGNOSIS-2026-10-05.md` found three ways this file retired repos for good
+on lane-level evidence. These rules now apply to every entry below, old or new:
+
+1. **A dead lane excludes that lane only.** It removes its capability and the file set it touched,
+   not the repo. A second, different lane on a repo we already used (approved, CLAIMED, in flight, or
+   rejected for a lane-level reason such as LOC, absorption, too-easy, a magnet, a PR in the lane) is a
+   normal, default source. The `⛔ DO-NOT-PICK`, `AVOID`, "NO LANE", "spent" and "stays DEAD:
+   repo-wide" labels in B1/B2/B3 read as LANE verdicts unless the entry cites a repo-level reason.
+   Not changed: a kill under the signature-account rule (two or more accounts, a burst, an in-lane
+   PR), the AI-sweep rule or the commit-velocity rule keeps whatever scope `olympus-hunt` Stage 2b-bis
+   and 2c give it today, and so does a maintainer-authored roadmap magnet.
+2. **Repo-level reasons keep a repo dead and never expire:** licence (incl. vendored), language,
+   activity / corpse, Requirement 7 (as narrowed in rule 4), platform reservation (A0) and
+   platform-flagged over-use (A). A derivative loss to an older accepted task also never expires: the
+   lane it covers stays dead for good, and any candidate re-entering that lane is dead with it.
+3. **Lane-level verdicts expire after 60 days** and may be re-audited. The repo moved, the PR closed,
+   the maintainer finished the workstream: a 60-day-old lane verdict is a briefing, not a block.
+4. **Requirement 7 now kills only on a failing TEST workflow on the default branch that touches the
+   lane.** A red non-test workflow (govulncheck, lint, release) or one unrelated matrix leg is a note.
+   Rows recorded before 2026-10-05 as Requirement 7 on that kind of failure (for example canvas on one
+   PDF size test, cartopy on one Windows image) are re-checkable under this rule.
+5. **Only written verdicts block.** A slug that a sweep merely listed or displayed (the topic-hit
+   tables, the `deadlist_v*.txt` and `allseen_*.txt` seen-sets under `worktrees/_hunt/`) is a fetch
+   cache, not a verdict, and gets screened again. The hunt keeps judged rows in
+   `worktrees/_hunt/judged.tsv` (`slug lane scope reason date`); only `scope=repo` rows feed the
+   sweep's dead-list filter (`olympus-hunt` Stage 1).
+
+The saturation reasons:
+- **GLOBAL-SATURATED (REPO-DEAD)** — the platform itself flags the repo as heavily over-used (all authors combined). It warns at submit and applies EXTRA review scrutiny; tasks are far more likely to be duplicate / low-novelty. Treat as effectively unpickable.
+- **OUR COUNT (warning only, changed 2026-10-05, user decision):** we have shipped 6 or more submissions for the repo, or 3 in one week. The platform WARNS at submit; it does not refuse. Report the count in the dossier and keep hunting the repo's other lanes. Peers ship ~12 on one repo, and dasel 9, cliffy 7, yaegi 7 and sfepy 25 were all submitted.
+
+Platform numbers (admin 2026): it warns past 6 per repo per author and past 3 per repo per week, and flags a repo as over-used around 50 across the whole quest. Detail: `RULES.md § Repository Requirements` + `CLAUDE.md § RULE UPDATE 2026-06-26`.
 
 ---
 
@@ -67,7 +98,10 @@ risor (902★) is the most over-used repo seen — the star-proxy is FALSE. The 
 
 ---
 
-## B. OUR-CAP-REACHED (≥6 of our own submissions — do NOT add more)
+## B. OUR SUBMISSION COUNT (≥6 of our own: a submit-time WARNING, not a block; changed 2026-10-05, user decision)
+
+Recorded so the count is visible at pick time. These repos are NOT dead: report the count in the
+dossier and audit their unused lanes like any other repo.
 
 | Repo | Our subs | 
 |---|---|
@@ -112,7 +146,7 @@ untouched surface, and pick elsewhere in the same repo if the seams are good. Do
 
 | [olofk/fusesoc](https://github.com/olofk/fusesoc) | 2026-08-07-C (first PYTHON sweep): NOT saturated, NOT blocked, quota 0/6 — recorded so the next Python hunt does not re-derive it. BSD-2-Clause, ★1444, obscure FPGA/ASIC build-abstraction domain (not the author-obvious class), 74 commits/12mo, **G-PY2 CLEAN** (no numpy/scipy/lxml/pandas anywhere — deps are edalize/pyparsing/pyyaml/pydantic/simplesat/fastjsonschema/argcomplete). Real staged pipeline on paper: CAPI2 core files -> dependency resolution -> flow/target/parameter/fileset resolution -> backend generation, with a genuine two-tier `_append` inheritance form at `fusesoc/capi2/inheritance.py` (F-13 shape). **Two kills:** (1) **6,545 total Python LOC** — the jd profile, far under the ~30k repo-fit proxy; (2) **the machinery that would carry a pick lives in OTHER REPOS** — the SAT dependency solver is the separate `simplesat` package, the backend generators are the separate `edalize` package, so fusesoc itself is glue. Also open PR #778 already owns the `..._append` merge lane and #734 the runtime-validation lane. | ⭐ NEW PYTHON LAW: machinery absorption in Python happens at the **REPO boundary**, not inside a file. Python's packaging culture pushes heavy engines into separate installable distributions, so a repo can present a full pipeline in its module tree while importing every hard part. At hunt time, check total LOC AND read the dependency list for siblings that own the algorithms. Prefer monorepo-style engines over composable single-purpose libraries. |
 
-Near cap (headroom, in parens): expr (1 left), pest (1 left), katex (2 left), knex (2 left). Recount at pick time across `Olympus-Approved/Feature-Requests/<repo>/`, `problems/`, `diamond-problems/`, `rejected/` before relying on these numbers.
+Counts near 6 (warning only, changed 2026-10-05, user decision): expr, pest, katex, knex. Recount at pick time across `approved-problems/`, `problems/`, `rejected/` and `pipeline/LEDGER.md`, report the number, and never skip a repo for it.
 
 ---
 
@@ -755,6 +789,14 @@ javac + JUnit driven directly (the pom needs JDK <= 11), cold build ~35 s.
 | World snapshot / restore / rollback / prediction-by-copy, broadphase (brute-force, Sap, DynamicAABBTree) copies, CCD state copies | DEAD with the row above (same engine) |
 | Everything outside world copying | not surveyed |
 
+### B2-PYFAKEFS. pytest-dev/pyfakefs — LANE LEDGER (1 approved sub of ours: block + inode accounting; a foreign sub owns advisory locking)
+
+| Lane | Verdict |
+|---|---|
+| Advisory file locks (`fcntl.lockf`/`flock`/`fcntl` F_SETLK/F_SETLKW/F_GETLK, process + OFD interval engine, descriptor-lifetime release, EDEADLK) | **DEAD 2026-10-01, DERIVATIVE** overlap `Blocker` 237/299 subject lines = 79.3% (237/521 = 45.5% older side) against an older same-repo advisory-lock task; a different conflict decision (EDEADLK vs waiting) does not make the ownership + interval engine new. Issue #645 (maintainer mocked fcntl) was judged not a rejection. `rejected/pyfakefs-advisory-file-locks/` |
+| `os.lockf` dispatch, flock/dup sharing, descriptor-close repair | DEAD with the row above (partial overlaps with three more foreign subs) |
+| Block + inode per-mount accounting | APPROVED (ours), `approved-problems/pyfakefs-block-inode-accounting/` |
+
 ### B2-STREMIO. Stremio/stremio-core — LANE LEDGER (⛔ DO-NOT-PICK as of 2026-09-21: mechanically excellent, structurally unauthorable; 0 subs, quota untouched)
 
 Hunt 2026-09-21-B RANK 1. MIT, Rust 99.8%, 2411 stars, `development` @ `b3062f7f`, committed
@@ -1058,7 +1100,9 @@ Ran after the same day's RANK 1 (DataFixerUpper) was authored. RANK 1 out of thi
 | **beartype/beartype** | ⛔ **AVOID (2026-09-10-C)** — solo-maintainer roadmap + PEP-named capability space | ★3493 MIT Python, CI green on `main`, competitor-clean. Dead anyway: all 104 open issues are `[Feature Request]`/`[Docos]` written in `leycec`'s own voice and commented by him — the tracker IS the maintainer's public roadmap and already enumerates every extension point (#53 deep type-checking, #391 dataclass fields, #589 generators, #644 class-var defaults, #626 forward refs). Capability space is PEPs, externally named by construction. Codebase is famously comment-dense and idiosyncratic (style tax) |
 | **mozman/ezdxf** | ⛔ **CONTESTED (2026-09-10-C)** | `youdie006` (above) plus `origami7`, `eXponenta`, `haluk-pointr`, `eeshsaxena` — several thin accounts at 2-3 PRs each on a 21-issue/2-PR tracker |
 | **pybamm-team/PyBaMM** | ⛔ **DEAD as of 2026-09-10-C — COMPETITOR SWARM (third kill; supersedes the 08-07-D "revisit if the wave lands" note)** | The 08-07-D note said the shape was excellent (symbolic model -> discretisation -> solver is a real compiler pipeline) and to revisit if the unstructured-mesh wave landed. It landed (#5687/#5688 MERGED) and the repo is mechanically BETTER than before: BSD-3, ★1657, **CI green on `main`** (the 09-09 Requirement-7 doubt was wrong — the failing runs are `event=pull_request` on PR branches), zero AI-sweep marks in 300 commits, and a tracker full of open uncommented CORE bugs in the expression-tree/discretisation lane. **Killed on Stage 2b-bis instead.** `binggao1230` — a RECORDED signature account (also on cantools and petl) — holds **NINE open PRs**, and they are capability-shaped f2p work, one of them squarely in the target lane: *"Fix #4930: discretise `Variable.reference` / `scale` so r/x in initial concentration don't leak"*, *"Fix #5018: exclude internal 'start time' InputParameter from termination check"*, *"Fix #2484: include unsaved cycles in solve_time / integration_time"*, *"Let CRate accept callables for its default duration"*. Alongside: `medha-14` 8, `Rishab87` 4, `mleot` 3, `martin1cifuentes` 3, `AIMindCrafter` 2, `vidipsingh` 2, `swastim01` 2, plus `repowazdogz-droid` (new account, 1 follower, footprint spans cedar-spec / cvc5 / **pandapower** / common_cells / PyBaMM — AI-evals researcher, forks-then-fixes pattern, recorded below). All three softened reject thresholds are met at once: a recorded signature account, a burst, and a signature PR inside the intended lane |
-| **bufbuild/protobuf-es** | ⛔ **NOT AUTHORABLE as of 2026-09-10-B (re-screened at author Phase 2)** — was MEDIUM, now parked | Four lanes, all closed. (1) **Codec/serialization**: `ajeetdsouza` 10-PR perf campaign + the maintainer's own correctness sweep + the conformance corpus + it is our approved pick's subsystem. (2) **Naming/imports in protoplugin**: ABSORBED — `names.ts` already escalates `idealDescName(desc, i)` over `allNames(file)`, and `processImports` in `generated-file.ts` already does collision detection with `$N` aliasing, type-only-vs-value grouping and path rewriting. (3) **New codegen options**: maintainer philosophy — `timostamm` on #1319, *"we're very conservative adding new options to the plugin because supporting them isn't free"*, which covers most of the tracker. (4) **The two substantial capabilities are pre-designed or ported**: #1031 ES-Maps-for-map-fields has a published implementation plan from `sbarfurth` (*"a new kind of option that propagates from `protoplugin` to `protobuf`... `create` will need to know what kind of code was generated... `createZeroField`"*), and #1153 custom field mapping is answered by `timostamm` pointing at gogo/protobuf, which ships it — external reference implementation, and it is the umbrella for 6 other issues (the maintainer's roadmap). Repo remains clean and quota is 1/6 if a genuinely invented lane ever appears |
+| **bufbuild/protobuf-es** | ⛔ **DO-NOT-PICK as of 2026-10-12** (was NOT AUTHORABLE 2026-09-10-B; the 10-05 printer lane reopened it and died) | **2026-10-12: the fifth lane, the `.proto` source printer in protoplugin (`getProtoSource`), is DEAD, DERIVATIVE overlap `Blocker` 373/559 = 66.7% against an older foreign descriptor-to-.proto printer task; `rejected/protobuf-es-proto-source-printer/`. Every surveyed lane is now closed.** Four lanes, all closed. (1) **Codec/serialization**: `ajeetdsouza` 10-PR perf campaign + the maintainer's own correctness sweep + the conformance corpus + it is our approved pick's subsystem. (2) **Naming/imports in protoplugin**: ABSORBED — `names.ts` already escalates `idealDescName(desc, i)` over `allNames(file)`, and `processImports` in `generated-file.ts` already does collision detection with `$N` aliasing, type-only-vs-value grouping and path rewriting. (3) **New codegen options**: maintainer philosophy — `timostamm` on #1319, *"we're very conservative adding new options to the plugin because supporting them isn't free"*, which covers most of the tracker. (4) **The two substantial capabilities are pre-designed or ported**: #1031 ES-Maps-for-map-fields has a published implementation plan from `sbarfurth` (*"a new kind of option that propagates from `protoplugin` to `protobuf`... `create` will need to know what kind of code was generated... `createZeroField`"*), and #1153 custom field mapping is answered by `timostamm` pointing at gogo/protobuf, which ships it — external reference implementation, and it is the umbrella for 6 other issues (the maintainer's roadmap). Repo remains clean and quota is 1/6 if a genuinely invented lane ever appears |
+| **gonum/plot** | ⛔ **LAYOUT LANE DEAD as of 2026-10-13** | `rejected/gonum-plot-exact-glyph-layout` (exact glyph-aware padding + exact Align + WriterTo/Save overflow error) was REJECTED at platform review: DERIVATIVE overlap `Blocker` 110/236 = 46.6% against an older gonum/plot task that owns the "glyph-bound envelope and maximum-fitting grid-span engine". The lane is the repo's open-bug cluster #773/#733/#722/#723/#724, the tracker magnet. Dead: padX/padY, glyph boxes, Align, axis-label placement/rotation extents, export errors. Plotters, `vg` backends, `text` and palettes were not surveyed; assume any tracker-named bug is rival-held. |
+| **marcomusy/pianoplayer** | ⛔ **DO-NOT-PICK as of 2026-10-13** | Our only lane, performed-order reading of repeats/endings/D.C./D.S. with a tempo map and per-pass fingering (`unfold_repeats`), was REJECTED at platform review: DERIVATIVE overlap `Blocker` 88/206 = 42.7% against an older same-repo repeat-fingering task (jumps + tempo rated bolt-ons); a second foreign task touches note-element mapping (9/206, distinct). The lane is issue #8 "Fingering with voltas" (closed 2018, "a bit difficult"), the tracker magnet. Hunt 10-05-J found nothing else above ~160 written in this ~892-star, single-maintainer repo. `rejected/pianoplayer-performed-order-timeline/` |
 | **casid/jte** | ⛔ **AVOID as of 2026-09-10-B — RANK 1 REVERSED at author Phase 2** | Mechanically excellent (Apache-2.0, 1136 stars, quota 0/6, competitor-clean, CI green, cold compiler core, gap reproduced on base, harness built and Docker-validated at 1207 tests). Killed on Gate 8: the HTML-output escaping/policy lane is DECLINED THREE TIMES -- #387 `kelunik` "we don't really plan to support context dependent escaping for JS" and owner `casid` "the `OwaspHtmlTemplateOutput` is just one implementation... it would be possible to create an `HtmlTemplateOutput` that is aware of Alpine or HTMX" (i.e. user's job, not core's); #437 template calls in `<script>` declined; #252 JS inlining closed. That machinery is the ONLY deep coupled surface in the repo -- what remains (`BinaryContent` 52 LOC, `Utf8ByteOutput` 94, trimControlStructures, hot-reload plumbing) cannot carry 200 eff LOC against a 3789-LOC core module |
 | **onekey-sec/unblob** | **SHELVED — lead lane EXCLUSIVITY-DEAD** | Cleared everything else: MIT, 2552 stars, CI green, competitor-clean, core cold (`processing.py` 9 commits/24mo), and a real behavioural gap (partially overlapping chunks survive `remove_inner_chunks`, which handles only full containment, and then `calculate_unknown_chunks` builds an inverted `UnknownChunk`). Killed by closed issue #232, whose BODY carries two complete code solutions, and **closed PR #234 "Fix overlapping valid chunks." (+17/-0 in `processing.py`, `fix_chunk_overlaps`)**. Closed and unmerged is still a hard scope-gate reject. Other lanes thin: handlers are absorbed missing-arms, reporting shipped 2026-09-08, extraction-path safety is the maintainer's live lane, whole package is 4973 LOC |
 | **opensheetmusicdisplay** | **DEAD — competitor swarm** | `isc` x5, `gifflet` x2, `ymxlx`, `dotkebi` x2, `youdie006`, `ishinomaru` x3, `recrack` filing house-style capability-shaped one-bug fixes ("Carry the hidden unison exception to the notehead and the tuplet", "re-link lyric word chains split across voices", "match tied notes by sounding pitch instead of letter name") |
@@ -1066,7 +1110,7 @@ Ran after the same day's RANK 1 (DataFixerUpper) was authored. RANK 1 out of thi
 | **Vineflower/vineflower** | **AVOID — poor lane availability** | Not a competitor problem (6 Minecraft-ecosystem regulars: `Kroppeb` 13, `coehlrich` 13, `sschr15` 9, `aoqia194` 6) but they sweep the decompiler correctness-gap class continuously across structuring, variables, switches, finally, generics and Kotlin. Capabilities are JLS-named -> derivative risk |
 | **simpeg/simpeg** | **DOWNGRADED from 09-10 RANK 2** | Audit closed: the 12mo stream is the f2p class swept across every lane ("Fix bug in VRM effects on EM1D", "Fix bug in IP effects on EM1D", "Fix bug in apparent conductivity"), plus a v0.26 deprecation wave (moving baseline) and a mature directives/regularization framework (absorption). Published-method capability class |
 | **ostafen/digler** | **LOW** | File carving; PhotoRec/TestDisk is the reference toolchain and ships every recovery capability. Solo maintainer, 2 outside PRs ever, 2 code PRs in 2026, small repo -> LOC risk |
-| **bufbuild/protobuf-es** | **MEDIUM — lane-limited, NOT dead** | Proven repo, quota 1/6, competitor-clean, CI green. Codec lane DEAD (`ajeetdsouza` 10-PR perf campaign + maintainer correctness sweep + the conformance corpus + it is our approved pick's subsystem). protoplugin codegen is cold (2-7 commits/24mo per file) but `names.ts` already carries collision avoidance (absorbed) and `import-path.ts`/`map-imports.ts` is the live lane. `generated-file.ts` (19.8KB import-tracking emitter) is the one unread piece |
+| **bufbuild/protobuf-es** | ~~MEDIUM — lane-limited, NOT dead~~ ⛔ **superseded: DO-NOT-PICK 2026-10-12** (see the 09-10-B row above) | Proven repo, quota 1/6, competitor-clean, CI green. Codec lane DEAD (`ajeetdsouza` 10-PR perf campaign + maintainer correctness sweep + the conformance corpus + it is our approved pick's subsystem). protoplugin codegen is cold (2-7 commits/24mo per file) but `names.ts` already carries collision avoidance (absorbed) and `import-path.ts`/`map-imports.ts` is the live lane. `generated-file.ts` (19.8KB import-tracking emitter) is the one unread piece |
 | gimli-rs/gimli, fxamacker/cbor, harfbuzz/ttf-parser, ical4j, libriscv, libjxl, aeron-io/simple-binary-encoding, wasmi-labs/wasmi | spec-named class | DWARF / CBOR RFC 8949 / TrueType / RFC 5545 / RISC-V / JPEG XL / SBE / Wasm — the capability IS the standard and each has a reference toolchain |
 | dlclark/regexp2 | port law | a port of the .NET regex engine; inherits its whole feature list as prior art |
 | dartsim/dart, simbody/simbody | vendored-licence risk / AI-sweep | Eigen (MPL/LGPL) under vendored dirs; simbody also shows "Running Copilot Code Review" on `master` |
@@ -1446,12 +1490,14 @@ gh api "repos/OWNER/REPO/forks?sort=newest&per_page=10" -q '.[] | "\(.full_name)
 
 ## How to use
 
-1. At pick time, if the candidate repo appears in Section A, C, D or E → DEAD, pick another repo.
-2. If it appears in Section B proper (or a fresh recount puts it at ≥6) → DEAD for new subs.
+1. At pick time, if the candidate repo appears in Section A0, A, C, D or E → DEAD, pick another repo.
+2. If it appears in Section B proper (or a fresh recount puts it at ≥6) → NOT dead (changed
+   2026-10-05, user decision). Report the count; the platform warns at submit and does not refuse.
 2b. **If it appears ONLY in B1/B2/B3 → NOT dead.** Those are lane ledgers. Read which subsystem or
    capability lane died and whether a REVISIT condition has fired, then pick a DIFFERENT lane in the
    same repo. A repo with a dead lane and good seams is a cheaper target than a fresh one, because
-   its licence / determinism / dev-dep / Docker measurements are already paid for.
+   its licence / determinism / dev-dep / Docker measurements are already paid for. A lane verdict
+   older than 60 days may be re-audited ("Verdict scope and expiry", top of file).
 3. Stars is NOT the gate (risor 902★ = 78 subs). Bias hunts toward OBSCURE-to-problem-authors repos = deep engines in UNUSUAL domains, NOT the famous clean VM / SQL tool / config-lang everyone picks (those saturate regardless of stars). Verify the platform sub-count on the "Learn more" page BEFORE investing authoring effort — it is the only oracle. Check both famous AND niche-star candidates.
 4. Whenever you SEE a platform over-use warning, record the repo in Section A (with sub-count + stars) so it is never re-authored.
 

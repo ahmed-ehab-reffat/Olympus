@@ -1920,3 +1920,183 @@ Accepted at 4/10 on the first batch, after four platform gate rounds and no earl
   "in use". Holding the descriptor keeps the inode allocated.
 - **A 23-line slice grew to 294 over thirteen gate rounds.** Every round added a requirement (L91); it
   stayed solvable only because each one was stated in meta.md before the first batch.
+
+## pict-engine-negative-values (APPROVED Olympus 2026-09-29)
+
+- **Batch after the second gate round, not the fifth.** Five Auto Review rounds each added one High
+  coverage cell (lifecycle, header, tree and CLI exclusions, order 3 across models, CLI parity cells,
+  exports) and batch 1 read 0/11. The cut that recovered it (drop CLI parity and cross-model exclusions)
+  was chosen by replaying the saved patches, 1/11 counterfactual, and ended at 3/10.
+- **An FP flag that breaks every saved passer is a contract problem, not a missing test (L101).** Two
+  rounds: a value starved by an exclusion, then exclusions constraining the fillers of negative rows.
+  Seeded fuzz over the input class showed the crashes lived entirely in "exclusions touching parameters
+  with negative values"; confining exclusions in meta.md fixed it and the accepted batch was FP-clean.
+- **Fixtures are code: brute-force them and run them through base (L102).** One of mine was the sole
+  failure of a 33/34 run; another silently required a pre-existing base fix.
+- **Never let a shared test module bind the new API at import (L103).**
+
+## macs-circular-chromosomes (APPROVED Olympus 2026-09-29)
+
+- **A zero batch is first a claim about your fixtures.** Test BAMs gave the two mates of a pair
+  different read names; the reference never reads QNAMEs, 4/11 agents did and parsed 0 fragments. Build
+  synthetic files the way a real producer writes them (L105), and replay the saved patches before
+  cutting a single test: here the replay predicted the re-eval run for run (L68).
+- **Do not test an invariance law's degenerate case unless its canonical choice is written down
+  (L104).** Whole-circle and tied-gap tests killed 11/11, every run cutting at the origin. Dropping the
+  three tests turned 0/11 into 1/11 on a re-eval; the solution kept its canonical cut.
+- **Seven gate rounds, 17 zero-kill tests.** Every reviewer coverage request (format matrix, pooled
+  headers, q-value population) killed nobody (L95); the one that did (a default-mode PeakModel test)
+  decided the band (F-64, L22).
+- **Editable-install precheck on a Cython repo:** pip compiles editable extensions in a throwaway
+  build_lib and copies `scripts=`; seed `build/lib` from the in-tree `.so` and wrap the script, or every
+  test.sh run recompiles and the CLI stays stale.
+
+## ray-optics-sp-coherence-transport (APPROVED Olympus 2026-09-30)
+
+- **Scope added to a stated model does not move the rate (L106).** Batch 1 (core coherence transport)
+  and batch 2 (plus Polarizer, Retarder, polarimetry, ~290 more effective lines) both read 7/10. The
+  designed derivation traps (back-side sigma flip, oblique projection, Retarder algebra) killed 0 of 20
+  runs. Budget new scope as LOC and payout, not as difficulty.
+- **When probes converge, ask which engine the app runs by default (L108).** Every batch-2 run built
+  the objects for the primitive engines only; the app's default is the legacy `Simulator`. One
+  paragraph stating it took the rate to 3/10 (F-67). The legacy engine ran headlessly in jest with
+  `jest.unmock` and no canvases, so the cell was testable through the objects' own readings.
+- **Replay at perturbed parameters before reading an exact-cell kill as logic (L107).** The isolator
+  test killed 4/10; all four failing runs equalled the reference at 89.9, 90.1 and 80 degrees and
+  failed only at exactly 90 (cancellation to -1e-17, dropped by the engine's negative-power guard).
+- **Mutant-test every formula sentence that a later sentence reuses in a new regime.** "Reflected C is
+  multiplied by r_s r_p" plus "TIR uses the same coefficients" gave the phase SUM where the tests used
+  r_s conj(r_p); a literal-reading mutant failed both TIR tests. Fixed in meta.md before any batch.
+- **Six Auto Review rounds of coverage requests killed nobody (L95).** They earned Tests 2-3/3 and
+  nothing else. The one acceptance-time S1 (a legacy Retarder absorbing sub-cutoff rays through a
+  shared pass-through helper) was a reference bug no test covered: never route a lossless element
+  through a helper that applies a weak-ray cutoff.
+
+## riff-unified-conflict-regions (APPROVED Olympus 2026-09-30)
+
+- **Four batches of FP-voided passes, then an accepted 1/10.** Every pass failed some edge nobody tested
+  (empty sides, a missing final newline in three different ways, a second opener, stray markers). What
+  ended it: name each implied rule in one sentence (they killed 0/10 afterwards, L109) and cap the one
+  input family base riff itself mishandles (`\ No newline at end of file`, L101).
+- **A boundary the contract never defines is not a trap.** Where an out-of-order marker set ends killed
+  9/11. Moving the valid region after it into a separate file made every reading agree, tests-only (L110).
+- **The reference had four bugs, and all four came from AI reviewers.** Context prefix, a second set in
+  one block, resolution vs base, stray markers after a close. Budget review rounds as reference QA.
+- **Probe every saved solution against your fixture library before arguing with an FP panel.** The
+  differential probe found Nova_2's untested block-unit gap before the panel did, and later showed both
+  batch-3 passers differing only on the second-opener cases.
+
+## grmtools-contextual-lexeme-readings (APPROVED Olympus 2026-09-30)
+
+- **Three zero batches (0/25, 0/12, 0/10) before 2/10, each with a different cause.** Batch 1 was an
+  undefined technical verb ("can be shifted", L111); batch 2 an unstated recovery edge; batch 3 the same
+  edge broken a new way after it was stated, fixed by capping splits at three pieces (L113).
+- **Read assertion diffs before naming a killer (L92).** Most "recovery" kills in batches 2-4 were
+  grammars rejected at load because declared names were never registered (F-71). Batch 3's Nova_9 was
+  killed only by keeping trailing piece shifts the base simplifier strips (L112): plausibly 1/10, not 0/10.
+- **A regression test for a reviewer-found bug asserts the promise, not the reference's output shape.**
+  The exact-shape four-piece test killed 23/25 replayed runs including every candidate; the property
+  version killed the 16 real violators.
+- **Seven reference bugs, all found by AI reviewers,** the last one (reading not latched across
+  reductions in a reduce/reduce-conflicted table) only after acceptance.
+
+## pyocd-dwt-watchpoint-planner (APPROVED Olympus 2026-10-10)
+
+- **First problem accepted under the 2026-10-09 per-agent gate:** Nova 0/8, Orion 1/4, Nova sequence
+  length avg 521k. It was re-measured by re-eval on the new models after the admin revert, not re-authored.
+- **Six old-model batches (0/11, 0/10, 0/10, 0/10, 3/10) were spent mostly on fairness, not difficulty:**
+  deferred-write tests nobody could pass, acknowledgement wording, humanizer drifts, the agent-export bug
+  dropping `pyocd/target/` edits, eager probing. Each was found from the saved runs, not by intuition.
+- **On the new models Orion converged completely:** four solutions behaved identically under 3400
+  differential scenarios. The 1-of-4 lever was an implied boundary (top of the 32-bit space, F-73) that the
+  exact-range sentence already covered, found by a patch-reading subagent after fuzzing came up empty (L115).
+- **A new test can pass on base for a boring reason** (base refuses the range too). Read the clean room's
+  "no-solution new" failure count every time, not just the pass count with the solution.
+- **Ten reference bugs, three found by my own hardening audit:** comparator assignment wasting wide
+  comparators, `init()` duplicating comparators, rollback catching only `TransferError`. The accepted
+  artifact still has one Medium: `_disable_comparators` stops at the first cleanup fault.
+
+## cwerg-fe-address-constants (APPROVED Olympus 2026-10-11)
+
+- **Eleven batches and re-evals across both model generations.** Old models: three passes in a row were
+  FP-voided, each on a pre-existing C++ gap the reference fixed (sparse vec defaults, reads past the last
+  element, a record-with-span copy). Capping the domain in meta ended it; testing them would not have.
+- **The accepted Orion separator was an edge I had cut myself.** Empty-span `front` came from a Solution
+  Quality finding on my reference and killed 2/3 Orion passers when found, so it stayed untested. When
+  batch 9 read Orion 2/4 and eleven probes showed no divergence, re-replaying it split the passers 1/1
+  (L117). Keep a list of every edge you held back and why.
+- **Both of my designed hardening levers on the new models killed nobody** (cross-global compile errors;
+  typed self/mutual references). The first was later cut whole for the requirement-count check at no cost.
+- **The "Too many requirements" check is noisy:** the same 273-word text failed, then passed on a plain re-run.
+  I had already drafted a deeper cut; re-run once before cutting.
+- **An environment-blocker verdict on a one-line backend fix was contested twice and upheld both times
+  (L118).** A re-eval re-graded an unchanged trajectory into the blocker class, so read every verdict
+  after a re-eval.
+- **The Convex export dropped the patch of the one Nova pass.** I couldn't replay my lever against it and
+  shipped on the Orion evidence; the re-eval showed it died too. Retry the download before spending re-eval.
+
+## libspatialindex-mvr-history-pruning (APPROVED Olympus 2026-10-11)
+
+- **A requirement-count cut can create the lead trap.** "Kept pages lose entries that expire at or before
+  the horizon" killed 0/5 strong runs while stated; cut for the Task Prompt gate, the same behaviour
+  killed 4/8 Orion and 8/8 Nova (L120). Before cutting a zero-kill rule, ask whether it was zero because
+  it was stated.
+- **Parse platform JUnit with ElementTree.** A regex over self-closing `<testcase/>` elements attributed
+  failures to the wrong tests and made four solutions with identical (real) failures look like a harness bug.
+- **An oracle built on "unreferenced page = root" inherits base leaks.** The base MVR-tree orphans a node
+  created and killed in one instant; my first FP test (40 inserts at one instant) failed the reference.
+  Always run the reference against the oracle on each new input shape.
+- **The gate pool is cumulative (L121):** re-eval 0/4 Orion, 2 fresh passes, 2 fresh fails, accepted 2/8.
+- **Gate findings on the reference kept coming to the end:** the last one (erase markers keyed by id and
+  time, archiving a live same-id record) arrived after 16 rounds. Nine reference bugs in total.
+
+## asdf-conversion-free-lazy-tree (APPROVED Olympus 2026-10-11)
+
+- **A repo-wide `filterwarnings = error` is part of every new test.** The unknown-tag test failed on
+  the warning base itself emits; it was the only failure of 1 Orion and 3 Vega runs and made batch 11
+  read 0/20. Graders called it unfair; suppressing it with the repo's own flag gave Orion 1/8 (L122). I
+  had read the same failure as a fair miss twice before.
+- **After a requirement-count cut, cut the reference too.** Solution Quality failed twice on behaviour
+  from cut rules that the reference still had (L123). Diff the probe outputs of the old and new
+  reference: only cells for the cut rules should move.
+- **Thirty rounds were mostly spent on old-model walls that were later cut.** Block renumbering, version
+  migration, list-form arrays and import paths never separated a strong agent on the new models. The
+  winning tests were a repo invariant and an existing output line.
+- **Auto Review's last-minute S1/S2 (extension removal after a lazy open) did not block acceptance.** It
+  was a held-back edge that kills every Orion run. Record such edges with their replay numbers so the
+  decision is visible to the reviewer.
+
+## hayro-optional-content-baking (APPROVED Olympus 2026-10-12)
+
+- **Cutting an 11/11 wall was right on the old models and wrong to keep cut.** The per-caller Form render
+  mode killed every run in batch 1, including Vega and my reference. Capped to one caller per Form, it was
+  the 8/8-Nova, 0/4-Orion wall on the new models (L125). Keep a list of cut walls and replay them after a
+  model change.
+- **Treat every S1 on the reference as a trap candidate.** Both lead killers (Type 3 via ExtGState, caller
+  Form mode) began as Auto Review S1s on my code. If I wrote the bug, the agents will too (L17).
+- **Read the FP panel's dissents before hunting a lever.** At Orion 2/4, one overruled judge probe
+  (indirect ExtGState font size) killed exactly one passer and was graded a fair miss (L126).
+- **Each FP-voided strong pass was fixed with a cap, not a test,** when the replay showed the test would
+  kill most strong runs (shared Type 3/pattern contexts, pattern start mode).
+- **The oracle quirk still came back at acceptance.** The reference follows hayro's renderer and hides any
+  `BDC` with a hidden-group property, not only `/OC`; the meta cap did not stop an S1 High (L127). Make the
+  reference follow the spec outside the cap; no test pins it.
+- **Fifteen batches and 31 rounds.** Most old-model rounds went into fairness fixes for oracle-vs-spec gaps;
+  list those gaps before the first batch.
+
+## macs-callvar-fragment-phasing (APPROVED Olympus 2026-10-13)
+
+- **Your first gate-found reference bug may be the problem.** The precheck round-1 Solution Quality FAIL
+  (third-allele fragment admitted to a haplotype) became the rule that held 8/8 Nova at acceptance, with
+  0/4 Orion (F-86, L90). Keep every such fix and give it a test.
+- **At Orion 3/4 with Nova at 0, mine three free sources before touching the meta:** the FP panel's
+  false-positive scenario (quiet-peak crash), its judges' probes (read 1 outside every peak), and the
+  passers' behaviour on the repo path the default flags take (assembly). Each killed a different Orion run
+  and the re-eval read 1/4 (L126, L128).
+- **Where the meta says nothing, compare with the option off.** "pair-aware DPT == read-mode DPT when no
+  fragment has two reads over the site" needs no sentence and the evaluator graded it a missed requirement.
+- **Scoping a path out to stop FP voids can become a reference bug later.** Forcing assembly off ended four
+  batches of fermi-path voids, then contradicted a later meta sentence (Auto Review S1). Restoring the path
+  is where the Orion separator came from.
+- **The requirement-count gate cut ~27 rules to ~14 and 22 tests.** The cut contract still held Nova; the
+  Orion side needed one new stated rule plus three tests-only cells. Nineteen batches, two model generations.

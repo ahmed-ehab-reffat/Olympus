@@ -27,6 +27,10 @@ a FINISH the way they used to. Without that, a `clean` verdict is only bookkeepi
 
 ## State
 
+- `new-problems/`: every problem folder the loop creates lives here (`new-problems/<slug>/`). The loop
+  never creates, edits or moves anything under `problems/`. When the human starts work on a problem,
+  they move its folder from `new-problems/` to `problems/` themselves; that move means the problem is
+  theirs (see the claim check in the tick).
 - `pipeline/LEDGER.md`: one row per candidate. You are its only writer. Also append one dated line per
   event to its `## Log`.
 - `pipeline/INBOX.md`: the human writes here, and you move each handled line from `## New` to
@@ -41,7 +45,7 @@ With `finish-here` or a `finish` inbox line the older path still exists:
 
 - At most ONE hunter and ONE builder running at once. They run in parallel with each other.
 - Launch a hunter only while fewer than 2 rows are `HUNTED`.
-- Launch a SLICE builder only while fewer than 4 rows are `HANDOFF`. Past that the human is the
+- Launch a SLICE builder only while fewer than 10 rows are `HANDOFF`. Past that the human is the
   bottleneck: send one notification and stop slicing until a row clears (`CLAIMED`, `DEAD` or finished).
 
 ## The tick (run it at start, after every worker result, and after every wake-up)
@@ -55,12 +59,15 @@ With `finish-here` or a `finish` inbox line the older path still exists:
      `finish-here`; otherwise the row is the human's and the loop just records it.
    - `finish` (optionally `| <pasted precheck warnings>`): the human wants the loop to build this one
      after all. Set `PRECHECK-CLEAN` and queue a FINISH build.
-   - `dead` or `picker-refused`: launch nothing. Shelve the problem yourself: `git mv problems/<slug>
-     rejected/<slug>` (or plain `mv`), plus a one-line entry in `Instructions/SATURATED-REPOS.md` (A0
+   - `dead` or `picker-refused`: launch nothing. Shelve the problem yourself: `git mv new-problems/<slug>
+     rejected/<slug>` (or plain `mv`). If the folder is already in `problems/`, the human moved it:
+     leave it there, since shelving it is their call, plus a one-line entry in `Instructions/SATURATED-REPOS.md` (A0
      for a picker refusal, the lane ledger for a dedupe death). Set the row `DEAD`.
    - `claimed`: set `CLAIMED` and never touch that slug again.
    - `hunt-hint`: add it to the hunter preferences.
    Then move the line to `## Processed`.
+   **Claim check:** for every `HANDOFF` or `PRECHECK-CLEAN` row, if `new-problems/<slug>/` is gone and
+   `problems/<slug>/` exists, the human has taken it: set `CLAIMED` and never touch it again.
 3. **Worker results.** Parse the result block of any worker that just finished (formats are in
    `.claude/agents/olympus-hunter.md` and `olympus-builder.md`):
    - Hunter `CANDIDATE`: add a `HUNTED` row keyed by repo (slug `TBD`) and reset the miss counter.
@@ -70,9 +77,9 @@ With `finish-here` or a `finish` inbox line the older path still exists:
    - Builder `READY`: set `READY` and notify.
    - Builder `DEAD`: set `DEAD` with the reason. If it was a SLICE run and the hunt had `FALLBACKS`, add
      the first unused fallback as a new `HUNTED` row.
-   - Garbled result or crashed worker: read `problems/<slug>/feedback.md` to recover the state. Retry the
+   - Garbled result or crashed worker: read `new-problems/<slug>/feedback.md` to recover the state. Retry the
      same job once; if it fails twice, mark the row `DEAD (worker failure)` and move on.
-4. **Disk gate.** Run `df -h / /var/lib/docker`. Launch builders only if both have >= 10G free. If not,
+4. **Disk gate.** Run `df -h / /var/lib/docker`. Launch builders only if both have >= 5G free. If not,
    notify the human once, keep hunting (hunts barely use disk), and re-check each tick. Never prune Docker
    and never delete anything outside `worktrees/<repo>/target` yourself.
 5. **Launch builder** (if the builder slot is free and the disk gate passed). Pick in this order:
@@ -96,8 +103,9 @@ the agent file holds the whole contract. Include today's date, and:
 - SLICE builder: `MODE=SLICE REPO=<owner/repo> LANE=<...> HUNT_LOG=<path> FALLBACKS=<...>`.
 - FINISH builder: `MODE=FINISH SLUG=<slug>`, plus the precheck warnings pasted verbatim from the inbox.
 
-Never run two builders on the same slug. Never launch any worker on a `CLAIMED` row or on a
-`problems/` folder that has no ledger row (it belongs to a human session).
+Never run two builders on the same slug. Never launch any worker on a `CLAIMED` row, on anything in
+`problems/` (the human moved it there to work on it), or on a `new-problems/` folder that has no
+ledger row.
 
 ## Notifications
 
@@ -110,7 +118,8 @@ Do not notify on routine ticks.
 
 Print a table of every ledger row touched this run, with its status and next human step. Report counts
 (HANDOFF / READY / DEAD) and the remaining disk. For each `HANDOFF` row give the handover facts the
-human's next session needs: folder path, what is owed (picker, precheck), the measured LOC and the
+human's next session needs: folder path (`new-problems/<slug>/`, to be moved to `problems/` when work
+starts), what is owed (picker, precheck), the measured LOC and the
 FINISH plan in its `DESIGN.md`. Do not commit. The human decides what enters
 git.
 

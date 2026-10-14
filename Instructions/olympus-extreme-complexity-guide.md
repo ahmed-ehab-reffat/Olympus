@@ -1618,3 +1618,103 @@ Confirmed on an identity-aware reservation ledger for a SCSI emulator:
 - **What does NOT add difficulty:** alias identity through `.`, `..`, symlinks and hard links; reader
   and writer sharing rules; per-holder release; holder ordering. 37 of 66 tests killed nobody.
 - **A stated library-contract edge stays hard (F-39):** passwd-less create, 6/10 then 3/10.
+
+## pict-engine-negative-values (APPROVED Olympus 2026-09-29)
+
+Confirmed on negative values for a hierarchical combinatorial generator:
+
+- **F-62, whole-unit composition at a parent.** A child model is one value per row at its parent; test
+  every cross product of whole child rows with and without the special value, from an output-derived
+  oracle. 5/10, the sole failure of two 33/34 runs. Leaf-pair checks cannot see it.
+- **F-63, two regimes in one pass.** Require that the ordinary-only rows keep the old guarantee. 3/10 to
+  7/11 on the same sentence: effective but high variance.
+- **What does NOT add difficulty:** the header compile check, the export-list check, ordinary-model column
+  mapping (0 kills each); the lifecycle leak test (2/10, never a sole failure).
+- **What kills FAIRNESS instead:** exclusions that touch the special values. Every passer crashed on them;
+  confine them in the contract before the first batch.
+
+## macs-circular-chromosomes (APPROVED Olympus 2026-09-29)
+
+**Confirmed: a topology change is hardest where the pipeline hides a stage.** Changing linear
+coordinates to circular touches every stage of a peak caller; agents cover the stages the outputs
+visibly come from and miss the estimator that runs first (F-64, 10/11) and the structures derived
+inside each group (F-65, 8/11). Anti-agent lever: switch the estimator off in every exact-value test
+(so nothing else reaches it) and keep one default-mode test; state the estimator's OUTPUT in the law,
+not the estimator. **Confirmed limit:** the law's degenerate cases (full wrap, ties) are a same-reason
+wipeout, not difficulty (L104).
+
+## ray-optics-sp-coherence-transport (APPROVED Olympus 2026-09-30)
+
+**Confirmed dead: difficulty from a derivation inside a stated physics model.** An object-fixed
+polarizer axis seen from behind (sigma flip) and at oblique incidence (projection through -d_0y) looked
+like a misdirecting derivation; it killed 0 of 20 runs. **Confirmed live: a second engine the product
+defaults to** (F-67, 3/10 once stated, 10/10 omitted when unstated) and **an exact composite that lands
+on a strict repo guard** (F-66, 4/10, batch-variant). Anti-agent lever: make the new objects work in
+the default engine too, and let one textbook composite hit an exact zero next to a pre-existing
+validity guard. Write the reference as non-negative products so it lands on exactly 0.
+
+## riff-unified-conflict-regions (APPROVED Olympus 2026-09-30)
+
+**Confirmed: a stateful renderer with several independent stated seams holds ~10% without a wall.** No
+single trap carried it: empty texts into a panicking repo primitive, a rule that differs by mode, the
+block unit, and multi-set cells each took 2-4/10, and the three best runs each missed exactly one.
+**Confirmed limit:** rules added to close FP holes add no difficulty once named (L109); the grammar and
+ordering tests (six of them, plus the DESIGN lead trap) killed nothing in the accepted batch.
+
+## grmtools-contextual-lexeme-readings (APPROVED Olympus 2026-09-30)
+
+**Confirmed: a parser-generator feature spanning the grammar reader, the LR loop and CPCT+ recovery holds
+~20% on declaration bookkeeping plus one recovery seam.** The symbol-table side effect (F-71) taxed every
+fixture that declared a token only in the new directive, and the recovery stack's iteration order (F-72)
+decided the near-misses. **Confirmed limit:** a trap resting on an undefined technical verb is not
+difficulty (L111), and an edge each near-miss breaks differently is cheaper to cap than to state (L113).
+
+## pyocd-dwt-watchpoint-planner (APPROVED Olympus 2026-10-10)
+
+**Confirmed: a hardware-register feature spanning a planner, a halt/session lifecycle and two reporting
+front ends meets the new per-agent gate with tests-only hardening.** A stated latch lifecycle (F-74) is a
+Nova wall the new Orion clears every time; an implied domain boundary (F-73) is where Orion still varies.
+**Confirmed limit:** once the strong agent converges, more stated rules cannot split it (they kill all four
+or none, L115); and an old-model kill count says nothing about the new models (L114).
+
+## cwerg-fe-address-constants (APPROVED Olympus 2026-10-11)
+
+**Confirmed: a compiler feature that folds a new value kind at compile time and must emit it as data
+through twin implementations is deep enough for the new gate.** The difficulty sits between passes: a
+lowering pass changes the node shape before an emitter that dispatches on syntax (F-75), and an evaluator
+that now yields whole aggregates meets an emitter written for literals (F-77). Default/empty values of the
+new kind are the sharpest cell. **Confirmed limit:** designed traps in the type checker (self/mutual
+references) and in error rules (cross-global compile errors) killed nothing on the new models.
+
+## libspatialindex-mvr-history-pruning (APPROVED Olympus 2026-10-11)
+
+**Confirmed pattern:** a feature that frees storage under a parent-pointer structure whose store recycles
+ids (F-78) hides its bug until reuse, far from the cause; long post-free workloads against a page-graph
+oracle make it a 12/16 wall. A watermark the contract lets equal "now" adds a near-miss cell the strong
+agent misses (F-79). **Confirmed limit:** query clipping, horizon persistence, archive boundaries and a 3D
+workload killed nothing.
+
+## asdf-conversion-free-lazy-tree (APPROVED Olympus 2026-10-11)
+
+**Confirmed pattern:** a feature that adds a raw traversal over a lazily materialized graph breaks the
+identity cache for shared references (F-80, 15/20 incl. 6/8 Orion), and its inspection side leaks into
+existing output for default metadata (F-81, 4/8 Orion). Both are invariants, so they need no meta words
+and survive the requirement-count gate. **Confirmed limit:** block renumbering, version migration,
+list-form arrays and import-path types cost ten rounds on the old models and separated no strong agent
+on the new ones; 13 of 25 tests killed nothing.
+
+## hayro-optional-content-baking (APPROVED Olympus 2026-10-12)
+
+**Confirmed pattern:** a rewriter that recurses into callees has two reach walls that hold Nova at zero:
+inherited caller state for callees that run in it (F-83, 8/8 Nova) and a second route to the same resource
+kind (F-84, 8/8 Nova). The strong agent clears both and splits only on second-order edges of the same
+seams (an indirect operand on the second route). **Confirmed limit:** 57 of 74 tests killed nothing,
+including the inline-property test once it was stated (16/18 Orion kills when implied, 0/12 stated).
+
+## macs-callvar-fragment-phasing (APPROVED Olympus 2026-10-13)
+
+**Confirmed pattern:** one flag with two halves (counting, then phasing) on two evidence paths gives Nova a
+long grind (avg 565k sequence length) and then a data-structure wall: the per-unit table shaped for the
+first consumer cannot express what the second consumer excludes (F-86, 8/8 Nova). **Confirmed limit:** 47 of
+55 tests killed nothing, including every control-side, multiprocessing and chromosome-isolation test and
+the in-window strand test; only the window-edge cell of the strand rule killed (F-87, 8/12).

@@ -1298,3 +1298,156 @@ Cross-agent blind spots, 10-Nova accepted batch (4/10).
 - **What every agent got right:** alias identity through dot segments, `..`, symlinks and hard links,
   reader/writer sharing, per-holder release, protobuf holder fields, scsictl text.
 - Effort: Nova only; passing diffs +354, +499, +575 raw lines against the reference's 294 (Counter 1).
+
+## pict-engine-negative-values (APPROVED Olympus 2026-09-29)
+
+- **Partner rows sized by leaf values (F-62, 5/10 + 5/10).** Nova ported the CLI's two-run template, so a
+  child's negative rows got no positive sibling partners (#44), or got just enough partners to cover every
+  leaf pair but not every whole sibling row. Sole failure of two 33/34 runs (Vega and Nova).
+- **One generator for two regimes (F-63, 3/10; 7/11 in one batch).** Agents ran the existing generator once
+  with pair masks, so negative rows absorbed positive coverage. The sentence was identical across batches
+  that read 3 and 8: pure variance.
+- **Order 1 forgotten (F-10 cell).** A 32/34 Nova run aborted (`choice != -1`) only on order-1 models.
+- **Brittle under constrained fillers.** Every passer in four batches crashed or hung when an exclusion
+  named a parameter with negative values; the reference's separate masked phase never did.
+- **Shared-engine regressions (F-12).** 1-7 runs per batch broke the repo's perl CLI harness through engine
+  edits, including one run that passed all 35 new tests.
+
+## macs-circular-chromosomes (APPROVED Olympus 2026-09-29)
+
+- **Upstream estimator left on the old topology (F-64, 10/11).** Nova patched pileups, lambda, peak
+  joining and outputs for circular chromosomes and left MACS3's PeakModel linear: zero strand pairs on
+  origin-straddling sites, callpeak exits. Sole failure of a 46/47 run. Only Vega adapted it.
+- **Wrap joined at the top, not inside (F-65, 8/11 and 5/11).** Agents join the first and last linear
+  groups at the origin; gapped-peak blocks and subpeak summit offsets stay computed on the pre-join
+  pieces ("126 versus -19874", "3 blocks versus 2").
+- **Degenerate case falls back to the origin (11/11, batch 1).** A component wrapping the whole circle,
+  or tied widest gaps: every run cut at coordinate 0 despite a stated rotation law.
+- **Paired-end parsing by QNAME.** 4/11 paired BAMPE mates by read name (legitimate); fixtures must give
+  mates one name. Nova 0/10, Vega 1/1.
+
+## ray-optics-sp-coherence-transport (APPROVED Olympus 2026-09-30)
+
+- **Nova transcribes a stated physics model reliably.** Across 30 Nova runs the Fresnel/TIR products,
+  default-slot rule, GRIN and sampling scaling, sigma back-side axis flip and oblique projection were
+  right in every run that did not break a whole object. Failures were elsewhere.
+- **Expanded algebra lands on the wrong side of a strict guard (F-66, 4/10 in batch 3, 0/10 in batch
+  2).** Nova writes Jones products out term by term; at an exact extinction the zero component comes
+  out about -1e-17 and the engine drops the whole ray. Evaluators read it as a basis/sign logic error.
+- **New objects built only for the engine the tests visibly use (F-67).** Unstated: 10/10 omitted the
+  legacy Simulator path. Stated: 2 of 10 implemented `onRayIncident` but not the base-class
+  `checkRayIntersects` (defaults to null), 1 projected on the ray vector instead of the segment.
+- **Pairing rule applied to reads (F-68).** 3 of 30 rejected a surface that reads only `C_0r`,
+  extending a rule stated for output labels to reserved inputs.
+
+## riff-unified-conflict-regions (APPROVED Olympus 2026-09-30)
+
+- **Empty input into a repo primitive (F-39, 4/10; 3/11 in batch 1).** Nova hands empty side or
+  resolution texts to riff's `refiner::diff`, which underflows; the region's output is dropped. The one
+  Vega pass mapped empty text to a newline.
+- **A mode-split rule collapsed (F-69, 4/10 twice).** Resolved context lines are printed raw; Nova prints
+  unresolved context raw too, losing its word highlights.
+- **Unit re-derived by the new buffer (F-70, 4/10; sole failure of the best near-miss twice).** A removed
+  line after added lines starts a new block; Nova absorbs the finished pair into the region or renders it
+  through a helper that drops newlines.
+- **Named rules are cleared.** Stray markers after a close and a second opener killed 0/10 once one
+  sentence named each (11/22 and 4/13 of solutions written before those sentences).
+- **Vega passed on the fewest requests (47) and tokens (3.7M vs 5.2-12.5M for Nova).** Nova 0/9.
+
+## grmtools-contextual-lexeme-readings (APPROVED Olympus 2026-09-30)
+
+- **Declared names stored, never registered (F-71, 14 runs over 3 batches).** Nova parses `%fallback` /
+  `%split` into a new map and forgets that the directive declares tokens; bare names become rule
+  references, directive-only sources "unknown token".
+- **Recovery stack read top-first (F-72, 7 runs, sole failure of three near-misses).** The reading helper
+  written for the main loop's bottom-first `Vec` is fed `Cactus::vals()` unreversed.
+- **"Can shift" read as "the table action is Shift" (20/25) until defined (L111).**
+- **Several Nova runs kept trailing piece shifts in CPCT+ repairs on purpose** so replay could resume
+  inside a split (L112), a design the tests pinned against. One gated the directives on one grammar kind.
+- **Both passes were Nova** (+932 and +605 lines, ~90 and 134 messages). Orion 0/2 and Vega 0/5 over the
+  earlier batches.
+
+## pyocd-dwt-watchpoint-planner (APPROVED Olympus 2026-10-10)
+
+- **New Nova misses a read-to-clear hardware latch across session boundaries (F-74): 18/19 runs.** It resets
+  its own per-halt cache on resume/step/reset but never reads FUNCTION to drain MATCHED, so an unreported
+  hit leaks into the next halt. Old Nova on the same artifact: 2/10. New Orion: 0/8.
+- **Both agents trust unbounded Python arithmetic into a 32-bit register (F-73):** 8/8 Nova and 3/4 Orion
+  let a range past 0xFFFFFFFF wrap into low memory. The Orion pass checked `addr + size > 1 << 32`.
+- **New Orion is fast and convergent on hardware planning:** sequence length ~75k, 673-832 added lines,
+  every run optimal on heterogeneous-capacity comparator packing (1500-case oracle), best-fit assignment.
+- **New Nova grinds:** 500k-605k sequence length (one compaction each), 907-1147 added lines, 68-73/78;
+  besides F-73/F-74 it loses 3-4 runs to capacity cells (block too large for the remaining comparators).
+
+## cwerg-fe-address-constants (APPROVED Olympus 2026-10-11)
+
+- **Both agents key a late emitter on the syntax they see, not on the folded value (F-75).** After span
+  lowering rewrites `front(empty)` into `ExprField(empty, pointer)`, 8/8 new Nova and 3/4 new Orion crashed
+  or rejected it; the Orion pass dispatched on the evaluated `EvalSpan` and wrote a zero pointer.
+- **New Nova misses aggregate read-through (F-77): 5/12 runs** in the accepted batch, the lead killer in
+  batches 5-7. Scalar `p^.x` works, so it believes `global copy = p^` does too. New Orion cleared it 4/4.
+- **New Nova uses `size` for an array stride (F-76)** on padded records: right on a32, wrong on x64/a64
+  (2/12). No Orion run made this mistake.
+- **Nova tests one pipeline and assumes its twin.** A run checked C++ front-end output only through the
+  Python backend (`-fe c++ -be py`) and never hit the C++ ELF `addend == 0` assert; 6 of 7 sibling runs
+  found and fixed it.
+- **Sequence length on a twin-implementation feature:** Nova 0.79M-1.58M (avg 995k) without compaction,
+  Orion 145k-468k.
+
+## libspatialindex-mvr-history-pruning (APPROVED Olympus 2026-10-11)
+
+- **Shared blind spot (12/16, 4/8 Orion): reclaiming storage without rewriting the parents.** Agents delete
+  the unreachable pages and leave the expired child entries in the nodes they keep. It passes every
+  immediate check and fails hundreds of operations later, once the storage manager reuses the page ids.
+- **Strong-agent shortcut (2/16, both Orion near-misses):** resuming the next purge from the previous
+  horizon. Right for every page that existed at the earlier prune, wrong for pages ended at that instant
+  after a prune at the current time.
+- **Statistics after a purge:** strong runs recomputed dead-node counts from each node's own end time, which
+  the base tree does not keep current (the parent entry is authoritative); split Orion 1/4 in batch 7.
+- **Sequence length:** Nova 521k-562k (avg 543k), Orion 101k-144k, on a 6-file C++ feature.
+
+## asdf-conversion-free-lazy-tree (APPROVED Olympus 2026-10-11)
+
+- **Shared blind spot (15/20: 8/8 Nova, 6/8 Orion, 1/4 Vega): alias identity across a raw second
+  traversal.** Agents write the accessed alias through its wrapper and the untouched alias from the raw
+  backing dict, so a YAML anchor becomes two copies. Every tag check passes; only `is` on the re-read
+  file fails.
+- **Strong-agent miss (4/8 Orion): the new view also reroutes nodes the old renderer handled.**
+  `asdf_library (Software)` gained a schema-title comment or lost its children.
+- **Vega-only miss (2/4): "when unsure, convert".** A multi-type converter was run inside `info()` to
+  find its class, crashing on a bad node.
+- **Nova-only misses:** history entries in block files, raw ndarray sources on update, search-result
+  `node(s)` materialization, key-before-filter across a chain.
+- **Sequence length:** Nova 742k-1.17M (avg 902k) on a 7-module Python feature; Orion 105k-149k, Vega
+  150k-204k.
+
+## hayro-optional-content-baking (APPROVED Olympus 2026-10-12)
+
+- **Shared blind spot (8/8 Nova, 0/4 Orion): Form XObjects baked from the default text render mode.**
+  Agents write one bake(stream) that starts at mode 0, so the restore after hidden text undoes the
+  caller's `1 Tr`/`5 Tr`. Orion seeds Forms from the caller and patterns from fresh state.
+- **Shared blind spot (9/12: 8/8 Nova + 1 Orion): a resource reached through a second dictionary.** Type 3
+  fonts selected by an ExtGState `/Font` array are never found by a `/Font`-only walk. The strong
+  agent's version of the miss: reading the array's size only when it is a direct number (`raw_iter`).
+- **Nova-only (5/8): a hidden soft-mask group.** Its own `/OC` is checked only at `Do`; and "hidden" must
+  mean an empty mask (everything masked), not a dropped mask.
+- **Nova-only (2/8): XObject-level `/OC` ignored entirely,** 15 failures each.
+- **Orion near-misses fail second-order edges of the same seams:** indirect operand on the ExtGState
+  route, caller-resource fallback for a Form with an empty `/Resources`.
+- **Sequence length:** Nova 505k-886k (avg 636k) on a 4-file Rust feature with a 1700-test crate;
+  Orion used about a tenth of Nova's prompt tokens.
+
+## macs-callvar-fragment-phasing (APPROVED Olympus 2026-10-13)
+
+- **Shared Nova blind spot (8/8 Nova, 0/4 Orion): the evidence table is built for the first consumer.**
+  Nova stores only REF/ALT per fragment for linking, so the membership rule ("every allele it carries")
+  can never see the uncalled base; trajectories even restate the rule and still ship the reduced map.
+- **Nova + weaker Orion (8/12): an attribute owned by a record the window never fetched.** Strand from read
+  1 falls back to read 2's own strand when read 1 sits outside every peak, though read 2's flags carry it.
+- **Nova bypasses the second engine (5/8):** pair-aware counting only on raw reads, local assembly (-F auto,
+  default) left per-read. Orion's version: reads placed by `seq.find` in a unitig, one hanging 1 bp past the
+  end is lost (29 vs 30).
+- **Orion near-misses fail edges, not rules:** a crash on a peak with no calls (unconditional reference to
+  an assembly-only variable), a `*` deletion misread at membership.
+- **Sequence length:** Nova 521k-793k (avg 565k), every run compacted, ~200-280 steps on a 10-file
+  Python+Cython feature; Orion used about a tenth of Nova's prompt tokens.

@@ -1,6 +1,6 @@
 ---
 name: olympus-hunt
-description: Use when SOURCING new target repositories for Olympus challenges — the stage BEFORE authoring. Finds niche, unsaturated repos in Go, Rust, Python, TypeScript/JavaScript, C++, or Java (500+ stars, permissive license, active, pure-language, live upstream — issue count and commit velocity are ranking signals, NOT gates) and scores each for trap-seam potential against the measured patterns in failure-patterns.md, plus capability-lane availability, so the shortlist is ranked by whether the repo can still carry an authorable pick at all. Runs the six mechanical hard requirements, the local dedup/saturation check (SATURATED-REPOS.md + problems/ + rejected/ + approved-problems/), the capability-lane-density triage, the maintainer-welcomed-lane search, a Docker-feasibility estimate, and emits a per-candidate dossier. Triggers when the user says "find repos", "hunt repos", "new targets", "repo recon", "candidates for Olympus", "repos similar to X", or asks what to author next with no repo chosen. Hands off to olympus-author once a candidate is scope-locked. Source of truth: Instructions/PICK-FILTER.md (10 gates), Instructions/RULES.md (repo + license rules), Instructions/SATURATED-REPOS.md (blocklist), failure-patterns.md (trap-seam targeting), Instructions/TOO-EASY.md (dead classes).
+description: Use when SOURCING new target repositories for Olympus challenges — the stage BEFORE authoring. Finds niche, unsaturated repos in Go, Rust, Python, TypeScript/JavaScript, C++, or Java (500+ stars, permissive license, active, pure-language, live upstream — issue count and commit velocity are ranking signals, NOT gates) and scores each for trap-seam potential against the measured patterns in failure-patterns.md, plus capability-lane availability, so the shortlist is ranked by whether the repo can still carry an authorable pick at all. Runs the six mechanical hard requirements, the local dedup/saturation check (SATURATED-REPOS.md + new-problems/ + problems/ + rejected/ + approved-problems/), the capability-lane-density triage, the maintainer-welcomed-lane search, a Docker-feasibility estimate, and emits a per-candidate dossier. Triggers when the user says "find repos", "hunt repos", "new targets", "repo recon", "candidates for Olympus", "repos similar to X", or asks what to author next with no repo chosen. Hands off to olympus-author once a candidate is scope-locked. Source of truth: Instructions/PICK-FILTER.md (10 gates), Instructions/RULES.md (repo + license rules), Instructions/SATURATED-REPOS.md (blocklist), failure-patterns.md (trap-seam targeting), Instructions/TOO-EASY.md (dead classes).
 ---
 
 # Olympus Repo Hunt — sourcing targets that can carry a hard problem
@@ -28,6 +28,19 @@ Time budget: 30-40 min for a 3-5 candidate shortlist. Stages 2c and 2d are the c
 the hunt — 2c kills a repo whose lanes are gone before you audit its seams, and 2d finds a lane the
 maintainer has already blessed.
 
+**★ What the 2026-10-09 new-model gate asks of a repo.** The platform now requires Nova >= 8 runs at
+0 passes, Orion or Vega >= 4 runs at 1-25%, and an average Nova sequence length > 256k (the largest
+input+output of any step, compaction windows summed). Two consequences for hunting:
+- **Reading surface is now a gate, not a nicety.** Nova must work long before it fails. Prefer repos
+  where the capability forces the solver to read and connect several large modules (a pipeline, a
+  type system, a multi-stage analysis). A pick that a solver can attempt from one small file will
+  fail the sequence-length average even at 0/8.
+- **The trap has to separate Nova from Orion,** not just lower a rate. Seams that need cross-file
+  reasoning (F-9 stage boundary, F-10 cross-product cells, F-1 convergent wall) are the ones to score
+  up; a single stated rule that a careful reader gets right either passes Nova or kills everyone.
+Measured pass rates in this skill and in the dossiers came from the OLD models; use them to rank
+seams against each other, not to predict the new gate.
+
 ---
 
 ## Stage 0 — Set the search space (2 min)
@@ -45,7 +58,7 @@ Derive the search axes from the anchors — domain, not name. All five are
 
 ⚠️ **Do this BEFORE any GitHub sweep.** A cold hunt is the low-probability path, and the corpus says so.
 
-**The evidence.** Across `approved-problems/` + `problems/` + `rejected/`, the ~39 repos carrying
+**The evidence.** Across `approved-problems/` + `problems/` + `new-problems/` + `rejected/`, the ~39 repos carrying
 frontmatter host multiple problems each — starlark-go 3, gluon 3, numbat 2, python-control 2, lyon 2,
 ezdxf 2, yara-x 2, pcapplusplus 3, amaranth 2, customasm 2, rmk 2. **The corpus re-mines repos that
 already worked.** Four consecutive cold-start picks (geometry-central, choco-solver, thermo,
@@ -58,19 +71,29 @@ shipped from.
 - Every mechanical measurement is already paid for: licence, stars, activity, live-upstream, Docker
   pattern, flakiness baseline, test conventions, JUnit wiring.
 - There is a calibrated `meta.md`, `DESIGN.md` and `feedback.md` to scaffold against, and a known
-  pass rate to aim at.
-- Quota is `<= 6` per repo, so a repo at 1-2 has room for 4 more.
+  pass rate to aim at (measured on the pre-2026-10-09 models, so a relative guide only).
+- **Our submission count is a submit-time platform WARNING, not a hunt gate (changed 2026-10-05, user
+  decision).** Report the count in the dossier and never kill or skip a repo for it. Peers ship ~12 on
+  one repo, and dasel 9, cliffy 7, yaegi 7 and sfepy 25 were all submitted.
 
 ```bash
 # Build the pool: repos we have shipped from, with counts
-for f in approved-problems/*/meta.md problems/*/meta.md rejected/*/meta.md; do
+for f in approved-problems/*/meta.md problems/*/meta.md new-problems/*/meta.md rejected/*/meta.md; do
   grep -m1 '^Repository:' "$f" | sed 's|Repository: *||; s|https://github.com/||; s|/*$||'
 done | grep -E '^[^/]+/[^/]+$' | sort | uniq -c | sort -n
 ```
 
-**Then, for each candidate at 1-2 subs:** confirm it is still live, run **Stage 2b-bis PR-author
-profiling**, and pick a **different SUBSYSTEM CLASS** from the one already shipped (the self-collision
-rule is subsystem-level, not repo-level — see the comrak note in Stage 2b).
+**Second lanes are the DEFAULT source (changed 2026-10-05, user decision).** A `pipeline/LEDGER.md`
+row or an earlier problem on a repo excludes only THAT lane: its capability and the file set it
+touched. Repos we used before (approved, CLAIMED, in flight in `problems/` or waiting in `new-problems/`, or rejected for a
+lane-level reason such as LOC, absorption or too-easy) stay in the pool for every other lane. Add the
+LEDGER repos to the counts above. A repo stays dead only for a repo-level reason: licence, language,
+activity, Requirement 7, or a derivative loss to an older accepted task on the lane being considered.
+Never take the capability or the file set of an in-flight or CLAIMED row, since another session owns it.
+
+**Then, for each pool candidate, whatever its count:** confirm it is still live, run **Stage 2b-bis
+PR-author profiling**, and pick a **different SUBSYSTEM CLASS** from the one already shipped (the
+self-collision rule is subsystem-level, not repo-level — see the comrak note in Stage 2b).
 
 ⚠️ **Read the COMMIT stream, not the PR queue** — the rapier lesson bites hardest here, because a
 proven repo is usually a small repo with one maintainer who pushes directly. **Measured on neva
@@ -105,7 +128,7 @@ the capability check in Stage 2c and the seam audit in Stage 3, not by more repo
 
 | # | Requirement | Why |
 |---|---|---|
-| 1 | **stars ≥ 500** (`RULES.md` floor). No ceiling — but 5000+ is a PENALTY band | <500 = platform-invalid. High stars = more training data AND faster global saturation, so score 5000+ down and verify the platform sub-count before authoring. It is not a reject; the 10000 cap was arbitrary and cost us candidates |
+| 1 | **stars ≥ 500** (`RULES.md` floor). No ceiling — but 5000+ is a PENALTY band | <500 = platform-invalid. High stars = more training data AND faster global saturation, so score 5000+ down and verify the platform sub-count before authoring. It is not a reject; the 10000 cap was arbitrary and cost us candidates. **Changed 2026-10-05, user decision:** a row sitting at the floor needs only a ~505 margin before it is spiked (the old ~520 buffer is dropped); the 500 floor itself is unchanged |
 | 2 | **Go, Rust, Python, TypeScript/JavaScript, C++, or Java — as the PRIMARY or a MAJOR language by code volume** | This hunt's scope. ⛔ **Plain C is NOT supported (platform picker, 2026-09-19):** "No supported language is a primary or major part of this repo (top: C). Use a repo where Python, TypeScript, JavaScript, Go, Rust, Java, or C++ is primary or a top-3 language by code volume." The top-3 clause has a size floor: tyfkda/xcc was refused with TypeScript 2nd at 4.9% of bytes. Check `gh api repos/O/R/languages` at Stage 1; RULES.md's "C/C++" wording and `olympus-base-cpp` building C are NOT eligibility. |
 | 3 | **≥1 commit in last 12 months** | `RULES.md` repo requirement |
 | 4 | **Permissive license** — MIT, BSD (any clause), Apache-2.0, Boost/BSL-1.0, CC-BY | GPL/AGPL = hard reject |
@@ -132,9 +155,16 @@ gh run list -R $R --limit 8 --json conclusion,name,createdAt -q '.[]|"\(.created
 grep -iE "numpy|scipy|pandas|networkx" setup.py pyproject.toml   # are deps PINNED?
 ```
 
-**Reject when:** there is no test-running workflow, or the test workflow FAILS ON THE DEFAULT BRANCH,
-or the runtime deps are entirely unpinned. All three mean the baseline is a moving target you cannot
-rely on, and **base mode must PASS** for every submission.
+**Reject when:** there is no test-running workflow, or a failing TEST workflow on the default branch
+touches the lane you intend, or the runtime deps are entirely unpinned. All three mean the baseline is
+a moving target you cannot rely on, and **base mode must PASS** for every submission.
+
+**Changed 2026-10-05, user decision: a CI failure kills only when it is a failing TEST workflow on the
+default branch that touches the lane.** A red non-test workflow (govulncheck, lint, release, docs,
+packaging) is a dossier note. So is a single failing matrix leg whose failures sit outside the lane
+(one Windows image, one PDF size test). For those, pick a green base commit or exclude the unrelated
+tests in `test.sh` base mode with a written reason. A red test workflow inside the lane is still a
+reject, because the lane's own tests cannot be excluded (the causal-learn case below).
 
 ⚠️ **Softened 2026-09-09-B (user decision): read the CONCLUSION of runs on the default branch, not the
 latest rows.** `action_required` means a fork PR is waiting for a maintainer to approve the workflow
@@ -186,8 +216,10 @@ promised one, and unpinned deps mean it can rot again between authoring and the 
   below. Only capability collision kills.
 - **Already in the workspace.** Not automatically dead. A repo you cloned and shelved for a
   capability reason still has its other subsystems available, and its licence/build/determinism
-  measurements are already paid for. Check `SATURATED-REPOS.md` and the ≤6 quota (Stage 2), then
-  reuse the audit.
+  measurements are already paid for. Check `SATURATED-REPOS.md` (Stage 2), report the submission
+  count, then reuse the audit. **Changed 2026-10-05, user decision:** a LEDGER row, an approved or
+  CLAIMED problem, an in-flight folder or a lane-level rejection excludes that lane only (Stage 0-bis);
+  the count is a submit-time warning and never a reason to skip the repo.
 
 ### 🐍 PYTHON NOTES (added 2026-08-07) — same bands, different trap mix, two extra gates
 
@@ -308,8 +340,8 @@ apply to all three the same way they do to Go/Rust/Python.
   grep -riE "^\s*(implementation|api|testImplementation)\s" build.gradle build.gradle.kts 2>/dev/null | head -20
   ```
 - **Docker:** Pattern B, `olympus-base-jvm`. Local setup notes: `Instructions/jvm-toolchain.md`.
-  Gradle-cache directory must be `a+rwX` writable per `DOCKER.md`; use the documented
-  `gradlew test --tests __nope__` graph-warming trick to pre-populate the cache offline.
+  Gradle-cache directory must be `a+rwX` writable per `DOCKER.md`; pre-populate the cache offline
+  with `compileTestJava`, never a no-op `test` run (the Dockerfile check FAILs any test runner in RUN).
 - **Extra gate G-JVM2 (vendored-jar licence, added 2026-09-18-B):** `find . -name '*.jar' -not -path
   './gradle/*'` plus `ls lib*/*/ | grep -iE 'licen|copying'`. synthea's correct top-level Apache-2.0
   label hid an LGPL-3.0 jar in `lib/sbscl/` compiled into the engine; same rule as the C++ `external/` scan.
@@ -356,18 +388,30 @@ done | sort -rn | head -10
 ⭐ **TOPIC SEARCH is the sweep that still works (measured 2026-09-09).** Star-sorted KEYWORD search
 is LLM-colonised (2026-09-06 lesson), but `gh search repos --topic=<t>` reads maintainer-curated
 topics and returned ZERO LLM-infra rows across ~120 niche engineering topics in one session. Run it
-with a DEAD-LIST filter built from every slug in the ledger, pool and hunt logs so nothing is
-re-screened, and use single-word topics (`assembler`, `disassembler`, `voxel`, `slam`, `sdr`,
+with a DEAD-LIST filter built from JUDGED rows only (see the rule below), and use single-word topics (`assembler`, `disassembler`, `voxel`, `slam`, `sdr`,
 `gcode`, `pcb`, `hydrology`, `crystallography`, `petri-net`, `datalog`, `type-inference`,
 `register-allocation`, `circuit-simulator`, `logic-synthesis`, `nurbs`, `marching-cubes`, ...).
 The 2026-09-09 RANK 1 (Cwerg, topic `assembler`) came out of this sweep after 44 pool/keyword
 repos had produced nothing.
 
+**The dead list holds VERDICTS, not mentions (changed 2026-10-05, user decision).** The old filter
+excluded every `owner/repo` ever mentioned in the ledger, pool or hunt logs. It grew from 15k to 74.6k
+slugs, and 09-23-E found 1,122 rows dead-listed only because a sweep had displayed them. Now:
+
+- **Judged rows** carry a written verdict: `slug  lane  scope  reason  date` in
+  `worktrees/_hunt/judged.tsv`, where `scope` is `repo` or `lane`. Every hunt appends one row per
+  verdict it writes, and seeds the file from `SATURATED-REPOS.md § A0, A, C, D, E` on first use.
+- **Only `scope=repo` rows block a repo.** Those are licence, language, activity, Requirement 7,
+  platform-reserved, platform-flagged over-use, and a derivative loss to an older accepted task (which
+  blocks that lane for good). A `scope=lane` row is a briefing for that lane only, and it EXPIRES after
+  60 days: re-audit it if the lane still looks good.
+- **Displayed rows** (a slug a sweep listed, a seen-set such as `allseen_k2.txt` or the
+  `deadlist_v*.txt` files) are a fetch cache. Use them to skip re-downloading metadata, never to skip
+  a screen.
+
 ```bash
-# dead-list: every owner/repo ever mentioned in the ledger, pool or hunt logs (case-folded)
-{ grep -rhoE 'github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+' Instructions/SATURATED-REPOS.md \
-    Instructions/repo-hunt-logs/*.md approved-problems/*/meta.md problems/*/meta.md rejected/*/meta.md \
-    | sed 's|github.com/||'; } | tr 'A-Z' 'a-z' | sort -u > /tmp/deadlist.txt
+# dead-list: repo-scope verdicts only (case-folded); everything else gets screened
+awk -F'\t' '$3=="repo"{print tolower($1)}' worktrees/_hunt/judged.tsv | sort -u > /tmp/deadlist.txt
 for T in <topic> ...; do
   gh search repos --topic="$T" --stars=">=500" --limit=40 \
     --json fullName,stargazersCount,language,license,pushedAt,openIssuesCount,description \
@@ -437,11 +481,13 @@ DOMAIN keywords rather than reaching for a repo that fails one of the six.
 ```bash
 cd <workspace-root>
 R=<repo-short-name>
-grep -ri "$R" Instructions/SATURATED-REPOS.md          # see below: A/C/D/E = dead, B2 = lane ledger, NOT dead
-ls worktrees/ problems/ rejected/ diamond-problems/ Olympus-Approved/Feature-Requests/ 2>/dev/null | grep -i "$R"
+grep -ri "$R" Instructions/SATURATED-REPOS.md          # see below: A0/A/C/D/E = dead, B = count (warning), B1/B2/B3 = lane ledger, NOT dead
+ls worktrees/ problems/ new-problems/ rejected/ diamond-problems/ approved-problems/ 2>/dev/null | grep -i "$R"
+grep -i "$R" pipeline/LEDGER.md                        # a row here excludes ITS lane only
 ```
 
-**Reject only on a REPO-DEAD hit (sections A, B, C, D, E).** A hit in the **B1/B2/B3 lane ledger is
+**Reject only on a REPO-DEAD hit (sections A0, A, C, D, E) (changed 2026-10-05, user decision:
+section B, our own submission count, is no longer repo-dead).** A hit in the **B1/B2/B3 lane ledger is
 NOT a reject** — those entries record a dead SUBSYSTEM or CAPABILITY LANE in a repo that is still
 pickable, and several of them literally begin "NOT saturated, NOT blocked" (one, customasm, is a repo
 we have an APPROVED problem in). Read the entry's untouched-surface note and pick a different lane;
@@ -449,11 +495,15 @@ the entry's licence / determinism / dev-dep measurements are a paid-for head sta
 Killing a repo for one failing feature permanently shrinks the searchable universe.
 
 Known repo-dead at time of writing: **risor (78 subs),
-sqlglot (62), opa (60), goja (57)** global-saturated; **dasel (9), cliffy (7), yaegi (7)** at our
-6-cap; **scriggo** contested subsystem. Re-read the file rather than trusting this list.
+sqlglot (62), opa (60), goja (57)** global-saturated (platform-flagged, section A); **scriggo**
+platform-reserved (section A0). Re-read the file rather than trusting this list.
 
-Count existing submissions per candidate repo — the cap is **≤6 total, ≤3 per week, global ≤50**
-(`PICK-FILTER.md` Gate 10). A repo at 5 is worth one pick, not a campaign.
+**Per-repo quota is a submit-time WARNING, not a hunt gate (changed 2026-10-05, user decision).**
+Count our submissions per candidate repo across `approved-problems/`, `problems/`, `new-problems/`,
+`rejected/` and `pipeline/LEDGER.md`, and REPORT the number in the dossier. Never kill or skip a repo for it: the
+platform only warns at submit (>6 ours, >3 in one week), peers ship ~12 on one repo, and dasel 9,
+cliffy 7, yaegi 7 and sfepy 25 were all submitted. Only a platform "heavily over-used" flag (section A)
+or a reservation (section A0) makes a repo dead. `PICK-FILTER.md` Gate 10 carries the same rule.
 
 ---
 
@@ -612,7 +662,7 @@ reproduced traps, killed at the Scope Gate by an older accepted submission touch
   reaching for the subsystem name to make it sound novel ("a new document-level phase in the
   streaming renderer"), you are describing your IMPLEMENTATION, not your capability. The dedup engine
   compares capabilities.
-- The self-collision check (approved-problems/, problems/) is a DIFFERENT question and does not
+- The self-collision check (approved-problems/, problems/, new-problems/) is a DIFFERENT question and does not
   substitute. Passing it means we have not built this; it says nothing about the other authors in
   the pipeline, whom you cannot see.
 
@@ -748,6 +798,9 @@ grep -rln "testcases\|corpus\|golden\|snapshot" --include=*.rs --include=*.go . 
   tracker-sourced lanes in one repo is a property of the repo, not bad luck. One INVENTED lane (from
   the source tree's own seams, filtered against the tracker afterwards) is still allowed before you
   leave — that is how scikit-fem's embedded-mesh lane was found after the wedge lane died.
+  **Changed 2026-10-05, user decision:** this stop ends THIS session's audit of the repo. Record each
+  dead lane as a `scope=lane` verdict, never as "repo-wide" or "stays DEAD", so the lanes expire after
+  60 days and the repo's other lanes stay open to the next hunt.
 - **Cold lanes exist and carry no branch family** -> proceed to Stage 3 on those lanes specifically.
 
 Do NOT read a high total commit count as bad. neva did 600/12mo and was accepted. What matters is
@@ -832,6 +885,12 @@ stage is a pre-sized pick that a different rival can take, and building the unio
 set-level derivative ("stitches two older major implementation blocks"). oxipng was flagged exactly
 this way in the dossier, authored anyway on the strength of its size, and died at the core-slice
 precheck against two older submissions (44.5% and 48.9%). See `TOO-EASY.md § oxipng-apng-frame-optimization`.
+
+⛔ **A maintainer-AUTHORED roadmap issue with no PR is still a magnet kill (user ruling 2026-10-05:
+not relaxed).** This differs from the BEST CASE row above, where the maintainer says yes to someone
+else's request. When the maintainer wrote the issue themselves (quint #1566 state-space estimate,
+calyx's roadmap trackers, beartype's tracker), the lane is a public, pre-sized pick list in the
+owner's voice, and it stays dead even with no PR and no design.
 
 ---
 
@@ -1072,6 +1131,213 @@ Dossier rows: `F-59 seam: yes/no + the ledger key + every rebuild/restore/report
 `F-58 seam: yes/no + the dry-run loop + where item identity comes from`,
 `F-60 seam: yes/no + the confinement rule + its last-component exception`.
 
+### F-62 / F-63 seam probe — a hierarchical generator whose child results enter the parent as one value (pict)
+
+```bash
+# F-62: a child result wrapped as ONE parent-level value (pseudo-parameter, sub-row, nested record)
+grep -rnE "PseudoParameter|Submodel|sub_?model|GetResults\(\)|child_rows|nested_results" --include=*.{cpp,h,go,rs,py} . | grep -vi test | head
+# F-63: an existing coverage/scheduling guarantee the feature must not dilute with "special" items
+grep -rnE "coverage|combinations?|GetRemainingCombinationsCount|t-?way|pairwise" --include=*.{cpp,h,go,rs,py} . | grep -vi test | head
+# F-39 identity instance: a per-container sequence/id used by a global ordering or comparator
+grep -rnE "GetSequence\(\)|size\(\) *\+ *1|nextId|m_lastParamId" --include=*.{cpp,h} . | head
+```
+
+On pict all three were live: `Model::generateMixedOrder` wraps each submodel's rows in a
+`PseudoParameter`, the feature (negative values) needs positive-only rows to keep full coverage, and
+`PictAddParameter` numbers parameters per model while exclusion ordering asserts distinct sequences.
+Measured: F-62 5/10 (two sole failures), F-63 3/10 (7/11 in one batch), F-39 8/11 in batch 1.
+**Budget the FP risk:** every passer across four batches crashed on exclusions touching the new
+special values; the contract had to confine exclusions to plain parameters (L101).
+Dossier rows: `F-62 seam: yes/no + how a child result enters the parent`,
+`F-63 seam: yes/no + the guarantee special items must not dilute`.
+
+### F-64 / F-65 seam probe — a coordinate-topology feature with an upstream estimator (macs)
+
+```bash
+# F-64: an optional estimator stage that reads the same coordinates BEFORE the main computation
+grep -rnE "class .*Model|build_model|estimate_|calibrat|auto_?tune|bandwidth|--nomodel|--no-?model" --include=*.{py,pyx,go,rs,cpp} . | grep -vi test | head
+# F-65: nested / derived structures built from a top-level group (blocks, sub-intervals, sub-summits)
+grep -rnE "gapped|blockCount|block_?sizes|subpeak|sub_?summit|call_summits|nested" --include=*.{py,pyx,go,rs,cpp} . | grep -vi test | head
+```
+
+On MACS3 both were live: `PeakModel` pairs strand tag peaks on raw coordinates before peak calling,
+and broad calling builds gappedPeak blocks and subpeak summits inside each region. Measured: F-64
+10/11 (sole failure of the best near-miss), F-65 8/11 and 5/11. The estimator is invisible to every
+test that pins exact values (they switch it off), so it only discriminates with a default-mode test.
+Dossier rows: `F-64 seam: yes/no + the estimator and its off switch`,
+`F-65 seam: yes/no + the derived structures inside a group`.
+
+### F-67 / F-66 seam probe — a second (default) engine, and a strict domain guard (ray-optics)
+
+```bash
+# F-67: which engine does the app construct by DEFAULT? Two engines over one object model = seam
+grep -rnE "engine === 'default'|simulationEngine: ?'|new (Legacy)?Simulator\(|createSimulator" src --include=*.{js,ts,vue} | head
+# F-67: base-class hooks that default to "not involved" (return null) rather than throwing
+grep -nE "checkRayIntersects\(|onRayIncident\(|return null;" src/core/sceneObjs/BaseSceneObj.js | head
+# F-66: a strict validity guard on a quantity the feature can drive exactly to its boundary
+grep -rnE "power[SP]? *< *0|>= *0 *&&|isFinite\(.*power|invalid|negative" src --include=*.js | grep -vi test | head
+```
+
+On ray-optics the app still defaults to the legacy `Simulator` beside the primitive engines, and
+`BaseSceneObj.checkRayIntersects` returns null. Measured: F-67 omitted by **10/10** while unstated,
+**3/10** once one paragraph stated it; F-66 (the engine drops any ray with negative power, and an
+exact double-pass isolator lands on -1e-17) 4/10. Needs the old engine to run headlessly (it did with
+`jest.unmock` and no canvases). Dossier rows: `F-67 seam: yes/no + the default engine and its object
+hooks`, `F-66 seam: yes/no + the guard and a composite that lands exactly on it`.
+
+### F-69 / F-70 / F-39 seam probe — a mode-split feature over a streaming highlighter (riff)
+
+```bash
+# F-39 empty-input: a shared comparison/refinement primitive that indexes len()-1 or assumes a
+# non-empty slice, fed today only by callers that never pass empty text
+grep -rnE "len\(\) ?- ?1|\.len\(\)-1|\[0\]|\.first\(\)\.unwrap|\.last\(\)\.unwrap" src | head
+# F-70: a streaming highlighter that already splits the input into units the feature will anchor on
+grep -rnE "RejectedDone|consume_line|fn drain|AcceptedWantMore" src | head
+# F-69: one line class (context) whose treatment the feature makes depend on a mode
+grep -rnE "starts_with\(' '\)|is_context|context line" src | head
+```
+
+On riff, `refiner::diff` ends in `bridge_consecutive_highlighted_tokens` (`1..(tokens.len()-1)`), which
+underflows on empty text, and `HunkLinesHighlighter` already splits `-a +b -c` into two blocks. Measured on
+riff-unified-conflict-regions: empty sides 4/10 (F-39), unresolved context 4/10 twice (F-69), the block
+unit 4/10 and the sole failure of the best near-miss twice (F-70). Dossier rows: `F-39 seam: the primitive
+and the empty input the feature produces`, `F-70 seam: the unit the repo streams on`, `F-69 seam: the line
+class whose rule splits by mode`.
+
+### F-71 / F-72 seam probe — a new declaration over a parser generator with a recovery engine (grmtools)
+
+```bash
+# F-71: more than one membership set per symbol kind (is-a-token vs may-be-written-bare), so a
+# directive that "declares" symbols has to reach both
+grep -rnE "token_directives|implicit_tokens|tokens\.insert|insert_full" src | head
+# F-72: one logical stack in two containers with opposite iteration orders (Vec vs persistent)
+grep -rnE "Cactus|\.vals\(\)|persistent|im::Vector|rpds" src | head
+```
+
+On grmtools, cfgrammar keeps `tokens` (IndexSet) and `token_directives` (the subset a rule may
+name bare), and CPCT+ recovery keeps the parse stack as a `Cactus` whose `vals()` is top first while
+the main loop's `Vec` is bottom first. Measured on grmtools-contextual-lexeme-readings: declared names
+never registered **14 runs over 3 batches** (F-71), reversed recovery stack **7 runs, sole failure of
+three near-misses** (F-72). Dossier rows: `F-71 seam: the symbol sets a declaration must reach`,
+`F-72 seam: the two stack containers and their iteration orders`.
+
+### F-73 / F-74 seam probe — hardware-register features driven from an unbounded-integer host (pyOCD DWT)
+
+```bash
+# F-73: address/offset arithmetic in Python (or any bigint host) written into a fixed-width register
+grep -rnE "write32|write_memory\(|& 0xffffffff|0xFFFFFFFF|1 << 32" --include=*.py . | head
+# F-74: read-to-clear or sticky status bits the feature must consume (MATCHED, DWTTRAP, W1C flags)
+grep -rniE "matched|sticky|clear(ed)? on read|read.to.clear|w1c|DFSR" --include=*.py . | head
+```
+
+On pyOCD the DWT comparator writes go through `ap.write_memory` (32-bit), Python block arithmetic is
+unbounded, and FUNCTION.MATCHED clears on read while DFSR.DWTTRAP is sticky. Measured on
+pyocd-dwt-watchpoint-planner (new models): a range past 0xFFFFFFFF wrapped into low memory in **8/8
+Nova and 3/4 Orion** (F-73, the sole failure of all three Orion near-misses); stale MATCHED across
+resume/step/reset in **18/19 Nova, 0/8 Orion** (F-74). Dossier rows: `F-73 seam: the fixed-width field
+host arithmetic feeds`, `F-74 seam: read-to-clear bits and the session boundaries that must drain them`.
+
+### F-75 / F-76 / F-77 seam probe — a compiler feature that folds a new value kind and emits it as data (Cwerg front ends)
+
+```bash
+# F-75: a lowering pass rewrites operands of a kind into another node shape before a late emitter
+grep -rnE "def (Replace|Lower|Canonicalize)|ReplaceSpans|MakeTypeVoid|canonicalize_" --include=*.py . | head
+grep -rnE "unhandled node|isinstance\(node, cwast\.(ExprFront|ExprAddrOf|Id)\)" --include=*.py . | head   # emitter keyed on syntax
+# F-76: two size notions on the type, only one is the array stride
+grep -rnE "aligned_size|\.size\b.*\*|stride" --include=*.py . | head
+# F-77: an emitter written against literal syntax (ValCompound / ValPoint) next to an evaluator
+grep -rnE "ValCompound|EvalCompound|_EmitInitializer" --include=*.py . | head
+```
+
+On Cwerg, `canonicalize_span` turns `front(span)` into `ExprField(span, pointer)`, `emit_ir`
+dispatches on node kind, the canonical type carries both `size` and `aligned_size`, and the data
+emitter walks `ValCompound`. Measured on cwerg-fe-address-constants (accepted, new models): empty
+default span `front` **11/12**, the Orion 1-of-4 separator (F-75); aggregate read-through `p^`
+**5/12**, all Nova (F-77); stride from `size` on x64/a64 **2/12** (F-76). Dossier rows: `F-75 seam: the
+lowering pass and the emitter's dispatch key`, `F-76 seam: size vs stride on padded records`, `F-77
+seam: evaluated aggregates vs literal-syntax emitter`. A twin implementation (Python + C++) doubles each
+seam and gives ~1M Nova sequence length (L119).
+
+### F-78 / F-79 seam probe — a feature that frees storage under a parent-pointer structure with id reuse (libspatialindex MVR-tree)
+
+```bash
+# F-78: freed ids handed back to new allocations (page/slot reuse) under parents that store child ids
+grep -rnE "deleteByteArray|m_emptyPages|freeList|free_list|reuse" --include=*.cc --include=*.h . | head
+grep -rnE "m_pIdentifier\[|child(ren)?_?ids?\[" --include=*.cc . | head
+# F-79: a monotone watermark the contract may set to "now" while writes at that instant stay legal
+grep -rnE "m_currentTime|currentTime|horizon|checkpoint|watermark" --include=*.cc --include=*.h . | head
+```
+
+On libspatialindex both storage managers reuse emptied page ids, index nodes hold child page ids, and the
+MVR-tree accepts operations at the current time. Measured on libspatialindex-mvr-history-pruning
+(accepted Nova 0/8 + Orion 2/8): dangling parent entries after the purge **12/16** (4/8 Orion, F-78);
+resuming the next purge from the previous horizon **2/16**, the sole failure of both Orion near-misses
+(F-79). Dossier rows: `F-78 seam: id reuse under parent pointers the feature leaves stale`, `F-79 seam: a
+watermark that may equal now`. Check the base for orphaned storage (here a node created and killed in one
+instant) before trusting a page-graph oracle.
+
+### F-80 / F-81 / F-82 seam probe — a lazy object graph with an identity cache and a feature that touches the unmaterialized parts (asdf lazy_tree)
+
+```bash
+# F-80: a per-raw-node wrapper cache that keeps aliases identical, and an anchor/shared-reference format
+grep -rnE "_tagged_object_cache|identity|id\(|weakref|memo" --include=*.py . | grep -iE "cache|memo" | head
+grep -rnE "anchor|alias|&id|yaml.*represent" --include=*.py . | head
+# F-81: metadata nodes every real input carries that an inspection API renders (header, library info)
+grep -rnE "asdf_library|history|software|header" --include=*.py . | grep -iE "info|render|display" | head
+# F-82: handlers that may claim several runtime types
+grep -rnE "^\s+types\s*=\s*\[" --include=*.py . | head
+```
+
+On asdf, lazy nodes are wrapped on access and cached per raw object so aliases stay one object, YAML
+anchors carry shared containers, every file has `asdf_library`/`history`, and converters list several
+`types`. Measured on asdf-conversion-free-lazy-tree (accepted Nova 0/8 + Orion 1/8, Vega 2/4): one alias
+accessed and the other written raw duplicates the container **15/20** (8/8 Nova, 6/8 Orion, F-80); the
+existing `asdf_library (Software)` line changed by the new view **6/20** (4/8 Orion, F-81); a multi-type
+converter run inside `info()` **2/4 Vega** (F-82). Dossier rows: `F-80 seam: identity cache vs a raw
+second traversal`, `F-81 seam: default metadata through the rerouted view`, `F-82 seam: multi-type
+handlers`. Also check pytest config for `filterwarnings = error` (L122) before any test touches a path
+where base warns.
+
+### F-83 / F-84 / F-85 seam probe — a content-stream rewriter that recurses into callees (hayro-write)
+
+```bash
+# F-83: callees that run in the caller's state (Form XObjects, <use>, macros) beside callees that start fresh
+grep -rnE "save_state|push_state|from_parent|State::new|restore_state" --include=*.rs . | head
+# F-84: one resource kind reachable through two dictionaries (fonts via /Font AND an ExtGState /Font array)
+grep -rnE "b\"Font\"|FONT\b|ext_g_state|ExtGState" --include=*.rs . | head
+# F-85: an object-level enable flag the engine checks on every entry path (soft-mask groups reached via gs)
+grep -rnE "\bOC\b|is_visible|optional_content|SMask" --include=*.rs . | head
+```
+
+On hayro the interpreter saves the caller's state before a Form (form.rs) but starts patterns fresh
+(State::new), resolves an ExtGState `/Font` array into font and size (state.rs), and reads a soft-mask
+group's `/OC`. Measured on hayro-optional-content-baking (accepted Nova 0/8 + Orion 1/4): Forms baked
+from the default render mode **8/12** (8/8 Nova, 0/4 Orion, F-83); Type 3 fonts reached only through
+ExtGState **9/12** (8/8 Nova + Orion #4), its indirect-size variant the 1-of-4 Orion separator (F-84);
+hidden soft-mask group **5/8 Nova** (F-85). Dossier rows: `F-83 seam: inherited caller state vs fresh-start
+siblings`, `F-84 seam: a second route to the same resource kind`, `F-85 seam: object-level flag on a
+non-call entry path`. When the oracle is the repo's own renderer, list where it departs from the spec
+before the first batch (L127 and the oracle-semantics memory).
+
+### F-86 / F-87 / L128 seam probe — per-record evidence regrouped into units (MACS3 callvar)
+
+```bash
+# F-86: one evidence table, two consumers with different eligibility (vote vs membership)
+grep -rnE "top1|top2|update_top_alleles|allele.*count|is_called" --include=*.py --include=*.pyx . | head
+# F-87: partner metadata on each record (mate flags, back-pointers) and a fetch window narrower than the unit
+grep -rnE "0x20|0x40|mate_|flag & |get_reads_in_region|fetch\(" --include=*.py --include=*.pyx . | head
+# L128: a second evidence path the DEFAULT flags take (assembly, fallback engine)
+grep -rnE "fermi|unitig|assembl|fallback|legacy" --include=*.py --include=*.pyx . | head
+```
+
+On MACS3 the evidence (PosReadsInfo) keeps every base but callvar's consumer reads only the top two; BAM
+records carry the full flag word; `-F auto` (default) recalls indel peaks from fermi-lite unitigs. Measured
+on macs-callvar-fragment-phasing (accepted Nova 0/8 + Orion 1/4): uncalled allele kept off both
+haplotypes **8/8 Nova, 0/4 Orion** (F-86); read 1 outside every peak **7/8 Nova + Orion #2** (F-87);
+pair-aware == read mode on assembled calls **7/12** (F-67/L128). Dossier rows: `F-86 seam: evidence table
+with a vote consumer and a membership consumer`, `F-87 seam: attribute owned by a partner outside the
+fetch window`, `L128 seam: second path under default flags`.
+
 **F-20, repo-helper variant.** F-20 does not need an agent refactor: if the repo already routes a
 sibling operation through the primitive the feature changes (`add_real_directory` -> `create_dir`),
 a new rule on the primitive leaks by itself (3/10 on pyfakefs). Grep the callers of whatever the
@@ -1299,9 +1565,31 @@ it into one more slot"*, the pick is dead at the LOC floor no matter how good it
 ⚠️ **Softened 2026-09-09-B (user decision): a "missing arm" / absorption verdict is not final until
 the diff is SKETCHED in effective LOC against the nearest existing sibling arm.** Inspection alone
 killed koto today without a number. The rule is: sketch (sibling arm size x number of sites the new
-arm must touch, plus any semantics the sibling does not have); **below ~150 eff it dies, 150-250 needs
-a coupled second lever named in the dossier, above 250 it proceeds.** Write the number down; a
-verdict without one is an opinion.
+arm must touch, plus any semantics the sibling does not have); **below ~150 eff it dies.** Write the
+number down; a verdict without one is an opinion.
+
+⛔ **The RETURN bar is a written number, not a paper one (changed 2026-10-05, user decision; replaces
+the old "150-250 needs a second lever, above 250 proceeds" paper bar).** Every recent LOC death was
+returned on a paper estimate and measured far lower at slice: aerich 157 (hunt ~250), sqlalchemy-continuum
+146 (sketch 310), healthchecks 194 (~240), vega 123, vrp 155, teavm 192 (205-315). All six were
+"carry state through / make X survive Y" lanes over a mature kernel, while hunt-time spikes (riff 440,
+grmtools 362, asdf 362, MACS 312) cleared.
+
+- **The tell that forces a hunt-time spike:** the lane adds NO new persistent structure (no new
+  table, module or kernel) AND each reproduced trap's minimal fix looks like 3 lines or fewer. When
+  both hold, write the lane as leanest-correct code in the clone (unrun is fine) and measure it with
+  `python .claude/hooks/effective_loc_check.py <patch>` BEFORE returning it.
+- **Returnable = 220 or more `human-effective`, written or spiked.** A lane written at ~210-220 with a
+  weak second lever is also returnable (user ruling 2026-10-05) when that lever is real code named in
+  the dossier, not a padding idea; the builder's spike must still clear the 200 floor. Below ~210
+  written, it does not go out.
+- **Price the existing channels before per-site work.** Before multiplying sites by a per-site cost,
+  check whether the repo's cache key, dependency channel or dispatch table already carries the new
+  fact. teavm's fact-reuse lane priced 205-315 per site and measured 192, because the cache key
+  already hashed the resolved program and facts rode the existing `Supplier<String[]>` dependency list.
+- A lane that adds a genuinely NEW table, module or kernel tends to outgrow its paper number (micasa
+  270 to 487, commafeed 240 to 335), so the spike is not mandatory there; the 220 written bar still
+  applies if you do write one.
 
 ⚠️ **Sketch against the CHOKEPOINT, not the surface list (added 2026-09-19, paid for by dinit).** A
 dossier that lists every behaviour the contract touches (start, failure, stop, restart, force, pins,
@@ -1393,10 +1681,14 @@ knowable in ten minutes and would have saved a full session.
 
 ## Stage 4 — Feasibility (5 min)
 
-**Effective LOC.** Current floor is **≥200 effective (Counter 2)** per the 2026-07 sprint;
+**Effective LOC.** The 2026-10-09 update dropped the long-horizon floor (files / messages / LOC) in
+favour of Nova sequence length, but payout still scales with scope and Auto Review is said to be
+unchanged, so keep the old target until a submission proves otherwise. Old floor: **≥200 effective (Counter 2)** per the 2026-07 sprint;
 **design to ≥250-450** so revisions do not dip under, and note that 400 is the platform
 auto-block on the looser Counter-1 measure. Estimate the *implemented fix slice*, not the file
 sizes (`PICK-FILTER.md` Gate 4) — a surgical fix to mostly-correct code is ~30-50 LOC and dies.
+The 250-450 figure is the AUTHOR's design target; the hunt's return bar is Stage 3b's written or
+spiked 220 human-effective (changed 2026-10-05, user decision).
 Target **3+ files**.
 
 ⭐ **The LOC question is "does the repo LACK the machinery", not "is the subsystem big".** The
@@ -1451,7 +1743,7 @@ One block per candidate, ranked by **trap-seam score first**, mechanical fit sec
   / merged-PR cluster / corpus invariant — and which are open>
 - **Maintainer-welcomed lanes (Stage 2d):** <issue refs where the maintainer said yes with no design
   published and no PR, or "none found">
-- **Self-collision:** <nearest feature class in approved-problems/ + problems/, and which SUBSYSTEM
+- **Self-collision:** <nearest feature class in approved-problems/ + problems/ + new-problems/, and which SUBSYSTEM
   of this repo avoids it>
 - **Missing machinery (LOC carry):** <what the capability needs that the repo cannot already do — if
   you cannot name it, expect a scope lever>
@@ -1512,6 +1804,14 @@ Ask these four before writing the dossier's verdict line:
    agents single-shot-fix each one.
 3. **Could a standalone new file with minimal wiring solve it?** That is an explicit Phase-3 reject.
    Post-passes over a public event/AST/token stream almost always are.
+   **Waiver (changed 2026-10-05, user decision):** this question is waived for a lane above ~300
+   human-effective whose hidden wall is INTERNAL to the repo, meaning the hard decisions come from the
+   repo's own model and cannot be named by an outsider. The waiver never applies to a printer or
+   serializer back to a format the ecosystem already compiles: the bufbuild/protobuf-es `.proto`
+   source printer it was written for died at platform review on 2026-10-12 (overlap `Blocker` 66.7%
+   against an older foreign printer; the dedupe compares the engine, not where the wall is). Below ~300, or when the wall is outsider-nameable (a spec, a famous tool's feature, a
+   textbook algorithm), the guard stays and the standalone file is a reject. Questions 1, 2 and 4
+   still apply to a waived lane.
 4. **Run `TOO-EASY.md`'s Pre-Pick Guard 1-5 verbatim.** Guard #2 (single-subsystem fully-specified
    transform) is the one that catches this class.
 
@@ -1521,8 +1821,8 @@ and re-rank the shortlist on coupling rather than on availability.
 ### Then the gates
 
 Before `olympus-author`, the chosen candidate must clear the full
-**`PICK-FILTER.md` 10 gates** — this skill pre-clears 2 (saturation), 7 (dedup), 9 (flaky), 10
-(quota) and partially 4 (LOC ceiling). Still owed at scope-lock:
+**`PICK-FILTER.md` 10 gates** — this skill pre-clears 2 (saturation), 7 (dedup), 9 (flaky), reports
+10 (quota, a submit-time warning since 2026-10-05) and partially 4 (LOC ceiling). Still owed at scope-lock:
 
 - **Gate 1 BEHAVIORAL-F2P-GAP** — base must produce observably wrong output (decisive)
 - **Gate 5 COLD-NOT-LIVE** — check commit DATES in the target subsystem, not issue state
@@ -1538,7 +1838,7 @@ Before `olympus-author`, the chosen candidate must clear the full
 
 | Signal | Why |
 |---|---|
-| In `SATURATED-REPOS.md` **section A/B/C/D/E**, or ≥6 of our subs | Platform warns at submit; extra scrutiny. (A B1/B2/B3 lane-ledger hit is NOT a kill — pick another lane) |
+| In `SATURATED-REPOS.md` **section A0/A/C/D/E** | Reserved, platform-flagged over-use, corpse, mirror or dead upstream. **Changed 2026-10-05, user decision:** section B (our own count, including >=6 of our subs) is NOT a kill; report the count, the platform only warns at submit. A B1/B2/B3 lane-ledger hit is NOT a kill either: pick another lane |
 | GPL / AGPL / NCSA / rider-BSD | Hard license reject |
 | >5000 stars with a famous spec (JSON, semver, java.time, SVGO, Box2D) | Training-saturated; a faithful port is a dead class (`TOO-EASY.md`). High-star repos are admissible only where the CAPABILITIES are repo-internal — a high-star repo implementing a famous spec is still dead |
 | CGO / `-sys` crates / vendored C | Docker cost, offline-build risk |
@@ -1549,7 +1849,8 @@ Before `olympus-author`, the chosen candidate must clear the full
 | Best pick is a NAMED external standard AND a long-open uncommented issue asks for exactly it (or it is a faithful port) | Derivative magnet — the name is the spec, so authors converge (Stage 2b). Nameable ALONE is a mitigation, not a kill (softened 2026-09-09-B) |
 | Repo has an open, uncommented, long-lived issue asking for a famous feature | Every author picks it; the SIX-CHECK is blind to the pipeline (Stage 2b) |
 | Active maintainer workstream in the target CAPABILITY (not merely the target files) | Corrected Gate 5. A `fix/<topic>-*` branch family or >=4 merged PRs in one narrow lane means that lane is dead — pick another lane, not another repo (Stage 2c) |
-| Two or more TRACKER-SOURCED candidate lanes already dead in the same repo | Lane density, not bad luck. A further tracker-sourced candidate is a coin flip at the same odds (veryl: 4 for 4). One INVENTED lane (built from the source tree, not the tracker) is still allowed before stopping |
+| Two or more TRACKER-SOURCED candidate lanes already dead in the same repo | Lane density, not bad luck. A further tracker-sourced candidate is a coin flip at the same odds (veryl: 4 for 4). One INVENTED lane (built from the source tree, not the tracker) is still allowed before stopping. **Changed 2026-10-05, user decision:** this stops the current session only; the dead lanes are recorded lane-level and expire after 60 days |
+| A maintainer-AUTHORED roadmap issue for the lane, even with no PR | Magnet, unchanged on purpose (user ruling 2026-10-05). The owner's own pre-sized pick list (quint #1566, calyx trackers) (Stage 2d) |
 | The lane restores a capability a release REMOVED ("X is no longer ...", "removed X", even beside "let me know if you need it") | Scope gate: publicly-solved, unfixable, whatever the new mechanism (kira-frame-accurate-start-times, 2026-09-18). Check the changelog for removals BEFORE reading it for invitations (Stage 2d) |
 | A popular repo whose maintainer merged ~1 PR in 12 months while the PR queue keeps filling | **Dormancy is a derivative MAGNET, not an opportunity** (added 2026-09-16, paid for by ruptures). When nobody merges, the obvious features pile up as PUBLIC, READABLE PR DIFFS — exactly what the exclusivity gate rejects on. ruptures passed every mechanical gate, the dedup check and the seam audit, then died to a two-day-old open PR implementing the precise interaction the trap thesis rested on, beside three more PRs adding new detectors and costs. Prefer "maintained but consuming a DIFFERENT lane" over "dormant with a full PR queue". Corollary: run Stage 2c's PR enumeration BEFORE the seam audit, never after — it is two API calls |
 | Core dirs frozen for 12mo while the periphery stays busy, and you have NOT checked for a live fork | Ambiguous: either a real cold seam or a dead upstream. `gh api "repos/O/R/forks?sort=newest"` — a livelier low-star fork means the coldness is a corpse (`SATURATED-REPOS.md § E`) |
