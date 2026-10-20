@@ -1595,3 +1595,164 @@ read-1-outside-peaks probe, and pair-aware == read mode on assembled calls (F-67
 **Orion 1/4**, and 8 fresh Nova read **0/8**. Four Auto Review tests were added (3 killed nothing), then a
 final re-eval on 55 tests: **Nova 0/8, Orion 1/4**, FP genuine, Auto Review approved (Tests 2/3: BAR
 upward rounding and exact deletion DPT unpinned).
+
+
+## micasa-field-level-sync-merge (Go / micasa Pro sync: per-field last-writer-wins merging, whole-row LWW for removals, per-field conflict accounting) — ACCEPTED 2026-10-15, Nova 0/8 + Orion 1/4
+
+**What made it hard.** When two devices edit the same row between syncs, Pro sync merges field by field:
+one-sided changes (even blanks) win, both-sided changes go to the most recent edit, coupled fields move
+together, removals use full-row LWW with every device holding the winning row, and each rejected field is
+one conflict in sync results and `micasa pro conflicts`. Base resolves only against ops not yet pushed,
+logs whole-row snapshots and sends delete/restore with no row. Nova was held by all four of those at once:
+**merging only while the local op is unpushed (F-88, 8/8 Nova, 0/4 Orion)**, field times read off
+snapshots (F-89), empty tombstones (F-91, 9/12). Orion split only on **counting the local edit an incoming
+winner displaced (F-90, 11/12, every failing Orion run)**. F-88 and F-90 were both Solution Quality HIGHs on
+my own reference before any batch. Nova sequence length averaged 547k.
+
+**The fixes, and what each cost.** (1) Four AI-gate rounds on the meta (humanizer + word-level drift
+repair; swapping only the opener passed); the meta never changed after that. (2) Eight Solution Quality
+FAILs, one forcing a redesign to per-field LWW replayed from the oplog. (3) Batch 1 **Orion 0/4** (two
+35/36 on the restore-count cell, kept). Auto Review T1: patch-added guards ran in base mode, so all moved
+out (two became F2P, three dropped); S1: legacy whole-row fallback now reports displaced edits. (4) Batch 2
+**Orion 0/4**, but two runs were TEST_BROKEN on my harness: a `mergeDevice` helper collided with an agent's
+own test file, and edit helpers rewrote `created_at` after the write. Hash-suffixed helpers, real-clock
+ordering and a JUnit fallback that adds instead of replaces: re-eval **Orion 1/4** plus 8 fresh Nova
+**0/8**, FP genuine. Auto Review asked for revision (Solution 1/3: `last_serviced_at` merged as an LWW
+snapshot, not recomputed from the merged service logs; Tests 2/3: 2 ms sleeps, reporter exit status);
+accepted anyway.
+
+## csbindgen-const-expression-values (Rust / csbindgen: evaluate Rust constant expressions in const initializers and enum discriminants, emit them as C# literals) — ACCEPTED 2026-10-15, Nova 0/8 + Orion 1/4
+
+**What made it hard.** Consts and discriminants written as Rust expressions (contextual literal typing,
+all operators with Rust semantics, casts across int/float/bool/char, `MIN`/`MAX`, 128-bit intermediates,
+64-bit `isize`/`usize`, paths through `use` renames and variant globs, across files) must come out as C#
+literals of csbindgen's existing types with the same value. Nova failed by breadth: **host-formatted
+literals (F-94, 1e20 as an integer token, `NaNf`, `\u{0}`, raw U+2028; 5/5 non-aborting Nova)**,
+discriminants evaluated in the C# backing type (F-93, 5/5), and a whole-enum walk that turns a forward
+variant reference into a false cycle (F-92, 7/8 incl. 3 stack-overflow aborts). Orion cleared all of
+those and split on **a child glob variant shadowed by a parent const (F-95, sole failure of 2/4 Orion)**
+plus `3f64` (F-18). Nova sequence length averaged 506k.
+
+**The fixes, and what each cost.** (1) Accepted on the old models after batch 1 (0/11, review-ratchet
+cells cut and capped), reverted by the 2026-10-09 gate. (2) Batch 3 Orion 4/4 -> cand3h cells -> batch 4
+**Orion 0/14** and Task Prompt "Too many requirements" -> rules cut, several AI-gate rounds. (3) Batch 5
+2/4 with one FP (cast operand typed by its target) and batch 6 3/4 with two FP (flat alias map): each a
+meta sentence plus a test. (4) A cap added for Auto Review named only the excluded side ("other than
+`i128`, `u128`"): batch 7 **Orion 0/8**, 6/8 on 128-bit; fixed by naming what stays in. (5) Batch 8 Orion
+3/4 with two passes FP-voided for ancestor-first lookup: the adjudicator's probe as one cell, re-eval
+**Orion 1/4** plus 8 fresh Nova **0/8**, FP genuine. Auto Review's ask for a selected `usize` above 32 bits
+was declined (every agent fails it, the meta caps it); in-range `nint`/`nuint` cells added instead.
+Roughly 30 Solution Quality FAILs over the life of the problem, the `as f32` claim false 5 times. Accepted
+with Auto Review Tests 2/3 (T8: aborting test binary loses its stderr in JUnit).
+
+## mirrorbits-mirror-sync-point (Go / mirrorbits: source generation ledger in Redis, mirror sync points solved from rsync/FTP listings) — ACCEPTED 2026-10-15, Nova 0/8 + Vega 1/5
+
+**What made it hard.** Every source scan that changes a file advances a generation; a reloadable
+`SourceHistory` decides how many are remembered, and what falls out is forgotten for good even if the
+setting is raised later. A mirror's sync point is the newest remembered generation its listing is
+consistent with, at the protocol's precision, with paths a partial rsync transfer couldn't read counting
+as no evidence. Nova failed by breadth: **the unreadable exception applied to a status-0 rsync (F-97, 6/13,
+sole failure of 3 Nova + 1 Vega)**, **a retention window recomputed from the live setting so a raise
+reopens pruned generations (F-96, 4/5 Vega, sole failure of 2)**, and base's `Time.String()` re-parse
+failing in a nameless +05:45 zone (F-39, 3/13). Nova sequence length averaged 326k.
+
+**The fixes, and what each cost.** (1) Old models: b1 1/10, b2 0/10 after two stacked round-5 walls, cut by
+replaying all 20 patches. (2) New gate: Orion 2/2, 4/4 (replay, after a hash-suffix fix for TEST_BROKEN
+helper collisions), 2/4, 3/4, 2/4 across five batches; three description levers killed 0 Orion; Task Prompt
+"Too many requirements" failed four times until the meta was ~10 rules. (3) Batch 8 on the same meta:
+**Vega 1/4** but a genuine Nova pass; a timezone cell (its change detector used base's time string) and a
+YAML-load cell, re-eval Nova 0/8. (4) One Vega regraded FAIL_UNDOCUMENTED (blame unfair) on an
+empty-generation floor fixture: contested, replaced, and every floor fixture rebuilt around a forgotten
+version. (5) Auto Review Tests 1/3 for empty final listings: mixed listings added beside them, mutants
+proved the gap, re-eval **Nova 0/8, Vega 1/5**, Approved 3/3/3. About 12 reference bugs, all gate-found;
+one false Solution Quality claim (`(?:` unsupported) sidestepped, one false NOSCRIPT claim contested.
+
+## ray-optics-module-inlining (JavaScript / ray-optics scene modules: inlining nested module instances on removal, single-instance inlining, template-aware parameter rename) — ACCEPTED 2026-10-16, Nova 0/8 + Orion 1/8
+
+**What made it hard.** Removing a module must replace every instance of it inside other modules'
+definitions with its own rows, rewritten in the container's terms. Inlining does the same for one
+row. Renaming a parameter must rewrite the definition and every instance. After any of these, the whole
+scene must expand to the same objects and equation values, and a failed call must change nothing.
+
+Nova failed by breadth:
+- **capture-avoiding substitution (F-99), every Nova run across six cells**: swapped names, a nested
+  loop shadowing the parameter, a loop named like a parameter, a colliding child loop, a negative
+  literal, a juxtaposed product;
+- **merged loops outgrowing the default loop limit (F-98, 8/8 Nova, 0 of 15 Orion)**.
+
+Orion split on its own whole-scene validator, which refuses beside an unrelated broken instance
+(**F-100, sole failure of 6/8**). Nova sequence length was about 290k by my count.
+
+**The fixes, and what each cost.**
+1. Batch 1, Orion 0/4, was void. The humanized cap "no distinct variables have identical names" was too
+   broad, and a merge fixture broke the real cap. Fixed the cap with both sides named.
+2. b2 read Orion 2/3 working. The stated loop-shadow clause then gave b3 Orion 4/4, with one FP: a
+   whole-scene pre-check.
+3. I took that FP as the broken-instance pair. Test Quality struck the inline variant as unfair and
+   kept remove and rename. I also stated juxtaposed products. b4 read Orion 0/4, all failing only that
+   pair.
+4. b5 read Orion 2/4 with one FP (tiny values printed into LaTeX). Two tiny-value tests fixed it; b6
+   was Nova 0/8 fresh and the Orion re-eval read 1/8.
+5. Auto Review asked for revision. I added 10 coverage tests (killed 0) and a reference guard for a
+   stricter child loop limit, untested because the passer lacks it (L76). I answered a false
+   `constructor` S1 with a base probe. Re-eval: **Nova 0/8, Orion 1/8**, Approved 3/2/3.
+
+About 8 reference bugs, all found by gates or the FP panel.
+
+## cwerg-compact-pointer-unions (Python + C++ / Cwerg front ends: one-word compact tagged unions) — ACCEPTED 2026-10-19, Nova 0/8 + Vega 1/4 (Orion 3/4)
+
+**What made it hard.** A tagged union of one pointer plus void or wrapped-void members must take one word
+in both front ends on x64/a64/a32, and no program may behave differently because of it. Every run got the
+sizes right; the work is re-lowering every operation and conversion for the new word.
+
+Nova failed by breadth:
+- **compact/ordinary conversions (F-101), 8/8**;
+- **indexed and span-element sources (F-102), 8/8**;
+- **zero-sized values that drop their side-effecting expression (F-103), 7/8**;
+- **the repo's size-zero shortcut used as eligibility (F-104), 3/8**.
+
+Vega split on F-102: it cloned a "copyable" source instead of making a temporary, the sole failure of 2/4.
+Orion read every rule and passed short (143k-196k), so it could not qualify.
+
+**The fixes, and what each cost.**
+1. Before batch 1: two Task Prompt AI flags (humanizer x2 plus drift repair) and a requirement-count FAIL
+   (cut to ~9 rules). Meta stayed frozen after that.
+2. b1 Orion 4/4. Effects test from a Solution Quality bug in my reference: re-eval Orion 3/4, fresh Vega
+   2/2.
+3. Locals test (x64 BITCAST of an immediate, read off Vega #2's patch): b4 Vega 3/4.
+4. A probe battery on conversion sources found the split, plus two more reference bugs (nested
+   `^!Lookup` member, indexed sources). Elements test: b5 **Nova 0/8, Vega 1/4** (512k pass). Auto Review
+   then asked for a `[0]u8` boundary test (Tests 1/3).
+5. Two static_asserts, killing 3/8 Nova and no strong run: b6 re-eval Approved 3/3/3, accepted.
+
+6 reference bugs were found, all by gates or probe batteries. The seven designed traps killed only Nova,
+or nobody.
+
+## micasa-pro-blob-reclaim (Go / micasa Pro relay: per-device file reports and `micasa pro storage --reclaim`) — ACCEPTED 2026-10-20, Nova 0/8 + Vega 1/4 (pass 326k)
+
+**What made it hard.** After every sync, each device reports which document files it uses, including
+deleted and not-downloaded ones. Reports go in parts under the 1 MB limit and are incremental (a
+one-document change under 64 KB of traffic). Reclaim sweeps only when every device has reported since its
+own last push, then re-uploads missing files. Both relay stores, memory and Postgres, are graded.
+
+What killed:
+- **a committed report whose reply is lost (F-105), 8/8 Nova, 0/4 Vega:** every Nova run kept unversioned
+  add/remove deltas;
+- **the push sequence read off the envelope on Postgres (F-106), 3/8 Nova;**
+- **a cut-off multi-part report voiding the complete one (F-107):** Vega b3-1, Nova #8;
+- **a never-reported device counted as current (F-108):** Vega, twice.
+
+Orion passed 4/4 at 100k-133k and could not qualify.
+
+**The fixes, and what each cost.**
+1. b1 Orion 4/4 with zero divergence on stated rules. Description round: multi-part 1 MB reports, quota
+   re-upload, Postgres graded. Two humanizer rounds, a Test Quality unfairness round (3 negative-output
+   asserts) and a harness race (repo's 2-minute test build).
+2. b2 Vega 3/4 (265k-487k). Description round: the 64 KB incremental rule.
+3. b3 Vega 2/2 (310k, 326k). Test only: a cut-off multi-part report (kills b3-1).
+4. b4 = re-eval + 2 fresh Vega + 8 Nova: **Vega 1/4, Nova 3/8.** Test only: lost reply, plus Auto Review's
+   absent-blob cell.
+5. b5 re-eval: **Nova 0/8, Vega 1/4**, Auto Review Approved 3/2/3, accepted.
+
+7 reference bugs, all found by gates. All four designed walls killed nobody in the accepted batch, and
+15 of 21 tests killed nothing.

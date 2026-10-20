@@ -1670,3 +1670,61 @@ precheck reference bug is a calibrated Nova trap (F-86, L90); at Orion 3/4, take
 and judge probes and probe the default alternate path before any meta change (L126); where the meta is
 silent, assert equality with the option-off output on inputs where the new rule is a no-op (Pattern 118,
 L128).
+
+## micasa-field-level-sync-merge (APPROVED Olympus 2026-10-15)
+
+Accepted at Nova 0/8 + Orion 1/4 after two Orion batches (0/4, 0/4) and a re-eval. Playbook points:
+sync/replication features hand you four base-design walls at once (merge only against unpushed ops,
+whole-row snapshot log, one-sided conflict list, empty tombstones; F-88..F-91), and an overlap harness
+that holds one device's push makes them testable without sleeps (Pattern 119). Before reading a 0/4 as
+too hard, check the evaluators for TEST_BROKEN on your own fixtures: fix test.patch and re-eval (L129,
+L130).
+
+## csbindgen-const-expression-values (APPROVED Olympus 2026-10-15)
+
+Accepted at Nova 0/8 + Orion 1/4 after eight new-model batches (re-eval of batch 8 + 8 fresh Nova).
+Playbook points: a broad, rustc-checked semantic surface makes Nova fail by breadth with no single trap
+(L131), so the work is landing Orion at 1/4: take the FP panel's probe as one cell and re-eval (L126). Every
+meta edit near a tested boundary must name both sides (L89, a one-sided cap cost a 0/8 batch). Compile
+every reviewer claim about Rust before acting on it (Pattern 120 makes rustc the test oracle).
+
+## mirrorbits-mirror-sync-point (APPROVED Olympus 2026-10-15)
+
+Accepted at Nova 0/8 + Vega 1/5 after a long Orion plateau. Playbook points: a scanner feature with three
+independent stated corners (exit-status gate, retention floor, no-op stability) holds Nova on breadth (L131);
+if Orion converges for several batches with nothing left to probe, run Vega x4 before shelving (L133); every
+irreversibility test needs an empty AND a mixed observation (L132); and test-only rounds with re-eval carried
+the last four steps (timezone cell, fixture rework, mixed listings) without touching meta.
+
+## ray-optics-module-inlining (APPROVED Olympus 2026-10-16)
+
+Accepted at Nova 0/8 + Orion 1/8 via re-eval after six new-model batches. Playbook points:
+- A template refactor checked by expansion equivalence (Pattern 122) holds Nova on breadth over
+  binder cells (F-99) and one repo-constant hop (F-98, L135), with zero meta words for the hop.
+- Orion is landed by FP-panel findings turned into tests (L37). Its own whole-scene validator was
+  the 6/8 splitter (L134).
+- Once the meta is frozen, every later round is test-only plus re-eval. Leave a reviewer gap that the
+  passer shares in the reference only (L76).
+
+## cwerg-compact-pointer-unions (APPROVED Olympus 2026-10-19)
+
+Accepted at Nova 0/8 + Vega 1/4 (Orion 3/4) after six batches, five of them re-evals or re-eval plus
+fresh runs. Playbook points:
+- Twin-implementation compiler features (two front ends, three targets) keep giving Nova ~1M sequence
+  length and Vega 300k-500k. Orion passes stay under 200k, so plan on Vega as the qualifying agent (L136).
+- Freeze meta before batch 1, then steer with test-only levers found by probing saved patches (F-102 took
+  Vega 3/4 -> 1/4). Each re-eval re-grades every saved run, Nova included.
+- The F2P gate is a size static_assert per program; with those stripped, every runtime check passes on
+  base with ordinary unions (Pattern 123).
+
+## micasa-pro-blob-reclaim (APPROVED Olympus 2026-10-20)
+
+Fifth batch, Nova 0/8 + Vega 1/4 (pass 326,155), Auto Review Approved 3/2/3. Second micasa lane after
+micasa-field-level-sync-merge, disjoint capability (relay blob reports and sweep).
+- Order that worked: Orion 4/4 -> description deltas (multi-part, quota re-upload, Postgres graded, then
+  the 64 KB incremental rule) -> switch to Vega (Orion < 256k) -> tests-only levers through re-eval: cut-off
+  (Vega 2/2 -> 1/2), then lost reply after 8 Nova were added (Nova 3/8 -> 0/8).
+- Batch plan when Vega already sits in band: re-eval the previous Vega pair together with the fresh runs
+  so one batch carries the kept long passer.
+- Auto Review Tests 2/3 at acceptance (two Medium T4 coverage asks: every 20,000 reference checked, two
+  missing blobs at once) did not block.

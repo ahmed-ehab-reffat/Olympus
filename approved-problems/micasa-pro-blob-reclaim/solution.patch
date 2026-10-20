@@ -1,0 +1,1322 @@
+diff --git a/.golangci.yml b/.golangci.yml
+index aa4162e..108c292 100644
+--- a/.golangci.yml
++++ b/.golangci.yml
+@@ -87,7 +87,7 @@ linters:
+         - suite-broken-parallel # Our suites capture t := s.T() before Parallel()
+ 
+     interfacebloat:
+-      max: 25  # relay Store has 24 methods; default 10 is too low
++      max: 26  # relay Store has 26 methods; default 10 is too low
+ 
+     recvcheck:
+       exclusions:
+diff --git a/cmd/micasa/pro.go b/cmd/micasa/pro.go
+index 6db6284..c2aefda 100644
+--- a/cmd/micasa/pro.go
++++ b/cmd/micasa/pro.go
+@@ -351,16 +351,23 @@ func runProStatus(dbPath string) error {
+ // --- pro storage ---
+ 
+ func newProStorageCmd() *cobra.Command {
+-	return &cobra.Command{
++	var reclaim bool
++	cmd := &cobra.Command{
+ 		Use:           "storage [database-path]",
+ 		Short:         "Show blob storage usage",
+ 		Args:          cobra.MaximumNArgs(1),
+ 		SilenceErrors: true,
+ 		SilenceUsage:  true,
+ 		RunE: func(_ *cobra.Command, args []string) error {
++			if reclaim {
++				return runProStorageReclaim(dbPathFromEnvOrArg(args))
++			}
+ 			return runProStorage(dbPathFromEnvOrArg(args))
+ 		},
+ 	}
++	cmd.Flags().BoolVar(&reclaim, "reclaim", false,
++		"Sync, then delete stored files that no device uses any more")
++	return cmd
+ }
+ 
+ func runProStorage(dbPath string) error {
+@@ -386,6 +393,51 @@ func runProStorage(dbPath string) error {
+ 	return nil
+ }
+ 
++func runProStorageReclaim(dbPath string) error {
++	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
++	defer stop()
++
++	deps, err := resolveProDeps(dbPath)
++	if err != nil {
++		return err
++	}
++	defer func() { _ = deps.store.Close() }()
++
++	client := sync.NewClient(deps.device.RelayURL, deps.token, deps.key)
++	engine := sync.NewEngine(deps.store, client, deps.device.HouseholdID)
++	result, synced, err := engine.Reclaim(ctx)
++	if err != nil {
++		return err
++	}
++	if synced.BlobErrs > 0 {
++		fmt.Fprintf(os.Stderr, "warning: %d blob operation(s) failed\n", synced.BlobErrs)
++	}
++
++	if len(result.Waiting) > 0 {
++		names := make([]string, 0, len(result.Waiting))
++		for _, d := range result.Waiting {
++			names = append(names, d.Name)
++		}
++		fmt.Printf("waiting for: %s\n", strings.Join(names, ", "))
++		return nil
++	}
++
++	status, err := client.Status(ctx)
++	if err != nil {
++		return fmt.Errorf("fetch status: %w", err)
++	}
++	fmt.Printf(
++		"removed %d files, freed %s\n",
++		result.Removed,
++		formatBytes(result.FreedBytes),
++	)
++	fmt.Printf(
++		"storage:   %s\n",
++		formatStorageUsage(result.UsedBytes, status.BlobStorage.QuotaBytes),
++	)
++	return nil
++}
++
+ // formatBytes formats a byte count as a human-readable string using
+ // binary units (KiB, MiB, GiB).
+ func formatBytes(b int64) string {
+diff --git a/docs/content/docs/reference/cli.md b/docs/content/docs/reference/cli.md
+index 24fb6fb..e48ef28 100644
+--- a/docs/content/docs/reference/cli.md
++++ b/docs/content/docs/reference/cli.md
+@@ -1921,6 +1921,7 @@ micasa pro storage [database-path] [flags]
+ | Flag | Default | Description |
+ |------|---------|-------------|
+ | `-h`, `--help` | - | help for storage |
++| `--reclaim` | - | Sync, then delete stored files that no device uses any more |
+ 
+ ### See also
+ 
+diff --git a/internal/data/meta_generated.go b/internal/data/meta_generated.go
+index 2cb3b2f..e0e1183 100644
+--- a/internal/data/meta_generated.go
++++ b/internal/data/meta_generated.go
+@@ -102,6 +102,8 @@ const (
+ 	ColPurchaseDate      = "purchase_date"
+ 	ColReceivedDate      = "received_date"
+ 	ColRelayURL          = "relay_url"
++	ColReportVersion     = "report_version"
++	ColReportedFiles     = "reported_files"
+ 	ColRestoredAt        = "restored_at"
+ 	ColRoofType          = "roof_type"
+ 	ColRowID             = "row_id"
+@@ -275,6 +277,8 @@ var TableExtractColumns = map[string][]metaColumn{
+ 		{Name: "household_id", JSONType: "string"},
+ 		{Name: "relay_url", JSONType: "string"},
+ 		{Name: "last_seq", JSONType: "integer"},
++		{Name: "report_version", JSONType: "integer"},
++		{Name: "reported_files", JSONType: "string"},
+ 	},
+ 	TableSyncOplogEntries: {
+ 		{Name: "table_name", JSONType: "string"},
+diff --git a/internal/data/models.go b/internal/data/models.go
+index bb7baf0..76b3501 100644
+--- a/internal/data/models.go
++++ b/internal/data/models.go
+@@ -357,12 +357,14 @@ type SyncOplogEntry struct {
+ 
+ // SyncDevice stores this device's identity. Only one row exists locally.
+ type SyncDevice struct {
+-	ID          string `gorm:"primaryKey;size:26"`
+-	Name        string `gorm:"not null"`
+-	HouseholdID string
+-	RelayURL    string
+-	LastSeq     int64 `gorm:"default:0"`
+-	CreatedAt   time.Time
++	ID            string `gorm:"primaryKey;size:26"`
++	Name          string `gorm:"not null"`
++	HouseholdID   string
++	RelayURL      string
++	LastSeq       int64 `gorm:"default:0"`
++	ReportVersion int64 `gorm:"default:0"`
++	ReportedFiles string
++	CreatedAt     time.Time
+ }
+ 
+ func (x *SyncOplogEntry) BeforeCreate(_ *gorm.DB) error {
+diff --git a/internal/data/oplog.go b/internal/data/oplog.go
+index a9cd697..705a84d 100644
+--- a/internal/data/oplog.go
++++ b/internal/data/oplog.go
+@@ -10,6 +10,7 @@ import (
+ 	"fmt"
+ 	"log/slog"
+ 	"os"
++	"strings"
+ 	gosync "sync"
+ 	"time"
+ 
+@@ -319,6 +320,27 @@ func (s *Store) UpdateSyncDevice(updates map[string]any) error {
+ 	return s.db.Model(&SyncDevice{}).Where("1 = 1").Updates(updates).Error
+ }
+ 
++// ReportedFiles returns the version and sorted file checksums of the
++// in-use report the relay last confirmed for this device.
++func (s *Store) ReportedFiles() (int64, []string, error) {
++	dev, err := s.GetSyncDevice()
++	if err != nil {
++		return 0, nil, err
++	}
++	if dev.ReportedFiles == "" {
++		return dev.ReportVersion, nil, nil
++	}
++	return dev.ReportVersion, strings.Split(dev.ReportedFiles, "\n"), nil
++}
++
++// SetReportedFiles records the in-use report the relay confirmed.
++func (s *Store) SetReportedFiles(version int64, sums []string) error {
++	return s.UpdateSyncDevice(map[string]any{
++		ColReportVersion: version,
++		ColReportedFiles: strings.Join(sums, "\n"),
++	})
++}
++
+ // ConflictLosers returns oplog entries that lost LWW conflict resolution:
+ // synced from the relay (synced_at IS NOT NULL) but not applied locally
+ // (applied_at IS NULL). Ordered newest first with deterministic tiebreaker.
+diff --git a/internal/data/store_document.go b/internal/data/store_document.go
+index 89090be..21838c6 100644
+--- a/internal/data/store_document.go
++++ b/internal/data/store_document.go
+@@ -110,6 +110,38 @@ func (s *Store) PendingBlobDocuments() ([]Document, error) {
+ 	return docs, err
+ }
+ 
++// DocumentChecksums returns the distinct file checksums of every document,
++// including soft-deleted ones and ones whose file has not been downloaded.
++func (s *Store) DocumentChecksums() ([]string, error) {
++	var sums []string
++	err := s.db.Unscoped().Model(&Document{}).
++		Where(ColChecksumSHA256+" != ''").
++		Distinct(ColChecksumSHA256).
++		Order(ColChecksumSHA256).
++		Pluck(ColChecksumSHA256, &sums).Error
++	return sums, err
++}
++
++// StoredBlobDocuments returns documents whose file bytes are stored
++// locally, without loading the bytes. Soft-deleted documents are included
++// because they can be restored.
++func (s *Store) StoredBlobDocuments() ([]Document, error) {
++	var docs []Document
++	err := s.db.Unscoped().Select(listDocumentColumns).
++		Where("sha256 != '' AND data IS NOT NULL").
++		Order("updated_at DESC, id DESC").
++		Find(&docs).Error
++	return docs, err
++}
++
++// DocumentData returns the file bytes of a document, including a
++// soft-deleted one. It returns nil when the bytes are not stored locally.
++func (s *Store) DocumentData(id string) ([]byte, error) {
++	var doc Document
++	err := s.db.Unscoped().Select(ColData).Where(ColID+" = ?", id).First(&doc).Error
++	return doc.Data, err
++}
++
+ // UpdateDocumentData sets the Data blob on an existing document by ID.
+ func (s *Store) UpdateDocumentData(id string, data []byte) error {
+ 	return s.db.Model(&Document{}).Where("id = ?", id).Update("data", data).Error
+diff --git a/internal/relay/handler.go b/internal/relay/handler.go
+index c2747d5..fac28d4 100644
+--- a/internal/relay/handler.go
++++ b/internal/relay/handler.go
+@@ -9,6 +9,7 @@ import (
+ 	"io"
+ 	"log/slog"
+ 	"net/http"
++	"slices"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -18,6 +19,7 @@ import (
+ const (
+ 	maxRequestBody   = 1 << 20 // 1 MB
+ 	maxDeviceNameLen = 255
++	maxReportIDLen   = 64
+ 	publicKeySize    = 32 // Curve25519
+ 
+ 	// respKeyStatus is the JSON field name for the operation-status string in
+@@ -88,6 +90,14 @@ func NewHandler(store Store, log *slog.Logger, opts ...HandlerOption) *Handler {
+ 		"HEAD /blobs/{household_id}/{hash}",
+ 		h.requireAuth(h.requireSubscription(h.handleHeadBlob)),
+ 	)
++	mux.HandleFunc(
++		"POST /households/{id}/blobs/in-use",
++		h.requireAuth(h.requireSubscription(h.handleReportBlobsInUse)),
++	)
++	mux.HandleFunc(
++		"POST /households/{id}/blobs/reclaim",
++		h.requireAuth(h.requireSubscription(h.handleReclaimBlobs)),
++	)
+ 	mux.HandleFunc("GET /status", h.requireAuth(h.handleStatus))
+ 	mux.HandleFunc("POST /webhooks/stripe", h.handleStripeWebhook)
+ 	h.mux = mux
+@@ -549,6 +559,80 @@ func (h *Handler) handleHeadBlob(
+ 	w.WriteHeader(http.StatusOK)
+ }
+ 
++func (h *Handler) handleReportBlobsInUse(
++	w http.ResponseWriter,
++	r *http.Request,
++	dev sync.Device,
++) {
++	hhID := r.PathValue("id")
++	if dev.HouseholdID != hhID {
++		writeError(w, http.StatusForbidden, "device does not belong to this household")
++		return
++	}
++	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
++	body, err := io.ReadAll(r.Body)
++	if err != nil {
++		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
++			writeError(w, http.StatusRequestEntityTooLarge, "report body exceeds maximum size")
++		} else {
++			writeError(w, http.StatusBadRequest, "read body failed")
++		}
++		return
++	}
++	var req sync.BlobReportRequest
++	if err := json.Unmarshal(body, &req); err != nil {
++		writeError(w, http.StatusBadRequest, "invalid request body")
++		return
++	}
++	if req.ReportID == "" || len(req.ReportID) > maxReportIDLen {
++		writeError(w, http.StatusBadRequest, "report_id is required")
++		return
++	}
++	for _, hash := range slices.Concat(req.Hashes, req.Removed) {
++		if !validSHA256Hash(hash) {
++			writeError(
++				w,
++				http.StatusBadRequest,
++				"invalid hash: must be 64 lowercase hex characters",
++			)
++			return
++		}
++	}
++	version, err := h.store.ReportBlobsInUse(r.Context(), hhID, dev.ID, req)
++	if errors.Is(err, ErrStaleReportBase) {
++		writeError(w, http.StatusConflict, "report base is out of date; send the full report")
++		return
++	}
++	if err != nil {
++		h.log.Error("report blobs in use", "error", err, "device_id", dev.ID)
++		writeError(w, http.StatusInternalServerError, "report blobs failed")
++		return
++	}
++	writeJSON(w, http.StatusOK, sync.BlobReportResponse{Version: version})
++}
++
++func (h *Handler) handleReclaimBlobs(
++	w http.ResponseWriter,
++	r *http.Request,
++	dev sync.Device,
++) {
++	hhID := r.PathValue("id")
++	if dev.HouseholdID != hhID {
++		writeError(w, http.StatusForbidden, "device does not belong to this household")
++		return
++	}
++	result, err := h.store.ReclaimBlobs(r.Context(), hhID)
++	if err != nil {
++		h.log.Error("reclaim blobs", "error", err)
++		writeError(w, http.StatusInternalServerError, "reclaim blobs failed")
++		return
++	}
++	if result.Waiting == nil {
++		result.Waiting = []sync.Device{}
++	}
++	writeJSON(w, http.StatusOK, result)
++}
++
+ func (h *Handler) handleStatus(
+ 	w http.ResponseWriter,
+ 	r *http.Request,
+diff --git a/internal/relay/memstore.go b/internal/relay/memstore.go
+index 6d82572..83e3127 100644
+--- a/internal/relay/memstore.go
++++ b/internal/relay/memstore.go
+@@ -4,6 +4,7 @@
+ package relay
+ 
+ import (
++	"cmp"
+ 	"context"
+ 	"crypto/rand"
+ 	"crypto/sha256"
+@@ -11,6 +12,8 @@ import (
+ 	"encoding/hex"
+ 	"errors"
+ 	"fmt"
++	"maps"
++	"slices"
+ 	gosync "sync"
+ 	"time"
+ 
+@@ -41,6 +44,21 @@ type MemStore struct {
+ 	invites       map[string]*inviteRecord
+ 	exchanges     map[string]*keyExchangeRecord
+ 	blobs         map[string]map[string][]byte // household_id -> hash -> data
++	pushSeqs      map[string]int64             // device_id -> seq of its last pushed op
++	reports       map[string]blobReport        // device_id -> latest in-use report
++	reportParts   map[string]blobReportParts   // device_id -> unfinished report
++}
++
++type blobReportParts struct {
++	id      string
++	hashes  []string
++	removed []string
++}
++
++type blobReport struct {
++	seq     int64
++	version int64
++	hashes  map[string]struct{}
+ }
+ 
+ type deviceRecord struct {
+@@ -75,13 +93,16 @@ type keyExchangeRecord struct {
+ // NewMemStore creates a new in-memory relay store.
+ func NewMemStore() *MemStore {
+ 	return &MemStore{
+-		households: make(map[string]sync.Household),
+-		devices:    make(map[string]deviceRecord),
+-		tokenIndex: make(map[string]string),
+-		seqs:       make(map[string]int64),
+-		invites:    make(map[string]*inviteRecord),
+-		exchanges:  make(map[string]*keyExchangeRecord),
+-		blobs:      make(map[string]map[string][]byte),
++		households:  make(map[string]sync.Household),
++		devices:     make(map[string]deviceRecord),
++		tokenIndex:  make(map[string]string),
++		seqs:        make(map[string]int64),
++		invites:     make(map[string]*inviteRecord),
++		exchanges:   make(map[string]*keyExchangeRecord),
++		blobs:       make(map[string]map[string][]byte),
++		pushSeqs:    make(map[string]int64),
++		reports:     make(map[string]blobReport),
++		reportParts: make(map[string]blobReportParts),
+ 	}
+ }
+ 
+@@ -105,6 +126,7 @@ func (m *MemStore) Push(_ context.Context, ops []sync.Envelope) ([]sync.PushConf
+ 		seq := m.seqs[op.HouseholdID]
+ 		op.Seq = seq
+ 		m.ops = append(m.ops, op)
++		m.pushSeqs[op.DeviceID] = seq
+ 		confirmed = append(confirmed, sync.PushConfirmation{
+ 			ID:  op.ID,
+ 			Seq: seq,
+@@ -671,6 +693,99 @@ func (m *MemStore) BlobUsage(_ context.Context, householdID string) (int64, erro
+ 	return total, nil
+ }
+ 
++func (m *MemStore) ReportBlobsInUse(
++	_ context.Context,
++	householdID, deviceID string,
++	part sync.BlobReportRequest,
++) (int64, error) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++
++	rec, ok := m.devices[deviceID]
++	if !ok || rec.revoked || rec.device.HouseholdID != householdID {
++		return 0, fmt.Errorf("device %s not found", deviceID)
++	}
++	pending := m.reportParts[deviceID]
++	if pending.id != part.ReportID {
++		pending = blobReportParts{id: part.ReportID}
++	}
++	pending.hashes = append(pending.hashes, part.Hashes...)
++	pending.removed = append(pending.removed, part.Removed...)
++	if !part.Final {
++		m.reportParts[deviceID] = pending
++		return 0, nil
++	}
++	delete(m.reportParts, deviceID)
++	prev := m.reports[deviceID]
++	set := make(map[string]struct{}, len(pending.hashes))
++	if part.Base != 0 {
++		if prev.version != part.Base {
++			return 0, ErrStaleReportBase
++		}
++		maps.Copy(set, prev.hashes)
++		for _, h := range pending.removed {
++			delete(set, h)
++		}
++	}
++	for _, h := range pending.hashes {
++		set[h] = struct{}{}
++	}
++	version := prev.version + 1
++	m.reports[deviceID] = blobReport{seq: m.seqs[householdID], version: version, hashes: set}
++	return version, nil
++}
++
++func (m *MemStore) ReclaimBlobs(
++	_ context.Context,
++	householdID string,
++) (sync.ReclaimResult, error) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++
++	if _, ok := m.households[householdID]; !ok {
++		return sync.ReclaimResult{}, fmt.Errorf("household %s not found", householdID)
++	}
++
++	var result sync.ReclaimResult
++	inUse := make(map[string]struct{})
++	for _, rec := range m.devices {
++		if rec.revoked || rec.device.HouseholdID != householdID {
++			continue
++		}
++		report, ok := m.reports[rec.device.ID]
++		if !ok || report.seq < m.pushSeqs[rec.device.ID] {
++			result.Waiting = append(result.Waiting, rec.device)
++			continue
++		}
++		for h := range report.hashes {
++			inUse[h] = struct{}{}
++		}
++	}
++	sortDevicesByName(result.Waiting)
++
++	blobs := m.blobs[householdID]
++	if len(result.Waiting) == 0 {
++		for hash, data := range blobs {
++			if _, ok := inUse[hash]; ok {
++				continue
++			}
++			result.Removed++
++			result.FreedBytes += int64(len(data))
++			delete(blobs, hash)
++		}
++	}
++	for _, data := range blobs {
++		result.UsedBytes += int64(len(data))
++	}
++	return result, nil
++}
++
++func sortDevicesByName(devices []sync.Device) {
++	slices.SortFunc(devices, func(a, b sync.Device) int {
++		return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.ID, b.ID))
++	})
++}
++
+ func (m *MemStore) Close() error { return nil }
+ 
+ func generateInviteCode() (string, error) {
+diff --git a/internal/relay/pgstore.go b/internal/relay/pgstore.go
+index 0e7680e..de9ac32 100644
+--- a/internal/relay/pgstore.go
++++ b/internal/relay/pgstore.go
+@@ -7,6 +7,8 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"maps"
++	"slices"
+ 	"time"
+ 
+ 	"github.com/micasa-dev/micasa/internal/relay/rlsdb"
+@@ -106,11 +108,34 @@ type pgBlob struct {
+ 
+ func (pgBlob) TableName() string { return "blobs" }
+ 
++type pgBlobReport struct {
++	DeviceID    string    `gorm:"primaryKey"`
++	HouseholdID string    `gorm:"not null;index"`
++	Seq         int64     `gorm:"not null"`
++	Version     int64     `gorm:"not null;default:0"`
++	Hashes      []string  `gorm:"not null;serializer:json"`
++	UpdatedAt   time.Time `gorm:"not null;autoUpdateTime"`
++}
++
++func (pgBlobReport) TableName() string { return "blob_reports" }
++
++type pgBlobReportPart struct {
++	DeviceID    string   `gorm:"primaryKey"`
++	HouseholdID string   `gorm:"not null;index"`
++	ReportID    string   `gorm:"not null"`
++	Hashes      []string `gorm:"not null;serializer:json"`
++	Removed     []string `gorm:"serializer:json"`
++}
++
++func (pgBlobReportPart) TableName() string { return "blob_report_parts" }
++
+ // rlsTables lists the tables that have row-level security policies
+ // enforcing household isolation.
+ var rlsTables = []rlsdb.RLSTable{
+ 	{Name: "ops", Column: "household_id"},
+ 	{Name: "blobs", Column: "household_id"},
++	{Name: "blob_reports", Column: "household_id"},
++	{Name: "blob_report_parts", Column: "household_id"},
+ }
+ 
+ // OpenPgStore connects to a Postgres database and returns a PgStore.
+@@ -141,6 +166,8 @@ var pgModels = []any{
+ 	&pgInvite{},
+ 	&pgKeyExchange{},
+ 	&pgBlob{},
++	&pgBlobReport{},
++	&pgBlobReportPart{},
+ }
+ 
+ // AutoMigrate creates/updates the database schema and enables RLS.
+@@ -320,14 +347,16 @@ func (s *PgStore) RegisterDevice(
+ 	}
+ 
+ 	err = s.rls.Tx(ctx, req.HouseholdID, func(tx *gorm.DB) error {
+-		// Verify household exists within the transaction.
+-		var count int64
++		// Verify household exists and lock it so a concurrent ReclaimBlobs
++		// sees either no device or a device without a report.
+ 		if err := tx.Model(&pgHousehold{}).
+-			Where("id = ?", req.HouseholdID).Count(&count).Error; err != nil {
+-			return fmt.Errorf("check household: %w", err)
+-		}
+-		if count == 0 {
+-			return fmt.Errorf("household %s not found", req.HouseholdID)
++			Clauses(clause.Locking{Strength: lockStrengthUpdate}).
++			Where("id = ?", req.HouseholdID).
++			First(&pgHousehold{}).Error; err != nil {
++			if errors.Is(err, gorm.ErrRecordNotFound) {
++				return fmt.Errorf("household %s not found", req.HouseholdID)
++			}
++			return fmt.Errorf("lock household: %w", err)
+ 		}
+ 
+ 		dev := pgDevice{
+@@ -542,6 +571,15 @@ func (s *PgStore) CompleteKeyExchange(
+ 	encryptedKey []byte,
+ ) error {
+ 	return s.rls.Tx(ctx, householdID, func(tx *gorm.DB) error {
++		// Lock the household first, as ReclaimBlobs does, so a joiner
++		// cannot be added between its device query and its sweep.
++		if err := tx.Model(&pgHousehold{}).
++			Clauses(clause.Locking{Strength: lockStrengthUpdate}).
++			Where("id = ?", householdID).
++			First(&pgHousehold{}).Error; err != nil {
++			return fmt.Errorf("lock household: %w", err)
++		}
++
+ 		var ex pgKeyExchange
+ 		if err := tx.Clauses(clause.Locking{Strength: lockStrengthUpdate}).
+ 			Where("id = ?", exchangeID).First(&ex).Error; err != nil {
+@@ -684,6 +722,15 @@ func (s *PgStore) ListDevices(
+ 
+ func (s *PgStore) RevokeDevice(ctx context.Context, householdID, deviceID string) error {
+ 	return s.rls.Tx(ctx, householdID, func(tx *gorm.DB) error {
++		// Lock the household first, as ReclaimBlobs does, so a device
++		// cannot be revoked between its device query and its sweep.
++		if err := tx.Model(&pgHousehold{}).
++			Clauses(clause.Locking{Strength: lockStrengthUpdate}).
++			Where("id = ?", householdID).
++			First(&pgHousehold{}).Error; err != nil {
++			return fmt.Errorf("lock household: %w", err)
++		}
++
+ 		var dev pgDevice
+ 		if err := tx.Clauses(clause.Locking{Strength: lockStrengthUpdate}).
+ 			Where("id = ?", deviceID).First(&dev).Error; err != nil {
+@@ -912,6 +959,206 @@ func (s *PgStore) BlobUsage(ctx context.Context, householdID string) (int64, err
+ 	return used, nil
+ }
+ 
++func (s *PgStore) ReportBlobsInUse(
++	ctx context.Context,
++	householdID, deviceID string,
++	part sync.BlobReportRequest,
++) (int64, error) {
++	var version int64
++	err := s.rls.Tx(ctx, householdID, func(tx *gorm.DB) error {
++		var dev pgDevice
++		if err := tx.Clauses(clause.Locking{Strength: lockStrengthUpdate}).
++			Where("id = ? AND household_id = ? AND revoked = false", deviceID, householdID).
++			First(&dev).Error; err != nil {
++			if errors.Is(err, gorm.ErrRecordNotFound) {
++				return fmt.Errorf("device %s not found", deviceID)
++			}
++			return fmt.Errorf("find device: %w", err)
++		}
++		pending, err := accumulateReportParts(tx, householdID, deviceID, part)
++		if err != nil {
++			return err
++		}
++		if !part.Final {
++			return nil
++		}
++		var prev pgBlobReport
++		if err := tx.Where("device_id = ?", deviceID).Limit(1).Find(&prev).Error; err != nil {
++			return fmt.Errorf("read blob report: %w", err)
++		}
++		set := make(map[string]struct{}, len(pending.Hashes))
++		if part.Base != 0 {
++			if prev.Version != part.Base {
++				return ErrStaleReportBase
++			}
++			for _, h := range prev.Hashes {
++				set[h] = struct{}{}
++			}
++			for _, h := range pending.Removed {
++				delete(set, h)
++			}
++		}
++		for _, h := range pending.Hashes {
++			set[h] = struct{}{}
++		}
++		var hh pgHousehold
++		if err := tx.Where("id = ?", householdID).First(&hh).Error; err != nil {
++			return fmt.Errorf("read household seq: %w", err)
++		}
++		version = prev.Version + 1
++		report := pgBlobReport{
++			DeviceID:    deviceID,
++			HouseholdID: householdID,
++			Seq:         hh.SeqCounter,
++			Version:     version,
++			Hashes:      slices.Sorted(maps.Keys(set)),
++		}
++		return tx.Clauses(clause.OnConflict{
++			Columns: []clause.Column{{Name: "device_id"}},
++			DoUpdates: clause.AssignmentColumns(
++				[]string{"seq", "version", "hashes", "updated_at"},
++			),
++		}).Create(&report).Error
++	})
++	if err != nil {
++		return 0, err
++	}
++	return version, nil
++}
++
++// accumulateReportParts adds part to the device's unfinished report and
++// returns everything collected so far. A final part removes the unfinished
++// report; other parts store it for the next request.
++func accumulateReportParts(
++	tx *gorm.DB,
++	householdID, deviceID string,
++	part sync.BlobReportRequest,
++) (pgBlobReportPart, error) {
++	var stored pgBlobReportPart
++	if err := tx.Where("device_id = ?", deviceID).Limit(1).Find(&stored).Error; err != nil {
++		return pgBlobReportPart{}, fmt.Errorf("read report parts: %w", err)
++	}
++	pending := pgBlobReportPart{
++		DeviceID:    deviceID,
++		HouseholdID: householdID,
++		ReportID:    part.ReportID,
++		Hashes:      []string{},
++	}
++	if stored.ReportID == part.ReportID {
++		pending.Hashes = append(pending.Hashes, stored.Hashes...)
++		pending.Removed = append(pending.Removed, stored.Removed...)
++	}
++	pending.Hashes = append(pending.Hashes, part.Hashes...)
++	pending.Removed = append(pending.Removed, part.Removed...)
++
++	if part.Final {
++		if err := tx.Where("device_id = ?", deviceID).
++			Delete(&pgBlobReportPart{}).Error; err != nil {
++			return pgBlobReportPart{}, fmt.Errorf("clear report parts: %w", err)
++		}
++		return pending, nil
++	}
++	if err := tx.Clauses(clause.OnConflict{
++		Columns:   []clause.Column{{Name: "device_id"}},
++		DoUpdates: clause.AssignmentColumns([]string{"report_id", "hashes", "removed"}),
++	}).Create(&pending).Error; err != nil {
++		return pgBlobReportPart{}, fmt.Errorf("store report parts: %w", err)
++	}
++	return pending, nil
++}
++
++func (s *PgStore) ReclaimBlobs(
++	ctx context.Context,
++	householdID string,
++) (sync.ReclaimResult, error) {
++	var result sync.ReclaimResult
++	err := s.rls.Tx(ctx, householdID, func(tx *gorm.DB) error {
++		// Lock the household row so no push, upload or device registration
++		// interleaves with the freshness check and the sweep.
++		if err := tx.Model(&pgHousehold{}).
++			Clauses(clause.Locking{Strength: lockStrengthUpdate}).
++			Where("id = ?", householdID).
++			First(&pgHousehold{}).Error; err != nil {
++			return fmt.Errorf("lock household for reclaim: %w", err)
++		}
++
++		var devices []pgDevice
++		if err := tx.Where("household_id = ? AND revoked = false", householdID).
++			Find(&devices).Error; err != nil {
++			return fmt.Errorf("list devices: %w", err)
++		}
++		var pushes []struct {
++			DeviceID string
++			Seq      int64
++		}
++		if err := tx.Model(&pgOp{}).
++			Select("device_id, MAX(seq) AS seq").
++			Where("household_id = ?", householdID).
++			Group("device_id").
++			Scan(&pushes).Error; err != nil {
++			return fmt.Errorf("last pushes: %w", err)
++		}
++		lastPush := make(map[string]int64, len(pushes))
++		for _, p := range pushes {
++			lastPush[p.DeviceID] = p.Seq
++		}
++		var reports []pgBlobReport
++		if err := tx.Where("household_id = ?", householdID).Find(&reports).Error; err != nil {
++			return fmt.Errorf("list blob reports: %w", err)
++		}
++		byDevice := make(map[string]pgBlobReport, len(reports))
++		for _, r := range reports {
++			byDevice[r.DeviceID] = r
++		}
++
++		inUse := make(map[string]struct{})
++		for _, d := range devices {
++			report, ok := byDevice[d.ID]
++			if !ok || report.Seq < lastPush[d.ID] {
++				result.Waiting = append(result.Waiting, pgDeviceToSync(d))
++				continue
++			}
++			for _, h := range report.Hashes {
++				inUse[h] = struct{}{}
++			}
++		}
++		sortDevicesByName(result.Waiting)
++
++		if len(result.Waiting) == 0 {
++			var stored []pgBlob
++			if err := tx.Select("hash, size_bytes").
++				Where("household_id = ?", householdID).
++				Find(&stored).Error; err != nil {
++				return fmt.Errorf("list blobs: %w", err)
++			}
++			var unused []string
++			for _, b := range stored {
++				if _, ok := inUse[b.Hash]; ok {
++					continue
++				}
++				unused = append(unused, b.Hash)
++				result.FreedBytes += b.SizeBytes
++			}
++			if len(unused) > 0 {
++				if err := tx.Where("household_id = ? AND hash IN ?", householdID, unused).
++					Delete(&pgBlob{}).Error; err != nil {
++					return fmt.Errorf("delete blobs: %w", err)
++				}
++			}
++			result.Removed = len(unused)
++		}
++
++		return tx.Model(&pgBlob{}).
++			Where("household_id = ?", householdID).
++			Select("COALESCE(SUM(size_bytes), 0)").
++			Scan(&result.UsedBytes).Error
++	})
++	if err != nil {
++		return sync.ReclaimResult{}, fmt.Errorf("reclaim blobs: %w", err)
++	}
++	return result, nil
++}
++
+ func (s *PgStore) Close() error {
+ 	return s.rls.Close()
+ }
+diff --git a/internal/relay/store.go b/internal/relay/store.go
+index f877744..0e991fb 100644
+--- a/internal/relay/store.go
++++ b/internal/relay/store.go
+@@ -5,6 +5,7 @@ package relay
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"time"
+ 
+ 	"github.com/micasa-dev/micasa/internal/sync"
+@@ -27,6 +28,10 @@ const (
+ 	keyExchangeExpiry = 15 * time.Minute
+ )
+ 
++// ErrStaleReportBase is returned when a report change names a base version
++// the relay no longer holds for the device.
++var ErrStaleReportBase = errors.New("in-use report base version is stale")
++
+ // Store defines the persistence interface for the relay server.
+ // Implementations handle storage of encrypted operations and device
+ // registration without needing to decrypt any user data.
+@@ -144,6 +149,25 @@ type Store interface {
+ 	// BlobUsage returns the total bytes used by blobs for a household.
+ 	BlobUsage(ctx context.Context, householdID string) (int64, error)
+ 
++	// ReportBlobsInUse records one part of a device's in-use report. Parts
++	// sharing a report ID accumulate; a part with a new ID discards any
++	// unfinished report. The final part replaces the device's previous
++	// report, or changes it when Base is set, stamps it with the
++	// household's current sequence number and returns its new version.
++	// It returns ErrStaleReportBase when Base is not the device's current
++	// report version.
++	ReportBlobsInUse(
++		ctx context.Context,
++		householdID, deviceID string,
++		part sync.BlobReportRequest,
++	) (int64, error)
++
++	// ReclaimBlobs deletes the household's blobs that no device report
++	// lists. It deletes nothing, and returns the devices it is waiting on,
++	// while any active device has no report stamped at or after the last
++	// op it pushed.
++	ReclaimBlobs(ctx context.Context, householdID string) (sync.ReclaimResult, error)
++
+ 	// SetEncryptionKey sets the AES-256-GCM key used to encrypt device
+ 	// tokens at rest during key exchanges. Must be exactly 32 bytes.
+ 	SetEncryptionKey(key []byte)
+diff --git a/internal/sync/apply.go b/internal/sync/apply.go
+index 75e1036..7a06006 100644
+--- a/internal/sync/apply.go
++++ b/internal/sync/apply.go
+@@ -214,6 +214,11 @@ func applyUpdate(tx *gorm.DB, op OpPayload) error {
+ 	delete(updates, data.ColID)
+ 	delete(updates, data.ColCreatedAt)
+ 	stripNonColumnKeys(op.TableName, updates)
++	if op.TableName == data.TableDocuments {
++		if err := dropReplacedFileData(tx, op.RowID, updates); err != nil {
++			return err
++		}
++	}
+ 	result := tx.Table(op.TableName).Where(sqlWhereID, op.RowID).Updates(updates)
+ 	if result.Error != nil {
+ 		return result.Error
+@@ -224,6 +229,25 @@ func applyUpdate(tx *gorm.DB, op OpPayload) error {
+ 	return nil
+ }
+ 
++// dropReplacedFileData clears a document's local file when an incoming
++// update carries a different checksum, so the blob phase downloads the
++// replacement instead of keeping the old bytes under the new checksum.
++func dropReplacedFileData(tx *gorm.DB, rowID string, updates map[string]any) error {
++	incoming, ok := updates[data.ColChecksumSHA256].(string)
++	if !ok {
++		return nil
++	}
++	var current []string
++	if err := tx.Table(data.TableDocuments).Where(sqlWhereID, rowID).
++		Pluck(data.ColChecksumSHA256, &current).Error; err != nil {
++		return fmt.Errorf("read document checksum: %w", err)
++	}
++	if len(current) == 1 && current[0] != incoming {
++		updates[data.ColData] = nil
++	}
++	return nil
++}
++
+ // stripNonColumnKeys removes payload keys that should not be written to the
+ // database from remote operations. This includes:
+ //   - Keys with no corresponding DB column (e.g. blob_ref on documents)
+diff --git a/internal/sync/blob.go b/internal/sync/blob.go
+index 4cff074..d695b74 100644
+--- a/internal/sync/blob.go
++++ b/internal/sync/blob.go
+@@ -8,12 +8,16 @@ import (
+ 	"context"
+ 	"crypto/sha256"
+ 	"encoding/hex"
++	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+ 	"net/url"
++	"slices"
+ 
+ 	"github.com/micasa-dev/micasa/internal/crypto"
++	"github.com/micasa-dev/micasa/internal/uid"
+ 	"golang.org/x/crypto/nacl/secretbox"
+ )
+ 
+@@ -143,3 +147,150 @@ func (c *Client) HasBlob(ctx context.Context, householdID, hash string) (bool, e
+ 		return false, fmt.Errorf("check blob failed (status %d)", resp.StatusCode)
+ 	}
+ }
++
++// blobReportPartSize keeps each in-use report request well under the
++// relay's request body limit.
++const blobReportPartSize = 8192
++
++// errStaleReportBase means the relay no longer holds the report version a
++// change was based on, so the full list has to be sent instead.
++var errStaleReportBase = errors.New("relay holds a different report version")
++
++// BlobReport is the in-use report the relay last confirmed for this
++// device: its version and its sorted hashes. Version 0 means none.
++type BlobReport struct {
++	Version int64
++	Hashes  []string
++}
++
++// ReportBlobsInUse tells the relay which blobs this device's documents
++// still use, in as many parts as needed. When prev holds a confirmed
++// report, only the hashes added and removed since then are sent, falling
++// back to the full list if the relay holds another version. The relay
++// replaces the device's previous report only once the last part has
++// arrived. hashes must be sorted; the confirmed report is returned.
++func (c *Client) ReportBlobsInUse(
++	ctx context.Context,
++	householdID string,
++	hashes []string,
++	prev BlobReport,
++) (BlobReport, error) {
++	if prev.Version > 0 {
++		added, removed := diffSortedHashes(prev.Hashes, hashes)
++		version, err := c.sendBlobReport(ctx, householdID, prev.Version, added, removed)
++		if err == nil {
++			return BlobReport{Version: version, Hashes: hashes}, nil
++		}
++		if !errors.Is(err, errStaleReportBase) {
++			return BlobReport{}, err
++		}
++	}
++	version, err := c.sendBlobReport(ctx, householdID, 0, hashes, nil)
++	if err != nil {
++		return BlobReport{}, err
++	}
++	return BlobReport{Version: version, Hashes: hashes}, nil
++}
++
++func (c *Client) sendBlobReport(
++	ctx context.Context,
++	householdID string,
++	base int64,
++	added, removed []string,
++) (int64, error) {
++	reportID := uid.New()
++	for {
++		n := min(len(added), blobReportPartSize)
++		m := min(len(removed), blobReportPartSize-n)
++		part := BlobReportRequest{
++			ReportID: reportID,
++			Base:     base,
++			Hashes:   slices.Clip(added[:n]),
++			Removed:  slices.Clip(removed[:m]),
++			Final:    n == len(added) && m == len(removed),
++		}
++		if part.Hashes == nil {
++			part.Hashes = []string{}
++		}
++		added, removed = added[n:], removed[m:]
++		var resp BlobReportResponse
++		if err := c.postBlobs(ctx, householdID, "in-use", part, &resp); err != nil {
++			return 0, err
++		}
++		if part.Final {
++			return resp.Version, nil
++		}
++	}
++}
++
++// diffSortedHashes returns the hashes in next but not prev, and those in
++// prev but not next. Both inputs must be sorted.
++func diffSortedHashes(prev, next []string) (added, removed []string) {
++	i, j := 0, 0
++	for i < len(prev) || j < len(next) {
++		switch {
++		case j == len(next) || (i < len(prev) && prev[i] < next[j]):
++			removed = append(removed, prev[i])
++			i++
++		case i == len(prev) || next[j] < prev[i]:
++			added = append(added, next[j])
++			j++
++		default:
++			i++
++			j++
++		}
++	}
++	return added, removed
++}
++
++// ReclaimBlobs asks the relay to delete the household's blobs that no
++// device reports as in use.
++func (c *Client) ReclaimBlobs(ctx context.Context, householdID string) (*ReclaimResult, error) {
++	var result ReclaimResult
++	if err := c.postBlobs(ctx, householdID, "reclaim", struct{}{}, &result); err != nil {
++		return nil, err
++	}
++	return &result, nil
++}
++
++func (c *Client) postBlobs(
++	ctx context.Context,
++	householdID, action string,
++	body, out any,
++) error {
++	endpoint, err := url.JoinPath(c.baseURL, "households", householdID, "blobs", action)
++	if err != nil {
++		return fmt.Errorf("construct blobs %s URL: %w", action, err)
++	}
++	payload, err := json.Marshal(body)
++	if err != nil {
++		return fmt.Errorf("marshal blobs %s request: %w", action, err)
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
++	if err != nil {
++		return fmt.Errorf("create blobs %s request: %w", action, err)
++	}
++	req.Header.Set("Authorization", "Bearer "+c.token)
++	req.Header.Set("Content-Type", "application/json")
++
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return fmt.Errorf("blobs %s request: %w", action, err)
++	}
++	defer func() { _ = resp.Body.Close() }()
++
++	if resp.StatusCode == http.StatusConflict {
++		return errStaleReportBase
++	}
++	if resp.StatusCode != http.StatusOK {
++		respBody := readErrorBody(resp.Body)
++		return fmt.Errorf("blobs %s failed (status %d): %s", action, resp.StatusCode, respBody)
++	}
++	if out == nil {
++		return nil
++	}
++	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
++		return fmt.Errorf("decode blobs %s response: %w", action, err)
++	}
++	return nil
++}
+diff --git a/internal/sync/engine.go b/internal/sync/engine.go
+index a49d397..9138cb9 100644
+--- a/internal/sync/engine.go
++++ b/internal/sync/engine.go
+@@ -75,6 +75,10 @@ func (e *Engine) Sync(ctx context.Context) (SyncResult, error) {
+ 
+ 	blobsUp, blobErrs := e.uploadPendingBlobs(ctx, pushedOps)
+ 	blobsDown, fetchErrs := e.fetchPendingBlobs(ctx)
++	if err := e.reportBlobsInUse(ctx); err != nil {
++		slog.Warn("report blobs in use", logKeyError, err)
++		blobErrs++
++	}
+ 
+ 	result := SyncResult{
+ 		Pulled:    pulled,
+@@ -90,6 +94,97 @@ func (e *Engine) Sync(ctx context.Context) (SyncResult, error) {
+ 	return result, nil
+ }
+ 
++// Reclaim runs a full sync and then asks the relay to delete the blobs
++// that no device of the household still uses. After a sweep it uploads
++// any local document blob the relay is missing, so an upload that failed
++// earlier (e.g. over quota) is retried once space has been freed.
++func (e *Engine) Reclaim(ctx context.Context) (*ReclaimResult, SyncResult, error) {
++	synced, err := e.Sync(ctx)
++	if err != nil {
++		return nil, synced, err
++	}
++	if err := e.reportBlobsInUse(ctx); err != nil {
++		return nil, synced, fmt.Errorf("report blobs in use: %w", err)
++	}
++	result, err := e.client.ReclaimBlobs(ctx, e.householdID)
++	if err != nil {
++		return nil, synced, fmt.Errorf("reclaim blobs: %w", err)
++	}
++	if len(result.Waiting) > 0 {
++		return result, synced, nil
++	}
++
++	uploaded, uploadErrs := e.uploadMissingBlobs(ctx)
++	synced.BlobsUp += uploaded
++	synced.BlobErrs += uploadErrs
++	if uploaded > 0 {
++		status, err := e.client.Status(ctx)
++		if err != nil {
++			return nil, synced, fmt.Errorf("fetch status: %w", err)
++		}
++		result.UsedBytes = status.BlobStorage.UsedBytes
++	}
++	return result, synced, nil
++}
++
++// uploadMissingBlobs uploads every locally stored document blob that the
++// relay does not have. Returns the number of uploads and errors.
++func (e *Engine) uploadMissingBlobs(ctx context.Context) (int, int) {
++	docs, err := e.store.StoredBlobDocuments()
++	if err != nil {
++		slog.Warn("query stored blobs", logKeyError, err)
++		return 0, 1
++	}
++	seen := make(map[string]struct{}, len(docs))
++	uploaded, errCount := 0, 0
++	for _, doc := range docs {
++		if ctx.Err() != nil {
++			return uploaded, errCount
++		}
++		if _, ok := seen[doc.ChecksumSHA256]; ok {
++			continue
++		}
++		seen[doc.ChecksumSHA256] = struct{}{}
++		ok, err := e.uploadDocumentBlob(ctx, doc.ID, doc.ChecksumSHA256)
++		if err != nil {
++			slog.Warn("upload missing blob", colBlobRef, doc.ChecksumSHA256, logKeyError, err)
++			errCount++
++			continue
++		}
++		if ok {
++			uploaded++
++		}
++	}
++	return uploaded, errCount
++}
++
++func (e *Engine) reportBlobsInUse(ctx context.Context) error {
++	if err := ctx.Err(); err != nil {
++		return fmt.Errorf("report cancelled: %w", err)
++	}
++	sums, err := e.store.DocumentChecksums()
++	if err != nil {
++		return fmt.Errorf("list document checksums: %w", err)
++	}
++	version, reported, err := e.store.ReportedFiles()
++	if err != nil {
++		return fmt.Errorf("read last report: %w", err)
++	}
++	confirmed, err := e.client.ReportBlobsInUse(
++		ctx,
++		e.householdID,
++		sums,
++		BlobReport{Version: version, Hashes: reported},
++	)
++	if err != nil {
++		return err
++	}
++	if err := e.store.SetReportedFiles(confirmed.Version, confirmed.Hashes); err != nil {
++		return fmt.Errorf("record report: %w", err)
++	}
++	return nil
++}
++
+ func (e *Engine) pullAll(ctx context.Context, lastSeq int64) (int, int, error) {
+ 	total := 0
+ 	totalConflicts := 0
+@@ -214,36 +309,42 @@ func (e *Engine) uploadPendingBlobs(ctx context.Context, ops []OpPayload) (int,
+ 			continue
+ 		}
+ 
+-		exists, err := e.client.HasBlob(ctx, e.householdID, blobRef)
+-		if err != nil {
+-			slog.Warn("check blob on relay", colBlobRef, blobRef, logKeyError, err)
+-			errCount++
+-			continue
+-		}
+-		if exists {
+-			continue
+-		}
+-
+-		doc, err := e.store.GetDocument(op.RowID)
++		ok, err := e.uploadDocumentBlob(ctx, op.RowID, blobRef)
+ 		if err != nil {
+-			slog.Warn("load document for blob upload", data.ColRowID, op.RowID, logKeyError, err)
+-			errCount++
+-			continue
+-		}
+-		if doc.Data == nil {
+-			continue
+-		}
+-
+-		if err := e.client.UploadBlob(ctx, e.householdID, blobRef, doc.Data); err != nil {
+ 			slog.Warn("upload blob", colBlobRef, blobRef, logKeyError, err)
+ 			errCount++
+ 			continue
+ 		}
+-		uploaded++
++		if ok {
++			uploaded++
++		}
+ 	}
+ 	return uploaded, errCount
+ }
+ 
++// uploadDocumentBlob uploads the blob of a local document unless the relay
++// already has it. Reports whether an upload happened.
++func (e *Engine) uploadDocumentBlob(ctx context.Context, docID, hash string) (bool, error) {
++	exists, err := e.client.HasBlob(ctx, e.householdID, hash)
++	if err != nil {
++		return false, fmt.Errorf("check blob on relay: %w", err)
++	}
++	if exists {
++		return false, nil
++	}
++	content, err := e.store.DocumentData(docID)
++	if err != nil {
++		return false, fmt.Errorf("load document %s: %w", docID, err)
++	}
++	if content == nil {
++		return false, nil
++	}
++	if err := e.client.UploadBlob(ctx, e.householdID, hash, content); err != nil {
++		return false, err
++	}
++	return true, nil
++}
++
+ // fetchPendingBlobs downloads blobs for documents that have a checksum but
+ // no local data (arrived via sync without the blob payload).
+ // Returns the number of successful fetches and the number of errors.
+diff --git a/internal/sync/types.go b/internal/sync/types.go
+index 50ed288..ad693e7 100644
+--- a/internal/sync/types.go
++++ b/internal/sync/types.go
+@@ -147,3 +147,30 @@ type KeyExchangeResult struct {
+ 	DeviceID              string `json:"device_id,omitempty"`
+ 	DeviceToken           string `json:"device_token,omitempty"`
+ }
++
++// BlobReportRequest is one part of a device's in-use report, sent as the
++// body of POST /households/{id}/blobs/in-use. Parts of one report share a
++// ReportID; the relay applies the report only when the Final part arrives.
++// A report with Base 0 lists every hash. Otherwise it changes the device's
++// report at version Base: Hashes are added and Removed are dropped.
++type BlobReportRequest struct {
++	ReportID string   `json:"report_id"`
++	Base     int64    `json:"base,omitempty"`
++	Hashes   []string `json:"hashes"`
++	Removed  []string `json:"removed,omitempty"`
++	Final    bool     `json:"final"`
++}
++
++// BlobReportResponse answers a final report part with the version of the
++// device's report the relay now holds.
++type BlobReportResponse struct {
++	Version int64 `json:"version"`
++}
++
++// ReclaimResult is the response of POST /households/{id}/blobs/reclaim.
++type ReclaimResult struct {
++	Removed    int      `json:"removed"`
++	FreedBytes int64    `json:"freed_bytes"`
++	UsedBytes  int64    `json:"used_bytes"`
++	Waiting    []Device `json:"waiting"`
++}

@@ -15,6 +15,97 @@ The goal is to ship the HARDEST viable problems at the Olympus and Diamond tiers
 
 ---
 
+## ⚠️ AGENT IDENTITIES 2026-10-18 (user) — Vega = Claude Opus 5.5 at xhigh reasoning, Orion = GPT Sol 6.1 at xhigh
+
+The user learned which models sit behind the platform codenames (2026-10-18):
+- **Vega = Claude Opus 5.5, reasoning effort xhigh.**
+- **Orion = GPT Sol 6.1, reasoning effort xhigh.**
+- Nova and Castor: not known yet. Record them here when the user learns them.
+
+What this changes:
+- **Vega can be approximated locally.** Spawn the Agent tool with `model: "opus"` and `effort: "xhigh"`, give it only
+  the meta.md title + body, and point it at a fresh clone at BASE OUTSIDE the Olympus tree (so the solution,
+  tests and runs are not in reach). Run Go/Rust through the problem's Docker image with the clone mounted and
+  `--network none`, so the toolchain and the offline limits match the platform. Then grade the result with
+  the real test.patch. First trial: pint-value-range-analysis, 2 local runs, 2026-10-18 (setup in
+  `/home/ahmed/vega-local/`, see that problem's feedback.md). Use it as a cheap pre-batch screen ONLY after
+  local and platform pass rates have been compared on the same artifact; until then it is UNPROVEN.
+  First comparison (pint, r18 meta, n=2 local vs 4 platform): local Opus left `sum` unknown where all 4
+  platform Vega gave it a range, and handled fill where 2/4 platform Vega missed it. Both sides converged
+  on other behaviours (both groups miss infinite clamp bounds). Not yet a reliable stand-in; treat it as an
+  extra sample of Opus-style failures, useful for finding convergent blind spots before paying for a batch.
+  Second comparison (micasa-pro-blob-reclaim, 2026-10-19, n=2 local): local L1 failed exactly like platform
+  Vega b3-1 (a cut-off multi-part report voids the complete one, F-107) and L2 passed like b3-2. It
+  reproduced a known failure mode but found no new lever; the decisive Nova lever came from the FP panel.
+- **Caveats:** the local subagent harness is not the platform harness (different system prompt, tools,
+  output caps, no Orion evaluator), and the subagent session still loads this repo's CLAUDE.md/memory. Its
+  sequence length is not the platform's `sequence_length`. It does not replace the Orion/Vega gate run.
+- **Orion (GPT Sol 6.1) cannot be simulated here.** No local access to that model.
+
+---
+
+## ⚠️ RULE UPDATE 2026-10-18 — LONG HORIZON is now TWO checks: Nova average > 256k AND passing Orion/Vega runs average > 256k (platform update)
+
+The platform now shows two long-horizon checks (user, 2026-10-18), and BOTH must pass:
+- **"Long horizon: Nova runs must average more than 256K tokens of sequence length."** (the 2026-10-09 rule, still live)
+- **"Long horizon (Orion / Vega): the passing runs on the qualifying codename must average more than 256K
+  tokens of sequence length."** (NEW)
+
+The rest of the 2026-10-09 block (Nova 0/8, Orion|Vega 1-25% of >= 4 same-agent runs, calibration order,
+re-eval) is unchanged.
+
+- **What the NEW check measures:** only the PASSING runs of the qualifying agent (the one whose runs meet the 1-25%
+  gate: Orion, or Vega). With 4 runs and 1 pass, that ONE passing run must be > 256k on its own. With 8 runs
+  and 2 passes, the two are averaged. Failing Orion/Vega runs do not enter this number; Nova runs have their own check.
+- **Sequence length definition is unchanged:** `trajectory.json` -> `final_metrics.extra.sequence_length`
+  (largest input+output step, compaction windows summed). `sequence_largest` is only the biggest window.
+- **⭐ Nothing we have shipped clears this.** Every recorded Orion/Vega PASS is 49k-149k (ray-optics-module-
+  inlining 49k-116k, mirrorbits Orion 86k/112k and Vega 86k, commafeed Orion 125k, KNOWLEDGE.md Orion
+  74k-149k, Vega 84k-89k). Orion is fast and convergent and does not compact on our tasks. The passer has to
+  run roughly 2-5x longer than any passer so far. Measured from saved trajectories 2026-10-18: 31 Orion runs
+  over aptly, pint, micasa-pro-blob-reclaim (pass AND fail) read 89k-133k, and NONE compacted
+  (`sequence_length == sequence_largest`). Nova's largest window before compaction is ~266k-400k. So an
+  Orion pass has to either fill one window past 256k (about 2x its current max) or compact at least once;
+  either way it needs roughly double the context work it does today. Treat every in-flight problem as failing this check until
+  its passing Orion/Vega run is re-read against 256k.
+- **The design target doubles.** Nova still has to fail long, and now the STRONG agent also has to SUCCEED long: a
+  task whose correct solution itself requires a big reading surface and a lot of verified work, not a
+  compact feature that Orion finishes in ~80k and the trap decides. Levers to try (UNPROVEN, no data yet):
+  a wider cross-subsystem footprint the solution must read and edit (more files, larger existing files that
+  have to be understood, not skimmed), more requirements whose verification needs real test runs with
+  output in context, and a repo whose own test suite is big enough that running it costs tokens. Do NOT
+  pad with busywork the tests don't check; the task must still be fair and every requirement stated.
+- **Measured where Orion's context goes (pint batch 7, 2026-10-18):** the passing run started at 13k and
+  ended at 99k over 47 requests. About 85% of the growth was file reads (25 of 46 tool calls, each capped
+  near 11k characters); `go test` output was about 1% because passing Go tests print one line. Vega's
+  nearest-to-passing run made 30 calls (358k characters of output) and reached 149k. So the 256k bar is
+  roughly 3x the code an Orion passer actually reads. A meta tweak on a single-subsystem feature does not
+  get there; the correct solution has to need about three times the reading surface.
+- **First data point above 256k (aptly-publish-history-rollback batch 4, 2026-10-18):** all 4 Vega passes ran
+  290k-330k (avg 308k) in ONE window, no compaction, 119-125 steps. The task spans 15 production files over API, CLI,
+  persistence, db cleanup and drop guards, and Vega also wrote its own system tests (51-58 files touched). Orion on
+  the same task: 185k (failed). So a wide cross-subsystem footprint does push Vega past the bar, but the same
+  problem was too easy (Vega 4/4, Nova 3/8). Width gives sequence length, not difficulty.
+- **Second data point: widening an existing problem works for length (pint-value-range-analysis batch 8,
+  2026-10-18).** Adding one meta sentence's worth of cross-cutting plumbing (selector ranges resolved from
+  the recording rules being checked, threaded through the whole source walk) moved Vega from 149k-211k (b6)
+  to 254k-335k (b8), all in ONE window, while the meta stayed at ~18 requirements (222 words). It also made
+  the task easier (Vega 2/4). Get difficulty back with test-only levers through re-eval, which does not
+  change length. Pick the lever that kills the SHORT passer: the passer kept has to clear 256k on its own.
+- **First acceptance under the passing-run check (cwerg-compact-pointer-unions, 2026-10-19):** Nova 0/8
+  (avg 962k) + **Vega 1/4 with the pass at 512k**, Orion 3/4 ignored. Twin compiler front ends (Python +
+  C++, three targets): Vega ran 327k-512k in ONE window, Orion passes stayed at 143k-196k in six batches.
+  When Orion cannot reach 256k, make Vega the qualifying agent and steer it with test-only re-evals that
+  keep the longest passer (failure-patterns.md L136).
+- **Tension with the requirement-count gate:** Task Prompt Quality blocks "too many requirements", so scope
+  has to come from depth per requirement (more code to understand and touch per rule), not more rules.
+- **Nova check is still live** (confirmed 2026-10-18, user, second platform row). Nova has met it easily on
+  every recent problem (its runs compact once and sum to ~500k+), so the new Orion/Vega check is the binding one.
+- **Where to read it:** batch view / trajectory of each passing Orion/Vega run. Record it per passing run
+  in `eval-results.md` (new column, next to the Nova average) and in the tracker `REVERT-RECALIBRATION-2026-10.md`.
+
+---
+
 ## ⚠️ RULE UPDATE 2026-10-09 — NEW MODELS: per-agent pass gate (Nova 0/8, Orion|Vega 1-25% of 4+) + SEQUENCE LENGTH replaces long-horizon (platform update)
 
 The models behind Nova, Orion and Vega changed. This is the newest rule and it OVERRIDES every pass-rate
@@ -30,6 +121,7 @@ unchanged.
 - **Sequence length replaces the long-horizon metrics** (the >= 2 files / >= 40 messages / >= 200 eff LOC
   floor is gone). Sequence length = the maximum input+output tokens of any single step across the run; if
   the model compacts, the per-window values are summed. **The AVERAGE over all Nova runs must be > 256k.**
+  (**Still live 2026-10-18**, and joined by a second check on the PASSING Orion/Vega runs, see the block above.)
   So Nova must fail LONG: a Nova run that quits early, crashes on setup, or hits a quick dead end drags
   the average down. Design for a big reading surface and deep work that Nova grinds on and still gets
   wrong, not a cheap trap Nova trips over in a few steps.
@@ -64,7 +156,7 @@ These numbers OVERRIDE every older band figure anywhere in this repo (this file,
 - **Olympus: `<= 20%` pass MAXIMUM** (Nova/Orion/Vega/Castor). DOWN FROM 30%. 0% = reject; `> 20%` = reject (too easy). `~10%` (1-3/12) stays the Good target; design to land at-or-under 20%. Any shape band that historically read 25-30% (O-Composite-extend, O-Pipeline-easy) MUST now be hardened to `<= 20%`.
 - **Diamond: unchanged** (Castor `<= 30%` ceiling) until admin updates it; the flakiness check below still applies.
 - **Flakiness verification is now a MANDATORY Core Dev check (gate, not advisory).** Before submit, confirm the target repo's EXISTING tests AND your NEW tests are NOT flaky: run the full suite (base + new) at least 3-5 times and confirm identical, deterministic pass/fail every run. Reject/avoid timing-dependent assertions, ordering-dependent tests (map/set iteration, parallel races), unseeded RNG, network/clock/filesystem-time dependence, and resource-contention races. A flaky repo baseline OR a flaky new test = reject. If the repo has a known-flaky baseline, scope base mode to the solution-relevant tests (see `Instructions/TESTS.md`) and document why. This gate sits alongside the LOC floor and the SIX-CHECK in every pre-submit checklist. Full detail: `## ⚠️ HARD RULE — Flakiness is a MANDATORY Check` below.
-- **Per-repo submission caps (platform warns at submit):** `≤ 6` submissions per repo total, `≤ 3` per repo in a single week, and a global `≤ 50` per repo across the whole quest (all authors combined). COUNT existing subs per repo (across `Olympus-Approved/Feature-Requests/<repo>/`, `problems/`, `diamond-problems/`, `rejected/`) at PICK time — do not burn authoring effort on a repo you can't submit against. Already at/over the 6-cap: dasel (9), cliffy (7), yaegi (7). Detail: `Instructions/PICK-FILTER.md § Gate 10 REPO-QUOTA` + `RULES.md § Repository Requirements`.
+- **Per-repo submission caps (platform warns at submit):** `≤ 12` submissions per repo total (raised from 6, user report 2026-10-16), `≤ 3` per repo in a single week, and a global `≤ 50` per repo across the whole quest (all authors combined). COUNT existing subs per repo (across `Olympus-Approved/Feature-Requests/<repo>/`, `problems/`, `diamond-problems/`, `rejected/`) at PICK time — do not burn authoring effort on a repo you can't submit against. Already at/over the 6-cap: dasel (9), cliffy (7), yaegi (7). Detail: `Instructions/PICK-FILTER.md § Gate 10 REPO-QUOTA` + `RULES.md § Repository Requirements`.
 - **Feedback now cites rubric codes (P1, T3, S4, R2, …).** Every code maps to a point in the platform guide, mirrored verbatim in `Instructions/OFFICIAL-RUBRIC.md`. Reference every R/P/T/S point while authoring and self-reviewing; when a reviewer cites a code, look it up there.
 
 ---

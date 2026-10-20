@@ -1,0 +1,1569 @@
+diff --git a/cmd/micasa/pro.go b/cmd/micasa/pro.go
+index 6db6284..acb612d 100644
+--- a/cmd/micasa/pro.go
++++ b/cmd/micasa/pro.go
+@@ -11,6 +11,7 @@ import (
+ 	"io"
+ 	"os"
+ 	"os/signal"
++	"strconv"
+ 	"strings"
+ 	"text/tabwriter"
+ 	"time"
+@@ -864,24 +865,28 @@ func runProConflicts(w io.Writer, dbPath string) error {
+ 	if err != nil {
+ 		return fmt.Errorf("query conflict losers: %w", err)
+ 	}
+-	if len(losers) == 0 {
++	fields, err := store.FieldConflicts()
++	if err != nil {
++		return fmt.Errorf("query field conflicts: %w", err)
++	}
++	if len(losers) == 0 && len(fields) == 0 {
+ 		return nil
+ 	}
+ 
+ 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+-	if _, err := fmt.Fprintf(tw, "ID\tTABLE\tROW ID\tOP\tDEVICE\tCREATED\n"); err != nil {
++	if _, err := fmt.Fprintf(tw, "ID\tTABLE\tROW ID\tOP\tFIELD\tLOST VALUE\tDEVICE\tCREATED\n"); err != nil {
+ 		return fmt.Errorf("write header: %w", err)
+ 	}
+ 	for _, op := range losers {
+-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+-			op.ID,
+-			op.TableName,
+-			op.RowID,
+-			op.OpType,
+-			op.DeviceID,
+-			op.CreatedAt.Format(time.RFC3339),
+-		); err != nil {
+-			return fmt.Errorf("write conflict: %w", err)
++		if err := writeConflictRow(tw, op.ID, op.TableName, op.RowID, op.OpType,
++			data.LostWholeRow, lostRowValue(op), op.DeviceID, op.CreatedAt); err != nil {
++			return err
++		}
++	}
++	for _, fc := range fields {
++		if err := writeConflictRow(tw, fc.OpID, fc.TableName, fc.RowID, data.OpUpdate,
++			fc.Field, formatConflictValue(fc.Value), fc.DeviceID, fc.CreatedAt); err != nil {
++			return err
+ 		}
+ 	}
+ 	if err := tw.Flush(); err != nil {
+@@ -889,3 +894,49 @@ func runProConflicts(w io.Writer, dbPath string) error {
+ 	}
+ 	return nil
+ }
++
++func writeConflictRow(
++	w io.Writer,
++	id, table, rowID, op, field, value, device string,
++	created time.Time,
++) error {
++	if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
++		id, table, rowID, op, field, conflictValueEscaper.Replace(value), device,
++		created.Format(time.RFC3339),
++	); err != nil {
++		return fmt.Errorf("write conflict: %w", err)
++	}
++	return nil
++}
++
++var conflictValueEscaper = strings.NewReplacer(`\`, `\\`, "\t", `\t`, "\n", `\n`, "\r", `\r`)
++
++func lostRowValue(op data.SyncOplogEntry) string {
++	switch op.OpType {
++	case data.OpDelete:
++		return "deleted"
++	case data.OpRestore:
++		return "restored"
++	default:
++		return op.Payload
++	}
++}
++
++func formatConflictValue(v any) string {
++	switch val := v.(type) {
++	case nil:
++		return ""
++	case string:
++		return val
++	case float64:
++		return strconv.FormatFloat(val, 'f', -1, 64)
++	case []any:
++		parts := make([]string, 0, len(val))
++		for _, member := range val {
++			parts = append(parts, formatConflictValue(member))
++		}
++		return strings.Join(parts, " / ")
++	default:
++		return fmt.Sprint(val)
++	}
++}
+diff --git a/internal/data/meta_generated.go b/internal/data/meta_generated.go
+index 2cb3b2f..54e09b3 100644
+--- a/internal/data/meta_generated.go
++++ b/internal/data/meta_generated.go
+@@ -38,6 +38,7 @@ const (
+ 	ColBrand             = "brand"
+ 	ColBudgetCents       = "budget_cents"
+ 	ColCategoryID        = "category_id"
++	ColChangedFields     = "changed_fields"
+ 	ColChecksumSHA256    = "sha256"
+ 	ColCity              = "city"
+ 	ColContactName       = "contact_name"
+@@ -79,6 +80,7 @@ const (
+ 	ColLastServicedAt    = "last_serviced_at"
+ 	ColLocale            = "locale"
+ 	ColLocation          = "location"
++	ColLostFields        = "lost_fields"
+ 	ColLotSquareFeet     = "lot_square_feet"
+ 	ColMIMEType          = "mime_type"
+ 	ColMaintenanceItemID = "maintenance_item_id"
+@@ -284,6 +286,8 @@ var TableExtractColumns = map[string][]metaColumn{
+ 		{Name: "device_id", JSONType: "string"},
+ 		{Name: "applied_at", JSONType: "string"},
+ 		{Name: "synced_at", JSONType: "string"},
++		{Name: "lost_fields", JSONType: "string"},
++		{Name: "changed_fields", JSONType: "string"},
+ 	},
+ 	TableVendors: {
+ 		{Name: "name", JSONType: "string"},
+diff --git a/internal/data/models.go b/internal/data/models.go
+index bb7baf0..843cbe7 100644
+--- a/internal/data/models.go
++++ b/internal/data/models.go
+@@ -344,15 +344,17 @@ const (
+ // Local mutations have applied_at set immediately; synced_at is set after
+ // successful push to the relay. Remote ops have both set on receipt.
+ type SyncOplogEntry struct {
+-	ID        string `gorm:"primaryKey;size:26"`
+-	TableName string `gorm:"not null;index:idx_oplog_table_row"`
+-	RowID     string `gorm:"not null;index:idx_oplog_table_row"`
+-	OpType    string `gorm:"not null"`
+-	Payload   string `gorm:"type:text;not null"`
+-	DeviceID  string `gorm:"not null"`
+-	CreatedAt time.Time
+-	AppliedAt *time.Time
+-	SyncedAt  *time.Time `gorm:"index"`
++	ID            string `gorm:"primaryKey;size:26"`
++	TableName     string `gorm:"not null;index:idx_oplog_table_row"`
++	RowID         string `gorm:"not null;index:idx_oplog_table_row"`
++	OpType        string `gorm:"not null"`
++	Payload       string `gorm:"type:text;not null"`
++	DeviceID      string `gorm:"not null"`
++	CreatedAt     time.Time
++	AppliedAt     *time.Time
++	SyncedAt      *time.Time `gorm:"index"`
++	LostFields    string     `gorm:"not null;default:''"`
++	ChangedFields string     `gorm:"not null;default:''"`
+ }
+ 
+ // SyncDevice stores this device's identity. Only one row exists locally.
+diff --git a/internal/data/oplog.go b/internal/data/oplog.go
+index a9cd697..893f0e9 100644
+--- a/internal/data/oplog.go
++++ b/internal/data/oplog.go
+@@ -85,19 +85,7 @@ func writeOplogEntry(tx *gorm.DB, tableName, rowID, opType string, payload any)
+ 	if err != nil {
+ 		return fmt.Errorf("oplog marshal %s/%s: %w", tableName, rowID, err)
+ 	}
+-
+-	now := time.Now()
+-	entry := SyncOplogEntry{
+-		ID:        uid.New(),
+-		TableName: tableName,
+-		RowID:     rowID,
+-		OpType:    opType,
+-		Payload:   string(jsonBytes),
+-		DeviceID:  deviceID,
+-		CreatedAt: now,
+-		AppliedAt: &now,
+-	}
+-	return tx.Create(&entry).Error
++	return createOplogEntry(tx, tableName, rowID, opType, string(jsonBytes), deviceID)
+ }
+ 
+ // writeOplogEntryRaw writes an oplog entry with a pre-serialized JSON string.
+@@ -110,17 +98,30 @@ func writeOplogEntryRaw(tx *gorm.DB, tableName, rowID, opType string) error {
+ 	if err != nil {
+ 		return fmt.Errorf("oplog %s/%s: %w", tableName, rowID, err)
+ 	}
++	return createOplogEntry(tx, tableName, rowID, opType, "{}", deviceID)
++}
+ 
++// createOplogEntry records a local op with the fields it changes, stamped
++// after every write the row already has so it never loses to an older one.
++func createOplogEntry(tx *gorm.DB, tableName, rowID, opType, payload, deviceID string) error {
++	payload, changed, latest, err := localChanges(tx, tableName, rowID, opType, payload)
++	if err != nil {
++		return fmt.Errorf("oplog %s/%s: %w", tableName, rowID, err)
++	}
+ 	now := time.Now()
++	if !now.After(latest) {
++		now = latest.Add(time.Microsecond)
++	}
+ 	entry := SyncOplogEntry{
+-		ID:        uid.New(),
+-		TableName: tableName,
+-		RowID:     rowID,
+-		OpType:    opType,
+-		Payload:   "{}",
+-		DeviceID:  deviceID,
+-		CreatedAt: now,
+-		AppliedAt: &now,
++		ID:            uid.New(),
++		TableName:     tableName,
++		RowID:         rowID,
++		OpType:        opType,
++		Payload:       payload,
++		DeviceID:      deviceID,
++		CreatedAt:     now,
++		AppliedAt:     &now,
++		ChangedFields: changed,
+ 	}
+ 	return tx.Create(&entry).Error
+ }
+diff --git a/internal/data/oplog_merge.go b/internal/data/oplog_merge.go
+new file mode 100644
+index 0000000..76dd49a
+--- /dev/null
++++ b/internal/data/oplog_merge.go
+@@ -0,0 +1,469 @@
++// Copyright 2026 Phillip Cloud
++// Licensed under the Apache License, Version 2.0
++
++package data
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"maps"
++	"reflect"
++	"slices"
++	"strings"
++	"time"
++
++	"gorm.io/gorm"
++)
++
++// FieldConflict describes one field edit that was discarded when two
++// devices changed the same row between syncs. A coupled unit is reported
++// once, with its member fields joined by "+".
++type FieldConflict struct {
++	OpID      string
++	TableName string
++	RowID     string
++	Field     string
++	Value     any
++	DeviceID  string
++	CreatedAt time.Time
++}
++
++// FieldStamp identifies the oplog entry that last wrote a field of a row.
++type FieldStamp struct {
++	OpID     string
++	At       time.Time
++	DeviceID string
++}
++
++// Beats reports whether an edit stamped s wins last-writer-wins against one
++// stamped o: the later edit wins, equal times go to the larger device id,
++// and anything beats a field nothing has written yet.
++func (s FieldStamp) Beats(o FieldStamp) bool {
++	if o.OpID == "" {
++		return true
++	}
++	if s.At.Equal(o.At) {
++		return s.DeviceID >= o.DeviceID
++	}
++	return s.At.After(o.At)
++}
++
++// RowHistory is a row as this device's oplog has built it: the value each
++// field was last given and the entry that wrote it, the latest insert,
++// update or restore, and the latest delete. A delete writes the deleting
++// device's copy of the row, so every device keeps the same deleted row.
++// Lost keeps, for each entry that lost here, the entries its changed fields
++// replaced.
++type RowHistory struct {
++	State     map[string]any
++	Stamps    map[string]FieldStamp
++	Alive     FieldStamp
++	Deleted   *FieldStamp
++	CreatedAt any
++	UpdatedAt any
++	Lost      map[string]map[string]string
++}
++
++// Saw reports whether an op that replaced the entry prev in a field had
++// seen the value the field holds here: prev wrote it, or prev lost here
++// after replacing an entry the op saw in turn.
++func (h *RowHistory) Saw(field, prev string) bool {
++	for range len(h.Lost) + 1 {
++		if prev == h.Stamps[field].OpID {
++			return true
++		}
++		next, ok := h.Lost[prev][field]
++		if !ok {
++			return false
++		}
++		prev = next
++	}
++	return false
++}
++
++// IsDeleted reports whether the row's latest delete is later than its
++// latest insert, update and restore.
++func (h *RowHistory) IsDeleted() bool {
++	return h.Deleted != nil && h.Deleted.Beats(h.Alive)
++}
++
++func (h *RowHistory) latest() time.Time {
++	latest := h.Alive.At
++	for _, stamp := range h.Stamps {
++		if stamp.At.After(latest) {
++			latest = stamp.At
++		}
++	}
++	if h.Deleted != nil && h.Deleted.At.After(latest) {
++		latest = h.Deleted.At
++	}
++	return latest
++}
++
++// LoadRowHistory replays the applied oplog entries of a row in the order
++// this device applied them.
++func LoadRowHistory(tx *gorm.DB, tableName, rowID string) (RowHistory, error) {
++	hist := RowHistory{
++		State:  make(map[string]any),
++		Stamps: make(map[string]FieldStamp),
++		Lost:   make(map[string]map[string]string),
++	}
++	var entries []SyncOplogEntry
++	if err := tx.Where(ColTableName+" = ? AND "+ColRowID+" = ?", tableName, rowID).
++		Order("rowid ASC").
++		Find(&entries).Error; err != nil {
++		return hist, fmt.Errorf("load history of %s/%s: %w", tableName, rowID, err)
++	}
++	for _, entry := range entries {
++		if entry.AppliedAt == nil {
++			changed, _, err := DecodeChangedFields(entry.ChangedFields)
++			if err != nil {
++				return hist, err
++			}
++			hist.Lost[entry.ID] = changed
++			continue
++		}
++		stamp := FieldStamp{OpID: entry.ID, At: entry.CreatedAt, DeviceID: entry.DeviceID}
++		switch entry.OpType {
++		case OpDelete:
++			if hist.Deleted == nil || stamp.Beats(*hist.Deleted) {
++				hist.Deleted = &stamp
++			}
++		case OpInsert, OpUpdate, OpRestore:
++			if stamp.Beats(hist.Alive) {
++				hist.Alive = stamp
++			}
++		}
++		if err := hist.replay(tableName, entry, stamp); err != nil {
++			return hist, err
++		}
++	}
++	return hist, nil
++}
++
++func (h *RowHistory) replay(tableName string, entry SyncOplogEntry, stamp FieldStamp) error {
++	row, err := DecodeOplogPayload(tableName, entry.Payload)
++	if err != nil {
++		return err
++	}
++	changed, known, err := DecodeChangedFields(entry.ChangedFields)
++	if err != nil {
++		return err
++	}
++	for key, value := range row {
++		if _, ok := changed[key]; MergeExempt(key) || (known && !ok) {
++			continue
++		}
++		h.State[key] = value
++		h.Stamps[key] = stamp
++	}
++	if value, ok := row[ColCreatedAt]; ok && h.CreatedAt == nil {
++		h.CreatedAt = value
++	}
++	if value, ok := row[ColUpdatedAt]; ok && LaterTimestamp(value, h.UpdatedAt) {
++		h.UpdatedAt = value
++	}
++	return nil
++}
++
++// LaterTimestamp reports whether a decoded payload timestamp a is later
++// than b, treating a missing or unparsable b as earlier than anything.
++func LaterTimestamp(a, b any) bool {
++	as, _ := a.(string)
++	bs, _ := b.(string)
++	at, aerr := time.Parse(time.RFC3339Nano, as)
++	bt, berr := time.Parse(time.RFC3339Nano, bs)
++	if aerr != nil {
++		return false
++	}
++	return berr != nil || at.After(bt)
++}
++
++// localChanges works out which fields a local op changes, each mapped to
++// the entry whose value it replaces, and when the row was last written so
++// the new entry can be stamped after it. A delete or restore carries the
++// row as stored at that moment as its payload and changes every field of it.
++func localChanges(
++	tx *gorm.DB,
++	tableName, rowID, opType, payload string,
++) (string, string, time.Time, error) {
++	hist, err := LoadRowHistory(tx, tableName, rowID)
++	if err != nil {
++		return "", "", time.Time{}, err
++	}
++	changed := make(map[string]string)
++	switch opType {
++	case OpInsert, OpUpdate:
++		row, err := DecodeOplogPayload(tableName, payload)
++		if err != nil {
++			return "", "", time.Time{}, err
++		}
++		for key, value := range row {
++			prev, seen := hist.State[key]
++			if MergeExempt(key) || (seen && SameFieldValue(tableName, key, value, prev)) {
++				continue
++			}
++			changed[key] = hist.Stamps[key].OpID
++		}
++	case OpDelete, OpRestore:
++		row, found, err := storedRow(tx, tableName, rowID)
++		if err != nil {
++			return "", "", time.Time{}, err
++		}
++		if !found {
++			row = maps.Clone(hist.State)
++		}
++		row[ColID] = rowID
++		raw, err := json.Marshal(row)
++		if err != nil {
++			return "", "", time.Time{}, fmt.Errorf("encode %s/%s: %w", tableName, rowID, err)
++		}
++		payload = string(raw)
++		for key := range row {
++			if !MergeExempt(key) {
++				changed[key] = hist.Stamps[key].OpID
++			}
++		}
++	}
++	encoded, err := EncodeChangedFields(changed)
++	return payload, encoded, hist.latest(), err
++}
++
++// EncodeChangedFields serializes the fields an op changed, each mapped to
++// the entry whose value it replaced. A nil map encodes as empty: the op
++// predates field tracking and stands for its whole row.
++func EncodeChangedFields(fields map[string]string) (string, error) {
++	if fields == nil {
++		return "", nil
++	}
++	raw, err := json.Marshal(fields)
++	if err != nil {
++		return "", fmt.Errorf("encode changed fields: %w", err)
++	}
++	return string(raw), nil
++}
++
++// DecodeChangedFields reverses EncodeChangedFields; known is false for an
++// entry written before field tracking.
++func DecodeChangedFields(raw string) (map[string]string, bool, error) {
++	if raw == "" {
++		return nil, false, nil
++	}
++	fields := make(map[string]string)
++	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
++		return nil, false, fmt.Errorf("decode changed fields: %w", err)
++	}
++	return fields, true, nil
++}
++
++var mergeExemptFields = []string{ColID, ColCreatedAt, ColUpdatedAt, ColDeletedAt, "blob_ref"}
++
++// MergeExempt reports whether a payload key is bookkeeping that is never
++// tracked or merged as a field.
++func MergeExempt(field string) bool {
++	return slices.Contains(mergeExemptFields, field)
++}
++
++// SameFieldValue compares two decoded payload values of one field by
++// meaning: numbers by value, timestamp columns by instant whatever offset
++// or precision they were written with, and any other text byte for byte.
++func SameFieldValue(tableName, field string, a, b any) bool {
++	if a == nil || b == nil {
++		return a == nil && b == nil
++	}
++	as, aok := a.(string)
++	bs, bok := b.(string)
++	if aok != bok {
++		return false
++	}
++	if !aok {
++		return fmt.Sprint(a) == fmt.Sprint(b)
++	}
++	if as == bs || !IsTimeColumn(tableName, field) {
++		return as == bs
++	}
++	at, aerr := time.Parse(time.RFC3339Nano, as)
++	bt, berr := time.Parse(time.RFC3339Nano, bs)
++	return aerr == nil && berr == nil && at.Equal(bt)
++}
++
++// AddLostFields notes on an oplog entry which of its merge units a merge
++// discarded, keeping any it lost before.
++func AddLostFields(tx *gorm.DB, opID string, units [][]string) error {
++	if len(units) == 0 {
++		return nil
++	}
++	var entry SyncOplogEntry
++	if err := tx.Select(ColLostFields).Where(ColID+" = ?", opID).Take(&entry).Error; err != nil {
++		return fmt.Errorf("load lost fields of %s: %w", opID, err)
++	}
++	lost := make(map[string]bool)
++	for name := range strings.SplitSeq(entry.LostFields, ",") {
++		if name != "" {
++			lost[name] = true
++		}
++	}
++	for _, unit := range units {
++		lost[LostUnitName(unit)] = true
++	}
++	return tx.Model(&SyncOplogEntry{}).
++		Where(ColID+" = ?", opID).
++		Update(ColLostFields, strings.Join(slices.Sorted(maps.Keys(lost)), ",")).Error
++}
++
++const lostUnitSep = "+"
++
++// LostWholeRow is the field name conflict reports give an op that lost its
++// whole row.
++const LostWholeRow = "*"
++
++// LostUnitName names a discarded unit in conflict reports: the field
++// itself, or the members of a coupled unit joined by "+".
++func LostUnitName(unit []string) string {
++	return strings.Join(unit, lostUnitSep)
++}
++
++// LostUnitValue returns the value a conflict reports for a discarded
++// unit: the field's own value, or one value per member of a coupled unit.
++func LostUnitValue(row map[string]any, unit []string) any {
++	if len(unit) == 1 {
++		return row[unit[0]]
++	}
++	values := make([]any, 0, len(unit))
++	for _, f := range unit {
++		values = append(values, row[f])
++	}
++	return values
++}
++
++// DecodeOplogPayload decodes an insert or update payload into a full row.
++// Document payloads leave out empty values, so every omitted key is
++// restored as the zero value it stands for.
++func DecodeOplogPayload(tableName, payload string) (map[string]any, error) {
++	row := make(map[string]any)
++	if err := json.Unmarshal([]byte(payload), &row); err != nil {
++		return nil, fmt.Errorf("decode %s payload: %w", tableName, err)
++	}
++	if tableName == TableDocuments {
++		for key, zero := range documentPayloadZeroes {
++			if _, ok := row[key]; !ok {
++				row[key] = zero
++			}
++		}
++	}
++	return row, nil
++}
++
++var documentPayloadZeroes = func() map[string]any {
++	kindZeroes := map[reflect.Kind]any{
++		reflect.String: "",
++		reflect.Int64:  float64(0),
++	}
++	zeroes := make(map[string]any)
++	typ := reflect.TypeFor[documentOplogPayload]()
++	for field := range typ.Fields() {
++		name, opts, _ := strings.Cut(field.Tag.Get("json"), ",")
++		if opts != "omitempty" || name == ColDeletedAt {
++			continue
++		}
++		zeroes[name] = kindZeroes[field.Type.Kind()]
++	}
++	return zeroes
++}()
++
++// IsTimeColumn reports whether a column of a syncable table holds a
++// timestamp, so its values compare by instant rather than by text.
++func IsTimeColumn(tableName, column string) bool {
++	return timeColumns[tableName][column]
++}
++
++var syncModels = map[string]reflect.Type{
++	TableAppliances:            reflect.TypeFor[Appliance](),
++	TableDocuments:             reflect.TypeFor[Document](),
++	TableHouseProfiles:         reflect.TypeFor[HouseProfile](),
++	TableIncidents:             reflect.TypeFor[Incident](),
++	TableMaintenanceCategories: reflect.TypeFor[MaintenanceCategory](),
++	TableMaintenanceItems:      reflect.TypeFor[MaintenanceItem](),
++	TableProjectTypes:          reflect.TypeFor[ProjectType](),
++	TableProjects:              reflect.TypeFor[Project](),
++	TableQuotes:                reflect.TypeFor[Quote](),
++	TableServiceLogEntries:     reflect.TypeFor[ServiceLogEntry](),
++	TableVendors:               reflect.TypeFor[Vendor](),
++}
++
++// storedRow reads a row as it is stored right now, deleted or not, encoded
++// like the payload of an update to it, and reports whether it was found.
++func storedRow(tx *gorm.DB, tableName, rowID string) (map[string]any, bool, error) {
++	typ, ok := syncModels[tableName]
++	if !ok {
++		return nil, false, nil
++	}
++	ptr := reflect.New(typ).Interface()
++	err := tx.Unscoped().Where(ColID+" = ?", rowID).Take(ptr).Error
++	if errors.Is(err, gorm.ErrRecordNotFound) {
++		return nil, false, nil
++	}
++	if err != nil {
++		return nil, false, fmt.Errorf("read %s/%s: %w", tableName, rowID, err)
++	}
++	if doc, ok := ptr.(*Document); ok {
++		ptr = newDocumentOplogPayload(*doc)
++	}
++	raw, err := json.Marshal(ptr)
++	if err != nil {
++		return nil, false, fmt.Errorf("encode %s/%s: %w", tableName, rowID, err)
++	}
++	row, err := DecodeOplogPayload(tableName, string(raw))
++	return row, err == nil, err
++}
++
++var timeColumns = func() map[string]map[string]bool {
++	timeType := reflect.TypeFor[time.Time]()
++	out := make(map[string]map[string]bool, len(syncModels))
++	for table, typ := range syncModels {
++		cols := make(map[string]bool)
++		for field := range typ.Fields() {
++			name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
++			ft := field.Type
++			if ft.Kind() == reflect.Pointer {
++				ft = ft.Elem()
++			}
++			if name != "" && name != "-" && ft == timeType {
++				cols[name] = true
++			}
++		}
++		out[table] = cols
++	}
++	return out
++}()
++
++// FieldConflicts lists every field edit a merge discarded, newest first.
++func (s *Store) FieldConflicts() ([]FieldConflict, error) {
++	var ops []SyncOplogEntry
++	err := s.db.Where(ColLostFields + " <> ''").
++		Order(ColCreatedAt + " DESC, " + ColID + " DESC").
++		Find(&ops).Error
++	if err != nil {
++		return nil, err
++	}
++	var out []FieldConflict
++	for _, op := range ops {
++		row, err := DecodeOplogPayload(op.TableName, op.Payload)
++		if err != nil {
++			return nil, err
++		}
++		for entry := range strings.SplitSeq(op.LostFields, ",") {
++			out = append(out, FieldConflict{
++				OpID:      op.ID,
++				TableName: op.TableName,
++				RowID:     op.RowID,
++				Field:     entry,
++				Value:     LostUnitValue(row, strings.Split(entry, lostUnitSep)),
++				DeviceID:  op.DeviceID,
++				CreatedAt: op.CreatedAt,
++			})
++		}
++	}
++	return out, nil
++}
+diff --git a/internal/data/store_servicelog.go b/internal/data/store_servicelog.go
+index e802800..1179675 100644
+--- a/internal/data/store_servicelog.go
++++ b/internal/data/store_servicelog.go
+@@ -6,27 +6,58 @@ package data
+ import (
+ 	"errors"
+ 	"strings"
++	"time"
+ 
+ 	"gorm.io/gorm"
+ )
+ 
+ // syncLastServiced sets a maintenance item's LastServicedAt to the most recent
+ // ServicedAt from its non-deleted service log entries. If no entries exist the
+-// field is left unchanged, preserving any manually-set value.
++// field is left unchanged, preserving any manually-set value. A change is
++// logged so other devices receive the new date with the item.
+ func syncLastServiced(tx *gorm.DB, maintenanceItemID string) error {
++	item, changed, err := setLastServiced(tx, maintenanceItemID)
++	if err != nil || !changed || isSyncApplying(tx) {
++		return err
++	}
++	return writeOplogEntry(tx, TableMaintenanceItems, item.ID, OpUpdate, item)
++}
++
++// latestServicedAt returns the most recent ServicedAt among an item's
++// non-deleted service log entries, and whether it has any.
++func latestServicedAt(tx *gorm.DB, maintenanceItemID string) (time.Time, bool, error) {
+ 	var latest ServiceLogEntry
+ 	err := tx.Where(ColMaintenanceItemID+" = ?", maintenanceItemID).
+ 		Order(ColServicedAt + " desc, " + ColID + " desc").
+ 		First(&latest).Error
+ 	if errors.Is(err, gorm.ErrRecordNotFound) {
+-		return nil
++		return time.Time{}, false, nil
+ 	}
+ 	if err != nil {
+-		return err
++		return time.Time{}, false, err
+ 	}
+-	return tx.Model(&MaintenanceItem{}).
++	return latest.ServicedAt, true, nil
++}
++
++func setLastServiced(tx *gorm.DB, maintenanceItemID string) (MaintenanceItem, bool, error) {
++	var item MaintenanceItem
++	latest, ok, err := latestServicedAt(tx, maintenanceItemID)
++	if err != nil || !ok {
++		return item, false, err
++	}
++	if err := tx.Unscoped().First(&item, ColID+" = ?", maintenanceItemID).Error; err != nil {
++		return item, false, err
++	}
++	if item.LastServicedAt != nil && item.LastServicedAt.Equal(latest) {
++		return item, false, nil
++	}
++	if err := tx.Model(&MaintenanceItem{}).
+ 		Where(ColID+" = ?", maintenanceItemID).
+-		Update(ColLastServicedAt, latest.ServicedAt).Error
++		Update(ColLastServicedAt, latest).Error; err != nil {
++		return item, false, err
++	}
++	item.LastServicedAt = &latest
++	return item, true, nil
+ }
+ 
+ func (s *Store) ListServiceLog(
+diff --git a/internal/sync/apply.go b/internal/sync/apply.go
+index 75e1036..8dbe63b 100644
+--- a/internal/sync/apply.go
++++ b/internal/sync/apply.go
+@@ -24,9 +24,10 @@ const colBlobRef = "blob_ref"
+ 
+ // ApplyResult tracks the outcome of applying remote ops.
+ type ApplyResult struct {
+-	Applied   int
+-	Conflicts int
+-	Errors    []error
++	Applied        int
++	Conflicts      int
++	Errors         []error
++	FieldConflicts []data.FieldConflict
+ }
+ 
+ // allowedSyncTable returns true if tableName is a known syncable table.
+@@ -69,14 +70,16 @@ func ApplyOps(ctx context.Context, db *gorm.DB, ops []DecryptedOp) ApplyResult {
+ 
+ 	var result ApplyResult
+ 	for _, dop := range sorted {
+-		if err := applyOne(db, dop); err != nil {
+-			if isConflictLoss(err) {
+-				result.Conflicts++
+-			} else {
+-				result.Errors = append(result.Errors, err)
+-			}
+-		} else {
++		conflicts, err := applyRemote(db, dop)
++		switch {
++		case err == nil:
+ 			result.Applied++
++			result.Conflicts += len(conflicts)
++			result.FieldConflicts = append(result.FieldConflicts, conflicts...)
++		case isConflictLoss(err):
++			result.Conflicts++
++		default:
++			result.Errors = append(result.Errors, err)
+ 		}
+ 	}
+ 	return result
+@@ -88,55 +91,80 @@ func isConflictLoss(err error) bool {
+ 	return errors.Is(err, errConflictLoss)
+ }
+ 
++// applyOne applies a single remote op for callers that only need to know
++// whether it failed or lost.
+ func applyOne(db *gorm.DB, dop DecryptedOp) error {
++	_, err := applyRemote(db, dop)
++	return err
++}
++
++func applyRemote(db *gorm.DB, dop DecryptedOp) ([]data.FieldConflict, error) {
+ 	op := dop.Payload
+ 
+ 	if !allowedSyncTable(op.TableName) {
+-		return fmt.Errorf("table %q is not a valid sync target", op.TableName)
++		return nil, fmt.Errorf("table %q is not a valid sync target", op.TableName)
+ 	}
+ 
++	var conflicts []data.FieldConflict
++	var lostRow bool
+ 	// Run the entire conflict-check + apply inside a single transaction
+ 	// to avoid a TOCTOU race where a local op could be created between
+ 	// the conflict check and the apply.
+-	return db.Transaction(func(tx *gorm.DB) error {
+-		// Check for LWW conflict: does a local unsynced op exist for this row?
+-		var localOp struct {
+-			ID        string
+-			CreatedAt time.Time
+-			DeviceID  string
+-		}
+-		err := tx.Table(data.TableSyncOplogEntries).
+-			Select("id, created_at, device_id").
+-			Where("table_name = ? AND row_id = ? AND synced_at IS NULL", op.TableName, op.RowID).
+-			Order("created_at DESC, id DESC").
+-			Limit(1).
+-			Scan(&localOp).Error
+-		if err != nil {
+-			return fmt.Errorf("check conflict for %s/%s: %w", op.TableName, op.RowID, err)
++	err := db.Transaction(func(tx *gorm.DB) error {
++		var err error
++		if op.ChangedFields == nil {
++			conflicts, lostRow, err = applyWholeRow(tx, op)
++		} else {
++			conflicts, lostRow, err = applyFieldwise(tx, op)
+ 		}
++		return err
++	})
++	if err == nil && lostRow {
++		err = errConflictLoss
++	}
++	return conflicts, err
++}
+ 
+-		// If a local unsynced op exists, apply LWW.
+-		if localOp.ID != "" {
+-			if lwwLocalWins(localOp.CreatedAt, localOp.DeviceID, op.CreatedAt, op.DeviceID) {
+-				// Local wins -- record remote op with applied_at = NULL.
+-				return recordUnappliedOp(tx, op)
+-			}
+-			// Remote won the conflict -- clear applied_at on ALL local
+-			// unsynced ops for this row, not just the latest. Multiple
+-			// local ops can exist (e.g. insert then update) and all must
+-			// be marked unapplied so the row state is consistent.
+-			if err := tx.Table(data.TableSyncOplogEntries).
+-				Where("table_name = ? AND row_id = ? AND synced_at IS NULL", op.TableName, op.RowID).
+-				Update(data.ColAppliedAt, nil).Error; err != nil {
+-				return fmt.Errorf("clear local applied_at: %w", err)
+-			}
+-		}
++// applyWholeRow applies an op that does not list its changed fields, as
++// sent before field tracking: a pending local op on the same row decides
++// the whole row by last-writer-wins.
++func applyWholeRow(tx *gorm.DB, op OpPayload) ([]data.FieldConflict, bool, error) {
++	var localOp struct {
++		ID        string
++		CreatedAt time.Time
++		DeviceID  string
++	}
++	err := tx.Table(data.TableSyncOplogEntries).
++		Select("id, created_at, device_id").
++		Where("table_name = ? AND row_id = ? AND synced_at IS NULL", op.TableName, op.RowID).
++		Order("created_at DESC, id DESC").
++		Limit(1).
++		Scan(&localOp).Error
++	if err != nil {
++		return nil, false, fmt.Errorf("check conflict for %s/%s: %w", op.TableName, op.RowID, err)
++	}
+ 
+-		if err := applyOpToTable(tx, op); err != nil {
+-			return err
++	var conflicts []data.FieldConflict
++	if localOp.ID != "" {
++		if lwwLocalWins(localOp.CreatedAt, localOp.DeviceID, op.CreatedAt, op.DeviceID) {
++			// Local wins -- record remote op with applied_at = NULL. The
++			// record must commit, so the loss is reported after the
++			// transaction instead of rolling it back.
++			return nil, true, recordLoss(tx, op)
+ 		}
+-		return recordAppliedOp(tx, op)
+-	})
++		conflicts, err = settleDisplacedLocal(tx, op)
++		if err != nil {
++			return nil, false, err
++		}
++	}
++	return conflicts, false, applyAndRecord(tx, op)
++}
++
++func applyAndRecord(tx *gorm.DB, op OpPayload) error {
++	if err := applyOpToTable(tx, op); err != nil {
++		return err
++	}
++	return recordAppliedOp(tx, op)
+ }
+ 
+ // lwwLocalWins returns true if the local op should win the conflict.
+@@ -205,8 +233,8 @@ func applyInsert(tx *gorm.DB, op OpPayload) error {
+ }
+ 
+ func applyUpdate(tx *gorm.DB, op OpPayload) error {
+-	var updates map[string]any
+-	if err := json.Unmarshal([]byte(op.Payload), &updates); err != nil {
++	updates, err := data.DecodeOplogPayload(op.TableName, op.Payload)
++	if err != nil {
+ 		return fmt.Errorf("unmarshal update payload: %w", err)
+ 	}
+ 	// All model structs use json:"snake_case" tags, so payload keys are
+@@ -272,32 +300,42 @@ func applyRestore(tx *gorm.DB, op OpPayload) error {
+ }
+ 
+ func recordAppliedOp(tx *gorm.DB, op OpPayload) error {
++	changed, err := data.EncodeChangedFields(op.ChangedFields)
++	if err != nil {
++		return err
++	}
+ 	now := time.Now()
+ 	return tx.Table(data.TableSyncOplogEntries).Create(map[string]any{
+-		data.ColID:        op.ID,
+-		data.ColTableName: op.TableName,
+-		data.ColRowID:     op.RowID,
+-		data.ColOpType:    op.OpType,
+-		data.ColPayload:   op.Payload,
+-		data.ColDeviceID:  op.DeviceID,
+-		data.ColCreatedAt: op.CreatedAt,
+-		data.ColAppliedAt: now,
+-		data.ColSyncedAt:  now,
++		data.ColID:            op.ID,
++		data.ColTableName:     op.TableName,
++		data.ColRowID:         op.RowID,
++		data.ColOpType:        op.OpType,
++		data.ColPayload:       op.Payload,
++		data.ColDeviceID:      op.DeviceID,
++		data.ColCreatedAt:     op.CreatedAt,
++		data.ColAppliedAt:     now,
++		data.ColSyncedAt:      now,
++		data.ColChangedFields: changed,
+ 	}).Error
+ }
+ 
+ func recordUnappliedOp(db *gorm.DB, op OpPayload) error {
++	changed, err := data.EncodeChangedFields(op.ChangedFields)
++	if err != nil {
++		return err
++	}
+ 	now := time.Now()
+-	err := db.Table(data.TableSyncOplogEntries).Create(map[string]any{
+-		data.ColID:        op.ID,
+-		data.ColTableName: op.TableName,
+-		data.ColRowID:     op.RowID,
+-		data.ColOpType:    op.OpType,
+-		data.ColPayload:   op.Payload,
+-		data.ColDeviceID:  op.DeviceID,
+-		data.ColCreatedAt: op.CreatedAt,
+-		data.ColAppliedAt: nil,
+-		data.ColSyncedAt:  now,
++	err = db.Table(data.TableSyncOplogEntries).Create(map[string]any{
++		data.ColID:            op.ID,
++		data.ColTableName:     op.TableName,
++		data.ColRowID:         op.RowID,
++		data.ColOpType:        op.OpType,
++		data.ColPayload:       op.Payload,
++		data.ColDeviceID:      op.DeviceID,
++		data.ColCreatedAt:     op.CreatedAt,
++		data.ColAppliedAt:     nil,
++		data.ColSyncedAt:      now,
++		data.ColChangedFields: changed,
+ 	}).Error
+ 	if err != nil {
+ 		return err
+diff --git a/internal/sync/client.go b/internal/sync/client.go
+index 4b6b2f1..175605a 100644
+--- a/internal/sync/client.go
++++ b/internal/sync/client.go
+@@ -185,6 +185,10 @@ type OpPayload struct {
+ 	Payload   string    `json:"payload"`
+ 	DeviceID  string    `json:"device_id"`
+ 	CreatedAt time.Time `json:"created_at"`
++	// ChangedFields maps each field the op changed to the oplog entry
++	// whose value it replaced. It is nil for ops sent before field
++	// tracking, which stand for their whole row.
++	ChangedFields map[string]string `json:"changed_fields"`
+ }
+ 
+ // DecryptedOp pairs a relay envelope with its decrypted payload.
+diff --git a/internal/sync/engine.go b/internal/sync/engine.go
+index a49d397..65861b3 100644
+--- a/internal/sync/engine.go
++++ b/internal/sync/engine.go
+@@ -111,7 +111,7 @@ func (e *Engine) pullAll(ctx context.Context, lastSeq int64) (int, int, error) {
+ 		if len(ar.Errors) > 0 {
+ 			return total, totalConflicts, fmt.Errorf("apply ops: %w", ar.Errors[0])
+ 		}
+-		total += ar.Applied + ar.Conflicts
++		total += ar.Applied + ar.Conflicts - len(ar.FieldConflicts)
+ 		totalConflicts += ar.Conflicts
+ 
+ 		// Update last seq from the highest envelope seq.
+@@ -150,14 +150,19 @@ func (e *Engine) pushAll(ctx context.Context) (int, []OpPayload, error) {
+ 
+ 	ops := make([]OpPayload, 0, len(unsynced))
+ 	for _, entry := range unsynced {
++		changed, _, err := data.DecodeChangedFields(entry.ChangedFields)
++		if err != nil {
++			return 0, nil, fmt.Errorf("op %s: %w", entry.ID, err)
++		}
+ 		ops = append(ops, OpPayload{
+-			ID:        entry.ID,
+-			TableName: entry.TableName,
+-			RowID:     entry.RowID,
+-			OpType:    entry.OpType,
+-			Payload:   entry.Payload,
+-			DeviceID:  entry.DeviceID,
+-			CreatedAt: entry.CreatedAt,
++			ID:            entry.ID,
++			TableName:     entry.TableName,
++			RowID:         entry.RowID,
++			OpType:        entry.OpType,
++			Payload:       entry.Payload,
++			DeviceID:      entry.DeviceID,
++			CreatedAt:     entry.CreatedAt,
++			ChangedFields: changed,
+ 		})
+ 	}
+ 
+diff --git a/internal/sync/merge.go b/internal/sync/merge.go
+new file mode 100644
+index 0000000..3633e0a
+--- /dev/null
++++ b/internal/sync/merge.go
+@@ -0,0 +1,507 @@
++// Copyright 2026 Phillip Cloud
++// Licensed under the Apache License, Version 2.0
++
++package sync
++
++import (
++	"fmt"
++	"maps"
++	"slices"
++	"sort"
++
++	"github.com/micasa-dev/micasa/internal/data"
++	"gorm.io/gorm"
++)
++
++// coupledFields lists, per table, the groups of fields that only make
++// sense together and therefore merge as a single unit.
++var coupledFields = map[string][][]string{
++	data.TableMaintenanceItems: {
++		{data.ColIntervalMonths, data.ColDueDate},
++	},
++	data.TableIncidents: {
++		{data.ColStatus, data.ColPreviousStatus, data.ColDateResolved},
++	},
++}
++
++// mergeUnits splits a row's fields into the units a merge decides on:
++// each coupled group, then every remaining field alone.
++func mergeUnits(tableName string, rows ...map[string]any) [][]string {
++	seen := make(map[string]bool)
++	var units [][]string
++	for _, group := range coupledFields[tableName] {
++		units = append(units, group)
++		for _, f := range group {
++			seen[f] = true
++		}
++	}
++	var singles []string
++	for _, row := range rows {
++		for key := range row {
++			if !seen[key] && !data.MergeExempt(key) {
++				seen[key] = true
++				singles = append(singles, key)
++			}
++		}
++	}
++	sort.Strings(singles)
++	for _, f := range singles {
++		units = append(units, []string{f})
++	}
++	return units
++}
++
++type localLoss struct {
++	stamp data.FieldStamp
++	units [][]string
++}
++
++// localLosses groups the local units a merge discards by the entry that
++// wrote them.
++type localLosses map[string]*localLoss
++
++func (l localLosses) add(stamp data.FieldStamp, unit []string) {
++	if stamp.OpID == "" {
++		return
++	}
++	loss, ok := l[stamp.OpID]
++	if !ok {
++		loss = &localLoss{stamp: stamp}
++		l[stamp.OpID] = loss
++	}
++	loss.units = append(loss.units, unit)
++}
++
++type fieldMerge struct {
++	updates    map[string]any
++	applied    map[string]string
++	remoteLost [][]string
++	localLost  localLosses
++}
++
++// mergeFields decides, unit by unit, which fields an incoming update
++// changed win last-writer-wins against the row as this device has it.
++func mergeFields(
++	tableName string,
++	hist data.RowHistory,
++	remote map[string]any,
++	op OpPayload,
++) fieldMerge {
++	incoming := data.FieldStamp{OpID: op.ID, At: op.CreatedAt, DeviceID: op.DeviceID}
++	m := fieldMerge{
++		updates:   make(map[string]any),
++		applied:   make(map[string]string),
++		localLost: make(localLosses),
++	}
++	for _, unit := range mergeUnits(tableName, remote, hist.State) {
++		if !slices.ContainsFunc(unit, func(f string) bool {
++			_, changed := op.ChangedFields[f]
++			return changed
++		}) {
++			continue
++		}
++		same := sameUnit(tableName, unit, remote, hist.State)
++		local := unitStamp(unit, hist.Stamps)
++		if !incoming.Beats(local) {
++			if !same {
++				m.remoteLost = append(m.remoteLost, unit)
++			}
++			continue
++		}
++		for _, f := range unit {
++			m.updates[f] = remote[f]
++			m.applied[f] = hist.Stamps[f].OpID
++		}
++		if same || !overwritesUnseen(tableName, unit, remote, hist, op.ChangedFields) {
++			continue
++		}
++		m.localLost.add(local, unit)
++	}
++	if len(m.updates) > 0 && data.LaterTimestamp(remote[data.ColUpdatedAt], hist.UpdatedAt) {
++		m.updates[data.ColUpdatedAt] = remote[data.ColUpdatedAt]
++	}
++	return m
++}
++
++func sameUnit(tableName string, unit []string, a, b map[string]any) bool {
++	return !slices.ContainsFunc(unit, func(f string) bool {
++		return !data.SameFieldValue(tableName, f, a[f], b[f])
++	})
++}
++
++func unitStamp(unit []string, stamps map[string]data.FieldStamp) data.FieldStamp {
++	var latest data.FieldStamp
++	for _, f := range unit {
++		if s, ok := stamps[f]; ok && s.Beats(latest) {
++			latest = s
++		}
++	}
++	return latest
++}
++
++// displacedLocal lists the local units that writing a whole row from an op
++// replaces with a different value the op's author never saw.
++func displacedLocal(
++	tableName string,
++	hist data.RowHistory,
++	row map[string]any,
++	changed map[string]string,
++) localLosses {
++	lost := make(localLosses)
++	for _, unit := range mergeUnits(tableName, row, hist.State) {
++		if sameUnit(tableName, unit, row, hist.State) ||
++			!overwritesUnseen(tableName, unit, row, hist, changed) {
++			continue
++		}
++		lost.add(unitStamp(unit, hist.Stamps), unit)
++	}
++	return lost
++}
++
++// overwritesUnseen reports whether winning a unit discards a value the
++// incoming op's author never saw: a changed member replaced an entry that
++// did not lead to the value held here, or an unchanged member differs.
++func overwritesUnseen(
++	tableName string,
++	unit []string,
++	remote map[string]any,
++	hist data.RowHistory,
++	changed map[string]string,
++) bool {
++	return slices.ContainsFunc(unit, func(f string) bool {
++		if prev, ok := changed[f]; ok {
++			return !hist.Saw(f, prev)
++		}
++		return !data.SameFieldValue(tableName, f, remote[f], hist.State[f])
++	})
++}
++
++// applyFieldwise applies a remote op that lists the fields it changed.
++// Updates merge field by field; deletes and restores, and updates meeting a
++// deleted row, are decided for the whole row by last-writer-wins. The
++// result is the same on every device whatever order the ops arrive in.
++func applyFieldwise(tx *gorm.DB, op OpPayload) ([]data.FieldConflict, bool, error) {
++	if op.OpType == data.OpInsert {
++		return nil, false, applyAndRecord(tx, op)
++	}
++	hist, err := data.LoadRowHistory(tx, op.TableName, op.RowID)
++	if err != nil {
++		return nil, false, err
++	}
++	incoming := data.FieldStamp{OpID: op.ID, At: op.CreatedAt, DeviceID: op.DeviceID}
++	switch op.OpType {
++	case data.OpDelete:
++		return deleteFieldwise(tx, op, hist, incoming)
++	case data.OpRestore:
++		if hist.IsDeleted() {
++			if !incoming.Beats(*hist.Deleted) {
++				return nil, true, recordLoss(tx, op)
++			}
++			conflicts, err := reviveWholeRow(tx, op, hist)
++			return conflicts, false, err
++		}
++		if !incoming.Beats(hist.Alive) {
++			return nil, true, recordLoss(tx, op)
++		}
++		conflicts, err := writeWholeRow(tx, op, hist)
++		return conflicts, false, err
++	case data.OpUpdate:
++		return updateFieldwise(tx, op, hist, incoming)
++	}
++	return nil, false, applyAndRecord(tx, op)
++}
++
++// deleteFieldwise applies a delete when it is later than every other
++// change to the row, deletes included; a losing delete changes nothing. A
++// winning delete first writes the deleting device's copy of the row, so
++// every device keeps the same deleted row, and local edits it discards
++// unseen are reported as conflicts.
++func deleteFieldwise(
++	tx *gorm.DB,
++	op OpPayload,
++	hist data.RowHistory,
++	incoming data.FieldStamp,
++) ([]data.FieldConflict, bool, error) {
++	if !incoming.Beats(hist.Alive) || (hist.Deleted != nil && hist.Deleted.Beats(incoming)) {
++		return nil, true, recordLoss(tx, op)
++	}
++	snapshot, err := data.DecodeOplogPayload(op.TableName, op.Payload)
++	if err != nil {
++		return nil, false, fmt.Errorf("unmarshal delete payload: %w", err)
++	}
++	updates, changed := wholeRow(hist, snapshot)
++	applied := op
++	applied.ChangedFields = changed
++	exists, err := rowExists(tx, op.TableName, op.RowID)
++	if err != nil {
++		return nil, false, err
++	}
++	if exists {
++		if err := writeFields(tx, op, updates); err != nil {
++			return nil, false, err
++		}
++		if err := applyDelete(tx, op); err != nil {
++			return nil, false, err
++		}
++	}
++	if err := recordAppliedOp(tx, applied); err != nil {
++		return nil, false, err
++	}
++	lost := displacedLocal(op.TableName, hist, snapshot, op.ChangedFields)
++	conflicts, err := recordLocalLosses(tx, op, hist, lost)
++	return conflicts, false, err
++}
++
++// wholeRow takes every field of a payload as its op wrote it, each mapped
++// to the entry whose value it replaces here.
++func wholeRow(hist data.RowHistory, row map[string]any) (map[string]any, map[string]string) {
++	updates := make(map[string]any)
++	changed := make(map[string]string)
++	for key, value := range row {
++		if data.MergeExempt(key) {
++			continue
++		}
++		updates[key] = value
++		changed[key] = hist.Stamps[key].OpID
++	}
++	return updates, changed
++}
++
++// reviveWholeRow brings back a deleted row for an update or restore made
++// after the delete. Last-writer-wins decides the whole row here, so the
++// op's full row becomes the row, not only the fields it changed.
++func reviveWholeRow(
++	tx *gorm.DB,
++	op OpPayload,
++	hist data.RowHistory,
++) ([]data.FieldConflict, error) {
++	if err := reviveRow(tx, op, hist); err != nil {
++		return nil, err
++	}
++	return writeWholeRow(tx, op, hist)
++}
++
++// writeWholeRow makes an op's full row the row and reports the local edits
++// it discards unseen as conflicts.
++func writeWholeRow(
++	tx *gorm.DB,
++	op OpPayload,
++	hist data.RowHistory,
++) ([]data.FieldConflict, error) {
++	remote, err := data.DecodeOplogPayload(op.TableName, op.Payload)
++	if err != nil {
++		return nil, fmt.Errorf("unmarshal %s payload: %w", op.OpType, err)
++	}
++	updates, changed := wholeRow(hist, remote)
++	if data.LaterTimestamp(remote[data.ColUpdatedAt], hist.UpdatedAt) {
++		updates[data.ColUpdatedAt] = remote[data.ColUpdatedAt]
++	}
++	if err := writeFields(tx, op, updates); err != nil {
++		return nil, err
++	}
++	applied := op
++	applied.ChangedFields = changed
++	if err := recordAppliedOp(tx, applied); err != nil {
++		return nil, err
++	}
++	lost := displacedLocal(op.TableName, hist, remote, op.ChangedFields)
++	return recordLocalLosses(tx, op, hist, lost)
++}
++
++// reviveRow brings back a deleted row before a newer change applies to it:
++// a soft-deleted row is restored, and a permanently deleted one is rebuilt
++// from the values its history last gave it.
++func reviveRow(tx *gorm.DB, op OpPayload, hist data.RowHistory) error {
++	exists, err := rowExists(tx, op.TableName, op.RowID)
++	if err != nil {
++		return err
++	}
++	if exists {
++		return applyRestore(tx, op)
++	}
++	row := maps.Clone(hist.State)
++	row[data.ColID] = op.RowID
++	row[data.ColCreatedAt] = hist.CreatedAt
++	row[data.ColUpdatedAt] = hist.UpdatedAt
++	stripNonColumnKeys(op.TableName, row)
++	if err := tx.Table(op.TableName).Create(row).Error; err != nil {
++		return fmt.Errorf("recreate %s/%s: %w", op.TableName, op.RowID, err)
++	}
++	return nil
++}
++
++func rowExists(tx *gorm.DB, tableName, rowID string) (bool, error) {
++	var n int64
++	if err := tx.Table(tableName).Where(sqlWhereID, rowID).Count(&n).Error; err != nil {
++		return false, fmt.Errorf("check %s/%s: %w", tableName, rowID, err)
++	}
++	return n > 0, nil
++}
++
++func updateFieldwise(
++	tx *gorm.DB,
++	op OpPayload,
++	hist data.RowHistory,
++	incoming data.FieldStamp,
++) ([]data.FieldConflict, bool, error) {
++	if hist.IsDeleted() {
++		if !incoming.Beats(*hist.Deleted) {
++			return nil, true, recordLoss(tx, op)
++		}
++		conflicts, err := reviveWholeRow(tx, op, hist)
++		return conflicts, false, err
++	}
++	remote, err := data.DecodeOplogPayload(op.TableName, op.Payload)
++	if err != nil {
++		return nil, false, fmt.Errorf("unmarshal update payload: %w", err)
++	}
++	m := mergeFields(op.TableName, hist, remote, op)
++	if err := writeFields(tx, op, m.updates); err != nil {
++		return nil, false, err
++	}
++	applied := op
++	applied.ChangedFields = m.applied
++	if err := recordAppliedOp(tx, applied); err != nil {
++		return nil, false, err
++	}
++	if err := data.AddLostFields(tx, op.ID, m.remoteLost); err != nil {
++		return nil, false, err
++	}
++	conflicts := make([]data.FieldConflict, 0, len(m.remoteLost))
++	for _, unit := range m.remoteLost {
++		conflicts = append(conflicts, data.FieldConflict{
++			OpID: op.ID, TableName: op.TableName, RowID: op.RowID,
++			Field: data.LostUnitName(unit), Value: data.LostUnitValue(remote, unit),
++			DeviceID: op.DeviceID, CreatedAt: op.CreatedAt,
++		})
++	}
++	local, err := recordLocalLosses(tx, op, hist, m.localLost)
++	if err != nil {
++		return nil, false, err
++	}
++	return append(conflicts, local...), false, nil
++}
++
++// settleDisplacedLocal settles the pending local ops on a row that a newer
++// op sent without field tracking replaces whole. A local update that lists
++// its changed fields keeps them as lost fields wherever the incoming row
++// overwrites its value; every other pending op is marked unapplied so the
++// row state stays consistent, as before field tracking.
++func settleDisplacedLocal(tx *gorm.DB, op OpPayload) ([]data.FieldConflict, error) {
++	var pending []data.SyncOplogEntry
++	if err := tx.Where(data.ColTableName+" = ? AND "+data.ColRowID+" = ?", op.TableName, op.RowID).
++		Where(data.ColSyncedAt + " IS NULL").
++		Order("rowid ASC").
++		Find(&pending).Error; err != nil {
++		return nil, fmt.Errorf("load pending ops of %s/%s: %w", op.TableName, op.RowID, err)
++	}
++	remote, err := data.DecodeOplogPayload(op.TableName, op.Payload)
++	if err != nil {
++		return nil, fmt.Errorf("unmarshal %s payload: %w", op.OpType, err)
++	}
++	var conflicts []data.FieldConflict
++	var unapplied []string
++	for _, entry := range pending {
++		changed, known, err := data.DecodeChangedFields(entry.ChangedFields)
++		if err != nil {
++			return nil, err
++		}
++		if entry.OpType != data.OpUpdate || !known {
++			unapplied = append(unapplied, entry.ID)
++			continue
++		}
++		local, err := data.DecodeOplogPayload(op.TableName, entry.Payload)
++		if err != nil {
++			return nil, err
++		}
++		var lost [][]string
++		for _, unit := range mergeUnits(op.TableName, local) {
++			if slices.ContainsFunc(unit, func(f string) bool {
++				_, ok := changed[f]
++				return ok
++			}) && replacesUnit(op, unit, remote, local) {
++				lost = append(lost, unit)
++			}
++		}
++		if err := data.AddLostFields(tx, entry.ID, lost); err != nil {
++			return nil, err
++		}
++		for _, unit := range lost {
++			conflicts = append(conflicts, data.FieldConflict{
++				OpID: entry.ID, TableName: op.TableName, RowID: op.RowID,
++				Field: data.LostUnitName(unit), Value: data.LostUnitValue(local, unit),
++				DeviceID: entry.DeviceID, CreatedAt: entry.CreatedAt,
++			})
++		}
++	}
++	if len(unapplied) > 0 {
++		if err := tx.Model(&data.SyncOplogEntry{}).
++			Where(data.ColID+" IN ?", unapplied).
++			Update(data.ColAppliedAt, nil).Error; err != nil {
++			return nil, fmt.Errorf("clear local applied_at: %w", err)
++		}
++	}
++	return conflicts, nil
++}
++
++// replacesUnit reports whether a whole-row op discards a unit's local
++// value: a delete discards every unit, any other op one whose value it
++// writes differently.
++func replacesUnit(op OpPayload, unit []string, remote, local map[string]any) bool {
++	if op.OpType == data.OpDelete {
++		return true
++	}
++	return slices.ContainsFunc(unit, func(f string) bool {
++		value, ok := remote[f]
++		return ok && !data.SameFieldValue(op.TableName, f, value, local[f])
++	})
++}
++
++// recordLocalLosses marks the units each local entry lost and returns them
++// as conflicts.
++func recordLocalLosses(
++	tx *gorm.DB,
++	op OpPayload,
++	hist data.RowHistory,
++	lost localLosses,
++) ([]data.FieldConflict, error) {
++	var conflicts []data.FieldConflict
++	for _, id := range slices.Sorted(maps.Keys(lost)) {
++		loss := lost[id]
++		if err := data.AddLostFields(tx, id, loss.units); err != nil {
++			return nil, err
++		}
++		for _, unit := range loss.units {
++			conflicts = append(conflicts, data.FieldConflict{
++				OpID: id, TableName: op.TableName, RowID: op.RowID,
++				Field: data.LostUnitName(unit), Value: data.LostUnitValue(hist.State, unit),
++				DeviceID: loss.stamp.DeviceID, CreatedAt: loss.stamp.At,
++			})
++		}
++	}
++	return conflicts, nil
++}
++
++func writeFields(tx *gorm.DB, op OpPayload, updates map[string]any) error {
++	stripNonColumnKeys(op.TableName, updates)
++	if len(updates) == 0 {
++		return nil
++	}
++	result := tx.Table(op.TableName).Where(sqlWhereID, op.RowID).Updates(updates)
++	if result.Error != nil {
++		return fmt.Errorf("merge %s/%s: %w", op.TableName, op.RowID, result.Error)
++	}
++	if result.RowsAffected == 0 {
++		return fmt.Errorf("merge %s/%s: row not found", op.TableName, op.RowID)
++	}
++	return nil
++}
++
++// recordLoss records a remote op that lost its whole row so it is listed
++// as a conflict, and lets the caller report the loss after commit.
++func recordLoss(tx *gorm.DB, op OpPayload) error {
++	if err := recordUnappliedOp(tx, op); !isConflictLoss(err) {
++		return err
++	}
++	return nil
++}

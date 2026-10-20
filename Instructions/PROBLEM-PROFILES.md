@@ -3615,3 +3615,146 @@ outside the peaks (8/12); F-67 option-on == option-off on assembled calls (7/12,
 → 3/10. New models: Nova 3/5 → cross-peak phasing → Nova 1/7, 1/8, 0/8 → requirement-count cut (~27 → ~14
 rules) → Orion 2/4, 2/4, 3/4 → strand rule stated → 3/4 → three tests-only cells from the FP panel and
 assembly-path probes → 1/4 → four Auto Review tests (3 killed nothing) → accepted.
+
+## micasa-field-level-sync-merge (APPROVED Olympus 2026-10-15)
+
+**Outcome.** Accepted Nova 0/8 + Orion 1/4 (re-eval of batch 2's Orion runs after fixture fixes + 8 fresh
+Nova), Nova sequence length avg 547k. Auto Review at acceptance: Description 3/3, Tests 2/3 (T2 2 ms sleeps
+order edits; T8 reporter exit status not captured), Solution 1/3 (S1 High x4: `last_serviced_at` merged as
+an LWW snapshot, not recomputed from merged service logs). FP panel: Orion pass genuine, one dissenting
+judge on the same service-date gap (shared by the reference, ruled unstated).
+
+**Shape + stats.** O-Composite-extend in Go (micasa Pro sync): per-field LWW over the replicated oplog
+(changed_fields per op, replayed row history), coupled units, whole-row LWW for removals with row
+snapshots, hard-delete rebuild, displaced-edit accounting in sync results and `micasa pro conflicts`.
+10 files, 818 human-effective, 38 tests over a real in-memory relay, 1377 base, meta 239 words.
+
+**Decisive drivers.** F-90 one-sided accounting (11/12, every failing Orion); F-91 empty tombstones
+(9/12); F-88 merge only while unpushed (8/8 Nova, 0/4 Orion); F-89 snapshot field stamps (8/8 Nova);
+F-39 outbox selecting losers by `synced_at` (5/8 Nova).
+
+**Iteration lessons.** SLICE 2026-09-30 → 4 AI-gate rounds on meta (humanizer, word-level repair) → 8
+Solution Quality FAILs, one a full redesign to oplog replay → batch 1 Orion 0/4 (two 35/36) → Auto Review
+T1 (base-mode guards) + S1 (legacy fallback) → batch 2 Orion 0/4 with 2 TEST_BROKEN on fixtures → tests-only
+fix → re-eval Orion 1/4 + Nova 0/8 → accepted.
+
+## csbindgen-const-expression-values (APPROVED Olympus 2026-10-15)
+
+**Outcome.** Accepted Nova 0/8 + Orion 1/4 (re-eval of batch 8's Orion runs after one test cell + 8 fresh
+Nova), Nova sequence length avg 506k. Auto Review at acceptance: Description 3/3, Tests 2/3 (T8 Medium: an
+aborting cargo test binary loses its stderr in JUnit), Solution 3/3. FP panel: Orion pass genuine (high).
+Accepted on the old models after batch 1 (0/11, cut + capped), reverted by the 2026-10-09 gate.
+
+**Shape + stats.** O-Algorithm-correctness in Rust (csbindgen): typed constant evaluator + module resolver
++ C# literal emitter. 5 files, 931 human-effective / 1284 raw, 20 tests (18 F2P + 2 P2P) whose fixtures are
+compiled by rustc as the oracle, meta 301 words.
+
+**Decisive drivers.** F-94 host-formatted literals (5/5 Nova floats, 4/5 chars, Orion #1); F-93 output type
+as evaluation type (5/5 Nova); F-92 false cycle on forward variant refs (7/8 Nova); F-95 module scope as
+lexical scope (sole failure of 2/4 Orion); F-18 `3f64` (Orion #1).
+
+**Iteration lessons.** Batches: b2 Nova 0/8, b3 Orion 4/4, b4 Orion 0/14 (requirement-count cut followed),
+b5 2/4 (1 FP), b6 3/4 (2 FP), b7 0/8 (one-sided cap), b8 3/4 (2 FP) -> re-eval 1/4. Both FP rounds were
+resolver shortcuts; the second became the Orion lever. Roughly 30 Solution Quality FAILs, about 15 real
+reference bugs.
+
+## mirrorbits-mirror-sync-point (APPROVED Olympus 2026-10-15)
+
+**Outcome.** Accepted Nova 0/8 + Vega 1/5 on the third re-eval of batch 8's runs (plus one fresh Vega),
+Nova sequence length avg 326k (238k-543k). Auto Review at acceptance: 3/3/3, Approved. FP panel: Vega pass
+genuine (high). The two old-model batches (b1 1/10, b2 0/10) predate the 2026-10-09 gate and count for
+nothing now.
+
+**Shape + stats.** O-Pipeline-hard in Go (mirrorbits): Redis-backed source version ledger with a monotonic
+retention floor, mirror sync-point solver at protocol precision, rsync partial-transfer exception gated on
+exit 23. 6 files, 283 human-effective, 29 tests in one build-tagged file against a real redis-server and
+a fake rsync, meta ~230 words.
+
+**Decisive drivers.** F-97 exception keyed on the diagnostic, not exit 23 (6/13; sole failure of 3 Nova +
+1 Vega); F-96 retention window recomputed from the live setting after a raise (4/5 Vega, sole failure of 2);
+F-39 base `Time.String()` round-trip fails in nameless +05:45 zones (3/13).
+
+**Iteration lessons.** About 19 rounds and 11 batches/re-evals. Orion converged five batches running
+(2/2, 4/4, 2/4, 3/4, 2/4) through description levers that killed nobody and four Task Prompt "Too many
+requirements" FAILs; Vega x4 on the next meta read 1/4 (L133). The last three rounds were test-only:
+a timezone cell that flipped a genuine Nova pass, fixtures reworked to clear a blame-unfair regrade, and
+mixed listings beside empty ones for Auto Review (L132). About 12 reference bugs, all gate-found.
+
+## ray-optics-module-inlining (APPROVED Olympus 2026-10-16)
+
+**Outcome.** Accepted Nova 0/8 + Orion 1/8 on the re-eval of batch 6 (8 fresh Nova + the 8 Orion
+runs of batches 4-5), after the round-9 Auto Review fixes. Auto Review at acceptance: 3/2/3, Approved,
+with one T4 Medium: rename across two containing definitions, one uninstantiated. FP panel: Orion
+#7 genuine (high; judges ran 571 and 9 probes). Nova sequence length about 290k by my count; the
+platform accepted it.
+
+**Shape + stats.** O-Composite-extend in JavaScript (ray-optics): `removeModule` now inlines nested
+instances; new `inlineModuleInstance` and `renameModuleParam` share a capture-avoiding mathjs AST
+rewriter; all three are atomic, with store and UI propagation. 6 files, 360 human-effective, 44 Jest
+tests in one file comparing expansions before and after, meta ~470 words.
+
+**Decisive drivers.**
+- F-99 capture-avoiding substitution: every Nova run, six cells.
+- F-98 merged loops over the default loop limit: 8/8 Nova, 0 of 15 Orion.
+- F-100 whole-scene validator refusing beside a broken bystander: the sole failure of 6/8 Orion.
+- F-94 tiny values printed into LaTeX: 1 Orion.
+
+**Iteration lessons.** About 9 rounds and 6 batches plus one re-eval:
+- Batch 1 was void: a humanized cap was too broad, and a fixture broke the real cap.
+- The loop-shadow clause took Orion to 4/4.
+- The broken-instance pair, taken from the FP panel, took Orion to 0/4. A second batch read 2/4, and
+  the tiny-value FP was fixed with tests.
+- Re-eval read Orion 1/8. Round 9 added coverage tests that killed nothing, plus a reference
+  loop-limit guard left untested (L76).
+
+About 8 reference bugs were found, all by gates or the FP panel.
+
+## cwerg-compact-pointer-unions (APPROVED Olympus 2026-10-19)
+
+**Outcome.** Accepted Nova 0/8 + Vega 1/4 (Orion 3/4) on the batch-6 re-eval. Auto Review Approved
+3/3/3. The FP panel rated the Vega pass genuine (high). Nova sequence length avg 962k; the passing Vega run
+512k.
+
+**Shape + stats.** O-Composite-extend in Python + C++ (Cwerg): the disabled `optimize_union_tag` layout
+enabled in both type corpora. A union of one pointer (or wrapped pointer) plus void/wrapped-void members
+becomes a one-field record whose word is the pointer or the member's typeid. All union operations and
+conversions are re-lowered in canonicalize_union.{py,cc}. 10 files, 434 human-effective, 7 new + 2
+updated FE programs x 2 front ends x 3 targets + output parity = 81 cases; meta 203 words with 4 caps.
+
+**Decisive drivers.**
+- F-101 compact/ordinary conversions: 8/8 Nova.
+- F-102 Id-only source precondition: 8/8 Nova, sole failure of 2/4 Vega.
+- F-103 zero-sized value drops its expression: 7/8 Nova, sole failure of Orion #3.
+- F-104 size-zero eligibility shortcut: 3/8 Nova.
+
+**Iteration lessons.** Four meta rounds before batch 1 (AI gate twice, requirement count once), then six
+batches:
+- b1 Orion 4/4.
+- The effects test (a reference bug) gave Orion 3/4; Vega went 2/2.
+- The locals test (x64 bitcast) gave Vega 3/4 with two fresh runs.
+- The elements test (probe battery) gave Vega 1/4 and Nova 0/8.
+- The `[0]u8` asserts (Auto Review) turned Tests 1/3 into 3/3.
+
+6 reference bugs were found, all by gates or probes.
+
+## micasa-pro-blob-reclaim (APPROVED Olympus 2026-10-20)
+
+**Outcome.** Accepted on batch 5 (re-eval): Nova 0/8 (avg sequence 567,649), Vega 1/4 (pass 326,155), Auto
+Review Approved (Description 3, Tests 2, Solution 3).
+
+**Shape and stats.** O-Composite-add over CLI, local store, sync engine/client/apply, relay handler, memory
+and Postgres stores. 15 files, human-effective 635. 21 tests x 2 backends = 63 cases through the real CLI
+binary and in-process engines over an httptest relay with fault hooks. Meta 426 body words, two humanizer
+rounds.
+
+**Decisive difficulty drivers.**
+- Lost reply after a committed report (F-105): 8/8 Nova, 0/4 Vega.
+- Server-assigned sequence on the Postgres store (F-106): 3/8 Nova.
+- Cut-off multi-part report (F-107): Vega b3-1, Nova #8.
+- Never-reported device as sequence 0 (F-108): Vega, twice across batches.
+
+**Iteration lessons.**
+- Five batches. Orion 4/4 short ruled Orion out.
+- Description deltas raised Vega length (265k-490k) but not difficulty (3/4, 2/2).
+- Two test-only re-eval levers finished it.
+- 15 of 21 tests killed nothing in the accepted batch, including all four designed walls.

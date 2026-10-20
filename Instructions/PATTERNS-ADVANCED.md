@@ -2671,3 +2671,129 @@ placed reads by substring and lost one (29 vs 30). The test killed Orion #3 alon
 and in the accepted batch **7/12** (5/8 Nova); the evaluator graded it FAIL_MISSED_REQUIREMENT. Together
 with the FP panel's quiet-peak crash and read-1 cell: **Orion 3/4 → 1/4**, accepted. Siblings: Pattern 116
 (base invariants the new path bypasses), Pattern 117 (FP-panel dissent).
+
+## micasa-field-level-sync-merge (APPROVED Olympus 2026-10-15)
+
+## Pattern 119 — Gated relay for deterministic concurrency cells
+
+When a feature changes how a replicated store resolves concurrent writes, the sequential tests (A syncs,
+B syncs, A syncs) always pull before they push and never reach the hardest state: both devices' ops on
+the relay before either has seen the other. Reach it deterministically:
+
+1. Wrap the test relay's HTTP handler; on `POST /sync/push` from a chosen device, signal "reached" and
+   block on a release channel.
+2. Start that device's sync in a goroutine, wait for "reached" (fail if the sync finishes without
+   pushing), run the other device's full sync, then release.
+3. Cross it with every merge kind (disjoint fields, same field, edit vs delete) and assert both devices'
+   final rows plus the conflict count.
+4. Order edits in real time; never rewrite stored timestamps after the write (L129). Suffix every helper
+   with the file hash.
+
+**Measured.** micasa-field-level-sync-merge: the three overlap cells killed **8/8 Nova, 0/4 Orion** (F-88)
+and were the first Solution Quality HIGH on my own reference. Channels only, no sleeps on the
+concurrency path; stable over every clean-room run. Siblings: Pattern 116 (base invariants a new path
+bypasses), F-10 cross-product cells.
+
+## csbindgen-const-expression-values (APPROVED Olympus 2026-10-15)
+
+## Pattern 120 — The source compiler as the test oracle (stringify fixtures)
+
+When the feature evaluates source-language code (constant folding, type inference, macro expansion),
+make the source compiler compute every expected value, so no expected number is hand-written:
+
+1. Write each fixture as real items inside a macro that both emits them and stringifies them:
+   `macro_rules! fixture { ($($i:item)*) => { $($i)* pub const SRC: &str = stringify!($($i)*); } }`.
+2. Feed `SRC` to the generator under test; assert against `fx::module::NAME as i128` (or `as f64`), which
+   rustc computed. Modules inside the fixture give real `use`/`super`/glob scoping for free.
+3. Parse the generated output with the TARGET language's literal grammar and accept every valid spelling
+   (hex, suffixes, `double.NaN` vs `0.0/0.0`), so the tests pin value and type, not formatting.
+4. A reviewer's "this is not what Rust does" claim is settled by adding the expression to a fixture: it
+   either compiles to the claimed value or it does not (the `as f32` claim was refuted 5 times this way).
+
+Measured on csbindgen-const-expression-values: 20 tests, 0 flaky, and every one of about 30 gate claims
+about Rust semantics resolved by rustc rather than by argument.
+
+## Pattern 121 — Real backing service plus a fake subprocess for a Go scanner feature
+
+When the feature lives in code that talks to a database and shells out (mirrorbits: Redis + rsync), test
+it end to end without mocks:
+
+1. test.sh starts the real service on a private port (`redis-server --port N --save "" --daemonize yes`),
+   exports its address (`MIRRORBITS_TEST_REDIS`), and stops it on exit; a failed start writes failing
+   testcases for every expected name (fail-safe JUnit).
+2. The env constructor wipes ALL server state per test, including caches the client relies on
+   (`FLUSHALL` then `SCRIPT FLUSH`, so Lua scripts run cold and an EVAL/EVALSHA claim is testable).
+3. The subprocess is a shell script on a per-test PATH that cats fixture stdout/stderr files and exits
+   with a fixture status, so exit codes (rsync 23) and diagnostics are independent axes (F-97).
+4. Every package-level helper carries the test file's hash suffix (`newSyncEnv6075cf`) so agents' own
+   test files cannot collide (TEST_BROKEN otherwise).
+5. Global state a cell needs (time.Local, config file path) is set inside the test and restored in
+   `t.Cleanup`; test.sh runs packages with -p 1 and no -race.
+
+Measured on mirrorbits-mirror-sync-point: 29 tests, 5x identical in Docker as uid 1000/0/4242, Auto Review
+"fail-safe harness", no flake across 11 platform regrades.
+
+## Pattern 122 — Expansion equivalence as the oracle for a template refactor
+
+When the feature rewrites templates (inline, extract, rename, flatten) and the repo can expand them
+into concrete objects, test the PROMISE, not the rewritten text:
+
+1. Load the scene, expand every instance, and snapshot the objects (type plus numeric fields) and each
+   equation's VALUE at a few sample points, never its text. The rewriter may legally re-parenthesize or
+   reorder.
+2. Call the API, assert `true`, reload, expand again, and compare as multisets. Object order may change,
+   and the meta says so.
+3. For refusals, assert `false` and that the serialized scene is byte-identical to before (atomicity).
+4. Build one fixture per binder kind and printing hazard (F-99), one where merged scopes outgrow the
+   repo's per-scope budget (F-98), and one unrelated broken instance beside a valid edit for APIs base
+   already performs (F-100).
+5. Run probes with the same helpers against every saved agent patch before adding a test. The
+   helpers are part of the contract surface (L27).
+
+Measured on ray-optics-module-inlining: 44 tests, 3x identical in Docker as uid 1000 (1301 base tests
+alongside). The FP panel's two judges and the adjudicator reran the oracle with their own probes
+(571 and 9) and found no fair discriminator. Auto Review rated the tests "strong and deterministic".
+
+## Pattern 123 — Size assert as the only base failure, for a layout optimisation
+
+When a feature changes how values are STORED but promises the same behaviour, write each test program so
+that it fails on base only through compile-time size checks:
+
+1. Put one or more `static_assert size_of(T) == ...` lines (or `offset_of`) at the top of each program.
+   They are the F2P gate.
+2. Make every runtime check behaviour the old layout already has: operations, conversions, side effects,
+   globals.
+3. Fairness proof: strip the asserts and run the program on BASE with the old layout. Every program must
+   pass (on cwerg: all of them, py and cc, x64/a64/a32). A cell that base also fails needs the reference
+   to remove that limit for both layouts (L137).
+4. Run every program through both implementations and every target, plus a per-target output-parity
+   case, so a twin that diverges fails by name.
+5. Add negative layout asserts for each kind the contract excludes but a coarse repo predicate would admit
+   (F-104).
+
+Measured on cwerg-compact-pointer-unions: 81 cases from 9 programs, 3 identical new-mode runs as root
+with `--network none`, base 230/0. Auto Review: *"The harness records real per-run failures, compares
+frontend output, and exits nonzero whenever any case fails"*. Tests 3/3.
+
+## Pattern 124 — A fault-injecting test relay for a client/server sync feature
+
+When the feature's correctness depends on what happens between a client and its server, wrap the real
+server handler in the test's httptest server and give it switches, all keyed on the device token and all
+deterministic (no sleeps):
+
+1. **Cut-off:** count each token's request-body bytes and answer 503 once they pass a threshold, before
+   the handler runs. Nothing commits. It splits designs that void the last complete state when a rebuild
+   starts (F-107).
+2. **Lost reply:** run the handler into `httptest.NewRecorder()`, then `panic(http.ErrAbortHandler)`.
+   The server commits and closes the connection, and Go's client does not retry a POST. It splits
+   designs that record a delta only after a 200 with no version on the server's copy (F-105). Arrange the
+   sync so that the only body-carrying request is the one under test (pull + download only).
+3. **Wire traffic:** wrap the listener and count every byte read and written, so a size rule counts
+   headers and bodyless requests too.
+4. **Failing GETs** for one path prefix (blob downloads) to keep a file "not downloaded".
+5. Run every test against every store backend (memory + Postgres started by test.sh).
+
+Measured on micasa-pro-blob-reclaim: the lost reply failed **8/8 Nova, 0/4 Vega**. The cut-off failed
+Vega b3-1 and Nova #8. Clean room 63/63 fail without the solution and 63/63 pass x3 with it on uids 0, 1000
+and 4242. Auto Review: *"strong and deterministic"*, and the lost-reply cases *"natural consequences of
+retaining the latest complete report"*.

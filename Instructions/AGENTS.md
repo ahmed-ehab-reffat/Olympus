@@ -79,6 +79,8 @@ These trip ALL agents — design around them:
 - **Blind spots:** High thrashing on hard problems (1000+ messages → Early Termination); type conversion bypass; TS intersection types narrowed to `never`; `fmt.Errorf` no-op passthrough; frequent API failures on simple tasks.
 
 ### Orion
+
+**Model (user, 2026-10-18): GPT Sol 6.1 at xhigh reasoning.**
 - **Role:** Both tiers; evaluator for Mars
 - **Strengths:** **Decisive commit-and-implement style.** Picks an architecture and executes thoroughly without backtracking. Highest LOC-per-message efficiency (~6.5 LOC/msg on Olympus solves).
 - **Best Mars shapes:** **B (smashes 2/2)**, **D-new (smashes 2/2)** — when description names the API surface or new variant explicitly, Orion converges immediately
@@ -86,6 +88,8 @@ These trip ALL agents — design around them:
 - **Blind spots:** Binary decision-making — when wrong architecture is chosen, commits fully and doesn't pivot. Fails on Mars Shape A1 (distributed semantic complexity). `errors.As` half works perfectly while `reflect.TypeOf` half completely fails. Can implement one subsystem cleanly while another gets fundamentally wrong design. Doesn't self-debug.
 
 ### Vega ⚡10 tokens — Olympus only
+
+**Model (user, 2026-10-18): Claude Opus 5.5 at xhigh reasoning.**
 
 - **Role:** Olympus only — heavy multi-stage refactoring and add-new-feature problems
 - **Olympus pass rate: 31.3% (10/32 attempts)** — leading Olympus agent

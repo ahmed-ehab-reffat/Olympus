@@ -633,3 +633,32 @@ O-Pipeline-hard confirmed for Python+Cython with one flag driving two halves (ev
 cross-site inference) over two evidence paths. Nova grinds (565k avg) and fails the data-structure seam
 between the halves (F-86); the strong agent splits only on path edges (assembly, window edge, no-call
 peak). 10 files, 325 human-effective, 55 tests, Nova 0/8 + Orion 1/4.
+
+## Shape note — micasa-field-level-sync-merge (APPROVED 2026-10-15)
+
+O-Composite-extend confirmed for Go sync layers: the feature extends every oplog writer and the apply
+path across 3 packages (data, sync, cmd), and the walls come from what the base sync design
+never stored (history across a push, per-field change sets, row payloads on tombstones). Nova grinds
+(547k avg) and fails all four; Orion splits on symmetric accounting. 10 files, 818 human-effective, 38
+tests, Nova 0/8 + Orion 1/4.
+
+## Shape note — csbindgen-const-expression-values (APPROVED 2026-10-15)
+
+O-Algorithm-correctness confirmed for code generators: one new evaluator module plus thin wiring in 4
+files, with difficulty in semantic breadth (typing, casts, scoping, literal grammar) rather than in file
+count. Nova fails by breadth (5-7 of 18 per run, 506k avg sequence length); Orion splits on one scope
+cell. 5 files, 931 human-effective, 20 tests, Nova 0/8 + Orion 1/4.
+
+## Shape note — ray-optics-module-inlining (APPROVED 2026-10-16)
+
+O-Composite-extend confirmed for template refactors: one new rewriting module plus Scene, store and UI
+wiring, with difficulty in substitution semantics over a real expression parser rather than in file
+count. Nova fails by breadth (2-8 of 44 per run, about 290k sequence length); Orion splits on its own
+validator. 6 files, 360 human-effective, 44 tests, Nova 0/8 + Orion 1/8.
+
+## Shape note — cwerg-compact-pointer-unions (APPROVED 2026-10-19)
+
+O-Composite-extend confirmed for a compiler layout optimisation across twin front ends: difficulty sits
+in re-lowering every operation and conversion for the new layout, not in the layout itself (every run got
+sizes right). Nova fails by breadth at ~1M sequence length; Vega passes long (512k), Orion passes short
+(< 200k). 10 files, 434 human-effective, 81 cases, Nova 0/8 + Vega 1/4.

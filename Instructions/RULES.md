@@ -107,11 +107,11 @@ Top contributors go through 1-5 revision rounds before approval. This is normal 
 - Optional: GitHub issue URL that describes the problem
 
 **Per-repo submission caps (admin 2026 — platform warns at submit):**
-- **≤ 6 submissions per repo (total).**
+- **≤ 12 submissions per repo (total).** (Raised from 6, user report 2026-10-16.)
 - **≤ 3 submissions per repo in a single week.**
 - **Global ≤ 50 submissions per repo across the whole quest** (all authors combined).
 
-Count existing subs for a repo across ALL dirs (`Olympus-Approved/Feature-Requests/<repo>/`, `problems/`, `diamond-problems/`, `rejected/`) at pick time. Repos already at/over the 6-cap (do NOT add): dasel (9), cliffy (7), yaegi (7). Platform-flagged over-used (all authors, DEAD): opa (60). Full blocklist: `SATURATED-REPOS.md`. See `PICK-FILTER.md § Gate 10 REPO-QUOTA`.
+Count existing subs for a repo across ALL dirs (`Olympus-Approved/Feature-Requests/<repo>/`, `problems/`, `diamond-problems/`, `rejected/`) at pick time. Repos past the 12-cap (do NOT add): none of ours today (dasel 9, cliffy 7, yaegi 7 were over the old 6-cap and are back under). Platform-flagged over-used (all authors, DEAD): opa (60). Full blocklist: `SATURATED-REPOS.md`. See `PICK-FILTER.md § Gate 10 REPO-QUOTA`.
 - NOT plagiarized from another submission (plagiarism = hard reject)
 
 ### Allowed Licenses

@@ -2100,3 +2100,108 @@ Accepted at 4/10 on the first batch, after four platform gate rounds and no earl
   is where the Orion separator came from.
 - **The requirement-count gate cut ~27 rules to ~14 and 22 tests.** The cut contract still held Nova; the
   Orion side needed one new stated rule plus three tests-only cells. Nineteen batches, two model generations.
+
+## micasa-field-level-sync-merge (APPROVED Olympus 2026-10-15)
+
+- **Your harness can void the strong agent's runs.** Two of eight Orion runs were TEST_BROKEN on my
+  fixtures, not the task: a test helper named `mergeDevice` collided with an agent's own test file (the
+  memory note for this existed and I still shipped unsuffixed names), and edit helpers rewrote
+  `created_at` after the write, so an agent that stored versions at write time saw inverted order (L129).
+- **A TEST_BROKEN on your harness is a re-eval lever (L130).** Fixing only test.patch and re-evaluating
+  turned Orion 0/4 into 1/4 with no fresh Orion runs.
+- **A JUnit fallback must add, never replace.** When one package failed to compile, test.sh overwrote 5
+  passing CLI tests with synthetic failures. Append failures for the missing ids only.
+- **Eight Solution Quality FAILs before the first batch were the calibration, not a cost.** The overlap
+  bypass (round 2) and the unreported displaced edit (round 9) became the Nova separator and the Orion
+  decider (L90 twice).
+- **Settle the meta before the first batch.** The AI gate took four humanizer rounds; after it passed the
+  meta never changed again, so every later round was tests or solution only and re-eval stayed available.
+
+## csbindgen-const-expression-values (APPROVED Olympus 2026-10-15)
+
+- **A cap written to calm a reviewer is a description change with its own failure mode.** "Declared types
+  are ... other than `i128`, `u128`" made 6/8 Orion drop 128-bit from expressions; the tests had not
+  changed. Name what stays in, in the same sentence (L89), and compare per-test kills batch over batch
+  after every meta edit.
+- **Read the FP panel before you read the counts.** Two of three batch-8 Orion passes were voided for one
+  resolver shortcut; the adjudicator's probe, replayed on every saved run, killed exactly those two. One
+  cell in an existing test plus a re-eval gave Orion 1/4 (L126).
+- **Do not take a coverage ask every saved run fails.** Auto Review wanted a selected `usize` above 32 bits;
+  all four agents emit an oversized `const nuint` there, so it reads 0/4, and the meta caps that input.
+  Add the in-range cells and contest the rest with the meta sentence plus the FP adjudicator's own reading.
+- **Gate claims about language semantics need a compiler check.** About 30 Solution Quality FAILs; the
+  `as f32` claim alone came back 5 times and was false every time (rustc said so).
+- **A stack-overflow abort wipes a cargo test binary.** Three Nova runs read 18/18 failed; keep the abort's
+  stderr in the JUnit (Auto Review T8 Medium at acceptance).
+
+## mirrorbits-mirror-sync-point (APPROVED Olympus 2026-10-15)
+
+- **When Orion keeps converging, change the agent before shelving.** Five Orion batches read 2/4-4/4 with no
+  probe divergence and the recommendation was to shelve; Vega x4 on the next meta read 1/4 and the problem
+  was accepted at Vega 1/5. Vega missed a stated irreversibility rule Orion had implemented 4/4.
+- **A blame-unfair regrade on one run can be cleared in the tests.** The judge's objection was one fixture
+  (an empty early generation had to stay forgotten though nothing was forgotten). Every fixture was rebuilt
+  around a concrete forgotten version, the user contested the run, and the next regrade was a plain miss.
+- **Empty-observation tests do not prove "forgotten".** Keep them and add a listing of the forgotten item
+  beside live evidence; build the keep-everything implementation as a mutant to show the gap (L132).
+- **Environment-blocker flags with agent_blame_unfair=false did not block acceptance.** Every Nova run and
+  the Vega passer carried one (base image GOFLAGS vs the Makefile); only the blame-unfair flag needed action.
+- **The Task Prompt requirement count, not words, capped this meta.** Four FAILs between 279 and 229 words;
+  it passed at ~10 rules / 195 words. Cut whole rules with their tests, picking ones that killed 0.
+
+## ray-optics-module-inlining (APPROVED Olympus 2026-10-16)
+
+- **Read every humanized cap sentence for its quantifier.** "No distinct variables have identical names"
+  was far broader than the intended "no module defines a name twice". It excluded half the traps, and my
+  own merge fixture also broke the cap, so batch 1 (Orion 0/4) was void.
+- **Turn FP-panel voids into tests.** The whole-scene pre-check FP (batch 3) and the tiny-value FP
+  (batch 5) became the two Orion killers of the accepted batch.
+- **Over-guard tests have a fairness line.** Test Quality struck "inlines while an unrelated instance
+  fails" (a new API that may refuse) and kept remove and rename (base already succeeded). Assert success
+  beside a broken bystander only where base already did.
+- **Check an S1 premise against base before obeying it.** "Rename must accept `constructor`" was false,
+  because base cannot expand a parameter with that name. I changed the reference's name check, cited the
+  base probe, and added no test.
+- **A reviewer gap the lone passer shares goes in the reference only.** The stricter-child-loop-limit
+  guard is untested, because 22/23 saved runs lack it. The FP panel and Auto Review accepted that.
+- **Re-eval carried the last two rounds.** It took test-only fixes (tiny values, 10 coverage tests) plus
+  a reference guard to acceptance without a fresh batch. The 4-run Orion odds at a 1/8 rate (59% read
+  0/4) made re-eval the only sane path.
+
+## cwerg-compact-pointer-unions (APPROVED Olympus 2026-10-19)
+
+- **Read the passing-run sequence length before choosing whom to harden against.** Every Orion pass was
+  143k-196k, so only Vega could qualify. Six batches of Orion were sunk cost after 2026-10-18 (L136).
+- **Keep the longest passer when you pick a re-eval lever.** The elements lever killed the 336k and 415k
+  Vega passes and kept the 512k one. A re-eval cannot change the length of the run you keep.
+- **When the stated surface converges, probe conversion SOURCES, not operations.** 63 probe programs found
+  no divergence. Nine cells on fields, derefs, indices and span elements split the Vega passers 1/2, and
+  my own reference crashed on the same cells.
+- **A cell base also fails is fine if the reference removes the limit for both layouts.** Base's regular
+  unions assert on indexed sources ("non-ID NYI"). I lifted that in the regular helpers too, so the
+  reference does not change behaviour because of the feature. Evaluators and Auto Review called it fair
+  (L137).
+- **A Solution Quality FAIL can be false; re-run it before you edit.** "DefRec/DefType guard dropped": the
+  guard was at canonicalize_union.py:86-87, and the re-run passed.
+- **Test-only rounds kept meta frozen for six batches.** The humanizer and requirement-count rounds all
+  happened before batch 1, so every later fix went through re-eval at ~30%.
+
+## micasa-pro-blob-reclaim (APPROVED Olympus 2026-10-20)
+
+- **Mine the Nova passers' shared design before looking for a new rule.** All three batch-4 Nova passes
+  kept unversioned add/remove deltas recorded after a 200. One lost-reply test killed all three, and the
+  re-eval read 8/8 Nova with Vega untouched. The FP panel's void of Nova #2 had already named the root.
+- **A refused request is not a lost reply.** The 503 cut-off committed nothing, so only the two designs
+  that void the last complete report failed it. To split deltas from versioned designs, the server has
+  to commit and the client has to miss the answer.
+- **Decide on the second backend before the first batch.** Grading Postgres took a socket Postgres in
+  test.sh, nss_wrapper for unmapped uids and a rebuilt image. It gave 3/8 Nova on an ordinary test, and
+  it was the only DESIGN.md prediction that killed.
+- **A meta rule that forces two-ended state is a length lever first.** The 64 KB incremental sentence
+  left Vega at 2/2 but pushed runs to 310k-490k. The kills came one round later, from tests of that
+  state breaking.
+- **Time the suite on the platform logs, not on a loaded host.** The same Postgres replay ran about 3x
+  slower here while another session's container held the disk, and a 30-minute go test timeout looked
+  at risk when it was not (platform 571 s).
+- **Keep fixtures that push thousands of ops batched.** Base push sends every op in one request, so
+  1,000 deleted documents already broke the 1 MB limit; the cut-off fixture pushes in batches of 400.

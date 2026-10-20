@@ -1,0 +1,1089 @@
+diff --git a/cmd/micasa/pro_reclaim_f908dd_test.go b/cmd/micasa/pro_reclaim_f908dd_test.go
+new file mode 100644
+index 0000000..2b5a4a6
+--- /dev/null
++++ b/cmd/micasa/pro_reclaim_f908dd_test.go
+@@ -0,0 +1,947 @@
++// Copyright 2026 Phillip Cloud
++// Licensed under the Apache License, Version 2.0
++
++package main
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"fmt"
++	"io"
++	"log/slog"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"strconv"
++	"strings"
++	gosync "sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/micasa-dev/micasa/internal/crypto"
++	"github.com/micasa-dev/micasa/internal/data"
++	"github.com/micasa-dev/micasa/internal/relay"
++	"github.com/micasa-dev/micasa/internal/sync"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"gorm.io/gorm"
++)
++
++type reclaimRelayF908dd interface {
++	CreateHousehold(
++		ctx context.Context,
++		req sync.CreateHouseholdRequest,
++	) (sync.CreateHouseholdResponse, error)
++	RegisterDevice(
++		ctx context.Context,
++		req sync.RegisterDeviceRequest,
++	) (sync.RegisterDeviceResponse, error)
++	HasBlob(ctx context.Context, householdID, hash string) (bool, error)
++	BlobUsage(ctx context.Context, householdID string) (int64, error)
++	RevokeDevice(ctx context.Context, householdID, deviceID string) error
++}
++
++type reclaimHouseholdF908dd struct {
++	t           *testing.T
++	relay       reclaimRelayF908dd
++	url         string
++	householdID string
++	key         crypto.HouseholdKey
++	failGets    atomic.Bool
++	maxBody     atomic.Int64
++	traffic     atomic.Int64
++	cutOff      atomic.Pointer[cutOffF908dd]
++	lostReplies atomic.Pointer[string]
++}
++
++type cutOffF908dd struct {
++	token string
++	after int64
++	sent  atomic.Int64
++}
++
++type countingListenerF908dd struct {
++	net.Listener
++
++	n *atomic.Int64
++}
++
++func (l countingListenerF908dd) Accept() (net.Conn, error) {
++	conn, err := l.Listener.Accept()
++	if err != nil {
++		return nil, err //nolint:wrapcheck // http.Server inspects accept errors as returned
++	}
++	return countingConnF908dd{Conn: conn, n: l.n}, nil
++}
++
++type countingConnF908dd struct {
++	net.Conn
++
++	n *atomic.Int64
++}
++
++func (c countingConnF908dd) Read(p []byte) (int, error) {
++	n, err := c.Conn.Read(p)
++	c.n.Add(int64(n))
++	return n, err //nolint:wrapcheck // http.Server compares read errors with io.EOF
++}
++
++func (c countingConnF908dd) Write(p []byte) (int, error) {
++	n, err := c.Conn.Write(p)
++	c.n.Add(int64(n))
++	return n, err //nolint:wrapcheck // passed through to http.Server unchanged
++}
++
++type reclaimDeviceF908dd struct {
++	t       *testing.T
++	hh      *reclaimHouseholdF908dd
++	name    string
++	id      string
++	token   string
++	dataDir string
++	dbPath  string
++	store   *data.Store
++	engine  *sync.Engine
++}
++
++var reclaimLineF908dd = regexp.MustCompile(`removed (\d+) files, freed (.+)`)
++
++var reclaimTestKeyF908dd = []byte("test-encryption-key-exactly-32b!")
++
++var reclaimPgStoreF908dd = gosync.OnceValues(func() (*relay.PgStore, error) {
++	pg, err := relay.OpenPgStore(os.Getenv("RELAY_POSTGRES_DSN"))
++	if err != nil {
++		return nil, err
++	}
++	if err := pg.AutoMigrate(); err != nil {
++		return nil, err
++	}
++	pg.SetEncryptionKey(reclaimTestKeyF908dd)
++	return pg, nil
++})
++
++var reclaimBinF908dd = gosync.OnceValues(func() (string, error) {
++	dir, err := os.MkdirTemp("", "micasa-reclaim-*")
++	if err != nil {
++		return "", fmt.Errorf("create temp dir: %w", err)
++	}
++	bin := filepath.Join(dir, "micasa")
++	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, "go", "build", "-o", bin, ".")
++	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
++	if out, err := cmd.CombinedOutput(); err != nil {
++		_ = os.RemoveAll(dir)
++		return "", fmt.Errorf("build: %w\n%s", err, out)
++	}
++	testBinPath.CompareAndSwap(nil, &bin)
++	return bin, nil
++})
++
++func eachRelayF908dd(t *testing.T, body func(hh *reclaimHouseholdF908dd)) {
++	t.Helper()
++	t.Run("memory", func(t *testing.T) {
++		ms := relay.NewMemStore()
++		ms.SetEncryptionKey(reclaimTestKeyF908dd)
++		body(newReclaimHouseholdF908dd(t, ms))
++	})
++	t.Run("postgres", func(t *testing.T) {
++		if os.Getenv("RELAY_POSTGRES_DSN") == "" {
++			t.Skip("RELAY_POSTGRES_DSN not set, skipping Postgres relay")
++		}
++		pg, err := reclaimPgStoreF908dd()
++		require.NoError(t, err)
++		body(newReclaimHouseholdF908dd(t, pg))
++	})
++}
++
++func newReclaimHouseholdF908dd(t *testing.T, store relay.Store) *reclaimHouseholdF908dd {
++	t.Helper()
++	hh := &reclaimHouseholdF908dd{t: t, relay: store}
++	handler := relay.NewHandler(
++		store,
++		slog.Default(),
++		relay.WithSelfHosted(),
++		relay.WithBlobQuota(1<<20),
++	)
++	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if hh.failGets.Load() && r.Method == http.MethodGet &&
++			strings.HasPrefix(r.URL.Path, "/blobs/") {
++			http.Error(w, "blob store unavailable", http.StatusServiceUnavailable)
++			return
++		}
++		body, err := io.ReadAll(r.Body)
++		if err != nil {
++			http.Error(w, "read body", http.StatusBadRequest)
++			return
++		}
++		if c := hh.cutOff.Load(); c != nil && r.Header.Get("Authorization") == "Bearer "+c.token {
++			if c.sent.Add(int64(len(body)))-int64(len(body)) >= c.after {
++				http.Error(w, "connection lost", http.StatusServiceUnavailable)
++				return
++			}
++		}
++		for n := int64(len(body)); ; {
++			if cur := hh.maxBody.Load(); n <= cur || hh.maxBody.CompareAndSwap(cur, n) {
++				break
++			}
++		}
++		r.Body = io.NopCloser(bytes.NewReader(body))
++		if tok := hh.lostReplies.Load(); tok != nil && len(body) > 0 &&
++			r.Header.Get("Authorization") == "Bearer "+*tok {
++			handler.ServeHTTP(httptest.NewRecorder(), r)
++			panic(http.ErrAbortHandler)
++		}
++		handler.ServeHTTP(w, r)
++	}))
++	srv.Listener = countingListenerF908dd{Listener: srv.Listener, n: &hh.traffic}
++	srv.Start()
++	t.Cleanup(srv.Close)
++	key, err := crypto.GenerateHouseholdKey()
++	require.NoError(t, err)
++	hh.url, hh.key = srv.URL, key
++	return hh
++}
++
++func (h *reclaimHouseholdF908dd) join(name string) *reclaimDeviceF908dd {
++	h.t.Helper()
++	kp, err := crypto.GenerateDeviceKeyPair()
++	require.NoError(h.t, err)
++	var id, token string
++	if h.householdID == "" {
++		created, err := h.relay.CreateHousehold(h.t.Context(), sync.CreateHouseholdRequest{
++			DeviceName: name,
++			PublicKey:  kp.PublicKey[:],
++		})
++		require.NoError(h.t, err)
++		h.householdID = created.HouseholdID
++		id, token = created.DeviceID, created.DeviceToken
++	} else {
++		joined, err := h.relay.RegisterDevice(h.t.Context(), sync.RegisterDeviceRequest{
++			HouseholdID: h.householdID,
++			Name:        name,
++			PublicKey:   kp.PublicKey[:],
++		})
++		require.NoError(h.t, err)
++		id, token = joined.DeviceID, joined.DeviceToken
++	}
++
++	dataDir := h.t.TempDir()
++	secrets := filepath.Join(dataDir, "micasa", "secrets")
++	require.NoError(h.t, os.MkdirAll(secrets, 0o700))
++	require.NoError(h.t, crypto.SaveDeviceToken(secrets, token))
++	require.NoError(h.t, crypto.SaveHouseholdKey(secrets, h.key))
++	require.NoError(h.t, crypto.SaveDeviceKeyPair(secrets, kp))
++
++	dbPath := filepath.Join(h.t.TempDir(), "micasa.db")
++	store, err := openAndMigrate(dbPath)
++	require.NoError(h.t, err)
++	h.t.Cleanup(func() { _ = store.Close() })
++	require.NoError(h.t, store.SetMaxDocumentSize(1<<20))
++	require.NoError(h.t, store.GormDB().Create(&data.SyncDevice{
++		ID:          id,
++		Name:        name,
++		HouseholdID: h.householdID,
++		RelayURL:    h.url,
++	}).Error)
++	store.SetDeviceID(id)
++
++	return &reclaimDeviceF908dd{
++		t:       h.t,
++		hh:      h,
++		name:    name,
++		id:      id,
++		token:   token,
++		dataDir: dataDir,
++		dbPath:  dbPath,
++		store:   store,
++		engine:  sync.NewEngine(store, sync.NewClient(h.url, token, h.key), h.householdID),
++	}
++}
++
++func (h *reclaimHouseholdF908dd) stored(content string) bool {
++	h.t.Helper()
++	ok, err := h.relay.HasBlob(h.t.Context(), h.householdID, checksumF908dd(content))
++	require.NoError(h.t, err)
++	return ok
++}
++
++func (h *reclaimHouseholdF908dd) usage() int64 {
++	h.t.Helper()
++	used, err := h.relay.BlobUsage(h.t.Context(), h.householdID)
++	require.NoError(h.t, err)
++	return used
++}
++
++func (h *reclaimHouseholdF908dd) revoke(d *reclaimDeviceF908dd) {
++	h.t.Helper()
++	require.NoError(h.t, h.relay.RevokeDevice(h.t.Context(), h.householdID, d.id))
++}
++
++func checksumF908dd(content string) string {
++	sum := sha256.Sum256([]byte(content))
++	return hex.EncodeToString(sum[:])
++}
++
++func (d *reclaimDeviceF908dd) sync() {
++	d.t.Helper()
++	_, err := d.engine.Sync(d.t.Context())
++	require.NoError(d.t, err)
++}
++
++func (d *reclaimDeviceF908dd) reclaim() string {
++	d.t.Helper()
++	return d.run("pro", "storage", "--reclaim", d.dbPath)
++}
++
++func (d *reclaimDeviceF908dd) storage() string {
++	d.t.Helper()
++	return strings.TrimSpace(d.run("pro", "storage", d.dbPath))
++}
++
++func (d *reclaimDeviceF908dd) run(args ...string) string {
++	d.t.Helper()
++	bin, err := reclaimBinF908dd()
++	require.NoError(d.t, err, "building micasa")
++	cmd := exec.CommandContext(d.t.Context(), bin, args...)
++	home := d.t.TempDir()
++	cmd.Env = append(os.Environ(),
++		"HOME="+home,
++		"XDG_CONFIG_HOME="+filepath.Join(home, "config"),
++		"XDG_STATE_HOME="+filepath.Join(home, "state"),
++		"XDG_CACHE_HOME="+filepath.Join(home, "cache"),
++		"XDG_DATA_HOME="+d.dataDir,
++		"MICASA_DB_PATH=",
++	)
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout = &stdout
++	cmd.Stderr = &stderr
++	require.NoError(d.t, cmd.Run(), "stderr: %s", stderr.String())
++	return stdout.String()
++}
++
++func (d *reclaimDeviceF908dd) vendor(name string) string {
++	d.t.Helper()
++	v := &data.Vendor{Name: name}
++	require.NoError(d.t, d.store.CreateVendor(v))
++	return v.ID
++}
++
++func (d *reclaimDeviceF908dd) attach(vendorID, title, content string) string {
++	d.t.Helper()
++	doc := &data.Document{
++		Title:          title,
++		FileName:       title + ".txt",
++		EntityKind:     data.DocumentEntityVendor,
++		EntityID:       vendorID,
++		MIMEType:       "text/plain",
++		SizeBytes:      int64(len(content)),
++		ChecksumSHA256: checksumF908dd(content),
++		Data:           []byte(content),
++	}
++	require.NoError(d.t, d.store.CreateDocument(doc))
++	return doc.ID
++}
++
++func (d *reclaimDeviceF908dd) replace(docID, content string) {
++	d.t.Helper()
++	doc, err := d.store.GetDocument(docID)
++	require.NoError(d.t, err)
++	doc.Data = []byte(content)
++	doc.SizeBytes = int64(len(content))
++	doc.ChecksumSHA256 = checksumF908dd(content)
++	require.NoError(d.t, d.store.UpdateDocument(doc))
++}
++
++func (d *reclaimDeviceF908dd) content(docID string) string {
++	d.t.Helper()
++	var doc data.Document
++	require.NoError(d.t, d.store.GormDB().Unscoped().First(&doc, "id = ?", docID).Error)
++	return string(doc.Data)
++}
++
++func (d *reclaimDeviceF908dd) createDeletedDocuments(vendorID string, first, n int) {
++	d.t.Helper()
++	deletedAt := gorm.DeletedAt{Time: time.Now(), Valid: true}
++	docs := make([]data.Document, 0, n)
++	for i := first; i < first+n; i++ {
++		content := fmt.Sprintf("receipt %05d", i)
++		docs = append(docs, data.Document{
++			Title:          fmt.Sprintf("receipt %05d", i),
++			FileName:       fmt.Sprintf("receipt-%05d.txt", i),
++			EntityKind:     data.DocumentEntityVendor,
++			EntityID:       vendorID,
++			MIMEType:       "text/plain",
++			SizeBytes:      int64(len(content)),
++			ChecksumSHA256: checksumF908dd(content),
++			DeletedAt:      deletedAt,
++		})
++	}
++	require.NoError(d.t, d.store.GormDB().CreateInBatches(docs, 500).Error)
++}
++
++func (d *reclaimDeviceF908dd) addDeletedDocuments(vendorID string, n int) {
++	d.t.Helper()
++	d.createDeletedDocuments(vendorID, 0, n)
++	unsynced, err := d.store.UnsyncedOps()
++	require.NoError(d.t, err)
++	ids := make([]string, 0, len(unsynced))
++	for _, e := range unsynced {
++		ids = append(ids, e.ID)
++	}
++	require.NoError(d.t, d.store.MarkSynced(ids))
++}
++
++func (d *reclaimDeviceF908dd) uploadOrphan(content string) {
++	d.t.Helper()
++	require.NoError(d.t, sync.NewClient(d.hh.url, d.token, d.hh.key).
++		UploadBlob(d.t.Context(), d.hh.householdID, checksumF908dd(content), []byte(content)))
++}
++
++func assertNothingRemovedF908dd(t *testing.T, out string) {
++	t.Helper()
++	if m := reclaimLineF908dd.FindStringSubmatch(out); m != nil {
++		assert.Equal(t, "0", m[1], "files removed while waiting: %q", out)
++	}
++}
++
++func largeFileF908dd(fill string) string {
++	return strings.Repeat(fill, 600<<10)
++}
++
++func parseReclaimF908dd(t *testing.T, out string) (int, string) {
++	t.Helper()
++	m := reclaimLineF908dd.FindStringSubmatch(out)
++	require.NotNil(t, m, "no removal line in output: %q", out)
++	n, err := strconv.Atoi(m[1])
++	require.NoError(t, err)
++	return n, strings.TrimSpace(m[2])
++}
++
++func TestProReclaimRemovesAReplacedFileOnceEveryDeviceSynced(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		doc := laptop.attach(laptop.vendor("Acme Plumbing"), "invoice", "invoice v1")
++		laptop.sync()
++		phone.sync()
++		laptop.replace(doc, "invoice v2, corrected")
++		laptop.sync()
++		phone.sync()
++
++		before := hh.usage()
++		out := laptop.reclaim()
++		removed, freed := parseReclaimF908dd(t, out)
++		assert.Equal(t, 1, removed)
++		assert.Equal(t, formatBytes(before-hh.usage()), freed)
++		assert.Contains(t, out, laptop.storage())
++		assert.False(t, hh.stored("invoice v1"))
++		assert.True(t, hh.stored("invoice v2, corrected"))
++	})
++}
++
++func TestProReclaimReplacedFileReachesTheOtherDevice(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		doc := laptop.attach(laptop.vendor("Acme Plumbing"), "manual", "manual first edition")
++		laptop.sync()
++		phone.sync()
++		require.Equal(t, "manual first edition", phone.content(doc))
++
++		laptop.replace(doc, "manual second edition")
++		laptop.sync()
++		phone.sync()
++		assert.Equal(t, "manual second edition", phone.content(doc))
++	})
++}
++
++func TestProReclaimWaitsForADeviceThatNeverSynced(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		hh.join("tablet")
++		doc := laptop.attach(laptop.vendor("Acme Plumbing"), "quote", "quote draft")
++		laptop.sync()
++		laptop.uploadOrphan("quote nobody kept")
++		laptop.replace(doc, "quote final")
++		laptop.sync()
++
++		out := laptop.reclaim()
++		assert.Contains(t, out, "tablet")
++		assertNothingRemovedF908dd(t, out)
++		assert.True(t, hh.stored("quote draft"))
++		assert.True(t, hh.stored("quote nobody kept"))
++	})
++}
++
++func TestProReclaimIgnoresARevokedDevice(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		tablet := hh.join("tablet")
++		doc := laptop.attach(laptop.vendor("Acme Plumbing"), "quote", "quote draft")
++		laptop.sync()
++		laptop.replace(doc, "quote final")
++		laptop.sync()
++		hh.revoke(tablet)
++
++		removed, _ := parseReclaimF908dd(t, laptop.reclaim())
++		assert.Equal(t, 1, removed)
++		assert.False(t, hh.stored("quote draft"))
++	})
++}
++
++func TestProReclaimWaitsForADeviceThatPushedAfterItsReport(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		doc := laptop.attach(laptop.vendor("Acme Plumbing"), "warranty", "warranty scan")
++		laptop.sync()
++		phone.sync()
++		laptop.replace(doc, "warranty scan, both pages")
++		laptop.sync()
++		phone.sync()
++
++		phone.vendor("Bolt Electric")
++		unsynced, err := phone.store.UnsyncedOps()
++		require.NoError(t, err)
++		ops := make([]sync.OpPayload, 0, len(unsynced))
++		for _, e := range unsynced {
++			ops = append(ops, sync.OpPayload{
++				ID:        e.ID,
++				TableName: e.TableName,
++				RowID:     e.RowID,
++				OpType:    e.OpType,
++				Payload:   e.Payload,
++				DeviceID:  e.DeviceID,
++				CreatedAt: e.CreatedAt,
++			})
++		}
++		pushed, err := sync.NewClient(hh.url, phone.token, hh.key).Push(t.Context(), ops)
++		require.NoError(t, err)
++		ids := make([]string, 0, len(pushed.Confirmed))
++		for _, c := range pushed.Confirmed {
++			ids = append(ids, c.ID)
++		}
++		require.NoError(t, phone.store.MarkSynced(ids))
++
++		out := laptop.reclaim()
++		assert.Contains(t, out, "phone")
++		assert.True(t, hh.stored("warranty scan"))
++
++		phone.sync()
++		removed, _ := parseReclaimF908dd(t, laptop.reclaim())
++		assert.Equal(t, 1, removed)
++		assert.False(t, hh.stored("warranty scan"))
++	})
++}
++
++func TestProReclaimKeepsTheFileOfADeletedDocument(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		doc := laptop.attach(laptop.vendor("Acme Plumbing"), "receipt", "receipt for the boiler")
++		laptop.sync()
++		phone.sync()
++		require.NoError(t, laptop.store.DeleteDocument(doc))
++		laptop.sync()
++		phone.sync()
++
++		removed, _ := parseReclaimF908dd(t, laptop.reclaim())
++		assert.Equal(t, 0, removed)
++		assert.True(t, hh.stored("receipt for the boiler"))
++	})
++}
++
++func TestProReclaimKeepsAFileAnotherDocumentStillUses(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		vendor := laptop.vendor("Acme Plumbing")
++		first := laptop.attach(vendor, "permit", "city permit")
++		laptop.attach(vendor, "permit copy", "city permit")
++		laptop.sync()
++		phone.sync()
++		laptop.replace(first, "city permit, renewed")
++		laptop.sync()
++		phone.sync()
++
++		removed, _ := parseReclaimF908dd(t, phone.reclaim())
++		assert.Equal(t, 0, removed)
++		assert.True(t, hh.stored("city permit"))
++		assert.True(t, hh.stored("city permit, renewed"))
++	})
++}
++
++func TestProReclaimKeepsADeletedFileForADeviceThatNeverDownloadedIt(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		doc := laptop.attach(laptop.vendor("Acme Plumbing"), "inspection", "inspection report")
++		laptop.sync()
++		require.NoError(t, laptop.store.DeleteDocument(doc))
++		laptop.sync()
++		tablet := hh.join("tablet")
++		tablet.sync()
++		hh.revoke(laptop)
++
++		removed, _ := parseReclaimF908dd(t, tablet.reclaim())
++		assert.Equal(t, 0, removed)
++		require.True(t, hh.stored("inspection report"))
++
++		require.NoError(t, tablet.store.RestoreDocument(doc))
++		tablet.sync()
++		assert.Equal(t, "inspection report", tablet.content(doc))
++	})
++}
++
++func TestProReclaimDoesNotWaitForADeviceThatJustSyncedANewDocument(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		vendor := laptop.vendor("Acme Plumbing")
++		laptop.sync()
++		phone.sync()
++		laptop.uploadOrphan("estimate nobody kept")
++		laptop.attach(vendor, "estimate", "roof estimate")
++		laptop.sync()
++
++		removed, _ := parseReclaimF908dd(t, laptop.reclaim())
++		assert.Equal(t, 1, removed)
++		assert.False(t, hh.stored("estimate nobody kept"))
++		assert.True(t, hh.stored("roof estimate"))
++
++		removed, _ = parseReclaimF908dd(t, phone.reclaim())
++		assert.Equal(t, 0, removed)
++		assert.True(t, hh.stored("roof estimate"))
++	})
++}
++
++func TestProReclaimSyncsBeforeRemoving(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		doc := laptop.attach(laptop.vendor("Acme Plumbing"), "lease", "lease 2025")
++		laptop.sync()
++		phone.sync()
++		laptop.replace(doc, "lease 2026")
++		laptop.sync()
++
++		removed, _ := parseReclaimF908dd(t, phone.reclaim())
++		assert.Equal(t, 1, removed)
++		assert.False(t, hh.stored("lease 2025"))
++		assert.Equal(t, "lease 2026", phone.content(doc))
++	})
++}
++
++func TestProReclaimCountsEveryRemovedFile(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		vendor := laptop.vendor("Acme Plumbing")
++		draft := largeFileF908dd("d")
++		contract := laptop.attach(vendor, "contract", draft)
++		invoice := laptop.attach(vendor, "invoice", "invoice for march")
++		laptop.sync()
++		phone.sync()
++		laptop.replace(contract, "contract signed by both parties")
++		laptop.replace(invoice, "invoice for march, paid")
++		laptop.sync()
++		phone.sync()
++
++		before := hh.usage()
++		out := phone.reclaim()
++		removed, freed := parseReclaimF908dd(t, out)
++		assert.Equal(t, 2, removed)
++		assert.Equal(t, formatBytes(before-hh.usage()), freed)
++		assert.Contains(t, out, phone.storage())
++		assert.False(t, hh.stored(draft))
++		assert.False(t, hh.stored("invoice for march"))
++	})
++}
++
++func TestProReclaimListsEveryWaitingDevice(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		hh.join("phone")
++		hh.join("tablet")
++		doc := laptop.attach(laptop.vendor("Acme Plumbing"), "survey", "survey sketch")
++		laptop.sync()
++		laptop.uploadOrphan("sketch nobody kept")
++		laptop.replace(doc, "survey final")
++		laptop.sync()
++
++		out := laptop.reclaim()
++		m := regexp.MustCompile(`waiting for: (.+)`).FindStringSubmatch(out)
++		require.NotNil(t, m, "no waiting line in output: %q", out)
++		names := strings.Split(m[1], ",")
++		for i := range names {
++			names[i] = strings.TrimSpace(names[i])
++		}
++		assert.ElementsMatch(t, []string{"phone", "tablet"}, names)
++		assertNothingRemovedF908dd(t, out)
++		assert.True(t, hh.stored("survey sketch"))
++		assert.True(t, hh.stored("sketch nobody kept"))
++	})
++}
++
++func TestProReclaimRemovesAFileNoDocumentUses(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		laptop.attach(laptop.vendor("Acme Plumbing"), "deed", "house deed")
++		laptop.sync()
++		phone.sync()
++		orphan := "scan nobody kept"
++		laptop.uploadOrphan(orphan)
++		laptop.sync()
++		phone.sync()
++
++		before := hh.usage()
++		removed, freed := parseReclaimF908dd(t, phone.reclaim())
++		assert.Equal(t, 1, removed)
++		assert.Equal(t, formatBytes(before-hh.usage()), freed)
++		assert.False(t, hh.stored(orphan))
++		assert.True(t, hh.stored("house deed"))
++	})
++}
++
++func TestProReclaimKeepsAFileADeviceHasNotDownloaded(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		doc := laptop.attach(laptop.vendor("Acme Plumbing"), "deed", "house deed")
++		laptop.sync()
++		hh.failGets.Store(true)
++		tablet := hh.join("tablet")
++		tablet.sync()
++		hh.revoke(laptop)
++
++		removed, _ := parseReclaimF908dd(t, tablet.reclaim())
++		assert.Equal(t, 0, removed)
++		require.True(t, hh.stored("house deed"))
++
++		hh.failGets.Store(false)
++		tablet.sync()
++		assert.Equal(t, "house deed", tablet.content(doc))
++	})
++}
++
++func TestProReclaimWorksForADeviceWithManyDocuments(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		phone.addDeletedDocuments(phone.vendor("Corner Hardware"), 20000)
++		var kept []string
++		for i := 0; i < 20000; i += 500 {
++			kept = append(kept, fmt.Sprintf("receipt %05d", i))
++			phone.uploadOrphan(kept[len(kept)-1])
++		}
++		phone.sync()
++		doc := laptop.attach(laptop.vendor("Acme Plumbing"), "survey", "survey 2025")
++		laptop.sync()
++		phone.sync()
++		laptop.uploadOrphan("receipt 00001")
++		laptop.replace(doc, "survey 2026")
++		laptop.sync()
++
++		removed, _ := parseReclaimF908dd(t, laptop.reclaim())
++		assert.Equal(t, 0, removed)
++		assert.True(t, hh.stored("receipt 00001"))
++
++		removed, _ = parseReclaimF908dd(t, phone.reclaim())
++		assert.Equal(t, 1, removed)
++		assert.False(t, hh.stored("survey 2025"))
++		assert.True(t, hh.stored("survey 2026"))
++		assert.Equal(t, "survey 2026", phone.content(doc))
++		assert.True(t, hh.stored("receipt 00001"))
++		for _, content := range kept {
++			assert.True(t, hh.stored(content), content)
++		}
++		assert.LessOrEqual(t, hh.maxBody.Load(), int64(1<<20))
++	})
++}
++
++func TestProReclaimDoesNotWaitForADeviceWhoseReportWasCutOff(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		vendor := laptop.vendor("Acme Plumbing")
++		laptop.attach(vendor, "deed", "house deed")
++		laptop.sync()
++		phone.addDeletedDocuments(phone.vendor("Corner Hardware"), 100)
++		phone.uploadOrphan("receipt 00042")
++		phone.sync()
++
++		for first := 100; first < 20100; first += 400 {
++			laptop.createDeletedDocuments(vendor, first, 400)
++			laptop.sync()
++		}
++		orphan := "scan nobody kept"
++		laptop.uploadOrphan(orphan)
++
++		hh.cutOff.Store(&cutOffF908dd{token: phone.token, after: 256 << 10})
++		_, _ = phone.engine.Sync(t.Context())
++		hh.cutOff.Store(nil)
++
++		removed, _ := parseReclaimF908dd(t, laptop.reclaim())
++		assert.Equal(t, 1, removed)
++		assert.False(t, hh.stored(orphan))
++		assert.True(t, hh.stored("receipt 00042"))
++		assert.True(t, hh.stored("house deed"))
++	})
++}
++
++func TestProReclaimRemovesAFileWhoseReportReplyWasLost(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		vendor := laptop.vendor("Acme Plumbing")
++		laptop.sync()
++		phone.sync()
++		doc := laptop.attach(vendor, "warranty", "warranty draft")
++		laptop.sync()
++
++		hh.lostReplies.Store(&phone.token)
++		_, _ = phone.engine.Sync(t.Context())
++		hh.lostReplies.Store(nil)
++		require.Equal(t, "warranty draft", phone.content(doc))
++
++		laptop.replace(doc, "warranty signed")
++		laptop.sync()
++		phone.sync()
++
++		removed, _ := parseReclaimF908dd(t, laptop.reclaim())
++		assert.Equal(t, 1, removed)
++		assert.False(t, hh.stored("warranty draft"))
++		assert.True(t, hh.stored("warranty signed"))
++		assert.Equal(t, "warranty signed", phone.content(doc))
++	})
++}
++
++func TestProReclaimSyncAfterOneChangeStaysSmall(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		vendor := phone.vendor("Corner Hardware")
++		doc := phone.attach(vendor, "estimate", "roof estimate")
++		phone.sync()
++		phone.addDeletedDocuments(vendor, 20000)
++		phone.sync()
++		laptop.sync()
++
++		phone.replace(doc, "roof estimate, revised")
++		hh.traffic.Store(0)
++		phone.run("pro", "sync", phone.dbPath)
++		assert.Less(t, hh.traffic.Load(), int64(64<<10))
++
++		laptop.sync()
++		removed, _ := parseReclaimF908dd(t, laptop.reclaim())
++		assert.Equal(t, 1, removed)
++		assert.False(t, hh.stored("roof estimate"))
++		assert.True(t, hh.stored("roof estimate, revised"))
++	})
++}
++
++func TestProReclaimUploadsAReplacementRefusedForSpace(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		first, second := largeFileF908dd("a"), largeFileF908dd("b")
++		doc := laptop.attach(laptop.vendor("Acme Plumbing"), "blueprint", first)
++		laptop.sync()
++		phone.sync()
++		laptop.replace(doc, second)
++		laptop.sync()
++		require.False(t, hh.stored(second))
++		phone.sync()
++
++		out := laptop.reclaim()
++		removed, _ := parseReclaimF908dd(t, out)
++		assert.Equal(t, 1, removed)
++		assert.False(t, hh.stored(first))
++		assert.True(t, hh.stored(second))
++		assert.Contains(t, out, laptop.storage())
++		phone.sync()
++		assert.Equal(t, second, phone.content(doc))
++	})
++}
++
++func TestProReclaimUploadsANewDocumentRefusedForSpace(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		vendor := laptop.vendor("Acme Plumbing")
++		old := largeFileF908dd("c")
++		manual := laptop.attach(vendor, "manual", old)
++		laptop.sync()
++		laptop.replace(manual, "manual, one page")
++		laptop.sync()
++		photos := largeFileF908dd("d")
++		doc := laptop.attach(vendor, "photos", photos)
++		laptop.sync()
++		require.False(t, hh.stored(photos))
++		phone.sync()
++
++		out := laptop.reclaim()
++		removed, _ := parseReclaimF908dd(t, out)
++		assert.Equal(t, 1, removed)
++		assert.True(t, hh.stored(photos))
++		assert.Contains(t, out, laptop.storage())
++		phone.sync()
++		assert.Equal(t, photos, phone.content(doc))
++	})
++}
++
++func TestProReclaimUploadsADeletedDocumentRefusedForSpace(t *testing.T) {
++	eachRelayF908dd(t, func(hh *reclaimHouseholdF908dd) {
++		t := hh.t
++		laptop := hh.join("laptop")
++		phone := hh.join("phone")
++		vendor := laptop.vendor("Acme Plumbing")
++		manual := laptop.attach(vendor, "manual", largeFileF908dd("e"))
++		laptop.sync()
++		laptop.replace(manual, "manual, one page")
++		laptop.sync()
++		photos := largeFileF908dd("f")
++		doc := laptop.attach(vendor, "photos", photos)
++		laptop.sync()
++		require.False(t, hh.stored(photos))
++		require.NoError(t, laptop.store.DeleteDocument(doc))
++		laptop.sync()
++		phone.sync()
++
++		out := laptop.reclaim()
++		removed, _ := parseReclaimF908dd(t, out)
++		assert.Equal(t, 1, removed)
++		assert.True(t, hh.stored(photos))
++		assert.Contains(t, out, laptop.storage())
++		require.NoError(t, phone.store.RestoreDocument(doc))
++		phone.sync()
++		assert.Equal(t, photos, phone.content(doc))
++	})
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..dab72fa
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,130 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path) OUTPUT_PATH="$2"; shift 2 ;;
++    base|new) MODE="$1"; shift ;;
++    *) shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++OUTPUT_PATH="${OUTPUT_PATH:-/tmp/test-results.xml}"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++cd "$(dirname "$0")" || exit 1
++export GOFLAGS="${GOFLAGS:--buildvcs=false}"
++if [ ! -w "${HOME:-/}" ]; then
++  HOME="$(mktemp -d)"
++  export HOME
++fi
++
++NEW_TESTS='^TestProReclaim'
++NEW_FILES="cmd/micasa/pro_reclaim_f908dd_test.go"
++LOG="$(mktemp)"
++
++start_postgres() {
++  local bindir pgroot run_as=()
++  bindir="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -n 1)"
++  [ -x "$bindir/initdb" ] || return 1
++  pgroot="$(mktemp -d)"
++  PG_STOP=("$bindir/pg_ctl" -D "$pgroot/data" -m immediate stop)
++  if [ "$(id -u)" = 0 ]; then
++    chown postgres "$pgroot"
++    run_as=(runuser -u postgres --)
++    PG_STOP=(runuser -u postgres -- "${PG_STOP[@]}")
++  elif ! id -un >/dev/null 2>&1; then
++    printf 'micasa:x:%s:%s::%s:/bin/sh\n' "$(id -u)" "$(id -g)" "$pgroot" >"$pgroot/passwd"
++    printf 'micasa:x:%s:\n' "$(id -g)" >"$pgroot/group"
++    run_as=(env LD_PRELOAD=libnss_wrapper.so NSS_WRAPPER_PASSWD="$pgroot/passwd" \
++      NSS_WRAPPER_GROUP="$pgroot/group")
++    PG_STOP=("${run_as[@]}" "${PG_STOP[@]}")
++  fi
++  "${run_as[@]}" "$bindir/initdb" -D "$pgroot/data" -U micasa -A trust -E UTF8 >>"$LOG" 2>&1 || return 1
++  "${run_as[@]}" "$bindir/pg_ctl" -D "$pgroot/data" -l "$pgroot/server.log" -w \
++    -o "-k $pgroot -c listen_addresses= -c fsync=off -c synchronous_commit=off -c full_page_writes=off" \
++    start >>"$LOG" 2>&1 || return 1
++  export RELAY_POSTGRES_DSN="host=$pgroot user=micasa dbname=postgres sslmode=disable"
++}
++
++PG_STOP=()
++CGO_ENABLED=0 go build -o /dev/null ./cmd/micasa >>"$LOG" 2>&1
++if [ "$MODE" = "new" ]; then
++  if ! start_postgres; then
++    echo "test.sh: could not start a local Postgres server" >>"$LOG"
++    export RELAY_POSTGRES_DSN="host=/nonexistent user=micasa dbname=postgres sslmode=disable"
++  fi
++  go test -count=1 -timeout 30m -v -run "$NEW_TESTS" ./cmd/micasa >>"$LOG" 2>&1
++else
++  OVERLAY="$(mktemp)"
++  {
++    printf '{"Replace":{'
++    SEP=""
++    for f in $NEW_FILES; do
++      printf '%s"%s":""' "$SEP" "$PWD/$f"
++      SEP=","
++    done
++    printf '}}'
++  } >"$OVERLAY"
++  go test -count=1 -v -overlay "$OVERLAY" \
++    ./internal/data/... ./internal/sync/... ./internal/relay/... ./cmd/micasa/... >>"$LOG" 2>&1
++fi
++STATUS=$?
++if [ "${#PG_STOP[@]}" -gt 0 ]; then
++  "${PG_STOP[@]}" >/dev/null 2>&1
++fi
++
++go-junit-report -set-exit-code <"$LOG" >"$OUTPUT_PATH"
++sed -i -e ':a' -e 's/::/:/g' -e 'ta' "$OUTPUT_PATH"
++
++DIAG="$(tail -c 4000 "$LOG" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
++
++MISSING=""
++if [ "$MODE" = "new" ]; then
++  for f in $NEW_FILES; do
++    pkg="github.com/micasa-dev/micasa/$(dirname "$f")"
++    for name in $(sed -n 's/^func \(Test[A-Za-z0-9_]*\)(t \*testing.T) {$/\1/p' "$f" 2>/dev/null); do
++      grep -q "name=\"$name\"" "$OUTPUT_PATH" || MISSING="$MISSING $pkg:$name"
++    done
++  done
++fi
++
++if [ -n "$MISSING" ] && grep -q '<testcase' "$OUTPUT_PATH" && grep -q '</testsuites>' "$OUTPUT_PATH"; then
++  REPORT="$(mktemp)"
++  {
++    sed '/<\/testsuites>/d' "$OUTPUT_PATH"
++    echo '<testsuite name="micasa-unreported">'
++    for entry in $MISSING; do
++      echo "<testcase classname=\"${entry%%:*}\" name=\"${entry#*:}\"><failure message=\"go test did not report this test\">$DIAG</failure></testcase>"
++    done
++    echo '</testsuite>'
++    echo '</testsuites>'
++  } >"$REPORT"
++  mv "$REPORT" "$OUTPUT_PATH"
++  [ "$STATUS" -eq 0 ] && STATUS=1
++elif [ -n "$MISSING" ] || ! grep -q '<testcase' "$OUTPUT_PATH" || { [ "$STATUS" -ne 0 ] && ! grep -qE '<failure|<error' "$OUTPUT_PATH"; }; then
++  {
++    echo '<?xml version="1.0" encoding="UTF-8"?>'
++    echo '<testsuites>'
++    echo "<testsuite name=\"micasa-$MODE\">"
++    if [ "$MODE" = "new" ]; then
++      for f in $NEW_FILES; do
++        pkg="github.com/micasa-dev/micasa/$(dirname "$f")"
++        for name in $(sed -n 's/^func \(Test[A-Za-z0-9_]*\)(t \*testing.T) {$/\1/p' "$f" 2>/dev/null); do
++          echo "<testcase classname=\"$pkg\" name=\"$name\"><failure message=\"go test did not report this test\">$DIAG</failure></testcase>"
++        done
++      done
++    else
++      echo "<testcase classname=\"micasa\" name=\"go test\"><failure message=\"go test produced no results\">$DIAG</failure></testcase>"
++    fi
++    echo '</testsuite>'
++    echo '</testsuites>'
++  } >"$OUTPUT_PATH"
++  [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++rm -f "$LOG" "${OVERLAY:-}"
++exit "$STATUS"

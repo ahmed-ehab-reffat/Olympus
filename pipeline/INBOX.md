@@ -15,6 +15,8 @@ the line to "Processed".
 
 ## Processed
 
+    allsorts-instance-layout-variations: dead derivative overlap Blocker 45.7% (layout-instancing engine) + set-level 62.6% (with vertical metrics)   (said in session 2026-10-18; handled)
+
     gonum-plot-exact-glyph-layout: dead derivative overlap Blocker 46.6% (glyph-bound envelope + max-fit Align engine)   (said in session 2026-10-13; handled)
 
     protobuf-es-proto-source-printer: dead derivative overlap Blocker 66.7% (descriptor-to-.proto printer engine)   (said in session 2026-10-12; handled)

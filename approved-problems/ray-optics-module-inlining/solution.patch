@@ -1,0 +1,574 @@
+diff --git a/locales/en/simulator.json b/locales/en/simulator.json
+index 876ce458..05e897be 100644
+--- a/locales/en/simulator.json
++++ b/locales/en/simulator.json
+@@ -885,7 +885,8 @@
+           "maxLoopLength": "Max loop length",
+           "renameButton": "Rename",
+           "removeButton": "Remove Module",
+-          "confirmRemove": "Remove module \"{{name}}\"?"
++          "confirmRemove": "Remove module \"{{name}}\"?",
++          "errorRemove": "Module \"{{name}}\" cannot be removed because another module uses it in a way that cannot be inlined."
+         }
+       }
+     },
+diff --git a/src/app/components/sidebar/ModuleEditor.vue b/src/app/components/sidebar/ModuleEditor.vue
+index 952b859d..f7223701 100644
+--- a/src/app/components/sidebar/ModuleEditor.vue
++++ b/src/app/components/sidebar/ModuleEditor.vue
+@@ -764,7 +764,10 @@ export default {
+       const name = props.moduleName
+       const ok = window.confirm(i18next.t('simulator:sidebar.visual.moduleEditor.settings.confirmRemove', { name }))
+       if (!ok) return
+-      scene.removeModule(name)
++      if (!scene.removeModule(name)) {
++        window.alert(i18next.t('simulator:sidebar.visual.moduleEditor.settings.errorRemove', { name }))
++        return
++      }
+       emit('module-removed', name)
+     }
+ 
+diff --git a/src/app/components/toolbar/ModuleTools.vue b/src/app/components/toolbar/ModuleTools.vue
+index b1407932..6881f0d6 100644
+--- a/src/app/components/toolbar/ModuleTools.vue
++++ b/src/app/components/toolbar/ModuleTools.vue
+@@ -73,6 +73,7 @@ import { vTooltipPopover } from '../../directives/tooltip-popover'
+ import { usePreferencesStore } from '../../store/preferences'
+ import { useSceneStore } from '../../store/scene'
+ import { computed, toRef } from 'vue'
++import i18next from 'i18next'
+ import { app } from '../../services/app.js'
+ import { promptNewModuleName } from '../../utils/promptNewModuleName.js'
+ 
+@@ -125,7 +126,10 @@ export default {
+ 
+     // Handle module removal
+     const handleRemoveModule = (moduleName) => {
+-      scene.removeModule(moduleName)
++      if (!scene.removeModule(moduleName)) {
++        window.alert(i18next.t('simulator:sidebar.visual.moduleEditor.settings.errorRemove', { name: moduleName }))
++        return
++      }
+       app.editor.addingObjType = ''
+     }
+ 
+diff --git a/src/app/store/scene.js b/src/app/store/scene.js
+index e703d989..243d03e9 100644
+--- a/src/app/store/scene.js
++++ b/src/app/store/scene.js
+@@ -200,13 +200,17 @@ export const useSceneStore = () => {
+   // Add module-specific methods
+   const removeModule = (moduleName) => {
+     if (app.scene) {
+-      app.scene.removeModule(moduleName)
++      if (!app.scene.removeModule(moduleName)) {
++        return false
++      }
+       // Update moduleIds
+       state.moduleIds = Object.keys(app.scene.modules).join(',')
+       // Trigger necessary updates
+       app.simulator?.updateSimulation(false, true)
+       app.editor.onActionComplete()
++      return true
+     }
++    return false
+   }
+   const renameModule = (oldName, newName) => {
+     if (app.scene) {
+diff --git a/src/core/Scene.js b/src/core/Scene.js
+index c3885e4f..eefc74e1 100644
+--- a/src/core/Scene.js
++++ b/src/core/Scene.js
+@@ -16,6 +16,7 @@
+ 
+ import * as sceneObjs from './sceneObjs.js';
+ import { versionUpdate } from './versionUpdate.js';
++import { inlineRows, instancesExpand, renameParamInDef } from './moduleRewriting.js';
+ import i18next from 'i18next';
+ import seedrandom from 'seedrandom';
+ 
+@@ -1090,10 +1091,45 @@ class Scene {
+   }
+ 
+   /**
+-   * Remove a given module and demodulize all corresponding module objects.
+-   * @param {string} moduleName 
++   * Remove a given module. Instances in the scene are demodulized, and instances inside other module definitions are replaced by the rows of the removed module rewritten into the names of the containing module.
++   * @param {string} moduleName
++   * @returns {boolean} Whether the module is removed. Nothing changes when it is not.
+    */
+   removeModule(moduleName) {
++    if (!this.modules[moduleName]) {
++      return false;
++    }
++    const plans = [];
++    for (const [name, def] of Object.entries(this.modules)) {
++      if (name === moduleName || !Array.isArray(def.objs)) continue;
++      const rows = [];
++      const indices = def.objs.flatMap((row, i) => (row && row.type === 'ModuleObj' && row.module === moduleName ? [i] : []));
++      if (indices.length && !instancesExpand(this.objs, name, indices)) {
++        return false;
++      }
++      let maxLoopLength = def.maxLoopLength || 1000;
++      for (let i = 0; i < def.objs.length; i++) {
++        const row = def.objs[i];
++        if (indices.includes(i)) {
++          const inlined = inlineRows(def, i, this.modules);
++          if (!inlined) {
++            return false;
++          }
++          rows.push(...inlined.rows);
++          maxLoopLength = Math.max(maxLoopLength, inlined.maxLoopLength);
++        } else {
++          rows.push(row);
++        }
++      }
++      plans.push({ def, rows, maxLoopLength });
++    }
++    for (const { def, rows, maxLoopLength } of plans) {
++      def.objs = rows;
++      if (maxLoopLength > (def.maxLoopLength || 1000)) {
++        def.maxLoopLength = maxLoopLength;
++      }
++    }
++
+     mainLoop: while (true) {
+       for (let obj of this.objs) {
+         if (obj.constructor.type === "ModuleObj" && obj.module === moduleName) {
+@@ -1105,6 +1141,54 @@ class Scene {
+     }
+ 
+     delete this.modules[moduleName];
++    this.reloadAllModules();
++    return true;
++  }
++
++  /**
++   * Replace one module instance inside a module definition by the rows of its module, keeping the module itself.
++   * @param {string} moduleName - The module whose definition contains the instance.
++   * @param {number} index - The index of the instance in the definition's objects.
++   * @returns {boolean} Whether the instance is inlined. Nothing changes when it is not.
++   */
++  inlineModuleInstance(moduleName, index) {
++    const def = this.modules[moduleName];
++    const row = def?.objs?.[index];
++    if (!row || row.type !== 'ModuleObj' || !this.modules[row.module] || row.module === moduleName || !instancesExpand(this.objs, moduleName, [index])) {
++      return false;
++    }
++    const inlined = inlineRows(def, index, this.modules);
++    if (!inlined) {
++      return false;
++    }
++    def.objs.splice(index, 1, ...inlined.rows);
++    if (inlined.maxLoopLength > (def.maxLoopLength || 1000)) {
++      def.maxLoopLength = inlined.maxLoopLength;
++    }
++    this.reloadAllModules();
++    return true;
++  }
++
++  /**
++   * Rename a parameter of a module, everywhere the module definition uses it and in every instance of the module.
++   * @param {string} moduleName
++   * @param {string} oldName
++   * @param {string} newName
++   * @returns {boolean} Whether the parameter is renamed. Nothing changes when it is not.
++   */
++  renameModuleParam(moduleName, oldName, newName) {
++    const def = this.modules[moduleName];
++    if (!def || !renameParamInDef(def, oldName, newName)) {
++      return false;
++    }
++    for (const ref of this.getModuleObjRefsById(moduleName)) {
++      if (ref.params && Object.prototype.hasOwnProperty.call(ref.params, oldName)) {
++        ref.params[newName] = ref.params[oldName];
++        delete ref.params[oldName];
++      }
++    }
++    this.reloadAllModules();
++    return true;
+   }
+ 
+   /**
+diff --git a/src/core/moduleRewriting.js b/src/core/moduleRewriting.js
+new file mode 100644
+index 00000000..c2bb40da
+--- /dev/null
++++ b/src/core/moduleRewriting.js
+@@ -0,0 +1,376 @@
++/*
++ * Copyright 2026 The Ray Optics Simulation authors and contributors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import * as math from 'mathjs';
++import { isValidFormulaParameterName } from './formula/formula-syntax.js';
++
++const DEFAULT_MAX_LOOP_LENGTH = 1000;
++
++function isPlainObject(value) {
++  return typeof value === 'object' && value !== null && !Array.isArray(value);
++}
++
++function parseRange(str) {
++  const eq = str.indexOf('=');
++  return { name: str.slice(0, eq).trim(), bounds: str.slice(eq + 1).split(':') };
++}
++
++function rangesOf(row) {
++  if (!isPlainObject(row) || !('for' in row)) return [];
++  return [].concat(row.for).map(parseRange);
++}
++
++function mapTemplate(str, mapExpr) {
++  const parts = str.split('`');
++  const out = [];
++  let inText = true;
++  for (let i = 0; i < parts.length; i++) {
++    if (inText) {
++      out.push(parts[i]);
++    } else if (parts[i] === '' && i < parts.length - 3 && parts[i + 2] === '') {
++      out.push('', mapExpr(parts[i + 1], true), '');
++      i += 2;
++    } else {
++      out.push(mapExpr(parts[i], false));
++    }
++    inText = !inText;
++  }
++  return out.join('`');
++}
++
++function isScoped(value) {
++  return isPlainObject(value) && ('for' in value || 'if' in value);
++}
++
++function mapValue(value, scope, hooks) {
++  if (typeof value === 'string') return mapTemplate(value, (src) => hooks.expr(src, scope));
++  if (Array.isArray(value)) {
++    return value.map((item) => (isScoped(item) ? mapScoped(item, scope, hooks) : mapValue(item, scope, hooks)));
++  }
++  if (isPlainObject(value)) {
++    const out = {};
++    for (const key in value) {
++      out[key] = mapValue(value[key], scope, hooks);
++    }
++    return out;
++  }
++  return value;
++}
++
++function mapScoped(obj, scope, hooks) {
++  const ranges = rangesOf(obj);
++  const bound = hooks.bound || hooks.expr;
++  const bounds = ranges.map((r) => r.bounds.map((b) => bound(b, scope)));
++  const entered = ranges.length ? hooks.enter(ranges.map((r) => r.name), scope) : { names: [], scope };
++  const out = {};
++  for (const key in obj) {
++    if (key === 'for') {
++      const specs = ranges.map((r, i) => `${entered.names[i]}=${bounds[i].join(':')}`);
++      out.for = Array.isArray(obj.for) ? specs : specs[0];
++    } else if (key === 'if') {
++      out.if = hooks.expr(obj.if, entered.scope);
++    } else {
++      out[key] = mapValue(obj[key], entered.scope, hooks);
++    }
++  }
++  return out;
++}
++
++function collectSymbols(node, names) {
++  node.traverse((n) => {
++    if (n.isSymbolNode) names.add(n.name);
++    if (n.isFunctionAssignmentNode) n.params.forEach((p) => names.add(p));
++    if (n.isFunctionAssignmentNode || n.isAssignmentNode) names.add(n.name);
++  });
++  return names;
++}
++
++export function namesUsedIn(def) {
++  const names = new Set();
++  const visit = (src) => {
++    collectSymbols(math.parse(src), names);
++    return src;
++  };
++  (def.params || []).forEach((p) => names.add(parseRange(p).name));
++  (def.vars || []).forEach(visit);
++  mapValue(def.objs || [], null, {
++    expr: visit,
++    enter: (loops, scope) => {
++      loops.forEach((n) => names.add(n));
++      return { names: loops, scope };
++    },
++  });
++  return names;
++}
++
++function definedNames(def) {
++  const names = new Set();
++  (def.params || []).forEach((p) => names.add(parseRange(p).name));
++  for (const v of def.vars || []) {
++    const node = math.parse(v);
++    if (node.isAssignmentNode || node.isFunctionAssignmentNode) names.add(node.name);
++  }
++  return names;
++}
++
++function freeNamesOf(def) {
++  const bound = definedNames(def);
++  for (let k = 1; k <= (def.numPoints || 0); k++) {
++    bound.add(`x_${k}`).add(`y_${k}`);
++  }
++  const free = new Set();
++  const visit = (node, local) => {
++    node.traverse((n) => {
++      if (n.isSymbolNode && !bound.has(n.name) && !local.has(n.name)) free.add(n.name);
++    });
++  };
++  for (const v of def.vars || []) {
++    const node = math.parse(v);
++    if (node.isFunctionAssignmentNode) visit(node.expr, new Set(node.params));
++    else visit(node.isAssignmentNode ? node.value : node, new Set());
++  }
++  mapValue(def.objs || [], new Set(), {
++    expr: (src, local) => (visit(math.parse(src), local), src),
++    enter: (loops, local) => ({ names: loops, scope: new Set([...local, ...loops]) }),
++  });
++  return free;
++}
++
++function wrap(node) {
++  if (node.isSymbolNode || node.isParenthesisNode) return node.clone();
++  if (node.isConstantNode && !(typeof node.value === 'number' && node.value < 0)) return node.clone();
++  return new math.ParenthesisNode(node.clone());
++}
++
++function substitute(node, env, funcs, bodyEnv) {
++  return node.transform(function walk(n) {
++    if (n.isFunctionNode && n.fn.isSymbolNode && funcs[n.fn.name] && !(n.fn.name in env)) {
++      const f = funcs[n.fn.name];
++      const inner = { ...bodyEnv(env) };
++      f.params.forEach((p, i) => {
++        inner[p] = wrap(substitute(n.args[i], env, funcs, bodyEnv));
++      });
++      return new math.ParenthesisNode(substitute(f.body, inner, funcs, bodyEnv));
++    }
++    if (n.isSymbolNode && Object.prototype.hasOwnProperty.call(env, n.name)) {
++      return wrap(env[n.name]);
++    }
++    return n;
++  });
++}
++
++function templateToNode(value) {
++  if (typeof value === 'number') return new math.ConstantNode(value);
++  const parts = String(value).split('`');
++  return math.parse(parts.length >= 3 ? parts[1] : parts[0]);
++}
++
++function defaultOf(spec) {
++  const bounds = parseRange(spec).bounds;
++  return new math.ConstantNode(math.evaluate(bounds.length === 4 ? bounds[3] : bounds[0]));
++}
++
++function bindInstance(row, child) {
++  const env = {};
++  for (let k = 0; k < (child.numPoints || 0); k++) {
++    const point = row.points ? row.points[k] : { x: 0, y: 0 };
++    env[`x_${k + 1}`] = templateToNode(point.x);
++    env[`y_${k + 1}`] = templateToNode(point.y);
++  }
++  for (const spec of child.params || []) {
++    const name = parseRange(spec).name;
++    env[name] = row.params ? templateToNode(row.params[name]) : defaultOf(spec);
++  }
++  const funcs = {};
++  const scalars = [];
++  for (const v of child.vars || []) {
++    const node = math.parse(v);
++    if (node.isFunctionAssignmentNode) {
++      funcs[node.name] = { params: node.params, body: node.expr };
++    } else {
++      scalars.push(node);
++    }
++  }
++  const finalEnv = () => env;
++  for (const node of scalars) {
++    env[node.name] = substitute(node.value, env, funcs, finalEnv);
++  }
++  return { env, funcs };
++}
++
++function freshNamer(used) {
++  return (base) => {
++    if (!used.has(base)) {
++      used.add(base);
++      return base;
++    }
++    let k = 1;
++    while (used.has(`${base}_${k}`)) k++;
++    used.add(`${base}_${k}`);
++    return `${base}_${k}`;
++  };
++}
++
++function symbolsOf(node) {
++  const names = new Set();
++  node.traverse((n) => {
++    if (n.isSymbolNode) names.add(n.name);
++  });
++  return names;
++}
++
++/**
++ * Rewrite the instance row `parentDef.objs[index]` into the rows of its module, expressed in the
++ * parent's own names.
++ * @returns {{rows: Array<Object>, maxLoopLength: number}|null} The replacement rows and the loop limit
++ *   they need, or null when the row cannot be inlined.
++ */
++export function inlineRows(parentDef, index, modules) {
++  const row = parentDef.objs[index];
++  const child = modules[row.module];
++  const outerLoops = rangesOf(row).map((r) => r.name);
++  const parentNames = definedNames(parentDef);
++  outerLoops.forEach((n) => parentNames.add(n));
++  for (let k = 1; k <= (parentDef.numPoints || 0); k++) {
++    parentNames.add(`x_${k}`).add(`y_${k}`);
++  }
++  if ([...freeNamesOf(child)].some((name) => parentNames.has(name))) return null;
++
++  const used = namesUsedIn(parentDef);
++  namesUsedIn(child).forEach((n) => used.add(n));
++  const fresh = freshNamer(used);
++  const { env, funcs } = bindInstance(row, child);
++  const outer = (src) => substitute(math.parse(src), env, funcs, () => env);
++  const dependsOnOuterLoop = (node) => outerLoops.some((n) => symbolsOf(node).has(n));
++  let nestedLoops = false;
++  let refused = false;
++  const hooks = {
++    expr: (src, scope) => substitute(math.parse(src), scope, funcs, () => scope).toString({ implicit: 'show' }),
++    bound: (src, scope) => {
++      const node = substitute(math.parse(src), scope, funcs, () => scope);
++      if (dependsOnOuterLoop(node)) refused = true;
++      return node.toString({ implicit: 'show' });
++    },
++    enter: (loops, scope) => {
++      nestedLoops = true;
++      const inner = { ...scope };
++      const names = loops.map((n) => {
++        inner[n] = new math.SymbolNode(fresh(n));
++        return inner[n].name;
++      });
++      return { names, scope: inner };
++    },
++  };
++
++  const parentMax = parentDef.maxLoopLength || DEFAULT_MAX_LOOP_LENGTH;
++  const childMax = child.maxLoopLength || DEFAULT_MAX_LOOP_LENGTH;
++  let maxLoopLength = parentMax;
++  const rows = [];
++  for (const childRow of child.objs || []) {
++    const localEnv = { ...env };
++    const ranges = [];
++    for (const { name, bounds } of rangesOf(childRow)) {
++      const nodes = bounds.map(outer);
++      if (nodes.some(dependsOnOuterLoop)) return null;
++      localEnv[name] = new math.SymbolNode(fresh(name));
++      ranges.push(`${localEnv[name].name}=${nodes.map((node) => node.toString({ implicit: 'show' })).join(':')}`);
++    }
++    const inner = (src) => hooks.expr(src, localEnv);
++    const body = {};
++    for (const key in childRow) {
++      if (key !== 'for' && key !== 'if') body[key] = mapValue(childRow[key], localEnv, hooks);
++    }
++    const loops = [].concat(row.for || [], ranges);
++    if (loops.length) body.for = loops.length === 1 ? loops[0] : loops;
++    if ('if' in childRow) {
++      body.if = 'if' in row ? `(${row.if}) and (${inner(childRow.if)})` : inner(childRow.if);
++    } else if ('if' in row) {
++      body.if = row.if;
++    }
++    if (ranges.length) {
++      maxLoopLength = Math.max(maxLoopLength, row.for ? parentMax * childMax : childMax);
++    }
++    rows.push(body);
++  }
++  if (refused) return null;
++  if (nestedLoops) {
++    maxLoopLength = Math.max(maxLoopLength, childMax);
++  }
++  return { rows, maxLoopLength };
++}
++
++/**
++ * Check that every instance of a module in the scene expands, along with the instances created by
++ * its rows at `indices`. The loop limits of those instances cannot be kept once their rows are inlined.
++ * @param {Array<Object>} objs - The scene objects.
++ * @param {string} moduleName - The module whose rows are inlined.
++ * @param {Array<number>} indices - The indices of the inlined rows.
++ * @returns {boolean} Whether all of those instances expand without errors.
++ */
++export function instancesExpand(objs, moduleName, indices) {
++  return objs.every((obj) => {
++    if (obj.constructor.type !== 'ModuleObj') return true;
++    if (obj.module === moduleName) {
++      if (obj.error) return false;
++      const failed = obj.objs.some((inner) => inner.constructor.type === 'ModuleObj' && indices.includes(inner._moduleSourceIndex) && inner.getError());
++      if (failed) return false;
++    }
++    return instancesExpand(obj.objs, moduleName, indices);
++  });
++}
++
++function isReadable(name) {
++  try {
++    return math.evaluate(name, { [name]: 1 }) === 1;
++  } catch (e) {
++    return false;
++  }
++}
++
++function renameIn(src, oldName, newName, shadowed) {
++  if (shadowed) return src;
++  return math.parse(src).transform((n) => {
++    if (n.isFunctionAssignmentNode && n.params.includes(oldName)) return n.clone();
++    if (n.isSymbolNode && n.name === oldName) return new math.SymbolNode(newName);
++    return n;
++  }).toString({ implicit: 'show' });
++}
++
++/**
++ * Rename every use of the parameter `oldName` inside a module definition.
++ * @returns {boolean} Whether the definition was rewritten.
++ */
++export function renameParamInDef(def, oldName, newName) {
++  const index = (def.params || []).findIndex((p) => parseRange(p).name === oldName);
++  if (index < 0) return false;
++  if (!isValidFormulaParameterName(newName) || /^[xy]_\d+$/.test(newName) || newName === 'random' || !isReadable(newName)) return false;
++  try {
++    const probe = math.parse(`${newName} + 1`);
++    if (!probe.args[0].isSymbolNode) return false;
++  } catch (e) {
++    return false;
++  }
++  if (namesUsedIn(def).has(newName)) return false;
++
++  const spec = def.params[index];
++  def.params[index] = newName + spec.slice(spec.indexOf('='));
++  def.vars = (def.vars || []).map((v) => renameIn(v, oldName, newName, false));
++  def.objs = mapValue(def.objs || [], false, {
++    expr: (src, shadowed) => renameIn(src, oldName, newName, shadowed),
++    enter: (loops, shadowed) => ({ names: loops, scope: shadowed || loops.includes(oldName) }),
++  });
++  return true;
++}

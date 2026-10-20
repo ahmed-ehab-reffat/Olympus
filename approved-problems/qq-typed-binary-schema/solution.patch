@@ -1,0 +1,794 @@
+diff --git a/codec/avro/avro.go b/codec/avro/avro.go
+index 02405bd..698dc64 100644
+--- a/codec/avro/avro.go
++++ b/codec/avro/avro.go
+@@ -3,10 +3,11 @@ package avro
+ import (
+ 	"bytes"
+ 	"fmt"
+-	"sort"
+ 	"strings"
+ 
++	"github.com/JFryy/qq/codec/util"
+ 	"github.com/goccy/go-json"
++	"github.com/hamba/avro/v2"
+ 	"github.com/hamba/avro/v2/ocf"
+ )
+ 
+@@ -18,19 +19,22 @@ func (c *Codec) Unmarshal(data []byte, v any) error {
+ 		return fmt.Errorf("error creating avro decoder: %v", err)
+ 	}
+ 
+-	var records []map[string]any
++	records := []any{}
+ 	for dec.HasNext() {
+ 		var record map[string]any
+ 		if err := dec.Decode(&record); err != nil {
+ 			return fmt.Errorf("error decoding avro record: %v", err)
+ 		}
+-		records = append(records, record)
++		records = append(records, util.NormalizeNumbers(unwrap(record, dec.Schema())))
+ 	}
+ 	if err := dec.Error(); err != nil {
+ 		return fmt.Errorf("avro decode error: %v", err)
+ 	}
+ 
+-	// JSON roundtrip normalises numeric types (same approach as parquet codec)
++	if ptr, ok := v.(*any); ok {
++		*ptr = records
++		return nil
++	}
+ 	jsonData, err := json.Marshal(records)
+ 	if err != nil {
+ 		return fmt.Errorf("error marshaling to JSON: %v", err)
+@@ -38,40 +42,73 @@ func (c *Codec) Unmarshal(data []byte, v any) error {
+ 	return json.Unmarshal(jsonData, v)
+ }
+ 
+-func (c *Codec) Marshal(v any) ([]byte, error) {
+-	// Normalise to []map[string]any via JSON roundtrip
+-	jsonData, err := json.Marshal(v)
+-	if err != nil {
+-		return nil, err
++func unwrap(value any, schema avro.Schema) any {
++	if value == nil {
++		return nil
+ 	}
+-
+-	var records []map[string]any
+-	if err := json.Unmarshal(jsonData, &records); err != nil {
+-		// Try single record
+-		var record map[string]any
+-		if err2 := json.Unmarshal(jsonData, &record); err2 != nil {
+-			return nil, fmt.Errorf("avro output requires an array of objects or a single object")
++	switch s := schema.(type) {
++	case *avro.UnionSchema:
++		for _, branch := range s.Types() {
++			if branch.Type() == avro.Null {
++				continue
++			}
++			key := string(branch.Type())
++			if named, ok := branch.(avro.NamedSchema); ok {
++				key = named.FullName()
++			}
++			if wrapped, ok := value.(map[string]any); ok && len(wrapped) == 1 && wrapped[key] != nil {
++				return unwrap(wrapped[key], branch)
++			}
++			return unwrap(value, branch)
++		}
++	case *avro.RecordSchema:
++		m := value.(map[string]any)
++		out := make(map[string]any, len(m))
++		for _, field := range s.Fields() {
++			key := field.Name()
++			if original, ok := field.Prop(keyProp).(string); ok {
++				key = original
++			}
++			out[key] = unwrap(m[field.Name()], field.Type())
++		}
++		return out
++	case *avro.ArraySchema:
++		items, _ := value.([]any)
++		out := make([]any, len(items))
++		for i, item := range items {
++			out[i] = unwrap(item, s.Items())
+ 		}
+-		records = []map[string]any{record}
++		return out
+ 	}
++	return value
++}
+ 
+-	if len(records) == 0 {
+-		return nil, fmt.Errorf("no data to write")
++func (c *Codec) Marshal(v any) ([]byte, error) {
++	records, err := util.Records(v)
++	if err != nil {
++		return nil, fmt.Errorf("avro %v", err)
+ 	}
++	shape := util.InferShape(records)
+ 
+-	schemaStr, err := inferSchema(records[0])
++	names := &recordNames{columns: map[*util.Shape]map[string]string{}}
++	schemaJSON, err := json.Marshal(avroType(shape, names, false))
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	schema, err := avro.Parse(string(schemaJSON))
++	if err != nil {
++		return nil, fmt.Errorf("error building avro schema: %v", err)
++	}
+ 
+ 	var buf bytes.Buffer
+-	enc, err := ocf.NewEncoder(schemaStr, &buf)
++	enc, err := ocf.NewEncoderWithSchema(schema, &buf, ocf.WithSchemaMarshaler(ocf.FullSchemaMarshaler))
+ 	if err != nil {
+ 		return nil, fmt.Errorf("error creating avro encoder: %v", err)
+ 	}
+ 
+ 	for _, record := range records {
+-		if err := enc.Encode(stringifyComplex(record)); err != nil {
++		value := wrapUnions(util.Conform(record, shape), shape, names, false)
++		if err := enc.Encode(value); err != nil {
+ 			return nil, fmt.Errorf("error encoding avro record: %v", err)
+ 		}
+ 	}
+@@ -82,57 +119,140 @@ func (c *Codec) Marshal(v any) ([]byte, error) {
+ 	return buf.Bytes(), nil
+ }
+ 
+-// stringifyComplex returns a copy of the record with any complex (non-scalar)
+-// values JSON-serialised as strings, matching the schema produced by inferSchema.
+-func stringifyComplex(record map[string]any) map[string]any {
+-	out := make(map[string]any, len(record))
+-	for k, v := range record {
+-		switch v.(type) {
+-		case nil, bool, float64, int64, string:
+-			out[k] = v
+-		default:
+-			b, err := json.Marshal(v)
+-			if err != nil {
+-				out[k] = fmt.Sprintf("%v", v)
+-			} else {
+-				out[k] = string(b)
+-			}
++const keyProp = "qqKey"
++
++func fieldNames(keys []string) map[string]string {
++	columns := make(map[string]string, len(keys))
++	taken := make(map[string]bool, len(keys))
++	for _, key := range keys {
++		if validName(key) {
++			columns[key] = key
++			taken[key] = true
++		}
++	}
++	for _, key := range keys {
++		if _, ok := columns[key]; ok {
++			continue
+ 		}
++		base := sanitizeName(key)
++		name := base
++		for i := 2; taken[name]; i++ {
++			name = fmt.Sprintf("%s_%d", base, i)
++		}
++		columns[key] = name
++		taken[name] = true
+ 	}
+-	return out
++	return columns
+ }
+ 
+-// inferAvroFieldType returns an Avro type string for a Go value.
+-// Complex types (objects, arrays) are stringified.
+-func inferAvroFieldType(v any) string {
+-	switch v.(type) {
+-	case bool:
+-		return `"boolean"`
+-	case float64:
+-		return `"double"`
+-	case int64:
+-		return `"long"`
+-	case string:
+-		return `"string"`
+-	default:
+-		return `"string"`
++func validName(name string) bool {
++	if name == "" {
++		return false
++	}
++	for i, r := range name {
++		if !nameChar(r) || (i == 0 && r >= '0' && r <= '9') {
++			return false
++		}
++	}
++	return true
++}
++
++func nameChar(r rune) bool {
++	return r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
++}
++
++func sanitizeName(key string) string {
++	var b strings.Builder
++	for _, r := range key {
++		if nameChar(r) {
++			b.WriteRune(r)
++		} else {
++			b.WriteByte('_')
++		}
++	}
++	name := b.String()
++	if name == "" || (name[0] >= '0' && name[0] <= '9') {
++		name = "_" + name
+ 	}
++	return name
++}
++
++type recordNames struct {
++	count   int
++	columns map[*util.Shape]map[string]string
+ }
+ 
+-// inferSchema builds an Avro record schema from the first record's keys/types.
+-// All fields are nullable (["null", <type>]) with a default of null.
+-func inferSchema(sample map[string]any) (string, error) {
+-	var fieldNames []string
+-	for k := range sample {
+-		fieldNames = append(fieldNames, k)
++func (n *recordNames) next() string {
++	n.count++
++	if n.count == 1 {
++		return "Root"
+ 	}
+-	sort.Strings(fieldNames)
++	return fmt.Sprintf("Record%d", n.count-1)
++}
+ 
+-	var fields []string
+-	for _, k := range fieldNames {
+-		avroType := inferAvroFieldType(sample[k])
+-		fields = append(fields, fmt.Sprintf(`{"name":%q,"type":["null",%s],"default":null}`, k, avroType))
++func avroType(s *util.Shape, names *recordNames, allowNull bool) any {
++	var base any
++	switch s.Leaf() {
++	case util.KindBool:
++		base = "boolean"
++	case util.KindInt:
++		base = "long"
++	case util.KindFloat:
++		base = "double"
++	case util.KindRecord:
++		s.Name = names.next()
++		fields := []any{}
++		columns := fieldNames(s.FieldNames())
++		names.columns[s] = columns
++		for _, key := range s.FieldNames() {
++			field := map[string]any{"name": columns[key], "type": avroType(s.Fields[key], names, true)}
++			if columns[key] != key {
++				field[keyProp] = key
++			}
++			if s.Fields[key].IsNullable() {
++				field["default"] = nil
++			}
++			fields = append(fields, field)
++		}
++		base = map[string]any{"type": "record", "name": s.Name, "fields": fields}
++	case util.KindList:
++		base = map[string]any{"type": "array", "items": avroType(s.Elem, names, true)}
++	default:
++		base = "string"
+ 	}
++	if allowNull && s.IsNullable() {
++		return []any{"null", base}
++	}
++	return base
++}
+ 
+-	return fmt.Sprintf(`{"type":"record","name":"Root","fields":[%s]}`, strings.Join(fields, ",")), nil
++func wrapUnions(value any, s *util.Shape, names *recordNames, inUnion bool) any {
++	var branch string
++	switch s.Leaf() {
++	case util.KindRecord:
++		branch = s.Name
++		if m, ok := value.(map[string]any); ok {
++			out := make(map[string]any, len(m))
++			columns := names.columns[s]
++			for key, field := range s.Fields {
++				out[columns[key]] = wrapUnions(m[key], field, names, field.IsNullable())
++			}
++			value = out
++		}
++	case util.KindList:
++		branch = "array"
++		if items, ok := value.([]any); ok {
++			out := make([]any, len(items))
++			for i, item := range items {
++				out[i] = wrapUnions(item, s.Elem, names, s.Elem.IsNullable())
++			}
++			value = out
++		}
++	default:
++		return value
++	}
++	if inUnion && value != nil {
++		return map[string]any{branch: value}
++	}
++	return value
+ }
+diff --git a/codec/parquet/parquet.go b/codec/parquet/parquet.go
+index 870d1fc..13e3a4c 100644
+--- a/codec/parquet/parquet.go
++++ b/codec/parquet/parquet.go
+@@ -4,10 +4,8 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"fmt"
+-	"maps"
+-	"reflect"
+-	"slices"
+ 
++	"github.com/JFryy/qq/codec/util"
+ 	"github.com/apache/arrow/go/v16/arrow"
+ 	"github.com/apache/arrow/go/v16/arrow/array"
+ 	"github.com/apache/arrow/go/v16/arrow/memory"
+@@ -21,28 +19,16 @@ import (
+ type Codec struct{}
+ 
+ func (c *Codec) Marshal(v any) ([]byte, error) {
+-	rv := reflect.ValueOf(v)
+-	if rv.Kind() != reflect.Slice {
+-		return nil, fmt.Errorf("input data must be a slice")
+-	}
+-
+-	if rv.Len() == 0 {
+-		return nil, fmt.Errorf("no data to write")
+-	}
+-
+-	firstElem := rv.Index(0).Interface()
+-	firstElemValue, ok := firstElem.(map[string]any)
+-	if !ok {
+-		return nil, fmt.Errorf("slice elements must be of type map[string]any")
++	records, err := util.Records(v)
++	if err != nil {
++		return nil, fmt.Errorf("parquet %v", err)
+ 	}
++	shape := util.InferShape(records)
+ 
+-	mem := memory.NewGoAllocator()
+ 	var fields []arrow.Field
+-
+-	for _, key := range slices.Sorted(maps.Keys(firstElemValue)) {
+-		fields = append(fields, arrow.Field{Name: key, Type: arrow.BinaryTypes.String, Nullable: true})
++	for _, key := range shape.FieldNames() {
++		fields = append(fields, arrowField(key, shape.Fields[key]))
+ 	}
+-
+ 	schema := arrow.NewSchema(fields, nil)
+ 
+ 	var buf bytes.Buffer
+@@ -55,28 +41,17 @@ func (c *Codec) Marshal(v any) ([]byte, error) {
+ 	}
+ 	defer writer.Close()
+ 
+-	builders := make([]array.Builder, len(fields))
+-	for i := range fields {
+-		builders[i] = array.NewStringBuilder(mem)
+-	}
++	builder := array.NewRecordBuilder(memory.NewGoAllocator(), schema)
++	defer builder.Release()
+ 
+-	for i := 0; i < rv.Len(); i++ {
+-		recordMap := rv.Index(i).Interface().(map[string]any)
+-		for j, field := range fields {
+-			if value, ok := recordMap[field.Name]; ok {
+-				builders[j].(*array.StringBuilder).Append(fmt.Sprintf("%v", value))
+-			} else {
+-				builders[j].(*array.StringBuilder).AppendNull()
+-			}
++	for _, record := range records {
++		row := util.Conform(record, shape).(map[string]any)
++		for j, key := range shape.FieldNames() {
++			appendValue(builder.Field(j), shape.Fields[key], row[key])
+ 		}
+ 	}
+ 
+-	columns := make([]arrow.Array, len(builders))
+-	for i, builder := range builders {
+-		columns[i] = builder.NewArray()
+-	}
+-
+-	record := array.NewRecord(schema, columns, int64(rv.Len()))
++	record := builder.NewRecord()
+ 	defer record.Release()
+ 
+ 	if err := writer.Write(record); err != nil {
+@@ -90,6 +65,60 @@ func (c *Codec) Marshal(v any) ([]byte, error) {
+ 	return buf.Bytes(), nil
+ }
+ 
++func arrowField(name string, s *util.Shape) arrow.Field {
++	return arrow.Field{Name: name, Type: arrowType(s), Nullable: s.IsNullable()}
++}
++
++func arrowType(s *util.Shape) arrow.DataType {
++	switch s.Leaf() {
++	case util.KindBool:
++		return arrow.FixedWidthTypes.Boolean
++	case util.KindInt:
++		return arrow.PrimitiveTypes.Int64
++	case util.KindFloat:
++		return arrow.PrimitiveTypes.Float64
++	case util.KindRecord:
++		var fields []arrow.Field
++		for _, key := range s.FieldNames() {
++			fields = append(fields, arrowField(key, s.Fields[key]))
++		}
++		return arrow.StructOf(fields...)
++	case util.KindList:
++		return arrow.ListOfField(arrowField("element", s.Elem))
++	}
++	return arrow.BinaryTypes.String
++}
++
++func appendValue(b array.Builder, s *util.Shape, v any) {
++	if v == nil {
++		b.AppendNull()
++		return
++	}
++	switch s.Leaf() {
++	case util.KindBool:
++		b.(*array.BooleanBuilder).Append(v.(bool))
++	case util.KindInt:
++		b.(*array.Int64Builder).Append(v.(int64))
++	case util.KindFloat:
++		b.(*array.Float64Builder).Append(v.(float64))
++	case util.KindRecord:
++		sb := b.(*array.StructBuilder)
++		sb.Append(true)
++		m := v.(map[string]any)
++		for i, key := range s.FieldNames() {
++			appendValue(sb.FieldBuilder(i), s.Fields[key], m[key])
++		}
++	case util.KindList:
++		lb := b.(*array.ListBuilder)
++		lb.Append(true)
++		for _, item := range v.([]any) {
++			appendValue(lb.ValueBuilder(), s.Elem, item)
++		}
++	default:
++		b.(*array.StringBuilder).Append(v.(string))
++	}
++}
++
+ func (c *Codec) Unmarshal(input []byte, v any) error {
+ 	reader := bytes.NewReader(input)
+ 
+@@ -104,65 +133,71 @@ func (c *Codec) Unmarshal(input []byte, v any) error {
+ 		return fmt.Errorf("error creating arrow file reader: %v", err)
+ 	}
+ 
+-	// Read the whole table
+ 	table, err := fileReader.ReadTable(context.Background())
+ 	if err != nil {
+ 		return fmt.Errorf("error reading table: %v", err)
+ 	}
+ 	defer table.Release()
+ 
+-	// Convert table to records
+-	tableReader := array.NewTableReader(table, 1000) // batch size
++	tableReader := array.NewTableReader(table, 1000)
+ 	defer tableReader.Release()
+ 
+-	var records []map[string]any
+-
++	records := []any{}
+ 	for tableReader.Next() {
+ 		record := tableReader.Record()
+ 		schema := record.Schema()
+-		numRows := record.NumRows()
+-		numCols := record.NumCols()
+-
+-		for i := range numRows {
++		for i := 0; i < int(record.NumRows()); i++ {
+ 			rowMap := make(map[string]any)
+-			for j := 0; j < int(numCols); j++ {
+-				field := schema.Field(j)
+-				column := record.Column(j)
+-
+-				if column.IsNull(int(i)) {
+-					rowMap[field.Name] = nil
+-				} else {
+-					switch arr := column.(type) {
+-					case *array.String:
+-						rowMap[field.Name] = arr.Value(int(i))
+-					case *array.Int64:
+-						rowMap[field.Name] = arr.Value(int(i))
+-					case *array.Float64:
+-						rowMap[field.Name] = arr.Value(int(i))
+-					case *array.Boolean:
+-						rowMap[field.Name] = arr.Value(int(i))
+-					case *array.Int32:
+-						rowMap[field.Name] = arr.Value(int(i))
+-					case *array.Float32:
+-						rowMap[field.Name] = arr.Value(int(i))
+-					default:
+-						rowMap[field.Name] = fmt.Sprintf("%v", column.GetOneForMarshal(int(i)))
+-					}
+-				}
++			for j := 0; j < int(record.NumCols()); j++ {
++				rowMap[schema.Field(j).Name] = arrowValue(record.Column(j), i)
+ 			}
+ 			records = append(records, rowMap)
+ 		}
+ 	}
+ 
+-	// Always use JSON marshaling for consistent type handling
++	if ptr, ok := v.(*any); ok {
++		*ptr = records
++		return nil
++	}
+ 	jsonData, err := json.Marshal(records)
+ 	if err != nil {
+ 		return fmt.Errorf("error marshaling to JSON: %v", err)
+ 	}
++	return json.Unmarshal(jsonData, v)
++}
+ 
+-	if err := json.Unmarshal(jsonData, v); err != nil {
+-		return fmt.Errorf("error unmarshaling JSON: %v", err)
++func arrowValue(column arrow.Array, i int) any {
++	if column.IsNull(i) {
++		return nil
++	}
++	switch arr := column.(type) {
++	case *array.String:
++		return arr.Value(i)
++	case *array.Boolean:
++		return arr.Value(i)
++	case *array.Int64:
++		return util.NormalizeNumbers(arr.Value(i))
++	case *array.Int32:
++		return int(arr.Value(i))
++	case *array.Float64:
++		return arr.Value(i)
++	case *array.Float32:
++		return float64(arr.Value(i))
++	case *array.Struct:
++		st := arr.DataType().(*arrow.StructType)
++		m := make(map[string]any, arr.NumField())
++		for j := 0; j < arr.NumField(); j++ {
++			m[st.Field(j).Name] = arrowValue(arr.Field(j), i)
++		}
++		return m
++	case *array.List:
++		start, end := arr.ValueOffsets(i)
++		values := arr.ListValues()
++		items := make([]any, 0, end-start)
++		for k := start; k < end; k++ {
++			items = append(items, arrowValue(values, int(k)))
++		}
++		return items
+ 	}
+-
+-	return nil
++	return fmt.Sprintf("%v", column.GetOneForMarshal(i))
+ }
+diff --git a/codec/util/shape.go b/codec/util/shape.go
+new file mode 100644
+index 0000000..9ebc6e5
+--- /dev/null
++++ b/codec/util/shape.go
+@@ -0,0 +1,212 @@
++package util
++
++import (
++	"fmt"
++	"maps"
++	"math/big"
++	"slices"
++
++	"github.com/goccy/go-json"
++)
++
++type Kind int
++
++const (
++	KindNull Kind = iota
++	KindBool
++	KindInt
++	KindFloat
++	KindString
++	KindRecord
++	KindList
++	KindMixed
++)
++
++type Shape struct {
++	Kind     Kind
++	Nullable bool
++	Fields   map[string]*Shape
++	Elem     *Shape
++	Name     string
++}
++
++func (s *Shape) FieldNames() []string {
++	return slices.Sorted(maps.Keys(s.Fields))
++}
++
++func Records(v any) ([]any, error) {
++	switch t := v.(type) {
++	case map[string]any:
++		return []any{t}, nil
++	case []any:
++		if len(t) == 0 {
++			return nil, fmt.Errorf("no data to write")
++		}
++		for i, item := range t {
++			if _, ok := item.(map[string]any); !ok {
++				return nil, fmt.Errorf("record %d is not an object", i)
++			}
++		}
++		return t, nil
++	case []map[string]any:
++		out := make([]any, len(t))
++		for i, item := range t {
++			out[i] = item
++		}
++		return Records(out)
++	}
++	return nil, fmt.Errorf("output requires an array of objects or a single object")
++}
++
++func InferShape(values []any) *Shape {
++	s := &Shape{Kind: KindNull}
++	for _, v := range values {
++		s = mergeShapes(s, shapeOf(v))
++	}
++	return s
++}
++
++func shapeOf(v any) *Shape {
++	switch t := v.(type) {
++	case nil:
++		return &Shape{Kind: KindNull, Nullable: true}
++	case bool:
++		return &Shape{Kind: KindBool}
++	case int, int8, int16, int32, int64, uint8, uint16, uint32:
++		return &Shape{Kind: KindInt}
++	case float32, float64:
++		return &Shape{Kind: KindFloat}
++	case string:
++		return &Shape{Kind: KindString}
++	case map[string]any:
++		fields := make(map[string]*Shape, len(t))
++		for key, item := range t {
++			fields[key] = shapeOf(item)
++		}
++		return &Shape{Kind: KindRecord, Fields: fields}
++	case []any:
++		return &Shape{Kind: KindList, Elem: InferShape(t)}
++	}
++	return &Shape{Kind: KindMixed}
++}
++
++func mergeShapes(a, b *Shape) *Shape {
++	if a.Kind == KindNull {
++		merged := *b
++		merged.Nullable = merged.Nullable || a.Nullable
++		return &merged
++	}
++	if b.Kind == KindNull {
++		merged := *a
++		merged.Nullable = true
++		return &merged
++	}
++	merged := &Shape{Kind: a.Kind, Nullable: a.Nullable || b.Nullable}
++	switch {
++	case a.Kind == KindRecord && b.Kind == KindRecord:
++		merged.Fields = make(map[string]*Shape)
++		for key, fa := range a.Fields {
++			if fb, ok := b.Fields[key]; ok {
++				merged.Fields[key] = mergeShapes(fa, fb)
++			} else {
++				merged.Fields[key] = mergeShapes(fa, &Shape{Kind: KindNull, Nullable: true})
++			}
++		}
++		for key, fb := range b.Fields {
++			if _, ok := a.Fields[key]; !ok {
++				merged.Fields[key] = mergeShapes(fb, &Shape{Kind: KindNull, Nullable: true})
++			}
++		}
++	case a.Kind == KindList && b.Kind == KindList:
++		merged.Elem = mergeShapes(a.Elem, b.Elem)
++	case a.Kind == b.Kind:
++	case isNumeric(a.Kind) && isNumeric(b.Kind):
++		merged.Kind = KindFloat
++	default:
++		merged.Kind = KindMixed
++	}
++	return merged
++}
++
++func isNumeric(k Kind) bool {
++	return k == KindInt || k == KindFloat
++}
++
++func (s *Shape) IsNullable() bool {
++	return s.Nullable || s.Kind == KindNull
++}
++
++func (s *Shape) Leaf() Kind {
++	if s.Kind == KindNull {
++		return KindString
++	}
++	return s.Kind
++}
++
++func Conform(v any, s *Shape) any {
++	if v == nil {
++		return nil
++	}
++	switch s.Leaf() {
++	case KindInt:
++		return toInt64(v)
++	case KindFloat:
++		return toFloat64(v)
++	case KindRecord:
++		m := v.(map[string]any)
++		out := make(map[string]any, len(s.Fields))
++		for key, field := range s.Fields {
++			out[key] = Conform(m[key], field)
++		}
++		return out
++	case KindList:
++		items := v.([]any)
++		out := make([]any, len(items))
++		for i, item := range items {
++			out[i] = Conform(item, s.Elem)
++		}
++		return out
++	case KindMixed:
++		b, err := json.Marshal(v)
++		if err != nil {
++			return fmt.Sprintf("%v", v)
++		}
++		return string(b)
++	}
++	return v
++}
++
++func toInt64(v any) int64 {
++	switch n := v.(type) {
++	case int:
++		return int64(n)
++	case int8:
++		return int64(n)
++	case int16:
++		return int64(n)
++	case int32:
++		return int64(n)
++	case int64:
++		return n
++	case uint8:
++		return int64(n)
++	case uint16:
++		return int64(n)
++	case uint32:
++		return int64(n)
++	}
++	return 0
++}
++
++func toFloat64(v any) float64 {
++	switch n := v.(type) {
++	case float64:
++		return n
++	case float32:
++		return float64(n)
++	case *big.Int:
++		f, _ := new(big.Float).SetInt(n).Float64()
++		return f
++	}
++	return float64(toInt64(v))
++}

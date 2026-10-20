@@ -1,0 +1,1509 @@
+diff --git a/csbindgen/src/const_eval.rs b/csbindgen/src/const_eval.rs
+new file mode 100644
+index 0000000..95f1640
+--- /dev/null
++++ b/csbindgen/src/const_eval.rs
+@@ -0,0 +1,1198 @@
++use crate::alias_map::AliasMap;
++use crate::emitter::convert_token_enum_repr;
++use crate::type_meta::{PointerType, RustConst, RustEnum, RustType, TypeKind};
++use std::cell::RefCell;
++use std::cmp::Ordering;
++use std::collections::{HashMap, HashSet};
++use syn::{BinOp, Expr, Lit, UnOp};
++
++#[derive(Clone, Copy, PartialEq, Debug)]
++pub struct IntTy {
++    bits: u32,
++    signed: bool,
++}
++
++#[derive(Clone, Copy, PartialEq, Debug)]
++pub enum Ty {
++    Int(IntTy),
++    F32,
++    F64,
++    Bool,
++    Char,
++    Str,
++}
++
++#[derive(Clone, PartialEq, Debug)]
++pub enum Value {
++    Int(u128, IntTy),
++    F32(f32),
++    F64(f64),
++    Bool(bool),
++    Char(char),
++    Str(String),
++    Bytes(Vec<u8>),
++}
++
++impl IntTy {
++    fn normalize(self, raw: u128) -> u128 {
++        if self.bits == 128 {
++            return raw;
++        }
++        let mask = (1u128 << self.bits) - 1;
++        let low = raw & mask;
++        if self.signed && (low >> (self.bits - 1)) & 1 == 1 {
++            low | !mask
++        } else {
++            low
++        }
++    }
++
++    fn max(self) -> u128 {
++        match (self.signed, self.bits) {
++            (true, bits) => (1u128 << (bits - 1)) - 1,
++            (false, 128) => u128::MAX,
++            (false, bits) => (1u128 << bits) - 1,
++        }
++    }
++
++    fn min(self) -> u128 {
++        if self.signed {
++            self.normalize(1u128 << (self.bits - 1))
++        } else {
++            0
++        }
++    }
++
++    fn saturate(self, value: f64) -> u128 {
++        if value.is_nan() {
++            return 0;
++        }
++        let value = value.trunc();
++        if self.signed {
++            let limit = 2f64.powi(self.bits as i32 - 1);
++            if value >= limit {
++                self.max()
++            } else if value < -limit {
++                self.min()
++            } else {
++                self.normalize(value as i128 as u128)
++            }
++        } else {
++            let limit = 2f64.powi(self.bits as i32);
++            if value >= limit {
++                self.max()
++            } else if value <= 0.0 {
++                0
++            } else {
++                value as u128
++            }
++        }
++    }
++
++    fn as_f64(self, raw: u128) -> f64 {
++        if self.signed {
++            raw as i128 as f64
++        } else {
++            raw as f64
++        }
++    }
++
++    fn as_f32(self, raw: u128) -> f32 {
++        if self.signed {
++            raw as i128 as f32
++        } else {
++            raw as f32
++        }
++    }
++}
++
++impl Value {
++    fn ty(&self) -> Option<Ty> {
++        match self {
++            Value::Int(_, t) => Some(Ty::Int(*t)),
++            Value::F32(_) => Some(Ty::F32),
++            Value::F64(_) => Some(Ty::F64),
++            Value::Bool(_) => Some(Ty::Bool),
++            Value::Char(_) => Some(Ty::Char),
++            Value::Str(_) => Some(Ty::Str),
++            Value::Bytes(_) => None,
++        }
++    }
++}
++
++fn int_ty(bits: u32, signed: bool) -> Option<Ty> {
++    Some(Ty::Int(IntTy { bits, signed }))
++}
++
++fn c_long_bits() -> u32 {
++    std::mem::size_of::<std::os::raw::c_long>() as u32 * 8
++}
++
++fn primitive_ty(name: &str) -> Option<Ty> {
++    match name {
++        "c_char" => int_ty(8, std::os::raw::c_char::MIN != 0),
++        "c_long" => int_ty(c_long_bits(), true),
++        "c_ulong" => int_ty(c_long_bits(), false),
++        "i8" | "c_schar" => int_ty(8, true),
++        "i16" | "c_short" => int_ty(16, true),
++        "i32" | "c_int" => int_ty(32, true),
++        "i64" | "isize" | "c_longlong" => int_ty(64, true),
++        "i128" => int_ty(128, true),
++        "u8" | "c_uchar" => int_ty(8, false),
++        "u16" | "c_ushort" => int_ty(16, false),
++        "u32" | "c_uint" => int_ty(32, false),
++        "u64" | "usize" | "c_ulonglong" => int_ty(64, false),
++        "u128" => int_ty(128, false),
++        "f32" | "c_float" => Some(Ty::F32),
++        "f64" | "c_double" => Some(Ty::F64),
++        "bool" => Some(Ty::Bool),
++        "char" => Some(Ty::Char),
++        _ => None,
++    }
++}
++
++fn literal(lit: &Lit, expected: Option<Ty>) -> Option<Value> {
++    match lit {
++        Lit::Int(i) => {
++            let ty = match i.suffix() {
++                "" => match expected {
++                    Some(t @ (Ty::Int(_) | Ty::F32 | Ty::F64)) => t,
++                    _ => int_ty(32, true)?,
++                },
++                suffix => primitive_ty(suffix)?,
++            };
++            match ty {
++                Ty::Int(t) => Some(Value::Int(t.normalize(i.base10_parse::<u128>().ok()?), t)),
++                Ty::F32 => Some(Value::F32(i.base10_digits().parse().ok()?)),
++                Ty::F64 => Some(Value::F64(i.base10_digits().parse().ok()?)),
++                _ => None,
++            }
++        }
++        Lit::Float(f) => {
++            let ty = match f.suffix() {
++                "" => match expected {
++                    Some(Ty::F32) => Ty::F32,
++                    _ => Ty::F64,
++                },
++                suffix => primitive_ty(suffix)?,
++            };
++            match ty {
++                Ty::F32 => Some(Value::F32(f.base10_digits().parse().ok()?)),
++                Ty::F64 => Some(Value::F64(f.base10_digits().parse().ok()?)),
++                _ => None,
++            }
++        }
++        Lit::Bool(b) => Some(Value::Bool(b.value)),
++        Lit::Char(c) => Some(Value::Char(c.value())),
++        Lit::Str(s) => Some(Value::Str(s.value())),
++        Lit::Byte(b) => Some(Value::Int(
++            b.value() as u128,
++            IntTy {
++                bits: 8,
++                signed: false,
++            },
++        )),
++        Lit::ByteStr(b) => Some(Value::Bytes(b.value())),
++        _ => None,
++    }
++}
++
++fn cast(value: Value, target: Ty) -> Option<Value> {
++    Some(match (value, target) {
++        (Value::Int(raw, _), Ty::Int(t)) => Value::Int(t.normalize(raw), t),
++        (Value::Int(raw, s), Ty::F32) => Value::F32(s.as_f32(raw)),
++        (Value::Int(raw, s), Ty::F64) => Value::F64(s.as_f64(raw)),
++        (
++            Value::Int(
++                raw,
++                IntTy {
++                    bits: 8,
++                    signed: false,
++                },
++            ),
++            Ty::Char,
++        ) => Value::Char(raw as u8 as char),
++        (Value::F32(f), Ty::Int(t)) => Value::Int(t.saturate(f as f64), t),
++        (Value::F64(f), Ty::Int(t)) => Value::Int(t.saturate(f), t),
++        (Value::F32(f), Ty::F32) => Value::F32(f),
++        (Value::F32(f), Ty::F64) => Value::F64(f as f64),
++        (Value::F64(f), Ty::F32) => Value::F32(f as f32),
++        (Value::F64(f), Ty::F64) => Value::F64(f),
++        (Value::Bool(b), Ty::Int(t)) => Value::Int(b as u128, t),
++        (Value::Bool(b), Ty::Bool) => Value::Bool(b),
++        (Value::Char(c), Ty::Int(t)) => Value::Int(t.normalize(c as u128), t),
++        (Value::Char(c), Ty::Char) => Value::Char(c),
++        _ => return None,
++    })
++}
++
++fn negate(value: Value) -> Option<Value> {
++    match value {
++        Value::Int(raw, t) => Some(Value::Int(t.normalize(raw.wrapping_neg()), t)),
++        Value::F32(f) => Some(Value::F32(-f)),
++        Value::F64(f) => Some(Value::F64(-f)),
++        _ => None,
++    }
++}
++
++fn not(value: Value) -> Option<Value> {
++    match value {
++        Value::Int(raw, t) => Some(Value::Int(t.normalize(!raw), t)),
++        Value::Bool(b) => Some(Value::Bool(!b)),
++        _ => None,
++    }
++}
++
++fn arithmetic(op: &BinOp, left: Value, right: Value) -> Option<Value> {
++    match (left, right) {
++        (Value::Int(a, t), Value::Int(b, u)) if t == u => {
++            let raw = match op {
++                BinOp::Add(_) => a.wrapping_add(b),
++                BinOp::Sub(_) => a.wrapping_sub(b),
++                BinOp::Mul(_) => a.wrapping_mul(b),
++                BinOp::Div(_) | BinOp::Rem(_) if b == 0 => return None,
++                BinOp::Div(_) if t.signed => (a as i128).wrapping_div(b as i128) as u128,
++                BinOp::Rem(_) if t.signed => (a as i128).wrapping_rem(b as i128) as u128,
++                BinOp::Div(_) => a / b,
++                BinOp::Rem(_) => a % b,
++                BinOp::BitAnd(_) => a & b,
++                BinOp::BitOr(_) => a | b,
++                BinOp::BitXor(_) => a ^ b,
++                _ => return None,
++            };
++            Some(Value::Int(t.normalize(raw), t))
++        }
++        (Value::F32(a), Value::F32(b)) => Some(Value::F32(match op {
++            BinOp::Add(_) => a + b,
++            BinOp::Sub(_) => a - b,
++            BinOp::Mul(_) => a * b,
++            BinOp::Div(_) => a / b,
++            BinOp::Rem(_) => a % b,
++            _ => return None,
++        })),
++        (Value::F64(a), Value::F64(b)) => Some(Value::F64(match op {
++            BinOp::Add(_) => a + b,
++            BinOp::Sub(_) => a - b,
++            BinOp::Mul(_) => a * b,
++            BinOp::Div(_) => a / b,
++            BinOp::Rem(_) => a % b,
++            _ => return None,
++        })),
++        (Value::Bool(a), Value::Bool(b)) => Some(Value::Bool(match op {
++            BinOp::BitAnd(_) => a & b,
++            BinOp::BitOr(_) => a | b,
++            BinOp::BitXor(_) => a ^ b,
++            _ => return None,
++        })),
++        _ => None,
++    }
++}
++
++fn shift(op: &BinOp, left: Value, right: Value) -> Option<Value> {
++    let (Value::Int(a, t), Value::Int(b, _)) = (left, right) else {
++        return None;
++    };
++    if b >= t.bits as u128 {
++        return None;
++    }
++    let raw = match op {
++        BinOp::Shl(_) => a << b,
++        BinOp::Shr(_) if t.signed => ((a as i128) >> b) as u128,
++        BinOp::Shr(_) => a >> b,
++        _ => return None,
++    };
++    Some(Value::Int(t.normalize(raw), t))
++}
++
++fn compare(op: &BinOp, left: Value, right: Value) -> Option<Value> {
++    let ordering = match (left, right) {
++        (Value::Int(a, t), Value::Int(b, u)) if t == u && t.signed => {
++            Some((a as i128).cmp(&(b as i128)))
++        }
++        (Value::Int(a, t), Value::Int(b, u)) if t == u => Some(a.cmp(&b)),
++        (Value::F32(a), Value::F32(b)) => a.partial_cmp(&b),
++        (Value::F64(a), Value::F64(b)) => a.partial_cmp(&b),
++        (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(&b)),
++        (Value::Char(a), Value::Char(b)) => Some(a.cmp(&b)),
++        _ => return None,
++    };
++    Some(Value::Bool(match op {
++        BinOp::Eq(_) => ordering == Some(Ordering::Equal),
++        BinOp::Ne(_) => ordering != Some(Ordering::Equal),
++        BinOp::Lt(_) => ordering == Some(Ordering::Less),
++        BinOp::Le(_) => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
++        BinOp::Gt(_) => ordering == Some(Ordering::Greater),
++        BinOp::Ge(_) => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
++        _ => return None,
++    }))
++}
++
++fn is_supported(expr: &Expr) -> bool {
++    match expr {
++        Expr::Paren(p) => is_supported(&p.expr),
++        Expr::Group(g) => is_supported(&g.expr),
++        Expr::Lit(_) | Expr::Path(_) => true,
++        Expr::Unary(u) => matches!(u.op, UnOp::Neg(_) | UnOp::Not(_)) && is_supported(&u.expr),
++        Expr::Binary(b) => is_supported(&b.left) && is_supported(&b.right),
++        Expr::Cast(c) => is_supported(&c.expr),
++        _ => false,
++    }
++}
++
++fn literal_operand(expr: &Expr) -> Option<&Lit> {
++    match expr {
++        Expr::Paren(p) => literal_operand(&p.expr),
++        Expr::Group(g) => literal_operand(&g.expr),
++        Expr::Unary(u) => literal_operand(&u.expr),
++        Expr::Lit(l) => Some(&l.lit),
++        _ => None,
++    }
++}
++
++fn is_comparison(op: &BinOp) -> bool {
++    matches!(
++        op,
++        BinOp::Eq(_) | BinOp::Ne(_) | BinOp::Lt(_) | BinOp::Le(_) | BinOp::Gt(_) | BinOp::Ge(_)
++    )
++}
++
++fn escape_csharp(text: impl Iterator<Item = char>, quote: char) -> String {
++    let mut out = String::new();
++    out.push(quote);
++    for c in text {
++        match c {
++            '\\' => out.push_str("\\\\"),
++            c if c == quote => {
++                out.push('\\');
++                out.push(c);
++            }
++            c if c < ' '
++                || ('\u{7f}'..='\u{9f}').contains(&c)
++                || c == '\u{2028}'
++                || c == '\u{2029}' =>
++            {
++                out.push_str(&format!("\\u{:04X}", c as u32))
++            }
++            c => out.push(c),
++        }
++    }
++    out.push(quote);
++    out
++}
++
++fn fits_64_bit_literal(raw: u128, t: IntTy) -> bool {
++    if t.signed {
++        (i64::MIN as i128..=u64::MAX as i128).contains(&(raw as i128))
++    } else {
++        raw <= u64::MAX as u128
++    }
++}
++
++pub fn csharp_literal(value: &Value) -> Option<String> {
++    Some(match value {
++        Value::Int(raw, t) if t.bits == 128 && !fits_64_bit_literal(*raw, *t) => format!(
++            "new {}(0x{:X}, 0x{:X})",
++            if t.signed { "Int128" } else { "UInt128" },
++            raw >> 64,
++            *raw as u64
++        ),
++        Value::Int(raw, t) if t.signed => (*raw as i128).to_string(),
++        Value::Int(raw, t) if t.bits == 128 && !t.signed => format!("{raw}UL"),
++        Value::Int(raw, _) => raw.to_string(),
++        Value::F32(f) if f.is_nan() => "float.NaN".to_string(),
++        Value::F32(f) if f.is_infinite() && *f > 0.0 => "float.PositiveInfinity".to_string(),
++        Value::F32(f) if f.is_infinite() => "float.NegativeInfinity".to_string(),
++        Value::F32(f) => format!("{f:?}f"),
++        Value::F64(f) if f.is_nan() => "double.NaN".to_string(),
++        Value::F64(f) if f.is_infinite() && *f > 0.0 => "double.PositiveInfinity".to_string(),
++        Value::F64(f) if f.is_infinite() => "double.NegativeInfinity".to_string(),
++        Value::F64(f) => format!("{f:?}"),
++        Value::Bool(b) => b.to_string(),
++        Value::Char(c) if (*c as u32) > 0xFFFF => return None,
++        Value::Char(c) => escape_csharp(std::iter::once(*c), '\''),
++        Value::Str(s) => escape_csharp(s.chars(), '"'),
++        Value::Bytes(b) => format!("{b:?}"),
++    })
++}
++
++fn discriminant_ty(item: &RustEnum) -> IntTy {
++    match item.repr.as_deref().and_then(primitive_ty) {
++        Some(Ty::Int(t)) => t,
++        _ => IntTy {
++            bits: 64,
++            signed: true,
++        },
++    }
++}
++
++pub(crate) fn csharp_integer_range(csharp_type: &str) -> Option<(i128, i128)> {
++    let ty = match csharp_type {
++        "sbyte" => IntTy {
++            bits: 8,
++            signed: true,
++        },
++        "byte" => IntTy {
++            bits: 8,
++            signed: false,
++        },
++        "short" => IntTy {
++            bits: 16,
++            signed: true,
++        },
++        "ushort" => IntTy {
++            bits: 16,
++            signed: false,
++        },
++        "int" => IntTy {
++            bits: 32,
++            signed: true,
++        },
++        "uint" => IntTy {
++            bits: 32,
++            signed: false,
++        },
++        "long" | "nint" => IntTy {
++            bits: 64,
++            signed: true,
++        },
++        "ulong" | "nuint" => IntTy {
++            bits: 64,
++            signed: false,
++        },
++        _ => return None,
++    };
++    Some((ty.min() as i128, ty.max() as i128))
++}
++
++pub(crate) fn csharp_const_fits(csharp_type: &str, value: i128) -> bool {
++    csharp_integer_range(csharp_type).is_none_or(|(low, high)| (low..=high).contains(&value))
++}
++
++fn enum_values_fit(item: &RustEnum, values: &[Value]) -> bool {
++    let backing = item.repr.as_deref().map_or("int", convert_token_enum_repr);
++    values.iter().all(
++        |value| matches!(value, Value::Int(raw, _) if csharp_const_fits(backing, *raw as i128)),
++    )
++}
++
++type Scope = (usize, Vec<String>);
++
++#[derive(Default)]
++pub struct UseScopes {
++    files: usize,
++    modules: HashSet<Scope>,
++    types: HashMap<Scope, HashMap<String, Vec<String>>>,
++    imports: HashMap<Scope, HashMap<String, Vec<String>>>,
++    globs: HashMap<Scope, Vec<Vec<String>>>,
++    owners: HashMap<String, Scope>,
++    variants: HashMap<String, Vec<String>>,
++    const_types: HashMap<String, Vec<String>>,
++}
++
++impl UseScopes {
++    pub fn add_file(&mut self, ast: &syn::File) {
++        let file = self.files;
++        self.files += 1;
++        self.add_items(&ast.items, (file, Vec::new()));
++    }
++
++    fn add_items(&mut self, items: &[syn::Item], scope: Scope) {
++        self.modules.insert(scope.clone());
++        for item in items {
++            match item {
++                syn::Item::Mod(m) => {
++                    if let Some((_, items)) = &m.content {
++                        let mut inner = scope.clone();
++                        inner.1.push(m.ident.to_string());
++                        self.add_items(items, inner);
++                    }
++                }
++                syn::Item::Use(u) => self.add_use(&scope, &u.tree, Vec::new()),
++                syn::Item::Type(t) => {
++                    if let Some(path) = type_path(&t.ty) {
++                        self.types
++                            .entry(scope.clone())
++                            .or_default()
++                            .insert(t.ident.to_string(), path);
++                    }
++                }
++                syn::Item::Const(c) => {
++                    let name = c.ident.to_string();
++                    if let Some(path) = type_path(&c.ty) {
++                        self.const_types.entry(name.clone()).or_insert(path);
++                    }
++                    self.owners.entry(name).or_insert_with(|| scope.clone());
++                }
++                syn::Item::Enum(e) => {
++                    self.owners
++                        .entry(e.ident.to_string())
++                        .or_insert_with(|| scope.clone());
++                    self.variants.entry(e.ident.to_string()).or_insert_with(|| {
++                        e.variants.iter().map(|v| v.ident.to_string()).collect()
++                    });
++                }
++                _ => {}
++            }
++        }
++    }
++
++    fn add_use(&mut self, scope: &Scope, tree: &syn::UseTree, mut prefix: Vec<String>) {
++        match tree {
++            syn::UseTree::Path(t) => {
++                prefix.push(t.ident.to_string());
++                self.add_use(scope, &t.tree, prefix);
++            }
++            syn::UseTree::Group(t) => {
++                for tree in &t.items {
++                    self.add_use(scope, tree, prefix.clone());
++                }
++            }
++            syn::UseTree::Name(t) => {
++                if t.ident != "self" {
++                    prefix.push(t.ident.to_string());
++                }
++                if let Some(name) = prefix.last().cloned() {
++                    self.imports
++                        .entry(scope.clone())
++                        .or_default()
++                        .insert(name, prefix);
++                }
++            }
++            syn::UseTree::Rename(t) => {
++                if t.ident != "self" {
++                    prefix.push(t.ident.to_string());
++                }
++                self.imports
++                    .entry(scope.clone())
++                    .or_default()
++                    .insert(t.rename.to_string(), prefix);
++            }
++            syn::UseTree::Glob(_) => self.globs.entry(scope.clone()).or_default().push(prefix),
++        }
++    }
++
++    fn modules_of(&self, scope: &Scope, path: &[String]) -> Vec<Scope> {
++        self.modules_via(scope, path, &mut HashSet::new())
++    }
++
++    fn modules_via(
++        &self,
++        scope: &Scope,
++        path: &[String],
++        seen: &mut HashSet<(Scope, String)>,
++    ) -> Vec<Scope> {
++        let supers = path.iter().take_while(|s| *s == "super").count();
++        let (base, rest) = match path.first().map(String::as_str) {
++            Some("crate") => ((scope.0, Vec::new()), &path[1..]),
++            Some("self") => (scope.clone(), &path[1..]),
++            Some("super") if supers <= scope.1.len() => (
++                (scope.0, scope.1[..scope.1.len() - supers].to_vec()),
++                &path[supers..],
++            ),
++            Some("super") => return Vec::new(),
++            _ => (scope.clone(), path),
++        };
++        let import = rest
++            .first()
++            .and_then(|first| self.imports.get(&base)?.get(first));
++        if let Some(import) = import {
++            if seen.insert((base.clone(), rest[0].clone())) {
++                let modules =
++                    self.modules_via(&base, &[import.as_slice(), &rest[1..]].concat(), seen);
++                if !modules.is_empty() {
++                    return modules;
++                }
++            }
++        }
++        let candidates = match path.first().map(String::as_str) {
++            Some("crate") => vec![path[1..].to_vec()],
++            Some("self") => vec![[scope.1.as_slice(), &path[1..]].concat()],
++            Some("super") if supers <= scope.1.len() => {
++                vec![[&scope.1[..scope.1.len() - supers], &path[supers..]].concat()]
++            }
++            Some("super") => vec![],
++            _ => vec![[scope.1.as_slice(), path].concat(), path.to_vec()],
++        };
++        let files = std::iter::once(scope.0).chain((0..self.files).filter(|f| *f != scope.0));
++        files
++            .flat_map(|file| candidates.iter().map(move |module| (file, module.clone())))
++            .filter(|module| self.modules.contains(module))
++            .collect()
++    }
++
++    fn declares(&self, module: &Scope, name: &str) -> bool {
++        self.types.get(module).is_some_and(|t| t.contains_key(name))
++            || self
++                .imports
++                .get(module)
++                .is_some_and(|t| t.contains_key(name))
++    }
++
++    fn resolve(
++        &self,
++        scope: &Scope,
++        path: &[String],
++        seen: &mut HashSet<(Scope, Vec<String>)>,
++    ) -> Option<String> {
++        let (name, prefix) = path.split_last()?;
++        if !seen.insert((scope.clone(), path.to_vec())) {
++            return None;
++        }
++        let modules = if prefix.is_empty() {
++            vec![scope.clone()]
++        } else {
++            self.modules_of(scope, prefix)
++        };
++        for module in &modules {
++            let target = self
++                .types
++                .get(module)
++                .and_then(|t| t.get(name))
++                .or_else(|| self.imports.get(module).and_then(|t| t.get(name)));
++            if let Some(target) = target {
++                return self.resolve(module, target, seen);
++            }
++            for glob in self.globs.get(module).into_iter().flatten() {
++                for inner in self.modules_of(module, glob) {
++                    if self.declares(&inner, name) {
++                        return self.resolve(&inner, std::slice::from_ref(name), seen);
++                    }
++                }
++            }
++        }
++        primitive_ty(name).map(|_| name.clone())
++    }
++
++    fn primitive_name(&self, item: &str, path: &[String]) -> Option<String> {
++        self.resolve(self.owners.get(item)?, path, &mut HashSet::new())
++    }
++
++    fn alias_is_ambiguous(&self, name: &str) -> bool {
++        let path = [name.to_string()];
++        let targets: HashSet<Option<String>> = self
++            .types
++            .iter()
++            .filter(|(_, types)| types.contains_key(name))
++            .map(|(module, _)| self.resolve(module, &path, &mut HashSet::new()))
++            .collect();
++        targets.len() > 1
++    }
++
++    fn item_name(&self, item: &str, path: &[String]) -> Option<String> {
++        self.find_item(self.owners.get(item)?, path, &mut HashSet::new())
++    }
++
++    fn find_item(
++        &self,
++        scope: &Scope,
++        path: &[String],
++        seen: &mut HashSet<(Scope, Vec<String>)>,
++    ) -> Option<String> {
++        let (name, prefix) = path.split_last()?;
++        if !seen.insert((scope.clone(), path.to_vec())) {
++            return None;
++        }
++        let modules = if prefix.is_empty() {
++            vec![scope.clone()]
++        } else {
++            self.modules_of(scope, prefix)
++        };
++        for module in &modules {
++            if self.owners.get(name) == Some(module) {
++                return Some(name.clone());
++            }
++            let target = self.imports.get(module).and_then(|t| t.get(name));
++            if let Some(found) = target.and_then(|target| self.find_item(module, target, seen)) {
++                return Some(found);
++            }
++            for glob in self.globs.get(module).into_iter().flatten() {
++                for inner in self.modules_of(module, glob) {
++                    if let Some(found) = self.find_item(&inner, std::slice::from_ref(name), seen) {
++                        return Some(found);
++                    }
++                }
++            }
++        }
++        None
++    }
++
++    fn variant(&self, item: &str, path: &[String]) -> Option<(String, String)> {
++        self.find_variant(self.owners.get(item)?, path, &mut HashSet::new())
++    }
++
++    fn enum_variant(&self, scope: &Scope, path: &[String], name: &str) -> Option<String> {
++        let owner = self.find_item(scope, path, &mut HashSet::new())?;
++        self.variants
++            .get(&owner)?
++            .iter()
++            .any(|v| v == name)
++            .then_some(owner)
++    }
++
++    fn find_variant(
++        &self,
++        scope: &Scope,
++        path: &[String],
++        seen: &mut HashSet<(Scope, Vec<String>)>,
++    ) -> Option<(String, String)> {
++        let (name, prefix) = path.split_last()?;
++        if !seen.insert((scope.clone(), path.to_vec())) {
++            return None;
++        }
++        if !prefix.is_empty() {
++            if let Some(owner) = self.enum_variant(scope, prefix, name) {
++                return Some((owner, name.clone()));
++            }
++        }
++        let modules = if prefix.is_empty() {
++            vec![scope.clone()]
++        } else {
++            self.modules_of(scope, prefix)
++        };
++        for module in &modules {
++            if self.owners.get(name) == Some(module) {
++                return None;
++            }
++            let target = self.imports.get(module).and_then(|t| t.get(name));
++            if let Some(found) = target.and_then(|target| self.find_variant(module, target, seen)) {
++                return Some(found);
++            }
++            for glob in self.globs.get(module).into_iter().flatten() {
++                if let Some(owner) = self.enum_variant(module, glob, name) {
++                    return Some((owner, name.clone()));
++                }
++                for inner in self.modules_of(module, glob) {
++                    let found = self.find_variant(&inner, std::slice::from_ref(name), seen);
++                    if found.is_some() {
++                        return found;
++                    }
++                }
++            }
++        }
++        None
++    }
++
++    fn imported_name(&self, item: &str, name: &str) -> Option<&String> {
++        self.import_path(item, name)?.last()
++    }
++
++    fn import_path(&self, item: &str, name: &str) -> Option<&Vec<String>> {
++        self.imports.get(self.owners.get(item)?)?.get(name)
++    }
++
++    fn glob_paths(&self, item: &str) -> &[Vec<String>] {
++        self.owners
++            .get(item)
++            .and_then(|scope| self.globs.get(scope))
++            .map_or(&[], Vec::as_slice)
++    }
++}
++
++fn type_path(ty: &syn::Type) -> Option<Vec<String>> {
++    match ty {
++        syn::Type::Path(p) if p.qself.is_none() => Some(
++            p.path
++                .segments
++                .iter()
++                .map(|s| s.ident.to_string())
++                .collect(),
++        ),
++        syn::Type::Paren(p) => type_path(&p.elem),
++        syn::Type::Group(g) => type_path(&g.elem),
++        _ => None,
++    }
++}
++
++pub struct ConstEvaluator<'a> {
++    aliases: &'a AliasMap,
++    scopes: &'a UseScopes,
++    consts: HashMap<&'a str, &'a RustConst>,
++    enums: HashMap<&'a str, &'a RustEnum>,
++    const_values: RefCell<HashMap<String, Option<Value>>>,
++    variant_values: RefCell<HashMap<String, Option<Value>>>,
++    active: RefCell<HashSet<String>>,
++    current_enum: RefCell<Vec<String>>,
++    current_item: RefCell<Vec<String>>,
++}
++
++impl<'a> ConstEvaluator<'a> {
++    pub fn new(
++        aliases: &'a AliasMap,
++        scopes: &'a UseScopes,
++        consts: &'a [RustConst],
++        enums: &'a [RustEnum],
++    ) -> Self {
++        let mut const_map = HashMap::new();
++        for c in consts {
++            const_map.entry(c.const_name.as_str()).or_insert(c);
++        }
++        let mut enum_map = HashMap::new();
++        for e in enums.iter().filter(|e| !e.is_flags) {
++            enum_map.entry(e.enum_name.as_str()).or_insert(e);
++        }
++        ConstEvaluator {
++            aliases,
++            scopes,
++            consts: const_map,
++            enums: enum_map,
++            const_values: RefCell::new(HashMap::new()),
++            variant_values: RefCell::new(HashMap::new()),
++            active: RefCell::new(HashSet::new()),
++            current_enum: RefCell::new(Vec::new()),
++            current_item: RefCell::new(Vec::new()),
++        }
++    }
++
++    pub fn emitted_consts(
++        &self,
++        consts: &[RustConst],
++        filter: fn(const_name: &str) -> bool,
++    ) -> Vec<RustConst> {
++        consts
++            .iter()
++            .filter(|c| filter(c.const_name.as_str()))
++            .filter_map(|c| {
++                let value = csharp_literal(&self.const_of(c)?)?;
++                let rust_type = self.declared_type(c);
++                Some(RustConst {
++                    value,
++                    rust_type,
++                    ..c.clone()
++                })
++            })
++            .collect()
++    }
++
++    pub fn emitted_enums(&self, enums: &[RustEnum]) -> Vec<RustEnum> {
++        let mut result = Vec::new();
++        for item in enums {
++            if item.is_flags {
++                result.push(item.clone());
++                continue;
++            }
++            let Some(values) = self
++                .variants_of(item)
++                .filter(|values| enum_values_fit(item, values))
++            else {
++                println!(
++                    "csbindgen can't represent the discriminants of this Enum in C#, so ignore generate, enum_name: {}",
++                    item.enum_name
++                );
++                continue;
++            };
++            let mut item = item.clone();
++            for (field, value) in item.fields.iter_mut().zip(values) {
++                if field.expr.is_some() {
++                    field.value = csharp_literal(&value);
++                }
++            }
++            result.push(item);
++        }
++        result
++    }
++
++    fn guarded<T>(&self, key: String, f: impl FnOnce() -> Option<T>) -> Option<T> {
++        if !self.active.borrow_mut().insert(key.clone()) {
++            return None;
++        }
++        let result = f();
++        self.active.borrow_mut().remove(&key);
++        result
++    }
++
++    fn const_of(&self, item: &RustConst) -> Option<Value> {
++        self.guarded(format!("const {}", item.const_name), || {
++            self.current_item.borrow_mut().push(item.const_name.clone());
++            let expected = match self.scopes.const_types.get(&item.const_name) {
++                Some(path) => self
++                    .primitive_name(path)
++                    .and_then(|name| primitive_ty(&name)),
++                None => self.resolve_type(&item.rust_type),
++            };
++            let value = self.eval(&item.expr.0, expected);
++            self.current_item.borrow_mut().pop();
++            let value = value?;
++            match (expected, value.ty()) {
++                (Some(t), Some(u)) if t != u => None,
++                _ => Some(value),
++            }
++        })
++    }
++
++    fn declared_type(&self, item: &RustConst) -> RustType {
++        let mut rust_type = item.rust_type.clone();
++        if matches!(rust_type.type_kind, TypeKind::Normal) {
++            let path = match self.scopes.const_types.get(&item.const_name) {
++                Some(path) => path.clone(),
++                None => vec![rust_type.type_name.clone()],
++            };
++            self.current_item.borrow_mut().push(item.const_name.clone());
++            if let Some(name) = self.primitive_name(&path) {
++                rust_type.type_name = name;
++            }
++            self.current_item.borrow_mut().pop();
++        }
++        rust_type
++    }
++
++    fn primitive_name(&self, path: &[String]) -> Option<String> {
++        let item = self.current_item.borrow().last().cloned();
++        if let Some(name) = item.and_then(|item| self.scopes.primitive_name(&item, path)) {
++            return Some(name);
++        }
++        let mut name = path.last()?.clone();
++        if self.scopes.alias_is_ambiguous(&name) {
++            return None;
++        }
++        let mut seen = HashSet::new();
++        while seen.insert(name.clone()) {
++            if primitive_ty(&name).is_some() {
++                return Some(name);
++            }
++            match self.aliases.normalize(&name) {
++                (target, Some(_)) => name = target,
++                _ => return None,
++            }
++        }
++        None
++    }
++
++    fn const_value(&self, name: &str) -> Option<Value> {
++        if let Some(value) = self.const_values.borrow().get(name) {
++            return value.clone();
++        }
++        let value = self.const_of(self.consts.get(name)?);
++        self.const_values
++            .borrow_mut()
++            .insert(name.to_string(), value.clone());
++        value
++    }
++
++    fn variants_of(&self, item: &RustEnum) -> Option<Vec<Value>> {
++        item.fields
++            .iter()
++            .map(|field| self.variant_value(&item.enum_name, &field.name))
++            .collect()
++    }
++
++    fn variant_value(&self, enum_name: &str, variant: &str) -> Option<Value> {
++        let key = format!("{enum_name}::{variant}");
++        if let Some(value) = self.variant_values.borrow().get(&key) {
++            return value.clone();
++        }
++        let item = *self.enums.get(enum_name)?;
++        let index = item.fields.iter().position(|f| f.name == variant)?;
++        let ty = discriminant_ty(item);
++        let value = self.guarded(key.clone(), || {
++            let raw = match &item.fields[index].expr {
++                Some(expr) => {
++                    self.current_enum.borrow_mut().push(enum_name.to_string());
++                    self.current_item.borrow_mut().push(enum_name.to_string());
++                    let value = self.eval(&expr.0, Some(Ty::Int(ty)));
++                    self.current_item.borrow_mut().pop();
++                    self.current_enum.borrow_mut().pop();
++                    match value? {
++                        Value::Int(raw, t) if t == ty => raw,
++                        _ => return None,
++                    }
++                }
++                None if index == 0 => 0,
++                None => match self.variant_value(enum_name, &item.fields[index - 1].name)? {
++                    Value::Int(raw, _) => ty.normalize(raw.wrapping_add(1)),
++                    _ => return None,
++                },
++            };
++            Some(Value::Int(raw, ty))
++        });
++        self.variant_values.borrow_mut().insert(key, value.clone());
++        value
++    }
++
++    fn resolve_type(&self, rust_type: &RustType) -> Option<Ty> {
++        match &rust_type.type_kind {
++            TypeKind::Normal => {
++                primitive_ty(&self.primitive_name(std::slice::from_ref(&rust_type.type_name))?)
++            }
++            TypeKind::Pointer(PointerType::ConstPointer, inner) if inner.type_name == "str" => {
++                Some(Ty::Str)
++            }
++            _ => None,
++        }
++    }
++
++    fn cast_target(&self, ty: &syn::Type) -> Option<Ty> {
++        match ty {
++            syn::Type::Path(_) | syn::Type::Paren(_) | syn::Type::Group(_) => {
++                primitive_ty(&self.primitive_name(&type_path(ty)?)?)
++            }
++            _ => None,
++        }
++    }
++
++    fn item_name(&self, path: &[String]) -> Option<String> {
++        let item = self.current_item.borrow().last().cloned()?;
++        self.scopes.item_name(&item, path)
++    }
++
++    fn declared_name(&self, name: &str) -> String {
++        let item = self.current_item.borrow().last().cloned();
++        item.and_then(|item| self.scopes.imported_name(&item, name).cloned())
++            .unwrap_or_else(|| name.to_string())
++    }
++
++    fn imported_variant(&self, name: &str) -> Option<Value> {
++        let item = self.current_item.borrow().last().cloned()?;
++        let enum_of = |path: &[String]| {
++            let name = match self.item_name(path) {
++                Some(name) => name,
++                None => self.declared_name(path.last()?),
++            };
++            let (owner, _) = self.aliases.normalize(&name);
++            self.enums.contains_key(owner.as_str()).then_some(owner)
++        };
++        if let Some(path) = self.scopes.import_path(&item, name) {
++            if path.len() >= 2 {
++                if let Some(owner) = enum_of(&path[..path.len() - 1]) {
++                    return self.variant_value(&owner, path.last()?);
++                }
++            }
++        }
++        for glob in self.scopes.glob_paths(&item) {
++            if let Some(owner) = enum_of(glob) {
++                if self.enums[owner.as_str()]
++                    .fields
++                    .iter()
++                    .any(|f| f.name == name)
++                {
++                    return self.variant_value(&owner, name);
++                }
++            }
++        }
++        None
++    }
++
++    fn path_value(&self, path: &syn::Path) -> Option<Value> {
++        let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
++        let item = self.current_item.borrow().last().cloned();
++        if let Some((owner, variant)) = item.and_then(|item| self.scopes.variant(&item, &segments))
++        {
++            if self.enums.contains_key(owner.as_str()) {
++                return self.variant_value(&owner, &variant);
++            }
++        }
++        if segments.len() == 1 {
++            if let Some(value) = self.imported_variant(&segments[0]) {
++                return Some(value);
++            }
++        }
++        let name = &self.declared_name(segments.last()?);
++        if segments.len() >= 2 {
++            let prefix = &segments[..segments.len() - 1];
++            let mut owner = self
++                .item_name(prefix)
++                .unwrap_or_else(|| self.declared_name(&segments[segments.len() - 2]));
++            if owner == "Self" {
++                owner = self.current_enum.borrow().last()?.clone();
++            }
++            let owner_ty = self.primitive_name(prefix).and_then(|n| primitive_ty(&n));
++            if let Some(Ty::Int(t)) = owner_ty {
++                match name.as_str() {
++                    "MAX" => return Some(Value::Int(t.max(), t)),
++                    "MIN" => return Some(Value::Int(t.min(), t)),
++                    _ => {}
++                }
++            }
++            let (owner, _) = self.aliases.normalize(&owner);
++            if self.enums.contains_key(owner.as_str()) {
++                return self.variant_value(&owner, name);
++            }
++        }
++        let target = self.item_name(&segments);
++        self.const_value(target.as_ref().unwrap_or(name))
++    }
++
++    fn infer(&self, expr: &Expr) -> Option<Ty> {
++        match expr {
++            Expr::Paren(p) => self.infer(&p.expr),
++            Expr::Group(g) => self.infer(&g.expr),
++            Expr::Lit(l) => match &l.lit {
++                Lit::Int(i) if !i.suffix().is_empty() => primitive_ty(i.suffix()),
++                Lit::Float(f) if !f.suffix().is_empty() => primitive_ty(f.suffix()),
++                Lit::Int(_) | Lit::Float(_) => None,
++                lit => literal(lit, None)?.ty(),
++            },
++            Expr::Unary(u) => self.infer(&u.expr),
++            Expr::Binary(b) => match &b.op {
++                BinOp::And(_) | BinOp::Or(_) => Some(Ty::Bool),
++                op if is_comparison(op) => Some(Ty::Bool),
++                BinOp::Shl(_) | BinOp::Shr(_) => self.infer(&b.left),
++                _ => self.infer(&b.left).or_else(|| self.infer(&b.right)),
++            },
++            Expr::Cast(c) => self.cast_target(&c.ty),
++            Expr::Path(p) => self.path_value(&p.path)?.ty(),
++            _ => None,
++        }
++    }
++
++    fn eval(&self, expr: &Expr, expected: Option<Ty>) -> Option<Value> {
++        match expr {
++            Expr::Paren(p) => self.eval(&p.expr, expected),
++            Expr::Group(g) => self.eval(&g.expr, expected),
++            Expr::Lit(l) => literal(&l.lit, expected),
++            Expr::Unary(u) => match u.op {
++                UnOp::Neg(_) => negate(self.eval(&u.expr, expected)?),
++                UnOp::Not(_) => not(self.eval(&u.expr, expected)?),
++                _ => None,
++            },
++            Expr::Binary(b) => self.binary(b, expected),
++            Expr::Cast(c) => {
++                let target = self.cast_target(&c.ty)?;
++                let hint = match (literal_operand(&c.expr), target) {
++                    (Some(Lit::Int(_)), Ty::Int(_)) | (Some(Lit::Float(_)), Ty::F32 | Ty::F64) => {
++                        Some(target)
++                    }
++                    (Some(Lit::Int(_)), Ty::Char) => int_ty(8, false),
++                    _ => None,
++                };
++                cast(self.eval(&c.expr, self.infer(&c.expr).or(hint))?, target)
++            }
++            Expr::Path(p) => self.path_value(&p.path),
++            _ => None,
++        }
++    }
++
++    fn binary(&self, b: &syn::ExprBinary, expected: Option<Ty>) -> Option<Value> {
++        match &b.op {
++            BinOp::And(_) | BinOp::Or(_) => {
++                let Value::Bool(left) = self.eval(&b.left, Some(Ty::Bool))? else {
++                    return None;
++                };
++                if left == matches!(b.op, BinOp::Or(_)) {
++                    return is_supported(&b.right).then_some(Value::Bool(left));
++                }
++                match self.eval(&b.right, Some(Ty::Bool))? {
++                    Value::Bool(right) => Some(Value::Bool(right)),
++                    _ => None,
++                }
++            }
++            BinOp::Shl(_) | BinOp::Shr(_) => {
++                let left = self.eval(&b.left, self.infer(&b.left).or(expected))?;
++                let right = self.eval(&b.right, self.infer(&b.right))?;
++                shift(&b.op, left, right)
++            }
++            op => {
++                let mut operand = self.infer(&b.left).or_else(|| self.infer(&b.right));
++                if !is_comparison(op) {
++                    operand = operand.or(expected);
++                }
++                let left = self.eval(&b.left, operand)?;
++                let right = self.eval(&b.right, left.ty())?;
++                if is_comparison(op) {
++                    compare(op, left, right)
++                } else {
++                    arithmetic(op, left, right)
++                }
++            }
++        }
++    }
++}
+diff --git a/csbindgen/src/emitter.rs b/csbindgen/src/emitter.rs
+index 5252cfb..1e69110 100644
+--- a/csbindgen/src/emitter.rs
++++ b/csbindgen/src/emitter.rs
+@@ -1,5 +1,6 @@
+ use crate::alias_map::AliasMap;
+ use crate::builder::BindgenOptions;
++use crate::const_eval::csharp_const_fits;
+ use crate::doc_comment::escape_doc_comment;
+ use crate::type_meta::ExportSymbolNaming::{ExportName, NoMangle};
+ use crate::type_meta::*;
+@@ -309,10 +310,6 @@ pub fn emit_csharp(
+ 
+     let mut const_string: String = String::new();
+     for item in consts {
+-        if let Some(doc_comment) = escape_doc_comment(&item.doc_comment, "        ") {
+-            const_string.push_str_ln(&doc_comment);
+-        }
+-
+         let mut type_name = item.rust_type.to_csharp_string(
+             options,
+             aliases,
+@@ -329,6 +326,20 @@ pub fn emit_csharp(
+             type_name = "char".to_string();
+         }
+ 
++        if let Ok(value) = item.value.parse::<i128>() {
++            if !csharp_const_fits(&type_name, value) {
++                println!(
++                    "csbindgen can't represent the value of this const in C#, so ignore generate, const_name: {}",
++                    item.const_name
++                );
++                continue;
++            }
++        }
++
++        if let Some(doc_comment) = escape_doc_comment(&item.doc_comment, "        ") {
++            const_string.push_str_ln(&doc_comment);
++        }
++
+         if item.value.starts_with("[") {
+             const_string.push_str(
+                 format!(
+@@ -339,20 +350,36 @@ pub fn emit_csharp(
+                 )
+                 .as_str(),
+             );
++        } else if type_name == "Int128" || type_name == "UInt128" {
++            const_string.push_str(
++                format!(
++                    "        {} static readonly {} {} = {};\n",
++                    accessibility,
++                    type_name,
++                    escape_csharp_name(item.const_name.as_str()),
++                    item.value
++                )
++                .as_str(),
++            );
++        } else if let Some(value) = native_int_cast(&type_name, &item.value) {
++            const_string.push_str(
++                format!(
++                    "        {} static readonly {} {} = {};\n",
++                    accessibility,
++                    type_name,
++                    escape_csharp_name(item.const_name.as_str()),
++                    value
++                )
++                .as_str(),
++            );
+         } else {
+-            let value = if type_name == "float" {
+-                format!("{}f", item.value)
+-            } else {
+-                item.value.to_string()
+-            };
+-
+             const_string.push_str(
+                 format!(
+                     "        {} const {} {} = {};\n",
+                     accessibility,
+                     type_name,
+                     escape_csharp_name(item.const_name.as_str()),
+-                    value
++                    item.value
+                 )
+                 .as_str(),
+             );
+@@ -422,7 +449,7 @@ namespace {namespace}
+     result
+ }
+ 
+-fn convert_token_enum_repr(repr: &str) -> &str {
++pub(crate) fn convert_token_enum_repr(repr: &str) -> &str {
+     match repr {
+         "(C)" => "uint",
+         "(u8)" => "byte",
+@@ -445,3 +472,14 @@ fn convert_token_enum_repr(repr: &str) -> &str {
+         x => x,
+     }
+ }
++
++fn native_int_cast(type_name: &str, value: &str) -> Option<String> {
++    let value = value.parse::<i128>().ok()?;
++    match type_name {
++        "nint" if i32::try_from(value).is_err() => Some(format!("(nint)({value}L)")),
++        "nuint" if u32::try_from(value).is_err() => Some(format!("(nuint){value}UL")),
++        "System.IntPtr" => Some(format!("new System.IntPtr({value}L)")),
++        "System.UIntPtr" => Some(format!("new System.UIntPtr({value}UL)")),
++        _ => None,
++    }
++}
+diff --git a/csbindgen/src/lib.rs b/csbindgen/src/lib.rs
+index 3a7cef5..670d859 100644
+--- a/csbindgen/src/lib.rs
++++ b/csbindgen/src/lib.rs
+@@ -1,5 +1,6 @@
+ mod alias_map;
+ mod builder;
++mod const_eval;
+ mod doc_comment;
+ mod emitter;
+ mod field_map;
+@@ -11,6 +12,7 @@ use alias_map::AliasMap;
+ pub use builder::Builder;
+ 
+ use builder::BindgenOptions;
++use const_eval::{ConstEvaluator, UseScopes};
+ use emitter::*;
+ use field_map::FieldMap;
+ use parser::*;
+@@ -36,6 +38,7 @@ pub(crate) fn generate(
+     let mut structs: Vec<RustStruct> = vec![];
+     let mut enums: Vec<RustEnum> = vec![];
+     let mut consts: Vec<RustConst> = vec![];
++    let mut scopes = UseScopes::default();
+ 
+     for path in paths {
+         let file_content = std::fs::read_to_string(path)
+@@ -49,10 +52,14 @@ pub(crate) fn generate(
+         collect_type_alias(&file_ast, &mut aliases);
+         collect_struct(&file_ast, &mut structs);
+         collect_enum(&file_ast, &mut enums);
+-
+-        collect_const(&file_ast, &mut consts, options.csharp_generate_const_filter);
++        collect_const(&file_ast, &mut consts);
++        scopes.add_file(&file_ast);
+     }
+ 
++    let evaluator = ConstEvaluator::new(&aliases, &scopes, &consts, &enums);
++    let consts = evaluator.emitted_consts(&consts, options.csharp_generate_const_filter);
++    let enums = evaluator.emitted_enums(&enums);
++
+     // collect using_types
+     let mut using_types = HashSet::new();
+     for method in &methods {
+diff --git a/csbindgen/src/parser.rs b/csbindgen/src/parser.rs
+index 8ea6c16..7b47b91 100644
+--- a/csbindgen/src/parser.rs
++++ b/csbindgen/src/parser.rs
+@@ -370,52 +370,16 @@ fn collect_fields_unnamed(fields: &syn::FieldsUnnamed) -> Vec<FieldMember> {
+     result
+ }
+ 
+-pub fn collect_const(
+-    ast: &syn::File,
+-    result: &mut Vec<RustConst>,
+-    filter: fn(const_name: &str) -> bool,
+-) {
++pub fn collect_const(ast: &syn::File, result: &mut Vec<RustConst>) {
+     for item in depth_first_module_walk(&ast.items) {
+         if let Item::Const(ct) = item {
+-            // pub const Ident: ty = expr
+-            let const_name = ct.ident.to_string();
+-            if filter(const_name.as_str()) {
+-                let t = parse_type(&ct.ty);
+-
+-                if let syn::Expr::Lit(lit_expr) = &*ct.expr {
+-                    let value = match &lit_expr.lit {
+-                        syn::Lit::Str(s) => {
+-                            format!("\"{}\"", s.value())
+-                        }
+-                        syn::Lit::ByteStr(bs) => {
+-                            format!("{:?}", bs.value())
+-                        }
+-                        syn::Lit::Byte(b) => {
+-                            format!("{}", b.value())
+-                        }
+-                        syn::Lit::Char(c) => {
+-                            format!("'{}'", c.value())
+-                        }
+-                        syn::Lit::Int(i) => {
+-                            format!("{}", i.base10_parse::<i64>().unwrap())
+-                        }
+-                        syn::Lit::Float(f) => {
+-                            format!("{}", f.base10_parse::<f64>().unwrap())
+-                        }
+-                        syn::Lit::Bool(b) => {
+-                            format!("{}", b.value)
+-                        }
+-                        _ => String::new(),
+-                    };
+-
+-                    result.push(RustConst {
+-                        const_name,
+-                        rust_type: t,
+-                        value,
+-                        doc_comment: gather_docs(&ct.attrs),
+-                    });
+-                }
+-            }
++            result.push(RustConst {
++                const_name: ct.ident.to_string(),
++                rust_type: parse_type(&ct.ty),
++                value: String::new(),
++                expr: ConstExpr((*ct.expr).clone()),
++                doc_comment: gather_docs(&ct.attrs),
++            });
+         }
+     }
+ }
+@@ -428,7 +392,10 @@ pub fn collect_enum(ast: &syn::File, result: &mut Vec<RustEnum>) {
+                 let last_segment = attr.path().segments.last().unwrap();
+                 if last_segment.ident == "repr" {
+                     attr.parse_nested_meta(|meta| {
+-                        repr = meta.path.get_ident().map(|ident| ident.to_string());
++                        let hint = meta.path.get_ident().map(|ident| ident.to_string());
++                        if repr.is_none() || hint.as_deref() != Some("C") {
++                            repr = hint;
++                        }
+                         Ok(())
+                     })
+                     .unwrap();
+@@ -447,29 +414,10 @@ pub fn collect_enum(ast: &syn::File, result: &mut Vec<RustEnum>) {
+             }
+ 
+             for v in &t.variants {
+-                let name = v.ident.to_string();
+-                let mut value = None;
+-
+-                match &v.discriminant {
+-                    Some((_, syn::Expr::Lit(x))) => {
+-                        if let syn::Lit::Int(x) = &x.lit {
+-                            let digits = x.base10_digits().to_string();
+-                            value = Some(digits);
+-                        }
+-                    }
+-                    Some((_, syn::Expr::Unary(u))) if matches!(u.op, syn::UnOp::Neg(_)) => {
+-                        if let syn::Expr::Lit(x) = &*u.expr {
+-                            if let syn::Lit::Int(x) = &x.lit {
+-                                value = Some(format!("-{}", x.base10_digits()));
+-                            }
+-                        }
+-                    }
+-                    _ => (),
+-                }
+-
+                 fields.push(RustEnumVariant {
+-                    name,
+-                    value,
++                    name: v.ident.to_string(),
++                    value: None,
++                    expr: v.discriminant.as_ref().map(|(_, e)| ConstExpr(e.clone())),
+                     doc_comment: gather_docs(&v.attrs),
+                 });
+             }
+@@ -526,6 +474,7 @@ pub fn collect_enum(ast: &syn::File, result: &mut Vec<RustEnum>) {
+                     .map(|x| RustEnumVariant {
+                         name: x.0,
+                         value: x.1,
++                        expr: None,
+                         doc_comment: Vec::new(),
+                     })
+                     .collect::<Vec<_>>();
+diff --git a/csbindgen/src/type_meta.rs b/csbindgen/src/type_meta.rs
+index 1b53ec4..72b2d2d 100644
+--- a/csbindgen/src/type_meta.rs
++++ b/csbindgen/src/type_meta.rs
+@@ -95,6 +95,7 @@ pub struct RustEnum {
+ pub struct RustEnumVariant {
+     pub name: String,
+     pub value: Option<String>,
++    pub expr: Option<ConstExpr>,
+     pub doc_comment: Vec<String>,
+ }
+ 
+@@ -103,9 +104,19 @@ pub struct RustConst {
+     pub const_name: String,
+     pub rust_type: RustType,
+     pub value: String,
++    pub expr: ConstExpr,
+     pub doc_comment: Vec<String>,
+ }
+ 
++#[derive(Clone)]
++pub struct ConstExpr(pub syn::Expr);
++
++impl std::fmt::Debug for ConstExpr {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("ConstExpr")
++    }
++}
++
+ impl RustType {
+     pub fn to_rust_string(&self, type_path: &str) -> String {
+         let mut sb = String::new();

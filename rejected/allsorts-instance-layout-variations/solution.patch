@@ -1,0 +1,511 @@
+diff --git a/src/gsub.rs b/src/gsub.rs
+index 23478ed..6815b07 100644
+--- a/src/gsub.rs
++++ b/src/gsub.rs
+@@ -1388,7 +1388,7 @@ pub fn apply(
+     // effects."
+     //
+     // https://learn.microsoft.com/en-us/typography/opentype/spec/features_pt#tag-rvrn
+-    if tuple.is_some() {
++    if tuple.is_some() || gsub_table.has_feature(tag::RVRN) {
+         apply_rvrn(
+             gsub_cache,
+             opt_gdef_table,
+diff --git a/src/layout.rs b/src/layout.rs
+index 8f61395..dc303f1 100644
+--- a/src/layout.rs
++++ b/src/layout.rs
+@@ -1,5 +1,6 @@
+ //! `GDEF` font table parsing and glyph lookup and layout properties.
+ 
++pub(crate) mod instance;
+ pub mod morx;
+ 
+ use std::borrow::Cow;
+@@ -913,6 +914,15 @@ impl<T> LayoutTable<T> {
+         Ok(None)
+     }
+ 
++    pub(crate) fn has_feature(&self, feature_tag: u32) -> bool {
++        self.opt_feature_list.as_ref().is_some_and(|feature_list| {
++            feature_list
++                .feature_records
++                .iter()
++                .any(|record| record.feature_tag == feature_tag)
++        })
++    }
++
+     pub fn feature_by_index(&self, feature_index: u16) -> Result<&FeatureRecord, ParseError> {
+         if let Some(ref feature_list) = self.opt_feature_list {
+             let feature_record = feature_list.nth_feature_record(usize::from(feature_index))?;
+diff --git a/src/layout/instance.rs b/src/layout/instance.rs
+new file mode 100644
+index 0000000..322b208
+--- /dev/null
++++ b/src/layout/instance.rs
+@@ -0,0 +1,297 @@
++use crate::binary::read::ReadScope;
++use crate::error::ParseError;
++use crate::layout::{
++    FeatureTable, LayoutTable, LayoutTableType, ValueFormat, VariationIndex, GPOS,
++};
++use crate::tables::variable_fonts::owned::ItemVariationStore;
++use crate::tables::variable_fonts::Tuple;
++
++const HEADER_LEN: usize = 10;
++const VARIATIONS_HEADER_LEN: usize = 14;
++const SINGLE_POS: u16 = 1;
++const PAIR_POS: u16 = 2;
++const EXTENSION_POS: u16 = 9;
++const VARIATION_INDEX_FORMAT: u16 = 0x8000;
++
++pub(crate) fn instance_layout<T: LayoutTableType>(
++    data: &[u8],
++    tuple: Tuple<'_>,
++) -> Result<Vec<u8>, ParseError> {
++    let layout = ReadScope::new(data).read::<LayoutTable<T>>()?;
++    let Some(feature_variations) = layout.opt_feature_variations.as_ref() else {
++        return Ok(data.to_vec());
++    };
++    let substitution = feature_variations.matches(tuple)?;
++    let records = layout
++        .opt_feature_list
++        .as_ref()
++        .map(|feature_list| feature_list.feature_records.as_slice())
++        .unwrap_or_default();
++    let alternates = (0..records.len())
++        .map(|index| {
++            let index = u16::try_from(index).map_err(|_| ParseError::LimitExceeded)?;
++            Ok(substitution
++                .as_ref()
++                .and_then(|substitution| substitution.substitute(index)))
++        })
++        .collect::<Result<Vec<Option<FeatureTable>>, ParseError>>()?;
++    rebuild_feature_list(data, &alternates)
++}
++
++pub(crate) fn instance_gpos(
++    data: &[u8],
++    tuple: Tuple<'_>,
++    store: Option<&ItemVariationStore>,
++) -> Result<Vec<u8>, ParseError> {
++    let mut table = instance_layout::<GPOS>(data, tuple)?;
++    if let Some(store) = store {
++        DeltaBaker { tuple, store }.bake_lookups(&mut table)?;
++    }
++    Ok(table)
++}
++
++pub(crate) fn drop_gdef_variation_store(data: &[u8]) -> Result<Vec<u8>, ParseError> {
++    let mut table = data.to_vec();
++    if read_u16(&table, 2)? >= 3 {
++        write_u32(&mut table, 14, 0)?;
++    }
++    Ok(table)
++}
++
++fn rebuild_feature_list(
++    data: &[u8],
++    alternates: &[Option<FeatureTable>],
++) -> Result<Vec<u8>, ParseError> {
++    let old_feature_list = usize::from(read_u16(data, 6)?);
++    let records_len = 2 + 6 * alternates.len();
++    let alternates_len = alternates
++        .iter()
++        .flatten()
++        .map(|feature| 4 + 2 * feature.lookup_indices.len())
++        .sum::<usize>();
++    let body_start = HEADER_LEN + records_len + alternates_len;
++    let relocate = |offset: usize| -> Result<u16, ParseError> {
++        match offset {
++            0 => Ok(0),
++            _ => u16::try_from(offset - VARIATIONS_HEADER_LEN + body_start)
++                .map_err(|_| ParseError::LimitExceeded),
++        }
++    };
++
++    let mut table = Vec::with_capacity(data.len() + body_start);
++    push_u16(&mut table, 1);
++    push_u16(&mut table, 0);
++    push_u16(&mut table, relocate(usize::from(read_u16(data, 4)?))?);
++    push_u16(
++        &mut table,
++        if old_feature_list == 0 {
++            0
++        } else {
++            HEADER_LEN as u16
++        },
++    );
++    push_u16(&mut table, relocate(usize::from(read_u16(data, 8)?))?);
++
++    let mut alternate_tables = Vec::with_capacity(alternates_len);
++    push_u16(&mut table, alternates.len() as u16);
++    for (index, alternate) in alternates.iter().enumerate() {
++        let record = old_feature_list + 2 + 6 * index;
++        table.extend_from_slice(data.get(record..record + 4).ok_or(ParseError::BadOffset)?);
++        let offset = match alternate {
++            Some(feature) => {
++                let offset = records_len + alternate_tables.len();
++                push_u16(&mut alternate_tables, 0);
++                push_u16(&mut alternate_tables, feature.lookup_indices.len() as u16);
++                for lookup_index in &feature.lookup_indices {
++                    push_u16(&mut alternate_tables, *lookup_index);
++                }
++                offset
++            }
++            None => {
++                let feature = old_feature_list + usize::from(read_u16(data, record + 4)?);
++                usize::from(relocate(feature)?) - HEADER_LEN
++            }
++        };
++        push_u16(
++            &mut table,
++            u16::try_from(offset).map_err(|_| ParseError::LimitExceeded)?,
++        );
++    }
++    table.extend_from_slice(&alternate_tables);
++    table.extend_from_slice(
++        data.get(VARIATIONS_HEADER_LEN..)
++            .ok_or(ParseError::BadOffset)?,
++    );
++    Ok(table)
++}
++
++struct DeltaBaker<'a, 'b> {
++    tuple: Tuple<'a>,
++    store: &'b ItemVariationStore,
++}
++
++impl DeltaBaker<'_, '_> {
++    fn bake_lookups(&self, table: &mut [u8]) -> Result<(), ParseError> {
++        let lookup_list = usize::from(read_u16(table, 8)?);
++        if lookup_list == 0 {
++            return Ok(());
++        }
++        for i in 0..usize::from(read_u16(table, lookup_list)?) {
++            let lookup = lookup_list + usize::from(read_u16(table, lookup_list + 2 + 2 * i)?);
++            let lookup_type = read_u16(table, lookup)?;
++            for j in 0..usize::from(read_u16(table, lookup + 4)?) {
++                let mut subtable = lookup + usize::from(read_u16(table, lookup + 6 + 2 * j)?);
++                let mut subtable_type = lookup_type;
++                if lookup_type == EXTENSION_POS {
++                    subtable_type = read_u16(table, subtable + 2)?;
++                    subtable += usize::try_from(read_u32(table, subtable + 4)?)
++                        .map_err(|_| ParseError::BadOffset)?;
++                }
++                match subtable_type {
++                    SINGLE_POS => self.single_pos(table, subtable)?,
++                    PAIR_POS => self.pair_pos(table, subtable)?,
++                    _ => {}
++                }
++            }
++        }
++        Ok(())
++    }
++
++    fn single_pos(&self, table: &mut [u8], subtable: usize) -> Result<(), ParseError> {
++        let value_format = ValueFormat(read_u16(table, subtable + 4)?);
++        match read_u16(table, subtable)? {
++            1 => self.value_record(table, subtable, subtable + 6, value_format),
++            2 => {
++                for k in 0..usize::from(read_u16(table, subtable + 6)?) {
++                    let record = subtable + 8 + k * value_format.size();
++                    self.value_record(table, subtable, record, value_format)?;
++                }
++                Ok(())
++            }
++            _ => Err(ParseError::BadVersion),
++        }
++    }
++
++    fn pair_pos(&self, table: &mut [u8], subtable: usize) -> Result<(), ParseError> {
++        let first = ValueFormat(read_u16(table, subtable + 4)?);
++        let second = ValueFormat(read_u16(table, subtable + 6)?);
++        match read_u16(table, subtable)? {
++            1 => {
++                let record_len = 2 + first.size() + second.size();
++                for k in 0..usize::from(read_u16(table, subtable + 8)?) {
++                    let pair_set = subtable + usize::from(read_u16(table, subtable + 10 + 2 * k)?);
++                    for r in 0..usize::from(read_u16(table, pair_set)?) {
++                        let record = pair_set + 2 + r * record_len + 2;
++                        self.value_record(table, pair_set, record, first)?;
++                        self.value_record(table, pair_set, record + first.size(), second)?;
++                    }
++                }
++                Ok(())
++            }
++            2 => {
++                let class_pairs = usize::from(read_u16(table, subtable + 12)?)
++                    * usize::from(read_u16(table, subtable + 14)?);
++                let record_len = first.size() + second.size();
++                for k in 0..class_pairs {
++                    let record = subtable + 16 + k * record_len;
++                    self.value_record(table, subtable, record, first)?;
++                    self.value_record(table, subtable, record + first.size(), second)?;
++                }
++                Ok(())
++            }
++            _ => Err(ParseError::BadVersion),
++        }
++    }
++
++    fn value_record(
++        &self,
++        table: &mut [u8],
++        parent: usize,
++        record: usize,
++        value_format: ValueFormat,
++    ) -> Result<(), ParseError> {
++        let mut values = [None; 4];
++        let mut devices = [None; 4];
++        let mut position = record;
++        for bit in 0..8 {
++            if value_format.0 & (1 << bit) != 0 {
++                if bit < 4 {
++                    values[bit] = Some(position);
++                } else {
++                    devices[bit - 4] = Some(position);
++                }
++                position += 2;
++            }
++        }
++        let read_value = |table: &[u8], field: Option<usize>| -> Result<i16, ParseError> {
++            field.map_or(Ok(0), |field| {
++                read_u16(table, field).map(|value| value as i16)
++            })
++        };
++        let has_placement =
++            read_value(table, values[0])? != 0 || read_value(table, values[1])? != 0;
++        if read_value(table, values[3])? != 0 {
++            return Ok(());
++        }
++        for field in 0..3 {
++            if field < 2 && !has_placement {
++                continue;
++            }
++            let (Some(value), Some(device)) = (values[field], devices[field]) else {
++                continue;
++            };
++            let device_offset = usize::from(read_u16(table, device)?);
++            if device_offset == 0 {
++                continue;
++            }
++            let Some(index) = read_variation_index(table, parent + device_offset)? else {
++                continue;
++            };
++            let delta = self.store.adjustment(index, self.tuple)?.round() as i16;
++            let baked = (read_u16(table, value)? as i16).wrapping_add(delta);
++            write_u16(table, value, baked as u16)?;
++            write_u16(table, device, 0)?;
++        }
++        Ok(())
++    }
++}
++
++fn read_variation_index(table: &[u8], device: usize) -> Result<Option<VariationIndex>, ParseError> {
++    if read_u16(table, device + 4)? != VARIATION_INDEX_FORMAT {
++        return Ok(None);
++    }
++    Ok(Some(VariationIndex {
++        outer_index: read_u16(table, device)?,
++        inner_index: read_u16(table, device + 2)?,
++    }))
++}
++
++fn read_u16(data: &[u8], offset: usize) -> Result<u16, ParseError> {
++    data.get(offset..offset + 2)
++        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
++        .ok_or(ParseError::BadOffset)
++}
++
++fn read_u32(data: &[u8], offset: usize) -> Result<u32, ParseError> {
++    data.get(offset..offset + 4)
++        .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
++        .ok_or(ParseError::BadOffset)
++}
++
++fn write_u16(data: &mut [u8], offset: usize, value: u16) -> Result<(), ParseError> {
++    data.get_mut(offset..offset + 2)
++        .ok_or(ParseError::BadOffset)?
++        .copy_from_slice(&value.to_be_bytes());
++    Ok(())
++}
++
++fn write_u32(data: &mut [u8], offset: usize, value: u32) -> Result<(), ParseError> {
++    data.get_mut(offset..offset + 4)
++        .ok_or(ParseError::BadOffset)?
++        .copy_from_slice(&value.to_be_bytes());
++    Ok(())
++}
++
++fn push_u16(out: &mut Vec<u8>, value: u16) {
++    out.extend_from_slice(&value.to_be_bytes());
++}
+diff --git a/src/tag.rs b/src/tag.rs
+index ef1ae55..b056763 100644
+--- a/src/tag.rs
++++ b/src/tag.rs
+@@ -409,6 +409,8 @@ pub const VMTX: u32 = tag!(b"vmtx");
+ pub const VORG: u32 = tag!(b"VORG");
+ /// `vrt2`
+ pub const VRT2: u32 = tag!(b"vrt2");
++/// `VVAR`
++pub const VVAR: u32 = tag!(b"VVAR");
+ /// `Zapf`
+ pub const ZAPF: u32 = tag!(b"Zapf");
+ /// `zero`
+diff --git a/src/variations.rs b/src/variations.rs
+index 4d711f5..09eb84c 100644
+--- a/src/variations.rs
++++ b/src/variations.rs
+@@ -15,6 +15,8 @@ use crate::binary::read::{ReadArrayCow, ReadScope};
+ use crate::cff::cff2::CFF2;
+ use crate::cff::CFFError;
+ use crate::error::{ParseError, ReadWriteError, WriteError};
++use crate::layout::instance::{drop_gdef_variation_store, instance_gpos, instance_layout};
++use crate::layout::{GDEFTable, GSUB};
+ use crate::post::PostTable;
+ use crate::subset::{FontBuilder, TableFilter};
+ use crate::tables::glyf::{BoundingBox, GlyfRecord, GlyfTable, Glyph};
+@@ -172,12 +174,13 @@ pub fn instance(
+         usize::from(hhea.num_h_metrics),
+     ))?;
+     let vhea_data = provider.table_data(tag::VHEA)?;
+-    let vhea = vhea_data
++    let mut vhea = vhea_data
+         .as_ref()
+         .map(|vhea_data| ReadScope::new(vhea_data).read::<HheaTable>())
+         .transpose()?;
+     let vmtx_data = provider.table_data(tag::VMTX)?;
+     let vmtx = vhea
++        .as_ref()
+         .and_then(|vhea| {
+             vmtx_data.as_ref().map(|vmtx_data| {
+                 ReadScope::new(vmtx_data).read_dep::<HmtxTable<'_>>((
+@@ -224,6 +227,11 @@ pub fn instance(
+         .as_ref()
+         .map(|hvar_data| ReadScope::new(hvar_data).read::<HvarTable<'_>>())
+         .transpose()?;
++    let vvar_data = provider.table_data(tag::VVAR)?;
++    let vvar = vvar_data
++        .as_ref()
++        .map(|vvar_data| ReadScope::new(vvar_data).read::<HvarTable<'_>>())
++        .transpose()?;
+     let mvar_data = provider.table_data(tag::MVAR)?;
+     let mvar = mvar_data
+         .as_ref()
+@@ -292,6 +300,13 @@ pub fn instance(
+         // unsupported.
+         _ => return Err(VariationError::NotImplemented),
+     };
++    let glyf = match &glyph_data {
++        GlyphData::Glyf(glyf) => Some(glyf),
++        GlyphData::Cff2(_) => None,
++    };
++    let vmtx = vmtx
++        .map(|vmtx| create_vmtx_table(&vmtx, vvar.as_ref(), glyf, &instance, maxp.num_glyphs))
++        .transpose()?;
+ 
+     // Update italic flags
+     head.mac_style
+@@ -310,7 +325,7 @@ pub fn instance(
+ 
+     // Apply deltas to OS/2, hhea, vhea, post
+     if let Some(mvar) = &mvar {
+-        process_mvar(mvar, &instance, &mut os2, &mut hhea, &mut None, &mut post);
++        process_mvar(mvar, &instance, &mut os2, &mut hhea, &mut vhea, &mut post);
+     }
+ 
+     // If one of the axes is wght or wdth then when need to update the corresponding
+@@ -405,6 +420,38 @@ pub fn instance(
+     builder.add_table::<_, owned::NameTable<'_>>(tag::NAME, &name, ())?;
+     builder.add_table::<_, Os2>(tag::OS_2, &os2, ())?;
+     builder.add_table::<_, PostTable<'_>>(tag::POST, &post, ())?;
++    if let (Some(mut vhea), Some(vmtx)) = (vhea, &vmtx) {
++        vhea.num_h_metrics = maxp.num_glyphs;
++        vhea.advance_width_max = vmtx
++            .h_metrics
++            .iter()
++            .map(|metric| metric.advance_width)
++            .max()
++            .unwrap_or(0);
++        builder.add_table::<_, HheaTable>(tag::VHEA, &vhea, ())?;
++        builder.add_table::<_, HmtxTable<'_>>(tag::VMTX, vmtx, ())?;
++    }
++
++    let gdef_data = provider.table_data(tag::GDEF)?;
++    let gdef = gdef_data
++        .as_ref()
++        .map(|gdef_data| ReadScope::new(gdef_data).read::<GDEFTable>())
++        .transpose()?;
++    let store = gdef
++        .as_ref()
++        .and_then(|gdef| gdef.opt_item_variation_store.as_ref());
++    if let Some(gsub_data) = provider.table_data(tag::GSUB)? {
++        let gsub = instance_layout::<GSUB>(&gsub_data, instance.as_tuple())?;
++        builder.add_table::<_, ReadScope<'_>>(tag::GSUB, ReadScope::new(&gsub), ())?;
++    }
++    if let Some(gpos_data) = provider.table_data(tag::GPOS)? {
++        let gpos = instance_gpos(&gpos_data, instance.as_tuple(), store)?;
++        builder.add_table::<_, ReadScope<'_>>(tag::GPOS, ReadScope::new(&gpos), ())?;
++    }
++    if let Some(gdef_data) = &gdef_data {
++        let gdef = drop_gdef_variation_store(gdef_data)?;
++        builder.add_table::<_, ReadScope<'_>>(tag::GDEF, ReadScope::new(&gdef), ())?;
++    }
+ 
+     let glyf = match glyph_data {
+         GlyphData::Cff2(cff2) => {
+@@ -852,6 +899,52 @@ fn apply_hvar<'a>(
+     })
+ }
+ 
++fn create_vmtx_table<'a>(
++    vmtx: &HmtxTable<'_>,
++    vvar: Option<&HvarTable<'_>>,
++    glyf: Option<&GlyfTable<'_>>,
++    instance: &OwnedTuple,
++    num_glyphs: u16,
++) -> Result<HmtxTable<'a>, ReadWriteError> {
++    let mut v_metrics = Vec::with_capacity(usize::from(num_glyphs));
++    for glyph_id in 0..num_glyphs {
++        let mut metric = vmtx.metric(glyph_id)?;
++        let vertical_origin = glyf
++            .map(|glyf| match glyf.records().get(usize::from(glyph_id)) {
++                Some(GlyfRecord::Parsed(glyph)) => {
++                    let bounding_box = glyph.bounding_box().unwrap_or_else(BoundingBox::empty);
++                    let phantom_points = glyph.phantom_points().ok_or(ParseError::MissingValue)?;
++                    Ok((phantom_points[2].1, phantom_points[3].1, bounding_box.y_max))
++                }
++                _ => Err(ParseError::BadIndex),
++            })
++            .transpose()?;
++        match (vvar, vertical_origin) {
++            (Some(vvar), _) => {
++                let delta = vvar.advance_delta(instance, glyph_id)?;
++                metric.advance_width = (metric.advance_width as f32 + delta)
++                    .round()
++                    .clamp(0., u16::MAX as f32) as u16;
++                if let Some(delta) = vvar.left_side_bearing_delta(instance, glyph_id)? {
++                    metric.lsb = add_delta_i16(metric.lsb, delta);
++                } else if let Some((pp3, _, y_max)) = vertical_origin {
++                    metric.lsb = pp3 - y_max;
++                }
++            }
++            (None, Some((pp3, pp4, y_max))) => {
++                metric.advance_width = u16::try_from(pp3 - pp4).unwrap_or(0);
++                metric.lsb = pp3 - y_max;
++            }
++            (None, None) => {}
++        }
++        v_metrics.push(metric);
++    }
++    Ok(HmtxTable {
++        h_metrics: ReadArrayCow::Owned(v_metrics),
++        left_side_bearings: ReadArrayCow::Owned(vec![]),
++    })
++}
++
+ fn htmx_from_phantom_points<'a>(
+     glyf: &GlyfTable<'_>,
+     num_glyphs: u16,

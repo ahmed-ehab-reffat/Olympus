@@ -1,0 +1,617 @@
+diff --git a/config/config.go b/config/config.go
+index 39a798f..fa2e4a7 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -60,6 +60,7 @@ func defaultConfig() Configuration {
+ 		DisallowRedirects:       false,
+ 		WeightDistributionRange: 1.5,
+ 		DisableOnMissingFile:    false,
++		SourceHistory:           10,
+ 		RPCListenAddress:        "localhost:3390",
+ 		RPCPassword:             "",
+ 	}
+@@ -92,6 +93,7 @@ type Configuration struct {
+ 	DisallowRedirects       bool       `yaml:"DisallowRedirects"`
+ 	WeightDistributionRange float32    `yaml:"WeightDistributionRange"`
+ 	DisableOnMissingFile    bool       `yaml:"DisableOnMissingFile"`
++	SourceHistory           int        `yaml:"SourceHistory"`
+ 	AllowOutdatedFiles      []OutdatedFilesConfig `yaml:"AllowOutdatedFiles"`
+ 	Fallbacks               []Fallback `yaml:"Fallbacks"`
+ 
+diff --git a/mirrorbits.conf b/mirrorbits.conf
+index 3373e69..e8fbab8 100644
+--- a/mirrorbits.conf
++++ b/mirrorbits.conf
+@@ -88,6 +88,11 @@
+ ## is updated.
+ # RepositoryScanInterval: 5
+ 
++## Number of recent repository generations to remember when computing
++## the sync point of a mirror (the newest state of the repository the
++## mirror is consistent with).
++# SourceHistory: 10
++
+ ## Enable or disable specific hashing algorithms
+ # Hashes:
+ #     SHA256: On
+diff --git a/mirrors/mirrors.go b/mirrors/mirrors.go
+index 6b12f03..ed63470 100644
+--- a/mirrors/mirrors.go
++++ b/mirrors/mirrors.go
+@@ -83,6 +83,8 @@ type Mirror struct {
+ 	LastSuccessfulSyncProtocol  core.ScannerType `redis:"lastSuccessfulSyncProtocol" yaml:"-"`
+ 	LastSuccessfulSyncPrecision core.Precision   `redis:"lastSuccessfulSyncPrecision" yaml:"-"`
+ 	LastModTime                 Time             `redis:"lastModTime" yaml:"-"`
++	SyncGeneration              int64            `redis:"syncGeneration" yaml:"-"`
++	SourceGeneration            int64            `redis:"sourceGeneration" yaml:"-"`
+ 
+ 	FileInfo *filesystem.FileInfo `redis:"-" json:"-" yaml:"-"` // Details of the requested file on this specific mirror
+ 	AbsoluteURL string            `redis:"-" yaml:"-"` // Absolute HttpURL, guaranteed to start with a scheme
+diff --git a/scan/ledger.go b/scan/ledger.go
+new file mode 100644
+index 0000000..20bb1fe
+--- /dev/null
++++ b/scan/ledger.go
+@@ -0,0 +1,296 @@
++// Copyright (c) 2014-2019 Ludovic Fauvet
++// Licensed under the MIT license
++
++package scan
++
++import (
++	"encoding/json"
++	"fmt"
++	"strconv"
++	"strings"
++	"time"
++
++	. "github.com/etix/mirrorbits/config"
++	"github.com/etix/mirrorbits/database"
++	"github.com/gomodule/redigo/redis"
++)
++
++const (
++	sourceGenerationKey = "SOURCE_GENERATION"
++	sourceHistoryKey    = "SOURCE_HISTORY"
++	sourceFloorKey      = "SOURCE_HISTORY_FLOOR"
++)
++
++var raiseFloor = redis.NewScript(1, `
++local floor = tonumber(redis.call("GET", KEYS[1]) or "0")
++if tonumber(ARGV[1]) > floor then
++	redis.call("SET", KEYS[1], ARGV[1])
++end
++return floor
++`)
++
++type fileVersion struct {
++	Size    int64
++	ModTime time.Time
++	From    int64
++	Until   int64
++}
++
++type sourceHistory struct {
++	generation int64
++	floor      int64
++	paths      map[string][]fileVersion
++}
++
++type syncPoint struct {
++	Generation       int64
++	SourceGeneration int64
++}
++
++func historyDepth() int64 {
++	depth := int64(GetConfig().SourceHistory)
++	if depth < 1 {
++		depth = 1
++	}
++	return depth
++}
++
++func (h *sourceHistory) oldest() int64 {
++	oldest := h.generation - historyDepth() + 1
++	if oldest < h.floor {
++		oldest = h.floor
++	}
++	if oldest < 1 {
++		oldest = 1
++	}
++	return oldest
++}
++
++func (v fileVersion) covers(generation int64) bool {
++	return generation >= v.From && (v.Until == 0 || generation < v.Until)
++}
++
++func anyCovers(versions []fileVersion, generation int64) bool {
++	for _, v := range versions {
++		if v.covers(generation) {
++			return true
++		}
++	}
++	return false
++}
++
++func currentVersion(versions []fileVersion) *fileVersion {
++	if n := len(versions); n > 0 && versions[n-1].Until == 0 {
++		return &versions[n-1]
++	}
++	return nil
++}
++
++func loadSourceHistory(conn redis.Conn) (*sourceHistory, error) {
++	conn.Send("MULTI")
++	conn.Send("GET", sourceGenerationKey)
++	conn.Send("GET", sourceFloorKey)
++	conn.Send("HGETALL", sourceHistoryKey)
++	reply, err := redis.Values(conn.Do("EXEC"))
++	if err != nil {
++		return nil, err
++	}
++	gen, err := redis.Int64(reply[0], nil)
++	if err == redis.ErrNil {
++		gen, err = 0, nil
++	}
++	if err != nil {
++		return nil, err
++	}
++	floor, err := redis.Int64(reply[1], nil)
++	if err == redis.ErrNil {
++		floor, err = 0, nil
++	}
++	if err != nil {
++		return nil, err
++	}
++	raw, err := redis.StringMap(reply[2], nil)
++	if err != nil {
++		return nil, err
++	}
++	h := &sourceHistory{
++		generation: gen,
++		floor:      floor,
++		paths:      make(map[string][]fileVersion, len(raw)),
++	}
++	for path, value := range raw {
++		var versions []fileVersion
++		if err := json.Unmarshal([]byte(value), &versions); err != nil {
++			return nil, fmt.Errorf("invalid history for %s: %w", path, err)
++		}
++		h.paths[path] = versions
++	}
++	return h, nil
++}
++
++func (h *sourceHistory) advance(files []*filedata) map[string][]fileVersion {
++	next := h.generation + 1
++	updated := make(map[string][]fileVersion)
++	seen := make(map[string]bool, len(files))
++
++	for _, f := range files {
++		seen[f.path] = true
++		versions := append([]fileVersion(nil), h.paths[f.path]...)
++		cur := currentVersion(versions)
++		if cur != nil && cur.Size == f.size && cur.ModTime.Equal(f.modTime) {
++			continue
++		}
++		if cur != nil {
++			cur.Until = next
++		}
++		updated[f.path] = append(versions, fileVersion{
++			Size:    f.size,
++			ModTime: f.modTime,
++			From:    next,
++		})
++	}
++
++	for path, versions := range h.paths {
++		if currentVersion(versions) != nil && !seen[path] {
++			versions = append([]fileVersion(nil), versions...)
++			versions[len(versions)-1].Until = next
++			updated[path] = versions
++		}
++	}
++
++	if len(updated) > 0 || h.generation == 0 {
++		h.generation = next
++	}
++	oldest := h.oldest()
++	moved := oldest != h.floor
++	h.floor = oldest
++	for path, versions := range h.paths {
++		if _, ok := updated[path]; !ok {
++			if kept := forget(versions, oldest); len(kept) != len(versions) {
++				updated[path] = kept
++			}
++		}
++	}
++	for path, versions := range updated {
++		updated[path] = forget(versions, oldest)
++		h.paths[path] = updated[path]
++	}
++	if len(updated) == 0 && h.generation != next && !moved {
++		return nil
++	}
++	return updated
++}
++
++func forget(versions []fileVersion, oldest int64) []fileVersion {
++	kept := make([]fileVersion, 0, len(versions))
++	for _, v := range versions {
++		if v.Until == 0 || v.Until > oldest {
++			kept = append(kept, v)
++		}
++	}
++	return kept
++}
++
++func (h *sourceHistory) queue(conn redis.Conn, updated map[string][]fileVersion) error {
++	for path, versions := range updated {
++		if len(versions) == 0 {
++			conn.Send("HDEL", sourceHistoryKey, path)
++			continue
++		}
++		value, err := json.Marshal(versions)
++		if err != nil {
++			return err
++		}
++		conn.Send("HSET", sourceHistoryKey, path, value)
++	}
++	conn.Send("SET", sourceGenerationKey, h.generation)
++	raiseFloor.Send(conn, sourceFloorKey, h.floor)
++	return nil
++}
++
++func (h *sourceHistory) keepFloor(conn redis.Conn) error {
++	oldest := h.oldest()
++	if oldest <= h.floor {
++		return nil
++	}
++	if _, err := raiseFloor.Do(conn, sourceFloorKey, oldest); err != nil {
++		return err
++	}
++	h.floor = oldest
++	return nil
++}
++
++func underDirectory(path string, dirs []string) bool {
++	for _, dir := range dirs {
++		dir = strings.TrimSuffix(dir, "/")
++		if dir == "" || path == dir || strings.HasPrefix(path, dir+"/") {
++			return true
++		}
++	}
++	return false
++}
++
++func sameContent(v fileVersion, f filedata, offset, precision time.Duration) bool {
++	if v.Size != f.size || f.modTime.IsZero() {
++		return false
++	}
++	return f.modTime.Add(offset).Truncate(precision).Equal(v.ModTime.Truncate(precision))
++}
++
++func (h *sourceHistory) solve(listed map[string]filedata, unreadable []string, offset, precision time.Duration) *syncPoint {
++	sp := &syncPoint{SourceGeneration: h.generation}
++
++	oldest := h.oldest()
++	possible := make([]bool, 0, h.generation-oldest+1)
++	for g := oldest; g <= h.generation; g++ {
++		possible = append(possible, true)
++	}
++	restrict := func(versions []fileVersion, held bool) {
++		for i := range possible {
++			if anyCovers(versions, oldest+int64(i)) != held {
++				possible[i] = false
++			}
++		}
++	}
++
++	for path, versions := range h.paths {
++		if versions = forget(versions, oldest); len(versions) == 0 {
++			continue
++		}
++		f, ok := listed[path]
++		switch {
++		case underDirectory(path, unreadable):
++		case ok:
++			var matched []fileVersion
++			for _, v := range versions {
++				if sameContent(v, f, offset, precision) {
++					matched = append(matched, v)
++				}
++			}
++			if len(matched) > 0 {
++				restrict(matched, true)
++			}
++		default:
++			restrict(versions, false)
++		}
++	}
++
++	for i := len(possible) - 1; i >= 0; i-- {
++		if possible[i] {
++			sp.Generation = oldest + int64(i)
++			break
++		}
++	}
++	return sp
++}
++
++func storeSyncPoint(conn redis.Conn, id int, sp *syncPoint) error {
++	_, err := conn.Do("HSET", fmt.Sprintf("MIRROR_%d", id),
++		"syncGeneration", sp.Generation,
++		"sourceGeneration", sp.SourceGeneration)
++	if err != nil {
++		return err
++	}
++	database.Publish(conn, database.MIRROR_UPDATE, strconv.Itoa(id))
++	return nil
++}
+diff --git a/scan/rsync.go b/scan/rsync.go
+index 32bda6d..d5c5224 100644
+--- a/scan/rsync.go
++++ b/scan/rsync.go
+@@ -10,6 +10,7 @@ import (
+ 	"io"
+ 	"net/url"
+ 	"os/exec"
++	"path"
+ 	"regexp"
+ 	"strconv"
+ 	"strings"
+@@ -22,6 +23,7 @@ import (
+ 
+ var (
+ 	rsyncOutputLine = regexp.MustCompile(`^.+\s+([0-9,]+)\s+([0-9/]+)\s+([0-9:]+)\s+(.*)$`)
++	rsyncUnreadable = regexp.MustCompile(`(opendir "([^"]*)" \(in [^)]*\)|readlink_stat\("([^"]*)" \(in [^)]*\)\)) failed`)
+ )
+ 
+ // RsyncScanner is the implementation of an rsync scanner
+@@ -172,7 +174,7 @@ func (r *RsyncScanner) Scan(rsyncURL, identifier string, conn redis.Conn, stop <
+ 
+ 	rsyncErrors := []string{}
+ 	for line, err = readln(readerErr); err == nil; line, err = readln(readerErr) {
+-		if strings.Contains(line, ": opendir ") {
++		if rsyncUnreadable.MatchString(line) {
+ 			rsyncErrors = append(rsyncErrors, line)
+ 		}
+ 	}
+@@ -188,9 +190,14 @@ func (r *RsyncScanner) Scan(rsyncURL, identifier string, conn redis.Conn, stop <
+ 		case "exit status 23":
+ 			for _, line := range rsyncErrors {
+ 				log.Warningf("[%s] %s", identifier, line)
++				if m := rsyncUnreadable.FindStringSubmatch(line); m != nil {
++					if dir, ok := rsyncModulePath(u.Path, m[2]+m[3]); ok {
++						r.scan.ScannerUnreadable(dir)
++					}
++				}
+ 			}
+ 			log.Warningf("[%s] rsync: Partial transfer due to error", identifier)
+-			err1 = nil
++			return core.Precision(time.Second), nil
+ 		case "exit status 30":
+ 			err1 = errors.New("rsync: Timeout in data send/receive")
+ 		case "exit status 35":
+@@ -212,6 +219,23 @@ func (r *RsyncScanner) Scan(rsyncURL, identifier string, conn redis.Conn, stop <
+ 	return core.Precision(time.Second), nil
+ }
+ 
++func rsyncModulePath(urlPath, dir string) (string, bool) {
++	dir = strings.Trim(path.Clean("/"+dir), "/")
++	base := ""
++	if parts := strings.SplitN(strings.Trim(urlPath, "/"), "/", 2); len(parts) == 2 {
++		base = strings.Trim(parts[1], "/")
++	}
++	switch {
++	case base == "":
++		return "/" + dir, true
++	case dir == "" || dir == base || strings.HasPrefix(base, dir+"/"):
++		return "/", true
++	case strings.HasPrefix(dir, base+"/"):
++		return "/" + strings.TrimPrefix(dir, base+"/"), true
++	}
++	return "", false
++}
++
+ func readln(r *bufio.Reader) (string, error) {
+ 	var (
+ 		isPrefix = true
+diff --git a/scan/scan.go b/scan/scan.go
+index 3036e3d..1dd01c3 100644
+--- a/scan/scan.go
++++ b/scan/scan.go
+@@ -9,6 +9,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"strconv"
++	"strings"
+ 	"time"
+ 
+ 	. "github.com/etix/mirrorbits/config"
+@@ -55,6 +56,8 @@ type scan struct {
+ 	mirrorid    int
+ 	filesTmpKey string
+ 	count       int64
++	listed      map[string]filedata
++	unreadable  []string
+ }
+ 
+ type ScanResult struct {
+@@ -64,6 +67,9 @@ type ScanResult struct {
+ 	KnownIndexed int64
+ 	Removed      int64
+ 	TZOffsetMs   int64
++
++	SyncGeneration   int64
++	SourceGeneration int64
+ }
+ 
+ // IsScanning returns true is a scan is already in progress for the given mirror
+@@ -82,6 +88,7 @@ func Scan(typ core.ScannerType, r *database.Redis, c *mirrors.Cache, url string,
+ 		mirrorid: id,
+ 		conn:     conn,
+ 		cache:    c,
++		listed:   make(map[string]filedata),
+ 	}
+ 
+ 	var scanner Scanner
+@@ -155,11 +162,23 @@ func Scan(typ core.ScannerType, r *database.Redis, c *mirrors.Cache, url string,
+ 	s.ScannerCommit()
+ 
+ 	// Get the list of files no more present on this mirror
+-	var toremove []any
++	var toremove, kept []any
+ 	toremove, err = redis.Values(conn.Do("SDIFF", filesKey, s.filesTmpKey))
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if len(s.unreadable) > 0 {
++		missing := toremove
++		toremove = toremove[:0:0]
++		for _, e := range missing {
++			path, _ := redis.String(e, nil)
++			if underDirectory(path, s.unreadable) {
++				kept = append(kept, e)
++			} else {
++				toremove = append(toremove, e)
++			}
++		}
++	}
+ 
+ 	// Remove this mirror from the given file SET
+ 	if len(toremove) > 0 {
+@@ -182,6 +201,14 @@ func Scan(typ core.ScannerType, r *database.Redis, c *mirrors.Cache, url string,
+ 	// of files for this mirror to the production key
+ 	if s.count > 0 {
+ 		_, err = conn.Do("RENAME", s.filesTmpKey, filesKey)
++	} else {
++		_, err = conn.Do("DEL", filesKey)
++	}
++	if err != nil {
++		return nil, err
++	}
++	if len(kept) > 0 {
++		_, err = conn.Do("SADD", append([]any{filesKey}, kept...)...)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -204,6 +231,11 @@ func Scan(typ core.ScannerType, r *database.Redis, c *mirrors.Cache, url string,
+ 		log.Warningf("Unable to check timezone shifts: %s", err)
+ 	}
+ 
++	sp, err := s.locateSyncPoint(tzoffset, precision)
++	if err != nil {
++		return nil, err
++	}
++
+ 	log.Infof("[%s] Indexed %d files (%d known), %d removed", name, s.count, common, len(toremove))
+ 	res := &ScanResult{
+ 		MirrorID:     id,
+@@ -212,6 +244,9 @@ func Scan(typ core.ScannerType, r *database.Redis, c *mirrors.Cache, url string,
+ 		KnownIndexed: common,
+ 		Removed:      int64(len(toremove)),
+ 		TZOffsetMs:   tzoffset,
++
++		SyncGeneration:   sp.Generation,
++		SourceGeneration: sp.SourceGeneration,
+ 	}
+ 
+ 	mirrors.PushLog(r, mirrors.NewLogScanCompleted(
+@@ -226,6 +261,7 @@ func Scan(typ core.ScannerType, r *database.Redis, c *mirrors.Cache, url string,
+ 
+ func (s *scan) ScannerAddFile(f filedata) {
+ 	s.count++
++	s.listed[f.path] = f
+ 
+ 	// Add all the files to a temporary key
+ 	s.conn.Send("SADD", s.filesTmpKey, f.path)
+@@ -242,6 +278,42 @@ func (s *scan) ScannerAddFile(f filedata) {
+ 	database.SendPublish(s.conn, database.MIRROR_FILE_UPDATE, fmt.Sprintf("%d %s", s.mirrorid, f.path))
+ }
+ 
++func (s *scan) sourceFileInfo(path string) (f filesystem.FileInfo, err error) {
++	reply, err := redis.Strings(s.conn.Do("HMGET", fmt.Sprintf("FILE_%s", path), "size", "modTime"))
++	if err != nil {
++		return
++	}
++	f.Path = path
++	f.Size, _ = strconv.ParseInt(reply[0], 10, 64)
++	f.ModTime, _ = time.Parse("2006-01-02 15:04:05.999999999 -0700 MST", reply[1])
++	return
++}
++
++func (s *scan) ScannerUnreadable(dir string) {
++	if !strings.HasPrefix(dir, "/") {
++		dir = "/" + dir
++	}
++	s.unreadable = append(s.unreadable, dir)
++}
++
++func (s *scan) locateSyncPoint(tzoffset int64, precision core.Precision) (*syncPoint, error) {
++	if precision == 0 {
++		precision = core.Precision(time.Second)
++	}
++	history, err := loadSourceHistory(s.conn)
++	if err != nil {
++		return nil, err
++	}
++	if err := history.keepFloor(s.conn); err != nil {
++		return nil, err
++	}
++	sp := history.solve(s.listed, s.unreadable, time.Duration(tzoffset)*time.Millisecond, precision.Duration())
++	if err := storeSyncPoint(s.conn, s.mirrorid, sp); err != nil {
++		return nil, err
++	}
++	return sp, nil
++}
++
+ func (s *scan) ScannerDiscard() {
+ 	s.conn.Do("DISCARD")
+ }
+@@ -313,15 +385,13 @@ func (s *scan) adjustTZOffset(name string, precision core.Precision) (ms int64,
+ 	for _, path := range filepaths {
+ 		p := pair{}
+ 
+-		p.local, err = s.cache.GetFileInfo(path)
++		p.local, err = s.sourceFileInfo(path)
+ 		if err != nil {
+ 			return
+ 		}
+ 
+-		p.remote, err = s.cache.GetFileInfoMirror(s.mirrorid, path)
+-		if err != nil {
+-			return
+-		}
++		listed := s.listed[path]
++		p.remote = filesystem.FileInfo{Path: path, Size: listed.size, ModTime: listed.modTime}
+ 
+ 		if p.remote.ModTime.IsZero() {
+ 			// Invalid mod time
+@@ -506,6 +576,11 @@ func ScanSource(r *database.Redis, forceRehash bool, stop <-chan struct{}) (err
+ 
+ 	defer lock.Release()
+ 
++	history, err := loadSourceHistory(conn)
++	if err != nil {
++		return err
++	}
++
+ 	conn.Send("MULTI")
+ 
+ 	// Remove any left over
+@@ -553,6 +628,13 @@ func ScanSource(r *database.Redis, forceRehash bool, stop <-chan struct{}) (err
+ 		}
+ 	}
+ 
++	if updated := history.advance(sourceFiles); updated != nil {
++		if err = history.queue(conn, updated); err != nil {
++			conn.Do("DISCARD")
++			return err
++		}
++	}
++
+ 	// Finally rename the temporary sets containing the list
+ 	// of files to the production key
+ 	conn.Send("RENAME", "FILES_TMP", "FILES")

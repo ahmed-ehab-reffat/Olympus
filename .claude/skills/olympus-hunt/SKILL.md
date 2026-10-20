@@ -29,7 +29,8 @@ the hunt — 2c kills a repo whose lanes are gone before you audit its seams, an
 maintainer has already blessed.
 
 **★ What the 2026-10-09 new-model gate asks of a repo.** The platform now requires Nova >= 8 runs at
-0 passes, Orion or Vega >= 4 runs at 1-25%, and an average Nova sequence length > 256k (the largest
+0 passes, Orion or Vega >= 4 runs at 1-25%, an average Nova sequence length > 256k, and (since 2026-10-18) the PASSING Orion/Vega runs also averaging
+> 256k, so the CORRECT solution must itself be long work (the largest
 input+output of any step, compaction windows summed). Two consequences for hunting:
 - **Reading surface is now a gate, not a nicety.** Nova must work long before it fails. Prefer repos
   where the capability forces the solver to read and connect several large modules (a pipeline, a
@@ -103,7 +104,7 @@ August (`Add neva fmt command`, `Add nevafmt renderer`, `Add nevafmt parser foun
 `Implement stream synchronization`, union literals, an os package and a portable type descriptor.
 Feature phase, invisible through the PR lens.
 
-**Pool status measured 2026-09-01** (all under the 6-cap):
+**Pool status measured 2026-09-01** (all under the per-repo cap, 12 since 2026-10-16):
 
 | Repo | Subs | Read |
 |---|---|---|
@@ -1337,6 +1338,128 @@ haplotypes **8/8 Nova, 0/4 Orion** (F-86); read 1 outside every peak **7/8 Nova 
 pair-aware == read mode on assembled calls **7/12** (F-67/L128). Dossier rows: `F-86 seam: evidence table
 with a vote consumer and a membership consumer`, `F-87 seam: attribute owned by a partner outside the
 fetch window`, `L128 seam: second path under default flags`.
+
+**Replicated-store seams (F-88..F-91).** A sync layer with an oplog/outbox and a relay is a whole
+nest of seams for any per-field or merge feature:
+
+```bash
+# F-88: conflict resolution keyed on "local op not yet pushed"
+grep -rnE "synced_at IS NULL|Unsynced|pending.*ops|outbox" --include=*.go --include=*.py --include=*.ts . | head
+# F-89: the log stores whole-row snapshots (json.Marshal of the model on every update)
+grep -rnE "json.Marshal\((row|model|m|v)\)|Payload.*=.*Marshal" --include=*.go . | head
+# F-90: a conflict list that only ever records the incoming loser
+grep -rnE "Conflicts?\+\+|conflict.*loser|ConflictLosers|errConflict" --include=*.go . | head
+# F-91: tombstone ops with an empty payload, and a hard-delete path
+grep -rnE "\{\}|OpDelete|OpRestore|HardDelete|Unscoped\(\)\.Delete" --include=*.go . | head
+```
+
+On micasa (Go, 1.3k stars) all four were present in base: `UnsyncedOps` + whole-row LWW only against
+pending ops, `updateByIDWith` logging full rows, `pro conflicts` listing incoming losers only, delete/restore
+payloads `{}` next to `HardDeleteIncident`. Measured on micasa-field-level-sync-merge (accepted Nova 0/8 +
+Orion 1/4): F-88 **8/8 Nova, 0/4 Orion**, F-89 **8/8 Nova, 0/4 Orion**, F-90 **11/12** (every failing
+Orion), F-91 **9/12**. Nova sequence length averaged 547k: sync features have the reading surface the
+gate wants. Dossier rows: `F-88 seam: merge only against unpushed ops`, `F-89 seam: snapshot log`,
+`F-90 seam: one-sided conflict list`, `F-91 seam: empty tombstones + hard delete`.
+
+**Code-generator / evaluator seams (F-92..F-95).** A binding generator or compiler front end that
+writes literals of one language from declarations in another is a nest of seams for any "evaluate
+expressions" feature:
+
+```bash
+# F-92: enum discriminants where implicit values follow the previous variant
+grep -rnE "discriminant|Variant.*value|prev.*\+ ?1" --include=*.rs --include=*.go --include=*.py . | head
+# F-93: an output type table distinct from the source type (enum backing, C int for isize)
+grep -rnE "\"(nint|nuint|int|uint|long)\"|repr\(C\)|backing" --include=*.rs . | head
+# F-94: literals printed with the host formatter (to_string / format! / escape_default) into another language
+grep -rnE "escape_default|to_string\(\)|format!\(\"\{\}" --include=*.rs . | grep -iE "emit|write|lit" | head
+# F-95: name resolution over the source language's modules (use, imports, globs, re-exports)
+grep -rnE "UseTree|use_tree|Glob|import.*alias|resolve_path" --include=*.rs --include=*.py . | head
+```
+
+On csbindgen (Rust, C# bindings) base collected only literal consts and literal discriminants, mapped
+no-repr enums to `int` and `repr(C)` to `uint`, and had no module resolver. Measured on
+csbindgen-const-expression-values (accepted Nova 0/8 + Orion 1/4): F-94 floats **5/5 Nova** and chars 4/5
++ Orion #1, F-93 **5/5 Nova, 0/4 Orion**, F-92 **7/8 Nova** (3 aborts), F-95 the sole failure of **2/4
+Orion**. No target compiler in the sandbox is what keeps F-94 alive. Nova sequence length averaged 506k.
+Dossier rows: `F-92 seam: implicit discriminants + cross-variant refs`, `F-93 seam: target type != source
+type`, `F-94 seam: host formatter writes target literals`, `F-95 seam: module resolver promised in part`.
+
+**History-ledger / scanner seams (F-96, F-97, F-39).** A scanner that compares a remote copy with a
+local source (mirrors, backups, sync daemons, package caches) carries three seams for any "how current
+is it" feature:
+
+```bash
+# F-96: a runtime-reloadable retention / history / TTL depth (pruned records would read as absence)
+grep -rnE "History|Retention|Keep(Last|Days)|MaxAge|TTL" --include=*.go --include=*.py --include=*.rs . | grep -iE "config|conf|setting" | head
+# F-97: an existing branch on a subprocess or protocol outcome code next to stderr/diagnostic parsing
+grep -rnE "exit status [0-9]+|ExitCode\(\)|returncode|code 23|Partial transfer" --include=*.go --include=*.py --include=*.rs . | head
+# F-39 serialization: timestamps stored as display strings and parsed back
+grep -rnE "time\.Parse\(|\.String\(\)|strptime|fromisoformat" --include=*.go --include=*.py . | grep -iE "mod|mtime|time" | head
+```
+
+On mirrorbits base had no source history, branched on rsync exit 23 only to log it, and stored FILE_
+modTimes as `Time.String()` re-parsed with a layout that fails in nameless fractional-hour zones.
+Measured on mirrorbits-mirror-sync-point (accepted Nova 0/8 + Vega 1/5): F-97 **6/13** (sole failure of
+3 Nova + 1 Vega), F-96 **4/5 Vega, 0/4 Orion** (L133: Vega missed a rule Orion always read), F-39 **3/13**.
+Nova sequence length averaged 326k. Dossier rows: `F-96 seam: reloadable retention depth`, `F-97 seam:
+diagnostics parsed beside an outcome branch`, `F-39 seam: timestamps round-tripped through strings`.
+
+**Template-refactor seams (F-98, F-99, F-100).** A repo whose documents hold templates that expand into
+objects (modules, macros, components, stencils) and evaluate expressions with a real parser carries all
+three seams for any refactor of those templates (inline, extract, rename, flatten):
+
+```bash
+# F-98: a per-scope expansion budget the refactor could merge (loop limits, depth caps)
+grep -rnE "maxLoopLength|max(Depth|Iterations|Recursion)|LOOP_LIMIT|expansion limit" --include=*.js --include=*.ts --include=*.py . | head
+# F-99: lexical binders inside templates (loop variables, function args) over a parser the repo ships
+grep -rnE "for:|\bfor\b.*=.*:|math\.parse|FunctionAssignmentNode|ast\.(walk|transform)" --include=*.js --include=*.ts . | head
+# F-100: per-object error state stored on each instance (a whole-scene validator will over-refuse)
+grep -rnE "this\.error\s*=|getError\(|objectExpansionError|\.errors?\.push" --include=*.js --include=*.ts . | head
+```
+
+On ray-optics, base had `ModuleObj.maxLoopLength` (default 1000, checked on the product of a row's loops),
+`for`/`if` rows plus functions in module definitions over mathjs, and per-instance `this.error`. Measured on
+ray-optics-module-inlining (accepted Nova 0/8 + Orion 1/8): F-98 **8/8 Nova, 0/15 Orion**, F-99 **8/8
+Nova** across six cells, F-100 the sole failure of **6/8 Orion**. Nova sequence length about 290k (my
+count, compactions summed). Dossier rows: `F-98 seam: per-scope expansion budget`, `F-99 seam: binders
+inside templates`, `F-100 seam: per-object error state`.
+
+**Second-representation seams (F-101..F-104).** A compiler (or serializer) with a disabled or
+half-built layout optimisation for a SUBSET of a type family (niche/optional-pointer layout, small-string
+inline storage, packed enums) carries four seams at once: conversions across the representation boundary,
+lowering helpers that assume a plain-variable source, zero-data members encoded as constants, and a
+coarse eligibility predicate already in the sizing code:
+
+```bash
+# the disabled layout flag / design note naming the target
+grep -rnE "optimize_union|niche|compact|small_size_opt|should be \(\* N" --include=*.py --include=*.cc --include=*.md . | head
+# F-102: helpers that assert an identifier source ("NYI") next to a temp-introducing utility
+grep -rnE "isinstance\((src|node), cwast\.Id\)|non-ID NYI|MakeNodeCopyable|IsNodeCopyable" --include=*.py --include=*.cc . | head
+# F-104: a coarse size-zero / kind shortcut inside the sizing function the feature edits
+grep -rnE "size == 0|size\(child_ct\) == 0" --include=*.py --include=*.cc . | head
+```
+
+On Cwerg base had `optimize_union_tag` disabled in both type corpora, `_MakeValRecForWidenFromUnion`
+asserting an Id, `MakeNodeCopyableWithoutRiskOfSideEffects` in canonicalize, and `child_ct.size == 0:
+continue` in union sizing. Measured on cwerg-compact-pointer-unions (accepted Nova 0/8 + Vega 1/4):
+F-101 **8/8 Nova**, F-102 **8/8 Nova + sole failure of 2/4 Vega**, F-103 **7/8 Nova + Orion #3**, F-104
+**3/8 Nova**. Twin front ends again put Nova at ~1M sequence length (avg 962k, L119); Vega passes ran
+327k-512k, Orion passes 143k-196k (L136: hunt twin-implementation lanes when the Orion side cannot reach
+256k). Dossier rows: `F-101 seam: second layout for a type subset`, `F-102 seam: Id-only lowering
+helper`, `F-103 seam: zero-data members as constants`, `F-104 seam: coarse eligibility shortcut`.
+
+**Two-ended sync-state seams (F-105..F-108).** A client/server feature that keeps a derived set on both ends (per-device reports, caches, sync cursors) over the repo's own fallible HTTP client, with a relay that has two store backends (memory + SQL), carries four seams. A lost reply after the server commits (F-105), a server-assigned value that the SQL store writes only in the INSERT (F-106), a multi-part rebuild that voids the last complete snapshot (F-107), and "never reported" read as sequence 0 (F-108):
+
+```bash
+# F-105: client marks things done only after a confirmed reply; relay persists before replying
+grep -rnE "MarkSynced|Confirmed|readErrorBody|http.Client\{" --include=*.go internal/ | head
+# F-106: two Store implementations; the SQL one assigns seq/id in the statement
+grep -rnE "RETURNING (seq|id)|seq_counter|func \(m \*MemStore\) Push|func \(s \*PgStore\) Push" --include=*.go . | head
+# body limit that forces multi-part requests (F-107 precondition)
+grep -rnE "MaxBytesReader|maxRequestBody|1 << 20" --include=*.go . | head
+```
+
+On micasa, base had `pushAll` marking ops synced only on confirmation, `PgStore.Push` taking the sequence from `UPDATE households ... RETURNING seq_counter` while `MemStore.Push` set `op.Seq`, and a 1 MB `maxRequestBody`. Measured on micasa-pro-blob-reclaim (accepted Nova 0/8 + Vega 1/4): F-105 **8/8 Nova, 0/4 Vega** (a re-eval lever, zero meta words), F-106 **3/8 Nova** (postgres subtest only), F-107 Vega b3-1 + Nova #8, F-108 two independent Vega runs. Nova averaged 567k, and the Vega pass was 326k. Dossier rows: `F-105 seam: two-ended derived state over a fallible client`, `F-106 seam: SQL-assigned value vs struct-assigned twin`, `F-107 seam: multi-part snapshot behind a completeness gate`.
 
 **F-20, repo-helper variant.** F-20 does not need an agent refactor: if the repo already routes a
 sibling operation through the primitive the feature changes (`add_real_directory` -> `create_dir`),

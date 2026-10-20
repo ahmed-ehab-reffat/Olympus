@@ -47,7 +47,7 @@ mandatory first reads it names (`failure-patterns.md`, `Instructions/HARDENING.m
    - The mutation / FP self-check the skill prescribes.
    - Re-run the SIX-CHECK and exclusivity right before the final patch generation.
 4. Update `feedback.md` with a short status block and
-   `NEXT (human): 1 Nova smoke run, then Orion x4 and Nova to 8 (2026-10-09 gate: Nova 0/8, Orion/Vega 1-25%, Nova avg sequence length >256k; freeze meta.md/Dockerfile/base first; steer with re-eval)`.
+   `NEXT (human): 1 Nova smoke run, then Orion x4 and Nova to 8 (2026-10-09 gate: Nova 0/8, Orion/Vega 1-25%, Nova avg sequence length >256k and passing Orion/Vega runs avg >256k (2026-10-18); freeze meta.md/Dockerfile/base first; steer with re-eval)`.
    Log the local validation numbers in `eval-results.md`.
 
 ## Death (either mode)

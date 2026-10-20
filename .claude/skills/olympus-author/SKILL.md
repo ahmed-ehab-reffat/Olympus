@@ -1,11 +1,11 @@
 ---
 name: olympus-author
-description: Use when authoring a new Olympus problem submission (one tier since the 2026-07 sprint merged Mars into Olympus; since 2026-10-09 the gate is per agent: Nova >=8 runs at 0 passes, Orion or Vega >=4 same-agent runs at >0% and <=25%, Nova average sequence length >256k; keep >=200 effective LOC / >=2 files as the scope baseline) — guides shape selection, difficulty design against the HARDENING.md trap arsenal, the TOO-EASY.md death-class pre-pick guard, 5-deliverable production (BASE_COMMIT.txt + meta.md + test.patch + solution.patch + Dockerfile), and pre-submit validation. Triggers when user mentions "create new problem", "author problem", "build a challenge", "Mars feature", "Olympus feature", "new submission", clones a target repo into worktrees/, or creates a folder under problems/ or diamond-problems/. Source of truth: Olympus/Instructions/HARDENING.md, TOO-EASY.md, PLAYBOOK.md, WORKFLOW.md, RULES.md, AGENTS.md, DESCRIPTION.md, TESTS.md, SOLUTION.md, DOCKER.md, CLAUDE.md RULE UPDATE 2026-07 (SPRINT).
+description: Use when authoring a new Olympus problem submission (one tier since the 2026-07 sprint merged Mars into Olympus; since 2026-10-09 the gate is per agent: Nova >=8 runs at 0 passes, Orion or Vega >=4 same-agent runs at >0% and <=25%, Nova average sequence length >256k AND (since 2026-10-18) passing Orion/Vega runs average >256k; keep >=200 effective LOC / >=2 files as the scope baseline) — guides shape selection, difficulty design against the HARDENING.md trap arsenal, the TOO-EASY.md death-class pre-pick guard, 5-deliverable production (BASE_COMMIT.txt + meta.md + test.patch + solution.patch + Dockerfile), and pre-submit validation. Triggers when user mentions "create new problem", "author problem", "build a challenge", "Mars feature", "Olympus feature", "new submission", clones a target repo into worktrees/, or creates a folder under problems/ or diamond-problems/. Source of truth: Olympus/Instructions/HARDENING.md, TOO-EASY.md, PLAYBOOK.md, WORKFLOW.md, RULES.md, AGENTS.md, DESCRIPTION.md, TESTS.md, SOLUTION.md, DOCKER.md, CLAUDE.md RULE UPDATE 2026-07 (SPRINT).
 ---
 
 # Olympus / Mars Problem Authoring
 
-> **NEW-MODEL GATE 2026-10-09 (supersedes every pass band, "10-run batch" and long-horizon figure below):** the models behind Nova, Orion and Vega changed. **Nova: >=8 runs, 0 passes** (any Nova pass = too easy). **Orion OR Vega: >=4 runs of the same agent, >0% and <=25%** (4 runs = exactly 1 pass; 0 = unsolvable; 2/4 = too easy). **Sequence length replaces the long-horizon metrics** (files / messages / LOC): the average over all Nova runs must be **>256k** (largest input+output of any step, compaction windows summed), so Nova has to fail LONG, after reading and connecting a lot of code, not trip early. FP panel, Auto Review and other checks unchanged. Design target: a trap that only careful cross-file reasoning clears, so the stronger agent passes about 1 in 4 and Nova never does. Calibrate with 1 Nova smoke run first (if it passes, harden before anything else), then Orion x4, then the remaining Nova runs. Every pass rate quoted below was measured on the OLD models: use it to rank levers, not to predict the new gate. Keep the >=200 effective LOC / >=2 files figures as the scope baseline (payout still scales with scope) until a submission shows Auto Review dropped them.
+> **NEW-MODEL GATE 2026-10-09 (supersedes every pass band, "10-run batch" and long-horizon figure below):** the models behind Nova, Orion and Vega changed. **Nova: >=8 runs, 0 passes** (any Nova pass = too easy). **Orion OR Vega: >=4 runs of the same agent, >0% and <=25%** (4 runs = exactly 1 pass; 0 = unsolvable; 2/4 = too easy). **Sequence length replaces the long-horizon metrics** (files / messages / LOC): the average over all Nova runs must be **>256k** (largest input+output of any step, compaction windows summed), so Nova has to fail LONG, after reading and connecting a lot of code, not trip early. FP panel, Auto Review and other checks unchanged. Design target: a trap that only careful cross-file reasoning clears, so the stronger agent passes about 1 in 4 and Nova never does. Calibrate with 1 Nova smoke run first (if it passes, harden before anything else), then Orion x4, then the remaining Nova runs. **2026-10-18 LONG-HORIZON CHANGE:** a SECOND >256k check now applies to the PASSING runs of the qualifying Orion/Vega agent, on top of the Nova average (both live). With 1 of 4 passing, that one Orion pass must exceed 256k by itself. Every Orion/Vega pass we have recorded is 49k-149k, so design the task so the CORRECT solution itself needs a large reading surface and a lot of verified work (wider cross-subsystem footprint, big existing files to understand, real test runs), not a compact feature the trap decides. Depth per requirement, not more requirements (the requirement-count gate still blocks). See CLAUDE.md RULE UPDATE 2026-10-18. Every pass rate quoted below was measured on the OLD models: use it to rank levers, not to predict the new gate. Keep the >=200 effective LOC / >=2 files figures as the scope baseline (payout still scales with scope) until a submission shows Auto Review dropped them.
 >
 > **SPRINT UPDATE 2026-07 (supersedes 2026-06-26 bands + the Mars/Olympus split below where they conflict):** Mars has been MERGED into Olympus — author every submission as Olympus, there is no separate Mars tier anymore. New long-horizon floor: **>=2 file changes, >=40 agent messages (solver median), >=200 effective/meaningful LOC** (down from 3 files / 100 msgs / 450 LOC). Pass-rate ceiling raised to **<=40%** (up from 20%/30%; 0%=reject, >40%=too easy). Payout $150-350, scales with scope/difficulty/fairness/quality. FP Check now MANDATORY (final gate: verify every passing agent actually met every requirement, not just passed tests). See CLAUDE.md RULE UPDATE 2026-07 (SPRINT).
 >
@@ -75,7 +75,7 @@ Plus from day one:
 |---|---|
 | Solution +LOC | **≥200 effective/meaningful** (Counter 2 / human-effective) — down from 450 |
 | Files modified | **≥2** — down from 3 (median ~17 in older approveds is historical data, not a gate) |
-| Agent messages (solver median) | **Gone 2026-10-09** — replaced by Nova average sequence length **>256k** |
+| Agent messages (solver median) | **Gone 2026-10-09** — replaced by sequence length **>256k**, averaged over all Nova runs AND (since 2026-10-18) over the PASSING Orion/Vega runs |
 | Solvability gate | **Orion OR Vega: ≥4 runs of one agent, ≥1 pass** (cannot be bypassed) |
 | Pass-rate gate | **Nova ≥8 runs at 0 passes; Orion/Vega ≤25%** (2026-10-09; any Nova pass or Orion/Vega >25% = too easy) |
 | Hint system | Removed April 2026 |
@@ -558,7 +558,7 @@ with a file:line citation, not a hunch.
 - Predicted Wrong Logic ≥25% (Diamond-grade territory — fine, just name it honestly, don't force a lower estimate)
 - Existing PR or publicly-solved (Phase 2)
 - Open issue covers as binding spec (inform from it, don't bind to it)
-- Outside the scope baseline (≥200 meaningful LOC, ≥2 files), or too small for Nova to reach a 256k average sequence length
+- Outside the scope baseline (≥200 meaningful LOC, ≥2 files), or too small for Nova to average 256k sequence length or for a PASSING Orion/Vega run to exceed 256k (2026-10-18)
 
 **Survivor MUST:**
 - Named S/A-tier arsenal class from Step B, CONTRACT-STATED/FIX-HIDDEN verified
@@ -629,7 +629,7 @@ user-run humanizer on a flag, rule-by-rule drift repair, ASCII apostrophes).
 | NEW    | path/new_module.go  |    —        |    +YY    |    YY×0.65         | …      |
 TOTAL: {raw}/{meaningful} across {N modified + M new} files.
 
-Current scope check (2026-07 baseline; the messages floor was replaced 2026-10-09 by Nova average sequence length > 256k):
+Current scope check (2026-07 baseline; the messages floor was replaced 2026-10-09 by sequence length > 256k, averaged over Nova runs and, since 2026-10-18, over the passing Orion/Vega runs too):
   >= 200 effective/meaningful LOC, >= 2 files modified, a reading surface large enough that Nova works long
   Historical shape bands (Mars Entry 100-200/1-3 files, Mars Solid 170-380/1-8, Mars Strong 380-600/6-12,
   D-new exception up to 15 files at 400 raw) are OBSERVATIONAL DATA from older approveds, not gates —
@@ -788,6 +788,18 @@ Wrong Logic % constraint: <25%. ≥25% → Olympus territory. Downgrade trap or 
 - [ ] Callee-state audit (F-83): for every callee the feature recurses into, does the engine start it from the caller's state or a fresh one? Seed each kind accordingly and test one inheriting and one fresh-start callee
 - [ ] Second-route audit (F-84): for every resource kind the feature must visit, grep every dictionary that can select it (e.g. ExtGState /Font), and resolve indirect operands on that route
 - [ ] Float audit (L59): no exact equality on a value a formula produces, even at a mathematically exact point
+- [ ] Harness audit (L129, L130): every package-level helper/type/var in a Go test.patch carries the file's hex suffix (`grep -E '^\+(func|type|var|const) ' test.patch | grep -v 'func Test'`); no helper rewrites a column the solution writes after the code under test ran (order operations in real time instead); the new-mode JUnit fallback ADDS failures for missing ids and never replaces real results
+- [ ] Cross-language literal audit (F-94): if the feature emits literals of language B from values computed in A, test one value per grammar difference (large double, NaN/infinities, NUL, B's line terminators) and parse the output with B's literal grammar; and test one expression typed by the SOURCE type where the target type differs (F-93)
+- [ ] Scope audit (F-95): if the contract promises imports/globs over a host module system, promise uniqueness only for the declared kinds and include one child-glob-vs-parent-item collision
+- [ ] Replication audit (F-88/F-90): if the feature changes how a sync layer resolves concurrent writes, include an overlap cell (one device pushes before it pulls) and a cell per winner kind where the LOCAL side loses, asserting the count
+- [ ] Irreversibility audit (F-96, L132): if a reloadable depth/retention setting forgets records "for good", every lower-then-raise test forgets a REAL record (never an empty generation) and carries two checks: an empty observation AND the forgotten record listed beside live evidence
+- [ ] Outcome-gate audit (F-97): if an exception is triggered by a diagnostic line, state it with the outcome as subject ("a partial transfer couldn't read") and test the same line under the success status
+- [ ] Expansion-budget audit (F-98, L135): if the feature flattens nested templates, macros or loops, find the repo's per-scope budget (loop limit, depth cap) and add one fixture where each part fits and the product does not; say nothing about the budget in meta
+- [ ] Binder audit (F-99): for a substitute/rename/inline feature over an expression language, one fixture per binder kind (simultaneous swap, nested-loop shadow, loop named like a parameter, colliding child loop, function argument) and per printing hazard (negative literal, juxtaposition, tiny number); compare expansions, not text
+- [ ] Bystander audit (F-100, L134): if failure is all-or-nothing and objects carry their own error state, test a valid edit beside an unrelated broken object, but ONLY for operations base already performs in that state (a new API may refuse; Test Quality strikes it)
+- [ ] Representation audit (F-101, F-102, F-103, F-104, L137): if the feature gives a SUBSET of a type family a second layout, test every conversion kind across the boundary (new->new, new->old, old->new, plus library-built ones), every source form (field, deref, index, span element, `a[i].f`; cap call results), a counting call through every write form base evaluates, and one static_assert per excluded kind a coarse repo predicate would admit. Where base also fails a cell for the OLD layout, make the reference lift it for both layouts
+- [ ] Sync-state audit (F-105..F-108, L138-L140): if the feature keeps derived state on both ends of the repo's fallible transport, the test relay gets fault hooks from the slice onward: a byte-count cut-off (refuse after N body bytes per token), a lost reply (run the handler into `httptest.NewRecorder()`, then `panic(http.ErrAbortHandler)`), and every test against every store backend. Add tests for a lost reply that makes a delta's addition obsolete, a cut-off rebuild from a device that pushed nothing, and a device that never reported
+- [ ] Round-trip audit (F-39): if base stores timestamps as display strings, add one no-op test under a nameless fractional-hour local zone (Go: time.Local = time.FixedZone("", 5*3600+45*60), restored in Cleanup)
 - [ ] **Sibling-API audit (F-20): does this feature add a variant of an existing entry point? If
       so, name the new rule's scope by naming ONLY the new API, and add a test of the OLD api in
       both directions. Confirm the base suite passes with the old behaviour broken — if it fails,
@@ -909,7 +921,7 @@ Wrong Logic % constraint: <25%. ≥25% → Olympus territory. Downgrade trap or 
 - [ ] Format-noun extents stated for every record/entry/block/section the meta names (L24)
 - [ ] Every tolerance rule has its N-1 fixture asserting nothing happened (L25)
 - [ ] Predicted Wrong Logic <25% (else this is genuinely Diamond-grade difficulty, not a tier upgrade — one tier now)
-- [ ] Predicted Nova 0 of 8 and Orion/Vega about 1 of 4 (2026-10-09 gate); Nova expected to work long (>256k average sequence length)
+- [ ] Predicted Nova 0 of 8 and Orion/Vega about 1 of 4 (2026-10-09 gate); the passing Orion/Vega run expected to work long (>256k sequence length, 2026-10-18); Nova expected to fail long (>256k average)
 - [ ] Category matches the description (enhancement vs feature-request)
 - [ ] Feature is NOT pattern-followable
 - [ ] Feature is NOT in RULES § Features already used
@@ -1201,7 +1213,7 @@ Layered checks:
 2. Description quality AI review — 1–3 rounds (HIGH blocks; MEDIUM/LOW advisory)
 3. Tests quality AI review — 1–2 rounds
 4. Alignment check (every test → description requirement)
-5. Nova empirical (≥8 runs, 0 passes, average sequence length >256k; 1 smoke run first)
+5. Nova empirical (≥8 runs, 0 passes, average sequence length >256k; 1 smoke run first); passing Orion/Vega runs average sequence length >256k (2026-10-18)
 6. Orion OR Vega (≥4 runs of one agent, 1-25% passes)
 
 Mars: 1–3 rounds. Olympus: 3–5 rounds. >5 on Mars = playbook patterns not followed (see `PLAYBOOK.md § Pattern 8`).
@@ -1371,6 +1383,64 @@ Mars: 1–3 rounds. Olympus: 3–5 rounds. >5 on Mars = playbook patterns not fo
    option-off assertion on the default local-assembly path (**F-67 / L128**, 7/12, sole failure of
    Orion #3). When the meta must stay short, assert equality with the old mode on inputs where the
    new rule is a no-op: it needs no sentence and evaluators rule it fair.
+
+0a-sexdecies. **Per-field merge over a replicated oplog (micasa-field-level-sync-merge, accepted
+   Nova 0/8 + Orion 1/4).** Four walls, all from base's sync design: merging only while the local op
+   is unpushed (**F-88**, **8/8 Nova, 0/4 Orion**, found by an overlap harness that holds one device's
+   push), field recency read off whole-row snapshots (**F-89**, 8/8 Nova), rejected changes counted
+   only for the incoming side (**F-90**, **11/12**, every failing Orion), tombstones with no row so a
+   hard delete cannot be undone (**F-91**, 9/12). F-88 and F-90 were both Solution Quality HIGHs on
+   my reference before any batch (L90 twice). Two of eight Orion runs were TEST_BROKEN on my harness
+   (helper name collision; a post-write `created_at` rewrite, L129). Fixing only test.patch and
+   re-evaluating turned 0/4 into 1/4 (L130).
+
+0a-septdecies. **Constant-expression evaluation in a code generator (csbindgen-const-expression-values,
+   accepted Nova 0/8 + Orion 1/4).** Nova fails by breadth (L131): every non-aborting run broke 5-7 of 18
+   tests across literals printed with the host formatter (**F-94**, 1e20 / NaN / NUL / U+2028, 5/5),
+   discriminants typed by the C# backing type (**F-93**, 5/5), and forward variant references walked as
+   a false cycle (**F-92**, 7/8 incl. 3 stack-overflow aborts). Orion cleared all of them; the 1-of-4
+   split was one FP-panel cell, a child glob variant shadowed by a parent const (**F-95**, sole failure
+   of 2/4 Orion, L126). Two lessons that cost batches: a reviewer-driven cap must name what stays in
+   (L89, 128-bit 6/8 Orion then 0/12), and an implied rule kills until stated (L109, cast-target typing
+   6/8 then 0/12). Keep "paths through `use` imports" promised but uniqueness promised only for declared
+   kinds, so the collision stays in contract.
+
+0a-octodecies. **Mirror sync points from a source generation ledger (mirrorbits-mirror-sync-point,
+   accepted Nova 0/8 + Vega 1/5).** Nova failed by breadth (L131) over an exit-status gate on the
+   rsync-diagnostic exception (**F-97**, 6/13, sole failure of 3 Nova + 1 Vega), a persisted retention
+   floor (**F-96**, 4/5 Vega) and a time-string round-trip in base (**F-39**, 3/13). Orion converged
+   for five batches (2/2, 4/4, 2/4, 3/4, 2/4) with zero probe divergence; Vega on the next meta read
+   1/4 and was accepted at 1/5 (L133). Before shelving an Orion-converged problem, run Vega x4.
+   F-97 came from a reviewer advisory (L17) and F-96 from two gate-found reference bugs (L90).
+
+0a-novodecies. **Template inlining and parameter rename (ray-optics-module-inlining, accepted Nova 0/8
+   + Orion 1/8).** Nova failed by breadth (L131):
+   - **F-99**, capture-avoiding substitution, failed every Nova run across six cells: swapped names,
+     nested-loop shadow, a loop sharing a parameter name, a colliding child loop, a negative literal,
+     a juxtaposed product;
+   - **F-98**, merged loops over the default loop limit, failed 8/8 Nova and 0 of 15 Orion. It is
+     the Nova separator at zero meta words (L135).
+
+   Orion cleared every stated cell. It split only on its own whole-scene validator (**F-100**, the
+   sole failure of 6/8 Orion, L134). That cell and the tiny-value cell (F-94) both came from FP-panel
+   voids (L37). Assert success beside a broken bystander only where base already succeeded:
+   Test Quality struck the variant on the new API.
+
+0a-vicies. **One-word compact tagged unions in twin compiler front ends (cwerg-compact-pointer-unions,
+   accepted Nova 0/8 + Vega 1/4, Orion 3/4).** Nova failed by breadth (L131): compact/ordinary
+   conversions (**F-101**, 8/8), indexed sources (**F-102**, 8/8), dropped zero-sized side effects
+   (**F-103**, 7/8), the size-zero eligibility shortcut (**F-104**, 3/8). Every Orion pass was under
+   256k, so Vega was the qualifying agent (L136). F-102 was the sole failure of 2/4 Vega and came from a
+   9-cell probe battery on conversion SOURCES after 63 programs showed no divergence (L117). Every
+   capable-agent kill came from a gate or a probe; the seven designed traps killed only Nova.
+
+0a-unvicies. **Per-device reports and a relay sweep (micasa-pro-blob-reclaim, accepted Nova 0/8 + Vega 1/4 at
+   326k).** One fault-injection test, a committed report whose reply is lost (**F-105**), failed **8/8 Nova
+   and 0/4 Vega** at zero meta words. Every Nova run shipped unversioned add/remove deltas. Grading the
+   Postgres store too added **F-106** (3/8 Nova, postgres only), the only DESIGN.md prediction that killed.
+   Vega was held by three different stated-rule misses (F-107 cut-off, F-108 never reported, the per-sync
+   heartbeat). The 64 KB incremental meta rule bought sequence length, not kills. The kills came from
+   testing how its two-ended state breaks (L140). All four designed § 11 walls killed 0.
 
 0b. **"Unlimited" reported as a figure and enforced as a limit (F-50)** — 2/10 on the accepted
    pyfakefs batch (116/117 near-miss), 4 runs on an earlier artifact. Free with any accounting pick
@@ -1650,6 +1720,7 @@ them and you know what they meant.** Three mechanical passes, all of which run t
 
 ### Solvability (current sprint, one tier)
 - **Nova: ≥8 runs, 0 passes**, average sequence length **>256k** (2026-10-09)
+- **Passing Orion/Vega runs: average sequence length >256k** (2026-10-18, in addition to the Nova average)
 - **Orion OR Vega: ≥4 runs of one agent, ≥1 pass and ≤25%** (cannot be bypassed). No `description_clear: false` flags.
 - Scope baseline: ≥200 effective LOC, ≥2 files (the messages floor is gone)
 
@@ -1699,6 +1770,7 @@ them and you know what they meant.** Three mechanical passes, all of which run t
 ### Difficulty calibration (one tier now — no Mars downgrade path)
 - Orion/Vega at 0 passes → cannot bypass; append runs (L65), then redesign the traps or route a near-0 design to Diamond (keeps the hint flow)
 - Any Nova pass, or Orion/Vega above 25% → too easy, harden (`olympus-harden`; add an interdependent+misdirecting trap; the knob is trap count/strength, NOT LOC)
+- Orion/Vega in band but the passing run(s) average ≤256k sequence length → the correct solution is too compact; widen the footprint the solution must read, edit and verify (2026-10-18). 
 - Nova at 0 but average sequence length ≤256k → Nova fails too fast; fix setup blockers, then widen the reading surface
 - Problem at low pass with Wrong Logic ≥25% → subtle algorithmic trap (good) OR ambiguous spec (bad — clarify)
 - Under the scope baseline (≥200 effective LOC, ≥2 files) → expand scope, don't pad

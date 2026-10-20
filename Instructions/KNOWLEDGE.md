@@ -145,6 +145,8 @@ Cross-problem patterns observed from 80+ eval runs. Use these to design tests ex
 
 ### Vega (Olympus only)
 
+**Model (user, 2026-10-18): Claude Opus 5.5 at xhigh reasoning.** See CLAUDE.md "AGENT IDENTITIES 2026-10-18".
+
 - **Strength:** highest raw scores among failing runs. Best non-pass: 26/27 (Run 20), 46/47 (Runs 9/11/15). Long-horizon: 400-1050 LOC across 5-13 files.
 - **Weakness:** needs most prescriptive hints. 0% pass without method-extraction recipe (Runs 12-15, 20). With recipe: 10% (Runs 9-10).
 - Sometimes uses wrong import paths (underscore vs hyphen)
@@ -205,6 +207,8 @@ Cross-problem patterns observed from 80+ eval runs. Use these to design tests ex
 - **⭐ Build-measure PREDICTED the batch exactly** (the naive Branch-based impl was proven to leak BEFORE authoring) — first time a local probe forecast a real batch. See lessons-learned § contract-stated-fix-hidden + PROBLEM-PROFILES.
 
 ### Orion (Mars Evaluator + solver)
+
+**Model (user, 2026-10-18): GPT Sol 6.1 at xhigh reasoning.** See CLAUDE.md "AGENT IDENTITIES 2026-10-18".
 
 **★ cliffy-output-format (Runs 12, 13, 16):**
 - High comprehension of explicit requirements + API shapes. 100% pass (2/2) Run 16 vs Nova 0/5 same prompt.
@@ -1451,3 +1455,99 @@ Cross-agent blind spots, 10-Nova accepted batch (4/10).
   an assembly-only variable), a `*` deletion misread at membership.
 - **Sequence length:** Nova 521k-793k (avg 565k), every run compacted, ~200-280 steps on a 10-file
   Python+Cython feature; Orion used about a tenth of Nova's prompt tokens.
+
+## micasa-field-level-sync-merge (APPROVED Olympus 2026-10-15)
+
+- **Shared Nova blind spot (8/8 Nova, 0/4 Orion): merging inside base's pending-op branch.** Nova extends
+  the existing "local op not yet pushed" conflict path, so once a device pushes before it pulls the
+  incoming op is applied without a merge and the devices diverge (F-88).
+- **Nova reads field recency off whole-row snapshots (8/8 Nova, 0/4 Orion).** Every key in a logged
+  payload gets the op's time, so a later edit of another field makes a stale value look newer (F-89).
+- **Nova keeps the repo's empty tombstones (8/8 Nova + Orion #2).** Delete/restore ops stay `{}`, so a
+  newer edit cannot rebuild a hard-deleted row ("row not found") and restores diverge (F-91).
+- **Both agents count only the incoming loser (11/12, every failing Orion).** The local edit an incoming
+  field, delete or restore displaced is overwritten silently or left out of the sync result (F-90).
+  Orion's failures were otherwise clean: correct rows, correct convergence, one count short.
+- **Orion persists its own per-field versions at write time.** Fixtures that rewrite stored timestamps
+  after the write break that design while the reference survives (L129).
+- **Sequence length:** Nova 525k-663k (avg 547k) on a 10-file Go sync feature, ptok 17-30M; Orion
+  118k-198k, ptok 4-8M.
+
+## csbindgen-const-expression-values (APPROVED Olympus 2026-10-15)
+
+- **Nova prints target-language literals with the host formatter (5/5 non-aborting Nova, 0/4 Orion).**
+  Rust `to_string()` gives `100000000000000000000` for the double 1e20 and `NaN` that becomes `NaNf`;
+  `escape_default()` gives `\u{0}`; U+2028 goes out raw (F-94). No dotnet in the sandbox, so nothing
+  rejects it.
+- **Nova types discriminant expressions with the C# backing type (5/5, 0/4 Orion).** A no-repr enum is
+  evaluated in `int` and `repr(C)` in `uint` instead of Rust's `isize` (F-93).
+- **Nova walks every earlier variant to evaluate one (7/8, 3 stack-overflow aborts).** A forward reference
+  to a later explicit variant becomes a false cycle (F-92).
+- **Both agents scope Rust modules lexically (2/4 Orion as the sole failure, 3/5 Nova).** A parent's
+  `const RED` beats the child's `use Paint::*` (F-95).
+- **Orion misses `3f64`** (syn `Lit::Int` with a float suffix): Orion #1 here, 5/8 in batch 7 (F-18).
+- **Sequence length:** Nova 499k-513k (avg 506k), every run compacted once, 5 files; Orion 74k-86k.
+
+## mirrorbits-mirror-sync-point (APPROVED Olympus 2026-10-15)
+
+- **Vega misreads "forgotten for good, even if raised later" (4/5 Vega, 0/4 Orion in batch 7).** It prunes
+  records when the setting drops, then recomputes the window from the live setting, so a raise reopens
+  generations whose pruned records read as absence (F-96). Orion persisted the floor every time.
+- **Both agents key a "partial transfer couldn't read" exception on the stderr line alone (5/8 Nova, 1/5
+  Vega).** They read base's `exit status 23` branch and still parse diagnostics on status 0 (F-97).
+- **Nova reuses base's stored time string for change detection (2/8 Nova, 1/5 Vega).** `Time.String()`
+  re-parsed with a layout that fails in a nameless +05:45 zone, errors ignored, so no-op scans advance (F-39).
+- **One Nova each:** demands positive evidence before returning a generation (empty evidence -> 0); runs
+  SCARD inside a Redis MULTI and treats QUEUED as a count, deleting the FILES index.
+- **Sequence length:** Nova 238k-543k (avg 326k) on 6-10 files and 1.0-1.55k added LOC; Vega 84k-89k at
+  1.2-1.5M prompt tokens against Nova's 15.7-25.7M.
+
+## ray-optics-module-inlining (APPROVED Olympus 2026-10-16)
+
+- **Nova never connects "expands to the same objects" to the repo's loop limit (8/8 Nova, 0 of 15
+  Orion).** It merges a child's loop into the parent row and leaves `maxLoopLength` alone, so 40 x 30
+  rows vanish (F-98).
+- **Nova substitutes by text or in sequence (8/8 Nova, six cells).** The failing cells were swapped
+  names, a nested loop shadowing the parameter, a row loop named like a parameter, a colliding child
+  loop, a negative literal without parentheses, and a juxtaposed product. Every cell is stated in meta.
+  Orion cleared them all from batch 4 on (F-99).
+- **Orion builds a whole-scene validator for atomicity (10 of 15 saved Orion, 0/8 Nova).** It refuses
+  every edit when an unrelated instance already fails to expand (F-100). Nova does not re-validate at
+  all, so this cell separates Orion runs from each other, not Orion from Nova.
+- **Orion prints JS numbers into LaTeX (1 Orion, FP-voided once).** 1e-7 becomes `1*e - 7` (F-94).
+- **Sequence length:** Nova about 290k by my count with compactions summed (217k-580k; two runs
+  compacted), 1.66-1.97k added LOC, ptok 14-32M. Orion 667-824 LOC, ptok 2.0-4.7M.
+
+## cwerg-compact-pointer-unions (APPROVED Olympus 2026-10-19)
+
+- **Nova builds the new layout and the member operations, and leaves union-to-union conversions on the
+  old record path (8/8 Nova, 0/8 Orion+Vega).** It never re-lowered compact<->ordinary widening or
+  narrowing to a void-only subunion (F-101).
+- **Every Nova and 2/4 Vega copied the repo helper's "Id source only" guard.** They cloned behind
+  `IsNodeCopyableWithoutRiskOfSideEffects` instead of making a temporary, so `a[i]` (already a deref of
+  INCP) aborted. v4 and all Orion passers used `MakeNodeCopyable...` (F-102).
+- **Encoding a zero-sized value as its typeid deletes the call that produced it (7/8 Nova).** Orion #3
+  kept the call but in an unused temp that the optimizer cannot analyse (`MayHaveSideEffects` has no
+  ExprWrap) (F-103).
+- **Nova reuses the repo's `size == 0` shortcut as eligibility (3/8 Nova)**, so `union(^u8, [0]u8)` was
+  compressed (F-104).
+- **Vega edits the backend when the backend blocks it.** v1 fixed x64 BITCAST-immediate legalize itself;
+  v2 did not and failed only x64 (one run).
+- **Sequence length:** Nova 781k-1.36M (avg 962k, compacted), Vega 327k-512k in one window (19-23 files,
+  +1.2-1.4k lines), Orion 143k-196k with no compaction (15-18 files, +586..+766).
+
+## micasa-pro-blob-reclaim (APPROVED Olympus 2026-10-20)
+
+- **Nova ships deltas without a version (8/8).** Every Nova run recorded its report locally only after a
+  200 and kept no version on the relay's copy. A lost reply after commit pins an obsolete hash forever
+  (F-105). Vega's one pass versioned the base and resent in full on 409.
+- **Nova reads a server-assigned sequence off the incoming envelope (3/8, Postgres only).** MemStore sets
+  `op.Seq` in place; PgStore assigns it in SQL. The memory tests pass, the postgres ones delete instead
+  of waiting (F-106).
+- **Vega fails stated rules one at a time.** Its three failures were three different sole causes: a new
+  multi-part report voiding the complete one (F-107), a never-reported device counted as current (F-108,
+  twice across batches), and skipping an unchanged report after a push.
+- **Orion finishes short on this shape.** 4/4 at 100k-133k, no compaction; it could not qualify.
+- **Sequence length:** Nova 528k-767k (avg 567,649), Vega 310k-431k in one window (20-27 files,
+  +2.3-2.7k lines), Nova 13-19 files and +1.4-1.9k lines.
+- **A local Opus xhigh run reproduced a platform Vega failure:** L1 failed exactly like Vega b3-1 (F-107).

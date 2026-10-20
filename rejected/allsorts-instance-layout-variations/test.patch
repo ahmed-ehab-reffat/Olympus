@@ -1,0 +1,767 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..296c962
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,116 @@
++#!/usr/bin/env bash
++set -uo pipefail
++export PATH="/opt/cargo/bin:/root/.cargo/bin:$PATH"
++export CARGO_INCREMENTAL=0
++export RUSTC_BOOTSTRAP=1
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++cd "$(dirname "$0")"
++
++NEW_TEST="instance_layout_6ffe2c"
++FEATURES=(--no-default-features --features flate2_rust)
++TEST_JSON="$(mktemp)"
++TEST_ERR="$(mktemp)"
++STATUS=0
++BROKEN=()
++
++run_cargo() {
++  local label="$1"; shift
++  local json err rc
++  json="$(mktemp)"; err="$(mktemp)"
++  cargo test "${FEATURES[@]}" "$@" -- -Z unstable-options --format json --report-time > "$json" 2> "$err"
++  rc=$?
++  cat "$json" >> "$TEST_JSON"
++  cat "$err" >> "$TEST_ERR"
++  if [ "$rc" -ne 0 ]; then
++    STATUS=1
++    if ! grep -q '"type": *"test"' "$json"; then
++      BROKEN+=("$label")
++      cat "$err" "$json" > "$TEST_ERR.$label"
++    fi
++  fi
++  rm -f "$json" "$err"
++}
++
++case "$MODE" in
++  base)
++    TARGETS=(--lib)
++    for file in tests/*.rs; do
++      name="$(basename "$file" .rs)"
++      [ "$name" = "$NEW_TEST" ] && continue
++      [ "$name" = "common" ] && continue
++      TARGETS+=(--test "$name")
++    done
++    run_cargo base "${TARGETS[@]}"
++    ;;
++  new)
++    run_cargo new --test "$NEW_TEST"
++    ;;
++esac
++
++cat "$TEST_ERR" >&2
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  : > "$OUTPUT_PATH"
++  HAD_CASES=0
++  if grep -q '"type": *"test"' "$TEST_JSON"; then
++    cargo2junit < "$TEST_JSON" > "$OUTPUT_PATH" 2> "$TEST_ERR.junit"
++    if grep -q '<testcase' "$OUTPUT_PATH" \
++      && python3 -c 'import sys, xml.dom.minidom; xml.dom.minidom.parse(sys.argv[1])' "$OUTPUT_PATH" 2>> "$TEST_ERR.junit"; then
++      sed -i -e 's/::/./g' "$OUTPUT_PATH"
++      HAD_CASES=1
++    else
++      STATUS=1
++      tail -c 2000 "$TEST_JSON" >> "$TEST_ERR.junit"
++      BROKEN+=(junit)
++    fi
++  fi
++  if [ "$HAD_CASES" -eq 0 ] && [ "${#BROKEN[@]}" -eq 0 ]; then
++    STATUS=1
++    BROKEN=(compilation)
++    cat "$TEST_ERR" "$TEST_JSON" > "$TEST_ERR.compilation"
++  fi
++  cases=""
++  count=0
++  for label in "${BROKEN[@]}"; do
++    log="$(tail -c 4000 "$TEST_ERR.$label" 2>/dev/null | sed -e 's/]]>/]]]]><![CDATA[>/g')"
++    if [ "$label" = "new" ]; then
++      class=""
++      names="$(grep -A1 '^#\[test\]' "tests/$NEW_TEST.rs" | sed -n 's/^fn \([a-z0-9_]*\)().*/\1/p')"
++    else
++      class="cargo"
++      names="$label"
++    fi
++    for name in $names; do
++      count=$((count + 1))
++      cases="${cases}    <testcase name=\"${name}\" classname=\"${class}\"><failure message=\"cargo test failed\"><![CDATA[${log}]]></failure></testcase>
++"
++    done
++  done
++  if [ "$count" -gt 0 ]; then
++    suite="  <testsuite name=\"cargo\" tests=\"${count}\" failures=\"${count}\" errors=\"0\">
++${cases}  </testsuite>
++"
++    if [ "$HAD_CASES" -eq 1 ]; then
++      body="$(cat "$OUTPUT_PATH")"
++      body="${body%</testsuites>*}"
++      { printf '%s' "$body"; printf '%s' "$suite"; printf '</testsuites>\n'; } > "$OUTPUT_PATH"
++    else
++      { printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n'; printf '%s' "$suite"; printf '</testsuites>\n'; } > "$OUTPUT_PATH"
++    fi
++  fi
++fi
++
++rm -f "$TEST_JSON" "$TEST_ERR" "$TEST_ERR".*
++exit $STATUS
+diff --git a/tests/instance_layout_6ffe2c.rs b/tests/instance_layout_6ffe2c.rs
+new file mode 100644
+index 0000000..540e7da
+--- /dev/null
++++ b/tests/instance_layout_6ffe2c.rs
+@@ -0,0 +1,639 @@
++use std::collections::BTreeMap;
++
++use allsorts::binary::read::ReadScope;
++use allsorts::font::MatchingPresentation;
++use allsorts::font_data::FontData;
++use allsorts::gsub::{FeatureMask, FeatureMaskExt};
++use allsorts::layout::{GDEFTable, LayoutTable, GPOS, GSUB};
++use allsorts::tables::variable_fonts::OwnedTuple;
++use allsorts::tables::{Fixed, FontTableProvider, HheaTable, HmtxTable, MaxpTable};
++use allsorts::{tag, variations, Font};
++
++const NOTO: &str = "tests/fonts/opentype/NotoSans-VF.abc.ttf";
++const SOURCE_SANS: &str = "tests/fonts/opentype/cff2/SourceSansVariable-Roman.abc.otf";
++const SINGLE_SUBST: u16 = 1;
++const PAIR_POS: u16 = 2;
++const WGHT_HEAVY: (u16, f32, f32) = (0, 0.5, 1.0);
++const VVAR: u32 = tag!(b"VVAR");
++
++#[derive(Default)]
++struct Layout {
++    scripts: Vec<(u32, Vec<u16>)>,
++    features: Vec<(u32, usize)>,
++    feature_tables: Vec<Vec<u16>>,
++    lookups: Vec<(u16, Vec<usize>)>,
++    subtables: Vec<Vec<u8>>,
++    variations: Vec<(Vec<(u16, f32, f32)>, Vec<(u16, Vec<u16>)>)>,
++}
++
++fn put16(out: &mut Vec<u8>, value: u16) {
++    out.extend_from_slice(&value.to_be_bytes());
++}
++
++fn put32(out: &mut Vec<u8>, value: u32) {
++    out.extend_from_slice(&value.to_be_bytes());
++}
++
++fn f2dot14(value: f32) -> u16 {
++    ((value * 16384.0).round() as i16) as u16
++}
++
++fn set16(out: &mut [u8], at: usize, value: usize) {
++    out[at..at + 2].copy_from_slice(&u16::try_from(value).unwrap().to_be_bytes());
++}
++
++fn set32(out: &mut [u8], at: usize, value: usize) {
++    out[at..at + 4].copy_from_slice(&u32::try_from(value).unwrap().to_be_bytes());
++}
++
++fn feature_table(out: &mut Vec<u8>, lookups: &[u16]) {
++    put16(out, 0);
++    put16(out, lookups.len() as u16);
++    lookups.iter().for_each(|index| put16(out, *index));
++}
++
++fn layout_table(layout: &Layout) -> Vec<u8> {
++    let mut out = vec![0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
++
++    let script_list = out.len();
++    set16(&mut out, 4, script_list);
++    put16(&mut out, layout.scripts.len() as u16);
++    for (script_tag, _) in &layout.scripts {
++        put32(&mut out, *script_tag);
++        put16(&mut out, 0);
++    }
++    for (i, (_, indices)) in layout.scripts.iter().enumerate() {
++        let script = out.len();
++        set16(&mut out, script_list + 6 + 6 * i, script - script_list);
++        put16(&mut out, 4);
++        put16(&mut out, 0);
++        put16(&mut out, 0);
++        put16(&mut out, 0xFFFF);
++        put16(&mut out, indices.len() as u16);
++        indices.iter().for_each(|index| put16(&mut out, *index));
++    }
++
++    let feature_list = out.len();
++    set16(&mut out, 6, feature_list);
++    put16(&mut out, layout.features.len() as u16);
++    for (feature_tag, _) in &layout.features {
++        put32(&mut out, *feature_tag);
++        put16(&mut out, 0);
++    }
++    let mut table_offsets = Vec::new();
++    for lookups in &layout.feature_tables {
++        table_offsets.push(out.len() - feature_list);
++        feature_table(&mut out, lookups);
++    }
++    for (i, (_, table)) in layout.features.iter().enumerate() {
++        set16(&mut out, feature_list + 6 + 6 * i, table_offsets[*table]);
++    }
++
++    let lookup_list = out.len();
++    set16(&mut out, 8, lookup_list);
++    put16(&mut out, layout.lookups.len() as u16);
++    out.resize(out.len() + 2 * layout.lookups.len(), 0);
++    let mut lookup_offsets = Vec::new();
++    for (i, (lookup_type, subtables)) in layout.lookups.iter().enumerate() {
++        let lookup = out.len();
++        lookup_offsets.push(lookup);
++        set16(&mut out, lookup_list + 2 + 2 * i, lookup - lookup_list);
++        put16(&mut out, *lookup_type);
++        put16(&mut out, 0);
++        put16(&mut out, subtables.len() as u16);
++        out.resize(out.len() + 2 * subtables.len(), 0);
++    }
++    let mut subtable_offsets = Vec::new();
++    for subtable in &layout.subtables {
++        subtable_offsets.push(out.len());
++        out.extend_from_slice(subtable);
++    }
++    for (i, (_, subtables)) in layout.lookups.iter().enumerate() {
++        for (j, subtable) in subtables.iter().enumerate() {
++            let at = lookup_offsets[i] + 6 + 2 * j;
++            set16(
++                &mut out,
++                at,
++                subtable_offsets[*subtable] - lookup_offsets[i],
++            );
++        }
++    }
++
++    if !layout.variations.is_empty() {
++        let variations = out.len();
++        set32(&mut out, 10, variations);
++        put16(&mut out, 1);
++        put16(&mut out, 0);
++        put32(&mut out, layout.variations.len() as u32);
++        out.resize(out.len() + 8 * layout.variations.len(), 0);
++        for (i, (conditions, substitutions)) in layout.variations.iter().enumerate() {
++            let condition_set = out.len();
++            set32(&mut out, variations + 8 + 8 * i, condition_set - variations);
++            put16(&mut out, conditions.len() as u16);
++            out.resize(out.len() + 4 * conditions.len(), 0);
++            for (k, (axis, min, max)) in conditions.iter().enumerate() {
++                let condition = out.len();
++                set32(
++                    &mut out,
++                    condition_set + 2 + 4 * k,
++                    condition - condition_set,
++                );
++                put16(&mut out, 1);
++                put16(&mut out, *axis);
++                put16(&mut out, f2dot14(*min));
++                put16(&mut out, f2dot14(*max));
++            }
++            let substitution = out.len();
++            set32(&mut out, variations + 12 + 8 * i, substitution - variations);
++            put16(&mut out, 1);
++            put16(&mut out, 0);
++            put16(&mut out, substitutions.len() as u16);
++            out.resize(out.len() + 6 * substitutions.len(), 0);
++            for (k, (feature_index, lookups)) in substitutions.iter().enumerate() {
++                let record = substitution + 6 + 6 * k;
++                set16(&mut out, record, usize::from(*feature_index));
++                let alternate = out.len();
++                set32(&mut out, record + 2, alternate - substitution);
++                feature_table(&mut out, lookups);
++            }
++        }
++    }
++    out
++}
++
++fn coverage(out: &mut Vec<u8>, glyphs: &[u16]) {
++    put16(out, 1);
++    put16(out, glyphs.len() as u16);
++    glyphs.iter().for_each(|glyph| put16(out, *glyph));
++}
++
++fn single_subst(pairs: &[(u16, u16)]) -> Vec<u8> {
++    let mut out = Vec::new();
++    put16(&mut out, 2);
++    put16(&mut out, (6 + 2 * pairs.len()) as u16);
++    put16(&mut out, pairs.len() as u16);
++    pairs.iter().for_each(|(_, to)| put16(&mut out, *to));
++    coverage(
++        &mut out,
++        &pairs.iter().map(|(from, _)| *from).collect::<Vec<_>>(),
++    );
++    out
++}
++
++fn device(out: &mut Vec<u8>, inner: u16) {
++    put16(out, 0);
++    put16(out, inner);
++    put16(out, 0x8000);
++}
++
++fn pair_kern(first: u16, second: u16, x_advance: i16, variation: Option<u16>) -> Vec<u8> {
++    let value_format = if variation.is_some() { 0x0044 } else { 0x0004 };
++    let mut out = Vec::new();
++    put16(&mut out, 1);
++    put16(&mut out, 0);
++    put16(&mut out, value_format);
++    put16(&mut out, 0);
++    put16(&mut out, 1);
++    put16(&mut out, 12);
++    put16(&mut out, 1);
++    put16(&mut out, second);
++    put16(&mut out, x_advance as u16);
++    if let Some(inner) = variation {
++        put16(&mut out, 8);
++        device(&mut out, inner);
++    }
++    let coverage_offset = out.len();
++    set16(&mut out, 2, coverage_offset);
++    coverage(&mut out, &[first]);
++    out
++}
++
++fn var_store(axis_count: u16, regions: &[Vec<(f32, f32, f32)>], rows: &[Vec<i16>]) -> Vec<u8> {
++    let mut out = Vec::new();
++    put16(&mut out, 1);
++    put32(&mut out, 12);
++    put16(&mut out, 1);
++    put32(&mut out, 0);
++    put16(&mut out, axis_count);
++    put16(&mut out, regions.len() as u16);
++    for region in regions {
++        for (start, peak, end) in region {
++            put16(&mut out, f2dot14(*start));
++            put16(&mut out, f2dot14(*peak));
++            put16(&mut out, f2dot14(*end));
++        }
++    }
++    let data = out.len();
++    set32(&mut out, 8, data);
++    put16(&mut out, rows.len() as u16);
++    put16(&mut out, regions.len() as u16);
++    put16(&mut out, regions.len() as u16);
++    (0..regions.len()).for_each(|region| put16(&mut out, region as u16));
++    rows.iter()
++        .flatten()
++        .for_each(|delta| put16(&mut out, *delta as u16));
++    out
++}
++
++fn gdef_with_store(store: &[u8]) -> Vec<u8> {
++    let mut out = vec![0, 1, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
++    put32(&mut out, 20);
++    put16(&mut out, 0);
++    out.extend_from_slice(store);
++    out
++}
++
++fn wght_region(axis_count: usize) -> Vec<(f32, f32, f32)> {
++    let mut region = vec![(0.0, 0.0, 0.0); axis_count];
++    region[0] = (0.0, 1.0, 1.0);
++    region
++}
++
++fn sfnt(magic: u32, tables: &BTreeMap<u32, Vec<u8>>) -> Vec<u8> {
++    let mut out = Vec::new();
++    put32(&mut out, magic);
++    put16(&mut out, tables.len() as u16);
++    put16(&mut out, 0);
++    put16(&mut out, 0);
++    put16(&mut out, 0);
++    let mut offset = 12 + 16 * tables.len();
++    for (table_tag, data) in tables {
++        put32(&mut out, *table_tag);
++        put32(&mut out, 0);
++        put32(&mut out, offset as u32);
++        put32(&mut out, data.len() as u32);
++        offset += (data.len() + 3) & !3;
++    }
++    for data in tables.values() {
++        out.extend_from_slice(data);
++        out.resize((out.len() + 3) & !3, 0);
++    }
++    out
++}
++
++fn font_with(path: &str, replacements: Vec<(u32, Vec<u8>)>) -> Vec<u8> {
++    let data = std::fs::read(path).unwrap();
++    let font_file = ReadScope::new(&data).read::<FontData<'_>>().unwrap();
++    let provider = font_file.table_provider(0).unwrap();
++    let mut tables = provider
++        .table_tags()
++        .unwrap()
++        .into_iter()
++        .map(|table_tag| {
++            (
++                table_tag,
++                provider.read_table_data(table_tag).unwrap().to_vec(),
++            )
++        })
++        .collect::<BTreeMap<_, _>>();
++    tables.extend(replacements);
++    sfnt(u32::from_be_bytes(data[..4].try_into().unwrap()), &tables)
++}
++
++fn instance(data: &[u8], user: &[f32]) -> (Vec<u8>, OwnedTuple) {
++    let font_file = ReadScope::new(data).read::<FontData<'_>>().unwrap();
++    let provider = font_file.table_provider(0).unwrap();
++    let user = user
++        .iter()
++        .map(|value| Fixed::from(*value))
++        .collect::<Vec<_>>();
++    variations::instance(&provider, &user).unwrap()
++}
++
++fn shape(
++    data: &[u8],
++    text: &str,
++    script: u32,
++    tuple: Option<&OwnedTuple>,
++) -> Vec<(u16, i16, String)> {
++    let font_file = ReadScope::new(data).read::<FontData<'_>>().unwrap();
++    let provider = font_file.table_provider(0).unwrap();
++    let mut font = Font::new(provider).unwrap();
++    let glyphs = font.map_glyphs(text, script, MatchingPresentation::NotRequired);
++    let infos = font
++        .shape(
++            glyphs,
++            script,
++            Some(tag::DFLT),
++            FeatureMask::default_mask(),
++            &[],
++            tuple.map(OwnedTuple::as_tuple),
++            true,
++        )
++        .unwrap();
++    infos
++        .iter()
++        .map(|info| {
++            (
++                info.glyph.glyph_index,
++                info.kerning,
++                format!("{:?}", info.placement),
++            )
++        })
++        .collect()
++}
++
++fn table(data: &[u8], table_tag: u32) -> Option<Vec<u8>> {
++    let font_file = ReadScope::new(data).read::<FontData<'_>>().unwrap();
++    let provider = font_file.table_provider(0).unwrap();
++    provider
++        .table_data(table_tag)
++        .unwrap()
++        .map(|data| data.to_vec())
++}
++
++fn assert_instance_shapes_like_variable(
++    data: &[u8],
++    user: &[f32],
++    texts: &[&str],
++    scripts: &[u32],
++) {
++    let (static_font, tuple) = instance(data, user);
++    for script in scripts {
++        for text in texts {
++            assert_eq!(
++                shape(&static_font, text, *script, None),
++                shape(data, text, *script, Some(&tuple)),
++                "{text:?} at {user:?}"
++            );
++        }
++    }
++}
++
++fn assert_variation_is_visible(data: &[u8], user: &[f32], text: &str, script: u32) {
++    let (_, tuple) = instance(data, user);
++    assert_ne!(
++        shape(data, text, script, Some(&tuple)),
++        shape(data, text, script, None)
++    );
++}
++
++fn rvrn_font() -> Vec<u8> {
++    let gsub = layout_table(&Layout {
++        scripts: vec![(tag::DFLT, vec![0]), (tag::LATN, vec![0])],
++        features: vec![(tag::RVRN, 0)],
++        feature_tables: vec![vec![]],
++        lookups: vec![(SINGLE_SUBST, vec![0])],
++        subtables: vec![single_subst(&[(1, 2)])],
++        variations: vec![(vec![WGHT_HEAVY], vec![(0, vec![0])])],
++    });
++    font_with(NOTO, vec![(tag::GSUB, gsub)])
++}
++
++fn liga_font() -> Vec<u8> {
++    let gsub = layout_table(&Layout {
++        scripts: vec![(tag::DFLT, vec![0]), (tag::LATN, vec![0])],
++        features: vec![(tag::LIGA, 0)],
++        feature_tables: vec![vec![0]],
++        lookups: vec![(SINGLE_SUBST, vec![0]), (SINGLE_SUBST, vec![1])],
++        subtables: vec![single_subst(&[(3, 1)]), single_subst(&[(1, 2)])],
++        variations: vec![(vec![WGHT_HEAVY], vec![(0, vec![0, 1])])],
++    });
++    font_with(NOTO, vec![(tag::GSUB, gsub)])
++}
++
++fn kern_font(shared_subtable: bool) -> Vec<u8> {
++    let lookups = if shared_subtable {
++        vec![(PAIR_POS, vec![0]), (PAIR_POS, vec![0])]
++    } else {
++        vec![(PAIR_POS, vec![0])]
++    };
++    let gpos = layout_table(&Layout {
++        scripts: vec![(tag::DFLT, vec![0]), (tag::LATN, vec![0])],
++        features: vec![(tag::KERN, 0)],
++        feature_tables: vec![vec![0]],
++        lookups,
++        subtables: vec![pair_kern(1, 2, -40, Some(0))],
++        variations: vec![],
++    });
++    let store = var_store(3, &[wght_region(3)], &[vec![-60]]);
++    font_with(
++        NOTO,
++        vec![(tag::GPOS, gpos), (tag::GDEF, gdef_with_store(&store))],
++    )
++}
++
++#[test]
++fn source_sans_kerning_matches_variable_font() {
++    let data = std::fs::read(SOURCE_SANS).unwrap();
++    assert_variation_is_visible(&data, &[900.0], "ba", tag::LATN);
++    for weight in [300.0, 650.0, 900.0] {
++        assert_instance_shapes_like_variable(
++            &data,
++            &[weight],
++            &["abcabc", "bacca", "cbcb"],
++            &[tag::LATN],
++        );
++    }
++}
++
++#[test]
++fn rvrn_substitution_survives_instancing() {
++    let data = rvrn_font();
++    assert_variation_is_visible(&data, &[900.0, 100.0, 0.0], "abc", tag::LATN);
++    for weight in [400.0, 700.0, 900.0] {
++        assert_instance_shapes_like_variable(
++            &data,
++            &[weight, 100.0, 0.0],
++            &["abc", "aa"],
++            &[tag::LATN, tag::DFLT],
++        );
++    }
++}
++
++#[test]
++fn heavy_instance_applies_alternate_liga_lookups() {
++    let data = liga_font();
++    let (static_font, _) = instance(&data, &[900.0, 100.0, 0.0]);
++    let glyphs = shape(&static_font, "abc", tag::LATN, None)
++        .into_iter()
++        .map(|(glyph, _, _)| glyph)
++        .collect::<Vec<_>>();
++    assert_eq!(glyphs, vec![2, 2, 2]);
++    assert_instance_shapes_like_variable(&data, &[400.0, 100.0, 0.0], &["abc"], &[tag::LATN]);
++}
++
++#[test]
++fn pair_kerning_delta_is_baked() {
++    let data = kern_font(false);
++    assert_variation_is_visible(&data, &[900.0, 100.0, 0.0], "ab", tag::LATN);
++    for weight in [100.0, 550.0, 900.0] {
++        assert_instance_shapes_like_variable(
++            &data,
++            &[weight, 100.0, 0.0],
++            &["ab", "abab", "ba"],
++            &[tag::LATN],
++        );
++    }
++}
++
++#[test]
++fn kerning_subtable_shared_by_two_lookups() {
++    let data = kern_font(true);
++    assert_instance_shapes_like_variable(&data, &[900.0, 100.0, 0.0], &["ab"], &[tag::LATN]);
++}
++
++#[test]
++fn instance_drops_feature_variations_and_variation_store() {
++    let (static_font, _) = instance(&kern_font(false), &[900.0, 100.0, 0.0]);
++    let gdef = ReadScope::new(&table(&static_font, tag::GDEF).unwrap())
++        .read::<GDEFTable>()
++        .unwrap();
++    assert!(gdef.opt_item_variation_store.is_none());
++    let (static_font, _) = instance(&rvrn_font(), &[900.0, 100.0, 0.0]);
++    let gsub = table(&static_font, tag::GSUB).unwrap();
++    let gsub = ReadScope::new(&gsub).read::<LayoutTable<GSUB>>().unwrap();
++    assert!(gsub.opt_feature_variations.is_none());
++}
++
++#[test]
++fn gpos_feature_variations_switch_kerning() {
++    let gpos = layout_table(&Layout {
++        scripts: vec![(tag::DFLT, vec![0]), (tag::LATN, vec![0])],
++        features: vec![(tag::KERN, 0)],
++        feature_tables: vec![vec![0]],
++        lookups: vec![(PAIR_POS, vec![0]), (PAIR_POS, vec![1])],
++        subtables: vec![pair_kern(1, 2, -40, None), pair_kern(2, 3, 25, None)],
++        variations: vec![(vec![WGHT_HEAVY], vec![(0, vec![1])])],
++    });
++    let data = font_with(NOTO, vec![(tag::GPOS, gpos)]);
++    assert_variation_is_visible(&data, &[900.0, 100.0, 0.0], "abc", tag::LATN);
++    for weight in [400.0, 900.0] {
++        assert_instance_shapes_like_variable(&data, &[weight, 100.0, 0.0], &["abc"], &[tag::LATN]);
++    }
++    let (static_font, _) = instance(&data, &[900.0, 100.0, 0.0]);
++    let gpos = table(&static_font, tag::GPOS).unwrap();
++    let gpos = ReadScope::new(&gpos).read::<LayoutTable<GPOS>>().unwrap();
++    assert!(gpos.opt_feature_variations.is_none());
++}
++
++fn vertical_tables() -> Vec<(u32, Vec<u8>)> {
++    let mut vhea = Vec::new();
++    put32(&mut vhea, 0x0001_0000);
++    for value in [
++        500u16,
++        (-500i16) as u16,
++        0,
++        1000,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++        4,
++    ] {
++        put16(&mut vhea, value);
++    }
++    let mut vmtx = Vec::new();
++    for glyph in 0..4u16 {
++        put16(&mut vmtx, 1000);
++        put16(&mut vmtx, 100 + glyph);
++    }
++    vec![(tag::VHEA, vhea), (tag::VMTX, vmtx)]
++}
++
++fn vertical_metrics(data: &[u8]) -> (HheaTable, Vec<(u16, i16)>) {
++    let maxp = ReadScope::new(&table(data, tag::MAXP).unwrap())
++        .read::<MaxpTable>()
++        .unwrap();
++    let vhea = ReadScope::new(&table(data, tag::VHEA).unwrap())
++        .read::<HheaTable>()
++        .unwrap();
++    let vmtx = table(data, tag::VMTX).unwrap();
++    let vmtx = ReadScope::new(&vmtx)
++        .read_dep::<HmtxTable<'_>>((
++            usize::from(maxp.num_glyphs),
++            usize::from(vhea.num_h_metrics),
++        ))
++        .unwrap();
++    let metrics = (0..maxp.num_glyphs)
++        .map(|glyph| {
++            let metric = vmtx.metric(glyph).unwrap();
++            (metric.advance_width, metric.lsb)
++        })
++        .collect();
++    (vhea, metrics)
++}
++
++fn y_max(data: &[u8], glyph: u16) -> i16 {
++    let font_file = ReadScope::new(data).read::<FontData<'_>>().unwrap();
++    let mut font = Font::new(font_file.table_provider(0).unwrap()).unwrap();
++    font.bounding_box(glyph)
++        .unwrap()
++        .map_or(0, |bounding_box| bounding_box.y_max)
++}
++
++#[test]
++fn vhea_takes_mvar_deltas() {
++    let store = var_store(3, &[wght_region(3)], &[vec![40], vec![-25]]);
++    let mut mvar = Vec::new();
++    for value in [1u16, 0, 0, 8, 2, 28] {
++        put16(&mut mvar, value);
++    }
++    for (inner, value_tag) in [tag::VASC, tag::VDSC].into_iter().enumerate() {
++        put32(&mut mvar, value_tag);
++        put16(&mut mvar, 0);
++        put16(&mut mvar, inner as u16);
++    }
++    mvar.extend_from_slice(&store);
++    let mut tables = vertical_tables();
++    tables.push((tag::MVAR, mvar));
++    let (static_font, _) = instance(&font_with(NOTO, tables), &[900.0, 100.0, 0.0]);
++    let (vhea, _) = vertical_metrics(&static_font);
++    assert_eq!((vhea.ascender, vhea.descender), (540, -525));
++}
++
++#[test]
++fn vertical_metrics_follow_phantom_points_without_vvar() {
++    let data = font_with(NOTO, vertical_tables());
++    let (static_font, _) = instance(&data, &[900.0, 100.0, 0.0]);
++    let (vhea, metrics) = vertical_metrics(&static_font);
++    assert_eq!(vhea.num_h_metrics, 4);
++    assert_ne!(y_max(&static_font, 1), y_max(&data, 1));
++    for glyph in 1..4u16 {
++        let top = 100 + glyph as i16 + y_max(&data, glyph);
++        assert_eq!(
++            metrics[usize::from(glyph)],
++            (1000, top - y_max(&static_font, glyph))
++        );
++    }
++}
++
++#[test]
++fn vertical_metrics_follow_vvar() {
++    let store = var_store(
++        3,
++        &[wght_region(3)],
++        &[vec![0], vec![80], vec![-30], vec![0]],
++    );
++    let mut vvar = Vec::new();
++    put16(&mut vvar, 1);
++    put16(&mut vvar, 0);
++    put32(&mut vvar, 24);
++    put32(&mut vvar, 0);
++    put32(&mut vvar, 0);
++    put32(&mut vvar, 0);
++    put32(&mut vvar, 0);
++    vvar.extend_from_slice(&store);
++    let mut tables = vertical_tables();
++    tables.push((VVAR, vvar));
++    let data = font_with(NOTO, tables);
++    let (static_font, _) = instance(&data, &[900.0, 100.0, 0.0]);
++    let font_file = ReadScope::new(&static_font).read::<FontData<'_>>().unwrap();
++    let mut font = Font::new(font_file.table_provider(0).unwrap()).unwrap();
++    let advances = (0..4)
++        .map(|glyph| font.vertical_advance(glyph))
++        .collect::<Vec<_>>();
++    assert_eq!(
++        advances,
++        vec![Some(1000), Some(1080), Some(970), Some(1000)]
++    );
++    let (vhea, _) = vertical_metrics(&static_font);
++    assert_eq!(vhea.advance_width_max, 1080);
++}

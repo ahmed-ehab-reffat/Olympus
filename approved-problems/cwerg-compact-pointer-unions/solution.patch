@@ -1,0 +1,914 @@
+diff --git a/FE/Docs/union_types.md b/FE/Docs/union_types.md
+index bc811c5f..bcf2d5aa 100644
+--- a/FE/Docs/union_types.md
++++ b/FE/Docs/union_types.md
+@@ -277,4 +277,14 @@ to `union_tag(u) ∉  member-type-ids((union_delta(tu, tv))` which may be faster
+   narrowto expressions that narrow to a non-union
+ 
+ * ReplaceSums
+-  Replaces all tagged unions with structs representing underlying the tag and the untagged union
+\ No newline at end of file
++  Replaces all tagged unions with structs representing underlying the tag and the untagged union
++
++## Compact Layout
++
++A tagged union whose members are one pointer (or a wrapped type of a pointer)
++plus one or more zero sized members (void or wrapped types of void) is stored
++as a single word with the size and alignment of a pointer.
++The word holds either the pointer or the typeid of the zero sized member.
++This relies on typeids being smaller than the address of any object:
++Cwerg executables are loaded at 0x400000 (x64, a64) or 0x20000 (a32)
++and the stack and heap are placed above the image.
+diff --git a/FE/canonicalize.h b/FE/canonicalize.h
+index 53f13197..069a3237 100644
+--- a/FE/canonicalize.h
++++ b/FE/canonicalize.h
+@@ -44,6 +44,7 @@ extern Node CloneId(Node id);
+ extern Node MakeDefVar(Name name, Node init);
+ 
+ extern Node MakeExprField(Node container, Node rec_field, const SrcLoc& sl);
++extern Node MakeValUndef(const SrcLoc& sl);
+ 
+ struct FieldTypeAndValue {
+   CanonType type;
+diff --git a/FE/canonicalize_union.cc b/FE/canonicalize_union.cc
+index 426b294a..19cc7020 100644
+--- a/FE/canonicalize_union.cc
++++ b/FE/canonicalize_union.cc
+@@ -69,9 +69,25 @@ Node MakeExprWidenBetweeUntaggedUnions(Node expr, CanonType dst_ct,
+   return out;
+ }
+ 
++Node MakeExprStmtWithPrefix(NodeChain* stmts, Node out, CanonType ct,
++                            const SrcLoc& sl) {
++  if (stmts->First().isnull()) {
++    return out;
++  }
++  Node wrapper = NodeNew(NT::ExprStmt);
++  NodeInitExprStmt(wrapper, kNodeInvalid, kStrInvalid, sl, ct);
++  Node ret = NodeNew(NT::StmtReturn);
++  NodeInitStmtReturn(ret, out, kStrInvalid, sl, wrapper);
++  stmts->Append(ret);
++  Node_body(wrapper) = stmts->First();
++  return wrapper;
++}
++
+ Node MakeValRecForWidenFromUnion(Node widen, CanonType dst_ct) {
+   const SrcLoc& sl = Node_srcloc(widen);
+-  Node src = Node_expr(widen);
++  NodeChain stmts;
++  Node src =
++      MakeNodeCopyableWithoutRiskOfSideEffects(Node_expr(widen), &stmts, false);
+   CanonType src_ct = Node_x_type(src);
+ 
+   Node dst_tag_field = CanonType_get_rec_field(dst_ct, 0);
+@@ -80,27 +96,35 @@ Node MakeValRecForWidenFromUnion(Node widen, CanonType dst_ct) {
+   Node src_tag_field = CanonType_get_rec_field(src_ct, 0);
+   Node src_union_field = Node_next(src_tag_field);
+ 
+-  CHECK(src.kind() == NT::Id, "Support for non-ID NYI");
+-  Node tag_value = MakeExprField(CloneId(src), src_tag_field, sl);
++  NodeToNodeMap dummy1;
++  NodeToNodeMap dummy2;
++  Node tag_value = MakeExprField(NodeCloneRecursively(src, &dummy1, &dummy2),
++                                 src_tag_field, sl);
+   Node union_field = MakeExprField(src, src_union_field, sl);
+ 
+   Node union_value = MakeExprWidenBetweeUntaggedUnions(
+       union_field, Node_x_type(dst_union_field), sl, Node_x_eval(widen));
+   NodeFree(Node_type(widen));
+   NodeFree(widen);
+-  return MakeValRecForTaggedUnion(dst_ct, tag_value, union_value, sl);
++  return MakeExprStmtWithPrefix(
++      &stmts, MakeValRecForTaggedUnion(dst_ct, tag_value, union_value, sl),
++      dst_ct, sl);
+ }
+ 
+ Node MakeValRecForNarrow(Node narrow, CanonType dst_ct) {
+   const SrcLoc& sl = Node_srcloc(narrow);
+-  Node src = Node_expr(narrow);
+-  ASSERT(src.kind() == NT::Id, "Support for non-ID NYI");
++  NodeChain stmts;
++  Node src = MakeNodeCopyableWithoutRiskOfSideEffects(Node_expr(narrow),
++                                                      &stmts, false);
+ 
+   Node dst_union_field = CanonType_get_rec_field(dst_ct, 1);
+-  CanonType src_ct = Node_x_type(Node_expr(narrow));
++  CanonType src_ct = Node_x_type(src);
+   Node src_tag_field = CanonType_get_rec_field(src_ct, 0);
+   Node src_union_field = Node_next(src_tag_field);
+-  Node val_tag = MakeExprField(CloneId(src), src_tag_field, sl);
++  NodeToNodeMap dummy1;
++  NodeToNodeMap dummy2;
++  Node val_tag = MakeExprField(NodeCloneRecursively(src, &dummy1, &dummy2),
++                               src_tag_field, sl);
+   Node val_union_tmp = MakeExprField(src, src_union_field, sl);
+   Node val_union = NodeNew(NT::ExprNarrow);
+   NodeInitExprNarrow(
+@@ -109,7 +133,214 @@ Node MakeValRecForNarrow(Node narrow, CanonType dst_ct) {
+   Node_x_eval(val_union) = Node_x_eval(narrow);
+   NodeFree(Node_type(narrow));
+   NodeFree(narrow);
+-  return MakeValRecForTaggedUnion(dst_ct, val_tag, val_union, sl);
++  return MakeExprStmtWithPrefix(
++      &stmts, MakeValRecForTaggedUnion(dst_ct, val_tag, val_union, sl), dst_ct,
++      sl);
++}
++
++bool IsCompactUnion(CanonType ct) {
++  return !ct.isnull() && CanonType_is_tagged_union(ct) &&
++         DKFlavor(CanonType_ir_regs(ct)) == DK_FLAVOR_A;
++}
++
++CanonType CompactPointerMember(CanonType ct) {
++  for (CanonType m : CanonType_children(ct)) {
++    if (CanonType_size(m) != 0) {
++      return m;
++    }
++  }
++  CHECK(false, "no pointer member");
++  return kCanonTypeInvalid;
++}
++
++CanonType CurrentType(CanonType ct) {
++  CanonType replacement_ct = CanonType_replacement_type(ct);
++  return replacement_ct.isnull() ? ct : replacement_ct;
++}
++
++Node MakeCompactReplacementStruct(CanonType union_ct, TypeCorpus* tc) {
++  std::vector<CanonType> members;
++  for (CanonType m : CanonType_children(union_ct)) {
++    members.push_back(CurrentType(m));
++  }
++  members.push_back(tc->get_uint_canon_type());
++  std::array<NameAndType, 1> fields = {{
++      NameAndType{NameNew("bits"), tc->InsertUnionType(true, members)},
++  }};
++  std::string name = "xcompact_";
++  name += NameData(CanonType_name(union_ct));
++  return MakeDefRec(NameNew(name), fields, tc);
++}
++
++Node MakeUintVal(uint64_t val, CanonType ct_uint, const SrcLoc& sl) {
++  Node out = NodeNew(NT::ValNum);
++  NodeInitValNum(out, StrNew(EVAL_STR), kStrInvalid, sl, ct_uint);
++  Node_x_eval(out) = ConstNewUnsigned(val, CanonType_base_type_kind(ct_uint));
++  return out;
++}
++
++Node MakeAs(Node expr, CanonType ct, const SrcLoc& sl) {
++  Node out = NodeNew(NT::ExprAs);
++  return NodeInitExprAs(out, expr, MakeTypeAuto(ct, sl), kStrInvalid, sl, ct);
++}
++
++Node MakeUncheckedNarrow(Node expr, CanonType ct, const SrcLoc& sl) {
++  Node out = NodeNew(NT::ExprNarrow);
++  return NodeInitExprNarrow(out, expr, MakeTypeAuto(ct, sl),
++                            Mask(BF::UNCHECKED), kStrInvalid, sl, ct);
++}
++
++Node MakeCompactBits(Node src, const SrcLoc& sl) {
++  return MakeExprField(src, CanonType_get_rec_field(Node_x_type(src), 0), sl);
++}
++
++Node MakeCompactVal(CanonType dst_ct, Node val, const SrcLoc& sl) {
++  CanonType bits_ct = Node_x_type(CanonType_get_rec_field(dst_ct, 0));
++  Node bits =
++      MakeExprWidenBetweeUntaggedUnions(val, bits_ct, sl, kConstInvalid);
++  std::array<FieldTypeAndValue, 1> fields = {{{bits_ct, bits}}};
++  return MakeValCompound(dst_ct, fields, sl);
++}
++
++Node MakeExprStmtWithCase(CanonType ct, const SrcLoc& sl, Node cond, Node val,
++                          Node last) {
++  Node out = NodeNew(NT::ExprStmt);
++  NodeInitExprStmt(out, kNodeInvalid, kStrInvalid, sl, ct);
++  Node ret_t = NodeNew(NT::StmtReturn);
++  NodeInitStmtReturn(ret_t, val, kStrInvalid, sl, out);
++  Node if_stmt = NodeNew(NT::StmtIf);
++  NodeInitStmtIf(if_stmt, cond, ret_t, kNodeInvalid, kStrInvalid, sl);
++  Node ret = NodeNew(NT::StmtReturn);
++  NodeInitStmtReturn(ret, last, kStrInvalid, sl, out);
++  NodeChain body;
++  body.Append(if_stmt);
++  body.Append(ret);
++  Node_body(out) = body.First();
++  return out;
++}
++
++// Cwerg executables are loaded at 0x400000 (x64, a64) or 0x20000 (a32) and
++// the stack and heap are placed above the image, so no object lives below this
++constexpr uint64_t kMinObjectAddress = 0x20000;
++
++Node MakeCompactTag(Node src, CanonType union_ct, TypeCorpus* tc,
++                    const SrcLoc& sl) {
++  CanonType ct_uint = tc->get_uint_canon_type();
++  CanonType ct_tag = tc->get_typeid_canon_type();
++  CHECK((uint64_t(1) << (8 * CanonType_size(ct_tag))) <= kMinObjectAddress, "");
++  Node tmp = MakeDefVar(
++      NameNew("compact_bits"),
++      MakeUncheckedNarrow(MakeCompactBits(src, sl), ct_uint, sl));
++  Node is_small = NodeNew(NT::Expr2);
++  NodeInitExpr2(
++      is_small, BINARY_EXPR_KIND::LT, IdNodeFromDef(tmp, sl),
++      MakeUintVal(uint64_t(1) << (8 * CanonType_size(ct_tag)), ct_uint, sl),
++      kStrInvalid, sl, tc->get_bool_canon_type());
++  Node out = MakeExprStmtWithCase(
++      ct_tag, sl, is_small, MakeAs(IdNodeFromDef(tmp, sl), ct_tag, sl),
++      MakeTypeidVal(CompactPointerMember(union_ct), sl, ct_tag));
++  Node_next(tmp) = Node_body(out);
++  Node_body(out) = tmp;
++  return out;
++}
++
++bool IsDiscardable(Node expr) {
++  while (expr.kind() == NT::ExprWrap) {
++    expr = Node_expr(expr);
++  }
++  return expr.kind() == NT::Id || expr.kind() == NT::ValVoid;
++}
++
++Node MakeCompactFromMember(Node expr, CanonType dst_ct, TypeCorpus* tc,
++                           const SrcLoc& sl) {
++  CanonType src_ct = Node_x_type(expr);
++  if (CanonType_size(src_ct) != 0) {
++    return MakeCompactVal(dst_ct, expr, sl);
++  }
++  Node val = MakeCompactVal(
++      dst_ct,
++      MakeUintVal(CanonType_get_original_typeid(src_ct),
++                  tc->get_uint_canon_type(), sl),
++      sl);
++  if (IsDiscardable(expr)) {
++    NodeFreeRecursively(expr);
++    return val;
++  }
++  Node out = NodeNew(NT::ExprStmt);
++  NodeInitExprStmt(out, kNodeInvalid, kStrInvalid, sl, dst_ct);
++  Node do_stmt = NodeNew(NT::StmtExpr);
++  NodeInitStmtExpr(do_stmt, expr, kStrInvalid, sl);
++  Node ret = NodeNew(NT::StmtReturn);
++  NodeInitStmtReturn(ret, val, kStrInvalid, sl, out);
++  NodeChain body;
++  body.Append(do_stmt);
++  body.Append(ret);
++  Node_body(out) = body.First();
++  return out;
++}
++
++Node MakeCompactFromUnion(Node src, CanonType src_union, CanonType dst_ct,
++                          TypeCorpus* tc, const SrcLoc& sl) {
++  CanonType ct_uint = tc->get_uint_canon_type();
++  if (IsCompactUnion(src_union)) {
++    return MakeCompactVal(
++        dst_ct, MakeUncheckedNarrow(MakeCompactBits(src, sl), ct_uint, sl),
++        sl);
++  }
++  NodeChain stmts;
++  src = MakeNodeCopyableWithoutRiskOfSideEffects(src, &stmts, false);
++  CanonType src_ct = Node_x_type(src);
++  Node tag_field = CanonType_get_rec_field(src_ct, 0);
++  NodeToNodeMap dummy1;
++  NodeToNodeMap dummy2;
++  Node small = MakeCompactVal(
++      dst_ct,
++      MakeAs(MakeExprField(NodeCloneRecursively(src, &dummy1, &dummy2),
++                           tag_field, sl),
++             ct_uint, sl),
++      sl);
++  CanonType ptr_ct = CompactPointerMember(CanonType_original_type(dst_ct));
++  Node out;
++  if (!CanonType_union_contains(src_union, ptr_ct)) {
++    NodeFreeRecursively(src);
++    out = small;
++  } else {
++    Node is_ptr = NodeNew(NT::Expr2);
++    NodeInitExpr2(is_ptr, BINARY_EXPR_KIND::EQ,
++                  MakeExprField(NodeCloneRecursively(src, &dummy1, &dummy2),
++                                tag_field, sl),
++                  MakeTypeidVal(ptr_ct, sl, Node_x_type(tag_field)),
++                  kStrInvalid, sl, tc->get_bool_canon_type());
++    Node payload =
++        MakeExprField(src, CanonType_get_rec_field(src_ct, 1), sl);
++    Node ptr =
++        MakeCompactVal(dst_ct, MakeUncheckedNarrow(payload, CurrentType(ptr_ct), sl), sl);
++    out = MakeExprStmtWithCase(dst_ct, sl, is_ptr, ptr, small);
++  }
++  return MakeExprStmtWithPrefix(&stmts, out, dst_ct, sl);
++}
++
++Node MakeUnionFromCompact(Node src, CanonType src_union, CanonType dst_ct,
++                          TypeCorpus* tc, const SrcLoc& sl) {
++  NodeChain stmts;
++  src = MakeNodeCopyableWithoutRiskOfSideEffects(src, &stmts, false);
++  NodeToNodeMap dummy1;
++  NodeToNodeMap dummy2;
++  Node tag = MakeCompactTag(NodeCloneRecursively(src, &dummy1, &dummy2),
++                            src_union, tc, sl);
++  CanonType dst_union_ct = Node_x_type(CanonType_get_rec_field(dst_ct, 1));
++  Node payload;
++  if (CanonType_size(dst_union_ct) == 0) {
++    NodeFreeRecursively(src);
++    payload = MakeValUndef(sl);
++  } else {
++    Node ptr = MakeUncheckedNarrow(MakeCompactBits(src, sl),
++                                   CurrentType(CompactPointerMember(src_union)), sl);
++    payload = MakeExprWidenBetweeUntaggedUnions(ptr, dst_union_ct, sl,
++                                                kConstInvalid);
++  }
++  return MakeExprStmtWithPrefix(
++      &stmts, MakeValRecForTaggedUnion(dst_ct, tag, payload, sl), dst_ct, sl);
+ }
+ 
+ void MakeAndRegisterUnionTypeReplacements(TypeCorpus* tc, NodeChain* out) {
+@@ -120,7 +351,11 @@ void MakeAndRegisterUnionTypeReplacements(TypeCorpus* tc, NodeChain* out) {
+     }
+ 
+     CanonType new_ct;
+-    if (CanonType_is_tagged_union(ct)) {
++    if (IsCompactUnion(ct)) {
++      Node rec = MakeCompactReplacementStruct(ct, tc);
++      out->Append(rec);
++      new_ct = Node_x_type(rec);
++    } else if (CanonType_is_tagged_union(ct)) {
+       Node rec = MakeUnionReplacementStruct(ct, tc);
+       out->Append(rec);
+       new_ct = Node_x_type(rec);
+@@ -144,8 +379,22 @@ void MakeAndRegisterUnionTypeReplacements(TypeCorpus* tc, NodeChain* out) {
+   }
+ }
+ 
+-void ReplaceUnions(Node mod) {
+-  auto replacer = [](Node node, Node parent) -> Node {
++void ReplaceUnions(Node mod, TypeCorpus* tc) {
++  auto replacer = [tc](Node node, Node parent) -> Node {
++    if (node.kind() == NT::ExprUnionUntagged ||
++        node.kind() == NT::ExprUnionTag) {
++      Node container = Node_container(node);
++      CanonType ct_orig = CanonType_original_type(Node_x_type(container));
++      if (IsCompactUnion(ct_orig)) {
++        const SrcLoc& sl = Node_srcloc(node);
++        bool is_tag = node.kind() == NT::ExprUnionTag;
++        NodeFree(node);
++        if (is_tag) {
++          return MakeCompactTag(container, ct_orig, tc, sl);
++        }
++        return MakeCompactBits(container, sl);
++      }
++    }
+     if (node.kind() == NT::ExprUnionUntagged) {
+       CanonType rec_ct = Node_x_type(Node_container(node));
+       Node union_field = CanonType_get_rec_field(rec_ct, 1);
+@@ -198,6 +447,22 @@ void ReplaceUnions(Node mod) {
+       case NT::ExprWiden: {
+         CanonType ct_orig =
+             CanonType_original_type(Node_x_type(Node_expr(node)));
++        const SrcLoc& sl = Node_srcloc(node);
++        if (IsCompactUnion(CanonType_original_type(replacement_ct))) {
++          Node src = Node_expr(node);
++          NodeFree(Node_type(node));
++          NodeFree(node);
++          if (!ct_orig.isnull() && CanonType_is_tagged_union(ct_orig)) {
++            return MakeCompactFromUnion(src, ct_orig, replacement_ct, tc, sl);
++          }
++          return MakeCompactFromMember(src, replacement_ct, tc, sl);
++        }
++        if (IsCompactUnion(ct_orig)) {
++          Node src = Node_expr(node);
++          NodeFree(Node_type(node));
++          NodeFree(node);
++          return MakeUnionFromCompact(src, ct_orig, replacement_ct, tc, sl);
++        }
+         if (!ct_orig.isnull() && CanonType_is_tagged_union(ct_orig)) {
+           return MakeValRecForWidenFromUnion(node, replacement_ct);
+         } else {
+@@ -205,6 +470,21 @@ void ReplaceUnions(Node mod) {
+         }
+       }
+       case NT::ExprNarrow: {
++        CanonType ct_orig =
++            CanonType_original_type(Node_x_type(Node_expr(node)));
++        const SrcLoc& sl = Node_srcloc(node);
++        if (IsCompactUnion(CanonType_original_type(replacement_ct))) {
++          Node src = Node_expr(node);
++          NodeFree(Node_type(node));
++          NodeFree(node);
++          return MakeCompactFromUnion(src, ct_orig, replacement_ct, tc, sl);
++        }
++        if (IsCompactUnion(ct_orig)) {
++          Node src = Node_expr(node);
++          NodeFree(Node_type(node));
++          NodeFree(node);
++          return MakeUnionFromCompact(src, ct_orig, replacement_ct, tc, sl);
++        }
+         if (CanonType_is_tagged_union(
+                 CanonType_original_type(replacement_ct))) {
+           return MakeValRecForNarrow(node, replacement_ct);
+diff --git a/FE/canonicalize_union.h b/FE/canonicalize_union.h
+index ea3b75a4..e0dcb129 100644
+--- a/FE/canonicalize_union.h
++++ b/FE/canonicalize_union.h
+@@ -11,5 +11,5 @@ extern void FunSimplifyTaggedExprNarrow(Node fun, TypeCorpus* tc);
+ 
+ extern void MakeAndRegisterUnionTypeReplacements(TypeCorpus* tc, NodeChain* out);
+ 
+-extern void ReplaceUnions(Node mod);
++extern void ReplaceUnions(Node mod, TypeCorpus* tc);
+ }  // namespace cwerg::fe
+\ No newline at end of file
+diff --git a/FE/canonicalize_union.py b/FE/canonicalize_union.py
+index 9775fdec..773abf40 100644
+--- a/FE/canonicalize_union.py
++++ b/FE/canonicalize_union.py
+@@ -8,7 +8,9 @@ Protocol:
+ """
+ 
+ 
+-from typing import Optional
++from typing import Any, Optional
++
++from IR import opcode_tab as o
+ 
+ from FE import cwast
+ from FE import type_corpus
+@@ -23,6 +25,31 @@ from FE import canonicalize
+ ############################################################
+ SUM_FIELD_TAG = cwast.NAME.Make("tag")
+ SUM_FIELD_UNION = cwast.NAME.Make("union")
++COMPACT_FIELD_BITS = cwast.NAME.Make("bits")
++
++
++def IsCompactUnion(ct: Optional[cwast.CanonType]) -> bool:
++    return (ct is not None and ct.is_tagged_union() and
++            ct.ir_regs.flavor() == o.DK_FLAVOR_A)
++
++
++def _CompactPointerMember(ct: cwast.CanonType) -> cwast.CanonType:
++    for m in ct.union_member_types():
++        if m.size != 0:
++            return m
++    assert False, f"{ct}"
++
++
++def _CurrentType(ct: cwast.CanonType) -> cwast.CanonType:
++    return ct.replacement_type if ct.replacement_type else ct
++
++
++def _MakeCompactReplacementStruct(union_type: cwast.CanonType,
++                                  tc: type_corpus.TypeCorpus) -> cwast.DefRec:
++    members = [_CurrentType(m) for m in union_type.union_member_types()]
++    bits_ct = tc.InsertUnionType(True, members + [tc.get_uint_canon_type()])
++    return typify.MakeDefRec(f"xcompact_{union_type.name}", [(COMPACT_FIELD_BITS, bits_ct)],
++                             tc, cwast.SRCLOC_GENERATED)
+ 
+ 
+ def _MakeUnionReplacementStruct(union_type: cwast.CanonType,
+@@ -52,7 +79,11 @@ def MakeAndRegisterUnionTypeReplacements(tc: type_corpus.TypeCorpus) -> list[cwa
+     for ct in tc.topo_order[:]:
+         if ct.desugared:
+             continue
+-        if ct.is_tagged_union():
++        if IsCompactUnion(ct):
++            rec = _MakeCompactReplacementStruct(ct, tc)
++            out.append(rec)
++            new_ct = rec.x_type
++        elif ct.is_tagged_union():
+             rec = _MakeUnionReplacementStruct(ct, tc)
+             out.append(rec)
+             new_ct = rec.x_type
+@@ -82,39 +113,38 @@ def _MakeValRecForTaggedUnion(sum_rec: cwast.CanonType, tag_value, union_value,
+                                          (union_field.x_type, union_value)], srcloc)
+ 
+ 
+-def _CloneId(node: cwast.Id) -> cwast.Id:
+-    assert isinstance(node, cwast.Id)
+-    return cwast.Id(node.name, x_symbol=node.x_symbol, x_type=node.x_type,
+-                    x_srcloc=node.x_srcloc)
+-
+-
+ def _MakeExpWidenBetweeUntaggedUnions(expr, dst_ct, sl, x_eval):
+     return cwast.ExprWiden(expr, cwast.TypeAuto(x_srcloc=sl, x_type=dst_ct),
+                            x_srcloc=sl, x_eval=x_eval, x_type=dst_ct)
+ 
+ 
+-def _MakeValRecForWidenFromUnion(widen: cwast.ExprWiden, dst_ct: cwast.CanonType) -> cwast.ValCompound:
+-    src = widen.expr
++def _MakeExprStmtWithPrefix(stmts, out, ct: cwast.CanonType, sl):
++    if not stmts:
++        return out
++    wrapper = cwast.ExprStmt(stmts, x_srcloc=sl, x_type=ct)
++    wrapper.body.append(cwast.StmtReturn(out, x_srcloc=sl, x_target=wrapper))
++    return wrapper
++
++
++def _MakeValRecForWidenFromUnion(widen: cwast.ExprWiden, dst_ct: cwast.CanonType):
+     sl = widen.x_srcloc
+     dst_union_field = dst_ct.get_rec_field(1)
++    stmts: list[Any] = []
++    src = canonicalize.MakeNodeCopyableWithoutRiskOfSideEffects(widen.expr, stmts, False)
+ 
+     src_ct: cwast.CanonType = src.x_type
+     assert src_ct.original_type.is_tagged_union()
+     src_tag_field = src_ct.get_rec_field(0)
+     src_union_field = src_ct.get_rec_field(1)
+-    # to drop this we would need to introduce a temporary since we access it more than once
+-    assert isinstance(src, cwast.Id), f"{src}"
+-    # assert False, f"{value.expr} {value.expr.x_type} -> {value.x_type} {value.x_srcloc}"
+ 
+     tag_value = canonicalize.MakeExprField(
+-        _CloneId(src), src_tag_field, sl)
+-    union_field = canonicalize.MakeExprField(
+-        _CloneId(src),  src_union_field, sl)
++        cwast.CloneNodeRecursively(src, {}, {}), src_tag_field, sl)
++    union_field = canonicalize.MakeExprField(src, src_union_field, sl)
+     union_value = _MakeExpWidenBetweeUntaggedUnions(
+         union_field, dst_union_field.x_type, sl, widen.x_eval)
+ 
+-    return _MakeValRecForTaggedUnion(
+-        dst_ct, tag_value, union_value, sl)
++    out = _MakeValRecForTaggedUnion(dst_ct, tag_value, union_value, sl)
++    return _MakeExprStmtWithPrefix(stmts, out, dst_ct, sl)
+ 
+ 
+ def _MakeValRecForWidenFromNonUnion(widen: cwast.ExprWiden, dst_ct: cwast.CanonType) -> cwast.ValCompound:
+@@ -134,22 +164,19 @@ def _MakeValRecForWidenFromNonUnion(widen: cwast.ExprWiden, dst_ct: cwast.CanonT
+     return _MakeValRecForTaggedUnion(dst_ct, tag_value, widen, sl)
+ 
+ 
+-def _MakeValRecForNarrow(narrow: cwast.ExprNarrow, dst_ct: cwast.CanonType) -> cwast.ValCompound:
+-    src = narrow.expr
++def _MakeValRecForNarrow(narrow: cwast.ExprNarrow, dst_ct: cwast.CanonType):
++    sl = narrow.x_srcloc
++    stmts: list[Any] = []
++    src = canonicalize.MakeNodeCopyableWithoutRiskOfSideEffects(narrow.expr, stmts, False)
+     src_ct: cwast.CanonType = src.x_type
+     assert src_ct.original_type.is_tagged_union()
+     dst_union_field: cwast.CanonType = dst_ct.get_rec_field(1)
+     src_tag_field = src_ct.get_rec_field(0)
+     src_union_field = src_ct.get_rec_field(1)
+-    # TODO
+-    # to drop this we would need to introduce a temporary
+-    assert isinstance(src, cwast.Id)
+-    sl = narrow.x_srcloc
+-    # assert False, f"{value.expr} {value.expr.x_type} -> {value.x_type} {value.x_srcloc}"
+ 
+-    val_tag = canonicalize.MakeExprField(_CloneId(src), src_tag_field, sl)
+-    val_union_tmp = canonicalize.MakeExprField(
+-        _CloneId(src), src_union_field, sl)
++    val_tag = canonicalize.MakeExprField(
++        cwast.CloneNodeRecursively(src, {}, {}), src_tag_field, sl)
++    val_union_tmp = canonicalize.MakeExprField(src, src_union_field, sl)
+     val_union = cwast.ExprNarrow(val_union_tmp,
+                                  cwast.TypeAuto(sl, dst_union_field.x_type),
+                                  unchecked=True,
+@@ -157,7 +184,128 @@ def _MakeValRecForNarrow(narrow: cwast.ExprNarrow, dst_ct: cwast.CanonType) -> c
+                                  x_eval=narrow.x_eval,
+                                  x_type=dst_union_field.x_type)
+     # tag is the same as with the src but (untagged) union is narrowed
+-    return _MakeValRecForTaggedUnion(dst_ct, val_tag, val_union, sl)
++    out = _MakeValRecForTaggedUnion(dst_ct, val_tag, val_union, sl)
++    return _MakeExprStmtWithPrefix(stmts, out, dst_ct, sl)
++
++
++def _MakeUintVal(val: int, ct_uint: cwast.CanonType, sl) -> cwast.ValNum:
++    return cwast.ValNum(eval.EVAL_STR, x_srcloc=sl, x_type=ct_uint,
++                        x_eval=eval.EvalNum(val, ct_uint.base_type_kind))
++
++
++def _MakeAs(expr, ct: cwast.CanonType, sl) -> cwast.ExprAs:
++    return cwast.ExprAs(expr, cwast.TypeAuto(x_srcloc=sl, x_type=ct), x_srcloc=sl, x_type=ct)
++
++
++def _MakeUncheckedNarrow(expr, ct: cwast.CanonType, sl) -> cwast.ExprNarrow:
++    return cwast.ExprNarrow(expr, cwast.TypeAuto(x_srcloc=sl, x_type=ct), unchecked=True,
++                            x_srcloc=sl, x_type=ct)
++
++
++def _MakeCompactBits(src, sl) -> cwast.ExprField:
++    return canonicalize.MakeExprField(src, src.x_type.get_rec_field(0), sl)
++
++
++def _MakeCompactVal(dst_ct: cwast.CanonType, val, sl) -> cwast.ValCompound:
++    bits_ct = dst_ct.get_rec_field(0).x_type
++    bits = _MakeExpWidenBetweeUntaggedUnions(val, bits_ct, sl, None)
++    return canonicalize.MakeValCompound(dst_ct, [(bits_ct, bits)], sl)
++
++
++def _MakeExprStmt(ct: cwast.CanonType, sl, cases, last) -> cwast.ExprStmt:
++    out = cwast.ExprStmt([], x_srcloc=sl, x_type=ct)
++    for cond, val in cases:
++        ret = cwast.StmtReturn(val, x_srcloc=sl, x_target=out)
++        out.body.append(cwast.StmtIf(cond, [ret], [], x_srcloc=sl))
++    out.body.append(cwast.StmtReturn(last, x_srcloc=sl, x_target=out))
++    return out
++
++
++# Cwerg executables are loaded at 0x400000 (x64, a64) or 0x20000 (a32) and
++# the stack and heap are placed above the image, so no object lives below this
++_MIN_OBJECT_ADDRESS = 0x20000
++
++
++def _MakeCompactTag(src, union_ct: cwast.CanonType, tc: type_corpus.TypeCorpus, sl):
++    """zero sized members are encoded by their typeid which is always smaller
++    than the address of any object"""
++    ct_uint = tc.get_uint_canon_type()
++    ct_tag = tc.get_typeid_canon_type()
++    assert 1 << (8 * ct_tag.size) <= _MIN_OBJECT_ADDRESS
++    tmp = canonicalize.MakeDefVar(cwast.NAME.Make("compact_bits"),
++                                  _MakeUncheckedNarrow(_MakeCompactBits(src, sl), ct_uint, sl))
++    is_small = cwast.Expr2(cwast.BINARY_EXPR_KIND.LT, canonicalize.IdNodeFromDef(tmp, sl),
++                           _MakeUintVal(1 << (8 * ct_tag.size), ct_uint, sl),
++                           x_srcloc=sl, x_type=tc.get_bool_canon_type())
++    out = _MakeExprStmt(ct_tag, sl,
++                        [(is_small, _MakeAs(canonicalize.IdNodeFromDef(tmp, sl), ct_tag, sl))],
++                        _MakeTypeidVal(_CompactPointerMember(union_ct), sl, ct_tag))
++    out.body.insert(0, tmp)
++    return out
++
++
++def _IsDiscardable(expr) -> bool:
++    while isinstance(expr, cwast.ExprWrap):
++        expr = expr.expr
++    return isinstance(expr, (cwast.Id, cwast.ValVoid))
++
++
++def _MakeCompactFromMember(expr, dst_ct: cwast.CanonType, tc: type_corpus.TypeCorpus, sl):
++    if expr.x_type.size != 0:
++        return _MakeCompactVal(dst_ct, expr, sl)
++    typeid = _MakeUintVal(expr.x_type.get_original_typeid(),
++                          tc.get_uint_canon_type(), sl)
++    val = _MakeCompactVal(dst_ct, typeid, sl)
++    if _IsDiscardable(expr):
++        return val
++    out = cwast.ExprStmt([], x_srcloc=sl, x_type=dst_ct)
++    out.body = [cwast.StmtExpr(expr, x_srcloc=sl),
++                cwast.StmtReturn(val, x_srcloc=sl, x_target=out)]
++    return out
++
++
++def _MakeCompactFromUnion(src, src_union: cwast.CanonType, dst_ct: cwast.CanonType,
++                          tc: type_corpus.TypeCorpus, sl):
++    """src is the replacement of a tagged union whose members are all members of dst"""
++    ct_uint = tc.get_uint_canon_type()
++    if IsCompactUnion(src_union):
++        bits = _MakeUncheckedNarrow(_MakeCompactBits(src, sl), ct_uint, sl)
++        return _MakeCompactVal(dst_ct, bits, sl)
++    stmts: list[Any] = []
++    src = canonicalize.MakeNodeCopyableWithoutRiskOfSideEffects(src, stmts, False)
++    tag = canonicalize.MakeExprField(cwast.CloneNodeRecursively(src, {}, {}),
++                                     src.x_type.get_rec_field(0), sl)
++    small = _MakeCompactVal(dst_ct, _MakeAs(tag, ct_uint, sl), sl)
++    dst_union = dst_ct.original_type
++    assert dst_union is not None
++    ptr_ct = _CompactPointerMember(dst_union)
++    out: Any = small
++    if src_union.union_contains(ptr_ct):
++        payload = canonicalize.MakeExprField(cwast.CloneNodeRecursively(src, {}, {}),
++                                             src.x_type.get_rec_field(1), sl)
++        ptr = _MakeCompactVal(dst_ct, _MakeUncheckedNarrow(payload, _CurrentType(ptr_ct), sl), sl)
++        is_ptr = cwast.Expr2(cwast.BINARY_EXPR_KIND.EQ, cwast.CloneNodeRecursively(tag, {}, {}),
++                             _MakeTypeidVal(ptr_ct, sl, tag.x_type),
++                             x_srcloc=sl, x_type=tc.get_bool_canon_type())
++        out = _MakeExprStmt(dst_ct, sl, [(is_ptr, ptr)], small)
++    return _MakeExprStmtWithPrefix(stmts, out, dst_ct, sl)
++
++
++def _MakeUnionFromCompact(src, src_union: cwast.CanonType, dst_ct: cwast.CanonType,
++                          tc: type_corpus.TypeCorpus, sl):
++    """dst is the replacement of a regular tagged union containing all members of src"""
++    stmts: list[Any] = []
++    src = canonicalize.MakeNodeCopyableWithoutRiskOfSideEffects(src, stmts, False)
++    tag = _MakeCompactTag(cwast.CloneNodeRecursively(src, {}, {}), src_union, tc, sl)
++    dst_union_ct = dst_ct.get_rec_field(1).x_type
++    if dst_union_ct.size == 0:
++        payload = cwast.ValUndef(x_srcloc=sl, x_eval=eval.VAL_UNDEF)
++    else:
++        ptr = _MakeUncheckedNarrow(_MakeCompactBits(src, sl),
++                                   _CurrentType(_CompactPointerMember(src_union)), sl)
++        payload = _MakeExpWidenBetweeUntaggedUnions(ptr, dst_union_ct, sl, None)
++    out = _MakeValRecForTaggedUnion(dst_ct, tag, payload, sl)
++    return _MakeExprStmtWithPrefix(stmts, out, dst_ct, sl)
+ 
+ 
+ def _ConvertTaggedNarrowToUntaggedNarrow(node: cwast.ExprNarrow, tc: type_corpus.TypeCorpus):
+@@ -235,13 +383,19 @@ def FunSimplifyTaggedExprNarrow(fun: cwast.DefFun, tc: type_corpus.TypeCorpus):
+     cwast.MaybeReplaceAstRecursivelyWithParentPost(fun, replacer)
+ 
+ 
+-def ReplaceUnions(node: cwast.DefMod):
++def ReplaceUnions(node: cwast.DefMod, tc: type_corpus.TypeCorpus):
+     """
+     Replaces all sum expressions with rec named tuple_sum<X>
+ 
+     After this tagged unions will be gone from the ASTs
+     """
+     def replacer(node, _parent):
++        if isinstance(node, (cwast.ExprUnionTag, cwast.ExprUnionUntagged)):
++            ct_orig = node.expr.x_type.original_type
++            if IsCompactUnion(ct_orig):
++                if isinstance(node, cwast.ExprUnionUntagged):
++                    return _MakeCompactBits(node.expr, node.x_srcloc)
++                return _MakeCompactTag(node.expr, ct_orig, tc, node.x_srcloc)
+         if isinstance(node, cwast.ExprUnionTag):
+             # get the tag field from the rec that now represents the union
+             # because of the post-order traversal, node.expr has already been processed
+@@ -276,6 +430,13 @@ def ReplaceUnions(node: cwast.DefMod):
+         elif isinstance(node, cwast.ExprWiden):
+             # Note, node.expr has already been processed by the recursion
+             ct_orig: cwast.CanonType = node.expr.x_type.original_type
++            sl = node.x_srcloc
++            if IsCompactUnion(new_ct.original_type):
++                if ct_orig is not None and ct_orig.is_tagged_union():
++                    return _MakeCompactFromUnion(node.expr, ct_orig, new_ct, tc, sl)
++                return _MakeCompactFromMember(node.expr, new_ct, tc, sl)
++            if IsCompactUnion(ct_orig):
++                return _MakeUnionFromCompact(node.expr, ct_orig, new_ct, tc, sl)
+             if ct_orig is not None and ct_orig.is_tagged_union():
+                 return _MakeValRecForWidenFromUnion(node, new_ct)
+             else:
+@@ -284,6 +445,12 @@ def ReplaceUnions(node: cwast.DefMod):
+         elif isinstance(node, cwast.ExprNarrow):
+             # checked ExprNarrow were eliminated by FunSimplifyTaggedExprNarrow
+             assert node.unchecked
++            ct_orig = node.expr.x_type.original_type
++            sl = node.x_srcloc
++            if IsCompactUnion(new_ct.original_type):
++                return _MakeCompactFromUnion(node.expr, ct_orig, new_ct, tc, sl)
++            if IsCompactUnion(ct_orig):
++                return _MakeUnionFromCompact(node.expr, ct_orig, new_ct, tc, sl)
+             if new_ct.original_type.is_tagged_union():
+                 assert new_ct.is_rec()
+                 # node.expr has already been processed
+diff --git a/FE/compiler.cc b/FE/compiler.cc
+index ddcbbbb2..ad4d8b5d 100644
+--- a/FE/compiler.cc
++++ b/FE/compiler.cc
+@@ -201,9 +201,9 @@ void PhaseEliminateSpanAndUnion(Node mod_gen,
+   MakeAndRegisterUnionTypeReplacements(tc, chain);
+   Node_body_mod(mod_gen) = chain->First();
+ 
+-  ReplaceUnions(mod_gen);
++  ReplaceUnions(mod_gen, tc);
+   for (Node mod : mods_in_topo_order) {
+-    ReplaceUnions(mod);
++    ReplaceUnions(mod, tc);
+   }
+ }
+ 
+diff --git a/FE/compiler.py b/FE/compiler.py
+index 41147666..fefd875d 100755
+--- a/FE/compiler.py
++++ b/FE/compiler.py
+@@ -171,7 +171,7 @@ def PhaseEliminateSpanAndUnion(mod_gen: cwast.DefMod, mod_topo_order: list[cwast
+     mod_gen.body_mod.extend(
+         canonicalize_union.MakeAndRegisterUnionTypeReplacements(tc))
+     for mod in ([mod_gen] + mod_topo_order):
+-        canonicalize_union.ReplaceUnions(mod)
++        canonicalize_union.ReplaceUnions(mod, tc)
+ 
+ 
+ def PhaseEliminateLargeArgs(mod_topo_order: list[cwast.DefMod], tc: type_corpus.TypeCorpus):
+diff --git a/FE/type_corpus.cc b/FE/type_corpus.cc
+index 6cdf8e27..2bf8adec 100644
+--- a/FE/type_corpus.cc
++++ b/FE/type_corpus.cc
+@@ -344,7 +344,12 @@ SizeAndAlignment GetSizeAndAlignmentForSum(CanonType ct,
+   SizeOrDim max_alignment = 1;
+   SizeOrDim ptr_size = ta.code_addr_bitwidth / 8;
+   for (CanonType child_ct : CanonType_children(ct)) {
+-    if (CanonType_size(child_ct) == 0) continue;
++    if (CanonType_size(child_ct) == 0) {
++      if (!CanonType_is_void(CanonType_get_unwrapped(child_ct))) {
++        ++num_other;
++      }
++      continue;
++    }
+     while (CanonType_kind(child_ct) == NT::DefType) {
+       child_ct = CanonType_children(child_ct)[0];
+     }
+@@ -438,11 +443,15 @@ DK GetMachineRegsForUnion(CanonType ct, const TargetArchConfig& ta) {
+   std::array<int, 16> larges_by_kind{
+       0};  // zero initializes all elements to zero
+   int num_void = 0;
++  int num_other_zero = 0;
+   int largest = 0;
+   for (CanonType child : CanonType_children(ct)) {
+     DK ir_reg = CanonType_ir_regs(child);
+     if (ir_reg == DK::NONE) {
+       ++num_void;
++      if (!CanonType_is_void(CanonType_get_unwrapped(child))) {
++        ++num_other_zero;
++      }
+       continue;
+     }
+     if (ir_reg == DK::MEM) {
+@@ -453,10 +462,6 @@ DK GetMachineRegsForUnion(CanonType ct, const TargetArchConfig& ta) {
+         std::max(larges_by_kind[DKFlavor(ir_reg)], DKBitWidth(ir_reg));
+     largest = std::max(largest, DKBitWidth(ir_reg));
+   }
+-  if (ta.optimize_union_tag && scalars.size() == 1 &&
+-      CanonType_kind(scalars[0]) == NT::TypePtr) {
+-    return CanonType_ir_regs(scalars[0]);
+-  }
+   if (CanonType_untagged(ct)) {
+     if (scalars.size() == 0) {
+       return DK::NONE;
+@@ -467,6 +472,15 @@ DK GetMachineRegsForUnion(CanonType ct, const TargetArchConfig& ta) {
+   if (largest == 0) {
+     return DKMake(DK_FLAVOR_U, ta.typeid_bitwidth);
+   }
++  if (ta.optimize_union_tag && num_other_zero == 0 && scalars.size() == 1) {
++    CanonType ptr = scalars[0];
++    while (CanonType_kind(ptr) == NT::DefType) {
++      ptr = CanonType_children(ptr)[0];
++    }
++    if (CanonType_kind(ptr) == NT::TypePtr) {
++      return CanonType_ir_regs(scalars[0]);
++    }
++  }
+   return DK::MEM;
+ }
+ 
+diff --git a/FE/type_corpus.h b/FE/type_corpus.h
+index ba7cea1d..78f4f272 100644
+--- a/FE/type_corpus.h
++++ b/FE/type_corpus.h
+@@ -41,9 +41,9 @@ struct TargetArchConfig {
+   DK get_sint_kind_ir() const { return DKMake(DK_FLAVOR_S, sint_bitwidth); }
+ };
+ 
+-constexpr TargetArchConfig STD_TARGET_X64 = {64, 64, 16, 64, 64, false};
+-constexpr TargetArchConfig STD_TARGET_A64 = {64, 64, 16, 64, 64, false};
+-constexpr TargetArchConfig STD_TARGET_A32 = {32, 32, 16, 32, 32, false};
++constexpr TargetArchConfig STD_TARGET_X64 = {64, 64, 16, 64, 64, true};
++constexpr TargetArchConfig STD_TARGET_A64 = {64, 64, 16, 64, 64, true};
++constexpr TargetArchConfig STD_TARGET_A32 = {32, 32, 16, 32, 32, true};
+ 
+ extern Name CanonType_name(CanonType n);
+ extern NT CanonType_kind(CanonType n);
+diff --git a/FE/type_corpus.py b/FE/type_corpus.py
+index a5109cb0..f17d1de8 100644
+--- a/FE/type_corpus.py
++++ b/FE/type_corpus.py
+@@ -216,14 +216,15 @@ class TargetArchConfig:
+         return self.typeid_bitwidth // 8
+ 
+ 
+-STD_TARGET_X64 = TargetArchConfig(64, 64, 16, 64, 64, False)
+-STD_TARGET_A64 = TargetArchConfig(64, 64, 16, 64, 64, False)
+-STD_TARGET_A32 = TargetArchConfig(32, 32, 16, 32, 32, False)
++STD_TARGET_X64 = TargetArchConfig(64, 64, 16, 64, 64, True)
++STD_TARGET_A64 = TargetArchConfig(64, 64, 16, 64, 64, True)
++STD_TARGET_A32 = TargetArchConfig(32, 32, 16, 32, 32, True)
+ 
+ 
+ def _GetMachineRegsForUnion(ct: cwast.CanonType, ta: TargetArchConfig) -> o.DK:
+     assert ct.node is cwast.TypeUnion
+     num_void = 0
++    num_other_zero = 0
+     scalars: list[cwast.CanonType] = []
+     largest_by_kind: dict[str, int] = {}
+     largest = 0
+@@ -231,6 +232,8 @@ def _GetMachineRegsForUnion(ct: cwast.CanonType, ta: TargetArchConfig) -> o.DK:
+         rt = t.ir_regs
+         if rt == o.DK.NONE:
+             num_void += 1
++            if not t.get_unwrapped().is_void():
++                num_other_zero += 1
+             continue
+         if rt == o.DK.MEM:
+             return o.DK.MEM
+@@ -239,13 +242,6 @@ def _GetMachineRegsForUnion(ct: cwast.CanonType, ta: TargetArchConfig) -> o.DK:
+         bitwidth = rt.bitwidth()
+         largest_by_kind[flavor] = max(largest_by_kind.get(flavor, 0), bitwidth)
+         largest = max(largest, bitwidth)
+-    # special hack for pointer + error-code
+-    if ta.optimize_union_tag and len(scalars) == 1 and scalars[0].is_ptr():
+-        return scalars[0].ir_regs
+-
+-    # BUG repro:
+-    # ./compiler.py LangTest/linked_list_gen_test.cw
+-    # ./compiler.py LangTest/sum_tagged_test.cw
+     if ct.untagged:
+         if largest == 0:
+             return o.DK.NONE
+@@ -253,6 +249,10 @@ def _GetMachineRegsForUnion(ct: cwast.CanonType, ta: TargetArchConfig) -> o.DK:
+ 
+     if largest == 0:
+         return ta.get_typeid_reg_type()
++    # special hack for pointer + error-code
++    if (ta.optimize_union_tag and num_other_zero == 0 and len(scalars) == 1 and
++            scalars[0].get_unwrapped().is_ptr()):
++        return scalars[0].ir_regs
+     return o.DK.MEM
+ 
+ 
+@@ -294,6 +294,8 @@ def _GetSizeAndAlignmentForSum(ct: cwast.CanonType, ta: TargetArchConfig) -> tup
+     ptr_size = ta.get_data_address_size()
+     for child_ct in ct.union_member_types():
+         if child_ct.size == 0:
++            if not child_ct.get_unwrapped().is_void():
++                num_other += 1
+             continue
+         while child_ct.is_wrapped():
+             child_ct = child_ct.children[0]

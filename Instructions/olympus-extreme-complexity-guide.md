@@ -1718,3 +1718,64 @@ long grind (avg 565k sequence length) and then a data-structure wall: the per-un
 first consumer cannot express what the second consumer excludes (F-86, 8/8 Nova). **Confirmed limit:** 47 of
 55 tests killed nothing, including every control-side, multiprocessing and chromosome-isolation test and
 the in-window strand test; only the window-edge cell of the strand rule killed (F-87, 8/12).
+
+## micasa-field-level-sync-merge (APPROVED Olympus 2026-10-15)
+
+**Confirmed pattern:** a feature that needs history the base never kept (per-field provenance across a
+push) is a durable Nova wall: Nova reuses base's pending-op conflict path and its whole-row snapshots and
+fails four walls together (18-21 of 38 tests), while Orion rebuilds the history and fails only the
+symmetric accounting (F-88..F-91). Nova averaged 547k sequence length. **Confirmed limit:** 15 of 38 tests
+killed nothing, including every document-clear cell, both coupled-unit cells and both service-date
+propagation cells; those rules cost three Solution Quality rounds and bought no difficulty.
+
+## csbindgen-const-expression-values (APPROVED Olympus 2026-10-15)
+
+**Confirmed pattern:** a code generator that must evaluate source-language expressions and print them
+in another language holds Nova on breadth alone: host-formatted literals (F-94), output type used as
+evaluation type (F-93) and a whole-sequence enum walk (F-92) each killed 5-8 of 8 Nova, 0/4 Orion. Orion's
+one-in-four split was a module-scope collision (F-95). Nova averaged 506k sequence length on 5 files.
+**Confirmed limit:** 11 of 18 tests killed nothing, including both 128-bit tests once the meta named them,
+and the cast-target literal test that killed 6/8 Orion while the rule was only implied.
+
+## mirrorbits-mirror-sync-point (APPROVED Olympus 2026-10-15)
+
+**Confirmed pattern:** a persisted retention floor that must survive a setting raise (F-96) separated Vega
+(4/5 missed it) even though the meta states the rule outright; an exception keyed on a diagnostic line that
+must also check the subprocess outcome (F-97) was the widest killer, 6/13. Nova averaged 326k sequence
+length on 6-10 files.
+**Confirmed limit:** four description levers (source-scan re-evaluation, FTP 550 subdirectories,
+module-relative opendir, readlink_stat) killed 0 Orion and all but readlink_stat were cut for the
+requirement count; 20 of 29 tests killed nothing in the accepted batch.
+
+## ray-optics-module-inlining (APPROVED Olympus 2026-10-16)
+
+**Confirmed pattern:** a refactor over templated expressions with a stated preservation invariant beat
+Nova two ways at once. It needs capture-avoiding substitution across six binder and printing cells
+(F-99, every Nova run), and one unstated hop through the repo's loop limit (F-98, 8/8 Nova, 0 of 15
+Orion). Orion's split came from its own over-cautious whole-scene validator (F-100, 6/8).
+**Confirmed limit:** 29 of 44 tests killed nothing: every refusal rule (dependent bounds, free-name
+capture), every invalid target, and the round-9 Auto Review coverage set. Stated scoping rules stopped
+killing Orion the batch they were stated.
+
+## cwerg-compact-pointer-unions (APPROVED Olympus 2026-10-19)
+
+**Confirmed pattern:** a second physical layout for a subset of a type family, under a one-line
+"behaviour does not depend on the layout" promise, beats Nova by breadth over four seams with zero
+enumerated rules: conversions across the boundary (F-101, 8/8), indexed sources (F-102, 8/8), zero-data
+members with side effects (F-103, 7/8) and a coarse eligibility shortcut (F-104, 3/8). The strong-agent
+splitter was a source FORM the repo helper never supported (F-102, sole failure of 2/4 Vega).
+**Confirmed limit:** all seven traps in my design matrix were Nova-only or killed nobody. The global-data
+emitter wall killed 0/16 and twin-FE parity never killed on its own. Every Orion/Vega kill (effects,
+locals, elements) came from a gate finding or a probe battery.
+
+## micasa-pro-blob-reclaim (APPROVED Olympus 2026-10-20)
+
+- **Inject faults at the commit/reply boundary.** A protocol feature that keeps state on both ends is
+  only as hard as the failures you test. A test relay with a byte-count cut-off and a lost-reply hook
+  (handler into a recorder, then abort the connection) split designs no stated rule could: unversioned
+  deltas (8/8 Nova) and "void the snapshot when a rebuild starts" (Vega b3-1).
+- **Grade the twin backend.** The SQL store assigns sequences in the INSERT and the memory store on the
+  struct; one ordinary test on both backends killed 3/8 Nova.
+- **Width for length, faults for kills.** Each new meta rule (1 MB multi-part, quota re-upload, 64 KB
+  incremental) raised Vega length and kept it passing. Difficulty came from test-only fault cells on the
+  state those rules created.

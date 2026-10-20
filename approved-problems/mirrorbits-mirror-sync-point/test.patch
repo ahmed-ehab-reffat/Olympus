@@ -1,0 +1,1052 @@
+diff --git a/scan/syncpoint_6075cf_test.go b/scan/syncpoint_6075cf_test.go
+new file mode 100644
+index 0000000..72e5249
+--- /dev/null
++++ b/scan/syncpoint_6075cf_test.go
+@@ -0,0 +1,912 @@
++//go:build syncpoint
++
++package scan
++
++import (
++	"bufio"
++	"fmt"
++	"net"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	. "github.com/etix/mirrorbits/config"
++	"github.com/etix/mirrorbits/core"
++	"github.com/etix/mirrorbits/database"
++	"github.com/etix/mirrorbits/mirrors"
++	"github.com/etix/mirrorbits/network"
++	"github.com/gomodule/redigo/redis"
++)
++
++type listedFile6075cf struct {
++	path    string
++	size    int64
++	modTime time.Time
++}
++
++type syncEnv6075cf struct {
++	t      *testing.T
++	r      *database.Redis
++	repo   string
++	fake   string
++	stamp  time.Time
++	config Configuration
++}
++
++func newSyncEnv6075cf(t *testing.T) *syncEnv6075cf {
++	addr := os.Getenv("MIRRORBITS_TEST_REDIS")
++	if addr == "" {
++		addr = "127.0.0.1:6379"
++	}
++	e := &syncEnv6075cf{
++		t:     t,
++		repo:  t.TempDir(),
++		fake:  t.TempDir(),
++		stamp: time.Date(2026, 3, 1, 10, 0, 0, 250000000, time.UTC),
++		config: Configuration{
++			RedisAddress:  addr,
++			SourceHistory: 10,
++		},
++	}
++	e.config.Repository = e.repo
++	SetConfiguration(&e.config)
++
++	raw, err := redis.Dial("tcp", addr)
++	if err != nil {
++		t.Fatalf("redis: %s", err)
++	}
++	_, err = raw.Do("FLUSHALL")
++	if err == nil {
++		_, err = raw.Do("SCRIPT", "FLUSH")
++	}
++	raw.Close()
++	if err != nil {
++		t.Fatalf("redis: %s", err)
++	}
++
++	e.r = database.NewRedis()
++	deadline := time.Now().Add(10 * time.Second)
++	for {
++		conn := e.r.Get()
++		_, err := conn.Do("PING")
++		conn.Close()
++		if err == nil {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatalf("redis not ready: %s", err)
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++	e.r.ConnectPubsub()
++	t.Cleanup(e.r.Close)
++
++	script := fmt.Sprintf("#!/bin/sh\n/bin/cat %[1]s/stdout\n/bin/cat %[1]s/stderr >&2\nexit $(/bin/cat %[1]s/status)\n", e.fake)
++	if err := os.WriteFile(filepath.Join(e.fake, "rsync"), []byte(script), 0755); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("PATH", e.fake+":"+os.Getenv("PATH"))
++	return e
++}
++
++func (e *syncEnv6075cf) setHistory(n int) {
++	e.config.SourceHistory = n
++	SetConfiguration(&e.config)
++}
++
++func (e *syncEnv6075cf) write(path, content string) {
++	e.stamp = e.stamp.Add(time.Minute)
++	full := filepath.Join(e.repo, path)
++	if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
++		e.t.Fatal(err)
++	}
++	if err := os.WriteFile(full, []byte(content), 0644); err != nil {
++		e.t.Fatal(err)
++	}
++	if err := os.Chtimes(full, e.stamp, e.stamp); err != nil {
++		e.t.Fatal(err)
++	}
++}
++
++func (e *syncEnv6075cf) remove(path string) {
++	if err := os.Remove(filepath.Join(e.repo, path)); err != nil {
++		e.t.Fatal(err)
++	}
++}
++
++func (e *syncEnv6075cf) scanSource(rehash bool) {
++	if err := ScanSource(e.r, rehash, nil); err != nil {
++		e.t.Fatalf("source scan: %s", err)
++	}
++}
++
++func (e *syncEnv6075cf) snapshot(paths ...string) []listedFile6075cf {
++	var out []listedFile6075cf
++	for _, p := range paths {
++		fi, err := os.Stat(filepath.Join(e.repo, p))
++		if err != nil {
++			e.t.Fatal(err)
++		}
++		out = append(out, listedFile6075cf{path: p, size: fi.Size(), modTime: fi.ModTime()})
++	}
++	return out
++}
++
++func (e *syncEnv6075cf) addMirror(id int) {
++	conn := e.r.Get()
++	defer conn.Close()
++	name := fmt.Sprintf("mirror%d", id)
++	if _, err := conn.Do("HSET", "MIRRORS", id, name); err != nil {
++		e.t.Fatal(err)
++	}
++	if _, err := conn.Do("HSET", fmt.Sprintf("MIRROR_%d", id), "ID", id, "name", name, "http", "http://127.0.0.1:1/", "enabled", true); err != nil {
++		e.t.Fatal(err)
++	}
++}
++
++func rsyncListing6075cf(files []listedFile6075cf, shift time.Duration) string {
++	var b strings.Builder
++	b.WriteString("drwxr-xr-x          4,096 2026/01/01 00:00:00 .\n")
++	for _, f := range files {
++		fmt.Fprintf(&b, "-rw-r--r-- %14d %s %s\n", f.size, f.modTime.Add(shift).UTC().Format("2006/01/02 15:04:05"), strings.TrimPrefix(f.path, "/"))
++	}
++	return b.String()
++}
++
++func (e *syncEnv6075cf) scanMirror(id int, stdout, stderr string, status int) *ScanResult {
++	url := "rsync://mirror.example/pub/"
++	for name, content := range map[string]string{"stdout": stdout, "stderr": stderr, "status": fmt.Sprint(status)} {
++		if err := os.WriteFile(filepath.Join(e.fake, name), []byte(content), 0644); err != nil {
++			e.t.Fatal(err)
++		}
++	}
++	res, err := Scan(core.RSYNC, e.r, mirrors.NewCache(e.r), url, id, nil)
++	for i := 0; err == ErrScanInProgress && i < 500; i++ {
++		time.Sleep(10 * time.Millisecond)
++		res, err = Scan(core.RSYNC, e.r, mirrors.NewCache(e.r), url, id, nil)
++	}
++	if err != nil {
++		e.t.Fatalf("mirror scan: %s", err)
++	}
++	return res
++}
++
++func (e *syncEnv6075cf) storedMirror(id int) mirrors.Mirror {
++	m, err := mirrors.NewCache(e.r).GetMirror(id)
++	if err != nil {
++		e.t.Fatal(err)
++	}
++	return m
++}
++
++func expectSync6075cf(t *testing.T, res *ScanResult, gen, source int64) {
++	t.Helper()
++	if res.SyncGeneration != gen || res.SourceGeneration != source {
++		t.Fatalf("sync generation %d of %d, want %d of %d", res.SyncGeneration, res.SourceGeneration, gen, source)
++	}
++}
++
++func expectStored6075cf(t *testing.T, m mirrors.Mirror, res *ScanResult) {
++	t.Helper()
++	if m.SyncGeneration != res.SyncGeneration || m.SourceGeneration != res.SourceGeneration {
++		t.Fatalf("stored mirror at %d of %d, scan result %d of %d", m.SyncGeneration, m.SourceGeneration, res.SyncGeneration, res.SourceGeneration)
++	}
++}
++
++func TestSyncPointMirrorIdenticalToSourceIsAtLatestGeneration(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/dir/b.iso", "bb")
++	e.scanSource(false)
++	e.write("/dir/c.iso", "ccc")
++	e.scanSource(false)
++	e.write("/a.iso", "aaaaaa")
++	e.scanSource(false)
++	e.addMirror(1)
++
++	res := e.scanMirror(1, rsyncListing6075cf(e.snapshot("/a.iso", "/dir/b.iso", "/dir/c.iso"), 0), "", 0)
++	expectSync6075cf(t, res, 3, 3)
++	if res.FilesIndexed != 3 || res.KnownIndexed != 3 || res.Removed != 0 {
++		t.Fatalf("indexed %d (%d known), %d removed", res.FilesIndexed, res.KnownIndexed, res.Removed)
++	}
++}
++
++func TestSyncPointMirrorHoldingOlderVersionsIsBehind(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/b.iso", "bb")
++	e.scanSource(false)
++	old := e.snapshot("/a.iso", "/b.iso")
++	e.write("/a.iso", "aaaaaaaa")
++	e.scanSource(false)
++	e.write("/c.iso", "cc")
++	e.scanSource(false)
++	e.addMirror(1)
++
++	res := e.scanMirror(1, rsyncListing6075cf(old, 0), "", 0)
++	expectSync6075cf(t, res, 1, 3)
++
++	m := e.storedMirror(1)
++	if m.SyncGeneration != 1 || m.SourceGeneration != 3 {
++		t.Fatalf("stored mirror fields not updated: %+v", m)
++	}
++}
++
++func TestSyncPointRehashAndNoopScansDoNotAdvance(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.config.Hashes.SHA256 = true
++	SetConfiguration(&e.config)
++	e.write("/a.iso", "aaaa")
++	e.write("/b.iso", "bb")
++	e.scanSource(false)
++	e.scanSource(true)
++	e.scanSource(false)
++	same := e.snapshot("/a.iso")
++	e.writeAt("/a.iso", "AAAA", same[0].modTime)
++	e.scanSource(false)
++	e.scanSource(true)
++	e.addMirror(1)
++
++	res := e.scanMirror(1, rsyncListing6075cf(e.snapshot("/a.iso", "/b.iso"), 0), "", 0)
++	expectSync6075cf(t, res, 1, 1)
++}
++
++func TestSyncPointUnreadableSubtreeIsUnverifiedNotMissing(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/private/x.iso", "xx")
++	e.write("/private/y.iso", "yy")
++	e.scanSource(false)
++	e.addMirror(1)
++	full := e.snapshot("/a.iso", "/private/x.iso", "/private/y.iso")
++	e.scanMirror(1, rsyncListing6075cf(full, 0), "", 0)
++
++	e.write("/a.iso", "aaaaaa")
++	e.scanSource(false)
++	stderr := "rsync: [sender] opendir \"/private\" (in pub) failed: Permission denied (13)\nrsync error: some files/attrs were not transferred (code 23)\n"
++	res := e.scanMirror(1, rsyncListing6075cf(e.snapshot("/a.iso"), 0), stderr, 23)
++	expectSync6075cf(t, res, 2, 2)
++	expectStored6075cf(t, e.storedMirror(1), res)
++
++	serving, err := mirrors.NewCache(e.r).GetMirrors("/private/x.iso", network.GeoIPRecord{})
++	if err != nil || len(serving) != 1 || serving[0].ID != 1 {
++		t.Fatalf("mirror no longer serves files under the unreadable directory: %v %v", serving, err)
++	}
++}
++
++func TestSyncPointDeletedFileStillOnMirrorCapsGeneration(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/old.iso", "oo")
++	e.scanSource(false)
++	e.write("/b.iso", "bb")
++	e.scanSource(false)
++	stale := e.snapshot("/old.iso")
++	e.remove("/old.iso")
++	e.scanSource(false)
++	e.addMirror(1)
++
++	res := e.scanMirror(1, rsyncListing6075cf(append(e.snapshot("/a.iso", "/b.iso"), stale...), 0), "", 0)
++	expectSync6075cf(t, res, 2, 3)
++}
++
++func TestSyncPointConflictingEvidenceHasNoSyncGeneration(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/b.iso", "bb")
++	e.scanSource(false)
++	old := e.snapshot("/a.iso")
++	e.write("/a.iso", "aaaaaaa")
++	e.write("/c.iso", "ccc")
++	e.scanSource(false)
++	e.addMirror(1)
++
++	res := e.scanMirror(1, rsyncListing6075cf(append(old, e.snapshot("/b.iso", "/c.iso")...), 0), "", 0)
++	expectSync6075cf(t, res, 0, 2)
++
++	m := e.storedMirror(1)
++	if m.SyncGeneration != 0 || m.SourceGeneration != 2 {
++		t.Fatalf("stored mirror fields not updated: %+v", m)
++	}
++}
++
++func TestSyncPointHistoryWindowForgetsOldVersions(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.setHistory(2)
++	e.write("/a.iso", "aaaa")
++	e.write("/b.iso", "bb")
++	e.write("/d.iso", "dd")
++	e.scanSource(false)
++	old := e.snapshot("/a.iso", "/d.iso")
++	e.write("/a.iso", "aaaaaaaa")
++	e.remove("/d.iso")
++	e.scanSource(false)
++	e.write("/c.iso", "cc")
++	e.scanSource(false)
++	e.addMirror(1)
++
++	res := e.scanMirror(1, rsyncListing6075cf(append(old, e.snapshot("/b.iso")...), 0), "", 0)
++	expectSync6075cf(t, res, 2, 3)
++}
++
++func TestSyncPointPathCurrentSinceBeforeTheWindowIsStillEvidence(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.setHistory(2)
++	e.write("/stable.iso", "ssss")
++	e.write("/c.iso", "c")
++	e.scanSource(false)
++	e.write("/c.iso", "cc")
++	e.scanSource(false)
++	e.write("/c.iso", "ccc")
++	e.scanSource(false)
++	e.addMirror(1)
++	e.addMirror(2)
++
++	res := e.scanMirror(1, rsyncListing6075cf(e.snapshot("/c.iso"), 0), "", 0)
++	expectSync6075cf(t, res, 0, 3)
++
++	res = e.scanMirror(2, rsyncListing6075cf(e.snapshot("/stable.iso", "/c.iso"), 0), "", 0)
++	expectSync6075cf(t, res, 3, 3)
++}
++
++func TestSyncPointMissingDeletedFileIsNotMissing(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/old.iso", "oo")
++	e.scanSource(false)
++	e.write("/b.iso", "bb")
++	e.scanSource(false)
++	e.remove("/old.iso")
++	e.scanSource(false)
++	e.addMirror(1)
++	e.addMirror(2)
++
++	res := e.scanMirror(1, rsyncListing6075cf(e.snapshot("/a.iso", "/b.iso"), 0), "", 0)
++	expectSync6075cf(t, res, 3, 3)
++
++	res = e.scanMirror(2, rsyncListing6075cf(e.snapshot("/a.iso"), 0), "", 0)
++	expectSync6075cf(t, res, 0, 3)
++}
++
++func TestSyncPointPlainOpendirFormIsUnreadable(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/private/x.iso", "xx")
++	e.scanSource(false)
++	e.write("/private/z.iso", "zzz")
++	e.scanSource(false)
++	e.addMirror(1)
++
++	stderr := "rsync: opendir \"private\" (in pub) failed: Permission denied (13)\nrsync error: some files/attrs were not transferred (code 23)\n"
++	res := e.scanMirror(1, rsyncListing6075cf(e.snapshot("/a.iso"), 0), stderr, 23)
++	expectSync6075cf(t, res, 2, 2)
++}
++
++func TestSyncPointUnknownFilesAndForeignPathsAreNotEvidence(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/b.iso", "bb")
++	e.scanSource(false)
++	e.write("/c.iso", "ccc")
++	e.scanSource(false)
++	e.addMirror(1)
++
++	files := e.snapshot("/a.iso", "/b.iso", "/c.iso")
++	files[1].size = 999
++	files = append(files, listedFile6075cf{path: "/extra.iso", size: 5, modTime: e.stamp})
++	res := e.scanMirror(1, rsyncListing6075cf(files, 0), "", 0)
++	expectSync6075cf(t, res, 2, 2)
++	expectStored6075cf(t, e.storedMirror(1), res)
++}
++
++func TestSyncPointEmptySourceTreeStartsGenerationOne(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.scanSource(false)
++	e.addMirror(1)
++	res := e.scanMirror(1, rsyncListing6075cf([]listedFile6075cf{{path: "/a.iso", size: 4, modTime: e.stamp}}, 0), "", 0)
++	expectSync6075cf(t, res, 1, 1)
++
++	e.write("/b.iso", "bb")
++	e.scanSource(false)
++	res = e.scanMirror(1, rsyncListing6075cf(e.snapshot("/b.iso"), 0), "", 0)
++	expectSync6075cf(t, res, 2, 2)
++}
++
++func TestSyncPointUnreadableModuleRootIsUnverified(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/dir/b.iso", "bb")
++	e.scanSource(false)
++	e.addMirror(1)
++	e.scanMirror(1, rsyncListing6075cf(e.snapshot("/a.iso", "/dir/b.iso"), 0), "", 0)
++
++	stderr := "rsync: [sender] opendir \".\" (in pub) failed: Permission denied (13)\nrsync error: some files/attrs were not transferred (code 23)\n"
++	res := e.scanMirror(1, rsyncListing6075cf(nil, 0), stderr, 23)
++	expectSync6075cf(t, res, 1, 1)
++
++	serving, err := mirrors.NewCache(e.r).GetMirrors("/dir/b.iso", network.GeoIPRecord{})
++	if err != nil || len(serving) != 1 || serving[0].ID != 1 {
++		t.Fatalf("mirror no longer serves files under the unreadable root: %v %v", serving, err)
++	}
++}
++
++func TestSyncPointSizeOnlyChangeAdvancesGeneration(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/b.iso", "bb")
++	e.scanSource(false)
++	old := e.snapshot("/a.iso", "/b.iso")
++	full := filepath.Join(e.repo, "/a.iso")
++	if err := os.WriteFile(full, []byte("aaaaaaaa"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Chtimes(full, old[0].modTime, old[0].modTime); err != nil {
++		t.Fatal(err)
++	}
++	e.scanSource(false)
++	e.addMirror(1)
++	e.addMirror(2)
++
++	res := e.scanMirror(1, rsyncListing6075cf(old, 0), "", 0)
++	expectSync6075cf(t, res, 1, 2)
++
++	res = e.scanMirror(2, rsyncListing6075cf(e.snapshot("/a.iso", "/b.iso"), 0), "", 0)
++	expectSync6075cf(t, res, 2, 2)
++}
++
++func (e *syncEnv6075cf) writeAt(path, content string, stamp time.Time) {
++	full := filepath.Join(e.repo, path)
++	if err := os.WriteFile(full, []byte(content), 0644); err != nil {
++		e.t.Fatal(err)
++	}
++	if err := os.Chtimes(full, stamp, stamp); err != nil {
++		e.t.Fatal(err)
++	}
++}
++
++func TestSyncPointModificationTimeOnlyChangeAdvancesGeneration(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/b.iso", "bb")
++	e.scanSource(false)
++	old := e.snapshot("/a.iso", "/b.iso")
++	e.write("/a.iso", "aaaa")
++	e.scanSource(false)
++	e.addMirror(1)
++	e.addMirror(2)
++
++	res := e.scanMirror(1, rsyncListing6075cf(old, 0), "", 0)
++	expectSync6075cf(t, res, 1, 2)
++
++	res = e.scanMirror(2, rsyncListing6075cf(e.snapshot("/a.iso", "/b.iso"), 0), "", 0)
++	expectSync6075cf(t, res, 2, 2)
++}
++
++func TestSyncPointRecurringVersionCoversBothPeriods(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/p.iso", "pppp")
++	e.write("/q.iso", "q")
++	e.scanSource(false)
++	first := e.snapshot("/p.iso", "/q.iso")
++	e.write("/p.iso", "pppppppp")
++	e.write("/q.iso", "qq")
++	e.write("/s.iso", "s")
++	e.scanSource(false)
++	second := e.snapshot("/q.iso", "/s.iso")
++	e.writeAt("/p.iso", "pppp", first[0].modTime)
++	e.write("/s.iso", "sss")
++	e.scanSource(false)
++	e.addMirror(1)
++	e.addMirror(2)
++	e.addMirror(3)
++
++	res := e.scanMirror(1, rsyncListing6075cf(first, 0), "", 0)
++	expectSync6075cf(t, res, 1, 3)
++
++	res = e.scanMirror(2, rsyncListing6075cf(append(first[:1:1], second...), 0), "", 0)
++	expectSync6075cf(t, res, 0, 3)
++
++	res = e.scanMirror(3, rsyncListing6075cf(append(first[:1:1], e.snapshot("/q.iso", "/s.iso")...), 0), "", 0)
++	expectSync6075cf(t, res, 3, 3)
++}
++
++type ftpEntry6075cf struct {
++	name    string
++	size    int64
++	modTime time.Time
++}
++
++func startFTPServer6075cf(t *testing.T, entries []ftpEntry6075cf) string {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { ln.Close() })
++	go func() {
++		for {
++			c, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			go serveFTP6075cf(c, entries)
++		}
++	}()
++	return ln.Addr().String()
++}
++
++func serveFTP6075cf(c net.Conn, entries []ftpEntry6075cf) {
++	defer c.Close()
++	r := bufio.NewReader(c)
++	reply := func(format string, args ...any) {
++		fmt.Fprintf(c, format+"\r\n", args...)
++	}
++	var data net.Listener
++	defer func() {
++		if data != nil {
++			data.Close()
++		}
++	}()
++	reply("220 ready")
++	for {
++		line, err := r.ReadString('\n')
++		if err != nil {
++			return
++		}
++		cmd, arg, _ := strings.Cut(strings.TrimRight(line, "\r\n"), " ")
++		switch strings.ToUpper(cmd) {
++		case "FEAT":
++			reply("211-Features:\r\n MLST type*;size*;modify*;\r\n MDTM\r\n211 End")
++		case "USER":
++			reply("331 password required")
++		case "PASS":
++			reply("230 logged in")
++		case "TYPE":
++			reply("200 ok")
++		case "CWD":
++			reply("250 ok")
++		case "PWD":
++			reply("257 \"/pub\"")
++		case "EPSV":
++			if data != nil {
++				data.Close()
++			}
++			data, err = net.Listen("tcp", "127.0.0.1:0")
++			if err != nil {
++				reply("425 no data connection")
++				continue
++			}
++			reply("229 Entering Extended Passive Mode (|||%d|)", data.Addr().(*net.TCPAddr).Port)
++		case "MLSD":
++			if data == nil {
++				reply("425 no data connection")
++				continue
++			}
++			dc, err := data.Accept()
++			if err != nil {
++				reply("425 no data connection")
++				continue
++			}
++			reply("150 listing")
++			for _, e := range entries {
++				fmt.Fprintf(dc, "type=file;size=%d;modify=%s; %s\r\n", e.size, e.modTime.UTC().Format("20060102150405"), e.name)
++			}
++			dc.Close()
++			reply("226 done")
++		case "MDTM":
++			found := false
++			for _, e := range entries {
++				if "/pub/"+e.name == arg {
++					reply("213 %s", e.modTime.UTC().Format("20060102150405.000"))
++					found = true
++				}
++			}
++			if !found {
++				reply("550 not found")
++			}
++		case "QUIT":
++			reply("221 bye")
++			return
++		default:
++			reply("502 not implemented")
++		}
++	}
++}
++
++func TestSyncPointFTPMillisecondPrecisionSeparatesVersions(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	base := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
++	e.writeAt("/a.iso", "aaaa", base.Add(250*time.Millisecond))
++	e.writeAt("/b.iso", "bb", base.Add(2*time.Second+500*time.Millisecond))
++	e.scanSource(false)
++	e.writeAt("/a.iso", "AAAA", base.Add(750*time.Millisecond))
++	e.scanSource(false)
++	e.addMirror(1)
++	e.addMirror(2)
++
++	b := ftpEntry6075cf{"b.iso", 2, base.Add(2*time.Second + 500*time.Millisecond)}
++	old := startFTPServer6075cf(t, []ftpEntry6075cf{{"a.iso", 4, base.Add(250 * time.Millisecond)}, b})
++	res, err := Scan(core.FTP, e.r, mirrors.NewCache(e.r), "ftp://"+old+"/pub/", 1, nil)
++	if err != nil {
++		t.Fatalf("mirror scan: %s", err)
++	}
++	expectSync6075cf(t, res, 1, 2)
++
++	cur := startFTPServer6075cf(t, []ftpEntry6075cf{{"a.iso", 4, base.Add(750 * time.Millisecond)}, b})
++	res, err = Scan(core.FTP, e.r, mirrors.NewCache(e.r), "ftp://"+cur+"/pub/", 2, nil)
++	if err != nil {
++		t.Fatalf("mirror scan: %s", err)
++	}
++	expectSync6075cf(t, res, 2, 2)
++}
++
++func TestSyncPointLoweredHistoryAppliesAtTheNextMirrorScan(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/old.iso", "oo")
++	e.scanSource(false)
++	old := e.snapshot("/old.iso")
++	e.remove("/old.iso")
++	e.scanSource(false)
++	e.write("/b.iso", "bb")
++	e.scanSource(false)
++	e.addMirror(1)
++	e.addMirror(2)
++	listing := rsyncListing6075cf(append(e.snapshot("/a.iso", "/b.iso"), old...), 0)
++
++	res := e.scanMirror(1, listing, "", 0)
++	expectSync6075cf(t, res, 0, 3)
++
++	e.setHistory(1)
++	res = e.scanMirror(2, listing, "", 0)
++	expectSync6075cf(t, res, 3, 3)
++}
++
++func TestSyncPointLoweredThenRaisedHistoryStaysForgotten(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "a")
++	e.scanSource(false)
++	first := e.snapshot("/a.iso")
++	e.write("/a.iso", "bb")
++	e.scanSource(false)
++	e.write("/c.iso", "c")
++	e.scanSource(false)
++	e.addMirror(1)
++	e.addMirror(2)
++	e.addMirror(3)
++	e.addMirror(4)
++
++	res := e.scanMirror(1, rsyncListing6075cf(first, 0), "", 0)
++	expectSync6075cf(t, res, 1, 3)
++
++	e.setHistory(1)
++	res = e.scanMirror(2, rsyncListing6075cf(e.snapshot("/a.iso", "/c.iso"), 0), "", 0)
++	expectSync6075cf(t, res, 3, 3)
++
++	e.setHistory(10)
++	res = e.scanMirror(3, rsyncListing6075cf(nil, 0), "", 0)
++	expectSync6075cf(t, res, 0, 3)
++
++	res = e.scanMirror(4, rsyncListing6075cf(append(first, e.snapshot("/c.iso")...), 0), "", 0)
++	expectSync6075cf(t, res, 3, 3)
++}
++
++func TestSyncPointRaisedHistoryDoesNotRestoreForgottenVersions(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.setHistory(1)
++	e.write("/a.iso", "a")
++	e.scanSource(false)
++	first := e.snapshot("/a.iso")
++	e.write("/a.iso", "bb")
++	e.scanSource(false)
++	e.write("/a.iso", "ccc")
++	e.scanSource(false)
++	e.setHistory(10)
++	e.addMirror(1)
++	e.addMirror(2)
++
++	res := e.scanMirror(1, rsyncListing6075cf(nil, 0), "", 0)
++	expectSync6075cf(t, res, 0, 3)
++
++	res = e.scanMirror(2, rsyncListing6075cf(first, 0), "", 0)
++	expectSync6075cf(t, res, 3, 3)
++}
++
++func TestSyncPointRaisedHistoryAfterUnchangedScanKeepsVersionsForgotten(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "a")
++	e.scanSource(false)
++	first := e.snapshot("/a.iso")
++	e.write("/a.iso", "bb")
++	e.write("/b.iso", "b")
++	e.scanSource(false)
++	e.setHistory(1)
++	e.scanSource(false)
++	e.setHistory(10)
++	e.addMirror(1)
++	e.addMirror(2)
++
++	res := e.scanMirror(1, rsyncListing6075cf(nil, 0), "", 0)
++	expectSync6075cf(t, res, 0, 2)
++
++	res = e.scanMirror(2, rsyncListing6075cf(append(first, e.snapshot("/b.iso")...), 0), "", 0)
++	expectSync6075cf(t, res, 2, 2)
++}
++
++func TestSyncPointOpendirWithoutPartialTransferIsEvidence(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/private/x.iso", "xx")
++	e.scanSource(false)
++	e.addMirror(1)
++
++	stderr := "rsync: opendir \"private\" (in pub) failed: Permission denied (13)\n"
++	res := e.scanMirror(1, rsyncListing6075cf(e.snapshot("/a.iso"), 0), stderr, 0)
++	expectSync6075cf(t, res, 0, 1)
++}
++
++func TestSyncPointDeletedPathUnderUnreadableDirectoryIsNotUnverified(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/private/old.iso", "oo")
++	e.write("/private/x.iso", "xx")
++	e.scanSource(false)
++	e.addMirror(1)
++	e.scanMirror(1, rsyncListing6075cf(e.snapshot("/a.iso", "/private/old.iso", "/private/x.iso"), 0), "", 0)
++
++	e.remove("/private/old.iso")
++	e.write("/a.iso", "aaaaaa")
++	e.scanSource(false)
++	stderr := "rsync: [sender] opendir \"private\" (in pub) failed: Permission denied (13)\nrsync error: some files/attrs were not transferred (code 23)\n"
++	res := e.scanMirror(1, rsyncListing6075cf(e.snapshot("/a.iso"), 0), stderr, 23)
++	expectSync6075cf(t, res, 2, 2)
++	if !e.serves("/private/old.iso", 1) {
++		t.Fatal("mirror no longer serves /private/old.iso, which rsync could not read")
++	}
++}
++
++func (e *syncEnv6075cf) serves(path string, id int) bool {
++	serving, err := mirrors.NewCache(e.r).GetMirrors(path, network.GeoIPRecord{})
++	if err != nil {
++		e.t.Fatal(err)
++	}
++	for _, m := range serving {
++		if m.ID == id {
++			return true
++		}
++	}
++	return false
++}
++
++func TestSyncPointUnstattableEntriesAreUnverified(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/pool/x.iso", "xx")
++	e.write("/pool/y.iso", "yy")
++	e.write("/pool/sub/z.iso", "zz")
++	e.write("/pool/sub/deep/w.iso", "ww")
++	e.scanSource(false)
++	e.addMirror(1)
++	all := []string{"/a.iso", "/pool/x.iso", "/pool/y.iso", "/pool/sub/z.iso", "/pool/sub/deep/w.iso"}
++	e.scanMirror(1, rsyncListing6075cf(e.snapshot(all...), 0), "", 0)
++
++	e.write("/a.iso", "aaaaaa")
++	e.scanSource(false)
++	stderr := "rsync: [sender] readlink_stat(\"/pool/x.iso\" (in pub)) failed: Permission denied (13)\n" +
++		"rsync: readlink_stat(\"pool/sub\" (in pub)) failed: Permission denied (13)\n" +
++		"rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1338) [generator=3.2.7]\n"
++	res := e.scanMirror(1, rsyncListing6075cf(e.snapshot("/a.iso", "/pool/y.iso"), 0), stderr, 23)
++	expectSync6075cf(t, res, 2, 2)
++	expectStored6075cf(t, e.storedMirror(1), res)
++	for _, p := range []string{"/pool/x.iso", "/pool/sub/z.iso", "/pool/sub/deep/w.iso"} {
++		if !e.serves(p, 1) {
++			t.Fatalf("mirror no longer serves %s, which rsync could not stat", p)
++		}
++	}
++}
++
++func TestSyncPointUnreadableEntriesDoNotCoverSiblingPrefixes(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/private/x.iso", "xx")
++	e.write("/private2/y.iso", "yy")
++	e.write("/pool/b.iso", "bb")
++	e.write("/pool/b.iso.sig", "s")
++	e.scanSource(false)
++	e.addMirror(1)
++	all := []string{"/a.iso", "/private/x.iso", "/private2/y.iso", "/pool/b.iso", "/pool/b.iso.sig"}
++	e.scanMirror(1, rsyncListing6075cf(e.snapshot(all...), 0), "", 0)
++
++	stderr := "rsync: [sender] opendir \"/private\" (in pub) failed: Permission denied (13)\n" +
++		"rsync: [sender] readlink_stat(\"/pool/b.iso\" (in pub)) failed: Permission denied (13)\n" +
++		"rsync error: some files/attrs were not transferred (code 23)\n"
++	res := e.scanMirror(1, rsyncListing6075cf(e.snapshot("/a.iso"), 0), stderr, 23)
++	expectSync6075cf(t, res, 0, 1)
++	for p, want := range map[string]bool{"/private/x.iso": true, "/pool/b.iso": true, "/private2/y.iso": false, "/pool/b.iso.sig": false} {
++		if e.serves(p, 1) != want {
++			t.Fatalf("mirror serves %s = %v, want %v", p, !want, want)
++		}
++	}
++}
++
++func TestSyncPointReadableEmptyListingIsMissingEverything(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/dir/b.iso", "bb")
++	e.scanSource(false)
++	e.addMirror(1)
++	e.scanMirror(1, rsyncListing6075cf(e.snapshot("/a.iso", "/dir/b.iso"), 0), "", 0)
++
++	res := e.scanMirror(1, rsyncListing6075cf(nil, 0), "", 0)
++	expectSync6075cf(t, res, 0, 1)
++	expectStored6075cf(t, e.storedMirror(1), res)
++	if e.serves("/a.iso", 1) || e.serves("/dir/b.iso", 1) {
++		t.Fatal("mirror still serves files missing from a readable empty listing")
++	}
++}
++
++func TestSyncPointUnmatchedVersionIsNotCurrent(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/b.iso", "bb")
++	e.scanSource(false)
++	b := e.snapshot("/b.iso")
++	e.write("/b.iso", "BBBB")
++	e.scanSource(false)
++	e.write("/a.iso", "AAAA")
++	e.scanSource(false)
++	e.addMirror(1)
++
++	stale := listedFile6075cf{path: "/a.iso", size: 4, modTime: e.stamp.Add(time.Hour)}
++	res := e.scanMirror(1, rsyncListing6075cf(append(b, stale), 0), "", 0)
++	expectSync6075cf(t, res, 1, 3)
++	expectStored6075cf(t, e.storedMirror(1), res)
++}
++
++func TestSyncPointNoopScansDoNotAdvanceInAnyLocalTimezone(t *testing.T) {
++	local := time.Local
++	time.Local = time.FixedZone("", 5*3600+45*60)
++	t.Cleanup(func() { time.Local = local })
++	e := newSyncEnv6075cf(t)
++	e.write("/a.iso", "aaaa")
++	e.write("/dir/b.iso", "bb")
++	e.scanSource(false)
++	e.scanSource(false)
++	e.write("/a.iso", "AAAA")
++	e.scanSource(false)
++	e.scanSource(false)
++	e.addMirror(1)
++
++	res := e.scanMirror(1, rsyncListing6075cf(e.snapshot("/a.iso", "/dir/b.iso"), 0), "", 0)
++	expectSync6075cf(t, res, 2, 2)
++}
++
++func TestSyncPointSourceHistoryLoadsFromConfigFile(t *testing.T) {
++	e := newSyncEnv6075cf(t)
++	file := filepath.Join(t.TempDir(), "mirrorbits.conf")
++	content := fmt.Sprintf("Repository: %s\nRedisAddress: %s\nSourceHistory: 2\n", e.repo, e.config.RedisAddress)
++	if err := os.WriteFile(file, []byte(content), 0644); err != nil {
++		t.Fatal(err)
++	}
++	previous := core.ConfigFile
++	core.ConfigFile = file
++	t.Cleanup(func() { core.ConfigFile = previous })
++	if err := ReloadConfig(); err != nil {
++		t.Fatal(err)
++	}
++	if GetConfig().SourceHistory != 2 {
++		t.Fatalf("SourceHistory loaded as %d, want 2", GetConfig().SourceHistory)
++	}
++	e.write("/a.iso", "a")
++	e.scanSource(false)
++	old := e.snapshot("/a.iso")
++	e.write("/a.iso", "aa")
++	e.scanSource(false)
++	e.write("/a.iso", "aaa")
++	e.scanSource(false)
++	e.addMirror(1)
++
++	res := e.scanMirror(1, rsyncListing6075cf(old, 0), "", 0)
++	expectSync6075cf(t, res, 3, 3)
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..56c915c
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,128 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++OUTPUT_PATH="${OUTPUT_PATH:-/tmp/mirrorbits-test-results.xml}"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++cd "$(dirname "$0")"
++export GOFLAGS="${GOFLAGS:--buildvcs=false}"
++if [ ! -w "$(go env GOCACHE)" ]; then
++  export GOCACHE="$(mktemp -d)"
++fi
++
++VERSION="$(git describe --always --tags 2>/dev/null || echo dev)"
++LDFLAGS="-X github.com/etix/mirrorbits/core.VERSION=$VERSION"
++
++WORK="$(mktemp -d)"
++RAW="$WORK/go-test.txt"
++NEW_TAG="syncpoint"
++NEW_FILES=$(grep -l "^//go:build $NEW_TAG" $(find . -name '*_test.go' -not -path './.git/*') 2>/dev/null)
++NEW_NAMES=$(for f in $NEW_FILES; do grep -oE '^func (Test[A-Za-z0-9_]+)' "$f" | awk '{print $2}'; done)
++
++REDIS_PORT=6390
++start_redis() {
++  redis-server --port "$REDIS_PORT" --bind 127.0.0.1 --save "" --appendonly no \
++    --dir "$WORK" --pidfile "$WORK/redis.pid" --logfile "$WORK/redis.log" --daemonize yes
++  for _ in $(seq 1 100); do
++    if redis-cli -p "$REDIS_PORT" ping 2>/dev/null | grep -q PONG; then
++      return 0
++    fi
++    sleep 0.1
++  done
++  return 1
++}
++stop_redis() {
++  redis-cli -p "$REDIS_PORT" shutdown nosave >/dev/null 2>&1 || true
++}
++
++xml_escape() {
++  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
++}
++
++drop_build_failures() {
++  [ -f "$OUTPUT_PATH" ] || return 0
++  awk '
++    /<testsuite[ >]/ { buf = $0 "\n"; insuite = 1; failed = 0; next }
++    insuite { buf = buf $0 "\n"; if (index($0, "[build failed]")) failed = 1
++              if (index($0, "</testsuite>")) { if (!failed) printf "%s", buf; insuite = 0 }
++              next }
++    { print }
++  ' "$OUTPUT_PATH" > "$WORK/filtered.xml" && mv "$WORK/filtered.xml" "$OUTPUT_PATH"
++}
++
++write_missing() {
++  local detail
++  detail=$(tail -c 20000 "$RAW" | xml_escape)
++  local names=() pkgs=()
++  for f in $NEW_FILES; do
++    local pkg="github.com/etix/mirrorbits/$(dirname "${f#./}")"
++    for name in $(grep -oE '^func (Test[A-Za-z0-9_]+)' "$f" | awk '{print $2}'); do
++      if ! grep -q "name=\"$name\"" "$OUTPUT_PATH" 2>/dev/null; then
++        names+=("$name")
++        pkgs+=("$pkg")
++      fi
++    done
++  done
++  [ "${#names[@]}" -eq 0 ] && return 0
++  local body="$WORK/missing.xml"
++  {
++    echo "<testsuite name=\"missing\" tests=\"${#names[@]}\" failures=\"${#names[@]}\" errors=\"0\">"
++    for i in "${!names[@]}"; do
++      echo "<testcase name=\"${names[$i]}\" classname=\"${pkgs[$i]}\"><failure message=\"no result reported\">$detail</failure></testcase>"
++    done
++    echo "</testsuite>"
++  } > "$body"
++  if [ -s "$OUTPUT_PATH" ] && grep -q "</testsuites>" "$OUTPUT_PATH"; then
++    sed -i "s#</testsuites>##" "$OUTPUT_PATH"
++    cat "$body" >> "$OUTPUT_PATH"
++    echo "</testsuites>" >> "$OUTPUT_PATH"
++  else
++    { echo '<?xml version="1.0" encoding="UTF-8"?>'; echo "<testsuites>"; cat "$body"; echo "</testsuites>"; } > "$OUTPUT_PATH"
++  fi
++  return 1
++}
++
++STATUS=0
++case "$MODE" in
++  base)
++    go test -v -count=1 -timeout 600s -ldflags "$LDFLAGS" -skip '^TestRefreshNodeList$' ./... > "$RAW" 2>&1
++    STATUS=$?
++    go-junit-report -set-exit-code < "$RAW" > "$OUTPUT_PATH" || STATUS=1
++    ;;
++  new)
++    if ! start_redis; then
++      echo "redis-server did not start" >> "$RAW"
++      cat "$WORK/redis.log" >> "$RAW" 2>/dev/null
++      STATUS=1
++    else
++      export MIRRORBITS_TEST_REDIS="127.0.0.1:$REDIS_PORT"
++      PKGS=$(for f in $NEW_FILES; do echo "./$(dirname "${f#./}")"; done | sort -u)
++      PATTERN="^($(echo $NEW_NAMES | tr ' ' '|'))\$"
++      go test -v -count=1 -p 1 -timeout 600s -ldflags "$LDFLAGS" -tags "$NEW_TAG" -run "$PATTERN" $PKGS > "$RAW" 2>&1
++      STATUS=$?
++      stop_redis
++    fi
++    go-junit-report -set-exit-code < "$RAW" > "$OUTPUT_PATH" || STATUS=1
++    drop_build_failures
++    write_missing || STATUS=1
++    ;;
++  *)
++    echo "usage: ./test.sh [--output_path <file>] base|new"
++    exit 2
++    ;;
++esac
++
++cat "$RAW"
++rm -rf "$WORK"
++exit "$STATUS"
